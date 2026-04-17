@@ -4,6 +4,28 @@ A file-based sharded database written in C. Started as a key/value store; now a 
 
 **Platform:** Linux x86_64 / ARM64 (uses `epoll`, `mmap`, POSIX pthreads). Not portable to macOS or Windows without source changes. License: MIT.
 
+## Performance
+
+Measured on **1,000,000 records** (single object, 32-byte hex keys, ~100-byte typed values, indexes on `age`, `active`, `username`).
+
+| Operation | Throughput / Latency |
+|---|---|
+| Bulk insert (JSON, 1M records in one request) | **~130,000 inserts/sec** (7.69s total) |
+| Bulk insert (CSV, 1M records in one request) | **~131,000 inserts/sec** (7.62s total) |
+| Pipelined GET (10k ops, 1 connection) | **~36,000 ops/sec** (278ms) |
+| Parallel GET (50k ops, 5 connections) | **~129,000 ops/sec** (387ms) |
+| Parallel UPDATE (50k ops, 5 connections) | **~100,000 ops/sec** (501ms) |
+| Indexed `find` / `count` / `aggregate` (any operator) | **1–3 ms** |
+| Full-scan `find` on non-indexed field | **2–3 ms** (mmap + Zone A compact probe) |
+| `aggregate` with `group_by` + `having` | **1–2 ms** |
+| Disk footprint for 1M records | 161 MB (~161 bytes/record, indexes included) |
+
+Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `not_in`, `like`, `not_like`, `contains`, `not_contains`, `starts`, `ends`, `exists`, `not_exists`) stay within the same 1–3 ms band on 1M records. Full scans are fast because Zone A (24-byte metadata headers) stays resident in page cache; typed binary records in Zone B are compared without JSON parsing.
+
+**Test machine:** AMD Ryzen 7 7840U (8 cores / 16 threads, up to 5.1 GHz) · 32 GB RAM · NVMe SSD (ext4) · Linux 6.19 · gcc 15.2 `-O2`.
+
+**Reproduce:** `./bench-kv.sh` (insert/get/update throughput) and `./bench-queries.sh` (find/count/aggregate latencies). Scripts live at the repo root and start/stop the server automatically.
+
 ## Features
 
 - **Typed fields** -- varchar (length-prefix, max 65535 bytes), int, long, short, double, bool, byte, date, datetime, numeric (fixed-point)
@@ -100,6 +122,95 @@ Place `db.env` in the working directory where you run shard-db.
 # 7. Stop
 ./shard-db stop
 ```
+
+## Common Query Recipes
+
+Real-world patterns, each stitched from the primitives documented under **JSON API Reference** below. Send any of these as the payload to `./shard-db query '<json>'` or over the TCP protocol.
+
+### 1. Paginated filter with projection, sorting, and cursor
+
+Return paid invoices from the last 30 days, newest first, 50 per page, only the fields a dashboard needs:
+
+```json
+{"mode":"find","dir":"acme","object":"invoices",
+ "criteria":[
+   {"field":"status","op":"eq","value":"paid"},
+   {"field":"paid_at","op":"gte","value":"20260318000000"}
+ ],
+ "fields":["id","customer","total","paid_at"],
+ "order_by":"paid_at","order":"desc",
+ "limit":50,
+ "cursor":""}
+```
+
+For the next page, pass the last returned key back as `"cursor":"<last_id>"`. Keyset pagination — O(1) regardless of page depth, unlike `offset`.
+
+### 2. Group-by aggregate with HAVING (revenue by product)
+
+Top 10 products by revenue, excluding any product that sold fewer than 100 units:
+
+```json
+{"mode":"aggregate","dir":"acme","object":"orders",
+ "criteria":[{"field":"status","op":"eq","value":"fulfilled"}],
+ "group_by":["product_sku"],
+ "aggregates":[
+   {"fn":"count","alias":"units_sold"},
+   {"fn":"sum","field":"line_total","alias":"revenue"},
+   {"fn":"avg","field":"line_total","alias":"avg_ticket"}
+ ],
+ "having":[{"field":"units_sold","op":"gte","value":"100"}],
+ "order_by":"revenue","order":"desc",
+ "limit":10}
+```
+
+Output is tabular (`{"columns":[...], "rows":[[...]]}`) — drop-in for spreadsheets or charting libraries.
+
+### 3. Multi-join: enrich orders with user email and product title
+
+A left-join on products (emit nulls if the SKU is missing), inner-join on users (drop orders without a known user):
+
+```json
+{"mode":"find","dir":"acme","object":"orders",
+ "criteria":[{"field":"status","op":"eq","value":"paid"}],
+ "join":[
+   {"object":"users","local":"user_id","remote":"key",
+    "as":"user","type":"inner","fields":["email","name"]},
+   {"object":"products","local":"product_sku","remote":"sku",
+    "as":"product","type":"left","fields":["title","price"]}
+ ],
+ "limit":100}
+```
+
+`remote` is either `"key"` (primary-key lookup) or any **indexed** field on the joined object. Output columns: `orders.key`, `orders.{field}`, `user.{field}`, `product.{field}`.
+
+### 4. Safe bulk update with dry-run first
+
+Mark all `pending` orders older than 7 days as `expired`. Dry-run first to see the blast radius, then run for real with a `limit` guard:
+
+```json
+# Dry run — returns the would-be count without writing
+{"mode":"bulk-update","dir":"acme","object":"orders",
+ "criteria":[
+   {"field":"status","op":"eq","value":"pending"},
+   {"field":"created","op":"lt","value":"20260410000000"}
+ ],
+ "value":{"status":"expired"},
+ "limit":10000,
+ "dry_run":true}
+```
+
+```json
+# Execute (drop dry_run, same criteria)
+{"mode":"bulk-update","dir":"acme","object":"orders",
+ "criteria":[
+   {"field":"status","op":"eq","value":"pending"},
+   {"field":"created","op":"lt","value":"20260410000000"}
+ ],
+ "value":{"status":"expired"},
+ "limit":10000}
+```
+
+Use CAS (`"if":{"version":42}`) on single-record updates for lock-free concurrency control. Combine with `auto_update` on a `version:int` field to track revisions.
 
 ## CLI Commands
 
