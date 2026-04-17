@@ -982,14 +982,34 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     const char *arg3 = args[5];
     const char *arg4 = args[6];
 
-    /* Validate dir */
+    /* Validate dir. Must `goto timing;` (not bare return) so is_write's
+       in_flight_writes++ at the top is paired with the matching decrement;
+       otherwise errored writes leak the counter and `stop` waits 30s for
+       phantom drains. */
     if (!is_valid_dir(dir_arg)) {
         OUT("{\"error\":\"Unknown dir: %s\"}\n", dir_arg);
         fflush(g_out);
-        return;
+        goto timing;
     }
     char eff_root[PATH_MAX];
     build_effective_root(eff_root, sizeof(eff_root), dir_arg);
+
+    /* Validate object exists — every fast-path command operates on a created object.
+       Without this, missing objects reach cmd_insert/cmd_get/... and null-deref on
+       the schema, killing the worker thread. */
+    if (!object || !object[0]) {
+        OUT("{\"error\":\"object is required\"}\n");
+        fflush(g_out);
+        goto timing;
+    }
+    char obj_check[PATH_MAX];
+    snprintf(obj_check, sizeof(obj_check), "%s/%s/fields.conf", eff_root, object);
+    struct stat obj_st;
+    if (stat(obj_check, &obj_st) != 0) {
+        OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
+        fflush(g_out);
+        goto timing;
+    }
 
     /* All args are \x1F separated:
        get\x1Fdir\x1Fobj\x1Fkey

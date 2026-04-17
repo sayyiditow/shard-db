@@ -724,6 +724,10 @@ int cmd_insert(const char *db_root, const char *object,
     size_t klen = strlen(key);
 
     TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
+        return 1;
+    }
     uint8_t *typed_buf = NULL;
     const char *store_value;
     size_t vlen;
