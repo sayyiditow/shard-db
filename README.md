@@ -127,9 +127,9 @@ Place `db.env` in the working directory where you run shard-db.
 
 Real-world patterns, each stitched from the primitives documented under **JSON API Reference** below. Send any of these as the payload to `./shard-db query '<json>'` or over the TCP protocol.
 
-### 1. Paginated filter with projection, sorting, and cursor
+### 1. Paginated filter with projection
 
-Return paid invoices from the last 30 days, newest first, 50 per page, only the fields a dashboard needs:
+Return paid invoices from the last 30 days, 50 per page, only the fields a dashboard needs:
 
 ```json
 {"mode":"find","dir":"acme","object":"invoices",
@@ -138,12 +138,11 @@ Return paid invoices from the last 30 days, newest first, 50 per page, only the 
    {"field":"paid_at","op":"gte","value":"20260318000000"}
  ],
  "fields":["id","customer","total","paid_at"],
- "order_by":"paid_at","order":"desc",
- "limit":50,
- "cursor":""}
+ "offset":0,
+ "limit":50}
 ```
 
-For the next page, pass the last returned key back as `"cursor":"<last_id>"`. Keyset pagination — O(1) regardless of page depth, unlike `offset`.
+For the next page, bump `offset` by `limit`. For deep pagination across an entire object (no filter), use `fetch` mode — it supports keyset pagination via `cursor` (see the [fetch](#fetch) reference). For sorted output, use `aggregate` with `order_by`, or sort the returned slice client-side.
 
 ### 2. Group-by aggregate with HAVING (revenue by product)
 
@@ -407,8 +406,8 @@ query({
     "dir": "default",
     "object": "products",
     "records": [
-        {"key": "prod-100", "value": {"name": "Gadget A", "price": "9.99", "stock": 500}},
-        {"key": "prod-101", "value": {"name": "Gadget B", "price": "19.99", "stock": 250}}
+        {"id": "prod-100", "data": {"name": "Gadget A", "price": "9.99", "stock": 500}},
+        {"id": "prod-101", "data": {"name": "Gadget B", "price": "19.99", "stock": 250}}
     ]
 })
 
@@ -572,8 +571,8 @@ public class ShardDbClient {
         // Bulk insert
         res = db.query("{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"orders\","
                       + "\"records\":["
-                      + "{\"key\":\"ord-100\",\"value\":{\"customer\":\"Bob\",\"total\":\"50.00\",\"status\":\"pending\"}},"
-                      + "{\"key\":\"ord-101\",\"value\":{\"customer\":\"Carol\",\"total\":\"75.00\",\"status\":\"pending\"}}"
+                      + "{\"id\":\"ord-100\",\"data\":{\"customer\":\"Bob\",\"total\":\"50.00\",\"status\":\"pending\"}},"
+                      + "{\"id\":\"ord-101\",\"data\":{\"customer\":\"Carol\",\"total\":\"75.00\",\"status\":\"pending\"}}"
                       + "]}");
         System.out.println(res);
 
@@ -731,8 +730,8 @@ function pipeline(requests, host = "localhost", port = 9199) {
     dir: "default",
     object: "events",
     records: [
-      { key: "evt-100", value: { type: "error", source: "api", severity: 5 } },
-      { key: "evt-101", value: { type: "warn", source: "worker", severity: 3 } },
+      { id: "evt-100", data: { type: "error", source: "api", severity: 5 } },
+      { id: "evt-101", data: { type: "warn", source: "worker", severity: 3 } },
     ],
   });
   console.log(res);
@@ -829,7 +828,7 @@ Response (multi): `[{"key":"k1","value":{...}},{"key":"k2","value":{...}}]`
 {"mode":"exists","dir":"<dir>","object":"<obj>","keys":["k1","k2"]}
 ```
 
-Response (single): `{"key":"<key>","exists":true}`
+Response (single): `{"exists":true}`
 Response (multi): `{"k1":true,"k2":false}`
 
 #### not-exists
@@ -846,7 +845,7 @@ Response: `["k3"]` (keys that don't exist)
 {"mode":"size","dir":"<dir>","object":"<obj>"}
 ```
 
-Response: `{"count":1000}`
+Response: `{"count":1000}` — when the object has tombstoned (deleted) slots yet to be vacuumed, the response also includes `"orphaned":<N>`: `{"count":1000,"orphaned":42}`.
 
 ### Query Operations
 
@@ -887,18 +886,18 @@ Response: `["k1","k2","k3",...]`
 {"mode":"fetch","dir":"<dir>","object":"<obj>","offset":0,"limit":50,"fields":"name,email","cursor":"last_key","format":"rows"}
 ```
 
-Response: same as find. Use `cursor` for keyset pagination (more efficient than offset for deep pages).
+Response: `{"results":[{"key":"k1","value":{...}},...],"cursor":"<next>|null"}`. When `format:"rows"` is set, the shape is `{"columns":[...],"rows":[...],"cursor":"<next>|null"}`. Pass the returned `cursor` back in the next request to resume; `null` means no more pages. Use `cursor` for keyset pagination (more efficient than `offset` for deep pages).
 
 ### Bulk Operations
 
 #### bulk-insert
 
 ```json
-{"mode":"bulk-insert","dir":"<dir>","object":"<obj>","records":[{"key":"k1","value":{...}},{"key":"k2","value":{...}}]}
+{"mode":"bulk-insert","dir":"<dir>","object":"<obj>","records":[{"id":"k1","data":{...}},{"id":"k2","data":{...}}]}
 {"mode":"bulk-insert","dir":"<dir>","object":"<obj>","file":"/path/to/data.json"}
 ```
 
-Response: `{"status":"inserted","count":2}`
+Response: `{"count":2}`. If any records were rejected, also includes `"errors":<N>` and `"error":"some_records_dropped"`.
 
 #### bulk-insert-delimited
 
@@ -906,7 +905,7 @@ Response: `{"status":"inserted","count":2}`
 {"mode":"bulk-insert-delimited","dir":"<dir>","object":"<obj>","file":"/path/to/data.csv","delimiter":"|"}
 ```
 
-The file's first line is the header (field names). Each subsequent line has key as the first column, then field values separated by the delimiter.
+Every line is a record — there is no header row. The first column is the key; the remaining columns are field values in `fields.conf` order (skipping tombstoned fields). Default delimiter is `|`.
 
 #### bulk-delete
 
@@ -921,7 +920,8 @@ By criteria:
 {"mode":"bulk-delete","dir":"<dir>","object":"<obj>","criteria":[...],"limit":1000,"dry_run":true}
 ```
 
-Response: `{"status":"deleted","count":50}` or `{"status":"would_delete","count":50}` (dry run)
+Response (by key list): `{"deleted":<N>}`.
+Response (by criteria): `{"matched":<M>,"deleted":<D>,"skipped":<S>}`, or `{"matched":<M>,"deleted":0,"skipped":0,"dry_run":true}` when `dry_run:true`.
 
 #### bulk-update
 
@@ -929,7 +929,7 @@ Response: `{"status":"deleted","count":50}` or `{"status":"would_delete","count"
 {"mode":"bulk-update","dir":"<dir>","object":"<obj>","criteria":[...],"value":{...},"limit":1000,"dry_run":true}
 ```
 
-Response: `{"status":"updated","count":50}` or `{"status":"would_update","count":50}` (dry run)
+Response: `{"matched":<M>,"updated":<U>,"skipped":<S>}`, or `{"matched":<M>,"updated":0,"skipped":0,"dry_run":true}` when `dry_run:true`.
 
 ### Search Operators
 
@@ -943,8 +943,8 @@ Used in `criteria` arrays for find, count, bulk-update, bulk-delete, and `if` co
 | `lt` | Numeric < | `{"field":"age","op":"lt","value":"65"}` |
 | `gte` | Numeric >= | `{"field":"score","op":"gte","value":"100"}` |
 | `lte` | Numeric <= | `{"field":"score","op":"lte","value":"999"}` |
-| `like` | Wildcard (`*` or `%`) | `{"field":"name","op":"like","value":"Ali*"}` |
-| `nlike` | Negated wildcard | `{"field":"name","op":"nlike","value":"test*"}` |
+| `like` | Wildcard `%` | `{"field":"name","op":"like","value":"Ali%"}` |
+| `nlike` | Negated wildcard `%` | `{"field":"name","op":"nlike","value":"test%"}` |
 | `contains` | Substring match | `{"field":"bio","op":"contains","value":"engineer"}` |
 | `ncontains` | No substring | `{"field":"bio","op":"ncontains","value":"spam"}` |
 | `starts` | Prefix match | `{"field":"email","op":"starts","value":"admin"}` |
