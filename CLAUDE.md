@@ -58,7 +58,7 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 - **Slot header** (24 bytes): 16-byte xxh128 hash, 2-byte flag, 2-byte key_len, 4-byte value_len
 - **Slot file layout**: `[ShardHeader: 32B][Zone A: slots × 24B headers][Zone B: slots × slot_size payloads]`
 - **Addressing**: `shard = hash[0..1] % splits`, `slot = hash[2..5] % slots_per_shard`, linear probing
-- **Dynamic shard growth**: 50% load → double `slots_per_shard`, bounded by `MAX_SPLITS=4096`
+- **Dynamic shard growth**: 50% load → double `slots_per_shard` (no slot cap, grows as data grows). `MAX_SPLITS=4096` is the cap on the *number of shard files* per object (3 hex digits in `NNN.bin`), not on slots.
 - **All I/O via mmap**: MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup
 - **Concurrency**: per-ucache-entry rwlock (shared for read, exclusive for write); per-object rwlock for schema mutations
