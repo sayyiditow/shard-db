@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & test (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: gcc -O2 -o shard-db src/*.c -Isrc -lpthread
+
+      - name: Schema mutation locking + key ceiling (test-objlock)
+        run: ./test-objlock.sh
+
+      - name: Rename field (test-rename-field)
+        run: ./test-rename-field.sh
+
+      - name: Remove field + vacuum --compact (test-remove-field)
+        run: ./test-remove-field.sh
+
+      - name: Vacuum + add-field (test-vacuum-addfield)
+        run: ./test-vacuum-addfield.sh
+
+      - name: Concurrent bulk-insert integrity (test-parallel-index-integrity)
+        run: ./test-parallel-index-integrity.sh
+
+      - name: Joins (test-joins)
+        run: ./test-joins.sh
