@@ -5379,6 +5379,26 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
+    /* Register the tenant dir in dirs.conf if missing, then reload the in-memory set */
+    char dirs_path[PATH_MAX];
+    snprintf(dirs_path, sizeof(dirs_path), "%s/dirs.conf", db_root);
+    int dir_listed = 0;
+    f = fopen(dirs_path, "r");
+    if (f) {
+        char line[256];
+        size_t dlen = strlen(dir);
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strlen(line) == dlen && memcmp(line, dir, dlen) == 0) { dir_listed = 1; break; }
+        }
+        fclose(f);
+    }
+    if (!dir_listed) {
+        f = fopen(dirs_path, "a");
+        if (f) { fprintf(f, "%s\n", dir); fclose(f); }
+    }
+    load_dirs();
+
     /* Write index.conf if indexes provided */
     if (indexes_json && indexes_json[0]) {
         snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", eff_root, object);

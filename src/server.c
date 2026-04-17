@@ -1227,9 +1227,8 @@ int cmd_server(const char *db_root, int daemonize) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    write_pid_file(db_root, port);
-
     log_init(db_root);
+    write_pid_file(db_root, port);
     g_server_start_ms = now_ms();
     bt_page_size = g_index_page_size;
     fcache_init(g_fcache_cap);
