@@ -42,7 +42,7 @@
 #define GROW_LOAD_DEN    2
 #define SHARD_MAGIC      0x564B4853u /* 'SHKV' little-endian */
 #define SHARD_VERSION    1u
-#define MAX_FIELDS  64
+#define MAX_FIELDS  256
 
 /* Per-shard header at byte 0 of each shard file. Records growth state so
    we can recover slots_per_shard after a restart without re-deriving it
@@ -392,7 +392,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 int cmd_exists(const char *db_root, const char *object, const char *key);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit);
 int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format);
-int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *join_json);
+int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *join_json, const char *order_by, const char *order_dir);
 int cmd_bulk_insert(const char *db_root, const char *object, const char *input);
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str);
 int cmd_bulk_insert_delimited(const char *db_root, const char *object, const char *filepath, char delimiter);

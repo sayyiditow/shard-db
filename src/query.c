@@ -4371,6 +4371,11 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     if (o) { c->op = parse_op(o); free(o); }
     if (v) {
         strncpy(c->value, v, sizeof(c->value) - 1);
+        /* LIKE/NOT_LIKE accept '*' as an alias for '%'. Normalize once
+           so both the typed and legacy match paths see a single form. */
+        if (c->op == OP_LIKE || c->op == OP_NOT_LIKE) {
+            for (char *q = c->value; *q; q++) if (*q == '*') *q = '%';
+        }
         if (c->op == OP_IN || c->op == OP_NOT_IN) {
             c->in_cap = 64;
             c->in_values = malloc(c->in_cap * sizeof(char *));
@@ -4629,10 +4634,106 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
    criteria_json: [{"field":"name","op":"contains","value":"ali"},{"field":"age","op":"gte","value":"18"}] */
+/* ===== Ordered find: buffer matches, sort, emit slice =====
+   Used when caller sets order_by on find mode. Joins are not supported in
+   this path (caller rejects the combination). Full-scan based; an indexed
+   ordered scan is a v2 item. */
+typedef struct {
+    char *key;
+    size_t key_len;
+    uint8_t *record;        /* malloc'd copy of [key bytes | value bytes] */
+    size_t value_len;       /* length of the value portion */
+    char *sort_str;         /* extracted sort field as string (may be NULL) */
+    double sort_num;        /* numeric form, valid iff sort_is_num */
+    int sort_is_num;
+} OrderedRow;
+
+typedef struct {
+    OrderedRow *rows;
+    size_t count;
+    size_t cap;
+    CompiledCriterion *compiled;
+    int num_criteria;
+    FieldSchema *fs;
+    int order_field_idx;    /* index in typed schema, -1 if field unknown/untyped */
+    const char *order_field_name;
+    ExcludedKeys *excluded;
+    QueryDeadline *deadline;
+    int dl_counter;
+    int order_is_numeric;
+    pthread_mutex_t lock;
+} OrderedCollectCtx;
+
+static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
+    OrderedCollectCtx *oc = (OrderedCollectCtx *)ctx;
+    if (query_deadline_tick(oc->deadline, &oc->dl_counter)) return 1;
+
+    /* Exclusion check */
+    char keybuf[1024];
+    size_t klen = hdr->key_len < sizeof(keybuf) - 1 ? hdr->key_len : sizeof(keybuf) - 1;
+    memcpy(keybuf, block, klen);
+    keybuf[klen] = '\0';
+    if (is_excluded(oc->excluded, keybuf)) return 0;
+
+    const uint8_t *raw = block + hdr->key_len;
+    for (int i = 0; i < oc->num_criteria; i++) {
+        if (!match_typed(raw, &oc->compiled[i], oc->fs)) return 0;
+    }
+
+    /* Extract sort key */
+    char *sv = NULL;
+    if (oc->fs && oc->fs->ts && oc->order_field_idx >= 0) {
+        sv = typed_get_field_str(oc->fs->ts, raw, oc->order_field_idx);
+    } else {
+        sv = decode_field((const char *)raw, hdr->value_len, oc->order_field_name, oc->fs);
+    }
+
+    pthread_mutex_lock(&oc->lock);
+    if (oc->count >= oc->cap) {
+        oc->cap = oc->cap ? oc->cap * 2 : 256;
+        oc->rows = realloc(oc->rows, oc->cap * sizeof(OrderedRow));
+    }
+    OrderedRow *r = &oc->rows[oc->count++];
+    r->key_len = hdr->key_len;
+    r->key = malloc(hdr->key_len + 1);
+    memcpy(r->key, block, hdr->key_len);
+    r->key[hdr->key_len] = '\0';
+    r->value_len = hdr->value_len;
+    size_t rec_len = (size_t)hdr->key_len + (size_t)hdr->value_len;
+    r->record = malloc(rec_len);
+    memcpy(r->record, block, rec_len);
+    r->sort_str = sv;
+    r->sort_is_num = oc->order_is_numeric;
+    r->sort_num = (oc->order_is_numeric && sv) ? atof(sv) : 0.0;
+    pthread_mutex_unlock(&oc->lock);
+    return 0;
+}
+
+static int cmp_row_asc(const void *a, const void *b) {
+    const OrderedRow *ra = (const OrderedRow *)a;
+    const OrderedRow *rb = (const OrderedRow *)b;
+    if (ra->sort_is_num) {
+        if (ra->sort_num < rb->sort_num) return -1;
+        if (ra->sort_num > rb->sort_num) return  1;
+        return 0;
+    }
+    const char *sa = ra->sort_str ? ra->sort_str : "";
+    const char *sb = rb->sort_str ? rb->sort_str : "";
+    return strcmp(sa, sb);
+}
+static int cmp_row_desc(const void *a, const void *b) { return -cmp_row_asc(a, b); }
+
+static int typed_field_is_numeric(uint8_t ft) {
+    return ft == FT_INT || ft == FT_LONG || ft == FT_SHORT || ft == FT_DOUBLE ||
+           ft == FT_NUMERIC || ft == FT_DATE || ft == FT_DATETIME ||
+           ft == FT_BOOL || ft == FT_BYTE;
+}
+
 int cmd_find(const char *db_root, const char *object,
                     const char *criteria_json, int offset, int limit,
                     const char *proj_str, const char *excluded_csv,
-                    const char *format, const char *join_json) {
+                    const char *format, const char *join_json,
+                    const char *order_by, const char *order_dir) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
 
     /* Parse joins (if any) — forces tabular output irrespective of `format`. */
@@ -4719,7 +4820,96 @@ int cmd_find(const char *db_root, const char *object,
         OUT("[");
     }
 
-    if (primary_idx >= 0) {
+    int has_order = (order_by && order_by[0] && !has_joins);
+
+    if (has_order) {
+        /* ===== ORDERED FIND: full-scan collect → sort → emit slice =====
+           v1.x: buffer all matches, qsort by order_by, then emit offset..offset+limit.
+           Indexed ordered scan is a v2 item. Joins + order_by is not supported. */
+        CompiledCriterion *compiled = compile_criteria(criteria, num_criteria, driver_fs.ts);
+
+        int order_idx = -1;
+        int order_is_num = 0;
+        if (driver_fs.ts) {
+            for (int i = 0; i < driver_fs.ts->nfields; i++) {
+                if (strcmp(driver_fs.ts->fields[i].name, order_by) == 0) {
+                    order_idx = i;
+                    order_is_num = typed_field_is_numeric(driver_fs.ts->fields[i].type);
+                    break;
+                }
+            }
+        }
+
+        OrderedCollectCtx oc;
+        memset(&oc, 0, sizeof(oc));
+        oc.compiled = compiled;
+        oc.num_criteria = num_criteria;
+        oc.fs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        oc.order_field_idx = order_idx;
+        oc.order_field_name = order_by;
+        oc.excluded = &excluded;
+        oc.deadline = &dl;
+        oc.order_is_numeric = order_is_num;
+        pthread_mutex_init(&oc.lock, NULL);
+
+        scan_shards(data_dir, sch.slot_size, ordered_collect_cb, &oc);
+
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 || strcmp(order_dir, "DESC") == 0));
+        if (oc.count > 1)
+            qsort(oc.rows, oc.count, sizeof(OrderedRow), desc ? cmp_row_desc : cmp_row_asc);
+
+        size_t start = offset > 0 ? (size_t)offset : 0;
+        size_t end = (limit > 0) ? start + (size_t)limit : oc.count;
+        if (end > oc.count) end = oc.count;
+        int printed = 0;
+        for (size_t i = start; i < end; i++) {
+            OrderedRow *r = &oc.rows[i];
+            const uint8_t *val = r->record + r->key_len;
+            if (rows_fmt) {
+                OUT("%s[\"%s\"", printed ? "," : "", r->key);
+                if (proj_count > 0) {
+                    for (int j = 0; j < proj_count; j++) {
+                        char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        OUT(",\"%s\"", pv ? pv : "");
+                        free(pv);
+                    }
+                } else if (driver_fs.ts) {
+                    for (int j = 0; j < driver_fs.ts->nfields; j++) {
+                        if (driver_fs.ts->fields[j].removed) continue;
+                        char *pv = typed_get_field_str(driver_fs.ts, val, j);
+                        OUT(",\"%s\"", pv ? pv : "");
+                        free(pv);
+                    }
+                }
+                OUT("]");
+            } else if (proj_count > 0) {
+                OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", r->key);
+                int first = 1;
+                for (int j = 0; j < proj_count; j++) {
+                    char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                    if (!pv) continue;
+                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                    first = 0;
+                    free(pv);
+                }
+                OUT("}}");
+            } else {
+                char *v = decode_value((const char *)val, r->value_len, &driver_fs);
+                OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", r->key, v);
+                free(v);
+            }
+            printed++;
+        }
+
+        for (size_t i = 0; i < oc.count; i++) {
+            free(oc.rows[i].key);
+            free(oc.rows[i].record);
+            free(oc.rows[i].sort_str);
+        }
+        free(oc.rows);
+        pthread_mutex_destroy(&oc.lock);
+        free_compiled_criteria(compiled, num_criteria);
+    } else if (primary_idx >= 0) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         int check_primary;
         { enum SearchOp _op = criteria[primary_idx].op;

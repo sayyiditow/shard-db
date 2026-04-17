@@ -212,5 +212,5 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 - `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`)
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`; uint16 `SlotHeader.key_len` allows 65535 but every slot reserves `max_key` bytes, so large caps bloat `slot_size`. Keys are stored raw in Zone B, length lives in Zone A header (no in-payload prefix).
 - `varchar` max content = **65535 bytes** (uint16 length prefix)
-- `MAX_FIELDS = 64` fields per schema
+- `MAX_FIELDS = 256` fields per schema (bumped from 64 in 2026.04.2)
 - `MAX_AGG_SPECS = 32` aggregates per query

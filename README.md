@@ -127,9 +127,9 @@ Place `db.env` in the working directory where you run shard-db.
 
 Real-world patterns, each stitched from the primitives documented under **JSON API Reference** below. Send any of these as the payload to `./shard-db query '<json>'` or over the TCP protocol.
 
-### 1. Paginated filter with projection
+### 1. Paginated filter with projection, sorted newest first
 
-Return paid invoices from the last 30 days, 50 per page, only the fields a dashboard needs:
+Return paid invoices from the last 30 days, newest first, 50 per page, only the fields a dashboard needs:
 
 ```json
 {"mode":"find","dir":"acme","object":"invoices",
@@ -138,11 +138,12 @@ Return paid invoices from the last 30 days, 50 per page, only the fields a dashb
    {"field":"paid_at","op":"gte","value":"20260318000000"}
  ],
  "fields":["id","customer","total","paid_at"],
+ "order_by":"paid_at","order":"desc",
  "offset":0,
  "limit":50}
 ```
 
-For the next page, bump `offset` by `limit`. For deep pagination across an entire object (no filter), use `fetch` mode — it supports keyset pagination via `cursor` (see the [fetch](#fetch) reference). For sorted output, use `aggregate` with `order_by`, or sort the returned slice client-side.
+For the next page, bump `offset` by `limit`. `find` buffers all matches then sorts, so deep pagination over huge result sets pays `O(matches)`; for raw full-scan pagination on an entire object (no filter), prefer `fetch` with keyset `cursor`.
 
 ### 2. Group-by aggregate with HAVING (revenue by product)
 
@@ -854,6 +855,7 @@ Response: `{"count":1000}` — when the object has tombstoned (deleted) slots ye
 ```json
 {"mode":"find","dir":"<dir>","object":"<obj>","criteria":[...],
  "offset":0,"limit":50,"fields":"name,email","excludedKeys":"bot1,bot2",
+ "order_by":"<field>","order":"asc",
  "format":"rows",
  "join":[...]}
 ```
@@ -863,6 +865,8 @@ Response: `{"count":1000}` — when the object has tombstoned (deleted) slots ye
 - **With `join`**: always tabular regardless of `format` — see [Joins](#joins) below.
 
 All parameters except `mode`, `dir`, `object`, and `criteria` are optional. For full-scan queries (no indexed criterion), the server uses a parallel shard scanner.
+
+**Sorting (`order_by` + `order`):** when `order_by` is set, matches are buffered and sorted before the `offset`/`limit` slice is emitted — `O(matches * log matches)`. Numeric field types (int/long/short/double/numeric/date/datetime/bool/byte) sort numerically; varchar sorts lexicographically. `order` is `"asc"` (default) or `"desc"`. Not compatible with `join`. Keyset pagination for sorted finds (cursor-based) is a future feature; for now pair `order_by` with `offset`.
 
 #### count
 
@@ -943,8 +947,8 @@ Used in `criteria` arrays for find, count, bulk-update, bulk-delete, and `if` co
 | `lt` | Numeric < | `{"field":"age","op":"lt","value":"65"}` |
 | `gte` | Numeric >= | `{"field":"score","op":"gte","value":"100"}` |
 | `lte` | Numeric <= | `{"field":"score","op":"lte","value":"999"}` |
-| `like` | Wildcard `%` | `{"field":"name","op":"like","value":"Ali%"}` |
-| `nlike` | Negated wildcard `%` | `{"field":"name","op":"nlike","value":"test%"}` |
+| `like` | Wildcard `%` or `*` | `{"field":"name","op":"like","value":"Ali%"}` |
+| `nlike` | Negated wildcard `%` or `*` | `{"field":"name","op":"nlike","value":"test*"}` |
 | `contains` | Substring match | `{"field":"bio","op":"contains","value":"engineer"}` |
 | `ncontains` | No substring | `{"field":"bio","op":"ncontains","value":"spam"}` |
 | `starts` | Prefix match | `{"field":"email","op":"starts","value":"admin"}` |
@@ -1417,7 +1421,7 @@ Shards start at 256 slots and double when load exceeds 50%. Growth is atomic (bu
 | Thing | Limit |
 |---|---|
 | Shards per object | 4096 (= `MAX_SPLITS`, 3-hex-digit filename) |
-| Fields per schema | 64 (= `MAX_FIELDS`) |
+| Fields per schema | 256 (= `MAX_FIELDS`) |
 | Key length (`max_key`) | 1024 bytes (= `MAX_KEY_CEILING`, default 64) — every slot reserves `max_key` bytes so larger caps bloat `slot_size`; UUIDs fit in 36B |
 | Varchar content | 65535 bytes (uint16 length prefix) |
 | Aggregates per query | 32 |
