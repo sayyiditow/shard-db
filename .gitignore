@@ -1,0 +1,42 @@
+# Build output
+build/
+shard-db
+shardkv
+*.o
+*.a
+
+# ASan / sanitizer builds
+*_asan
+*_asan.log
+bench-asan.log
+
+# Runtime state — must never be committed
+db/
+logs/
+*.pid
+
+# Per-instance config (operators populate these on the server)
+tokens.conf
+allowed_ips.conf
+
+# Private ops scripts (not part of the public release)
+drdb-setup.sh
+
+# Editor / IDE
+.history/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Temp benchmark artifacts
+/tmp/shard-db_*
+/tmp/shardkv_*
