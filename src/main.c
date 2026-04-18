@@ -35,14 +35,18 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  keys <object> [offset] [limit]       List keys\n");
         fprintf(stderr, "  fetch <object> [off] [lim] [fields]  Paginated scan\n");
         fprintf(stderr, "  add-index <object> <field> [-f]      Build index\n");
+        fprintf(stderr, "  remove-index <object> <field>        Drop index\n");
         fprintf(stderr, "  bulk-insert <object> [file]          Bulk insert JSON array\n");
         fprintf(stderr, "  bulk-delete <object> [file]          Bulk delete\n");
         fprintf(stderr, "  vacuum <object>                      Clean tombstones\n");
         fprintf(stderr, "  recount <object>                     Recalculate count\n");
         fprintf(stderr, "  truncate <object>                    Delete all data\n");
         fprintf(stderr, "  backup <object>                      Backup data\n");
-        fprintf(stderr, "  put-file <object> <filepath>         Store file\n");
-        fprintf(stderr, "  get-file-path <object> <filename>    Get file path\n");
+        fprintf(stderr, "  put-file <dir> <object> <local-path> [--if-not-exists]\n");
+        fprintf(stderr, "                                       Upload file (base64 over TCP)\n");
+        fprintf(stderr, "  get-file <dir> <object> <filename> [<out-path>]\n");
+        fprintf(stderr, "                                       Download file (base64 over TCP)\n");
+        fprintf(stderr, "  get-file-path <object> <filename>    Get server-local file path\n");
         fprintf(stderr, "\nSchema mutations (via JSON query):\n");
         fprintf(stderr, "  query '{\"mode\":\"rename-field\",\"dir\":\"...\",\"object\":\"...\",\"old\":\"...\",\"new\":\"...\"}'\n");
         fprintf(stderr, "  query '{\"mode\":\"remove-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"f1\",\"f2\"]}'\n");
@@ -117,6 +121,28 @@ int main(int argc, char *argv[]) {
         return cmd_query_json(port, "{\"mode\":\"db-dirs\"}");
     if (strcmp(cmd, "vacuum-check") == 0)
         return cmd_query_json(port, "{\"mode\":\"vacuum-check\"}");
+
+    /* File upload/download: route through dedicated TCP helpers (base64 in JSON).
+       Usage:
+         put-file <dir> <object> <local-path> [--if-not-exists]
+         get-file <dir> <object> <filename>   [<out-path>] */
+    if (strcmp(cmd, "put-file") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "Usage: shard-db put-file <dir> <object> <local-path> [--if-not-exists]\n");
+            return 1;
+        }
+        int ine = 0;
+        for (int i = 5; i < argc; i++) if (strcmp(argv[i], "--if-not-exists") == 0) ine = 1;
+        return cmd_put_file_tcp(port, argv[2], argv[3], argv[4], ine);
+    }
+    if (strcmp(cmd, "get-file") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "Usage: shard-db get-file <dir> <object> <filename> [<out-path>]\n");
+            return 1;
+        }
+        const char *out_path = (argc >= 6) ? argv[5] : NULL;
+        return cmd_get_file_tcp(port, argv[2], argv[3], argv[4], out_path);
+    }
 
     return cmd_query(port, argc - 1, argv + 1);
 }

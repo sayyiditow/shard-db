@@ -1,0 +1,106 @@
+site_name: shard-db
+site_description: A file-based sharded database in C — typed records, B+ tree indexes, joins, aggregates, CAS.
+site_url: https://example.com/shard-db/
+repo_url: https://github.com/sayyiditow/shard-db
+repo_name: shard-db
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    logo: material/database
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.keys
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Install: getting-started/install.md
+      - Quick start: getting-started/quickstart.md
+      - Configuration: getting-started/configuration.md
+  - Concepts:
+      - Storage model: concepts/storage-model.md
+      - Typed records: concepts/typed-records.md
+      - Indexes: concepts/indexes.md
+      - Concurrency: concepts/concurrency.md
+      - Multi-tenancy: concepts/multi-tenancy.md
+  - CLI reference:
+      - All commands: cli/index.md
+  - Query protocol:
+      - Overview: query-protocol/overview.md
+      - find: query-protocol/find.md
+      - count: query-protocol/count.md
+      - aggregate: query-protocol/aggregate.md
+      - joins: query-protocol/joins.md
+      - CAS: query-protocol/cas.md
+      - Bulk operations: query-protocol/bulk.md
+      - Schema mutations: query-protocol/schema-mutations.md
+      - Index management: query-protocol/index-management.md
+      - File storage: query-protocol/files.md
+      - Diagnostics: query-protocol/diagnostics.md
+  - Operations:
+      - Deployment: operations/deployment.md
+      - Tuning: operations/tuning.md
+      - Backup: operations/backup.md
+      - Monitoring: operations/monitoring.md
+  - Reference:
+      - Limits: reference/limits.md
+      - Error codes: reference/error-codes.md
+      - Changelog: reference/changelog.md
+  - Roadmap (v2): v2/roadmap.md

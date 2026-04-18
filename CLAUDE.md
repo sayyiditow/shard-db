@@ -117,9 +117,14 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db bulk-insert <dir> <obj> [file]         # JSON: [{"id":"k","data":{...}},...]
 ./shard-db bulk-delete <dir> <obj> [file]
 
+# Files (base64-in-JSON over TCP — remote-safe)
+./shard-db put-file <dir> <obj> <local-path> [--if-not-exists]
+./shard-db get-file <dir> <obj> <filename> [<out-path>]
+
 # Maintenance
 ./shard-db size|recount|truncate|vacuum|backup <dir> <obj>
 ./shard-db add-index <dir> <obj> <field> [-f]     # field or field1+field2
+./shard-db remove-index <dir> <obj> <field>       # drop index (exact name match)
 ./shard-db create-object <dir> <obj> <splits> <max_key> <max_value>
 
 # Diagnostics
@@ -182,6 +187,20 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 - `{"mode":"bulk-update", "criteria":[...], "value":{...}, "limit":N, "dry_run":true}` — conditional mass update
 - `{"mode":"bulk-delete", "criteria":[...], "limit":N, "dry_run":true}` — mass delete by criteria
 
+### File storage
+
+Files live at `$DB_ROOT/<dir>/<obj>/files/XX/XX/<filename>`, hash-bucketed by filename. Filenames are validated (no `/`, `\`, `..`, control chars, ≤255 bytes).
+
+Remote-safe (base64 in JSON):
+- `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
+- `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
+
+Server-local zero-copy (same-host callers only — admin fast path):
+- `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.
+- `{"mode":"get-file-path","dir":"...","object":"...","filename":"..."}` — returns `{"path":"..."}` as a string; no bytes on the wire.
+
+Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base64 inflation). Raise `MAX_REQUEST_SIZE` in db.env to lift it; every connection allocates a read buffer this size.
+
 ### Schema mutations
 
 - `{"mode":"rename-field","old":"X","new":"Y"}` — metadata-only, preserves data
@@ -202,6 +221,9 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 - `btree_insert/search/range/bulk_build/bulk_merge`: B+ tree ops with prefix-compressed leaves
 - `ucache`: unified shard mmap cache (FCACHE_MAX entries, per-entry rwlock, LRU eviction)
 - `typed_encode/decode/typed_get_field_str`: typed binary encode/decode with length-prefix varchar
+- `b64_encode/decode` (util.c): RFC 4648 base64, whitespace-tolerant on decode; used by `cmd_put_file_b64`/`cmd_get_file_b64`
+- `valid_filename` (util.c): basename sanitizer (no `/`, `\`, `..`, control chars, ≤255 bytes) — enforced on every remote upload/download
+- `cmd_put_file_tcp`/`cmd_get_file_tcp` (server.c): client-side helpers invoked by CLI; `query_collect` accumulates a full response buffer before parsing
 - `compute_addr` / `addr_from_hash`: xxh128 hash → shard_id/slot
 - `build_shard_filename(dir, shard_id)`: canonical `NNN.bin` formatter (3 hex, MAX_SPLITS=4096)
 - `g_schema_cache` / `g_idx_cache` / `g_typed_cache`: in-memory caches for config files

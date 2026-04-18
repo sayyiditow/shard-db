@@ -638,3 +638,134 @@ int cmd_add_indexes(const char *db_root, const char *object,
     return 0;
 }
 
+/* ========== remove-index ==========
+   Drops a single index by exact name (matches whatever was passed to
+   add-index, including composite "a+b" forms). Unlinks the .idx file,
+   removes its line from index.conf, and invalidates caches. */
+
+int cmd_remove_index(const char *db_root, const char *object, const char *field) {
+    if (!field || !field[0]) {
+        OUT("{\"error\":\"field is required\"}\n");
+        return 1;
+    }
+
+    char conf_path[PATH_MAX], idx_path[PATH_MAX];
+    snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
+    snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
+
+    /* Rewrite index.conf without the target line. */
+    int found = 0;
+    FILE *cf = fopen(conf_path, "r");
+    if (cf) {
+        char tmp_path[PATH_MAX];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.new", conf_path);
+        FILE *nf = fopen(tmp_path, "w");
+        if (!nf) { fclose(cf); OUT("{\"error\":\"Cannot write index.conf.new\"}\n"); return 1; }
+
+        char line[256];
+        while (fgets(line, sizeof(line), cf)) {
+            char stripped[256];
+            strncpy(stripped, line, sizeof(stripped) - 1);
+            stripped[sizeof(stripped) - 1] = '\0';
+            stripped[strcspn(stripped, "\n")] = '\0';
+            if (strcmp(stripped, field) == 0) { found = 1; continue; }
+            fprintf(nf, "%s", line);
+        }
+        fclose(cf);
+        fclose(nf);
+        if (rename(tmp_path, conf_path) != 0) {
+            unlink(tmp_path);
+            OUT("{\"error\":\"Failed to rewrite index.conf\"}\n");
+            return 1;
+        }
+    }
+
+    if (!found) {
+        OUT("{\"status\":\"not_indexed\",\"field\":\"%s\"}\n", field);
+        return 0;
+    }
+
+    btree_cache_invalidate(idx_path);
+    unlink(idx_path);
+    invalidate_idx_cache(object);
+
+    log_msg(3, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
+    OUT("{\"status\":\"removed\",\"field\":\"%s\"}\n", field);
+    return 0;
+}
+
+int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json) {
+    char fields[MAX_FIELDS][256];
+    int nfields = 0;
+    const char *p = json_skip(fields_json);
+    if (*p != '[') {
+        OUT("{\"error\":\"fields must be a JSON array\"}\n");
+        return 1;
+    }
+    p++;
+    while (*p && nfields < MAX_FIELDS) {
+        p = json_skip(p);
+        if (*p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p == '"') {
+            p++;
+            const char *start = p;
+            while (*p && *p != '"') p++;
+            int flen = (int)(p - start);
+            if (flen > 0 && flen < 255) {
+                memcpy(fields[nfields], start, flen);
+                fields[nfields][flen] = '\0';
+                nfields++;
+            }
+            if (*p == '"') p++;
+        } else {
+            p++;
+        }
+    }
+
+    if (nfields == 0) {
+        OUT("{\"error\":\"fields array is empty\"}\n");
+        return 1;
+    }
+
+    int removed = 0, missing = 0;
+    for (int i = 0; i < nfields; i++) {
+        char conf_path[PATH_MAX], idx_path[PATH_MAX];
+        snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
+        snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, fields[i]);
+
+        int found = 0;
+        FILE *cf = fopen(conf_path, "r");
+        if (cf) {
+            char tmp_path[PATH_MAX];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.new", conf_path);
+            FILE *nf = fopen(tmp_path, "w");
+            if (!nf) { fclose(cf); continue; }
+            char line[256];
+            while (fgets(line, sizeof(line), cf)) {
+                char stripped[256];
+                strncpy(stripped, line, sizeof(stripped) - 1);
+                stripped[sizeof(stripped) - 1] = '\0';
+                stripped[strcspn(stripped, "\n")] = '\0';
+                if (strcmp(stripped, fields[i]) == 0) { found = 1; continue; }
+                fprintf(nf, "%s", line);
+            }
+            fclose(cf);
+            fclose(nf);
+            if (rename(tmp_path, conf_path) != 0) { unlink(tmp_path); continue; }
+        }
+
+        if (found) {
+            btree_cache_invalidate(idx_path);
+            unlink(idx_path);
+            removed++;
+        } else {
+            missing++;
+        }
+    }
+
+    invalidate_idx_cache(object);
+    log_msg(3, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
+    OUT("{\"status\":\"removed\",\"count\":%d,\"not_indexed\":%d}\n", removed, missing);
+    return 0;
+}

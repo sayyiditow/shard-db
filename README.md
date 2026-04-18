@@ -252,7 +252,17 @@ shard-db bulk-delete <dir> <object> [file]
 
 ```bash
 shard-db add-index <dir> <object> <field> [-f]    # -f = force rebuild
+shard-db remove-index <dir> <object> <field>      # drop index (exact name match)
 ```
+
+### File Storage
+
+```bash
+shard-db put-file <dir> <object> <local-path> [--if-not-exists]   # upload (base64 over TCP)
+shard-db get-file <dir> <object> <filename> [<out-path>]          # download (base64 over TCP)
+```
+
+Bytes-in-JSON for remote clients. Bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). For same-host callers, the JSON API also exposes `{"mode":"put-file","path":"..."}` and `{"mode":"get-file-path",...}` as zero-copy fast paths.
 
 ### Maintenance
 
@@ -1061,6 +1071,15 @@ Response:
 
 Composite indexes use `+` to join fields: `"city+country"` indexes the concatenation of both fields.
 
+#### remove-index
+
+```json
+{"mode":"remove-index","dir":"<dir>","object":"<obj>","field":"email"}
+{"mode":"remove-index","dir":"<dir>","object":"<obj>","fields":["email","city+country"]}
+```
+
+Drops the index by exact name match (pass composite names the same way you registered them, e.g. `"city+country"`). Unlinks the `.idx` file, removes the line from `index.conf`, and invalidates caches. Returns `{"status":"not_indexed",...}` (not an error) when the field wasn't indexed — safe to call idempotently. Queries against that field fall back to full-shard scan afterwards.
+
 ### Schema Management
 
 #### create-object
@@ -1071,7 +1090,7 @@ Composite indexes use `+` to join fields: `"city+country"` indexes the concatena
  "indexes":["name","age"]}
 ```
 
-- `splits` -- initial number of shard files (default 64, range 4-256)
+- `splits` -- initial number of shard files (default 4 = `MIN_SPLITS`, max 4096 = `MAX_SPLITS`)
 - `max_key` -- maximum key length in bytes (default 64, hard ceiling 1024)
 - `fields` -- array of field definitions (see Field Types below)
 - `indexes` -- optional array of fields to index at creation
@@ -1182,12 +1201,50 @@ Copies the object's data directory to a timestamped backup.
 
 ### File Storage
 
+Files are stored under `$DB_ROOT/<dir>/<obj>/files/XX/XX/<filename>`, hash-bucketed by filename. Two variants for upload and download: a remote-safe **bytes-in-JSON** path (base64) and a zero-copy **server-local path** escape hatch.
+
+#### put-file (upload bytes — remote-safe)
+
 ```json
-{"mode":"put-file","dir":"<dir>","object":"<obj>","path":"/local/path/to/file.pdf"}
-{"mode":"get-file-path","dir":"<dir>","object":"<obj>","filename":"file.pdf"}
+{"mode":"put-file","dir":"<dir>","object":"<obj>",
+ "filename":"invoice.pdf",
+ "data":"<base64-encoded-bytes>",
+ "if_not_exists":true}
+```
+Response: `{"status":"stored","filename":"...","bytes":N}` or `{"error":"file exists",...}` when `if_not_exists` is set and the file already exists.
+
+Atomic write (`.tmp` + `fsync` + `rename`). Silent overwrite by default. Size is bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file after base64 inflation; raise the config to lift the cap).
+
+CLI: `./shard-db put-file <dir> <obj> <local-path> [--if-not-exists]` — reads the file, base64-encodes, sends the JSON. Works from any host with TCP access to the server.
+
+#### put-file (server-local path — zero-copy admin fast path)
+
+```json
+{"mode":"put-file","dir":"<dir>","object":"<obj>","path":"/srv/incoming/invoice.pdf"}
 ```
 
-Files are stored in `$DB_ROOT/<dir>/<obj>/files/`.
+Server reads the path directly from its own filesystem. Only useful when the caller is on the same host as the server (or shares a filesystem). No base64 overhead.
+
+#### get-file (download bytes — remote-safe)
+
+```json
+{"mode":"get-file","dir":"<dir>","object":"<obj>","filename":"invoice.pdf"}
+```
+Response: `{"status":"ok","filename":"...","bytes":N,"data":"<base64>"}` or `{"error":"file not found",...}`.
+
+CLI: `./shard-db get-file <dir> <obj> <filename> [<out-path>]` — downloads and decodes. Writes raw bytes to `<out-path>` or stdout.
+
+#### get-file-path (server path — zero-copy admin fast path)
+
+```json
+{"mode":"get-file-path","dir":"<dir>","object":"<obj>","filename":"invoice.pdf"}
+```
+
+Returns `{"path":"<db_root>/<obj>/files/XX/XX/<filename>"}` — the server-side path as a string. No bytes returned. Only useful for callers that can read the server's filesystem directly (same host, NFS, shared volume).
+
+#### Filename rules
+
+Filenames must be plain basenames — no `/`, no `\`, no `..`, no control characters, ≤ 255 bytes. Path-traversal attempts are rejected with `{"error":"invalid filename"}`.
 
 ### Diagnostics
 

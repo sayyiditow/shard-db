@@ -5347,6 +5347,123 @@ int cmd_get_file_path(const char *db_root, const char *object, const char *filen
     return 0;
 }
 
+/* Compute the on-disk destination path for a filename. Caller supplies buffers. */
+static void file_dest_path(const char *db_root, const char *object, const char *filename,
+                           char *dest_dir, size_t dd_sz, char *dest, size_t d_sz) {
+    char key[PATH_MAX];
+    snprintf(key, sizeof(key), "%s", filename);
+    char *dot = strrchr(key, '.');
+    if (dot) *dot = '\0';
+    uint8_t hash[16];
+    compute_hash_raw(key, strlen(key), hash);
+    snprintf(dest_dir, dd_sz, "%s/%s/files/%02x/%02x", db_root, object, hash[0], hash[1]);
+    snprintf(dest, d_sz, "%s/%s", dest_dir, filename);
+}
+
+/* Streaming upload (base64-in-JSON). Atomic: writes to .tmp.<pid>, fsyncs, renames.
+   if_not_exists=1 → refuse overwrite. */
+int cmd_put_file_b64(const char *db_root, const char *object,
+                     const char *filename, const char *b64_data, size_t b64_len,
+                     int if_not_exists) {
+    if (!valid_filename(filename)) {
+        OUT("{\"error\":\"invalid filename\"}\n");
+        return 1;
+    }
+    if (!b64_data) {
+        OUT("{\"error\":\"missing data\"}\n");
+        return 1;
+    }
+
+    char dest_dir[PATH_MAX], dest[PATH_MAX];
+    file_dest_path(db_root, object, filename, dest_dir, sizeof(dest_dir), dest, sizeof(dest));
+
+    if (if_not_exists) {
+        struct stat st;
+        if (stat(dest, &st) == 0) {
+            OUT("{\"error\":\"file exists\",\"filename\":\"%s\"}\n", filename);
+            return 1;
+        }
+    }
+
+    size_t cap = b64_decoded_maxsize(b64_len);
+    uint8_t *raw = malloc(cap);
+    if (!raw) { OUT("{\"error\":\"out of memory\"}\n"); return 1; }
+    size_t raw_len = 0;
+    if (b64_decode(b64_data, b64_len, raw, &raw_len) != 0) {
+        free(raw);
+        OUT("{\"error\":\"invalid base64\"}\n");
+        return 1;
+    }
+
+    mkdirp(dest_dir);
+
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", dest, (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(raw); OUT("{\"error\":\"cannot create %s\"}\n", tmp); return 1; }
+
+    size_t w = 0;
+    while (w < raw_len) {
+        ssize_t n = write(fd, raw + w, raw_len - w);
+        if (n <= 0) { close(fd); unlink(tmp); free(raw); OUT("{\"error\":\"write failed\"}\n"); return 1; }
+        w += (size_t)n;
+    }
+    fsync(fd);
+    close(fd);
+    free(raw);
+
+    if (rename(tmp, dest) != 0) {
+        unlink(tmp);
+        OUT("{\"error\":\"rename failed\"}\n");
+        return 1;
+    }
+
+    OUT("{\"status\":\"stored\",\"filename\":\"%s\",\"bytes\":%zu}\n", filename, raw_len);
+    return 0;
+}
+
+/* Streaming download: read file, base64-encode, emit with bytes + data. */
+int cmd_get_file_b64(const char *db_root, const char *object, const char *filename) {
+    if (!valid_filename(filename)) {
+        OUT("{\"error\":\"invalid filename\"}\n");
+        return 1;
+    }
+
+    char dest_dir[PATH_MAX], dest[PATH_MAX];
+    file_dest_path(db_root, object, filename, dest_dir, sizeof(dest_dir), dest, sizeof(dest));
+
+    int fd = open(dest, O_RDONLY);
+    if (fd < 0) {
+        OUT("{\"error\":\"file not found\",\"filename\":\"%s\"}\n", filename);
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); OUT("{\"error\":\"stat failed\"}\n"); return 1; }
+    size_t sz = (size_t)st.st_size;
+
+    uint8_t *raw = malloc(sz ? sz : 1);
+    if (!raw) { close(fd); OUT("{\"error\":\"out of memory\"}\n"); return 1; }
+    size_t r = 0;
+    while (r < sz) {
+        ssize_t n = read(fd, raw + r, sz - r);
+        if (n <= 0) break;
+        r += (size_t)n;
+    }
+    close(fd);
+    if (r != sz) { free(raw); OUT("{\"error\":\"read failed\"}\n"); return 1; }
+
+    size_t enc_sz = b64_encoded_size(sz);
+    char *enc = malloc(enc_sz + 1);
+    if (!enc) { free(raw); OUT("{\"error\":\"out of memory\"}\n"); return 1; }
+    b64_encode(raw, sz, enc);
+    free(raw);
+
+    OUT("{\"status\":\"ok\",\"filename\":\"%s\",\"bytes\":%zu,\"data\":\"%s\"}\n",
+        filename, sz, enc);
+    free(enc);
+    return 0;
+}
+
 /* ========== CREATE OBJECT ========== */
 
 /* Validate a field type spec like "name:varchar:30" or "age:int".

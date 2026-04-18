@@ -1,0 +1,205 @@
+# Bulk operations
+
+Single round-trip operations for inserting, updating, or deleting many records at once. All support `dry_run` (for update / delete) and respect CAS. Parallel index build on bulk-insert.
+
+## bulk-insert
+
+### Shape
+
+```json
+{
+  "mode": "bulk-insert",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "records": [
+    {"id":"<key>","data":{...}},
+    {"id":"<key>","data":{...}}
+  ]
+}
+```
+
+Or from a file:
+
+```json
+{"mode":"bulk-insert","dir":"<dir>","object":"<obj>","file":"/path/to/data.json"}
+```
+
+File content is the same JSON array (not NDJSON — one big array).
+
+### Record shape
+
+- `"id"` — the record key.
+- `"data"` — an object whose fields match the typed schema.
+
+### Response
+
+```json
+{"count": 10000}
+```
+
+If any records were rejected (type mismatch, missing required field, etc.):
+```json
+{"count": 9997, "errors": 3, "error": "some_records_dropped"}
+```
+
+### Performance
+
+- **Single-request bulk loads** — ~130 k inserts/sec on a typical laptop for 1 M records (see the README performance table).
+- **Parallel index build** — one pthread per indexed field, sharing a single shard scan. Much faster than adding indexes after bulk-insert.
+
+### Pattern: load + index in one go
+
+Create the object with indexes listed, then bulk-insert. Indexes are built as part of the load:
+
+```json
+{"mode":"create-object","dir":"default","object":"users","splits":16,"max_key":128,
+ "fields":["email:varchar:200","name:varchar:100","age:int"],
+ "indexes":["email","age"]}
+```
+
+## bulk-insert-delimited
+
+CSV-style flat files. Faster to generate than JSON for large exports.
+
+```json
+{
+  "mode": "bulk-insert-delimited",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "file": "/path/to/data.csv",
+  "delimiter": "|"
+}
+```
+
+### Wire format
+
+- Every line is a record. **No header row.**
+- First column = key.
+- Remaining columns = field values in `fields.conf` order (skipping tombstoned fields).
+- Default delimiter: `|`. Pass any single character via `"delimiter"`.
+
+Example file (delimiter `|`):
+```
+u1|Alice|alice@x.com|30|true
+u2|Bob|b@x.com|22|true
+u3|Carol|c@x.com|45|false
+```
+
+For an object with fields `name:varchar:100|email:varchar:200|age:int|active:bool`.
+
+Use `|` (default) or `,` for CSV — any byte that isn't present in your data works.
+
+### Value encoding
+
+- **varchar** — raw bytes (no quoting).
+- **int / long / short** — ASCII digits, optional `-` prefix.
+- **bool** — `true` / `false`.
+- **date** — `yyyyMMdd`.
+- **datetime** — `yyyyMMddHHmmss`.
+- **numeric** — decimal matching the scale.
+
+No escaping. Pick a delimiter your data doesn't contain.
+
+## bulk-delete
+
+### By key list
+
+```json
+{
+  "mode": "bulk-delete",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "keys": ["k1", "k2", "k3"]
+}
+```
+
+Or from file:
+
+```json
+{"mode":"bulk-delete","dir":"<dir>","object":"<obj>","file":"/path/to/keys.json"}
+```
+
+File = JSON array of keys.
+
+Response: `{"deleted": <N>}` (keys that weren't present are silently skipped).
+
+### By criteria
+
+```json
+{
+  "mode": "bulk-delete",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "criteria": [{"field":"status","op":"eq","value":"cancelled"}],
+  "limit": 1000,
+  "dry_run": true
+}
+```
+
+Response (dry run):
+```json
+{"matched":437,"deleted":0,"skipped":0,"dry_run":true}
+```
+
+Response (actual):
+```json
+{"matched":437,"deleted":437,"skipped":0}
+```
+
+- `limit` caps the number of deletions (defensive — prevents runaway deletes).
+- `skipped` counts records that matched the criteria but failed an `if` check (not shown above, but possible when combined).
+- Always dry-run first for criteria-based deletes in production.
+
+## bulk-update
+
+```json
+{
+  "mode": "bulk-update",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "criteria": [{"field":"status","op":"eq","value":"pending"}],
+  "value": {"status":"expired"},
+  "limit": 10000,
+  "dry_run": true
+}
+```
+
+- Updates every record matching `criteria` by merging `value` into the existing record.
+- Per-record CAS applies: `auto_update` fields bump, indexes stay in sync.
+- `dry_run:true` returns the match count without writing.
+- `limit` caps the update.
+
+Response:
+```json
+{"matched":2450, "updated":2450, "skipped":0}
+```
+
+## Dry-run workflow
+
+For `bulk-update` and `bulk-delete` on criteria, **always** run `dry_run:true` first in production:
+
+```json
+// 1. Dry run — check blast radius
+{..., "dry_run":true}
+
+// 2. Execute — same criteria, drop dry_run
+{..., "limit":10000}
+```
+
+## Crash safety
+
+- Bulk ops process records one at a time with per-record writes. A mid-batch crash leaves the already-written records committed — not all-or-nothing.
+- For **atomic** bulk operations across records, there's no option today. Stage intent in a control record and reconcile in the app.
+
+## Performance tips
+
+- **Bulk-insert over many singles** — amortizes connection setup, schema lookup, and (critically) enables the parallel index build.
+- **Create indexes before the bulk load** — so the load builds them inline. Adding indexes on a loaded object re-scans everything.
+- **Delimited (`|`-separated) over JSON** for huge CSV ingest — parses ~10–20% faster.
+- **Tune `MAX_REQUEST_SIZE`** if sending multi-million-record bulk loads in one request. 32 MB default holds ~300 k records at typical sizes.
+- **Pipeline many moderate bulk-inserts** rather than one huge one — keeps each request under the size limit and lets the server progress-log in info logs.
+
+## What bulk ops don't support
+
+- **Per-record error recovery in JSON** — if record #50 fails type validation, records 1–49 are committed and the response's `errors` count goes up. The failed record's details are logged but not returned to the client today.
+- **Heterogeneous objects in one call** — a bulk operation is scoped to one `(dir, object)` pair.

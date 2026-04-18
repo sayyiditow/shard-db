@@ -262,6 +262,15 @@ int json_get_fields(const char *json, const char **keys, int nkeys, char **out_v
 char *json_get_string_or_array(const char *json, const char *key);
 char *extract_field_value(const char *json, const char *field_name);
 
+/* Base64 (util.c, RFC 4648 standard alphabet) */
+size_t b64_encoded_size(size_t raw_len);
+size_t b64_decoded_maxsize(size_t b64_len);
+void b64_encode(const uint8_t *raw, size_t raw_len, char *out);
+int b64_decode(const char *b64, size_t b64_len, uint8_t *out, size_t *out_len);
+
+/* Filename sanitizer — rejects /, \, .., control chars, empty, >255 bytes */
+int valid_filename(const char *name);
+
 /* config.c */
 int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
@@ -363,6 +372,8 @@ void delete_index_entry(const char *db_root, const char *object, const char *fie
 void index_parallel(const char *db_root, const char *object, const char *value, const uint8_t hash16[16], char fields[][256], int nfields);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
+int cmd_remove_index(const char *db_root, const char *object, const char *field);
+int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 
 /* Field schema context — typed binary via fields.conf */
 typedef struct {
@@ -418,6 +429,10 @@ int cmd_aggregate(const char *db_root, const char *object,
                   const char *order_by, int order_desc, int limit);
 int cmd_put_file(const char *db_root, const char *object, const char *src);
 int cmd_get_file_path(const char *db_root, const char *object, const char *filename);
+int cmd_put_file_b64(const char *db_root, const char *object,
+                     const char *filename, const char *b64_data, size_t b64_len,
+                     int if_not_exists);
+int cmd_get_file_b64(const char *db_root, const char *object, const char *filename);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key);
@@ -465,6 +480,10 @@ int cmd_stop(const char *db_root);
 int cmd_status(const char *db_root);
 int cmd_query(int port, int argc, char **argv);
 int cmd_query_json(int port, const char *json);
+int cmd_put_file_tcp(int port, const char *dir, const char *object,
+                     const char *local_path, int if_not_exists);
+int cmd_get_file_tcp(int port, const char *dir, const char *object,
+                     const char *filename, const char *out_path);
 int read_server_port(const char *db_root);
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip);
 void server_process_fast(const char *db_root, const char *line, const char *client_ip);

@@ -222,3 +222,108 @@ int json_get_fields(const char *json, const char **keys, int nkeys, char **out_v
     return found;
 }
 
+/* ========== Base64 (RFC 4648) ========== */
+
+static const char B64_ENC[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* 0..63 for valid base64 alphabet chars; 64 for '='; 0xFF for invalid; 0xFE for whitespace */
+static uint8_t b64_dec_table[256];
+static int b64_dec_table_init = 0;
+
+static void b64_init_table(void) {
+    if (b64_dec_table_init) return;
+    for (int i = 0; i < 256; i++) b64_dec_table[i] = 0xFF;
+    for (int i = 0; i < 64; i++) b64_dec_table[(uint8_t)B64_ENC[i]] = (uint8_t)i;
+    b64_dec_table[(uint8_t)'='] = 64;
+    b64_dec_table[(uint8_t)' ']  = 0xFE;
+    b64_dec_table[(uint8_t)'\t'] = 0xFE;
+    b64_dec_table[(uint8_t)'\r'] = 0xFE;
+    b64_dec_table[(uint8_t)'\n'] = 0xFE;
+    b64_dec_table_init = 1;
+}
+
+size_t b64_encoded_size(size_t raw_len) {
+    return ((raw_len + 2) / 3) * 4;
+}
+
+/* out must be at least b64_encoded_size(raw_len) + 1 bytes (for NUL). */
+void b64_encode(const uint8_t *raw, size_t raw_len, char *out) {
+    size_t o = 0;
+    size_t i = 0;
+    while (i + 3 <= raw_len) {
+        uint32_t v = ((uint32_t)raw[i] << 16) | ((uint32_t)raw[i+1] << 8) | (uint32_t)raw[i+2];
+        out[o++] = B64_ENC[(v >> 18) & 0x3F];
+        out[o++] = B64_ENC[(v >> 12) & 0x3F];
+        out[o++] = B64_ENC[(v >>  6) & 0x3F];
+        out[o++] = B64_ENC[v         & 0x3F];
+        i += 3;
+    }
+    size_t rem = raw_len - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)raw[i] << 16;
+        out[o++] = B64_ENC[(v >> 18) & 0x3F];
+        out[o++] = B64_ENC[(v >> 12) & 0x3F];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)raw[i] << 16) | ((uint32_t)raw[i+1] << 8);
+        out[o++] = B64_ENC[(v >> 18) & 0x3F];
+        out[o++] = B64_ENC[(v >> 12) & 0x3F];
+        out[o++] = B64_ENC[(v >>  6) & 0x3F];
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+}
+
+/* Upper bound for decode output (ignoring whitespace). Real length returned via out_len. */
+size_t b64_decoded_maxsize(size_t b64_len) {
+    return (b64_len / 4) * 3 + 3;
+}
+
+/* Decode b64 input (ignoring whitespace). Returns 0 on success, -1 on invalid char or bad padding.
+   out must be at least b64_decoded_maxsize(b64_len) bytes. *out_len set to actual decoded size. */
+int b64_decode(const char *b64, size_t b64_len, uint8_t *out, size_t *out_len) {
+    b64_init_table();
+    uint32_t v = 0;
+    int bits = 0;
+    int pad = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < b64_len; i++) {
+        uint8_t c = (uint8_t)b64[i];
+        uint8_t d = b64_dec_table[c];
+        if (d == 0xFE) continue;          /* whitespace */
+        if (d == 0xFF) return -1;         /* invalid char */
+        if (d == 64) { pad++; continue; } /* '=' — track padding, do not emit */
+        if (pad) return -1;               /* non-pad after pad */
+        v = (v << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (uint8_t)((v >> bits) & 0xFF);
+        }
+    }
+    if (pad > 2) return -1;
+    /* Padding sanity: total sextets (alphabet + pad) must be % 4 == 0.
+       We can check by: o computed is correct, but we ensure no spurious bits remain. */
+    if (bits >= 6) return -1;
+    *out_len = o;
+    return 0;
+}
+
+/* ========== Filename validation ========== */
+
+/* Reject empty, oversized, absolute, traversal, or control-char names. */
+int valid_filename(const char *name) {
+    if (!name || !name[0]) return 0;
+    size_t n = strlen(name);
+    if (n > 255) return 0;
+    if (name[0] == '.' && (n == 1 || (n == 2 && name[1] == '.'))) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) return 0;
+    }
+    /* No component may be "..". Since we disallow '/', the whole name is one component;
+       we already rejected "..". Done. */
+    return 1;
+}

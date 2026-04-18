@@ -12,7 +12,8 @@ static int mode_is_write(const char *m) {
            strcasecmp(m, "delete") == 0 || strcasecmp(m, "bulk-insert") == 0 ||
            strcasecmp(m, "bulk-insert-delimited") == 0 || strcasecmp(m, "bulk-delete") == 0 ||
            strcasecmp(m, "bulk-update") == 0 ||
-           strcasecmp(m, "add-index") == 0 || strcasecmp(m, "put-file") == 0 ||
+           strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
+           strcasecmp(m, "put-file") == 0 ||
            strcasecmp(m, "sequence") == 0;
 }
 /* Schema/rebuild commands — take exclusive wrlock. */
@@ -668,6 +669,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         else if (field)
             cmd_add_index(db_root, object, field, f);
         free(field); free(fields_arr); free(force);
+    } else if (strcmp(mode, "remove-index") == 0) {
+        char *field = json_get_raw(json, "field");
+        char *fields_arr = json_get_field(json, "fields", 0);
+        if (fields_arr)
+            cmd_remove_indexes(db_root, object, fields_arr);
+        else if (field)
+            cmd_remove_index(db_root, object, field);
+        else
+            OUT("{\"error\":\"Missing field or fields\"}\n");
+        free(field); free(fields_arr);
     } else if (strcmp(mode, "bulk-insert") == 0) {
         char *file = json_get_raw(json, "file");
         char *records = json_get_field(json, "records", 0);
@@ -806,9 +817,28 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
     } else if (strcmp(mode, "put-file") == 0) {
-        char *path = json_get_raw(json, "path");
-        if (path) cmd_put_file(db_root, object, path);
-        free(path);
+        char *data = json_get_raw(json, "data");
+        if (data) {
+            char *filename = json_get_raw(json, "filename");
+            char *ine = json_get_raw(json, "if_not_exists");
+            int if_not_exists = ine && strcmp(ine, "true") == 0;
+            if (!filename)
+                OUT("{\"error\":\"filename is required when uploading via data\"}\n");
+            else
+                cmd_put_file_b64(db_root, object, filename, data, strlen(data), if_not_exists);
+            free(filename); free(ine);
+        } else {
+            char *path = json_get_raw(json, "path");
+            if (path) cmd_put_file(db_root, object, path);
+            else OUT("{\"error\":\"put-file requires \\\"data\\\" (base64) or \\\"path\\\" (server-local)\"}\n");
+            free(path);
+        }
+        free(data);
+    } else if (strcmp(mode, "get-file") == 0) {
+        char *filename = json_get_raw(json, "filename");
+        if (filename) cmd_get_file_b64(db_root, object, filename);
+        else OUT("{\"error\":\"filename is required\"}\n");
+        free(filename);
     } else if (strcmp(mode, "get-file-path") == 0) {
         char *filename = json_get_raw(json, "filename");
         if (filename) cmd_get_file_path(db_root, object, filename);
@@ -1024,6 +1054,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        keys\tobj\toffset\tlimit
        fetch\tobj\toffset\tlimit\tfields
        add-index\tobj\tfield\t-f
+       remove-index\tobj\tfield
        bulk-insert\tobj\tfile
        bulk-delete\tobj\tfile
        vacuum\tobj / recount\tobj / truncate\tobj / backup\tobj
@@ -1061,6 +1092,8 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "add-index") == 0) {
         int force = (arg2[0] && strcmp(arg2, "-f") == 0);
         cmd_add_index(eff_root, object, arg1, force);
+    } else if (strcasecmp(cmd, "remove-index") == 0) {
+        cmd_remove_index(eff_root, object, arg1);
     } else if (strcasecmp(cmd, "bulk-insert") == 0) {
         cmd_bulk_insert(eff_root, object, arg1[0] ? arg1 : NULL);
     } else if (strcasecmp(cmd, "bulk-delete") == 0) {
@@ -1153,7 +1186,11 @@ void *worker_thread(void *arg) {
                     /* Drain the rest of this oversized line */
                     int c;
                     while ((c = fgetc(cf)) != EOF && c != '\n');
-                    OUT("{\"error\":\"Request too large (max %d bytes)\"}\x00\n", buf_size - 1);
+                    OUT("{\"error\":\"Request too large (max %d bytes)\"}\n", buf_size - 1);
+                    fflush(g_out);
+                    /* Emit command separator (\0\n) so the client read loop unblocks. */
+                    fputc('\0', g_out);
+                    fputc('\n', g_out);
                     fflush(g_out);
                     continue;
                 }
@@ -1162,7 +1199,10 @@ void *worker_thread(void *arg) {
                 if (strcasecmp(line, "QUIT") == 0) break;
 
                 if (!server_running) {
-                    OUT("{\"error\":\"Server shutting down\"}\x00\n");
+                    OUT("{\"error\":\"Server shutting down\"}\n");
+                    fflush(g_out);
+                    fputc('\0', g_out);
+                    fputc('\n', g_out);
                     fflush(g_out);
                     break;
                 }
@@ -1454,6 +1494,194 @@ int cmd_query_json(int port, const char *json) {
         write(STDOUT_FILENO, rbuf, n);
     }
     close(sfd);
+    return 0;
+}
+
+/* ========== File upload/download client helpers ========== */
+
+/* Blocking write of all bytes. -1 on error. */
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t w = 0;
+    while (w < len) {
+        ssize_t n = write(fd, p + w, len - w);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        w += (size_t)n;
+    }
+    return 0;
+}
+
+/* Connect to local server, send JSON line, return accumulated response (up to first \0).
+   Caller frees *out. Returns 0 on success, -1 on error. */
+static int query_collect(int port, const char *json, size_t json_len, char **out, size_t *out_len) {
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+    if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sfd); return -1; }
+
+    if (write_all(sfd, json, json_len) != 0) { close(sfd); return -1; }
+    if (write_all(sfd, "\n", 1) != 0) { close(sfd); return -1; }
+
+    size_t cap = 8192, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { close(sfd); return -1; }
+
+    char rbuf[8192];
+    ssize_t n;
+    while ((n = read(sfd, rbuf, sizeof(rbuf))) > 0) {
+        for (ssize_t j = 0; j < n; j++) {
+            if (rbuf[j] == '\0') {
+                if (len + j > cap) {
+                    while (cap < len + j) cap *= 2;
+                    char *nb = realloc(buf, cap);
+                    if (!nb) { free(buf); close(sfd); return -1; }
+                    buf = nb;
+                }
+                memcpy(buf + len, rbuf, j);
+                len += j;
+                close(sfd);
+                *out = buf; *out_len = len;
+                return 0;
+            }
+        }
+        if (len + (size_t)n > cap) {
+            while (cap < len + (size_t)n) cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); close(sfd); return -1; }
+            buf = nb;
+        }
+        memcpy(buf + len, rbuf, n);
+        len += (size_t)n;
+    }
+    close(sfd);
+    /* EOF with no \0 sentinel — still return what we got. */
+    *out = buf; *out_len = len;
+    return 0;
+}
+
+/* CLI: read local file, base64-encode, send put-file JSON, print server response. */
+int cmd_put_file_tcp(int port, const char *dir, const char *object,
+                     const char *local_path, int if_not_exists) {
+    struct stat st;
+    if (stat(local_path, &st) != 0) {
+        fprintf(stderr, "{\"error\":\"source file not found: %s\"}\n", local_path);
+        return 1;
+    }
+    size_t raw_len = (size_t)st.st_size;
+
+    int fd = open(local_path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "{\"error\":\"cannot open %s\"}\n", local_path); return 1; }
+    uint8_t *raw = malloc(raw_len ? raw_len : 1);
+    if (!raw) { close(fd); fprintf(stderr, "{\"error\":\"out of memory\"}\n"); return 1; }
+    size_t r = 0;
+    while (r < raw_len) {
+        ssize_t n = read(fd, raw + r, raw_len - r);
+        if (n <= 0) break;
+        r += (size_t)n;
+    }
+    close(fd);
+    if (r != raw_len) { free(raw); fprintf(stderr, "{\"error\":\"read failed\"}\n"); return 1; }
+
+    size_t enc_sz = b64_encoded_size(raw_len);
+    char *enc = malloc(enc_sz + 1);
+    if (!enc) { free(raw); fprintf(stderr, "{\"error\":\"out of memory\"}\n"); return 1; }
+    b64_encode(raw, raw_len, enc);
+    free(raw);
+
+    const char *filename = strrchr(local_path, '/');
+    filename = filename ? filename + 1 : local_path;
+
+    /* Build JSON: {"mode":"put-file","dir":"D","object":"O","filename":"F","data":"B64"[,"if_not_exists":true]} */
+    size_t json_cap = enc_sz + 256 + strlen(dir) + strlen(object) + strlen(filename);
+    char *json = malloc(json_cap);
+    if (!json) { free(enc); fprintf(stderr, "{\"error\":\"out of memory\"}\n"); return 1; }
+    int jl = snprintf(json, json_cap,
+        "{\"mode\":\"put-file\",\"dir\":\"%s\",\"object\":\"%s\",\"filename\":\"%s\",%s\"data\":\"%s\"}",
+        dir, object, filename, if_not_exists ? "\"if_not_exists\":true," : "", enc);
+    free(enc);
+    if (jl < 0 || (size_t)jl >= json_cap) {
+        free(json); fprintf(stderr, "{\"error\":\"json build failed\"}\n"); return 1;
+    }
+
+    char *resp = NULL; size_t resp_len = 0;
+    int rc = query_collect(port, json, (size_t)jl, &resp, &resp_len);
+    free(json);
+    if (rc != 0) {
+        fprintf(stderr, "{\"error\":\"cannot connect to port %d\"}\n", port);
+        return 1;
+    }
+    write(STDOUT_FILENO, resp, resp_len);
+    write(STDOUT_FILENO, "\n", 1);
+    free(resp);
+    return 0;
+}
+
+/* CLI: send get-file JSON, parse response, decode base64, write to out_path (NULL=stdout). */
+int cmd_get_file_tcp(int port, const char *dir, const char *object,
+                     const char *filename, const char *out_path) {
+    char json[1024];
+    int jl = snprintf(json, sizeof(json),
+        "{\"mode\":\"get-file\",\"dir\":\"%s\",\"object\":\"%s\",\"filename\":\"%s\"}",
+        dir, object, filename);
+    if (jl < 0 || jl >= (int)sizeof(json)) {
+        fprintf(stderr, "{\"error\":\"request too long\"}\n"); return 1;
+    }
+
+    char *resp = NULL; size_t resp_len = 0;
+    if (query_collect(port, json, (size_t)jl, &resp, &resp_len) != 0) {
+        fprintf(stderr, "{\"error\":\"cannot connect to port %d\"}\n", port);
+        return 1;
+    }
+
+    /* NUL-terminate for JSON parsing. */
+    char *resp_z = malloc(resp_len + 1);
+    if (!resp_z) { free(resp); fprintf(stderr, "{\"error\":\"out of memory\"}\n"); return 1; }
+    memcpy(resp_z, resp, resp_len);
+    resp_z[resp_len] = '\0';
+    free(resp);
+
+    /* Extract "data" — large field, base64 payload. */
+    char *data = json_get_raw(resp_z, "data");
+    if (!data) {
+        /* Server returned error or unexpected shape — surface it verbatim. */
+        fprintf(stderr, "%s\n", resp_z);
+        free(resp_z);
+        return 1;
+    }
+    char *status = json_get_raw(resp_z, "status");
+
+    size_t b64_len = strlen(data);
+    size_t cap = b64_decoded_maxsize(b64_len);
+    uint8_t *raw = malloc(cap ? cap : 1);
+    size_t raw_len = 0;
+    if (!raw || b64_decode(data, b64_len, raw, &raw_len) != 0) {
+        free(raw); free(data); free(status); free(resp_z);
+        fprintf(stderr, "{\"error\":\"invalid base64 in response\"}\n");
+        return 1;
+    }
+
+    int ofd = STDOUT_FILENO;
+    int close_out = 0;
+    if (out_path) {
+        ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ofd < 0) {
+            free(raw); free(data); free(status); free(resp_z);
+            fprintf(stderr, "{\"error\":\"cannot open output %s\"}\n", out_path);
+            return 1;
+        }
+        close_out = 1;
+    }
+    int werr = write_all(ofd, raw, raw_len);
+    if (close_out) close(ofd);
+    free(raw); free(data); free(status); free(resp_z);
+    if (werr != 0) { fprintf(stderr, "{\"error\":\"write failed\"}\n"); return 1; }
+    if (out_path) fprintf(stderr, "{\"status\":\"ok\",\"filename\":\"%s\",\"bytes\":%zu,\"out\":\"%s\"}\n",
+                          filename, raw_len, out_path);
     return 0;
 }
 
