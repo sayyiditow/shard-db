@@ -22,7 +22,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: gcc -O2 -o shard-db src/*.c -Isrc -lpthread
+        # build.sh uses an explicit file list — avoids pulling in
+        # src/btree_test.c (standalone harness with its own main()).
+        run: ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Schema mutation locking + key ceiling (test-objlock)
         run: ./test-objlock.sh
