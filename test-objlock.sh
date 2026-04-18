@@ -34,7 +34,7 @@ $BIN start
 sleep 0.5
 $BIN query '{"mode":"truncate","dir":"default","object":"leads"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/leads"
-sed -i '/^default:leads:/d' "$DB_ROOT/schema.conf" 2>/dev/null
+sed -i '/^default:leads:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN query '{"mode":"create-object","dir":"default","object":"leads","splits":8,"max_key":32,"fields":["name:varchar:32","age:int"],"indexes":[]}' > /dev/null
 
 $BIN insert default leads a '{"name":"alice","age":30}' > /dev/null
@@ -102,7 +102,7 @@ echo "=== CREATE-OBJECT LIMITS: max_key ceiling (MAX_KEY_CEILING=1024) ==="
 # Ensure clean slate for this object
 $BIN query '{"mode":"truncate","dir":"default","object":"keylim"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/keylim"
-sed -i '/^default:keylim:/d' "$DB_ROOT/schema.conf" 2>/dev/null
+sed -i '/^default:keylim:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
 
 # max_key above ceiling must be rejected
 OUT=$($BIN query '{"mode":"create-object","dir":"default","object":"keylim","splits":4,"max_key":2000,"fields":["v:int"],"indexes":[]}')

@@ -19,7 +19,7 @@ sleep 0.3
 # Fresh object with both single and composite indexes
 $BIN query '{"mode":"truncate","dir":"default","object":"idxtest"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/idxtest"
-sed -i '/^default:idxtest:/d' "$DB_ROOT/schema.conf" 2>/dev/null
+sed -i '/^default:idxtest:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN query '{"mode":"create-object","dir":"default","object":"idxtest","splits":64,"max_key":32,"fields":["status:varchar:16","region:varchar:16","tier:varchar:8","amount:int"],"indexes":["status","region","status+region","region+tier","status+region+tier"]}'
 
 echo "=== Generating 5 chunks × 20K = 100K records ==="
