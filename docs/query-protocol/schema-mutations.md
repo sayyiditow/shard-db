@@ -29,8 +29,9 @@ Create a new typed object. See [Quick start](../getting-started/quickstart.md) f
 | `object` | yes | — | Object name. |
 | `splits` | no | `4` (`MIN_SPLITS`) | Initial shard count (max 4096 = `MAX_SPLITS`). |
 | `max_key` | no | `64` | Max key length in bytes. Hard ceiling 1024 (`MAX_KEY_CEILING`). |
-| `max_value` | no | derived from fields | Max typed-record size. Usually computed; override for headroom. |
 | `fields` | yes | — | Array of typed field specs. See [Concepts → Typed records](../concepts/typed-records.md). |
+
+`max_value` (the Zone B record size) is **always computed** as the sum of typed-field sizes — not user-configurable. Stored in `schema.conf` for persistence only.
 | `indexes` | no | `[]` | Fields to index at creation. Single or composite (`"a+b"`). |
 
 Response: `{"status":"created","object":"...","splits":N,"max_key":N,"value_size":N,"fields":N}`.

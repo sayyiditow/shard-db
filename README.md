@@ -1485,7 +1485,7 @@ Shards start at 256 slots and double when load exceeds 50%. Growth is atomic (bu
 | Key length (`max_key`) | 1024 bytes (= `MAX_KEY_CEILING`, default 64) — every slot reserves `max_key` bytes so larger caps bloat `slot_size`; UUIDs fit in 36B |
 | Varchar content | 65535 bytes (uint16 length prefix) |
 | Aggregates per query | 32 |
-| Record size | bounded by `max_value` at create-object time |
+| Record size | sum of typed-field sizes, computed automatically at `create-object` time (not user-settable) |
 
 ## Tests
 

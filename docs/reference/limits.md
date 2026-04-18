@@ -25,7 +25,7 @@ Changing these requires recompiling. Most don't need to change.
 |---|---|---|
 | Key length | `max_key` bytes (per-object, max 1024) | Set at `create-object`. Keys longer than this error on insert. |
 | varchar content | 65 535 bytes | uint16 length prefix. |
-| Total record size (Zone B) | `max_value` bytes | Computed from fields at `create-object`, override to leave headroom. |
+| Total record size (Zone B) | `max_value` bytes | Always computed as the sum of typed-field sizes at `create-object`; not user-configurable. Stored in `schema.conf` for persistence. |
 | Fields per object | 256 | `MAX_FIELDS`. Includes tombstoned fields until compact. |
 
 ## Query-level limits

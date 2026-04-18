@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "\nObject management (via JSON query):\n");
         fprintf(stderr, "  query '{\"mode\":\"create-object\",\"dir\":\"...\",\"object\":\"...\",\n");
         fprintf(stderr, "          \"fields\":[...],\"indexes\":[...],\n");
-        fprintf(stderr, "          \"splits\":N,\"max_key\":N,\"max_value\":N}'\n");
+        fprintf(stderr, "          \"splits\":N,\"max_key\":N}'\n");
         fprintf(stderr, "\nJSON query mode:\n");
         fprintf(stderr, "  query '{\"mode\":\"get\",\"object\":\"users\",\"key\":\"k1\"}'\n");
         fprintf(stderr, "  query '{\"mode\":\"get\",\"object\":\"users\",\"keys\":[\"k1\",\"k2\"]}'\n");

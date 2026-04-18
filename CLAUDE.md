@@ -125,7 +125,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db size|recount|truncate|vacuum|backup <dir> <obj>
 ./shard-db add-index <dir> <obj> <field> [-f]     # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>       # drop index (exact name match)
-./shard-db create-object <dir> <obj> <splits> <max_key> <max_value>
+./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
 
 # Diagnostics
 ./shard-db stats                                  # Global (connections, in-flight, cache hit, slow log)
