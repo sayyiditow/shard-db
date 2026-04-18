@@ -1,5 +1,8 @@
 # shard-db
 
+[![CI](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml)
+[![Docs](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml)
+
 A file-based sharded database written in C. Started as a key/value store; now a full small-scale DB with typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server. Single static binary, no external dependencies.
 
 **Platform:** Linux x86_64 / ARM64 (uses `epoll`, `mmap`, POSIX pthreads). Not portable to macOS or Windows without source changes. License: MIT.
