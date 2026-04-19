@@ -20,7 +20,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity (23)
 ./test-joins.sh                     # Join support                     (17)
 ./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
-# Total: 195 tests
+./test-or-logic.sh                  # OR criteria, all four shapes      (43)
+# Total: 238 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -152,6 +153,28 @@ All advanced queries go through `./shard-db query '<json>'`.
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
 
+### OR criteria
+
+`criteria` is implicit AND. Introduce an OR branch with `{"or":[...]}` (or explicit sub-AND via `{"and":[...]}`). Supported in find / count / aggregate `criteria` and `having`, and in bulk-delete / bulk-update.
+
+```json
+"criteria":[
+  {"field":"status","op":"eq","value":"paid"},
+  {"or":[
+    {"field":"region","op":"eq","value":"us"},
+    {"field":"total","op":"gte","value":"1000"}
+  ]}
+]
+```
+
+Planner picks one of four paths automatically:
+- **Pure AND** → primary-indexed-leaf scan (today's path).
+- **AND + OR, indexed AND sibling** → indexed leaf drives candidates, OR sub-tree evaluated per record via tree match.
+- **Pure OR, every child indexed** → per-child B+ tree lookups unioned into a concurrent KeySet (xxh128 hashes, lock-free CAS inserts); pure-OR count returns `|KeySet|` directly without fetching records.
+- **OR with non-indexed child** → full parallel shard scan, tree match per record.
+
+Hybrid (non-indexed AND + fully-indexed OR) uses KeySet as primary-candidate source and applies the AND siblings as a post-filter. Max nesting depth is `MAX_CRITERIA_DEPTH = 16`. Empty `or:[]` / `and:[]` → `{"error":"empty or/and"}`.
+
 ### Aggregation
 
 ```json
@@ -216,6 +239,9 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 
 ## Key internals
 
+- `CriteriaNode` (types.h) + `parse_criteria_tree` / `criteria_match_tree` / `compile_criteria_tree` (query.c): AND/OR tree form of criteria. Leaves hold a pre-compiled `CompiledCriterion` so the hot path stays zero-malloc-per-record
+- `KeySet` (keyset.c): lock-free open-addressed hash table of 16-byte xxh128 keys; lives on the OR index-union fast path
+- `choose_primary_source` (query.c): planner that picks `PRIMARY_LEAF` / `PRIMARY_KEYSET` / `PRIMARY_NONE` based on indexability of the tree's leaves
 - `match_typed()` / `CompiledCriterion` (query.c): typed-binary criterion matching — zero malloc per record, direct byte compares
 - `scan_shards()`: parallel mmap-based shard scanner (one thread per shard group)
 - `index_parallel()`: spawns pthread per index field during bulk insert

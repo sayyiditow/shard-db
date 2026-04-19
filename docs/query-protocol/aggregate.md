@@ -151,6 +151,25 @@ Typical latency on 1 M records: 1–3 ms for indexed, 2–10 ms for full scans w
  ]}
 ```
 
+## OR in `criteria` and `having`
+
+Both `criteria` and `having` accept the full AND/OR tree (see [find → OR criteria](find.md)):
+
+```json
+{"mode":"aggregate","dir":"acme","object":"orders",
+ "criteria":[
+   {"or":[
+     {"field":"status","op":"eq","value":"paid"},
+     {"field":"status","op":"eq","value":"refunded"}
+   ]}
+ ],
+ "group_by":["region"],
+ "aggregates":[{"fn":"count","alias":"n"},{"fn":"sum","field":"amount","alias":"total"}],
+ "having":[{"or":[{"field":"n","op":"gte","value":"100"},{"field":"total","op":"gte","value":"10000"}]}]}
+```
+
+The planner paths from [find](find.md#execution-paths) apply here too — when the OR is fully indexed the aggregate source records come from a KeySet rather than a shard scan.
+
 ## CLI shortcut
 
 ```bash

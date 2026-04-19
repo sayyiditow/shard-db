@@ -36,6 +36,7 @@ Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `betwe
 - **Zone A/B shard layout** -- metadata (24B headers) separated from payloads for fast probing
 - **Dynamic shard growth** -- each shard starts at 256 slots and doubles at 50% load (no slot cap — grows as data grows); up to **4096 shard *files* per object** (`MAX_SPLITS`, the filename format `NNN.bin`). Record capacity is bounded by disk, not by shard count.
 - **Find / Count / Fetch** -- 17 search operators (eq, neq, lt/gt/lte/gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists); all use indexes when available
+- **AND / OR criteria** -- flat arrays are implicit AND (backward-compatible); `{"or":[...]}` and `{"and":[...]}` sub-nodes compose arbitrary trees; pure-OR queries with every child indexed use a lock-free KeySet index-union (sublinear, no shard scan)
 - **Aggregations** -- count, sum, avg, min, max with `group_by`, `having`, `order_by`, `limit`; typed direct-to-double (no string round-trip)
 - **Joins** -- inner and left joins with multi-join chaining, by primary key or any indexed field, composite local fields, tabular output
 - **Conditional writes (CAS)** -- `if_not_exists`, `if:{...}` on insert/update/delete, `bulk-update`/`bulk-delete` by criteria with dry_run

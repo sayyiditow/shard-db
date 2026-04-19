@@ -77,7 +77,37 @@ For `between`:
 {"field":"age","op":"between","value":"18","value2":"65"}
 ```
 
-Multiple criteria are **AND**-combined. No `OR` yet — emulate with multiple queries + dedupe, or use `in` / `not_in` for value sets.
+Multiple criteria at the top level are **AND**-combined. Compose **OR** with a `{"or":[...]}` sub-node:
+
+```json
+"criteria":[
+  {"field":"status","op":"eq","value":"paid"},
+  {"or":[
+    {"field":"region","op":"eq","value":"us"},
+    {"field":"total","op":"gte","value":"1000"}
+  ]}
+]
+```
+
+Reads as: `status = 'paid' AND (region = 'us' OR total >= 1000)`.
+
+- `{"or":[...]}` — branch matches if **any** child matches.
+- `{"and":[...]}` — explicit AND sub-branch, useful when nesting.
+- Flat arrays remain implicit AND (zero change to existing queries).
+- Max nesting depth is **16**. Empty `or:[]` / `and:[]` returns `{"error":"empty or/and"}`.
+
+### Execution paths
+
+The planner selects automatically:
+
+| Shape | Example | Strategy |
+|---|---|---|
+| Pure AND | `[A, B]` | Primary-indexed-leaf scan (today's path). |
+| AND + OR, AND sibling indexed | `[{a*=x}, {or:[{b},{c}]}]` | AND leaf drives candidates; OR sub-tree evaluated per record. OR children don't need indexes. |
+| Pure OR, every child indexed | `[{or:[{a*=x},{b*=y}]}]` | Per-child B+ tree lookups unioned into a concurrent `KeySet` (xxh128 hashes, lock-free CAS inserts). Sublinear — no shard scan. |
+| OR with any non-indexed child | `[{or:[{a*=x},{b=y}]}]` | Full parallel shard scan + tree match. |
+
+Hybrid (non-indexed AND + fully-indexed OR sub-tree) uses the KeySet as primary-candidate source and applies the AND siblings as a post-filter.
 
 ## Operators
 

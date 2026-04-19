@@ -46,3 +46,6 @@ jobs:
 
       - name: CLI shortcuts + delete-file (test-cli-shortcuts)
         run: ./test-cli-shortcuts.sh
+
+      - name: OR criteria (test-or-logic)
+        run: ./test-or-logic.sh

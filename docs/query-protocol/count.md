@@ -17,8 +17,11 @@ Returns the number of records matching the criteria, without materializing any r
 ## Cost
 
 - **Single-criterion indexed path** — uses `idx_count_cb`, the inline index-walk counter. Zero record fetches — O(1) per B+ tree hit. Fastest path.
-- **Multi-criterion indexed** — primary index picks candidates, other criteria filter with `match_typed()`. Still fast because Zone B is read only for candidates that survive the primary index.
+- **Multi-criterion indexed** — primary index picks candidates, other criteria filter via the criteria tree (`criteria_match_tree`). Still fast because Zone B is read only for candidates that survive the primary index.
+- **Pure-OR (all children indexed)** — B+ tree lookups unioned into a `KeySet`; count = `|KeySet|`. **No record fetch, no per-record match.** Fastest multi-condition path.
 - **Full scan** — parallel per-shard Zone A walk. 2–3 ms on 1 M records.
+
+See [find → OR criteria](find.md) for the full planner table.
 
 `count` is always cheaper than `find` + ignoring results because it skips payload materialization and serialization.
 
