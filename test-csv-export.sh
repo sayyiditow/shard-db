@@ -148,6 +148,34 @@ LINES=$(echo "$GOT" | grep -c '^nl1|')
 assert_eq "nl value stays on one physical line" "1" "$LINES"
 
 echo ""
+echo "=== keys: CSV single-column export ==="
+GOT=$($BIN query '{"mode":"keys","dir":"default","object":"csv_orders","format":"csv"}')
+assert_contains "keys csv header"              'key'              "$GOT"
+# Every data row should be just a key (no comma)
+N=$(echo "$GOT" | tail -n +2 | wc -l)
+TOTAL=$($BIN count default csv_orders | sed 's/.*"count":\([0-9]*\).*/\1/')
+assert_eq "keys csv row count = total"         "$TOTAL"            "$N"
+
+echo ""
+echo "=== get-multi: CSV with schema field columns ==="
+GOT=$($BIN query '{"mode":"get","dir":"default","object":"csv_orders","keys":["o1","o2","o3"],"format":"csv","delimiter":"|"}')
+assert_contains "get-multi header has all fields" 'key|status|amount|note' "$GOT"
+assert_contains "get-multi o1 row"                'o1|paid|100|vip'         "$GOT"
+# Pipe delim means comma-in-value needs no quoting:
+assert_contains "get-multi o2 row (pipe, comma raw)" 'o2|paid|50|a,comma,here' "$GOT"
+# But with comma delim, the same value must be quoted:
+GOT_C=$($BIN query '{"mode":"get","dir":"default","object":"csv_orders","keys":["o2"],"format":"csv"}')
+assert_contains "get-multi comma delim quotes comma value" '"a,comma,here"' "$GOT_C"
+
+echo ""
+echo "=== exists-multi: CSV two-column key+bool ==="
+GOT=$($BIN query '{"mode":"exists","dir":"default","object":"csv_orders","keys":["o1","nope","o3"],"format":"csv"}')
+assert_contains "exists-multi header"          'key,exists'       "$GOT"
+assert_contains "exists-multi o1 true"         'o1,true'          "$GOT"
+assert_contains "exists-multi missing false"   'nope,false'       "$GOT"
+assert_contains "exists-multi o3 true"         'o3,true'          "$GOT"
+
+echo ""
 echo "=== round-trip: find CSV → bulk-insert-delimited → count equality ==="
 $BIN query '{"mode":"create-object","dir":"default","object":"csv_rt","splits":2,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:64"]}' > /dev/null
 # Export simple rows (no quotes, no newlines) from csv_orders filtered to paid → csv_rt

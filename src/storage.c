@@ -1244,7 +1244,9 @@ static void *multi_exists_shard_worker(void *arg) {
 }
 
 /* mode=exists with keys[], returns {"k1":true,"k2":false,...} */
-int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json) {
+int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json,
+                     const char *format, const char *delimiter) {
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     int key_count = 0, key_cap = 256;
     MultiExistsEntry *entries = malloc(key_cap * sizeof(MultiExistsEntry));
     Schema sc = load_schema(db_root, object);
@@ -1323,10 +1325,20 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             entries[sorted[gstarts[g] + i]].found = workers[g].entries[i].found;
 
     /* Output in original order */
-    OUT("{");
-    for (int i = 0; i < key_count; i++)
-        OUT("%s\"%s\":%s", i ? "," : "", entries[i].key, entries[i].found ? "true" : "false");
-    OUT("}\n");
+    if (csv_delim) {
+        OUT("key");
+        char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+        OUT("exists\n");
+        for (int i = 0; i < key_count; i++) {
+            csv_emit_cell(entries[i].key, csv_delim);
+            OUT("%s%s\n", d, entries[i].found ? "true" : "false");
+        }
+    } else {
+        OUT("{");
+        for (int i = 0; i < key_count; i++)
+            OUT("%s\"%s\":%s", i ? "," : "", entries[i].key, entries[i].found ? "true" : "false");
+        OUT("}\n");
+    }
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers); free(sorted);
@@ -1487,7 +1499,9 @@ static void *multi_get_shard_worker(void *arg) {
     return NULL;
 }
 
-int cmd_get_multi(const char *db_root, const char *object, const char *keys_json) {
+int cmd_get_multi(const char *db_root, const char *object, const char *keys_json,
+                  const char *format, const char *delimiter) {
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     /* Parse keys */
     int key_count = 0, key_cap = 256;
     MultiGetEntry *entries = malloc(key_cap * sizeof(MultiGetEntry));
@@ -1575,16 +1589,47 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             entries[sorted[gstarts[g] + i]].result_json = workers[g].entries[i].result_json;
 
     /* Output in original key order */
-    OUT("[");
-    int printed = 0;
-    for (int i = 0; i < key_count; i++) {
-        if (entries[i].result_json) {
-            OUT("%s%s", printed ? "," : "", entries[i].result_json);
-            free(entries[i].result_json);
-            printed++;
+    if (csv_delim) {
+        /* Header: key + schema fields (no projection on get-multi). */
+        OUT("key");
+        if (fs.ts) {
+            for (int i = 0; i < fs.ts->nfields; i++) {
+                if (fs.ts->fields[i].removed) continue;
+                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                csv_emit_cell(fs.ts->fields[i].name, csv_delim);
+            }
         }
+        OUT("\n");
+        for (int i = 0; i < key_count; i++) {
+            if (!entries[i].result_json) continue;
+            /* result_json shape: {"key":"k","value":{...}} — fields live under "value". */
+            csv_emit_cell(entries[i].key, csv_delim);
+            char *value_obj = json_get_field(entries[i].result_json, "value", 0);
+            if (fs.ts) {
+                for (int fi = 0; fi < fs.ts->nfields; fi++) {
+                    if (fs.ts->fields[fi].removed) continue;
+                    char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                    char *pv = value_obj ? json_get_raw(value_obj, fs.ts->fields[fi].name) : NULL;
+                    csv_emit_cell(pv, csv_delim);
+                    free(pv);
+                }
+            }
+            free(value_obj);
+            OUT("\n");
+            free(entries[i].result_json);
+        }
+    } else {
+        OUT("[");
+        int printed = 0;
+        for (int i = 0; i < key_count; i++) {
+            if (entries[i].result_json) {
+                OUT("%s%s", printed ? "," : "", entries[i].result_json);
+                free(entries[i].result_json);
+                printed++;
+            }
+        }
+        OUT("]\n");
     }
-    OUT("]\n");
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers); free(sorted);

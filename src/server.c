@@ -517,8 +517,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *keys = json_get_field(json, "keys", 0);
         char *fields = json_get_string_or_array(json, "fields");
         if (keys) {
-            cmd_get_multi(db_root, object, keys);
-            free(keys);
+            char *fmt = json_get_raw(json, "format");
+            char *delim = json_get_raw(json, "delimiter");
+            cmd_get_multi(db_root, object, keys, fmt, delim);
+            free(keys); free(fmt); free(delim);
         } else if (key) {
             if (fields && fields[0]) {
                 /* Get with projection — uses ucache */
@@ -607,8 +609,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *key = json_get_raw(json, "key");
         char *keys_json = json_get_field(json, "keys", 0);
         if (keys_json) {
-            cmd_exists_multi(db_root, object, keys_json);
-            free(keys_json);
+            char *fmt = json_get_raw(json, "format");
+            char *delim = json_get_raw(json, "delimiter");
+            cmd_exists_multi(db_root, object, keys_json, fmt, delim);
+            free(keys_json); free(fmt); free(delim);
         } else if (key) {
             cmd_exists(db_root, object, key);
         } else {
@@ -651,8 +655,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "keys") == 0) {
         char *off_s = json_get_raw(json, "offset");
         char *lim_s = json_get_raw(json, "limit");
-        cmd_keys(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0);
-        free(off_s); free(lim_s);
+        char *fmt = json_get_raw(json, "format");
+        char *delim = json_get_raw(json, "delimiter");
+        cmd_keys(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fmt, delim);
+        free(off_s); free(lim_s); free(fmt); free(delim);
     } else if (strcmp(mode, "fetch") == 0) {
         char *off_s = json_get_raw(json, "offset");
         char *lim_s = json_get_raw(json, "limit");
@@ -1087,7 +1093,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "exists") == 0) {
         cmd_exists(eff_root, object, arg1);
     } else if (strcasecmp(cmd, "keys") == 0) {
-        cmd_keys(eff_root, object, arg1[0] ? atoi(arg1) : 0, arg2[0] ? atoi(arg2) : 0);
+        cmd_keys(eff_root, object, arg1[0] ? atoi(arg1) : 0, arg2[0] ? atoi(arg2) : 0, NULL, NULL);
     } else if (strcasecmp(cmd, "fetch") == 0) {
         /* fetch\tobj\toff\tlim\tfields */
         cmd_fetch(eff_root, object, arg1[0] ? atoi(arg1) : 0,

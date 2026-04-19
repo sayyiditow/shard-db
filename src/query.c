@@ -2460,9 +2460,13 @@ int cmd_exists(const char *db_root, const char *object, const char *key) {
     return 1;
 }
 
+
 /* ========== KEYS ========== */
 
-typedef struct { int offset; int limit; int count; int printed; } KeysCtx;
+typedef struct {
+    int offset; int limit; int count; int printed;
+    char csv_delim;   /* 0 = JSON mode; else CSV (delim-less, single column) */
+} KeysCtx;
 
 int keys_cb(const SlotHeader *hdr, const uint8_t *block,
                     void *ctx) {
@@ -2470,24 +2474,31 @@ int keys_cb(const SlotHeader *hdr, const uint8_t *block,
     if (kc->limit > 0 && kc->printed >= kc->limit) return 1; /* stop */
     kc->count++;
     if (kc->count <= kc->offset) return 0;
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
-    OUT("%s\"%s\"", kc->printed ? "," : "", key);
-    free(key);
+    char kbuf[1024];
+    size_t kl = hdr->key_len < sizeof(kbuf) - 1 ? hdr->key_len : sizeof(kbuf) - 1;
+    memcpy(kbuf, block, kl); kbuf[kl] = '\0';
+    if (kc->csv_delim) {
+        csv_emit_cell(kbuf, kc->csv_delim);
+        OUT("\n");
+    } else {
+        OUT("%s\"%s\"", kc->printed ? "," : "", kbuf);
+    }
     kc->printed++;
     return 0;
 }
 
-int cmd_keys(const char *db_root, const char *object, int offset, int limit) {
+int cmd_keys(const char *db_root, const char *object, int offset, int limit,
+             const char *format, const char *delimiter) {
     if (limit <= 0) limit = g_global_limit;
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     Schema sch = load_schema(db_root, object);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    KeysCtx ctx = { offset, limit, 0, 0 };
-    OUT("[");
+    KeysCtx ctx = { offset, limit, 0, 0, csv_delim };
+    if (csv_delim) OUT("key\n");  /* header */
+    else OUT("[");
     scan_shards(data_dir, sch.slot_size, keys_cb, &ctx);
-    OUT("]\n");
+    if (!csv_delim) OUT("]\n");
     return 0;
 }
 
@@ -2576,7 +2587,7 @@ void emit_rows_columns(const char **proj_fields, int proj_count, FieldSchema *fs
    `"` doubled (RFC 4180 minus multi-line support). */
 
 /* Write one CSV cell to g_out, applying delimiter-aware quoting. */
-static void csv_emit_cell(const char *val, char delim) {
+void csv_emit_cell(const char *val, char delim) {
     if (!val || !val[0]) return;  /* empty cell */
 
     /* First pass: scan for characters that force quoting and build a
@@ -2665,7 +2676,7 @@ static void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
 
 /* Parse a delimiter string from the request. Supports `\t` literal for tabs.
    Returns the delimiter char, or 0 if the string is NULL/empty/invalid. */
-static char parse_csv_delim(const char *s) {
+char parse_csv_delim(const char *s) {
     if (!s || !s[0]) return ',';
     if (s[0] == '\\' && s[1] == 't' && s[2] == '\0') return '\t';
     if (s[1] != '\0') return ',';  /* multi-char → default to comma */

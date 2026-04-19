@@ -21,8 +21,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-joins.sh                     # Join support                     (17)
 ./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
 ./test-or-logic.sh                  # OR criteria, all four shapes      (43)
-./test-csv-export.sh                # CSV export on find/fetch/aggregate (27)
-# Total: 265 tests
+./test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
+# Total: 275 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -156,7 +156,7 @@ All advanced queries go through `./shard-db query '<json>'`.
 
 ### CSV / delimited export
 
-`"format":"csv"` on `find`, `fetch`, `aggregate` emits **raw CSV text** (not JSON-wrapped). Optional `delimiter` field picks a single-char separator — defaults to `,`, accepts `\t` literal for tab.
+`"format":"csv"` on `find`, `fetch`, `aggregate`, `get` (multi-key), `keys`, and `exists` (multi-key) emits **raw CSV text** (not JSON-wrapped). Optional `delimiter` field picks a single-char separator — defaults to `,`, accepts `\t` literal for tab.
 
 ```json
 {"mode":"find","dir":"t","object":"o","criteria":[],"format":"csv","delimiter":"|"}
