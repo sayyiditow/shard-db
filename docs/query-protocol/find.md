@@ -63,6 +63,16 @@ Required: `mode`, `dir`, `object`, `criteria`.
 
 Rows form is ~30% smaller on the wire and drops directly into spreadsheets / charting libraries.
 
+**With `"format":"csv"` (raw CSV, not JSON):**
+
+```
+key,name,email,age
+u1,Alice,a@x.com,30
+u2,Bob,b@x.com,22
+```
+
+Plain text body — no JSON wrapping. Optional `"delimiter":"|"` picks a single-char separator (`\t` literal for tab; defaults to `,`). Values containing the delimiter or `"` are RFC-4180-quoted with internal `"` doubled; newlines inside values are replaced with a space so one physical line equals one logical row. Errors still come as JSON `{"error":"..."}`. Not compatible with `join` (returns `{"error":"format=csv is not supported with join"}`). Same shape works on [`fetch`](#fetch) and [`aggregate`](aggregate.md).
+
 ## Criteria shape
 
 Each element of `criteria` is a JSON object:

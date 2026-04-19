@@ -2568,13 +2568,119 @@ void emit_rows_columns(const char **proj_fields, int proj_count, FieldSchema *fs
     OUT("],\"rows\":[");
 }
 
+/* ========== CSV output ==========
+   Pure text body (no JSON wrapping). One physical line per row — values
+   containing newlines get their `\n`/`\r` replaced with a single space
+   before escaping so the export stays grep/awk/spreadsheet-friendly.
+   Delimiter + `"` inside values → wrap the whole cell in `"` with internal
+   `"` doubled (RFC 4180 minus multi-line support). */
+
+/* Write one CSV cell to g_out, applying delimiter-aware quoting. */
+static void csv_emit_cell(const char *val, char delim) {
+    if (!val || !val[0]) return;  /* empty cell */
+
+    /* First pass: scan for characters that force quoting and build a
+       whitespace-normalized copy (newline → space) on the heap so we can
+       stream it back out. */
+    int needs_quote = 0;
+    size_t len = strlen(val);
+    char stack[1024];
+    char *buf;
+    int heap = 0;
+    if (len + 1 <= sizeof(stack)) {
+        buf = stack;
+    } else {
+        buf = malloc(len + 1);
+        if (!buf) return;
+        heap = 1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = val[i];
+        if (c == '\n' || c == '\r') { buf[i] = ' '; continue; }
+        if (c == delim || c == '"') needs_quote = 1;
+        buf[i] = c;
+    }
+    buf[len] = '\0';
+
+    if (!needs_quote) {
+        OUT("%s", buf);
+    } else {
+        OUT("\"");
+        for (size_t i = 0; i < len; i++) {
+            if (buf[i] == '"') OUT("\"\"");
+            else { char c[2] = { buf[i], '\0' }; OUT("%s", c); }
+        }
+        OUT("\"");
+    }
+
+    if (heap) free(buf);
+}
+
+/* Emit a CSV header row ("key,<field>,<field>,...") terminated by \n. */
+static void csv_emit_header(const char **proj_fields, int proj_count,
+                            FieldSchema *fs, char delim) {
+    OUT("key");
+    if (proj_count > 0) {
+        for (int i = 0; i < proj_count; i++) {
+            char d[2] = { delim, '\0' };
+            OUT("%s", d);
+            csv_emit_cell(proj_fields[i], delim);
+        }
+    } else if (fs && fs->ts) {
+        for (int i = 0; i < fs->ts->nfields; i++) {
+            if (fs->ts->fields[i].removed) continue;
+            char d[2] = { delim, '\0' };
+            OUT("%s", d);
+            csv_emit_cell(fs->ts->fields[i].name, delim);
+        }
+    }
+    OUT("\n");
+}
+
+/* Emit one data row from a typed record. `raw` points at the value payload.
+   `val_len` is the stored value length (for decode_field on composite/
+   untyped fallback). Terminated by \n. */
+static void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
+                         const char **proj_fields, int proj_count,
+                         FieldSchema *fs, char delim) {
+    csv_emit_cell(key, delim);
+    if (proj_count > 0) {
+        for (int i = 0; i < proj_count; i++) {
+            char d[2] = { delim, '\0' }; OUT("%s", d);
+            char *v = decode_field((const char *)raw, val_len, proj_fields[i], fs);
+            csv_emit_cell(v, delim);
+            free(v);
+        }
+    } else if (fs && fs->ts) {
+        for (int i = 0; i < fs->ts->nfields; i++) {
+            if (fs->ts->fields[i].removed) continue;
+            char d[2] = { delim, '\0' }; OUT("%s", d);
+            char *v = typed_get_field_str(fs->ts, raw, i);
+            csv_emit_cell(v, delim);
+            free(v);
+        }
+    }
+    OUT("\n");
+}
+
+/* Parse a delimiter string from the request. Supports `\t` literal for tabs.
+   Returns the delimiter char, or 0 if the string is NULL/empty/invalid. */
+static char parse_csv_delim(const char *s) {
+    if (!s || !s[0]) return ',';
+    if (s[0] == '\\' && s[1] == 't' && s[2] == '\0') return '\t';
+    if (s[1] != '\0') return ',';  /* multi-char → default to comma */
+    return s[0];
+}
+
 /* Cursor-based fetch — scans from cursor position, returns next cursor.
    Cursor format: "shard_path_idx:slot_idx" or empty for start.
    Response: {"results":[...],"cursor":"..."} */
 int cmd_fetch(const char *db_root, const char *object,
                      int offset, int limit, const char *proj_str,
-                     const char *cursor, const char *format) {
+                     const char *cursor, const char *format,
+                     const char *delimiter) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     if (limit <= 0) limit = g_global_limit;
     Schema sch = load_schema(db_root, object);
     char data_dir[PATH_MAX];
@@ -2628,7 +2734,9 @@ int cmd_fetch(const char *db_root, const char *object,
 
     FieldSchema *fs_ptr = (fs_fetch.ts || fs_fetch.nfields > 0) ? &fs_fetch : NULL;
 
-    if (rows_fmt)
+    if (csv_delim)
+        csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count, fs_ptr, csv_delim);
+    else if (rows_fmt)
         emit_rows_columns(proj_fields, proj_count, fs_ptr);
     else
         OUT("{\"results\":[");
@@ -2650,7 +2758,15 @@ int cmd_fetch(const char *db_root, const char *object,
             }
 
             const uint8_t *block = fc.map + zoneB_off(si, shard_slots, sch.slot_size);
-            if (rows_fmt)
+            if (csv_delim) {
+                char kbuf[1024];
+                size_t kl = hdr->key_len < sizeof(kbuf) - 1 ? hdr->key_len : sizeof(kbuf) - 1;
+                memcpy(kbuf, block, kl); kbuf[kl] = '\0';
+                csv_emit_row(kbuf, block + hdr->key_len, hdr->value_len,
+                             proj_count > 0 ? proj_fields : NULL,
+                             proj_count, fs_ptr, csv_delim);
+                printed++;
+            } else if (rows_fmt)
                 print_record_row(hdr, block, proj_fields, proj_count, &printed, fs_ptr);
             else
                 print_record_json(hdr, block, proj_fields, proj_count, &printed, fs_ptr);
@@ -2660,8 +2776,10 @@ int cmd_fetch(const char *db_root, const char *object,
         fcache_release(fc);
     }
 
-    /* Build next cursor */
-    if (printed >= limit && next_path >= 0) {
+    /* Build next cursor — CSV mode omits cursor (streaming export). */
+    if (csv_delim) {
+        /* Nothing more to append; body already ends with \n per row. */
+    } else if (printed >= limit && next_path >= 0) {
         OUT("],\"cursor\":\"%d:%zu\"}\n", next_path, next_slot);
     } else {
         OUT("],\"cursor\":null}\n");
@@ -2717,6 +2835,7 @@ typedef struct {
     ExcludedKeys excluded;
     FieldSchema *fs;
     int rows_fmt;
+    char csv_delim;       /* 0 = not CSV; else delimiter char, overrides rows_fmt */
     /* Joins (when njoins > 0, output is always tabular even if rows_fmt==0) */
     const char *driver_object;
     JoinSpec *joins;
@@ -3715,6 +3834,10 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                                                row + pos, sizeof(row) - pos);
                     snprintf(row + pos, sizeof(row) - pos, "]");
                     OUT("%s", row);
+                } else if (sc->csv_delim) {
+                    csv_emit_row(key, (const uint8_t *)raw, hdr->value_len,
+                                 sc->proj_count > 0 ? sc->proj_fields : NULL,
+                                 sc->proj_count, sc->fs, sc->csv_delim);
                 } else if (sc->rows_fmt) {
                     OUT("%s[\"%s\"", sc->printed ? "," : "", key);
                     if (sc->proj_count > 0) {
@@ -4150,7 +4273,8 @@ static int process_batch(CollectedHash *batch, int batch_count,
                          CriteriaNode *tree,
                          ExcludedKeys *excluded, const char **proj_fields, int proj_count,
                          FieldSchema *fs, int offset, int limit, int *count, int *printed,
-                         int rows_fmt, JoinSpec *joins, int njoins, QueryDeadline *dl) {
+                         int rows_fmt, char csv_delim,
+                         JoinSpec *joins, int njoins, QueryDeadline *dl) {
 
     qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
 
@@ -4218,6 +4342,25 @@ static int process_batch(CollectedHash *batch, int batch_count,
                 if (njoins > 0) {
                     /* mr->json already holds the full tabular row "[...]"; just emit. */
                     OUT("%s%s", *printed ? "," : "", mr->json);
+                } else if (csv_delim) {
+                    csv_emit_cell(mr->key, csv_delim);
+                    if (proj_count > 0) {
+                        for (int fi = 0; fi < proj_count; fi++) {
+                            char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                            char *pv = json_get_raw(mr->json, proj_fields[fi]);
+                            csv_emit_cell(pv, csv_delim);
+                            free(pv);
+                        }
+                    } else if (fs && fs->ts) {
+                        for (int fi = 0; fi < fs->ts->nfields; fi++) {
+                            if (fs->ts->fields[fi].removed) continue;
+                            char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                            char *pv = json_get_raw(mr->json, fs->ts->fields[fi].name);
+                            csv_emit_cell(pv, csv_delim);
+                            free(pv);
+                        }
+                    }
+                    OUT("\n");
                 } else if (rows_fmt) {
                     OUT("%s[\"%s\"", *printed ? "," : "", mr->key);
                     if (proj_count > 0) {
@@ -4261,7 +4404,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
                              SearchCriterion *primary_crit, int check_primary,
                              ExcludedKeys *excluded,
                              int offset, int limit, const char **proj_fields, int proj_count,
-                             FieldSchema *fs, int rows_fmt,
+                             FieldSchema *fs, int rows_fmt, char csv_delim,
                              JoinSpec *joins, int njoins, QueryDeadline *dl) {
     /* Collection cap heuristic:
        - No joins, or all-LEFT joins: every collected hash emits at most one row,
@@ -4290,7 +4433,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     process_batch(cc.entries, cc.count, db_root, object, sch,
                  tree, excluded,
                  proj_fields, proj_count, fs, offset, limit, &count, &printed,
-                 rows_fmt, joins, njoins, dl);
+                 rows_fmt, csv_delim, joins, njoins, dl);
 
     free(cc.entries);
     return printed;
@@ -4983,7 +5126,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                CriteriaNode *or_node,
                                ExcludedKeys *excluded, int offset, int limit,
                                const char **proj_fields, int proj_count,
-                               FieldSchema *fs, int rows_fmt,
+                               FieldSchema *fs, int rows_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
                                QueryDeadline *dl) {
     KeySet *ks = build_or_keyset(db_root, object, or_node, dl);
@@ -5093,6 +5236,10 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                         }
                         snprintf(buf + pos, sizeof(buf) - pos, "]");
                         OUT("%s%s", printed ? "," : "", buf);
+                    } else if (csv_delim) {
+                        csv_emit_row(keybuf, raw, h->value_len,
+                                     proj_count > 0 ? proj_fields : NULL,
+                                     proj_count, fs, csv_delim);
                     } else if (rows_fmt) {
                         OUT("%s[\"%s\"", printed ? "," : "", keybuf);
                         if (proj_count > 0) {
@@ -5429,9 +5576,11 @@ static int typed_field_is_numeric(uint8_t ft) {
 int cmd_find(const char *db_root, const char *object,
                     const char *criteria_json, int offset, int limit,
                     const char *proj_str, const char *excluded_csv,
-                    const char *format, const char *join_json,
+                    const char *format, const char *delimiter,
+                    const char *join_json,
                     const char *order_by, const char *order_dir) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
 
     /* Parse joins (if any) — forces tabular output irrespective of `format`. */
     JoinSpec *joins = NULL;
@@ -5493,12 +5642,24 @@ int cmd_find(const char *db_root, const char *object,
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
 
+    if (csv_delim && has_joins) {
+        OUT("{\"error\":\"format=csv is not supported with join\"}\n");
+        free_joins(joins, njoins);
+        free_criteria_tree(tree);
+        free_excluded(&excluded);
+        return -1;
+    }
+
     if (has_joins) {
         /* Joined queries always emit tabular, ignoring `format` and `rows_fmt`. */
         emit_joined_columns(object,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                             joins, njoins,
                             proj_count > 0 ? proj_fields : NULL, proj_count);
+    } else if (csv_delim) {
+        csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count,
+                        (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                        csv_delim);
     } else if (rows_fmt) {
         emit_rows_columns(proj_fields, proj_count,
                           (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL);
@@ -5549,6 +5710,13 @@ int cmd_find(const char *db_root, const char *object,
         for (size_t i = start; i < end; i++) {
             OrderedRow *r = &oc.rows[i];
             const uint8_t *val = r->record + r->key_len;
+            if (csv_delim) {
+                csv_emit_row(r->key, val, r->value_len,
+                             proj_count > 0 ? proj_fields : NULL,
+                             proj_count, &driver_fs, csv_delim);
+                printed++;
+                continue;
+            }
             if (rows_fmt) {
                 OUT("%s[\"%s\"", printed ? "," : "", r->key);
                 if (proj_count > 0) {
@@ -5602,23 +5770,26 @@ int cmd_find(const char *db_root, const char *object,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                         rows_fmt, joins, njoins, &dl);
+                         rows_fmt, csv_delim, joins, njoins, &dl);
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* ===== OR INDEX-UNION FIND ===== */
         keyset_find_from_or(db_root, object, &sch, tree, plan.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                            rows_fmt, joins, njoins, &dl);
+                            rows_fmt, csv_delim, joins, njoins, &dl);
     } else {
         /* ===== FULL SCAN FALLBACK ===== */
         AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
-                             proj_fields, proj_count, excluded, &driver_fs, rows_fmt,
+                             proj_fields, proj_count, excluded, &driver_fs,
+                             rows_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0 };
         scan_shards(data_dir, sch.slot_size, adv_search_cb, &ctx);
     }
 
     if (has_joins)
         OUT("]}\n");
+    else if (csv_delim)
+        { /* CSV body already ends with its own \n per row — nothing to close */ }
     else if (rows_fmt)
         OUT("]}\n");
     else
@@ -7083,7 +7254,9 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
-                  const char *order_by, int order_desc, int limit) {
+                  const char *order_by, int order_desc, int limit,
+                  const char *format, const char *delimiter) {
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     if (!aggregates_json || aggregates_json[0] == '\0') {
         OUT("{\"error\":\"Missing aggregates\"}\n");
         return -1;
@@ -7233,7 +7406,49 @@ int cmd_aggregate(const char *db_root, const char *object,
     if (limit <= 0) limit = g_global_limit;
     if (nbuckets > limit) nbuckets = limit;
 
-    /* Output */
+    /* Output — CSV path short-circuits before JSON emit. */
+    if (csv_delim) {
+        /* Header: group fields then aggregate aliases. */
+        for (int g = 0; g < ctx.ngroups; g++) {
+            if (g > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+            csv_emit_cell(ctx.group_fields[g], csv_delim);
+        }
+        for (int i = 0; i < nspecs; i++) {
+            if (ctx.ngroups > 0 || i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+            csv_emit_cell(specs[i].alias, csv_delim);
+        }
+        OUT("\n");
+
+        for (int bi = 0; bi < nbuckets; bi++) {
+            AggBucket *b = buckets[bi];
+            for (int g = 0; g < ctx.ngroups; g++) {
+                if (g > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+                csv_emit_cell(b->group_vals[g], csv_delim);
+            }
+            for (int i = 0; i < nspecs; i++) {
+                if (ctx.ngroups > 0 || i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+                AggAccum *a = &b->accums[i];
+                char vbuf[64];
+                switch (specs[i].fn) {
+                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", a->count); break;
+                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), a->sum); break;
+                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->sum / a->count : 0.0); break;
+                    case AGG_MIN:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0); break;
+                    case AGG_MAX:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->max : 0.0); break;
+                    default:        vbuf[0] = '\0'; break;
+                }
+                csv_emit_cell(vbuf, csv_delim);
+            }
+            OUT("\n");
+        }
+
+        free(buckets);
+        free_criteria_tree(tree);
+        free_criteria(having, nhaving);
+        agg_free(&ctx);
+        return 0;
+    }
+
     if (ctx.ngroups == 0 && nbuckets == 1) {
         /* No group_by: single object */
         AggBucket *b = buckets[0];

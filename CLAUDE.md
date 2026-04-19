@@ -21,7 +21,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-joins.sh                     # Join support                     (17)
 ./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
 ./test-or-logic.sh                  # OR criteria, all four shapes      (43)
-# Total: 238 tests
+./test-csv-export.sh                # CSV export on find/fetch/aggregate (27)
+# Total: 265 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -152,6 +153,28 @@ All advanced queries go through `./shard-db query '<json>'`.
  "fields":["id","name"],
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
+
+### CSV / delimited export
+
+`"format":"csv"` on `find`, `fetch`, `aggregate` emits **raw CSV text** (not JSON-wrapped). Optional `delimiter` field picks a single-char separator — defaults to `,`, accepts `\t` literal for tab.
+
+```json
+{"mode":"find","dir":"t","object":"o","criteria":[],"format":"csv","delimiter":"|"}
+```
+
+Body:
+```
+key|status|amount|note
+o1|paid|100|vip
+o2|paid|50|"a,comma,here"
+```
+
+- First row = column names.
+- Newlines (`\n`/`\r`) inside values → replaced with a space so one physical line = one logical row.
+- Values containing the delimiter or `"` are wrapped in `"` with internal `"` doubled (RFC 4180 minus multiline).
+- NULL fields → empty cell.
+- Errors still come as JSON — content type is unified only on success.
+- `csv + join` is rejected (`format=csv is not supported with join`).
 
 ### OR criteria
 

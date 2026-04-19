@@ -43,7 +43,7 @@ Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `betwe
 - **Field defaults** -- `default=<literal>`, `auto_create`, `auto_update`, `seq()`, `uuid()`, `random(N)`
 - **Schema mutations** -- add-field, remove-field (tombstone), rename-field, vacuum --compact, vacuum --splits (reshard)
 - **Bulk operations** -- bulk-insert (JSON, CSV, delimited), bulk-delete
-- **Response formats** -- JSON objects (default) or tabular rows (`"format":"rows"`); joins always tabular
+- **Response formats** -- JSON objects (default), tabular rows (`"format":"rows"`), or raw CSV/delimited text (`"format":"csv"` with optional `"delimiter":"|"`) on find/fetch/aggregate; joins always tabular
 - **Multi-tenancy** -- `dir` parameter isolates tenants, validated against allowlist
 - **Authentication** -- API token + IP allowlist
 - **Statement timeout** -- `TIMEOUT` in db.env (seconds, 0 = off), enforced via cooperative cancellation in scan loops

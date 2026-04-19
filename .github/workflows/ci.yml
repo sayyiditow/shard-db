@@ -49,3 +49,6 @@ jobs:
 
       - name: OR criteria (test-or-logic)
         run: ./test-or-logic.sh
+
+      - name: CSV export (test-csv-export)
+        run: ./test-csv-export.sh
