@@ -132,6 +132,33 @@ No bytes on the wire. The caller is expected to read the returned path directly 
 - Colocated services with shared-FS access.
 - Large files where you want to stream via `cat` / `sendfile` instead of base64 over the socket.
 
+## delete-file
+
+### Shape
+
+```json
+{"mode":"delete-file","dir":"<dir>","object":"<obj>","filename":"invoice.pdf"}
+```
+
+### Response
+
+```json
+{"status":"deleted","filename":"invoice.pdf"}
+```
+
+Not found:
+```json
+{"error":"file not found","filename":"invoice.pdf"}
+```
+
+Same filename rules as `put-file` / `get-file` — `{"error":"invalid filename"}` on `/`, `\`, `..`, control chars, or > 255 bytes.
+
+### CLI
+
+```bash
+./shard-db delete-file <dir> <obj> <filename>
+```
+
 ## Filename rules
 
 Enforced by `valid_filename()`:
@@ -186,6 +213,5 @@ md5sum /home/me/Invoice-001.pdf /tmp/invoice.pdf
 ## Limitations
 
 - No listing API for files — you fetch by known filename. Maintain a record in a regular object with the filenames you stored.
-- No automatic deletion — removing a file means deleting it from the filesystem directly (`rm <db_root>/<dir>/<obj>/files/XX/XX/<filename>`). A `delete-file` JSON mode is on the [roadmap](../v2/roadmap.md).
 - File content isn't indexed or queryable — it's opaque storage.
 - No ranged reads — every `get-file` returns the whole file.

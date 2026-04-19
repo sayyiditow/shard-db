@@ -239,9 +239,11 @@ shard-db size <dir> <object>
 ### Query
 
 ```bash
-shard-db find <dir> <object> '<criteria_json>' [offset] [limit] [fields]
-shard-db keys <dir> <object> [offset] [limit]
-shard-db fetch <dir> <object> [offset] [limit] [fields]
+shard-db find      <dir> <object> '<criteria_json>' [offset] [limit] [fields]
+shard-db count     <dir> <object> [criteria_json]                   # omit criteria → O(1) metadata count
+shard-db aggregate <dir> <object> '<aggregates_json>' [group_by_csv] [criteria_json] [having_json]
+shard-db keys      <dir> <object> [offset] [limit]
+shard-db fetch     <dir> <object> [offset] [limit] [fields]
 ```
 
 ### Bulk Operations
@@ -261,8 +263,9 @@ shard-db remove-index <dir> <object> <field>      # drop index (exact name match
 ### File Storage
 
 ```bash
-shard-db put-file <dir> <object> <local-path> [--if-not-exists]   # upload (base64 over TCP)
-shard-db get-file <dir> <object> <filename> [<out-path>]          # download (base64 over TCP)
+shard-db put-file    <dir> <object> <local-path> [--if-not-exists]  # upload (base64 over TCP)
+shard-db get-file    <dir> <object> <filename> [<out-path>]         # download (base64 over TCP)
+shard-db delete-file <dir> <object> <filename>                       # remove a stored file
 ```
 
 Bytes-in-JSON for remote clients. Bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). For same-host callers, the JSON API also exposes `{"mode":"put-file","path":"..."}` and `{"mode":"get-file-path",...}` as zero-copy fast paths.
@@ -1244,6 +1247,15 @@ CLI: `./shard-db get-file <dir> <obj> <filename> [<out-path>]` — downloads and
 ```
 
 Returns `{"path":"<db_root>/<obj>/files/XX/XX/<filename>"}` — the server-side path as a string. No bytes returned. Only useful for callers that can read the server's filesystem directly (same host, NFS, shared volume).
+
+#### delete-file
+
+```json
+{"mode":"delete-file","dir":"<dir>","object":"<obj>","filename":"invoice.pdf"}
+```
+Response: `{"status":"deleted","filename":"..."}` on success, `{"error":"file not found","filename":"..."}` if the file is absent. Same filename rules as put-file / get-file.
+
+CLI: `./shard-db delete-file <dir> <obj> <filename>`.
 
 #### Filename rules
 

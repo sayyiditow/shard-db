@@ -3779,8 +3779,7 @@ typedef struct {
     size_t cap;
     int splits;
     int collect_cap;     /* max entries to collect (0 = unlimited) */
-    SearchCriterion *criteria;
-    int primary_idx;
+    SearchCriterion *primary_crit;   /* pointer into tree — for check_primary pre-filter */
     int check_primary;
     QueryDeadline *deadline;
     int dl_counter;
@@ -3791,11 +3790,11 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return -1;
 
     /* For CONTAINS/LIKE/ENDS: filter on B+ tree value before collecting */
-    if (cc->check_primary) {
+    if (cc->check_primary && cc->primary_crit) {
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, &cc->criteria[cc->primary_idx])) return 0;
+        if (!match_criterion(tmp, cc->primary_crit)) return 0;
     }
 
     /* Stop at collection cap (set by caller per batch) */
@@ -4050,10 +4049,7 @@ typedef struct {
     const Schema *sch;
     CollectedHash *entries;
     int entry_count;
-    CompiledCriterion *compiled;
-    int num_criteria;
-    int primary_idx;
-    int check_primary;      /* if true, primary criterion also re-checked here */
+    CriteriaNode *tree;     /* compiled tree; full re-match per candidate */
     FieldSchema *fs;
     QueryDeadline *deadline;
     int dl_counter;
@@ -4092,12 +4088,7 @@ static void *shard_count_worker(void *arg) {
             if (memcmp(h->hash, e->hash, 16) != 0) continue;
 
             const uint8_t *raw = map + zoneB_off(s, slots, sc->sch->slot_size) + h->key_len;
-            int pass = 1;
-            for (int ci = 0; ci < sc->num_criteria && pass; ci++) {
-                if (ci == sc->primary_idx && !sc->check_primary) continue;
-                pass = match_typed(raw, &sc->compiled[ci], sc->fs);
-            }
-            if (pass) local++;
+            if (criteria_match_tree(raw, sc->tree, sc->fs)) local++;
             break;
         }
     }
@@ -4109,10 +4100,8 @@ static void *shard_count_worker(void *arg) {
 /* Orchestrate parallel indexed count: qsort by shard, fan out per-shard workers. */
 static size_t parallel_indexed_count(const char *db_root, const char *object,
                                      const Schema *sch, CollectedHash *batch,
-                                     int batch_count, CompiledCriterion *compiled,
-                                     int num_criteria, int primary_idx,
-                                     int check_primary, FieldSchema *fs,
-                                     QueryDeadline *dl) {
+                                     int batch_count, CriteriaNode *tree,
+                                     FieldSchema *fs, QueryDeadline *dl) {
     if (batch_count == 0) return 0;
     qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
 
@@ -4138,10 +4127,7 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
         workers[g].sch = sch;
         workers[g].entries = &batch[group_starts[g]];
         workers[g].entry_count = group_sizes[g];
-        workers[g].compiled = compiled;
-        workers[g].num_criteria = num_criteria;
-        workers[g].primary_idx = primary_idx;
-        workers[g].check_primary = check_primary;
+        workers[g].tree = tree;
         workers[g].fs = fs;
         workers[g].deadline = dl;
     }
@@ -4311,8 +4297,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     cc.entries = malloc(cc.cap * sizeof(CollectedHash));
     cc.splits = sch->splits;
     cc.collect_cap = collect_target;
-    cc.criteria = criteria;
-    cc.primary_idx = primary_idx;
+    cc.primary_crit = &criteria[primary_idx];
     cc.check_primary = check_primary;
     cc.deadline = dl;
 
@@ -4519,11 +4504,535 @@ void free_criteria(SearchCriterion *c, int count) {
     free(c);
 }
 
+/* ========== CriteriaNode tree parser (AND/OR composition) ========== */
+
+static CriteriaNode *cnode_new(CriteriaNodeKind kind) {
+    CriteriaNode *n = calloc(1, sizeof(CriteriaNode));
+    if (n) n->kind = kind;
+    return n;
+}
+
+static int cnode_append(CriteriaNode *parent, CriteriaNode *child) {
+    CriteriaNode **nc = realloc(parent->children,
+                                (parent->n_children + 1) * sizeof(CriteriaNode *));
+    if (!nc) return -1;
+    parent->children = nc;
+    parent->children[parent->n_children++] = child;
+    return 0;
+}
+
+void free_criteria_tree(CriteriaNode *n) {
+    if (!n) return;
+    if (n->kind == CNODE_LEAF) {
+        if (n->leaf.in_values) {
+            for (int i = 0; i < n->leaf.in_count; i++) free(n->leaf.in_values[i]);
+            free(n->leaf.in_values);
+        }
+        if (n->compiled) {
+            free_compiled_criteria(n->compiled, 1);
+        }
+    } else {
+        for (int i = 0; i < n->n_children; i++) free_criteria_tree(n->children[i]);
+        free(n->children);
+    }
+    free(n);
+}
+
+void compile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
+    if (!n) return;
+    if (n->kind == CNODE_LEAF) {
+        if (!n->compiled) {
+            n->compiled = calloc(1, sizeof(CompiledCriterion));
+            if (n->compiled) compile_one(n->compiled, &n->leaf, ts);
+        }
+        return;
+    }
+    for (int i = 0; i < n->n_children; i++) compile_criteria_tree(n->children[i], ts);
+}
+
+int criteria_match_tree(const uint8_t *rec, const CriteriaNode *n, FieldSchema *fs) {
+    if (!n) return 1;
+    switch (n->kind) {
+    case CNODE_LEAF:
+        if (!n->compiled) return 0;
+        return match_typed(rec, n->compiled, fs);
+    case CNODE_AND:
+        for (int i = 0; i < n->n_children; i++)
+            if (!criteria_match_tree(rec, n->children[i], fs)) return 0;
+        return 1;
+    case CNODE_OR:
+        for (int i = 0; i < n->n_children; i++)
+            if (criteria_match_tree(rec, n->children[i], fs)) return 1;
+        return 0;
+    }
+    return 0;
+}
+
+/* Forward decl — parse_tree_element and parse_tree_array recurse through each other. */
+static CriteriaNode *parse_tree_element(const char *obj_buf, int depth, const char **err);
+
+/* Parse the children of an array `[elem, elem, ...]` into parent. `arr_p` must
+   point at the opening '['. Each element is a leaf or a branch object. */
+static int parse_tree_array(const char *arr_p, CriteriaNode *parent,
+                            int depth, const char **err) {
+    if (depth > MAX_CRITERIA_DEPTH) {
+        if (err) *err = "nesting too deep (max 16)";
+        return -1;
+    }
+    const char *p = json_skip(arr_p);
+    if (*p != '[') { if (err) *err = "expected array"; return -1; }
+    p++;
+    while (*p) {
+        p = json_skip(p);
+        if (*p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') { if (err) *err = "expected object in criteria array"; return -1; }
+
+        const char *obj_start = p;
+        const char *obj_end = json_skip_value(p);
+        size_t obj_len = obj_end - obj_start;
+        char *obj_buf = malloc(obj_len + 1);
+        if (!obj_buf) { if (err) *err = "out of memory"; return -1; }
+        memcpy(obj_buf, obj_start, obj_len);
+        obj_buf[obj_len] = '\0';
+
+        CriteriaNode *child = parse_tree_element(obj_buf, depth + 1, err);
+        free(obj_buf);
+        if (!child) return -1;
+
+        if (cnode_append(parent, child) != 0) {
+            free_criteria_tree(child);
+            if (err) *err = "out of memory";
+            return -1;
+        }
+        p = obj_end;
+    }
+    return 0;
+}
+
+/* Parse a single element: either a branch `{or:[...]}` / `{and:[...]}` or a leaf
+   `{field,op,value,...}`. Returns newly-allocated node or NULL on error. */
+static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
+                                        const char **err) {
+    if (depth > MAX_CRITERIA_DEPTH) {
+        if (err) *err = "nesting too deep (max 16)";
+        return NULL;
+    }
+
+    char *or_arr  = json_get_field(obj_buf, "or",  0);
+    char *and_arr = or_arr ? NULL : json_get_field(obj_buf, "and", 0);
+
+    if (or_arr || and_arr) {
+        CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
+        if (!n) { free(or_arr); free(and_arr); if (err) *err = "out of memory"; return NULL; }
+        const char *arr = or_arr ? or_arr : and_arr;
+        if (parse_tree_array(arr, n, depth, err) != 0) {
+            free_criteria_tree(n); free(or_arr); free(and_arr);
+            return NULL;
+        }
+        if (n->n_children == 0) {
+            free_criteria_tree(n); free(or_arr); free(and_arr);
+            if (err) *err = "empty or/and";
+            return NULL;
+        }
+        free(or_arr); free(and_arr);
+        return n;
+    }
+
+    CriteriaNode *n = cnode_new(CNODE_LEAF);
+    if (!n) { if (err) *err = "out of memory"; return NULL; }
+    parse_one_criterion(obj_buf, &n->leaf);
+    if (n->leaf.field[0] == '\0') {
+        free_criteria_tree(n);
+        if (err) *err = "leaf missing 'field'";
+        return NULL;
+    }
+    return n;
+}
+
+CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
+    if (err) *err = NULL;
+    if (!json || !json[0]) return NULL;
+
+    const char *p = json_skip(json);
+    if (!*p) return NULL;
+
+    if (*p == '[') {
+        CriteriaNode *root = cnode_new(CNODE_AND);
+        if (!root) { if (err) *err = "out of memory"; return NULL; }
+        if (parse_tree_array(p, root, 0, err) != 0) {
+            free_criteria_tree(root);
+            return NULL;
+        }
+        if (root->n_children == 0) {
+            free_criteria_tree(root);
+            return NULL;
+        }
+        return root;
+    }
+
+    if (*p == '{') {
+        char *or_arr  = json_get_field(p, "or",  0);
+        char *and_arr = or_arr ? NULL : json_get_field(p, "and", 0);
+        if (or_arr || and_arr) {
+            CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
+            if (!n) { free(or_arr); free(and_arr); if (err) *err = "out of memory"; return NULL; }
+            if (parse_tree_array(or_arr ? or_arr : and_arr, n, 0, err) != 0) {
+                free_criteria_tree(n); free(or_arr); free(and_arr);
+                return NULL;
+            }
+            if (n->n_children == 0) {
+                free_criteria_tree(n); free(or_arr); free(and_arr);
+                if (err) *err = "empty or/and";
+                return NULL;
+            }
+            free(or_arr); free(and_arr);
+            return n;
+        }
+
+        char *field = json_get_raw(p, "field");
+        if (field) {
+            free(field);
+            CriteriaNode *n = cnode_new(CNODE_LEAF);
+            if (!n) { if (err) *err = "out of memory"; return NULL; }
+            parse_one_criterion(p, &n->leaf);
+            return n;
+        }
+
+        /* Simple-equality form `{"k1":"v1","k2":"v2"}` — backward compat.
+           Parse k:v pairs as EQ leaves under an implicit AND root. */
+        CriteriaNode *root = cnode_new(CNODE_AND);
+        if (!root) { if (err) *err = "out of memory"; return NULL; }
+        p++;
+        while (*p) {
+            p = json_skip(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; continue; }
+            if (*p != '"') { p++; continue; }
+            p++;
+            const char *fname = p;
+            while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+            size_t flen = p - fname;
+            if (*p == '"') p++;
+            p = json_skip(p);
+            if (*p == ':') p++;
+            p = json_skip(p);
+            const char *vstart = p;
+            const char *vend = json_skip_value(p);
+            size_t vlen = vend - vstart;
+
+            CriteriaNode *leaf = cnode_new(CNODE_LEAF);
+            if (!leaf) { free_criteria_tree(root); if (err) *err = "out of memory"; return NULL; }
+            if (flen > 255) flen = 255;
+            memcpy(leaf->leaf.field, fname, flen);
+            leaf->leaf.field[flen] = '\0';
+            leaf->leaf.op = OP_EQUAL;
+            if (vlen >= 2 && *vstart == '"' && *(vend - 1) == '"') { vlen -= 2; vstart++; }
+            if (vlen > sizeof(leaf->leaf.value) - 1) vlen = sizeof(leaf->leaf.value) - 1;
+            memcpy(leaf->leaf.value, vstart, vlen);
+            leaf->leaf.value[vlen] = '\0';
+
+            if (cnode_append(root, leaf) != 0) {
+                free_criteria_tree(leaf); free_criteria_tree(root);
+                if (err) *err = "out of memory";
+                return NULL;
+            }
+            p = vend;
+        }
+        if (root->n_children == 0) { free_criteria_tree(root); return NULL; }
+        return root;
+    }
+
+    if (err) *err = "criteria must be array or object";
+    return NULL;
+}
+
+/* ========== Criteria tree planner ========== */
+
+/* Is the leaf's field indexable AND does the operator make a useful btree range?
+   Returns 1 and fills out_idx_path on success, 0 otherwise. */
+static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
+                           const char *object, char *out_idx_path, size_t out_sz) {
+    if (!c || !c->field[0]) return 0;
+    if (c->op == OP_NOT_EXISTS) return 0;  /* missing field → not in index */
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->field);
+    struct stat st;
+    if (stat(p, &st) != 0 || st.st_size == 0) return 0;
+    if (out_idx_path) strncpy(out_idx_path, p, out_sz - 1);
+    return 1;
+}
+
+/* Walk immediate children of an AND root looking for the first indexable leaf.
+   Single-LEAF roots are treated as an AND of one. Returns the leaf's
+   SearchCriterion* (pointer into the tree — do not free). */
+static SearchCriterion *find_primary_leaf(CriteriaNode *root,
+                                          const char *db_root, const char *object,
+                                          char *out_idx_path, size_t out_sz) {
+    if (!root) return NULL;
+    if (root->kind == CNODE_LEAF) {
+        if (leaf_is_indexed(&root->leaf, db_root, object, out_idx_path, out_sz))
+            return &root->leaf;
+        return NULL;
+    }
+    if (root->kind == CNODE_AND) {
+        for (int i = 0; i < root->n_children; i++) {
+            CriteriaNode *c = root->children[i];
+            if (c->kind == CNODE_LEAF &&
+                leaf_is_indexed(&c->leaf, db_root, object, out_idx_path, out_sz))
+                return &c->leaf;
+        }
+    }
+    return NULL;
+}
+
+/* True if every child of `or_node` is a LEAF with an index. Nested AND/OR inside
+   OR disqualifies (keeps the planner simple — those fall to full scan). */
+static int or_all_children_indexed(const CriteriaNode *or_node,
+                                   const char *db_root, const char *object) {
+    if (!or_node || or_node->kind != CNODE_OR) return 0;
+    for (int i = 0; i < or_node->n_children; i++) {
+        CriteriaNode *c = or_node->children[i];
+        if (c->kind != CNODE_LEAF) return 0;
+        if (!leaf_is_indexed(&c->leaf, db_root, object, NULL, 0)) return 0;
+    }
+    return or_node->n_children > 0;
+}
+
+/* Look for an OR child of the root AND (or root itself if root is OR) whose
+   children are all indexed. Used when no AND leaf is indexable — we can still
+   narrow candidates via an OR-union fast path. Returns the OR node, or NULL. */
+static CriteriaNode *find_fully_indexed_or(CriteriaNode *root,
+                                           const char *db_root, const char *object) {
+    if (!root) return NULL;
+    if (root->kind == CNODE_OR) {
+        return or_all_children_indexed(root, db_root, object) ? root : NULL;
+    }
+    if (root->kind == CNODE_AND) {
+        for (int i = 0; i < root->n_children; i++) {
+            CriteriaNode *c = root->children[i];
+            if (c->kind == CNODE_OR && or_all_children_indexed(c, db_root, object))
+                return c;
+        }
+    }
+    return NULL;
+}
+
+typedef enum {
+    PRIMARY_NONE,     /* full scan */
+    PRIMARY_LEAF,     /* single indexed leaf drives btree_range */
+    PRIMARY_KEYSET    /* OR sub-tree drives index-union into a KeySet */
+} PrimaryKind;
+
+typedef struct {
+    PrimaryKind kind;
+    SearchCriterion *primary_leaf;   /* PRIMARY_LEAF */
+    char primary_idx_path[PATH_MAX];
+    CriteriaNode *or_node;           /* PRIMARY_KEYSET */
+} QueryPlan;
+
+static QueryPlan choose_primary_source(CriteriaNode *tree,
+                                       const char *db_root, const char *object) {
+    QueryPlan p = {0};
+    if (!tree) { p.kind = PRIMARY_NONE; return p; }
+
+    char idx_path[PATH_MAX] = "";
+    SearchCriterion *leaf = find_primary_leaf(tree, db_root, object,
+                                              idx_path, sizeof(idx_path));
+    if (leaf) {
+        p.kind = PRIMARY_LEAF;
+        p.primary_leaf = leaf;
+        strncpy(p.primary_idx_path, idx_path, sizeof(p.primary_idx_path) - 1);
+        return p;
+    }
+
+    CriteriaNode *or_node = find_fully_indexed_or(tree, db_root, object);
+    if (or_node) {
+        p.kind = PRIMARY_KEYSET;
+        p.or_node = or_node;
+        return p;
+    }
+
+    p.kind = PRIMARY_NONE;
+    return p;
+}
+
+/* ========== OR index-union (KeySet fast path) ========== */
+
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const SearchCriterion *leaf;
+    const char *idx_path;
+    KeySet *ks;
+    QueryDeadline *deadline;
+    int dl_counter;
+} OrChildWorkerCtx;
+
+/* btree callback — drops every hit into the shared KeySet. */
+static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;
+    OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
+    if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
+    keyset_insert(w->ks, hash16);
+    return 0;
+}
+
+static void *or_child_worker(void *arg) {
+    OrChildWorkerCtx *w = (OrChildWorkerCtx *)arg;
+    btree_dispatch(w->idx_path, (SearchCriterion *)w->leaf, or_collect_cb, w);
+    return NULL;
+}
+
+/* Build a KeySet by unioning the index lookups of every child of `or_node`.
+   Every child must be a LEAF with an index (verified by the planner).
+   Caller owns the returned KeySet and must keyset_free() it. */
+static KeySet *build_or_keyset(const char *db_root, const char *object,
+                               const CriteriaNode *or_node, QueryDeadline *dl) {
+    int n = or_node->n_children;
+    if (n <= 0) return NULL;
+
+    /* Estimate total candidate size from index file sizes (very rough: 1 entry
+       per 64 bytes of leaf storage). Floor at 1024, cap at 1M to keep memory
+       bounded for a single query. */
+    size_t est_total = 0;
+    for (int i = 0; i < n; i++) {
+        CriteriaNode *c = or_node->children[i];
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->leaf.field);
+        struct stat st;
+        if (stat(p, &st) == 0) est_total += (size_t)st.st_size / 64;
+    }
+    if (est_total < 1024) est_total = 1024;
+    if (est_total > 1000000) est_total = 1000000;
+
+    KeySet *ks = keyset_new(est_total);
+    if (!ks) return NULL;
+
+    OrChildWorkerCtx *ctxs = calloc(n, sizeof(OrChildWorkerCtx));
+    char (*idx_paths)[PATH_MAX] = calloc(n, sizeof(*idx_paths));
+    for (int i = 0; i < n; i++) {
+        CriteriaNode *c = or_node->children[i];
+        snprintf(idx_paths[i], PATH_MAX, "%s/%s/indexes/%s.idx",
+                 db_root, object, c->leaf.field);
+        ctxs[i].db_root = db_root;
+        ctxs[i].object = object;
+        ctxs[i].leaf = &c->leaf;
+        ctxs[i].idx_path = idx_paths[i];
+        ctxs[i].ks = ks;
+        ctxs[i].deadline = dl;
+    }
+
+    if (n < 2) {
+        or_child_worker(&ctxs[0]);
+    } else {
+        pthread_t *threads = calloc(n, sizeof(pthread_t));
+        for (int i = 0; i < n; i++)
+            pthread_create(&threads[i], NULL, or_child_worker, &ctxs[i]);
+        for (int i = 0; i < n; i++)
+            pthread_join(threads[i], NULL);
+        free(threads);
+    }
+
+    free(ctxs);
+    free(idx_paths);
+    return ks;
+}
+
+/* Read the record at `hash` from the object's shards. Writes the value payload
+   start + length into *out_val, *out_len. Returns 0 on success, -1 not found.
+   Caller holds the returned pointer only for the duration of the mmap lease. */
+typedef struct {
+    uint8_t *map;
+    size_t map_len;
+    const uint8_t *val;
+    size_t val_len;
+} KeysetRecordRead;
+
+static int read_record_by_hash(const char *db_root, const char *object,
+                               const Schema *sch, const uint8_t hash[16],
+                               KeysetRecordRead *out) {
+    memset(out, 0, sizeof(*out));
+    int shard_id, slot;
+    addr_from_hash(hash, sch->splits, &shard_id, &slot);
+
+    char shard[PATH_MAX];
+    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
+    int fd = open(shard, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)SHARD_HDR_SIZE) {
+        close(fd); return -1;
+    }
+    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return -1;
+
+    const ShardHeader *sh = (const ShardHeader *)map;
+    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) {
+        munmap(map, st.st_size); return -1;
+    }
+    uint32_t slots = sh->slots_per_shard;
+    uint32_t mask  = slots - 1;
+
+    for (uint32_t p = 0; p < slots; p++) {
+        uint32_t s = ((uint32_t)slot + p) & mask;
+        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+        if (h->flag == 0 && h->key_len == 0) break;
+        if (h->flag != 1) continue;
+        if (memcmp(h->hash, hash, 16) != 0) continue;
+
+        out->map = map;
+        out->map_len = st.st_size;
+        out->val = map + zoneB_off(s, slots, sch->slot_size) + h->key_len;
+        out->val_len = h->value_len;
+        return 0;
+    }
+    munmap(map, st.st_size);
+    return -1;
+}
+
+static void release_record_read(KeysetRecordRead *r) {
+    if (r && r->map) { munmap(r->map, r->map_len); r->map = NULL; }
+}
+
+/* Count records matching `tree` by iterating a KeySet built from the OR branch.
+   For pure-OR trees (root IS the or_node), returns |KeySet| directly.
+   For hybrid (AND + OR), re-matches each keyed record against the full tree. */
+static size_t keyset_count_from_or(const char *db_root, const char *object,
+                                   const Schema *sch, CriteriaNode *tree,
+                                   CriteriaNode *or_node, FieldSchema *fs,
+                                   QueryDeadline *dl) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl);
+    if (!ks) return 0;
+    if (dl->timed_out) { keyset_free(ks); return 0; }
+
+    /* Pure-OR (root is the OR itself) — no AND siblings, no re-match needed. */
+    if (tree == or_node || tree->kind == CNODE_OR) {
+        size_t n = keyset_size(ks);
+        keyset_free(ks);
+        return n;
+    }
+
+    /* Hybrid: fetch each keyed record, apply full tree match. */
+    size_t n = 0;
+    int dl_counter = 0;
+    for (size_t b = 0; b < ks->cap; b++) {
+        if (query_deadline_tick(dl, &dl_counter)) break;
+        if (ks->state[b] != 2) continue;
+        KeysetRecordRead r;
+        if (read_record_by_hash(db_root, object, sch, ks->keys[b], &r) != 0) continue;
+        if (criteria_match_tree(r.val, tree, fs)) n++;
+        release_record_read(&r);
+    }
+    keyset_free(ks);
+    return n;
+}
+
 /* ========== COUNT with criteria ========== */
 
 typedef struct {
-    CompiledCriterion *compiled;
-    int num_criteria;
+    CriteriaNode *tree;
     FieldSchema *fs;
     int count;
     QueryDeadline *deadline;
@@ -4534,9 +5043,7 @@ static int count_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     CountCtx *cc = (CountCtx *)ctx;
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return 1;
     const uint8_t *raw = block + hdr->key_len;
-    for (int i = 0; i < cc->num_criteria; i++) {
-        if (!match_typed(raw, &cc->compiled[i], cc->fs)) return 0;
-    }
+    if (!criteria_match_tree(raw, cc->tree, cc->fs)) return 0;
     cc->count++;
     return 0;
 }
@@ -4549,86 +5056,79 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         return 0;
     }
 
-    Schema sch = load_schema(db_root, object);
-    SearchCriterion *criteria = NULL; int ncrit = 0;
-    parse_criteria_json(criteria_json, &criteria, &ncrit);
-    if (ncrit == 0) {
-        free_criteria(criteria, ncrit);
+    const char *perr = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
+    if (perr) {
+        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
+        free_criteria_tree(tree);
+        return 1;
+    }
+    if (!tree) {
         int n = get_live_count(db_root, object);
         OUT("{\"count\":%d}\n", n);
         return 0;
     }
 
+    Schema sch = load_schema(db_root, object);
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
+    compile_criteria_tree(tree, fs.ts);
+
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
-    /* Check if any criterion can use a B+ tree index */
-    int primary_idx = -1;
-    char primary_idx_path[PATH_MAX] = "";
-    for (int i = 0; i < ncrit; i++) {
-        enum SearchOp op = criteria[i].op;
-        if (op == OP_NOT_EXISTS) continue; /* records without the field aren't in the index */
-        char ipath[PATH_MAX];
-        snprintf(ipath, sizeof(ipath), "%s/%s/indexes/%s.idx", db_root, object, criteria[i].field);
-        struct stat ist;
-        if (stat(ipath, &ist) == 0 && ist.st_size > 0) {
-            primary_idx = i;
-            strncpy(primary_idx_path, ipath, PATH_MAX - 1);
-            break;
-        }
-    }
-
+    QueryPlan plan = choose_primary_source(tree, db_root, object);
     QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
 
-    if (primary_idx >= 0) {
-        SearchCriterion *pc = &criteria[primary_idx];
-        int check_primary;
-        { enum SearchOp _op = criteria[primary_idx].op;
-          check_primary = (_op == OP_CONTAINS || _op == OP_LIKE || _op == OP_ENDS_WITH ||
-                          _op == OP_NOT_LIKE || _op == OP_NOT_CONTAINS || _op == OP_NOT_IN);
-        }
+    if (plan.kind == PRIMARY_LEAF) {
+        SearchCriterion *pc = plan.primary_leaf;
+        enum SearchOp op = pc->op;
+        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
+                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
 
-        if (ncrit == 1) {
-            /* Single criterion: inline counting via btree walk — no record fetch. */
+        /* Single-leaf tree → inline btree count, no record fetch. */
+        int is_single_leaf =
+            (tree->kind == CNODE_LEAF) ||
+            (tree->kind == CNODE_AND && tree->n_children == 1 &&
+             tree->children[0]->kind == CNODE_LEAF);
+
+        if (is_single_leaf) {
             IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
-            btree_dispatch(primary_idx_path, pc, idx_count_cb, &ic);
+            btree_dispatch(plan.primary_idx_path, pc, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("{\"count\":%zu}\n", ic.count);
         } else {
-            /* Multi-criteria: collect hashes, group by shard, parallel probe+match_typed. */
-            CompiledCriterion *compiled = compile_criteria(criteria, ncrit, fs.ts);
             CollectCtx cc;
             memset(&cc, 0, sizeof(cc));
             cc.cap = 4096;
             cc.entries = malloc(cc.cap * sizeof(CollectedHash));
             cc.splits = sch.splits;
-            cc.criteria = criteria;
-            cc.primary_idx = primary_idx;
+            cc.primary_crit = pc;
             cc.check_primary = check_primary;
             cc.deadline = &dl;
-            btree_dispatch(primary_idx_path, pc, collect_hash_cb, &cc);
+            btree_dispatch(plan.primary_idx_path, pc, collect_hash_cb, &cc);
 
             size_t count = parallel_indexed_count(db_root, object, &sch,
                                                   cc.entries, (int)cc.count,
-                                                  compiled, ncrit, primary_idx,
-                                                  check_primary, &fs, &dl);
+                                                  tree, &fs, &dl);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("{\"count\":%zu}\n", count);
             free(cc.entries);
-            free_compiled_criteria(compiled, ncrit);
         }
+    } else if (plan.kind == PRIMARY_KEYSET) {
+        /* Shape C / hybrid: build KeySet from OR index-union. */
+        size_t count = keyset_count_from_or(db_root, object, &sch, tree, plan.or_node,
+                                            &fs, &dl);
+        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+        else OUT("{\"count\":%zu}\n", count);
     } else {
-        CompiledCriterion *compiled = compile_criteria(criteria, ncrit, fs.ts);
-        CountCtx ctx = { compiled, ncrit, &fs, 0, &dl, 0 };
+        CountCtx ctx = { tree, &fs, 0, &dl, 0 };
         scan_shards(data_dir, sch.slot_size, count_scan_cb, &ctx);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("{\"count\":%d}\n", ctx.count);
-        free_compiled_criteria(compiled, ncrit);
     }
 
-    free_criteria(criteria, ncrit);
+    free_criteria_tree(tree);
     return 0;
 }
 
@@ -5461,6 +5961,30 @@ int cmd_get_file_b64(const char *db_root, const char *object, const char *filena
     OUT("{\"status\":\"ok\",\"filename\":\"%s\",\"bytes\":%zu,\"data\":\"%s\"}\n",
         filename, sz, enc);
     free(enc);
+    return 0;
+}
+
+/* Remove a file previously stored via put-file. Hash-bucket resolution matches
+   put-file / get-file. Returns {"status":"deleted",...} or {"error":"file not found",...}. */
+int cmd_delete_file(const char *db_root, const char *object, const char *filename) {
+    if (!valid_filename(filename)) {
+        OUT("{\"error\":\"invalid filename\"}\n");
+        return 1;
+    }
+
+    char dest_dir[PATH_MAX], dest[PATH_MAX];
+    file_dest_path(db_root, object, filename, dest_dir, sizeof(dest_dir), dest, sizeof(dest));
+
+    if (unlink(dest) != 0) {
+        if (errno == ENOENT)
+            OUT("{\"error\":\"file not found\",\"filename\":\"%s\"}\n", filename);
+        else
+            OUT("{\"error\":\"unlink failed: %s\",\"filename\":\"%s\"}\n",
+                strerror(errno), filename);
+        return 1;
+    }
+
+    OUT("{\"status\":\"deleted\",\"filename\":\"%s\"}\n", filename);
     return 0;
 }
 
@@ -6479,8 +7003,7 @@ int cmd_aggregate(const char *db_root, const char *object,
         cc.cap = 4096;
         cc.entries = malloc(cc.cap * sizeof(CollectedHash));
         cc.splits = sch.splits;
-        cc.criteria = criteria;
-        cc.primary_idx = primary_idx;
+        cc.primary_crit = &criteria[primary_idx];
         cc.check_primary = check_primary;
         cc.deadline = &dl;
 

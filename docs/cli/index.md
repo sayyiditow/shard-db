@@ -28,6 +28,8 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 | Command | Args | Description |
 |---|---|---|
 | `find` | `<dir> <obj> '<criteria_json>' [offset] [limit] [fields]` | Search records. For `join`, `order_by`, `format`, etc. use [JSON mode](../query-protocol/find.md). |
+| `count` | `<dir> <obj> [criteria_json]` | Count matching records. Omit criteria for the O(1) metadata count. |
+| `aggregate` | `<dir> <obj> '<aggregates_json>' [group_by_csv] [criteria_json] [having_json]` | Group + aggregate. `group_by` is a comma-separated field list; leave intermediate slots empty (`''`) to skip them. |
 | `keys` | `<dir> <obj> [offset] [limit]` | List keys, paginated. |
 | `fetch` | `<dir> <obj> [offset] [limit] [fields]` | Paginated full scan with optional field projection. Use JSON mode for keyset `cursor` pagination. |
 
@@ -44,6 +46,7 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 |---|---|---|
 | `put-file` | `<dir> <obj> <local-path> [--if-not-exists]` | Upload local file to server (base64 over TCP). `--if-not-exists` refuses overwrite. |
 | `get-file` | `<dir> <obj> <filename> [<out-path>]` | Download by filename (base64 over TCP). Writes to `<out-path>` or stdout. |
+| `delete-file` | `<dir> <obj> <filename>` | Remove a stored file. Returns `{"status":"deleted",...}` or `{"error":"file not found",...}`. |
 
 Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). For same-host admin tasks, [JSON mode `put-file` with `path`](../query-protocol/files.md) and `get-file-path` skip the base64 roundtrip.
 

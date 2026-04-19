@@ -19,7 +19,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-vacuum-addfield.sh           # vacuum + add-field               (50)
 ./test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity (23)
 ./test-joins.sh                     # Join support                     (17)
-# Total: 167 tests
+./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
+# Total: 195 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -110,6 +111,8 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 
 # Query (CLI — for simple ad-hoc; full query shape via JSON)
 ./shard-db find <dir> <obj> '<criteria>' [off] [lim] [fields]
+./shard-db count <dir> <obj> [criteria_json]      # empty criteria = O(1) metadata count
+./shard-db aggregate <dir> <obj> <aggregates_json> [group_by_csv] [criteria_json] [having_json]
 ./shard-db keys <dir> <obj> [off] [lim]
 ./shard-db fetch <dir> <obj> [off] [lim] [fields]
 
@@ -120,6 +123,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 # Files (base64-in-JSON over TCP — remote-safe)
 ./shard-db put-file <dir> <obj> <local-path> [--if-not-exists]
 ./shard-db get-file <dir> <obj> <filename> [<out-path>]
+./shard-db delete-file <dir> <obj> <filename>
 
 # Maintenance
 ./shard-db size|recount|truncate|vacuum|backup <dir> <obj>
@@ -194,6 +198,7 @@ Files live at `$DB_ROOT/<dir>/<obj>/files/XX/XX/<filename>`, hash-bucketed by fi
 Remote-safe (base64 in JSON):
 - `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
 - `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
+- `{"mode":"delete-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"deleted","filename":"..."}` or `{"error":"file not found","filename":"..."}`.
 
 Server-local zero-copy (same-host callers only — admin fast path):
 - `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.

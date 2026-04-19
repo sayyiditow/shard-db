@@ -163,6 +163,45 @@ typedef struct {
    consumed by match_typed() in the scan hot path. */
 typedef struct CompiledCriterion CompiledCriterion;
 
+/* Tree form of criteria — supports AND/OR composition.
+   Built by parse_criteria_tree(); flat arrays parse as a single AND root.
+   A LEAF carries a plain SearchCriterion; AND/OR branches own their children. */
+typedef enum { CNODE_LEAF, CNODE_AND, CNODE_OR } CriteriaNodeKind;
+
+typedef struct CriteriaNode {
+    CriteriaNodeKind kind;
+    SearchCriterion leaf;            /* valid iff kind == CNODE_LEAF */
+    CompiledCriterion *compiled;     /* populated by compile_criteria_tree() */
+    struct CriteriaNode **children;  /* valid iff kind == CNODE_AND || CNODE_OR */
+    int n_children;
+} CriteriaNode;
+
+#define MAX_CRITERIA_DEPTH 16
+
+/* Concurrent hash set of 16-byte xxh128 record-key hashes.
+   Used by the OR index-union fast path: multiple threads insert candidate keys
+   from their respective B+ tree lookups; duplicates are deduplicated via
+   lock-free CAS inserts. Capacity is fixed at construction — callers must
+   pre-size large enough to avoid hitting full (probes return failure). */
+typedef struct {
+    uint8_t  (*keys)[16];    /* cap buckets of 16-byte xxh128 */
+    uint32_t *state;          /* 0=empty, 1=filling, 2=filled */
+    size_t   cap;             /* power of two */
+    size_t   mask;            /* cap - 1 */
+    _Atomic size_t n;         /* filled count (approximate until all threads join) */
+} KeySet;
+
+KeySet *keyset_new(size_t capacity_hint);
+void    keyset_free(KeySet *ks);
+/* Returns 1 if newly inserted, 0 if duplicate, -1 if set is full. */
+int     keyset_insert(KeySet *ks, const uint8_t hash[16]);
+int     keyset_contains(const KeySet *ks, const uint8_t hash[16]);
+size_t  keyset_size(const KeySet *ks);
+/* Iterate every filled bucket calling cb(hash, ctx). Stops early if cb returns non-zero. */
+void    keyset_iter(const KeySet *ks,
+                    int (*cb)(const uint8_t hash[16], void *ctx),
+                    void *ctx);
+
 typedef struct {
     char **keys;
     int count;
@@ -433,6 +472,7 @@ int cmd_put_file_b64(const char *db_root, const char *object,
                      const char *filename, const char *b64_data, size_t b64_len,
                      int if_not_exists);
 int cmd_get_file_b64(const char *db_root, const char *object, const char *filename);
+int cmd_delete_file(const char *db_root, const char *object, const char *filename);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key);
@@ -464,6 +504,21 @@ int match_criterion(const char *val_str, const SearchCriterion *c);
 enum SearchOp parse_op(const char *s);
 int parse_criteria_json(const char *json, SearchCriterion **out, int *count);
 void free_criteria(SearchCriterion *c, int count);
+
+/* Tree parser — returns NULL for empty/no-criteria (not an error) or on parse
+   failure (err_out set to a string literal). Caller owns the returned tree and
+   must free via free_criteria_tree(). */
+CriteriaNode *parse_criteria_tree(const char *json, const char **err_out);
+void free_criteria_tree(CriteriaNode *root);
+
+/* Pre-compile every leaf in the tree against the schema so match_typed() has
+   zero-malloc-per-record cost during scans. Safe to call multiple times — leaves
+   already compiled are skipped. */
+void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
+
+/* Recursive match: AND short-circuits on first false, OR on first true. Passing
+   NULL means "no criteria" → match-all (returns 1). */
+int criteria_match_tree(const uint8_t *rec, const CriteriaNode *node, FieldSchema *fs);
 int cas_check(TypedSchema *ts, const uint8_t *value_ptr, SearchCriterion *crit, int ncrit);
 
 

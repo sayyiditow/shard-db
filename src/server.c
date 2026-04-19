@@ -14,6 +14,7 @@ static int mode_is_write(const char *m) {
            strcasecmp(m, "bulk-update") == 0 ||
            strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
            strcasecmp(m, "put-file") == 0 ||
+           strcasecmp(m, "delete-file") == 0 ||
            strcasecmp(m, "sequence") == 0;
 }
 /* Schema/rebuild commands — take exclusive wrlock. */
@@ -842,6 +843,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "get-file-path") == 0) {
         char *filename = json_get_raw(json, "filename");
         if (filename) cmd_get_file_path(db_root, object, filename);
+        free(filename);
+    } else if (strcmp(mode, "delete-file") == 0) {
+        char *filename = json_get_raw(json, "filename");
+        if (filename) cmd_delete_file(db_root, object, filename);
+        else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
     } else if (strcmp(mode, "aggregate") == 0) {
         char *crit = json_get_field(json, "criteria", 0);

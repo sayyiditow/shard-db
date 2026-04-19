@@ -32,6 +32,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  exists <object> <key>                Check if key exists\n");
         fprintf(stderr, "  size <object>                        Record count\n");
         fprintf(stderr, "  find <object> <criteria> [off] [lim] [fields]\n");
+        fprintf(stderr, "  count <dir> <obj> [criteria_json]    Count records (criteria optional)\n");
+        fprintf(stderr, "  aggregate <dir> <obj> <aggregates_json> [group_by_csv] [criteria_json] [having_json]\n");
         fprintf(stderr, "  keys <object> [offset] [limit]       List keys\n");
         fprintf(stderr, "  fetch <object> [off] [lim] [fields]  Paginated scan\n");
         fprintf(stderr, "  add-index <object> <field> [-f]      Build index\n");
@@ -46,6 +48,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "                                       Upload file (base64 over TCP)\n");
         fprintf(stderr, "  get-file <dir> <object> <filename> [<out-path>]\n");
         fprintf(stderr, "                                       Download file (base64 over TCP)\n");
+        fprintf(stderr, "  delete-file <dir> <object> <filename> Remove a stored file\n");
         fprintf(stderr, "  get-file-path <object> <filename>    Get server-local file path\n");
         fprintf(stderr, "\nSchema mutations (via JSON query):\n");
         fprintf(stderr, "  query '{\"mode\":\"rename-field\",\"dir\":\"...\",\"object\":\"...\",\"old\":\"...\",\"new\":\"...\"}'\n");
@@ -122,6 +125,95 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "vacuum-check") == 0)
         return cmd_query_json(port, "{\"mode\":\"vacuum-check\"}");
 
+    /* count <dir> <obj> [criteria_json] — debugging shortcut for the JSON query.
+       criteria_json must be a JSON array like '[{"field":"age","op":"gt","value":"30"}]'.
+       Empty/absent criteria returns the O(1) live count from metadata. */
+    if (strcmp(cmd, "count") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: shard-db count <dir> <obj> [criteria_json]\n");
+            return 1;
+        }
+        const char *crit = (argc >= 5 && argv[4][0]) ? argv[4] : NULL;
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + (crit ? strlen(crit) : 0) + 128;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        if (crit)
+            snprintf(json, cap,
+                "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s}",
+                argv[2], argv[3], crit);
+        else
+            snprintf(json, cap,
+                "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\"}",
+                argv[2], argv[3]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+
+    /* aggregate <dir> <obj> <aggregates_json> [group_by_csv] [criteria_json] [having_json]
+       group_by accepts comma-separated field names ("status,region"); use empty string to
+       skip a positional slot. */
+    if (strcmp(cmd, "aggregate") == 0) {
+        if (argc < 5) {
+            fprintf(stderr,
+                "Usage: shard-db aggregate <dir> <obj> <aggregates_json> "
+                "[group_by_csv] [criteria_json] [having_json]\n");
+            return 1;
+        }
+        const char *aggs = argv[4];
+        const char *gb   = (argc >= 6 && argv[5][0]) ? argv[5] : NULL;
+        const char *crit = (argc >= 7 && argv[6][0]) ? argv[6] : NULL;
+        const char *hav  = (argc >= 8 && argv[7][0]) ? argv[7] : NULL;
+
+        char *gb_json = NULL;
+        if (gb) {
+            size_t gblen = strlen(gb);
+            gb_json = malloc(gblen * 2 + 16);
+            if (!gb_json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+            char *p = gb_json;
+            *p++ = '[';
+            int first = 1;
+            const char *s = gb;
+            while (*s) {
+                const char *end = strchr(s, ',');
+                if (!end) end = s + strlen(s);
+                while (s < end && (*s == ' ' || *s == '\t')) s++;
+                const char *fe = end;
+                while (fe > s && (fe[-1] == ' ' || fe[-1] == '\t')) fe--;
+                if (fe > s) {
+                    if (!first) *p++ = ',';
+                    first = 0;
+                    *p++ = '"';
+                    memcpy(p, s, fe - s);
+                    p += fe - s;
+                    *p++ = '"';
+                }
+                if (!*end) break;
+                s = end + 1;
+            }
+            *p++ = ']';
+            *p = '\0';
+        }
+
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(aggs)
+                   + (gb_json ? strlen(gb_json) : 0)
+                   + (crit ? strlen(crit) : 0)
+                   + (hav  ? strlen(hav)  : 0) + 256;
+        char *json = malloc(cap);
+        if (!json) { free(gb_json); fprintf(stderr, "Error: out of memory\n"); return 1; }
+        int n = snprintf(json, cap,
+            "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\",\"aggregates\":%s",
+            argv[2], argv[3], aggs);
+        if (gb_json) n += snprintf(json + n, cap - n, ",\"group_by\":%s", gb_json);
+        if (crit)    n += snprintf(json + n, cap - n, ",\"criteria\":%s", crit);
+        if (hav)     n += snprintf(json + n, cap - n, ",\"having\":%s", hav);
+        snprintf(json + n, cap - n, "}");
+
+        int rc = cmd_query_json(port, json);
+        free(json); free(gb_json);
+        return rc;
+    }
+
     /* File upload/download: route through dedicated TCP helpers (base64 in JSON).
        Usage:
          put-file <dir> <object> <local-path> [--if-not-exists]
@@ -142,6 +234,21 @@ int main(int argc, char *argv[]) {
         }
         const char *out_path = (argc >= 6) ? argv[5] : NULL;
         return cmd_get_file_tcp(port, argv[2], argv[3], argv[4], out_path);
+    }
+    if (strcmp(cmd, "delete-file") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "Usage: shard-db delete-file <dir> <object> <filename>\n");
+            return 1;
+        }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(argv[4]) + 128;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"delete-file\",\"dir\":\"%s\",\"object\":\"%s\",\"filename\":\"%s\"}",
+            argv[2], argv[3], argv[4]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
     }
 
     return cmd_query(port, argc - 1, argv + 1);

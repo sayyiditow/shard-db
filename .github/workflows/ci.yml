@@ -43,3 +43,6 @@ jobs:
 
       - name: Joins (test-joins)
         run: ./test-joins.sh
+
+      - name: CLI shortcuts + delete-file (test-cli-shortcuts)
+        run: ./test-cli-shortcuts.sh

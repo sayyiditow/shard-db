@@ -53,6 +53,18 @@ Returns the total active record count (same as `size` without the orphan field).
  ]}
 ```
 
+### CLI shortcut
+
+```bash
+./shard-db count <dir> <obj> [criteria_json]
+```
+
+Omit the criteria argument to get the O(1) metadata count. Criteria must be a JSON array in a single shell-quoted argument:
+
+```bash
+./shard-db count acme orders '[{"field":"status","op":"eq","value":"paid"}]'
+```
+
 ### When to prefer `aggregate`
 
 If you want multiple counts (by status, by region, etc.) in one trip, use [`aggregate`](aggregate.md) with `group_by` instead of N round trips.

@@ -151,6 +151,22 @@ Typical latency on 1 M records: 1–3 ms for indexed, 2–10 ms for full scans w
  ]}
 ```
 
+## CLI shortcut
+
+```bash
+./shard-db aggregate <dir> <obj> '<aggregates_json>' [group_by_csv] [criteria_json] [having_json]
+```
+
+`group_by` is a plain comma-separated field list (whitespace tolerated). Later positional slots can be skipped with an empty `''` argument — e.g. to pass `having` without `criteria`:
+
+```bash
+./shard-db aggregate acme orders \
+  '[{"fn":"count","alias":"n"}]' \
+  'status,region' \
+  '' \
+  '[{"field":"n","op":"gte","value":"100"}]'
+```
+
 ## Limitations
 
 - Max **32 aggregates per query** (`MAX_AGG_SPECS`).
