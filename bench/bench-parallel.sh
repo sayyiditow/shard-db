@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 TOTAL=${1:-1000000}
 CHUNK=${2:-200000}
 CONNS=${3:-5}
+SPLITS=${SPLITS:-256}
 BIN="./shard-db"
 DB_ROOT=$(grep DB_ROOT db.env | sed "s/.*[\"']\(.*\)[\"']/\1/")
 PORT=$(grep PORT db.env | sed "s/.*[\"']\{0,1\}\([0-9]*\).*/\1/")
@@ -156,7 +157,7 @@ create_fresh() {
     $BIN query '{"mode":"truncate","dir":"default","object":"bench"}' > /dev/null 2>&1
     rm -rf "$DB_ROOT/default/bench"
     sed -i '/^default:bench:/d' "$DB_ROOT/schema.conf" 2>/dev/null
-    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":256,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":[]}" > /dev/null
+    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":$SPLITS,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":[]}" > /dev/null
 }
 
 # ==================== TEST 1a: Single JSON file (baseline) ====================
@@ -200,7 +201,7 @@ echo "--- TEST 3: Parallel $CONNS connections × ${CHUNK}, WITH pre-existing ind
 $BIN query '{"mode":"truncate","dir":"default","object":"bench"}' > /dev/null 2>&1
 rm -rf "$DB_ROOT/default/bench"
 sed -i '/^default:bench:/d' "$DB_ROOT/schema.conf" 2>/dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":256,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":$INDEXES_JSON}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":$SPLITS,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":$INDEXES_JSON}" > /dev/null
 time (
     for i in $(seq 0 $((NCHUNKS-1))); do
         while [ $(jobs -r | wc -l) -ge $CONNS ]; do sleep 0.05; done
@@ -231,7 +232,7 @@ echo "--- TEST 5: Parallel CSV $CONNS connections × ${CHUNK}, WITH pre-existing
 $BIN query '{"mode":"truncate","dir":"default","object":"bench"}' > /dev/null 2>&1
 rm -rf "$DB_ROOT/default/bench"
 sed -i '/^default:bench:/d' "$DB_ROOT/schema.conf" 2>/dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":256,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":$INDEXES_JSON}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\",\"splits\":$SPLITS,\"max_key\":64,\"fields\":$FIELDS_JSON,\"indexes\":$INDEXES_JSON}" > /dev/null
 time (
     for i in $(seq 0 $((NCHUNKS-1))); do
         while [ $(jobs -r | wc -l) -ge $CONNS ]; do sleep 0.05; done

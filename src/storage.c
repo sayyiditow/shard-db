@@ -57,11 +57,21 @@ void build_idx_path(char *buf, size_t buflen,
    - msync all dirty entries on shutdown for durability
    - Bulk insert uses slot_bits/dirty for fast activation pass */
 
-#define UCACHE_STRIPES 64
+/* Single global mutex for ucache_ensure / eviction / grow. The previous
+   UCACHE_STRIPES[64] design was racy: ucache_probe() walks the entire
+   hash table across stripes, so two threads installing different paths
+   that probe into the same slot could both claim it — neither stripe
+   lock guarded the slot. The race was invisible while bulk-insert was
+   single-threaded; the shard-grouped parallel port (16 workers per
+   request) exposes it at high split counts (~1 shard/run dropped at
+   splits=1024, 10M records). A proper per-slot lock would be a larger
+   refactor — for now a single mutex is correct and cheap: cache ops
+   hit no I/O on warm hits and run in microseconds, so global
+   serialisation is not visible in profiles. */
 static UCacheEntry     *g_ucache = NULL;
 static int              g_ucache_slots = 0;
 static int              g_ucache_count = 0;
-static pthread_mutex_t  g_ucache_stripe[UCACHE_STRIPES];
+static pthread_mutex_t  g_ucache_table_mutex;
 static volatile uint64_t g_ucache_clock = 0;  /* monotonic counter for LRU */
 
 uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
@@ -90,8 +100,7 @@ void fcache_init(int cap) {
         pthread_rwlock_init(&g_ucache[i].rwlock, NULL);
         g_ucache[i].fd = -1;
     }
-    for (int i = 0; i < UCACHE_STRIPES; i++)
-        pthread_mutex_init(&g_ucache_stripe[i], NULL);
+    pthread_mutex_init(&g_ucache_table_mutex, NULL);
 }
 
 void fcache_shutdown(void) {
@@ -175,9 +184,7 @@ static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create, int 
    slot_size_for_create<=0 means read-only (don't create file).
    Returns slot index, or -1 on failure. */
 static int ucache_ensure(const char *path, int slot_size_for_create, int prealloc_mb) {
-    uint32_t h = path_hash(path);
-    int stripe = h % UCACHE_STRIPES;
-    pthread_mutex_lock(&g_ucache_stripe[stripe]);
+    pthread_mutex_lock(&g_ucache_table_mutex);
 
     int found = 0;
     int slot = ucache_probe(path, &found);
@@ -185,7 +192,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
     if (found) {
         __atomic_add_fetch(&g_ucache_hits, 1, __ATOMIC_RELAXED);
         g_ucache[slot].last_access = __atomic_add_fetch(&g_ucache_clock, 1, __ATOMIC_RELAXED);
-        pthread_mutex_unlock(&g_ucache_stripe[stripe]);
+        pthread_mutex_unlock(&g_ucache_table_mutex);
         return slot;
     }
 
@@ -199,19 +206,19 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
     if (slot_size_for_create <= 0) {
         /* Read-only: open existing file */
         fd = open(path, O_RDWR);
-        if (fd < 0) { pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+        if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         struct stat st;
-        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         slots_per_shard = shard_init_or_read_header(fd, 0, 0);
-        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         sz = st.st_size;
     } else {
         /* Write: create file if needed, write header + ftruncate */
         mkdirp(dirname_of(path));
         fd = open(path, O_RDWR | O_CREAT, 0644);
-        if (fd < 0) { pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+        if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         slots_per_shard = shard_init_or_read_header(fd, slot_size_for_create, prealloc_mb);
-        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         struct stat st; fstat(fd, &st);
         sz = st.st_size;
     }
@@ -239,7 +246,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
             slot = lru;
         } else {
             close(fd);
-            pthread_mutex_unlock(&g_ucache_stripe[stripe]);
+            pthread_mutex_unlock(&g_ucache_table_mutex);
             return -1;
         }
     }
@@ -250,7 +257,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
     e->map_size = sz;
     e->slots_per_shard = slots_per_shard;
     e->map = mmap_with_hints(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (e->map == MAP_FAILED) { e->map = NULL; close(fd); e->fd = -1; pthread_mutex_unlock(&g_ucache_stripe[stripe]); return -1; }
+    if (e->map == MAP_FAILED) { e->map = NULL; close(fd); e->fd = -1; pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
     e->used = 1;
     e->dirty = 0;
     e->slot_bits = NULL;
@@ -260,7 +267,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
     e->retired_fd = -1;
     e->last_access = __atomic_add_fetch(&g_ucache_clock, 1, __ATOMIC_RELAXED);
     g_ucache_count++;
-    pthread_mutex_unlock(&g_ucache_stripe[stripe]);
+    pthread_mutex_unlock(&g_ucache_table_mutex);
     return slot;
 }
 

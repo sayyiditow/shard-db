@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 # Usage: ./bench-kv.sh [record_count]
 
 COUNT=${1:-1000000}
+SPLITS=${SPLITS:-256}
 BIN="./shard-db"
 DB_ROOT=$(grep DB_ROOT db.env | sed "s/.*[\"']\(.*\)[\"']/\1/")
 PORT=$(grep PORT db.env | sed "s/.*[\"']\{0,1\}\([0-9]*\).*/\1/")
@@ -33,7 +34,7 @@ q() { echo "$1" | socat - TCP:localhost:$PORT 2>/dev/null | tr -d '\0'; }
 q_cli() { $BIN query "$1"; }
 
 # 256 splits keeps shard load manageable; max_key=32 max_value=100
-q_cli "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":256,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
+q_cli "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
 
 echo ""
 echo "Generating $COUNT records (32B hex key, ~100B value)..."

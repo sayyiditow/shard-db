@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 TOTAL=${1:-1000000}
 CHUNK=${2:-200000}
 CONNS=${3:-5}
+SPLITS=${SPLITS:-256}
 BIN="./shard-db"
 DB_ROOT=$(grep DB_ROOT db.env | sed "s/.*[\"']\(.*\)[\"']/\1/")
 PORT=$(grep PORT db.env | sed "s/.*[\"']\{0,1\}\([0-9]*\).*/\1/")
@@ -75,7 +76,7 @@ create_fresh() {
     $BIN query "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"$OBJ\"}" > /dev/null 2>&1
     rm -rf "$DB_ROOT/default/$OBJ"
     sed -i "/^default:$OBJ:/d" "$DB_ROOT/schema.conf" 2>/dev/null
-    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":256,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
+    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
 }
 
 # ==================== TEST 1a: Single JSON file (baseline) ====================
