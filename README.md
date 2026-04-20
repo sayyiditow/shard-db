@@ -9,25 +9,120 @@ A file-based sharded database written in C. Started as a key/value store; now a 
 
 ## Performance
 
-Measured on **1,000,000 records** (single object, 32-byte hex keys, ~100-byte typed values, indexes on `age`, `active`, `username`).
+Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a standalone script in `bench/`.
+
+### 1. K/V single-threaded — 10M records (`bench-kv.sh 10000000`, `SPLITS=512`)
+
+Schema: 32-byte hex key, one `varchar(100)` value.
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 1M records in one request) | **~130,000 inserts/sec** (7.69s total) |
-| Bulk insert (CSV, 1M records in one request) | **~131,000 inserts/sec** (7.62s total) |
-| Pipelined GET (10k ops, 1 connection) | **~36,000 ops/sec** (278ms) |
-| Parallel GET (50k ops, 5 connections) | **~129,000 ops/sec** (387ms) |
-| Parallel UPDATE (50k ops, 5 connections) | **~100,000 ops/sec** (501ms) |
-| Indexed `find` / `count` / `aggregate` (any operator) | **1–3 ms** |
-| Full-scan `find` on non-indexed field | **2–3 ms** (mmap + Zone A compact probe) |
-| `aggregate` with `group_by` + `having` | **1–2 ms** |
-| Disk footprint for 1M records | 161 MB (~161 bytes/record, indexes included) |
+| Bulk insert (JSON, 10M in one request) | **709 k inserts/sec** (14.11 s) |
+| Bulk insert (CSV, 10M in one request) | **805 k inserts/sec** (12.42 s) |
+| GET ×10,000 (pipelined, 1 conn) | **15.4 k ops/sec** (651 ms) |
+| EXISTS ×10,000 hits (pipelined) | **15.4 k ops/sec** (648 ms) |
+| EXISTS ×10,000 all-miss (cold probe) | **65.4 k ops/sec** (151 ms) |
+| UPDATE ×10,000 (pipelined) | **14.5 k ops/sec** (692 ms) |
+| DELETE ×10,000 (pipelined) | **8.9 k ops/sec** (1.13 s) |
+| Parallel GET (5 conns × 10k) | **62.5 k ops/sec** (800 ms) |
+| Parallel UPDATE (5 conns × 10k) | **47.8 k ops/sec** (1.05 s) |
+| Disk footprint | 2.6 GB |
 
-Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `not_in`, `like`, `not_like`, `contains`, `not_contains`, `starts`, `ends`, `exists`, `not_exists`) stay within the same 1–3 ms band on 1M records. Full scans are fast because Zone A (24-byte metadata headers) stays resident in page cache; typed binary records in Zone B are compared without JSON parsing.
+### 2. K/V multi-threaded — 10M records, scaling across connections (`bench-kv-parallel.sh 10000000 1000000 10`, `SPLITS=1024`)
 
-**Test machine:** AMD Ryzen 7 7840U (8 cores / 16 threads, up to 5.1 GHz) · 32 GB RAM · NVMe SSD (ext4) · Linux 6.19 · gcc 15.2 `-O2`.
+Same schema, bulk insert fanned out across TCP connections.
 
-**Reproduce:** `./bench/bench-kv.sh` (insert/get/update throughput) and `./bench/bench-queries.sh` (find/count/aggregate latencies). Scripts live in `bench/` and start/stop the server automatically (they self-resolve to the repo root regardless of CWD).
+| Scenario | Time | Throughput |
+|---|---|---|
+| Single JSON, 10M | 15.61 s | **641 k/sec** |
+| Single CSV, 10M | 14.00 s | **714 k/sec** |
+| **Parallel JSON, 10 conns × 1M** | **8.74 s** | **1.14 M/sec** (1.8× single) |
+| **Parallel CSV, 10 conns × 1M** | **6.85 s** | **1.46 M/sec** (2.0× single) |
+
+Shard load distribution (1024 splits): avg 0.596, records stddev 6.2 %, 6 grows per shard.
+
+### 3. Queries on 1M users (`bench-queries.sh`)
+
+13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). Indexes on `username`, `email`, `age`, `active`, `birthday`.
+
+| Operation class | Latency band |
+|---|---|
+| `count` metadata (no criteria) | **2 ms** (O(1) counter file) |
+| `count` indexed eq / between / in / lt / gt / lte / gte | **3–20 ms** |
+| `count` indexed `starts` / `exists` | **3–21 ms** |
+| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **40–42 ms** |
+| `count` full-scan (non-indexed field) | **332–333 ms** |
+| `count` indexed + secondary filter | **31–63 ms** |
+| `find` limit 10 — any indexed op | **2–4 ms** |
+| `find` limit 10 — full scan on non-indexed | **3 ms** (Zone A probe + typed compare) |
+| `find` indexed + secondary filter | **2–3 ms** |
+| `aggregate count` (metadata) | **3 ms** |
+| `aggregate` where indexed-eq | **24–33 ms** |
+| `aggregate` where indexed range | **71–126 ms** |
+| `aggregate` full-scan (sum/avg/min/max) | **453 ms** |
+| `aggregate` group_by on full scan | **524–551 ms** |
+| `aggregate` group_by + having | **573 ms** |
+
+All 17 search operators (`eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `not_in`, `like`, `not_like`, `contains`, `not_contains`, `starts`, `ends`, `exists`, `not_exists`) use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
+
+### 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes (`bench-invoice.sh 1000000 persistent`)
+
+Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmStatus+pdfSent`, `status+source`, `status+createdAt`, `status+invoiceDate`.
+
+| Operation | Result |
+|---|---|
+| Bulk insert (no indexes) | **66.1 k/sec** (15.12 s) |
+| Bulk insert (with 14 indexes) | **54.9 k/sec** (18.21 s) — 20 % index overhead |
+| Add 14 indexes post-insert | **5.77 s** (single-pass, all 14 concurrent) |
+| GET ×1000 (pipelined) | **43.5 k ops/sec** (23 ms) |
+| EXISTS ×1000 (pipelined) | **50.0 k ops/sec** (20 ms) |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **3–4 ms** |
+| Indexed `contains` via leaf scan | 4–23 ms |
+| Indexed IN (2 values) | 3 ms |
+| Composite index eq / starts | 4 ms |
+| Indexed `range` | 3 ms |
+| Fetch page of 100 @ offset 5000 | 5 ms |
+| Single DELETE ×1000 (with 14 indexes) | **1.9 k/sec** (516 ms) |
+| Bulk DELETE ×1000 | **4.6 k/sec** (219 ms) |
+| VACUUM | 9 ms |
+| Disk footprint | 1.3 GB |
+
+### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 100000 10`)
+
+Same schema, 10 connections × 100 k records each.
+
+| Scenario | Time | Throughput |
+|---|---|---|
+| Single JSON, 1M, no indexes | 14.82 s | **67.5 k/sec** |
+| Single CSV, 1M, no indexes | 5.51 s | **181.5 k/sec** |
+| **Parallel JSON, 10 conns, no indexes** | **4.28 s** | **233.8 k/sec** (3.5× single-JSON) |
+| Parallel JSON, 10 conns, pre-existing 14 indexes | 6.45 s | **154.9 k/sec** |
+| **Parallel CSV, 10 conns, no indexes** | **3.41 s** | **293.2 k/sec** (1.6× single-CSV, 4.3× single-JSON) |
+| Parallel CSV, 10 conns, pre-existing 14 indexes | 5.47 s | **182.8 k/sec** |
+| Add 14 indexes after parallel bulk insert | ~5.7 s | (concurrent build across all 14) |
+| Disk footprint (with 14 indexes) | 1.3 GB |
+
+**Insert WITH indexes now beats load-then-index.** At 1M × 14 indexes: load (3.41 s) + add-indexes (5.68 s) = 9.09 s → 110 k/sec; insert with pre-existing indexes: 5.47 s → 183 k/sec. The parallel bulk-insert path maintains indexes cheaper than a post-hoc rebuild. **Recommended ingest pattern: create indexes up front, then parallel bulk-insert** — unless the schema is still evolving, in which case load-then-index is still fine.
+
+### Notes
+
+- **File-descriptor limit.** At `SPLITS ≥ 512`, `ucache_grow_shard` briefly holds 2 fds per shard during migration, so peak can hit ~8,256 fds at the default `FCACHE_MAX=4096`. The server auto-raises its soft limit to the hard limit at startup (no privilege needed); if the hard limit itself is too low (shells default to 1024 on many distros), the startup WARN tells you exactly what to put in `/etc/security/limits.conf` or as `LimitNOFILE=` in a systemd unit.
+- **Splits tuning.** Use `splits:256–512` for single-connection bulk; `splits:1024+` for multi-connection bulk (fewer cross-request shard-lock collisions).
+- **CSV vs JSON.** CSV bulk insert is faster because the CSV path parses directly against the mmap'd file via `(ptr, len)` spans with zero per-line memcpy, while the JSON path materializes a `JsonObj` per record.
+
+### Reproduce
+
+```bash
+./bench/bench-kv.sh 10000000                          # scenario 1
+./bench/bench-kv-parallel.sh 10000000 1000000 10      # scenario 2 (add SPLITS=1024)
+./bench/create-user-object.sh && \
+  ./bench/insert-users.sh 1000000 && \
+  ./bench/bench-queries.sh                            # scenario 3
+./bench/bench-invoice.sh 1000000 persistent           # scenario 4
+./bench/bench-parallel.sh 1000000 100000 10           # scenario 5
+```
+
+Scripts self-resolve to the repo root regardless of CWD and start/stop the server automatically. All scripts honour `SPLITS=N` to override the default (256).
 
 ## Features
 
