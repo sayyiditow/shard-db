@@ -23,7 +23,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-or-logic.sh                  # OR criteria, all four shapes      (43)
 ./test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
 ./test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
-# Total: 302 tests
+./test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
+# Total: 339 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -49,9 +50,10 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 
 ### Configuration
 
-- **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `QUERY_BUFFER_MB` (per-query intermediate buffer cap, default 500), `SLOW_QUERY_MS` (floor 100ms, 0=off)
-- **$DB_ROOT/tokens.conf** — Global / admin API tokens (one per line, full access to any dir + admin commands)
-- **$DB_ROOT/\<dir\>/tokens.conf** — Per-tenant tokens, scoped to that `dir` only. Cannot run admin commands (`stats`, `db-dirs`, `vacuum-check`, `shard-stats`, `create-object`, `truncate`, `vacuum`, `backup`, `recount`, schema mutations, index management, auth management). Loaded automatically at server start for every `dir` listed in `dirs.conf`.
+- **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `QUERY_BUFFER_MB` (per-query intermediate buffer cap, default 500), `DISABLE_LOCALHOST_TRUST` (strict mode, default 0), `TOKEN_CAP` (token table bucket count, default 1024), `SLOW_QUERY_MS` (floor 100ms, 0=off)
+- **$DB_ROOT/tokens.conf** — Global / admin API tokens (one per line). Line format: `token[:perm]` where `perm ∈ {r, rw, rwx}`; no suffix = `rwx` (admin, backward-compatible with pre-perm files).
+- **$DB_ROOT/\<dir\>/tokens.conf** — Per-tenant tokens. Same line format. Scope covers any object within `<dir>`.
+- **$DB_ROOT/\<dir\>/\<object\>/tokens.conf** — Per-object tokens. Same line format. Scope covers only that one object.
 - **$DB_ROOT/allowed_ips.conf** — Trusted IPs (skip token check entirely; global only — no per-tenant IP lists)
 - **$DB_ROOT/dirs.conf** — Allowed tenant directories
 - **$DB_ROOT/schema.conf** — Per-object: `dir:object:splits:max_key:max_value:prealloc_mb`
@@ -156,22 +158,49 @@ All advanced queries go through `./shard-db query '<json>'`.
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
 
-### Per-tenant auth
+### Auth: scope + permissions
 
-Tokens live in two tiers:
+Tokens have two independent dimensions: **scope** (what they can touch) and **permission** (what they can do).
 
-- Global / admin in `$DB_ROOT/tokens.conf` — any `dir`, any command.
-- Per-tenant in `$DB_ROOT/<dir>/tokens.conf` — scoped to that `dir` only. Rejected on admin-only commands.
+**Scope** is determined by which tokens.conf file the token lives in:
 
-Precedence on each request:
+| Scope | File | Covers |
+|---|---|---|
+| global | `$DB_ROOT/tokens.conf` | any `dir`, any object |
+| tenant | `$DB_ROOT/<dir>/tokens.conf` | any object within `<dir>` |
+| object | `$DB_ROOT/<dir>/<obj>/tokens.conf` | only `<dir>/<obj>` |
+
+**Permission** is the suffix on the token line:
+
+| Perm | Reads | Writes | Admin |
+|---|---|---|---|
+| `r` | ✓ | ✗ | ✗ |
+| `rw` | ✓ | ✓ | ✗ |
+| `rwx` | ✓ | ✓ | scope-dependent |
+| _(no suffix)_ | same as `rwx` | backward-compat for pre-2026.05 tokens.conf | |
+
+Admin commands themselves have scope. A token needs `rwx` AND scope at least as broad as the command's admin scope:
+
+| Command | Admin scope | Who can run it |
+|---|---|---|
+| `stats`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens` | server | global `rwx` or trusted IP only |
+| `create-object` | tenant | global-`rwx` or tenant-`rwx` on that dir |
+| `truncate`, `vacuum`, `backup`, `recount`, `add-field`, `remove-field`, `rename-field`, `add-index`, `remove-index` | object | any `rwx` whose scope covers that object |
+
+**Precedence on each request**:
 1. Trusted IP (global `allowed_ips.conf`) → bypass.
-2. Global token match → allow.
-3. Tenant token whose scope matches request's `dir` → allow data commands.
-4. Otherwise `{"error":"auth failed"}`.
+2. Token match with sufficient scope + perm → allow.
+3. Otherwise `{"error":"auth failed"}`.
 
-Localhost (127.0.0.1/::1) is trusted by default — shard-db typically sits behind a loopback-connecting proxy. Set `DISABLE_LOCALHOST_TRUST=1` in `db.env` to require explicit tokens even for same-host callers (strict mode; useful for testing and for deployments without a front-door proxy).
+Token management (`add-token`/`remove-token`/`list-tokens`) is **always** server-admin regardless of what scope/perm the token being managed has. Tenant admins and object admins cannot issue new tokens — the platform operator issues all credentials.
 
-Token management: `add-token` / `remove-token` / `list-tokens` JSON modes accept an optional `"dir"` field to write to a tenant-scoped file instead of global. `list-tokens` returns `{"token":"fingerprint","scope":"global"|"<dir>"}` per entry — full tokens are never echoed.
+Localhost (127.0.0.1/::1) is trusted by default (typical deployment: loopback-connecting proxy). Set `DISABLE_LOCALHOST_TRUST=1` to require tokens from same-host callers too (strict mode).
+
+`add-token` accepts optional `"dir"`, `"object"`, and `"perm"` fields. Default perm is `rw` (principle of least privilege — admins opt into `rwx` explicitly). Invalid perms (`x`, `rx`, etc.) are rejected. `object` scope requires `dir`.
+
+`list-tokens` returns `{"token":"fingerprint","scope":"global"|"<dir>"|"<dir>/<obj>","perm":"r|rw|rwx"}` per entry. Full tokens are never echoed.
+
+Token storage: open-addressed hash table sized by `TOKEN_CAP` (default 1024 buckets). Lookup O(1), lock-free reads. Bump `TOKEN_CAP` in db.env if you expect more than ~700 tokens in total across all scopes.
 
 ### Single-instance guard
 

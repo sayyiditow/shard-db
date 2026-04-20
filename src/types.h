@@ -217,6 +217,16 @@ extern int g_index_page_size;
 extern int g_global_limit;
 extern size_t g_query_buffer_max_bytes;
 extern int g_disable_localhost_trust;
+extern int g_token_cap;
+
+/* Token permission levels.
+   r   = read-only ops (get/exists/find/count/aggregate/fetch/keys/get-file).
+   rw  = all reads + data-write ops (insert/update/delete/bulk/put-file).
+   rwx = all writes + admin ops. Admin commands have their own scope (server,
+         tenant, or object); token scope must be as broad or broader. */
+#define PERM_R   1
+#define PERM_RW  2
+#define PERM_RWX 3
 
 /* Canonical error message for per-query memory-cap exceeded. Single string so
    callers don't drift apart; emit via OUT() at any of the 7 collection sites. */

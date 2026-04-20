@@ -45,7 +45,7 @@ Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `betwe
 - **Bulk operations** -- bulk-insert (JSON, CSV, delimited), bulk-delete
 - **Response formats** -- JSON objects (default), tabular rows (`"format":"rows"`), or raw CSV/delimited text (`"format":"csv"` with optional `"delimiter":"|"`) on find/fetch/aggregate; joins always tabular
 - **Multi-tenancy** -- `dir` parameter isolates tenants, validated against allowlist
-- **Authentication** -- per-tenant API tokens (scoped to a `dir`) + global admin tokens + global IP allowlist
+- **Authentication** -- tokens scoped three tiers (global / per-tenant / per-object) × three permission levels (`r` / `rw` / `rwx`). Global IP allowlist for server-to-server bypass.
 - **Statement timeout** -- `TIMEOUT` in db.env (seconds, 0 = off), enforced via cooperative cancellation in scan loops
 - **Crash safety** -- atomic flag-flip writes, msync on shutdown, recovery sweeps stale `*.new`/`*.old` on startup
 - **Async logging** -- ring buffer, date-rotated info/error files, slow query log (floor 100ms)
@@ -87,6 +87,7 @@ Place `db.env` in the working directory where you run shard-db.
 | `BT_CACHE_MAX` | `256` | B+ tree index cache capacity |
 | `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap in MB — protects against one bad query monopolising RAM |
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypass auth (assumes trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host) |
+| `TOKEN_CAP` | `1024` | Open-addressed hash-table bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes |
 | `SLOW_QUERY_MS` | `500` | Slow query log threshold in ms |
 
 ## Quick Start

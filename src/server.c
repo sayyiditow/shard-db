@@ -113,59 +113,117 @@ int is_ip_trusted(const char *ip) {
     return 0;
 }
 
-/* --- Token set: hash set, loaded from $DB_ROOT/tokens.conf (global/admin)
-       and $DB_ROOT/<dir>/tokens.conf (per-tenant, scoped).
-   Each slot holds one token plus its scope: empty string = global admin,
-   otherwise the tenant dir name. The same hash table holds both — they
-   disambiguate by the scope field on match. --- */
-#define TOKEN_SET_BUCKETS 1024
-static char g_token_set[TOKEN_SET_BUCKETS][256];
-static char g_token_scope[TOKEN_SET_BUCKETS][256];  /* "" = global, else dir */
-static int g_token_set_used[TOKEN_SET_BUCKETS];
+/* --- Token store: hash set, three scope tiers + r/rw/rwx permissions.
+   Files:
+     $DB_ROOT/tokens.conf                 — global admin tokens
+     $DB_ROOT/<dir>/tokens.conf           — tenant-scoped tokens for <dir>
+     $DB_ROOT/<dir>/<obj>/tokens.conf     — object-scoped tokens for <dir>/<obj>
+   Line format: `token[:perm]` where perm ∈ {r, rw, rwx}. Empty suffix or no
+   colon = rwx (admin) — preserves backward compat with pre-perm tokens.conf
+   files from before 2026.05.
+   The hash is keyed on the token string. Each slot carries its (dir, obj,
+   perm) — on lookup we match the request's (dir, obj) against the slot's
+   scope after the string compare. Five parallel heap arrays sized at startup
+   from g_token_cap. --- */
+static char   (*g_token_set)[256]       = NULL;
+static char   (*g_token_scope)[256]     = NULL;   /* "" = global, else dir */
+static char   (*g_token_scope_obj)[256] = NULL;   /* "" = dir-or-global, else object */
+static uint8_t *g_token_perm            = NULL;   /* PERM_R / PERM_RW / PERM_RWX */
+static int     *g_token_set_used        = NULL;
 int g_token_count = 0;
 static pthread_mutex_t g_token_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void token_set_add_scoped(const char *token, const char *dir_scope) {
-    uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
-    const char *scope = dir_scope ? dir_scope : "";
-    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-        int slot = (idx + i) % TOKEN_SET_BUCKETS;
+static void token_store_init(void) {
+    if (g_token_set) return;
+    g_token_set       = calloc(g_token_cap, sizeof(*g_token_set));
+    g_token_scope     = calloc(g_token_cap, sizeof(*g_token_scope));
+    g_token_scope_obj = calloc(g_token_cap, sizeof(*g_token_scope_obj));
+    g_token_perm      = calloc(g_token_cap, sizeof(*g_token_perm));
+    g_token_set_used  = calloc(g_token_cap, sizeof(*g_token_set_used));
+    if (!g_token_set || !g_token_scope || !g_token_scope_obj ||
+        !g_token_perm || !g_token_set_used) {
+        fprintf(stderr, "token_store_init: out of memory (TOKEN_CAP=%d)\n", g_token_cap);
+        exit(1);
+    }
+}
+
+static void token_set_add_full(const char *token,
+                               const char *dir_scope,
+                               const char *obj_scope,
+                               uint8_t perm) {
+    uint32_t idx = str_hash(token) % g_token_cap;
+    const char *ds = dir_scope ? dir_scope : "";
+    const char *os = obj_scope ? obj_scope : "";
+    for (int i = 0; i < g_token_cap; i++) {
+        int slot = (idx + i) % g_token_cap;
         if (!g_token_set_used[slot]) {
-            strncpy(g_token_set[slot], token, 255);
-            g_token_set[slot][255] = '\0';
-            strncpy(g_token_scope[slot], scope, 255);
-            g_token_scope[slot][255] = '\0';
-            g_token_set_used[slot] = 1;
+            strncpy(g_token_set[slot], token, 255);       g_token_set[slot][255] = '\0';
+            strncpy(g_token_scope[slot], ds, 255);        g_token_scope[slot][255] = '\0';
+            strncpy(g_token_scope_obj[slot], os, 255);    g_token_scope_obj[slot][255] = '\0';
+            g_token_perm[slot] = perm;
+            __atomic_store_n(&g_token_set_used[slot], 1, __ATOMIC_RELEASE);
             g_token_count++;
             return;
         }
         if (strcmp(g_token_set[slot], token) == 0) {
-            /* Already present — upgrade to broader scope if needed (empty
-               scope = global trumps tenant). Otherwise no-op. */
-            if (scope[0] == '\0' && g_token_scope[slot][0] != '\0') {
-                g_token_scope[slot][0] = '\0';
-            }
+            /* Token already present. Duplicate tokens must be unique across
+               scopes; later writes silently overwrite scope+perm. In practice
+               tokens are 32 random bytes so duplicates don't happen except on
+               explicit add-token of an existing value, which is caller error. */
+            strncpy(g_token_scope[slot], ds, 255);        g_token_scope[slot][255] = '\0';
+            strncpy(g_token_scope_obj[slot], os, 255);    g_token_scope_obj[slot][255] = '\0';
+            g_token_perm[slot] = perm;
             return;
         }
     }
 }
 
-static void token_set_add(const char *token) { token_set_add_scoped(token, NULL); }
+/* Legacy convenience: plain-string add always means global admin (rwx). */
+static void token_set_add(const char *token) {
+    token_set_add_full(token, NULL, NULL, PERM_RWX);
+}
+static void token_set_add_scoped(const char *token, const char *dir_scope) {
+    token_set_add_full(token, dir_scope, NULL, PERM_RWX);
+}
 
 static int token_set_remove(const char *token) {
-    uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
-    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-        int slot = (idx + i) % TOKEN_SET_BUCKETS;
+    uint32_t idx = str_hash(token) % g_token_cap;
+    for (int i = 0; i < g_token_cap; i++) {
+        int slot = (idx + i) % g_token_cap;
         if (!g_token_set_used[slot]) return 0;
         if (strcmp(g_token_set[slot], token) == 0) {
-            g_token_set_used[slot] = 0;
             g_token_set[slot][0] = '\0';
             g_token_scope[slot][0] = '\0';
+            g_token_scope_obj[slot][0] = '\0';
+            g_token_perm[slot] = 0;
+            __atomic_store_n(&g_token_set_used[slot], 0, __ATOMIC_RELEASE);
             g_token_count--;
             return 1;
         }
     }
     return 0;
+}
+
+/* Parse a line of the form "<token>[:r|rw|rwx]" into (token_out, perm_out).
+   No suffix (or :rwx) => PERM_RWX. Unknown suffix => returns 0 (reject). */
+static int parse_token_line(const char *line, char *token_out, size_t tok_sz,
+                            uint8_t *perm_out) {
+    const char *colon = strchr(line, ':');
+    if (!colon) {
+        size_t len = strlen(line);
+        if (len >= tok_sz) return 0;
+        memcpy(token_out, line, len); token_out[len] = '\0';
+        *perm_out = PERM_RWX;
+        return 1;
+    }
+    size_t tok_len = colon - line;
+    if (tok_len == 0 || tok_len >= tok_sz) return 0;
+    memcpy(token_out, line, tok_len); token_out[tok_len] = '\0';
+    const char *p = colon + 1;
+    if (p[0] == '\0' || strcmp(p, "rwx") == 0) { *perm_out = PERM_RWX; return 1; }
+    if (strcmp(p, "r") == 0)  { *perm_out = PERM_R;  return 1; }
+    if (strcmp(p, "rw") == 0) { *perm_out = PERM_RW; return 1; }
+    return 0;  /* bad perm suffix */
 }
 
 static int token_compare(const char *a, const char *b) {
@@ -176,121 +234,240 @@ static int token_compare(const char *a, const char *b) {
     return diff == 0;
 }
 
-/* Auth decision for a token against a request's dir.
-   Return codes:
-     TOKEN_NONE    — token absent or no match (reject)
-     TOKEN_GLOBAL  — matched a global / admin token (allow anything)
-     TOKEN_TENANT  — matched a tenant-scoped token whose scope == request_dir
-                     (allow only this dir, never admin commands) */
-#define TOKEN_NONE   0
-#define TOKEN_GLOBAL 1
-#define TOKEN_TENANT 2
-
-int check_token(const char *token, const char *request_dir) {
-    if (!token || !token[0]) return TOKEN_NONE;
-    uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
-    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-        int slot = (idx + i) % TOKEN_SET_BUCKETS;
-        if (!g_token_set_used[slot]) return TOKEN_NONE;
-        if (token_compare(g_token_set[slot], token)) {
-            if (g_token_scope[slot][0] == '\0') return TOKEN_GLOBAL;
-            if (request_dir && strcmp(g_token_scope[slot], request_dir) == 0)
-                return TOKEN_TENANT;
-            return TOKEN_NONE;  /* token exists but scope doesn't match */
-        }
+/* Look up a token. Returns slot index on match, -1 on miss. */
+static int token_find_slot(const char *token) {
+    if (!token || !token[0] || !g_token_set) return -1;
+    uint32_t idx = str_hash(token) % g_token_cap;
+    for (int i = 0; i < g_token_cap; i++) {
+        int slot = (idx + i) % g_token_cap;
+        uint32_t used = __atomic_load_n(&g_token_set_used[slot], __ATOMIC_ACQUIRE);
+        if (!used) return -1;
+        if (token_compare(g_token_set[slot], token)) return slot;
     }
-    return TOKEN_NONE;
+    return -1;
 }
 
-/* Legacy wrapper — callers that don't care about scope (e.g. the auth-
-   management commands, which are admin-only) use this. */
+/* Legacy wrapper: "is this a global admin token?" Used by the auth-management
+   early gate (add-token / remove-token / list-tokens / add-ip / etc.) which
+   is strictly server-admin regardless of the token being managed. */
 int is_token_valid(const char *token) {
-    return check_token(token, NULL) == TOKEN_GLOBAL;
+    int slot = token_find_slot(token);
+    if (slot < 0) return 0;
+    return g_token_scope[slot][0] == '\0' &&
+           g_token_scope_obj[slot][0] == '\0' &&
+           g_token_perm[slot] == PERM_RWX;
 }
 
-void load_tokens_conf(const char *db_root) {
-    /* Global tokens first. */
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
+/* Admin level a mode requires.
+     ADMIN_NONE   — data operation; permission check is read-vs-write only.
+     ADMIN_OBJECT — narrow admin on one object (add-field, vacuum, add-index).
+     ADMIN_TENANT — admin that targets a whole dir (create-object).
+     ADMIN_SERVER — admin that touches server state (stats, auth management). */
+typedef enum {
+    ADMIN_NONE   = 0,
+    ADMIN_OBJECT = 1,
+    ADMIN_TENANT = 2,
+    ADMIN_SERVER = 3
+} AdminLevel;
+
+static AdminLevel mode_admin_level(const char *mode) {
+    if (!mode) return ADMIN_NONE;
+    static const char *srv[] = {
+        "stats", "db-dirs", "vacuum-check", "shard-stats",
+        "add-token", "remove-token", "list-tokens",
+        "add-ip", "remove-ip", "list-ips",
+        NULL
+    };
+    for (int i = 0; srv[i]; i++)
+        if (strcmp(mode, srv[i]) == 0) return ADMIN_SERVER;
+    if (strcmp(mode, "create-object") == 0) return ADMIN_TENANT;
+    static const char *obj[] = {
+        "truncate", "vacuum", "backup", "recount",
+        "add-field", "remove-field", "rename-field",
+        "add-index", "remove-index",
+        NULL
+    };
+    for (int i = 0; obj[i]; i++)
+        if (strcmp(mode, obj[i]) == 0) return ADMIN_OBJECT;
+    return ADMIN_NONE;
+}
+
+/* Data-write modes (not admin). Reads are everything else that isn't admin. */
+static int mode_is_data_write(const char *mode) {
+    if (!mode) return 0;
+    static const char *w[] = {
+        "insert", "update", "delete",
+        "bulk-insert", "bulk-insert-delimited", "bulk-delete", "bulk-update",
+        "put-file", "delete-file", "sequence",
+        NULL
+    };
+    for (int i = 0; w[i]; i++)
+        if (strcmp(mode, w[i]) == 0) return 1;
+    return 0;
+}
+
+/* Full authorization check.
+   Returns 1 if this token is allowed to run `mode` against (req_dir, req_obj).
+   Returns 0 otherwise — caller emits {"error":"auth failed"}.
+   Admin-management modes (add-token etc.) bypass this and go through the
+   early gate using is_token_valid(). */
+int is_authorized(const char *token, const char *req_dir, const char *req_obj,
+                  const char *mode) {
+    int slot = token_find_slot(token);
+    if (slot < 0) return 0;
+
+    const char *tok_dir = g_token_scope[slot];
+    const char *tok_obj = g_token_scope_obj[slot];
+    uint8_t perm = g_token_perm[slot];
+
+    int scope_is_global = (tok_dir[0] == '\0');
+    int scope_is_tenant = (!scope_is_global && tok_obj[0] == '\0');
+    int scope_is_object = (!scope_is_global && tok_obj[0] != '\0');
+
+    /* Scope match against the request's (dir, object). */
+    if (scope_is_tenant) {
+        if (!req_dir || strcmp(req_dir, tok_dir) != 0) return 0;
+    } else if (scope_is_object) {
+        if (!req_dir || !req_obj) return 0;
+        if (strcmp(req_dir, tok_dir) != 0) return 0;
+        if (strcmp(req_obj, tok_obj) != 0) return 0;
+    }
+    /* Global scope: matches any (dir, object). */
+
+    /* Permission check against the mode. */
+    AdminLevel req = mode_admin_level(mode);
+    switch (req) {
+    case ADMIN_NONE:
+        if (mode_is_data_write(mode)) return perm >= PERM_RW;
+        return perm >= PERM_R;
+    case ADMIN_OBJECT:
+        /* Any rwx token whose scope covers this object can run it. */
+        return perm == PERM_RWX;
+    case ADMIN_TENANT:
+        /* rwx at tenant or global scope; object-scoped rwx is too narrow. */
+        return perm == PERM_RWX && !scope_is_object;
+    case ADMIN_SERVER:
+        /* rwx at global scope only. */
+        return perm == PERM_RWX && scope_is_global;
+    }
+    return 0;
+}
+
+/* Read one tokens.conf file into the token store with the given scope. */
+static void load_one_tokens_file(const char *path, const char *dir_scope,
+                                 const char *obj_scope) {
     FILE *f = fopen(path, "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            line[strcspn(line, "\n\r")] = '\0';
-            char *p = line; while (*p == ' ') p++;
-            if (*p && *p != '#') token_set_add_scoped(p, NULL);
-        }
-        fclose(f);
-    }
-
-    /* Per-tenant tokens: walk dirs.conf and try each <dir>/tokens.conf. */
-    char dirs_path[PATH_MAX];
-    snprintf(dirs_path, sizeof(dirs_path), "%s/dirs.conf", db_root);
-    FILE *df = fopen(dirs_path, "r");
-    if (!df) return;
-    char dirline[256];
-    while (fgets(dirline, sizeof(dirline), df)) {
-        dirline[strcspn(dirline, "\n\r")] = '\0';
-        char *dp = dirline; while (*dp == ' ') dp++;
-        if (!*dp || *dp == '#') continue;
-        char tpath[PATH_MAX];
-        snprintf(tpath, sizeof(tpath), "%s/%s/tokens.conf", db_root, dp);
-        FILE *tf = fopen(tpath, "r");
-        if (!tf) continue;
-        char tline[256];
-        while (fgets(tline, sizeof(tline), tf)) {
-            tline[strcspn(tline, "\n\r")] = '\0';
-            char *p = tline; while (*p == ' ') p++;
-            if (*p && *p != '#') token_set_add_scoped(p, dp);
-        }
-        fclose(tf);
-    }
-    fclose(df);
-}
-
-static void save_tokens_conf_scoped(const char *db_root, const char *dir_scope) {
-    char path[PATH_MAX];
-    if (dir_scope && dir_scope[0])
-        snprintf(path, sizeof(path), "%s/%s/tokens.conf", db_root, dir_scope);
-    else
-        snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
-    FILE *f = fopen(path, "w");
     if (!f) return;
-    const char *want = dir_scope ? dir_scope : "";
-    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-        if (!g_token_set_used[i]) continue;
-        if (strcmp(g_token_scope[i], want) != 0) continue;
-        fprintf(f, "%s\n", g_token_set[i]);
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n\r")] = '\0';
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char tokbuf[256]; uint8_t perm;
+        if (parse_token_line(p, tokbuf, sizeof(tokbuf), &perm)) {
+            token_set_add_full(tokbuf, dir_scope, obj_scope, perm);
+        } else {
+            fprintf(stderr, "load_tokens_conf: skipping malformed line '%s' in %s\n", p, path);
+        }
     }
     fclose(f);
 }
 
-static void save_tokens_conf(const char *db_root) {
-    save_tokens_conf_scoped(db_root, NULL);
+void load_tokens_conf(const char *db_root) {
+    token_store_init();
+
+    /* Global tokens. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
+    load_one_tokens_file(path, NULL, NULL);
+
+    /* Per-tenant tokens. */
+    char dirs_path[PATH_MAX];
+    snprintf(dirs_path, sizeof(dirs_path), "%s/dirs.conf", db_root);
+    FILE *df = fopen(dirs_path, "r");
+    if (df) {
+        char dirline[256];
+        while (fgets(dirline, sizeof(dirline), df)) {
+            dirline[strcspn(dirline, "\n\r")] = '\0';
+            char *dp = dirline; while (*dp == ' ') dp++;
+            if (!*dp || *dp == '#') continue;
+            char tpath[PATH_MAX];
+            snprintf(tpath, sizeof(tpath), "%s/%s/tokens.conf", db_root, dp);
+            load_one_tokens_file(tpath, dp, NULL);
+        }
+        fclose(df);
+    }
+
+    /* Per-object tokens: schema.conf lists `dir:object:splits:...`. */
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    FILE *sf = fopen(schema_path, "r");
+    if (sf) {
+        char sline[512];
+        while (fgets(sline, sizeof(sline), sf)) {
+            sline[strcspn(sline, "\n\r")] = '\0';
+            char *p = sline; while (*p == ' ') p++;
+            if (!*p || *p == '#') continue;
+            char *c1 = strchr(p, ':'); if (!c1) continue;
+            char *c2 = strchr(c1 + 1, ':'); if (!c2) continue;
+            size_t dlen = c1 - p;
+            size_t olen = c2 - c1 - 1;
+            char sdir[256], sobj[256];
+            if (dlen == 0 || dlen >= sizeof(sdir)) continue;
+            if (olen == 0 || olen >= sizeof(sobj)) continue;
+            memcpy(sdir, p, dlen); sdir[dlen] = '\0';
+            memcpy(sobj, c1 + 1, olen); sobj[olen] = '\0';
+            char tpath[PATH_MAX];
+            snprintf(tpath, sizeof(tpath), "%s/%s/%s/tokens.conf", db_root, sdir, sobj);
+            load_one_tokens_file(tpath, sdir, sobj);
+        }
+        fclose(sf);
+    }
 }
 
-/* Admin-only modes: diagnostics, schema mutations, object lifecycle, index
-   management, auth management, stats. A tenant-scoped token gets rejected
-   on any of these even if the command carries a matching `dir`. */
-static int mode_is_admin(const char *mode) {
-    if (!mode) return 0;
-    static const char *admin_modes[] = {
-        /* Diagnostics — no dir field */
-        "stats", "db-dirs", "vacuum-check", "shard-stats",
-        /* Auth management */
-        "add-token", "remove-token", "list-tokens",
-        "add-ip", "remove-ip", "list-ips",
-        /* Object lifecycle */
-        "create-object", "truncate", "vacuum", "backup", "recount",
-        /* Schema mutations */
-        "rename-field", "remove-field", "add-field",
-        /* Index management */
-        "add-index", "remove-index",
-        NULL
-    };
-    for (int i = 0; admin_modes[i]; i++)
-        if (strcmp(mode, admin_modes[i]) == 0) return 1;
-    return 0;
+/* Emit one token line to `f`: plain token for rwx (backward-compat), or
+   `token:r` / `token:rw` for narrower perms. */
+static void save_token_line(FILE *f, int slot) {
+    if (g_token_perm[slot] == PERM_RWX) {
+        fprintf(f, "%s\n", g_token_set[slot]);
+    } else {
+        const char *p = (g_token_perm[slot] == PERM_R) ? "r" : "rw";
+        fprintf(f, "%s:%s\n", g_token_set[slot], p);
+    }
+}
+
+/* Rewrite the tokens.conf file for a specific scope (global, tenant, or
+   object). Writes only tokens whose (dir, obj) matches the requested scope. */
+static void save_tokens_conf_full(const char *db_root,
+                                  const char *dir_scope,
+                                  const char *obj_scope) {
+    char path[PATH_MAX];
+    if (!dir_scope || !dir_scope[0])
+        snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
+    else if (!obj_scope || !obj_scope[0])
+        snprintf(path, sizeof(path), "%s/%s/tokens.conf", db_root, dir_scope);
+    else
+        snprintf(path, sizeof(path), "%s/%s/%s/tokens.conf",
+                 db_root, dir_scope, obj_scope);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    const char *wd = dir_scope ? dir_scope : "";
+    const char *wo = obj_scope ? obj_scope : "";
+    for (int i = 0; i < g_token_cap; i++) {
+        if (!g_token_set_used[i]) continue;
+        if (strcmp(g_token_scope[i], wd) != 0) continue;
+        if (strcmp(g_token_scope_obj[i], wo) != 0) continue;
+        save_token_line(f, i);
+    }
+    fclose(f);
+}
+
+/* Legacy wrappers used elsewhere in this file. */
+static void save_tokens_conf_scoped(const char *db_root, const char *dir_scope) {
+    save_tokens_conf_full(db_root, dir_scope, NULL);
+}
+static void save_tokens_conf(const char *db_root) {
+    save_tokens_conf_full(db_root, NULL, NULL);
 }
 
 /* ========== JSON QUERY DISPATCH ========== */
@@ -316,45 +493,91 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
         if (strcmp(mode, "add-token") == 0) {
             char *token = json_get_raw(json, "token");
-            char *scope = json_get_raw(json, "dir");  /* optional tenant scope */
-            if (scope && scope[0] && !is_valid_dir(scope)) {
-                OUT("{\"error\":\"Unknown dir: %s\"}\n", scope);
-                free(token); free(scope); free(mode);
+            char *dir_scope = json_get_raw(json, "dir");     /* optional */
+            char *obj_scope = json_get_raw(json, "object");  /* optional, needs dir */
+            char *perm_str  = json_get_raw(json, "perm");    /* r | rw | rwx (default rw) */
+
+            /* Validate dir if present */
+            if (dir_scope && dir_scope[0] && !is_valid_dir(dir_scope)) {
+                OUT("{\"error\":\"Unknown dir: %s\"}\n", dir_scope);
+                free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
                 return;
             }
+            /* Object scope requires dir scope */
+            if (obj_scope && obj_scope[0] && !(dir_scope && dir_scope[0])) {
+                OUT("{\"error\":\"object scope requires dir\"}\n");
+                free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                return;
+            }
+            /* Validate object exists under dir (schema.conf check is fs stat for
+               <dir>/<object>/fields.conf — reuses existing invariant). */
+            if (obj_scope && obj_scope[0]) {
+                char ocheck[PATH_MAX];
+                snprintf(ocheck, sizeof(ocheck), "%s/%s/%s/fields.conf",
+                         raw_db_root, dir_scope, obj_scope);
+                struct stat ost;
+                if (stat(ocheck, &ost) != 0) {
+                    OUT("{\"error\":\"object not found: %s/%s\"}\n", dir_scope, obj_scope);
+                    free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                    return;
+                }
+            }
+            /* Parse perm: default is rw (least privilege for new tokens;
+               admins explicitly opt into rwx). Empty or missing => rw. */
+            uint8_t perm = PERM_RW;
+            if (perm_str && perm_str[0]) {
+                if (strcmp(perm_str, "r") == 0)        perm = PERM_R;
+                else if (strcmp(perm_str, "rw") == 0)  perm = PERM_RW;
+                else if (strcmp(perm_str, "rwx") == 0) perm = PERM_RWX;
+                else {
+                    OUT("{\"error\":\"invalid perm: must be r, rw, or rwx\"}\n");
+                    free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                    return;
+                }
+            }
             if (token && token[0]) {
+                const char *ds = (dir_scope && dir_scope[0]) ? dir_scope : NULL;
+                const char *os = (obj_scope && obj_scope[0]) ? obj_scope : NULL;
                 pthread_mutex_lock(&g_token_lock);
-                token_set_add_scoped(token, scope && scope[0] ? scope : NULL);
-                save_tokens_conf_scoped(raw_db_root, scope && scope[0] ? scope : NULL);
+                token_set_add_full(token, ds, os, perm);
+                save_tokens_conf_full(raw_db_root, ds, os);
                 pthread_mutex_unlock(&g_token_lock);
-                log_msg(3, "AUTH add-token%s%s from %s",
-                        scope && scope[0] ? " dir=" : "",
-                        scope && scope[0] ? scope : "",
-                        client_ip);
-                OUT("{\"status\":\"token_added\",\"scope\":\"%s\"}\n",
-                    scope && scope[0] ? scope : "global");
+                const char *pstr = (perm == PERM_R) ? "r" : (perm == PERM_RW) ? "rw" : "rwx";
+                log_msg(3, "AUTH add-token scope=%s/%s perm=%s from %s",
+                        ds ? ds : "global", os ? os : "", pstr, client_ip);
+                OUT("{\"status\":\"token_added\",\"scope\":\"%s%s%s\",\"perm\":\"%s\"}\n",
+                    ds ? ds : "global",
+                    os ? "/" : "",
+                    os ? os : "",
+                    pstr);
             } else {
                 OUT("{\"error\":\"Missing token\"}\n");
             }
-            free(token); free(scope);
+            free(token); free(dir_scope); free(obj_scope); free(perm_str);
         } else if (strcmp(mode, "remove-token") == 0) {
             char *token = json_get_raw(json, "token");
             if (token && token[0]) {
                 pthread_mutex_lock(&g_token_lock);
-                /* Remember scope before removal so we know which file to rewrite. */
-                char removed_scope[256] = "";
-                uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
-                for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-                    int slot = (idx + i) % TOKEN_SET_BUCKETS;
+                /* Remember scope (dir + obj) before removal so we know which
+                   file to rewrite. */
+                char rm_dir[256] = "", rm_obj[256] = "";
+                int found = 0;
+                uint32_t idx = str_hash(token) % g_token_cap;
+                for (int i = 0; i < g_token_cap; i++) {
+                    int slot = (idx + i) % g_token_cap;
                     if (!g_token_set_used[slot]) break;
                     if (strcmp(g_token_set[slot], token) == 0) {
-                        strncpy(removed_scope, g_token_scope[slot], sizeof(removed_scope) - 1);
+                        strncpy(rm_dir, g_token_scope[slot],     sizeof(rm_dir) - 1);
+                        strncpy(rm_obj, g_token_scope_obj[slot], sizeof(rm_obj) - 1);
+                        found = 1;
                         break;
                     }
                 }
                 int removed = token_set_remove(token);
-                if (removed)
-                    save_tokens_conf_scoped(raw_db_root, removed_scope[0] ? removed_scope : NULL);
+                if (removed && found)
+                    save_tokens_conf_full(raw_db_root,
+                                          rm_dir[0] ? rm_dir : NULL,
+                                          rm_obj[0] ? rm_obj : NULL);
                 pthread_mutex_unlock(&g_token_lock);
                 OUT("{\"status\":\"%s\"}\n", removed ? "token_removed" : "token_not_found");
             } else {
@@ -387,10 +610,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(ip);
         } else if (strcmp(mode, "list-tokens") == 0) {
-            /* Emit {"token":"abcd...wxyz","scope":"global"|"<dir>"} per entry. */
+            /* Emit {"token":"fp","scope":"global"|"<dir>"|"<dir>/<obj>","perm":"r|rw|rwx"} */
             OUT("[");
             int printed = 0;
-            for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
+            for (int i = 0; i < g_token_cap; i++) {
                 if (!g_token_set_used[i]) continue;
                 int tlen = strlen(g_token_set[i]);
                 char fp[32];
@@ -399,8 +622,18 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                              g_token_set[i], g_token_set[i] + tlen - 4);
                 else
                     snprintf(fp, sizeof(fp), "****");
-                const char *scope = g_token_scope[i][0] ? g_token_scope[i] : "global";
-                OUT("%s{\"token\":\"%s\",\"scope\":\"%s\"}", printed ? "," : "", fp, scope);
+                char scope_buf[520];
+                if (g_token_scope[i][0] == '\0')
+                    snprintf(scope_buf, sizeof(scope_buf), "global");
+                else if (g_token_scope_obj[i][0] == '\0')
+                    snprintf(scope_buf, sizeof(scope_buf), "%s", g_token_scope[i]);
+                else
+                    snprintf(scope_buf, sizeof(scope_buf), "%s/%s",
+                             g_token_scope[i], g_token_scope_obj[i]);
+                const char *pstr = (g_token_perm[i] == PERM_R) ? "r"
+                                 : (g_token_perm[i] == PERM_RW) ? "rw" : "rwx";
+                OUT("%s{\"token\":\"%s\",\"scope\":\"%s\",\"perm\":\"%s\"}",
+                    printed ? "," : "", fp, scope_buf, pstr);
                 printed++;
             }
             OUT("]\n");
@@ -427,19 +660,14 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     if (!is_ip_trusted(client_ip)) {
         char *auth = json_get_raw(json, "auth");
         char *req_dir = json_get_raw(json, "dir");
-        int tok_kind = auth ? check_token(auth, req_dir) : TOKEN_NONE;
-        free(auth);
-        if (tok_kind == TOKEN_NONE) {
-            free(req_dir); free(mode);
+        char *req_obj = json_get_raw(json, "object");
+        int ok = auth && is_authorized(auth, req_dir, req_obj, mode);
+        free(auth); free(req_dir); free(req_obj);
+        if (!ok) {
+            free(mode);
             OUT("{\"error\":\"auth failed\"}\n");
             return;
         }
-        if (tok_kind == TOKEN_TENANT && mode_is_admin(mode)) {
-            free(req_dir); free(mode);
-            OUT("{\"error\":\"auth failed\"}\n");
-            return;
-        }
-        free(req_dir);
     }
 
     /* db-dirs doesn't need dir or object */
