@@ -27,34 +27,34 @@ jobs:
         run: ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Schema mutation locking + key ceiling (test-objlock)
-        run: ./test-objlock.sh
+        run: ./tests/test-objlock.sh
 
       - name: Rename field (test-rename-field)
-        run: ./test-rename-field.sh
+        run: ./tests/test-rename-field.sh
 
       - name: Remove field + vacuum --compact (test-remove-field)
-        run: ./test-remove-field.sh
+        run: ./tests/test-remove-field.sh
 
       - name: Vacuum + add-field (test-vacuum-addfield)
-        run: ./test-vacuum-addfield.sh
+        run: ./tests/test-vacuum-addfield.sh
 
       - name: Concurrent bulk-insert integrity (test-parallel-index-integrity)
-        run: ./test-parallel-index-integrity.sh
+        run: ./tests/test-parallel-index-integrity.sh
 
       - name: Joins (test-joins)
-        run: ./test-joins.sh
+        run: ./tests/test-joins.sh
 
       - name: CLI shortcuts + delete-file (test-cli-shortcuts)
-        run: ./test-cli-shortcuts.sh
+        run: ./tests/test-cli-shortcuts.sh
 
       - name: OR criteria (test-or-logic)
-        run: ./test-or-logic.sh
+        run: ./tests/test-or-logic.sh
 
       - name: CSV export (test-csv-export)
-        run: ./test-csv-export.sh
+        run: ./tests/test-csv-export.sh
 
       - name: Per-tenant auth (test-per-tenant-auth)
-        run: ./test-per-tenant-auth.sh
+        run: ./tests/test-per-tenant-auth.sh
 
       - name: Per-object tokens + perms (test-token-perms)
-        run: ./test-token-perms.sh
+        run: ./tests/test-token-perms.sh

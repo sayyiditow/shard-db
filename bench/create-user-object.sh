@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Create the 'users' object with one field of each data type.
 # Usage: ./create-user-object.sh
 

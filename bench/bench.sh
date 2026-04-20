@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Usage: ./bench.sh [record_count] [cli|persistent]
 
 COUNT=${1:-100000}

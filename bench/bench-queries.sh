@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Query benchmark — tests find, count, aggregate across all ops and indexed/unindexed paths.
 # Requires: users object with data (./create-user-object.sh + ./insert-users.sh N)
 # Usage: ./bench-queries.sh

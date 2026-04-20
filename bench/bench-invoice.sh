@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # shard-db invoice benchmark — realistic 64-field typed objects
 # Usage: ./bench-invoice.sh [record_count] [cli|persistent]
 

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Verify every record inserted via parallel bulk-insert is findable via
 # single and composite indexes. This is the scenario where the old strtok
 # race would silently drop index entries.

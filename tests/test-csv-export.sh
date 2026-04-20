@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-csv-export.sh — CSV/delimited output on find/fetch/aggregate.
 # Covers default comma, custom delimiter, quote escaping, delimiter-in-value,
 # newline-in-value collapsed to space, empty fields, projection, indexed path,

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Join benchmark — requires users (1M records) already inserted.
 # Creates orders object referencing users by key, then measures join throughput.
 # Usage: ./bench-joins.sh [orders_count]    (default 500000)

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-vacuum-addfield.sh — tests for vacuum --compact / --splits (task #5)
 # and add-field (task #6).
 

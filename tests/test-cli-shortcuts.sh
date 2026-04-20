@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-cli-shortcuts.sh — CLI shortcuts for count/aggregate + delete-file mode (2026.05)
 
 set -e

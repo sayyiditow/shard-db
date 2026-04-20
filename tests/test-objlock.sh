@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-objlock.sh — tests for per-object rwlock + rebuild crash recovery (task #1)
 
 set -e

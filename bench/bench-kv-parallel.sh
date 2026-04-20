@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Parallel K/V insert benchmark — mirrors bench-parallel.sh but for the
 # single-field varchar(100) schema. Use to compare parallel insert
 # throughput against the invoice parallel bench.

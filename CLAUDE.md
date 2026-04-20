@@ -12,25 +12,25 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./build.sh                          # compile + populate build/bin/db.env + build/db/schema.conf
 # or: gcc -O2 -o shard-db src/*.c -Isrc -lpthread
 
-# Tests (all start/stop server automatically)
-./test-objlock.sh                   # Schema mutation locking + key ceiling (18 tests)
-./test-rename-field.sh              # rename-field correctness         (24)
-./test-remove-field.sh              # remove-field + vacuum --compact  (35)
-./test-vacuum-addfield.sh           # vacuum + add-field               (50)
-./test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity (23)
-./test-joins.sh                     # Join support                     (17)
-./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
-./test-or-logic.sh                  # OR criteria, all four shapes      (43)
-./test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
-./test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
-./test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
+# Tests — all in tests/ folder, start/stop server automatically, portable CWD
+./tests/test-objlock.sh                   # Schema mutation locking + key ceiling (18)
+./tests/test-rename-field.sh              # rename-field correctness              (24)
+./tests/test-remove-field.sh              # remove-field + vacuum --compact       (35)
+./tests/test-vacuum-addfield.sh           # vacuum + add-field                    (50)
+./tests/test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity      (23)
+./tests/test-joins.sh                     # Join support                          (17)
+./tests/test-cli-shortcuts.sh             # count/aggregate CLI + delete-file     (28)
+./tests/test-or-logic.sh                  # OR criteria, all four shapes          (43)
+./tests/test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
+./tests/test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
+./tests/test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
 # Total: 339 tests
 
-# Benchmarks
-./bench-queries.sh                  # find/count/aggregate on 1M users
-./bench-joins.sh [count]            # join throughput
-./bench-kv.sh / bench-kv-parallel.sh # bulk insert throughput
-./bench-invoice.sh / bench-parallel.sh # 14-index invoice scenario
+# Benchmarks — all in bench/ folder
+./bench/bench-queries.sh                  # find/count/aggregate on 1M users
+./bench/bench-joins.sh [count]            # join throughput
+./bench/bench-kv.sh / bench-kv-parallel.sh # bulk insert throughput
+./bench/bench-invoice.sh / bench-parallel.sh # 14-index invoice scenario
 ```
 
 ## Architecture

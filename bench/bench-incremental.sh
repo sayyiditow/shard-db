@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # bench-incremental.sh — find rebuild-vs-point crossover empirically.
 # Since SHARDKV_BULK_RATIO must be set when the SERVER starts (not the client),
 # we stop/start the server around each strategy change.

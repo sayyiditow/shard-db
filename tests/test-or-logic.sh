@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-or-logic.sh — coverage for OR criteria across find/count/aggregate/bulk
 # Exercises Shapes A (AND only), B (AND+OR w/ indexed AND sibling), C (pure OR
 # all-indexed → KeySet path), D (OR with non-indexed child → full scan), and

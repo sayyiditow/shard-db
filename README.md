@@ -27,7 +27,7 @@ Indexed queries (all 17 operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `betwe
 
 **Test machine:** AMD Ryzen 7 7840U (8 cores / 16 threads, up to 5.1 GHz) · 32 GB RAM · NVMe SSD (ext4) · Linux 6.19 · gcc 15.2 `-O2`.
 
-**Reproduce:** `./bench-kv.sh` (insert/get/update throughput) and `./bench-queries.sh` (find/count/aggregate latencies). Scripts live at the repo root and start/stop the server automatically.
+**Reproduce:** `./bench/bench-kv.sh` (insert/get/update throughput) and `./bench/bench-queries.sh` (find/count/aggregate latencies). Scripts live in `bench/` and start/stop the server automatically (they self-resolve to the repo root regardless of CWD).
 
 ## Features
 
@@ -1507,23 +1507,32 @@ Shards start at 256 slots and double when load exceeds 50%. Growth is atomic (bu
 
 ## Tests
 
+All tests live in `tests/`. They start/stop the server themselves and self-resolve to the repo root, so `./tests/<name>.sh` works from any CWD.
+
 ```bash
-./test-objlock.sh                   # Schema mutation locking + key ceiling (18 tests)
-./test-rename-field.sh              # rename-field correctness         (24)
-./test-remove-field.sh              # remove-field + vacuum --compact  (35)
-./test-vacuum-addfield.sh           # vacuum + add-field interaction   (50)
-./test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity (23)
-./test-joins.sh                     # Join support                     (17)
-# Total: 167 tests, all pass
+./tests/test-objlock.sh                   # Schema mutation locking + key ceiling (18)
+./tests/test-rename-field.sh              # rename-field correctness             (24)
+./tests/test-remove-field.sh              # remove-field + vacuum --compact      (35)
+./tests/test-vacuum-addfield.sh           # vacuum + add-field interaction       (50)
+./tests/test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity     (23)
+./tests/test-joins.sh                     # Join support                         (17)
+./tests/test-cli-shortcuts.sh             # count/aggregate CLI + delete-file    (28)
+./tests/test-or-logic.sh                  # OR criteria, all four shapes         (43)
+./tests/test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
+./tests/test-per-tenant-auth.sh           # Per-tenant token scoping             (27)
+./tests/test-token-perms.sh               # Per-object tokens + r/rw/rwx perms   (37)
+# Total: 339 tests, all pass
 ```
 
 ## Benchmarks
 
+All benchmarks live in `bench/`. Seed helpers (`create-user-object.sh`, `insert-users.sh`) live next to them.
+
 ```bash
-./bench-queries.sh                  # find/count/aggregate on 1M users
-./bench-joins.sh [count]            # join throughput
-./bench-kv.sh / bench-kv-parallel.sh # bulk insert throughput
-./bench-invoice.sh / bench-parallel.sh # 14-index invoice scenario
+./bench/bench-queries.sh                  # find/count/aggregate on 1M users
+./bench/bench-joins.sh [count]            # join throughput
+./bench/bench-kv.sh / bench/bench-kv-parallel.sh # bulk insert throughput
+./bench/bench-invoice.sh / bench/bench-parallel.sh # 14-index invoice scenario
 ```
 
 ## License

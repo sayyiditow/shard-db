@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # test-per-tenant-auth.sh — per-tenant token scoping.
 #
 # Covers: global (admin) token works anywhere, tenant token works only in its

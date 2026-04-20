@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Pure key/value throughput — what shard-db looks like as a plain Map.
 # Schema: 1 field varchar(100), keys = 32-byte hex.
 # Usage: ./bench-kv.sh [record_count]

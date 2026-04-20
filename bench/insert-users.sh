@@ -1,4 +1,6 @@
 #!/bin/bash
+# Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
+cd "$(dirname "$0")/.."
 # Insert N auto-generated user records into the 'users' object.
 # Usage: ./insert-users.sh [count]
 #   count defaults to 1000
