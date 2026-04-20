@@ -802,10 +802,25 @@ int typed_field_index(const TypedSchema *ts, const char *name) {
     return -1;
 }
 
-/* ---- Encode: JSON → binary ---- */
+/* ---- Encode: JSON/CSV → binary ---- */
 
-void encode_field(const TypedField *f, const char *val, uint8_t *out) {
-    if (!val || !val[0]) {
+/* Copy up to (bufsz-1) chars of val/vlen into stack-local buf, null-terminate.
+   Used for numeric parses where we need a C-string for strtoll/atof but don't
+   want to null-terminate the source (mmap'd page cache, shared read). Fields
+   wider than the buffer are truncated — numeric values are always < 32 chars. */
+static inline void cbuf_from_span(char *buf, size_t bufsz,
+                                  const char *val, size_t vlen) {
+    size_t cl = vlen < bufsz - 1 ? vlen : bufsz - 1;
+    memcpy(buf, val, cl);
+    buf[cl] = '\0';
+}
+
+/* Length-based encoder: identical semantics to encode_field but takes an
+   explicit vlen instead of requiring a null-terminated string. Used by the
+   CSV path to parse directly against an mmap'd, unmodifiable buffer. */
+void encode_field_len(const TypedField *f, const char *val, size_t vlen,
+                      uint8_t *out) {
+    if (!val || vlen == 0) {
         memset(out, 0, f->size);
         return;
     }
@@ -813,16 +828,15 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
     case FT_VARCHAR: {
         /* Layout: [uint16 BE length][content]. Content max = f->size - 2. */
         int content_max = f->size - 2;
-        size_t vlen = strlen(val);
         if ((int)vlen > content_max) vlen = content_max;
         out[0] = (uint8_t)((vlen >> 8) & 0xFF);
         out[1] = (uint8_t)(vlen & 0xFF);
         memcpy(out + 2, val, vlen);
-        /* Tail bytes are untouched (already zeroed by typed_encode init). */
         break;
     }
     case FT_LONG: {
-        int64_t v = strtoll(val, NULL, 10);
+        char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int64_t v = strtoll(cbuf, NULL, 10);
         out[0] = (v >> 56) & 0xFF; out[1] = (v >> 48) & 0xFF;
         out[2] = (v >> 40) & 0xFF; out[3] = (v >> 32) & 0xFF;
         out[4] = (v >> 24) & 0xFF; out[5] = (v >> 16) & 0xFF;
@@ -830,34 +844,38 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
         break;
     }
     case FT_INT: {
-        int32_t v = (int32_t)atoi(val);
+        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int32_t v = (int32_t)atoi(cbuf);
         out[0] = (v >> 24) & 0xFF; out[1] = (v >> 16) & 0xFF;
         out[2] = (v >> 8) & 0xFF;  out[3] = v & 0xFF;
         break;
     }
     case FT_SHORT: {
-        int16_t v = (int16_t)atoi(val);
+        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int16_t v = (int16_t)atoi(cbuf);
         out[0] = (v >> 8) & 0xFF; out[1] = v & 0xFF;
         break;
     }
     case FT_DOUBLE: {
-        double v = atof(val);
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        double v = atof(cbuf);
         memcpy(out, &v, 8);
         break;
     }
     case FT_BOOL: {
-        out[0] = (val[0] == 't' || val[0] == 'T' || val[0] == '1') ? 1 : 0;
+        out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
         break;
     }
     case FT_BYTE: {
-        out[0] = (uint8_t)atoi(val);
+        char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        out[0] = (uint8_t)atoi(cbuf);
         break;
     }
     case FT_DATE: {
-        /* Accept yyyyMMdd or yyyy-MM-dd → strip non-digits, store as int32 BE */
+        /* Iterate the span directly, extract up to 8 digits. */
         char clean[16]; int ci = 0;
-        for (const char *c = val; *c && ci < 8; c++)
-            if (*c >= '0' && *c <= '9') clean[ci++] = *c;
+        for (size_t i = 0; i < vlen && ci < 8; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
         clean[ci] = '\0';
         int32_t v = (int32_t)atoi(clean);
         out[0] = (v >> 24) & 0xFF; out[1] = (v >> 16) & 0xFF;
@@ -865,19 +883,15 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
         break;
     }
     case FT_DATETIME: {
-        /* Accept yyyyMMddHHmmss or yyyy-MM-dd HH:mm:ss → strip non-digits
-           Store as 6 bytes: yyyyMMdd (4 bytes BE) + HHmmss (2 bytes packed) */
         char clean[16]; int ci = 0;
-        for (const char *c = val; *c && ci < 14; c++)
-            if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-        while (ci < 14) clean[ci++] = '0'; /* pad missing time with zeros */
+        for (size_t i = 0; i < vlen && ci < 14; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
+        while (ci < 14) clean[ci++] = '0';
         clean[14] = '\0';
-        /* First 8 digits = yyyyMMdd as int32 */
         char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
         int32_t d = (int32_t)atoi(datebuf);
         out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
         out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
-        /* Last 6 digits = HHmmss packed into 2 bytes: HH*3600 + MM*60 + SS (max 86399, fits uint16) */
         int hh = (clean[8]-'0')*10 + (clean[9]-'0');
         int mm = (clean[10]-'0')*10 + (clean[11]-'0');
         int ss = (clean[12]-'0')*10 + (clean[13]-'0');
@@ -886,11 +900,11 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
         break;
     }
     case FT_NUMERIC: {
-        /* Parse decimal string, multiply by 10^S, store as int64 BE */
-        double dv = atof(val);
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        double dv = atof(cbuf);
         int64_t scale = 1;
         for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
-        int64_t v = (int64_t)(dv * scale + (dv >= 0 ? 0.5 : -0.5)); /* round */
+        int64_t v = (int64_t)(dv * scale + (dv >= 0 ? 0.5 : -0.5));
         out[0] = (v >> 56) & 0xFF; out[1] = (v >> 48) & 0xFF;
         out[2] = (v >> 40) & 0xFF; out[3] = (v >> 32) & 0xFF;
         out[4] = (v >> 24) & 0xFF; out[5] = (v >> 16) & 0xFF;
@@ -901,6 +915,14 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
         memset(out, 0, f->size);
         break;
     }
+}
+
+/* Backward-compatible wrapper. Every existing caller passes a null-terminated
+   C-string; for those, strlen is free (short strings are L1-hot). The CSV
+   path is the only caller that benefits from the length-based variant, and
+   it calls encode_field_len directly. */
+void encode_field(const TypedField *f, const char *val, uint8_t *out) {
+    encode_field_len(f, val, val ? strlen(val) : 0, out);
 }
 
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size) {

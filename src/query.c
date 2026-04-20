@@ -1015,10 +1015,13 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         else active_indices[active_count++] = i;
     }
 
-    /* Stack buffer for copying each line — avoids writing into the mmap'd
-       buffer (MAP_PRIVATE COW page faults).  Lines longer than this are
-       heap-allocated. */
-    char line_stack[8192];
+    /* Length-based parsing: we work directly against the mmap'd page cache
+       with (ptr, len) spans and never copy the line body. This removes the
+       ~100 B-per-line memcpy that dominated memory bandwidth under parallel
+       load (multiple workers each churning ~1 GB of memcpy on a 10 M-record
+       CSV). encode_field_len / memcpy-with-length handle the null-terminator-
+       free parse on the numeric / varchar / index sides. */
+    struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
 
     while (rp < data_end) {
         /* Find end of line without modifying the buffer */
@@ -1031,64 +1034,55 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             continue;
         }
 
-        /* Copy line to a writable buffer so we can null-terminate fields */
-        char *line;
-        int line_heap = 0;
-        if (line_len < sizeof(line_stack)) {
-            memcpy(line_stack, rp, line_len);
-            line_stack[line_len] = '\0';
-            line = line_stack;
-        } else {
-            line = malloc(line_len + 1);
-            memcpy(line, rp, line_len);
-            line[line_len] = '\0';
-            line_heap = 1;
-        }
+        const char *line_start = rp;
+        const char *line_end   = eol;
 
-        /* Advance read pointer past this line */
+        /* Advance read pointer past this line (consume \r\n / \n / \r). */
         rp = eol;
         if (rp < data_end && *rp == '\r') rp++;
         if (rp < data_end && *rp == '\n') rp++;
 
-        /* Split line: first field = key, rest = values in fields.conf order */
-        char *key_end = line;
-        while (*key_end && *key_end != delimiter) key_end++;
-        if (*key_end == '\0') { /* no delimiter = skip line */
-            if (line_heap) free(line);
-            continue;
-        }
-        *key_end = '\0';
-        char *id = line;
-        size_t klen = key_end - line;
+        /* First field is the key; remaining fields in fields.conf order. */
+        const char *key_end = line_start;
+        while (key_end < line_end && *key_end != delimiter) key_end++;
+        if (key_end == line_end) continue;  /* no delimiter — skip line */
+        const char *id = line_start;
+        size_t klen = key_end - line_start;
 
-        /* Encode typed fields directly from delimited values.
-           CSV columns map 1:1 to ACTIVE (non-tombstoned) fields in order. */
+        /* Walk remaining spans into vals[] without copying. */
         memset(typed_tmp, 0, ts->total_size);
-        char *vals[MAX_FIELDS]; /* pointers into the line copy */
         int nvals = 0;
-        char *vp = key_end + 1;
+        const char *vp = key_end + 1;
         while (nvals < active_count) {
-            vals[nvals] = vp;
-            while (*vp && *vp != delimiter) vp++;
-            if (*vp == delimiter) { *vp = '\0'; vp++; }
+            const char *v_start = vp;
+            while (vp < line_end && *vp != delimiter) vp++;
+            vals[nvals].ptr = v_start;
+            vals[nvals].len = vp - v_start;
             nvals++;
-            if (!*vp && nvals < active_count) {
-                while (nvals < active_count) { vals[nvals] = vp; nvals++; }
+            if (vp < line_end) vp++;  /* skip delimiter */
+            else if (nvals < active_count) {
+                /* Line has fewer values than schema expects — pad the
+                   remainder with empty spans (legacy behaviour). */
+                while (nvals < active_count) {
+                    vals[nvals].ptr = line_end;
+                    vals[nvals].len = 0;
+                    nvals++;
+                }
             }
         }
 
         if (!has_tombstones) {
-            /* Fast path: direct positional encoding — matches pre-tombstone behavior */
             for (int i = 0; i < active_count && i < nvals; i++) {
-                if (vals[i][0] != '\0')
-                    encode_field(&ts->fields[i], vals[i], typed_tmp + ts->fields[i].offset);
+                if (vals[i].len > 0)
+                    encode_field_len(&ts->fields[i], vals[i].ptr, vals[i].len,
+                                     typed_tmp + ts->fields[i].offset);
             }
         } else {
-            /* Tombstoned fields exist: map CSV column to active field offset. */
             for (int i = 0; i < active_count && i < nvals; i++) {
                 int fi = active_indices[i];
-                if (vals[i][0] != '\0')
-                    encode_field(&ts->fields[fi], vals[i], typed_tmp + ts->fields[fi].offset);
+                if (vals[i].len > 0)
+                    encode_field_len(&ts->fields[fi], vals[i].ptr, vals[i].len,
+                                     typed_tmp + ts->fields[fi].offset);
             }
         }
 
@@ -1157,24 +1151,36 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
 
                         if (!is_update) count++;
 
-                        /* Collect index entries */
+                        /* Collect index entries — length-based; btree keys
+                           need owned null-terminated strings so we allocate
+                           exactly once per index entry with the known size. */
                         for (int fi = 0; fi < nidx; fi++) {
                             char *idx_val = NULL;
+                            size_t idx_vlen = 0;
                             if (idx_is_composite[fi]) {
-                                char cat[4096]; int cp = 0; int ok = 1;
+                                char cat[4096]; size_t cp = 0; int ok = 1;
                                 for (int si = 0; si < idx_field_counts[fi]; si++) {
                                     int fidx = idx_field_indices[fi][si];
-                                    if (fidx >= 0 && fidx < nvals && vals[fidx][0]) {
-                                        int sl = strlen(vals[fidx]);
-                                        memcpy(cat + cp, vals[fidx], sl); cp += sl;
+                                    if (fidx >= 0 && fidx < nvals && vals[fidx].len > 0) {
+                                        if (cp + vals[fidx].len >= sizeof(cat)) { ok = 0; break; }
+                                        memcpy(cat + cp, vals[fidx].ptr, vals[fidx].len);
+                                        cp += vals[fidx].len;
                                     } else { ok = 0; break; }
                                 }
-                                cat[cp] = '\0';
-                                if (ok && cp > 0) idx_val = strdup(cat);
+                                if (ok && cp > 0) {
+                                    idx_val = malloc(cp + 1);
+                                    memcpy(idx_val, cat, cp);
+                                    idx_val[cp] = '\0';
+                                    idx_vlen = cp;
+                                }
                             } else {
                                 int fidx = idx_field_indices[fi][0];
-                                if (fidx >= 0 && fidx < nvals && vals[fidx][0])
-                                    idx_val = strdup(vals[fidx]);
+                                if (fidx >= 0 && fidx < nvals && vals[fidx].len > 0) {
+                                    idx_val = malloc(vals[fidx].len + 1);
+                                    memcpy(idx_val, vals[fidx].ptr, vals[fidx].len);
+                                    idx_val[vals[fidx].len] = '\0';
+                                    idx_vlen = vals[fidx].len;
+                                }
                             }
                             if (idx_val) {
                                 if (idx_pair_counts[fi] >= idx_pair_caps[fi]) {
@@ -1184,17 +1190,16 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
                                 }
                                 BtEntry *bp = &idx_pairs[fi][idx_pair_counts[fi]++];
                                 bp->value = idx_val;
-                                bp->vlen = strlen(idx_val);
+                                bp->vlen = idx_vlen;
                                 memcpy(bp->hash, hash, 16);
                             }
                         }
                     }
-                } else { errors++; log_msg(1, "CSV_DROP shard=%d key=%s (shard full: %u slots)", shard_id, id, slots); }
+                } else { errors++; log_msg(1, "CSV_DROP shard=%d key=%.*s (shard full: %u slots)", shard_id, (int)klen, id, slots); }
                 ucache_write_release(wh);
-            } else { errors++; log_msg(1, "CSV_DROP key=%s (cannot open shard)", id); }
+            } else { errors++; log_msg(1, "CSV_DROP key=%.*s (cannot open shard)", (int)klen, id); }
         }
 next_delim:;
-        if (line_heap) free(line);
     }
 
     /* Activate — parallel across shards for THIS object */

@@ -344,6 +344,7 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 - `btree_insert/search/range/bulk_build/bulk_merge`: B+ tree ops with prefix-compressed leaves
 - `ucache`: unified shard mmap cache (FCACHE_MAX entries, per-entry rwlock, LRU eviction)
 - `typed_encode/decode/typed_get_field_str`: typed binary encode/decode with length-prefix varchar
+- `encode_field_len` (config.c): length-based encoder used by the CSV bulk-insert path to parse directly against an mmap'd page cache with (ptr, len) spans — no per-line memcpy. `encode_field()` is a thin `encode_field_len(f, val, strlen(val), out)` wrapper for null-terminated callers (JSON bulk-insert, typed_encode, cmd_update, etc.)
 - `b64_encode/decode` (util.c): RFC 4648 base64, whitespace-tolerant on decode; used by `cmd_put_file_b64`/`cmd_get_file_b64`
 - `valid_filename` (util.c): basename sanitizer (no `/`, `\`, `..`, control chars, ≤255 bytes) — enforced on every remote upload/download
 - `cmd_put_file_tcp`/`cmd_get_file_tcp` (server.c): client-side helpers invoked by CLI; `query_collect` accumulates a full response buffer before parsing

@@ -356,6 +356,7 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx);
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
+void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
 int typed_field_index(const TypedSchema *ts, const char *name);
 void parse_field_type(const char *spec, TypedField *f);
 
