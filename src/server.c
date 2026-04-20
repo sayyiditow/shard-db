@@ -476,6 +476,16 @@ static void save_tokens_conf(const char *db_root) {
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     char *mode = json_get_raw(json, "mode");
 
+    /* Per-request statement timeout. Set unconditionally at the start of every
+       dispatch so the next request on this worker thread never inherits a
+       stale value. "timeout_ms":0 or absent → fall back to global g_timeout
+       at QueryDeadline creation time (resolve_timeout_ms). */
+    {
+        char *tms = json_get_raw(json, "timeout_ms");
+        g_request_timeout_ms = tms ? (uint32_t)atoi(tms) : 0;
+        free(tms);
+    }
+
     /* Auth management modes — require trusted IP or valid token */
     if (mode && (strcmp(mode, "add-token") == 0 || strcmp(mode, "remove-token") == 0 ||
                  strcmp(mode, "add-ip") == 0 || strcmp(mode, "remove-ip") == 0 ||
@@ -1352,6 +1362,12 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     while (*trimmed == ' ') trimmed++;
     uint64_t t0 = (g_slow_query_ms > 0) ? now_ms() : 0;
     int is_json = (*trimmed == '{');
+
+    /* Reset any stale per-request timeout from a previous request on this
+       worker thread. dispatch_json_query will overwrite it for JSON requests
+       that carry "timeout_ms"; the legacy \x1F-delimited path doesn't carry
+       it at all, so we just zero it here. */
+    g_request_timeout_ms = 0;
 
     /* Detect mode early so we can track writes for graceful-shutdown drain.
        Writes must complete before the server exits; reads are safe to drop. */

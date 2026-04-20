@@ -1680,7 +1680,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
     compile_criteria_tree(tree, fs.ts);
-    QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
     int matched = ctx.count;
@@ -1879,7 +1879,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
     compile_criteria_tree(tree, fs.ts);
-    QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
     int matched = ctx.count;
@@ -5479,7 +5479,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
-    QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
     if (plan.kind == PRIMARY_LEAF) {
         SearchCriterion *pc = plan.primary_leaf;
@@ -5713,7 +5713,7 @@ int cmd_find(const char *db_root, const char *object,
     QueryPlan plan = choose_primary_source(tree, db_root, object);
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
-    QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
     if (csv_delim && has_joins) {
         OUT("{\"error\":\"format=csv is not supported with join\"}\n");
@@ -7438,7 +7438,7 @@ int cmd_aggregate(const char *db_root, const char *object,
     ctx.fs = &fs;
     ctx.specs = specs;
     ctx.nspecs = nspecs;
-    QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     ctx.deadline = &dl;
     _Atomic size_t agg_budget_bytes = 0;
     atomic_init(&agg_budget_bytes, 0);

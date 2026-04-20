@@ -14,6 +14,7 @@ int g_btcache_cap = 256;        /* B+ tree mmap cache capacity, configurable via
 size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024; /* 500 MB per-query intermediate cap, configurable via QUERY_BUFFER_MB */
 int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
+_Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */
 
 /* Monitoring counters */
 uint64_t g_ucache_hits = 0;

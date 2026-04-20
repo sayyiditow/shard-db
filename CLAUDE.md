@@ -24,7 +24,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
 ./tests/test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
 ./tests/test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
-# Total: 339 tests
+./tests/test-request-timeout.sh           # Per-request timeout_ms                (10)
+# Total: 349 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -205,6 +206,16 @@ Token storage: open-addressed hash table sized by `TOKEN_CAP` (default 1024 buck
 ### Single-instance guard
 
 `cmd_server` takes `flock(LOCK_EX | LOCK_NB)` on `$DB_ROOT/.shard-db.lock` before daemonizing. A second `./shard-db start` on the same `DB_ROOT` — even with a different port, a different config file, or a copied binary — fails fast with a clear error. The kernel holds the lock for the server's lifetime and releases it automatically on normal exit *or crash* (SIGKILL, power loss), so there's nothing to clean up manually. The lock file contains the running daemon's PID for `lsof`/`cat` visibility.
+
+### Per-request statement timeout
+
+Any query can carry a `"timeout_ms":N` field to override the global `TIMEOUT` for that single request. Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. Value is a hard cap in milliseconds; when exceeded, the query aborts with `{"error":"query_timeout"}` and the server keeps serving.
+
+- `"timeout_ms":0` or absent → falls back to the global `TIMEOUT` (unchanged behaviour).
+- Thread-local override — a tight timeout on one request doesn't leak to the next request on the same worker thread.
+- Zero perf cost: the existing `QueryDeadline` mechanism reads the override from a thread-local at construction time, no extra cost per iteration.
+
+Use it to give specific callers tighter deadlines (e.g., `"timeout_ms":200` for an interactive dashboard) without reconfiguring the server.
 
 ### Per-query memory cap
 

@@ -58,3 +58,6 @@ jobs:
 
       - name: Per-object tokens + perms (test-token-perms)
         run: ./tests/test-token-perms.sh
+
+      - name: Per-request timeout_ms (test-request-timeout)
+        run: ./tests/test-request-timeout.sh

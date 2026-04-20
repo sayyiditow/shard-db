@@ -219,6 +219,17 @@ extern size_t g_query_buffer_max_bytes;
 extern int g_disable_localhost_trust;
 extern int g_token_cap;
 
+/* Per-request statement timeout override. Thread-local: the server's dispatch
+   sets it from the JSON request's "timeout_ms" field before calling cmd_*,
+   then clears it after. When 0, cmd_* falls back to g_timeout * 1000.
+   resolve_timeout_ms() is the single read point used everywhere a
+   QueryDeadline is constructed. */
+extern _Thread_local uint32_t g_request_timeout_ms;
+static inline uint32_t resolve_timeout_ms(void) {
+    return g_request_timeout_ms > 0 ? g_request_timeout_ms
+                                    : (uint32_t)(g_timeout * 1000);
+}
+
 /* Token permission levels.
    r   = read-only ops (get/exists/find/count/aggregate/fetch/keys/get-file).
    rw  = all reads + data-write ops (insert/update/delete/bulk/put-file).
