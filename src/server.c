@@ -96,7 +96,13 @@ static void save_allowed_ips_conf(const char *db_root) {
 }
 
 int is_ip_trusted(const char *ip) {
-    if (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0) return 1;
+    /* Loopback is implicitly trusted by default (shard-db typically sits behind
+       a localhost-connecting proxy that does TLS + auth upstream). Strict
+       deployments set DISABLE_LOCALHOST_TRUST=1 in db.env to require an
+       explicit token even for same-host callers — useful for testing the auth
+       path and for production setups that don't front the DB with a proxy. */
+    if (!g_disable_localhost_trust &&
+        (strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0)) return 1;
     if (g_ip_set_count == 0) return 0;
     uint32_t idx = str_hash(ip) % IP_SET_BUCKETS;
     for (int i = 0; i < IP_SET_BUCKETS; i++) {
@@ -107,27 +113,44 @@ int is_ip_trusted(const char *ip) {
     return 0;
 }
 
-/* --- Token set: hash set, loaded from $DB_ROOT/tokens.conf --- */
-#define TOKEN_SET_BUCKETS 256
+/* --- Token set: hash set, loaded from $DB_ROOT/tokens.conf (global/admin)
+       and $DB_ROOT/<dir>/tokens.conf (per-tenant, scoped).
+   Each slot holds one token plus its scope: empty string = global admin,
+   otherwise the tenant dir name. The same hash table holds both — they
+   disambiguate by the scope field on match. --- */
+#define TOKEN_SET_BUCKETS 1024
 static char g_token_set[TOKEN_SET_BUCKETS][256];
+static char g_token_scope[TOKEN_SET_BUCKETS][256];  /* "" = global, else dir */
 static int g_token_set_used[TOKEN_SET_BUCKETS];
 int g_token_count = 0;
 static pthread_mutex_t g_token_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void token_set_add(const char *token) {
+static void token_set_add_scoped(const char *token, const char *dir_scope) {
     uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
+    const char *scope = dir_scope ? dir_scope : "";
     for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
         int slot = (idx + i) % TOKEN_SET_BUCKETS;
         if (!g_token_set_used[slot]) {
             strncpy(g_token_set[slot], token, 255);
             g_token_set[slot][255] = '\0';
+            strncpy(g_token_scope[slot], scope, 255);
+            g_token_scope[slot][255] = '\0';
             g_token_set_used[slot] = 1;
             g_token_count++;
             return;
         }
-        if (strcmp(g_token_set[slot], token) == 0) return;
+        if (strcmp(g_token_set[slot], token) == 0) {
+            /* Already present — upgrade to broader scope if needed (empty
+               scope = global trumps tenant). Otherwise no-op. */
+            if (scope[0] == '\0' && g_token_scope[slot][0] != '\0') {
+                g_token_scope[slot][0] = '\0';
+            }
+            return;
+        }
     }
 }
+
+static void token_set_add(const char *token) { token_set_add_scoped(token, NULL); }
 
 static int token_set_remove(const char *token) {
     uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
@@ -137,6 +160,7 @@ static int token_set_remove(const char *token) {
         if (strcmp(g_token_set[slot], token) == 0) {
             g_token_set_used[slot] = 0;
             g_token_set[slot][0] = '\0';
+            g_token_scope[slot][0] = '\0';
             g_token_count--;
             return 1;
         }
@@ -152,40 +176,121 @@ static int token_compare(const char *a, const char *b) {
     return diff == 0;
 }
 
-int is_token_valid(const char *token) {
-    if (!token || !token[0]) return 0;
+/* Auth decision for a token against a request's dir.
+   Return codes:
+     TOKEN_NONE    — token absent or no match (reject)
+     TOKEN_GLOBAL  — matched a global / admin token (allow anything)
+     TOKEN_TENANT  — matched a tenant-scoped token whose scope == request_dir
+                     (allow only this dir, never admin commands) */
+#define TOKEN_NONE   0
+#define TOKEN_GLOBAL 1
+#define TOKEN_TENANT 2
+
+int check_token(const char *token, const char *request_dir) {
+    if (!token || !token[0]) return TOKEN_NONE;
     uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
     for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
         int slot = (idx + i) % TOKEN_SET_BUCKETS;
-        if (!g_token_set_used[slot]) return 0;
-        if (token_compare(g_token_set[slot], token)) return 1;
+        if (!g_token_set_used[slot]) return TOKEN_NONE;
+        if (token_compare(g_token_set[slot], token)) {
+            if (g_token_scope[slot][0] == '\0') return TOKEN_GLOBAL;
+            if (request_dir && strcmp(g_token_scope[slot], request_dir) == 0)
+                return TOKEN_TENANT;
+            return TOKEN_NONE;  /* token exists but scope doesn't match */
+        }
     }
-    return 0;
+    return TOKEN_NONE;
+}
+
+/* Legacy wrapper — callers that don't care about scope (e.g. the auth-
+   management commands, which are admin-only) use this. */
+int is_token_valid(const char *token) {
+    return check_token(token, NULL) == TOKEN_GLOBAL;
 }
 
 void load_tokens_conf(const char *db_root) {
+    /* Global tokens first. */
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
     FILE *f = fopen(path, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\n\r")] = '\0';
+            char *p = line; while (*p == ' ') p++;
+            if (*p && *p != '#') token_set_add_scoped(p, NULL);
+        }
+        fclose(f);
+    }
+
+    /* Per-tenant tokens: walk dirs.conf and try each <dir>/tokens.conf. */
+    char dirs_path[PATH_MAX];
+    snprintf(dirs_path, sizeof(dirs_path), "%s/dirs.conf", db_root);
+    FILE *df = fopen(dirs_path, "r");
+    if (!df) return;
+    char dirline[256];
+    while (fgets(dirline, sizeof(dirline), df)) {
+        dirline[strcspn(dirline, "\n\r")] = '\0';
+        char *dp = dirline; while (*dp == ' ') dp++;
+        if (!*dp || *dp == '#') continue;
+        char tpath[PATH_MAX];
+        snprintf(tpath, sizeof(tpath), "%s/%s/tokens.conf", db_root, dp);
+        FILE *tf = fopen(tpath, "r");
+        if (!tf) continue;
+        char tline[256];
+        while (fgets(tline, sizeof(tline), tf)) {
+            tline[strcspn(tline, "\n\r")] = '\0';
+            char *p = tline; while (*p == ' ') p++;
+            if (*p && *p != '#') token_set_add_scoped(p, dp);
+        }
+        fclose(tf);
+    }
+    fclose(df);
+}
+
+static void save_tokens_conf_scoped(const char *db_root, const char *dir_scope) {
+    char path[PATH_MAX];
+    if (dir_scope && dir_scope[0])
+        snprintf(path, sizeof(path), "%s/%s/tokens.conf", db_root, dir_scope);
+    else
+        snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
+    FILE *f = fopen(path, "w");
     if (!f) return;
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\n\r")] = '\0';
-        char *p = line; while (*p == ' ') p++;
-        if (*p && *p != '#') token_set_add(p);
+    const char *want = dir_scope ? dir_scope : "";
+    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
+        if (!g_token_set_used[i]) continue;
+        if (strcmp(g_token_scope[i], want) != 0) continue;
+        fprintf(f, "%s\n", g_token_set[i]);
     }
     fclose(f);
 }
 
 static void save_tokens_conf(const char *db_root) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/tokens.conf", db_root);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
-        if (g_token_set_used[i]) fprintf(f, "%s\n", g_token_set[i]);
-    }
-    fclose(f);
+    save_tokens_conf_scoped(db_root, NULL);
+}
+
+/* Admin-only modes: diagnostics, schema mutations, object lifecycle, index
+   management, auth management, stats. A tenant-scoped token gets rejected
+   on any of these even if the command carries a matching `dir`. */
+static int mode_is_admin(const char *mode) {
+    if (!mode) return 0;
+    static const char *admin_modes[] = {
+        /* Diagnostics — no dir field */
+        "stats", "db-dirs", "vacuum-check", "shard-stats",
+        /* Auth management */
+        "add-token", "remove-token", "list-tokens",
+        "add-ip", "remove-ip", "list-ips",
+        /* Object lifecycle */
+        "create-object", "truncate", "vacuum", "backup", "recount",
+        /* Schema mutations */
+        "rename-field", "remove-field", "add-field",
+        /* Index management */
+        "add-index", "remove-index",
+        NULL
+    };
+    for (int i = 0; admin_modes[i]; i++)
+        if (strcmp(mode, admin_modes[i]) == 0) return 1;
+    return 0;
 }
 
 /* ========== JSON QUERY DISPATCH ========== */
@@ -211,23 +316,45 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
         if (strcmp(mode, "add-token") == 0) {
             char *token = json_get_raw(json, "token");
+            char *scope = json_get_raw(json, "dir");  /* optional tenant scope */
+            if (scope && scope[0] && !is_valid_dir(scope)) {
+                OUT("{\"error\":\"Unknown dir: %s\"}\n", scope);
+                free(token); free(scope); free(mode);
+                return;
+            }
             if (token && token[0]) {
                 pthread_mutex_lock(&g_token_lock);
-                token_set_add(token);
-                save_tokens_conf(raw_db_root);
+                token_set_add_scoped(token, scope && scope[0] ? scope : NULL);
+                save_tokens_conf_scoped(raw_db_root, scope && scope[0] ? scope : NULL);
                 pthread_mutex_unlock(&g_token_lock);
-                log_msg(3, "AUTH add-token from %s", client_ip);
-                OUT("{\"status\":\"token_added\"}\n");
+                log_msg(3, "AUTH add-token%s%s from %s",
+                        scope && scope[0] ? " dir=" : "",
+                        scope && scope[0] ? scope : "",
+                        client_ip);
+                OUT("{\"status\":\"token_added\",\"scope\":\"%s\"}\n",
+                    scope && scope[0] ? scope : "global");
             } else {
                 OUT("{\"error\":\"Missing token\"}\n");
             }
-            free(token);
+            free(token); free(scope);
         } else if (strcmp(mode, "remove-token") == 0) {
             char *token = json_get_raw(json, "token");
             if (token && token[0]) {
                 pthread_mutex_lock(&g_token_lock);
+                /* Remember scope before removal so we know which file to rewrite. */
+                char removed_scope[256] = "";
+                uint32_t idx = str_hash(token) % TOKEN_SET_BUCKETS;
+                for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
+                    int slot = (idx + i) % TOKEN_SET_BUCKETS;
+                    if (!g_token_set_used[slot]) break;
+                    if (strcmp(g_token_set[slot], token) == 0) {
+                        strncpy(removed_scope, g_token_scope[slot], sizeof(removed_scope) - 1);
+                        break;
+                    }
+                }
                 int removed = token_set_remove(token);
-                if (removed) save_tokens_conf(raw_db_root);
+                if (removed)
+                    save_tokens_conf_scoped(raw_db_root, removed_scope[0] ? removed_scope : NULL);
                 pthread_mutex_unlock(&g_token_lock);
                 OUT("{\"status\":\"%s\"}\n", removed ? "token_removed" : "token_not_found");
             } else {
@@ -260,18 +387,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(ip);
         } else if (strcmp(mode, "list-tokens") == 0) {
+            /* Emit {"token":"abcd...wxyz","scope":"global"|"<dir>"} per entry. */
             OUT("[");
             int printed = 0;
             for (int i = 0; i < TOKEN_SET_BUCKETS; i++) {
                 if (!g_token_set_used[i]) continue;
-                /* Show only first 4 and last 4 chars for security */
                 int tlen = strlen(g_token_set[i]);
-                if (tlen > 10) {
-                    OUT("%s\"%.4s...%s\"", printed ? "," : "",
-                        g_token_set[i], g_token_set[i] + tlen - 4);
-                } else {
-                    OUT("%s\"****\"", printed ? "," : "");
-                }
+                char fp[32];
+                if (tlen > 10)
+                    snprintf(fp, sizeof(fp), "%.4s...%s",
+                             g_token_set[i], g_token_set[i] + tlen - 4);
+                else
+                    snprintf(fp, sizeof(fp), "****");
+                const char *scope = g_token_scope[i][0] ? g_token_scope[i] : "global";
+                OUT("%s{\"token\":\"%s\",\"scope\":\"%s\"}", printed ? "," : "", fp, scope);
                 printed++;
             }
             OUT("]\n");
@@ -289,15 +418,28 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
-    /* Auth check — trusted IP or valid token required */
+    /* Auth check — order of precedence:
+         1. Trusted IP → allow anything (bypass token check).
+         2. Global/admin token → allow anything.
+         3. Tenant token whose scope matches the request's `dir` → allow data
+            commands for that dir only; admin commands rejected.
+         4. Otherwise reject. */
     if (!is_ip_trusted(client_ip)) {
         char *auth = json_get_raw(json, "auth");
-        if (!auth || !is_token_valid(auth)) {
-            free(auth); free(mode);
-            OUT("{\"error\":\"unauthorized\"}\n");
+        char *req_dir = json_get_raw(json, "dir");
+        int tok_kind = auth ? check_token(auth, req_dir) : TOKEN_NONE;
+        free(auth);
+        if (tok_kind == TOKEN_NONE) {
+            free(req_dir); free(mode);
+            OUT("{\"error\":\"auth failed\"}\n");
             return;
         }
-        free(auth);
+        if (tok_kind == TOKEN_TENANT && mode_is_admin(mode)) {
+            free(req_dir); free(mode);
+            OUT("{\"error\":\"auth failed\"}\n");
+            return;
+        }
+        free(req_dir);
     }
 
     /* db-dirs doesn't need dir or object */

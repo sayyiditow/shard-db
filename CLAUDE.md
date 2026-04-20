@@ -22,7 +22,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./test-cli-shortcuts.sh             # count/aggregate CLI + delete-file (28)
 ./test-or-logic.sh                  # OR criteria, all four shapes      (43)
 ./test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
-# Total: 275 tests
+./test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
+# Total: 302 tests
 
 # Benchmarks
 ./bench-queries.sh                  # find/count/aggregate on 1M users
@@ -49,8 +50,9 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ### Configuration
 
 - **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `QUERY_BUFFER_MB` (per-query intermediate buffer cap, default 500), `SLOW_QUERY_MS` (floor 100ms, 0=off)
-- **$DB_ROOT/tokens.conf** — API tokens (one per line)
-- **$DB_ROOT/allowed_ips.conf** — Trusted IPs (skip token check)
+- **$DB_ROOT/tokens.conf** — Global / admin API tokens (one per line, full access to any dir + admin commands)
+- **$DB_ROOT/\<dir\>/tokens.conf** — Per-tenant tokens, scoped to that `dir` only. Cannot run admin commands (`stats`, `db-dirs`, `vacuum-check`, `shard-stats`, `create-object`, `truncate`, `vacuum`, `backup`, `recount`, schema mutations, index management, auth management). Loaded automatically at server start for every `dir` listed in `dirs.conf`.
+- **$DB_ROOT/allowed_ips.conf** — Trusted IPs (skip token check entirely; global only — no per-tenant IP lists)
 - **$DB_ROOT/dirs.conf** — Allowed tenant directories
 - **$DB_ROOT/schema.conf** — Per-object: `dir:object:splits:max_key:max_value:prealloc_mb`
 - **$DB_ROOT/\<dir\>/\<object\>/fields.conf** — Typed field schema, one per line: `name:type[:size|P,S][:default=...]`
@@ -153,6 +155,23 @@ All advanced queries go through `./shard-db query '<json>'`.
  "fields":["id","name"],
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
+
+### Per-tenant auth
+
+Tokens live in two tiers:
+
+- Global / admin in `$DB_ROOT/tokens.conf` — any `dir`, any command.
+- Per-tenant in `$DB_ROOT/<dir>/tokens.conf` — scoped to that `dir` only. Rejected on admin-only commands.
+
+Precedence on each request:
+1. Trusted IP (global `allowed_ips.conf`) → bypass.
+2. Global token match → allow.
+3. Tenant token whose scope matches request's `dir` → allow data commands.
+4. Otherwise `{"error":"auth failed"}`.
+
+Localhost (127.0.0.1/::1) is trusted by default — shard-db typically sits behind a loopback-connecting proxy. Set `DISABLE_LOCALHOST_TRUST=1` in `db.env` to require explicit tokens even for same-host callers (strict mode; useful for testing and for deployments without a front-door proxy).
+
+Token management: `add-token` / `remove-token` / `list-tokens` JSON modes accept an optional `"dir"` field to write to a tenant-scoped file instead of global. `list-tokens` returns `{"token":"fingerprint","scope":"global"|"<dir>"}` per entry — full tokens are never echoed.
 
 ### Single-instance guard
 

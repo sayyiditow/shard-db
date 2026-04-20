@@ -216,6 +216,7 @@ extern int g_workers;
 extern int g_index_page_size;
 extern int g_global_limit;
 extern size_t g_query_buffer_max_bytes;
+extern int g_disable_localhost_trust;
 
 /* Canonical error message for per-query memory-cap exceeded. Single string so
    callers don't drift apart; emit via OUT() at any of the 7 collection sites. */

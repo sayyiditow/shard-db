@@ -52,3 +52,6 @@ jobs:
 
       - name: CSV export (test-csv-export)
         run: ./test-csv-export.sh
+
+      - name: Per-tenant auth (test-per-tenant-auth)
+        run: ./test-per-tenant-auth.sh
