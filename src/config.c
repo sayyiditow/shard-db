@@ -108,7 +108,8 @@ FILE *open_log_for_level(int level) {
     struct tm *t = localtime(&now);
     char date[16], path[PATH_MAX];
     strftime(date, sizeof(date), "%Y-%m-%d", t);
-    const char *prefix = (level <= 2) ? "error" : "info";
+    /* Level 1 = ERROR → error log. Everything else (WARN, INFO, DEBUG) → info log. */
+    const char *prefix = (level <= 1) ? "error" : "info";
     snprintf(path, sizeof(path), "%s/%s-%s.log", g_log_dir, date, prefix);
     return fopen(path, "a");
 }
@@ -144,7 +145,7 @@ void *log_writer_thread(void *arg) {
         FILE *info_f = NULL, *err_f = NULL;
         while (g_log_head != g_log_tail) {
             LogEntry *e = &g_log_ring[g_log_tail];
-            FILE **target = (e->level <= 2) ? &err_f : &info_f;
+            FILE **target = (e->level <= 1) ? &err_f : &info_f;
             if (!*target) *target = open_log_for_level(e->level);
             if (*target) fputs(e->msg, *target);
             g_log_tail = (g_log_tail + 1) % LOG_RING_SIZE;

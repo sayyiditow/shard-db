@@ -633,6 +633,15 @@ static void *bulk_insert_shard_worker(void *arg) {
                 break;
             }
             wh = ucache_get_write(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+            if (!wh.map) {
+                /* Grow succeeded but reacquire failed — e.g. EMFILE hit on open.
+                   Count the remaining records as errors so the caller doesn't
+                   silently lose them. */
+                log_msg(1, "INSERT_DROP shard=%d (reacquire after grow failed, dropping %zu records)",
+                        sw->shard_id, sw->count - i);
+                sw->errors += (int)(sw->count - i);
+                break;
+            }
             continue; /* re-probe same record index */
         }
 

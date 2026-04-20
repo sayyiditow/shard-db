@@ -1669,6 +1669,48 @@ void remove_pid_file(const char *db_root) {
 int cmd_server(const char *db_root, int daemonize) {
     int port = g_port;
 
+    /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
+       fd per cached shard and briefly 2 during ucache_grow_shard (new + retired
+       for grace-period). At FCACHE_MAX=4096 defaults, peak need is ~8k fds —
+       well above the 1024 default on many distros. Shell-default limits cause
+       EMFILE inside ucache_grow_shard at high split counts. Soft → hard needs
+       no privilege. If the hard limit itself is below a practical floor, warn
+       with actionable guidance. */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < rl.rlim_max) {
+                struct rlimit rl_new = { rl.rlim_max, rl.rlim_max };
+                if (setrlimit(RLIMIT_NOFILE, &rl_new) == 0)
+                    rl = rl_new;
+            }
+            /* Practical floor: 2 × FCACHE_MAX + 64 slack for sockets, logs,
+               index fds, stdin/out/err. At the default FCACHE_MAX=4096 this is
+               8256. */
+            rlim_t needed = (rlim_t)((g_fcache_cap > 0 ? g_fcache_cap : 4096) * 2 + 64);
+            if (rl.rlim_cur < needed) {
+                const char *user = getenv("USER");
+                if (!user) user = "your-user";
+                fprintf(stderr,
+                    "WARN: RLIMIT_NOFILE soft=%llu hard=%llu is below the "
+                    "practical floor %llu for FCACHE_MAX=%d. Bulk inserts at "
+                    "high split counts may hit EMFILE. Raise the hard limit:\n"
+                    "  /etc/security/limits.conf:\n"
+                    "    %s soft nofile %llu\n"
+                    "    %s hard nofile %llu\n"
+                    "  …then log out + back in. Or add 'LimitNOFILE=%llu' to "
+                    "the systemd unit file.\n",
+                    (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)rl.rlim_max,
+                    (unsigned long long)needed,
+                    g_fcache_cap > 0 ? g_fcache_cap : 4096,
+                    user, (unsigned long long)needed,
+                    user, (unsigned long long)needed,
+                    (unsigned long long)needed);
+            }
+        }
+    }
+
     /* Single-instance guard. flock on a per-DB_ROOT lock file prevents a
        second shard-db process from attaching to the same data directory
        (which would corrupt shared mmap state — the per-object rwlocks in
