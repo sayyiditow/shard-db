@@ -543,6 +543,12 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input);
 int cmd_bulk_update(const char *db_root, const char *object,
                     const char *criteria_json, const char *value_json,
                     int limit, int dry_run);
+/* Per-key partial update from a delimited text file. Row shape:
+   key<DELIM>field1<DELIM>field2<DELIM>... in fields.conf active-field order.
+   Semantics: update-only, key must exist, blank cell = leave alone,
+   non-blank cell = overwrite. */
+int cmd_bulk_update_delimited(const char *db_root, const char *object,
+                               const char *filepath, char delimiter);
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              const char *criteria_json, int limit, int dry_run);
 int cmd_vacuum(const char *db_root, const char *object,

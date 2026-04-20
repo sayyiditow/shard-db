@@ -11,7 +11,7 @@ static int mode_is_write(const char *m) {
     return strcasecmp(m, "insert") == 0 || strcasecmp(m, "update") == 0 ||
            strcasecmp(m, "delete") == 0 || strcasecmp(m, "bulk-insert") == 0 ||
            strcasecmp(m, "bulk-insert-delimited") == 0 || strcasecmp(m, "bulk-delete") == 0 ||
-           strcasecmp(m, "bulk-update") == 0 ||
+           strcasecmp(m, "bulk-update") == 0 || strcasecmp(m, "bulk-update-delimited") == 0 ||
            strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
            strcasecmp(m, "put-file") == 0 ||
            strcasecmp(m, "delete-file") == 0 ||
@@ -297,7 +297,7 @@ static int mode_is_data_write(const char *mode) {
     if (!mode) return 0;
     static const char *w[] = {
         "insert", "update", "delete",
-        "bulk-insert", "bulk-insert-delimited", "bulk-delete", "bulk-update",
+        "bulk-insert", "bulk-insert-delimited", "bulk-delete", "bulk-update", "bulk-update-delimited",
         "put-file", "delete-file", "sequence",
         NULL
     };
@@ -1129,6 +1129,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         else
             OUT("{\"error\":\"Missing criteria or value\"}\n");
         free(crit_json); free(value); free(lim_s); free(dry_s);
+    } else if (strcmp(mode, "bulk-update-delimited") == 0) {
+        char *file = json_obj_strdup(&req, "file");
+        char *delim = json_obj_strdup(&req, "delimiter");
+        char d = (delim && delim[0]) ? delim[0] : ',';
+        if (file) cmd_bulk_update_delimited(db_root, object, file, d);
+        else OUT("{\"error\":\"Missing file\"}\n");
+        free(file); free(delim);
     } else if (strcmp(mode, "vacuum") == 0) {
         /* Optional flags: "compact":true and "splits":N route to rebuild_object;
            no flags means fast in-place tombstone reclaim. */

@@ -532,6 +532,179 @@ static void *idx_build_worker(void *arg) {
 
 /* ---- Fast bulk insert using mmap ---- */
 
+/* Per-record buffered state collected in phase 1 (parse) and consumed in
+   phase 2 (write). Each record's payload is a ts->total_size typed buffer
+   owned by the record — freed after phase-2 is complete. */
+typedef struct {
+    char     *id;           /* owned null-terminated key */
+    uint8_t  *payload;      /* owned typed payload (ts->total_size bytes) */
+    size_t    klen;
+    uint8_t   hash[16];
+    int       start_slot;
+    int       shard_id;
+} BulkInsRecord;
+
+/* Per-shard bucket + worker arguments. Each bucket targets exactly one
+   shard so the worker can take the ucache wrlock **once**, write every
+   record in the bucket, and release **once** — avoiding per-record
+   acquire/release churn. Idx entries are collected into per-worker arrays
+   and merged into the caller's global arrays after the worker returns
+   (same shape bulk-delete's bulk_del_shard_worker uses). */
+typedef struct {
+    const char     *db_root;
+    const char     *object;
+    const Schema   *sch;
+    const TypedSchema *ts;
+    int             shard_id;
+    /* Per-record data — all records target sw->shard_id */
+    BulkInsRecord  *records;
+    size_t          count;
+    /* Index metadata (read-only, shared across workers) */
+    int             nidx;
+    const char    (*idx_fields)[256];
+    const int     (*idx_field_indices)[16];
+    const int      *idx_field_counts;
+    const int      *idx_is_composite;
+    /* Results (written by worker) */
+    int             inserted;   /* new keys — updates do NOT increment */
+    int             errors;
+    /* Per-worker index entry collection; merged post-phase into caller's
+       global arrays. Each BtEntry.value is an owned malloc'd string. */
+    BtEntry       **idx_pairs;        /* [nidx] */
+    size_t         *idx_pair_counts;  /* [nidx] */
+    size_t         *idx_pair_caps;    /* [nidx] */
+} BulkInsShardWork;
+
+/* Probe + write every record in one shard's bucket under a single ucache
+   wrlock held from start to finish. On shard-full, release the lock, grow
+   the shard, reacquire, and retry the **same** record index — avoids
+   per-record churn. Collects index entries into sw->idx_pairs for later
+   merge/bulk-build. pthread-compatible signature: workers in different
+   shard buckets never touch each other's shards, so the wrlocks are
+   disjoint and no cross-worker coordination is needed. */
+static void *bulk_insert_shard_worker(void *arg) {
+    BulkInsShardWork *sw = (BulkInsShardWork *)arg;
+    if (sw->count == 0) return NULL;
+
+    char shard_path[PATH_MAX];
+    build_shard_path(shard_path, sizeof(shard_path), sw->db_root, sw->object, sw->shard_id);
+
+    FcacheRead wh = ucache_get_write(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+    if (!wh.map) {
+        log_msg(1, "INSERT_DROP shard=%d (cannot open shard, dropping %zu records)",
+                sw->shard_id, sw->count);
+        sw->errors += (int)sw->count;
+        return NULL;
+    }
+
+    size_t i = 0;
+    while (i < sw->count && wh.map) {
+        BulkInsRecord *r = &sw->records[i];
+        uint8_t *map = wh.map;
+        UCacheEntry *e = ucache_entry(wh.slot);
+        uint32_t slots = wh.slots_per_shard;
+        uint32_t mask = slots - 1;
+
+        /* Probe for slot */
+        int slot = -1, first_tomb = -1;
+        for (uint32_t p = 0; p < slots; p++) {
+            uint32_t s = ((uint32_t)r->start_slot + p) & mask;
+            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            if (h->flag == 0 && h->key_len == 0) { slot = (int)s; break; }
+            if (h->flag == 2) { if (first_tomb < 0) first_tomb = (int)s; continue; }
+            if (memcmp(h->hash, r->hash, 16) == 0 &&
+                h->key_len == r->klen &&
+                memcmp(map + zoneB_off(s, slots, sw->sch->slot_size), r->id, r->klen) == 0) {
+                slot = (int)s; break;
+            }
+        }
+        if (slot < 0 && first_tomb >= 0) slot = first_tomb;
+
+        if (slot < 0) {
+            /* Shard full — release lock so grow can take it, grow, reacquire, retry */
+            ucache_write_release(wh);
+            if (ucache_grow_shard(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb) < 0) {
+                /* All remaining records in this bucket fail */
+                for (size_t j = i; j < sw->count; j++)
+                    log_msg(1, "INSERT_DROP shard=%d key=%s (shard full: cannot grow)",
+                            sw->shard_id, sw->records[j].id);
+                sw->errors += (int)(sw->count - i);
+                wh.map = NULL;
+                break;
+            }
+            wh = ucache_get_write(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+            continue; /* re-probe same record index */
+        }
+
+        /* Write header + payload */
+        SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
+        int is_update = (existing->flag == 1 &&
+                         memcmp(existing->hash, r->hash, 16) == 0);
+        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
+        memset(hdr, 0, HEADER_SIZE);
+        memcpy(hdr->hash, r->hash, 16);
+        hdr->flag = 0;
+        hdr->key_len = (uint16_t)r->klen;
+        hdr->value_len = (uint32_t)sw->ts->total_size;
+        uint8_t *payload = map + zoneB_off(slot, slots, sw->sch->slot_size);
+        memcpy(payload, r->id, r->klen);
+        memcpy(payload + r->klen, r->payload, sw->ts->total_size);
+        e->dirty = 1;
+
+        if ((uint32_t)slot < slots) {
+            size_t bits_cap = (slots + 7) / 8;
+            if (!e->slot_bits) e->slot_bits = calloc(bits_cap, 1);
+            if (e->slot_bits) e->slot_bits[slot / 8] |= (uint8_t)(1 << (slot % 8));
+            if (slot > e->max_dirty_slot) e->max_dirty_slot = slot;
+        }
+
+        if (!is_update) sw->inserted++;
+
+        /* Collect index entries from the typed payload */
+        for (int fi = 0; fi < sw->nidx; fi++) {
+            char *idx_val = NULL;
+            if (sw->idx_is_composite[fi]) {
+                char cat[4096]; int cp = 0; int ok = 1;
+                for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
+                    int tidx = sw->idx_field_indices[fi][si];
+                    char *v = (tidx >= 0) ? typed_get_field_str(sw->ts, r->payload, tidx) : NULL;
+                    if (!v || !v[0]) { ok = 0; free(v); break; }
+                    int sl = strlen(v);
+                    if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
+                    free(v);
+                }
+                cat[cp] = '\0';
+                if (ok && cp > 0) {
+                    idx_val = malloc(cp + 1);
+                    memcpy(idx_val, cat, cp);
+                    idx_val[cp] = '\0';
+                }
+            } else {
+                int tidx = sw->idx_field_indices[fi][0];
+                if (tidx >= 0) idx_val = typed_get_field_str(sw->ts, r->payload, tidx);
+            }
+            if (idx_val && idx_val[0]) {
+                if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
+                    sw->idx_pair_caps[fi] = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
+                    sw->idx_pairs[fi] = realloc(sw->idx_pairs[fi],
+                                                sw->idx_pair_caps[fi] * sizeof(BtEntry));
+                }
+                BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
+                bp->value = idx_val;
+                bp->vlen  = strlen(idx_val);
+                memcpy(bp->hash, r->hash, 16);
+            } else {
+                free(idx_val);
+            }
+        }
+
+        i++;
+    }
+
+    if (wh.map) ucache_write_release(wh);
+    return NULL;
+}
+
 /* Internal: bulk insert from a json string already in memory (no file I/O) */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str);
 
@@ -629,11 +802,23 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     int is_array_format = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
 
     if (!is_object_format && !is_array_format) {
-        fprintf(stderr, "Error: Expected JSON object or array\n"); free(json); return 1;
+        fprintf(stderr, "Error: Expected JSON object or array\n");
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        free(typed_tmp);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        return 1;
     }
     p++;
 
     int count = 0, errors = 0;
+
+    /* ===== Phase 1: parse every record into a buffered records[] array. Per-record
+       owned `id` + `payload` (ts->total_size bytes) so Phase 2 workers can replay
+       the probe+write loop without re-parsing or re-encoding. Ownership is
+       transferred into per-shard buckets in Phase 1.5 and freed after Phase 2. */
+    size_t rec_cap = 1024, rec_count = 0;
+    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
     while (*p) {
         p = json_skip(p);
@@ -703,140 +888,141 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         }
 
         if (id && data) {
-            const char *store_data;
-            size_t vlen;
             typed_encode_defaults(ts, data, typed_tmp, ts->total_size, db_root, object);
-            store_data = (const char *)typed_tmp;
-            vlen = ts->total_size;
             size_t klen = strlen(id);
 
-            if ((int)klen > sc.max_key || (int)vlen > sc.max_value) {
+            if ((int)klen > sc.max_key || (int)ts->total_size > sc.max_value) {
                 errors++;
+                free(id);
             } else {
-                /* Compute address */
-                uint8_t hash[16]; int shard_id, start_slot;
-                compute_addr(id, klen, sc.splits, hash, &shard_id, &start_slot);
+                /* Own the payload — freed after Phase 2 completes. */
+                uint8_t *payload = malloc(ts->total_size);
+                memcpy(payload, typed_tmp, ts->total_size);
 
-                /* Ensure shard is mapped with enough space via ucache */
-                char shard_path[PATH_MAX];
-                build_shard_path(shard_path, sizeof(shard_path), db_root, object, shard_id);
-                FcacheRead wh = ucache_get_write(shard_path, sc.slot_size, sc.prealloc_mb);
-                int slot = -1;
-                int first_tomb = -1;
-                uint8_t *map = NULL;
-                struct UCacheEntry *e = NULL;
-                uint32_t slots = 0, mask = 0;
-                for (int attempt = 0; attempt < 24 && wh.map; attempt++) {
-                    map = wh.map;
-                    e = ucache_entry(wh.slot);
-                    slots = wh.slots_per_shard;
-                    mask = slots - 1;
-
-                    slot = -1; first_tomb = -1;
-                    for (uint32_t i = 0; i < slots; i++) {
-                        uint32_t s = ((uint32_t)start_slot + i) & mask;
-                        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-                        if (h->flag == 0 && h->key_len == 0) { slot = (int)s; break; }
-                        if (h->flag == 2) { if (first_tomb < 0) first_tomb = (int)s; continue; }
-                        if (memcmp(h->hash, hash, 16) == 0 &&
-                            h->key_len == klen &&
-                            memcmp(map + zoneB_off(s, slots, sc.slot_size), id, klen) == 0) {
-                            slot = (int)s; break;
-                        }
-                    }
-                    if (slot < 0 && first_tomb >= 0) slot = first_tomb;
-                    if (slot >= 0) break;
-                    /* Shard full — grow (release lock so grow can take it) and retry */
-                    ucache_write_release(wh);
-                    /* Return value: >0 = grew, 0 = another thread already grew, <0 = failed.
-                       Only give up on real failure; "already grown" means re-probe. */
-                    if (ucache_grow_shard(shard_path, sc.slot_size, sc.prealloc_mb) < 0) {
-                        wh.map = NULL; break;
-                    }
-                    wh = ucache_get_write(shard_path, sc.slot_size, sc.prealloc_mb);
+                if (rec_count >= rec_cap) {
+                    rec_cap *= 2;
+                    records = realloc(records, rec_cap * sizeof(BulkInsRecord));
                 }
-                if (wh.map) {
-                    if (slot >= 0) {
-                        {
-                            SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
-                            int is_update = (existing->flag == 1 &&
-                                            memcmp(existing->hash, hash, 16) == 0);
+                BulkInsRecord *r = &records[rec_count++];
+                r->id = id;
+                r->payload = payload;
+                r->klen = klen;
+                compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+            }
+        } else {
+            if (id) free(id);
+        }
+        if (data) free(data);
+    }
 
-                            SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-                            memset(hdr, 0, HEADER_SIZE);
-                            memcpy(hdr->hash, hash, 16);
-                            hdr->flag = 0;
-                            hdr->key_len = (uint16_t)klen;
-                            hdr->value_len = (uint32_t)vlen;
-                            uint8_t *payload = map + zoneB_off(slot, slots, sc.slot_size);
-                            memcpy(payload, id, klen);
-                            memcpy(payload + klen, store_data, vlen);
-                            e->dirty = 1;
+    /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
+       writes and can hold the ucache wrlock once for the entire bucket. */
+    int *shard_counts = calloc(sc.splits, sizeof(int));
+    for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
-                            if ((uint32_t)slot < slots) {
-                                size_t bits_cap = (slots + 7) / 8;
-                                if (!e->slot_bits)
-                                    e->slot_bits = calloc(bits_cap, 1);
-                                if (e->slot_bits)
-                                    e->slot_bits[slot / 8] |= (uint8_t)(1 << (slot % 8));
-                                if (slot > e->max_dirty_slot)
-                                    e->max_dirty_slot = slot;
-                            }
+    int nshard_groups = 0;
+    for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
 
-                            if (!is_update) count++;
-
-                            /* Collect index entries for bulk write at end.
-                               Extract field values from typed binary — avoids a second JSON parse.
-                               Field indices are pre-resolved above. */
-                            if (nfields > 0) {
-                                for (int fi = 0; fi < nfields; fi++) {
-                                    char *idx_val = NULL;
-
-                                    if (idx_is_composite[fi]) {
-                                        char cat[4096]; int cp = 0; int ok = 1;
-                                        for (int si = 0; si < idx_field_counts[fi]; si++) {
-                                            int tidx = idx_field_indices[fi][si];
-                                            char *v = (tidx >= 0) ? typed_get_field_str(ts, (const uint8_t *)typed_tmp, tidx) : NULL;
-                                            if (!v || !v[0]) { ok = 0; free(v); break; }
-                                            int sl = strlen(v);
-                                            if (cp + sl < (int)sizeof(cat)) { memcpy(cat+cp, v, sl); cp += sl; }
-                                            free(v);
-                                        }
-                                        cat[cp] = '\0';
-                                        if (ok && cp > 0) {
-                                            idx_val = malloc(cp + 1);
-                                            memcpy(idx_val, cat, cp);
-                                            idx_val[cp] = '\0';
-                                        }
-                                    } else {
-                                        int tidx = idx_field_indices[fi][0];
-                                        if (tidx >= 0) idx_val = typed_get_field_str(ts, (const uint8_t *)typed_tmp, tidx);
-                                    }
-
-                                    if (idx_val && idx_val[0]) {
-                                        if (idx_pair_counts[fi] >= idx_pair_caps[fi]) {
-                                            idx_pair_caps[fi] *= 2;
-                                            idx_pairs[fi] = realloc(idx_pairs[fi],
-                                                idx_pair_caps[fi] * sizeof(BtEntry));
-                                        }
-                                        BtEntry *bp = &idx_pairs[fi][idx_pair_counts[fi]++];
-                                        bp->value = idx_val;
-                                        bp->vlen = strlen(idx_val);
-                                        memcpy(bp->hash, hash, 16);
-                                    } else {
-                                        free(idx_val);
-                                    }
-                                }
-                            }
-                        }
-                    } else { errors++; log_msg(1, "INSERT_DROP shard=%d key=%s (shard full: %u slots occupied)", shard_id, id, slots); }
-                    ucache_write_release(wh);
-                } else { errors++; log_msg(1, "INSERT_DROP key=%s (cannot open shard)", id); }
+    BulkInsShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
+    int *shard_to_worker = malloc(sc.splits * sizeof(int));
+    {
+        int g = 0;
+        for (int s = 0; s < sc.splits; s++) {
+            if (shard_counts[s] > 0) {
+                workers[g].shard_id = s;
+                workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+                workers[g].count = 0;
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
             }
         }
-next_record:
-        free(id); free(data);
     }
+    for (size_t i = 0; i < rec_count; i++) {
+        int w = shard_to_worker[records[i].shard_id];
+        workers[w].records[workers[w].count++] = records[i];  /* shallow copy, ownership transferred */
+    }
+    free(records);
+    free(shard_counts);
+    free(shard_to_worker);
+
+    /* Wire read-only worker context + allocate per-worker idx-entry collectors. */
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        BulkInsShardWork *ws = &workers[wi];
+        ws->db_root = db_root;
+        ws->object = object;
+        ws->sch = &sc;
+        ws->ts = ts;
+        ws->nidx = nfields;
+        ws->idx_fields = (const char (*)[256])idx_fields;
+        ws->idx_field_indices = (const int (*)[16])idx_field_indices;
+        ws->idx_field_counts = idx_field_counts;
+        ws->idx_is_composite = idx_is_composite;
+        ws->inserted = 0;
+        ws->errors = 0;
+        ws->idx_pairs = nfields > 0 ? calloc(nfields, sizeof(BtEntry *)) : NULL;
+        ws->idx_pair_counts = nfields > 0 ? calloc(nfields, sizeof(size_t)) : NULL;
+        ws->idx_pair_caps = nfields > 0 ? calloc(nfields, sizeof(size_t)) : NULL;
+    }
+
+    /* ===== Phase 2: run shard workers in parallel. Each worker owns one shard's
+       writes so ucache wrlocks are disjoint across workers — no cross-worker
+       coordination needed. Batched pthread_create/join pattern matches
+       bulk_del_shard_worker. Serial fallback when thread count ≤ 1 or workload
+       is small enough that spawn/join overhead would dominate. */
+    {
+        int nthreads = parallel_threads();
+        if (nthreads > nshard_groups) nthreads = nshard_groups;
+        if (nthreads <= 1 || nshard_groups <= 2) {
+            for (int wi = 0; wi < nshard_groups; wi++)
+                bulk_insert_shard_worker(&workers[wi]);
+        } else {
+            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
+            for (int b = 0; b < nshard_groups; b += nthreads) {
+                int n = nshard_groups - b;
+                if (n > nthreads) n = nthreads;
+                for (int t = 0; t < n; t++)
+                    pthread_create(&threads[t], NULL, bulk_insert_shard_worker, &workers[b + t]);
+                for (int t = 0; t < n; t++)
+                    pthread_join(threads[t], NULL);
+            }
+            free(threads);
+        }
+    }
+
+    /* Merge per-worker results into the caller's global counters and index arrays,
+       then release per-worker scratch. BtEntry.value ownership transfers into
+       the global idx_pairs — freed later by the idx-build cleanup. */
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        BulkInsShardWork *ws = &workers[wi];
+        count  += ws->inserted;
+        errors += ws->errors;
+
+        for (int fi = 0; fi < nfields; fi++) {
+            size_t add = ws->idx_pair_counts[fi];
+            if (add == 0) { free(ws->idx_pairs[fi]); continue; }
+            if (idx_pair_counts[fi] + add > idx_pair_caps[fi]) {
+                while (idx_pair_counts[fi] + add > idx_pair_caps[fi]) idx_pair_caps[fi] *= 2;
+                idx_pairs[fi] = realloc(idx_pairs[fi], idx_pair_caps[fi] * sizeof(BtEntry));
+            }
+            memcpy(idx_pairs[fi] + idx_pair_counts[fi],
+                   ws->idx_pairs[fi], add * sizeof(BtEntry));
+            idx_pair_counts[fi] += add;
+            free(ws->idx_pairs[fi]);
+        }
+
+        for (size_t ri = 0; ri < ws->count; ri++) {
+            free(ws->records[ri].id);
+            free(ws->records[ri].payload);
+        }
+        free(ws->records);
+        free(ws->idx_pairs);
+        free(ws->idx_pair_counts);
+        free(ws->idx_pair_caps);
+    }
+    free(workers);
 
     /* Activate all dirty shards for THIS object — filter by path prefix */
     {
@@ -1052,6 +1238,14 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
        free parse on the numeric / varchar / index sides. */
     struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
 
+    /* ===== Phase 1: parse every CSV line into a buffered records[] array. The
+       (ptr, len) span path stays zero-copy for the CSV body; we only allocate
+       owned `id` + typed `payload` to survive past Phase 1 into Phase 2. Once
+       a record is in the buffer, `bulk_insert_shard_worker` handles probe +
+       write identically to the JSON path. */
+    size_t rec_cap = 1024, rec_count = 0;
+    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
+
     while (rp < data_end) {
         /* Find end of line without modifying the buffer */
         const char *eol = rp;
@@ -1075,7 +1269,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         const char *key_end = line_start;
         while (key_end < line_end && *key_end != delimiter) key_end++;
         if (key_end == line_end) continue;  /* no delimiter — skip line */
-        const char *id = line_start;
+        const char *id_start = line_start;
         size_t klen = key_end - line_start;
 
         /* Walk remaining spans into vals[] without copying. */
@@ -1117,119 +1311,126 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
 
         if ((int)klen > sc.max_key || ts->total_size > sc.max_value) {
             errors++;
-        } else {
-            uint8_t hash[16]; int shard_id, start_slot;
-            compute_addr(id, klen, sc.splits, hash, &shard_id, &start_slot);
-
-            char shard_path[PATH_MAX];
-            build_shard_path(shard_path, sizeof(shard_path), db_root, object, shard_id);
-            FcacheRead wh = ucache_get_write(shard_path, sc.slot_size, sc.prealloc_mb);
-            int slot = -1, first_tomb = -1;
-            uint8_t *map = NULL;
-            UCacheEntry *e = NULL;
-            uint32_t slots = 0, mask = 0;
-            for (int attempt = 0; attempt < 24 && wh.map; attempt++) {
-                map = wh.map;
-                e = ucache_entry(wh.slot);
-                slots = wh.slots_per_shard;
-                mask = slots - 1;
-                slot = -1; first_tomb = -1;
-                for (uint32_t i = 0; i < slots; i++) {
-                    uint32_t s = ((uint32_t)start_slot + i) & mask;
-                    SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-                    if (h->flag == 0 && h->key_len == 0) { slot = (int)s; break; }
-                    if (h->flag == 2) { if (first_tomb < 0) first_tomb = (int)s; continue; }
-                    if (memcmp(h->hash, hash, 16) == 0 &&
-                        h->key_len == klen &&
-                        memcmp(map + zoneB_off(s, slots, sc.slot_size), id, klen) == 0) {
-                        slot = (int)s; break;
-                    }
-                }
-                if (slot < 0 && first_tomb >= 0) slot = first_tomb;
-                if (slot >= 0) break;
-                ucache_write_release(wh);
-                if (ucache_grow_shard(shard_path, sc.slot_size, sc.prealloc_mb) < 0) { wh.map = NULL; break; }
-                wh = ucache_get_write(shard_path, sc.slot_size, sc.prealloc_mb);
-            }
-            if (wh.map) {
-                if (slot >= 0) {
-                    {
-                        SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
-                        int is_update = (existing->flag == 1 &&
-                                        memcmp(existing->hash, hash, 16) == 0);
-                        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-                        memset(hdr, 0, HEADER_SIZE);
-                        memcpy(hdr->hash, hash, 16);
-                        hdr->flag = 0;
-                        hdr->key_len = (uint16_t)klen;
-                        hdr->value_len = (uint32_t)ts->total_size;
-                        uint8_t *payload = map + zoneB_off(slot, slots, sc.slot_size);
-                        memcpy(payload, id, klen);
-                        memcpy(payload + klen, typed_tmp, ts->total_size);
-                        e->dirty = 1;
-
-                        if ((uint32_t)slot < slots) {
-                            size_t bits_cap = (slots + 7) / 8;
-                            if (!e->slot_bits)
-                                e->slot_bits = calloc(bits_cap, 1);
-                            if (e->slot_bits)
-                                e->slot_bits[slot / 8] |= (uint8_t)(1 << (slot % 8));
-                            if (slot > e->max_dirty_slot)
-                                e->max_dirty_slot = slot;
-                        }
-
-                        if (!is_update) count++;
-
-                        /* Collect index entries — length-based; btree keys
-                           need owned null-terminated strings so we allocate
-                           exactly once per index entry with the known size. */
-                        for (int fi = 0; fi < nidx; fi++) {
-                            char *idx_val = NULL;
-                            size_t idx_vlen = 0;
-                            if (idx_is_composite[fi]) {
-                                char cat[4096]; size_t cp = 0; int ok = 1;
-                                for (int si = 0; si < idx_field_counts[fi]; si++) {
-                                    int fidx = idx_field_indices[fi][si];
-                                    if (fidx >= 0 && fidx < nvals && vals[fidx].len > 0) {
-                                        if (cp + vals[fidx].len >= sizeof(cat)) { ok = 0; break; }
-                                        memcpy(cat + cp, vals[fidx].ptr, vals[fidx].len);
-                                        cp += vals[fidx].len;
-                                    } else { ok = 0; break; }
-                                }
-                                if (ok && cp > 0) {
-                                    idx_val = malloc(cp + 1);
-                                    memcpy(idx_val, cat, cp);
-                                    idx_val[cp] = '\0';
-                                    idx_vlen = cp;
-                                }
-                            } else {
-                                int fidx = idx_field_indices[fi][0];
-                                if (fidx >= 0 && fidx < nvals && vals[fidx].len > 0) {
-                                    idx_val = malloc(vals[fidx].len + 1);
-                                    memcpy(idx_val, vals[fidx].ptr, vals[fidx].len);
-                                    idx_val[vals[fidx].len] = '\0';
-                                    idx_vlen = vals[fidx].len;
-                                }
-                            }
-                            if (idx_val) {
-                                if (idx_pair_counts[fi] >= idx_pair_caps[fi]) {
-                                    idx_pair_caps[fi] *= 2;
-                                    idx_pairs[fi] = realloc(idx_pairs[fi],
-                                        idx_pair_caps[fi] * sizeof(BtEntry));
-                                }
-                                BtEntry *bp = &idx_pairs[fi][idx_pair_counts[fi]++];
-                                bp->value = idx_val;
-                                bp->vlen = idx_vlen;
-                                memcpy(bp->hash, hash, 16);
-                            }
-                        }
-                    }
-                } else { errors++; log_msg(1, "CSV_DROP shard=%d key=%.*s (shard full: %u slots)", shard_id, (int)klen, id, slots); }
-                ucache_write_release(wh);
-            } else { errors++; log_msg(1, "CSV_DROP key=%.*s (cannot open shard)", (int)klen, id); }
+            continue;
         }
-next_delim:;
+
+        /* Own the key and typed payload — survives into Phase 2. */
+        char *id = malloc(klen + 1);
+        memcpy(id, id_start, klen); id[klen] = '\0';
+        uint8_t *payload = malloc(ts->total_size);
+        memcpy(payload, typed_tmp, ts->total_size);
+
+        if (rec_count >= rec_cap) {
+            rec_cap *= 2;
+            records = realloc(records, rec_cap * sizeof(BulkInsRecord));
+        }
+        BulkInsRecord *r = &records[rec_count++];
+        r->id = id;
+        r->payload = payload;
+        r->klen = klen;
+        compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
     }
+
+    /* ===== Phase 1.5: bucket by shard — identical to the JSON path. */
+    int *shard_counts = calloc(sc.splits, sizeof(int));
+    for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
+
+    int nshard_groups = 0;
+    for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
+
+    BulkInsShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
+    int *shard_to_worker = malloc(sc.splits * sizeof(int));
+    {
+        int g = 0;
+        for (int s = 0; s < sc.splits; s++) {
+            if (shard_counts[s] > 0) {
+                workers[g].shard_id = s;
+                workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+                workers[g].count = 0;
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
+            }
+        }
+    }
+    for (size_t i = 0; i < rec_count; i++) {
+        int w = shard_to_worker[records[i].shard_id];
+        workers[w].records[workers[w].count++] = records[i];
+    }
+    free(records);
+    free(shard_counts);
+    free(shard_to_worker);
+
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        BulkInsShardWork *ws = &workers[wi];
+        ws->db_root = db_root;
+        ws->object = object;
+        ws->sch = &sc;
+        ws->ts = ts;
+        ws->nidx = nidx;
+        ws->idx_fields = (const char (*)[256])idx_fields;
+        ws->idx_field_indices = (const int (*)[16])idx_field_indices;
+        ws->idx_field_counts = idx_field_counts;
+        ws->idx_is_composite = idx_is_composite;
+        ws->inserted = 0;
+        ws->errors = 0;
+        ws->idx_pairs = nidx > 0 ? calloc(nidx, sizeof(BtEntry *)) : NULL;
+        ws->idx_pair_counts = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
+        ws->idx_pair_caps = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
+    }
+
+    /* ===== Phase 2: parallel shard workers (reuses bulk_insert_shard_worker). */
+    {
+        int nthreads = parallel_threads();
+        if (nthreads > nshard_groups) nthreads = nshard_groups;
+        if (nthreads <= 1 || nshard_groups <= 2) {
+            for (int wi = 0; wi < nshard_groups; wi++)
+                bulk_insert_shard_worker(&workers[wi]);
+        } else {
+            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
+            for (int b = 0; b < nshard_groups; b += nthreads) {
+                int n = nshard_groups - b;
+                if (n > nthreads) n = nthreads;
+                for (int t = 0; t < n; t++)
+                    pthread_create(&threads[t], NULL, bulk_insert_shard_worker, &workers[b + t]);
+                for (int t = 0; t < n; t++)
+                    pthread_join(threads[t], NULL);
+            }
+            free(threads);
+        }
+    }
+
+    /* Merge per-worker results into caller's counters + index arrays. */
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        BulkInsShardWork *ws = &workers[wi];
+        count  += ws->inserted;
+        errors += ws->errors;
+
+        for (int fi = 0; fi < nidx; fi++) {
+            size_t add = ws->idx_pair_counts[fi];
+            if (add == 0) { free(ws->idx_pairs[fi]); continue; }
+            if (idx_pair_counts[fi] + add > idx_pair_caps[fi]) {
+                while (idx_pair_counts[fi] + add > idx_pair_caps[fi]) idx_pair_caps[fi] *= 2;
+                idx_pairs[fi] = realloc(idx_pairs[fi], idx_pair_caps[fi] * sizeof(BtEntry));
+            }
+            memcpy(idx_pairs[fi] + idx_pair_counts[fi],
+                   ws->idx_pairs[fi], add * sizeof(BtEntry));
+            idx_pair_counts[fi] += add;
+            free(ws->idx_pairs[fi]);
+        }
+
+        for (size_t ri = 0; ri < ws->count; ri++) {
+            free(ws->records[ri].id);
+            free(ws->records[ri].payload);
+        }
+        free(ws->records);
+        free(ws->idx_pairs);
+        free(ws->idx_pair_counts);
+        free(ws->idx_pair_caps);
+    }
+    free(workers);
 
     /* Activate — parallel across shards for THIS object */
     {
@@ -1691,6 +1892,172 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
     return 0;
 }
 
+/* Per-record state for bulk-update's Phase 2 shard-grouped workers. */
+typedef struct {
+    const char *key;
+    size_t      klen;
+    uint8_t     hash[16];
+    int         start_slot;
+    int         shard_id;
+} BulkUpdRec;
+
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    TypedSchema   *ts;
+    CriteriaNode  *tree;
+    FieldSchema   *fs;
+    const char    *value_json;
+    const char   (*idx_fields)[256];
+    int            nidx;
+    int            shard_id;
+    BulkUpdRec    *recs;
+    int            count;
+    /* Results */
+    int            updated;
+    int            skipped;
+} BulkUpdShardWork;
+
+/* Bulk-update phase 2 worker — one per shard, holds the ucache wrlock once
+   for the whole bucket. Index updates (btree_insert/btree_delete) are
+   serialised by bt_cache_lock inside the btree layer, so concurrent workers
+   hitting the same index file are safe. */
+static void *bulk_upd_shard_worker(void *arg) {
+    BulkUpdShardWork *w = (BulkUpdShardWork *)arg;
+    if (w->count == 0) return NULL;
+
+    char shard[PATH_MAX];
+    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
+    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    if (!wh.map) { w->skipped += w->count; return NULL; }
+    uint8_t *map = wh.map;
+    uint32_t slots = wh.slots_per_shard;
+    uint32_t mask = slots - 1;
+
+    for (int ki = 0; ki < w->count; ki++) {
+        BulkUpdRec *rec = &w->recs[ki];
+        int slot = -1;
+        for (uint32_t si = 0; si < slots; si++) {
+            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
+            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            if (h->flag == 0 && h->key_len == 0) break;
+            if (h->flag == 2) continue;
+            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
+                h->key_len == rec->klen &&
+                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
+                slot = (int)s; break;
+            }
+        }
+        if (slot < 0) { w->skipped++; continue; }
+
+        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
+        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
+
+        if (!criteria_match_tree(value_ptr, w->tree, w->fs)) { w->skipped++; continue; }
+
+        /* Collect old index values */
+        char *old_idx_vals[MAX_FIELDS];
+        memset(old_idx_vals, 0, sizeof(old_idx_vals));
+        for (int fi = 0; fi < w->nidx; fi++) {
+            if (strchr(w->idx_fields[fi], '+')) {
+                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
+                char cat[4096]; int cp = 0; int ok = 1;
+                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+                while (tok) {
+                    int fidx = typed_field_index(w->ts, tok);
+                    if (fidx >= 0) {
+                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
+                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
+                        else { ok = 0; break; }
+                    } else { ok = 0; break; }
+                    tok = strtok_r(NULL, "+", &_tok_save);
+                }
+                cat[cp] = '\0';
+                old_idx_vals[fi] = (ok && cp > 0) ? strdup(cat) : NULL;
+            } else {
+                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
+                old_idx_vals[fi] = typed_get_field_str(w->ts, value_ptr, fidx);
+            }
+        }
+
+        /* Apply partial update */
+        const char *field_names[MAX_FIELDS];
+        char *field_vals[MAX_FIELDS];
+        for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
+        json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
+
+        for (int fi = 0; fi < w->ts->nfields; fi++) {
+            if (field_vals[fi]) {
+                if (!w->ts->fields[fi].removed)
+                    encode_field(&w->ts->fields[fi], field_vals[fi], value_ptr + w->ts->fields[fi].offset);
+                free(field_vals[fi]);
+            }
+        }
+
+        /* auto_update fields */
+        for (int fi = 0; fi < w->ts->nfields; fi++) {
+            if (w->ts->fields[fi].removed) continue;
+            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+                char tbuf[20];
+                time_t now = time(NULL);
+                struct tm tm;
+                localtime_r(&now, &tm);
+                if (w->ts->fields[fi].type == FT_DATE)
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                else
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                             tm.tm_hour, tm.tm_min, tm.tm_sec);
+                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
+            }
+        }
+
+        /* Update indexes for changed values */
+        if (w->nidx > 0) {
+            uint8_t *new_val = map + zoneB_off(slot, slots, w->sch->slot_size) + rec->klen;
+            for (int fi = 0; fi < w->nidx; fi++) {
+                char *new_v = NULL;
+                if (strchr(w->idx_fields[fi], '+')) {
+                    char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
+                    char cat[4096]; int cp = 0; int ok = 1;
+                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+                    while (tok) {
+                        int fidx = typed_field_index(w->ts, tok);
+                        if (fidx >= 0) {
+                            char *v = typed_get_field_str(w->ts, new_val, fidx);
+                            if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
+                            else { ok = 0; break; }
+                        } else { ok = 0; break; }
+                        tok = strtok_r(NULL, "+", &_tok_save);
+                    }
+                    cat[cp] = '\0';
+                    if (ok && cp > 0) new_v = strdup(cat);
+                } else {
+                    int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
+                    new_v = typed_get_field_str(w->ts, new_val, fidx);
+                }
+                int changed = 0;
+                if (!old_idx_vals[fi] && new_v) changed = 1;
+                else if (old_idx_vals[fi] && !new_v) changed = 1;
+                else if (old_idx_vals[fi] && new_v && strcmp(old_idx_vals[fi], new_v) != 0) changed = 1;
+                if (changed) {
+                    if (old_idx_vals[fi]) delete_index_entry(w->db_root, w->object, w->idx_fields[fi], old_idx_vals[fi], rec->hash);
+                    if (new_v) write_index_entry(w->db_root, w->object, w->idx_fields[fi], new_v, rec->hash);
+                }
+                free(old_idx_vals[fi]);
+                free(new_v);
+            }
+        }
+
+        w->updated++;
+    }
+
+    ucache_write_release(wh);
+    return NULL;
+}
+
 int cmd_bulk_update(const char *db_root, const char *object,
                     const char *criteria_json, const char *value_json,
                     int limit, int dry_run) {
@@ -1739,63 +2106,212 @@ int cmd_bulk_update(const char *db_root, const char *object,
         return 0;
     }
 
-    /* Phase 2: Write — for each key, acquire wrlock, re-verify, apply update */
+    /* Phase 2: Write — bucket matched keys by shard and fan out one worker
+       per shard. Each worker takes the ucache wrlock **once** per shard,
+       walks its bucket end-to-end, and releases **once** — matching the
+       bulk-insert pattern. Index updates (btree_insert/btree_delete) are
+       serialised internally by bt_cache_lock, so concurrent workers are
+       safe. */
     TypedSchema *ts = load_typed_schema(db_root, object);
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     int updated = 0, skipped = 0;
 
+    /* Pre-compute each matched key's hash + shard placement so bucketing
+       is a single pass over ctx.keys[]. */
+    BulkUpdRec *all = matched > 0 ? malloc(matched * sizeof(BulkUpdRec)) : NULL;
     for (int i = 0; i < matched; i++) {
-        const char *key = ctx.keys[i];
-        size_t klen = strlen(key);
-        uint8_t hash[16]; int shard_id, start_slot;
-        compute_addr(key, klen, sch.splits, hash, &shard_id, &start_slot);
+        all[i].key = ctx.keys[i];
+        all[i].klen = strlen(ctx.keys[i]);
+        compute_addr(all[i].key, all[i].klen, sch.splits,
+                     all[i].hash, &all[i].shard_id, &all[i].start_slot);
+    }
 
-        char shard[PATH_MAX];
-        build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
+    /* Bucket by shard_id. */
+    int *shard_counts = calloc(sch.splits, sizeof(int));
+    for (int i = 0; i < matched; i++) shard_counts[all[i].shard_id]++;
+    int nshard_groups = 0;
+    for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
 
-        FcacheRead wh = ucache_get_write(shard, 0, 0);
-        if (!wh.map) { skipped++; continue; }
-        uint8_t *map = wh.map;
-        uint32_t slots = wh.slots_per_shard;
-        uint32_t mask = slots - 1;
+    BulkUpdShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkUpdShardWork)) : NULL;
+    int *shard_to_worker = malloc(sch.splits * sizeof(int));
+    {
+        int g = 0;
+        for (int s = 0; s < sch.splits; s++) {
+            if (shard_counts[s] > 0) {
+                workers[g].shard_id = s;
+                workers[g].recs = malloc(shard_counts[s] * sizeof(BulkUpdRec));
+                workers[g].count = 0;
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
+            }
+        }
+    }
+    for (int i = 0; i < matched; i++) {
+        int w = shard_to_worker[all[i].shard_id];
+        workers[w].recs[workers[w].count++] = all[i];
+    }
+    free(shard_counts);
+    free(shard_to_worker);
+    free(all);
 
-        /* Find the record */
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        workers[wi].db_root = db_root;
+        workers[wi].object = object;
+        workers[wi].sch = &sch;
+        workers[wi].ts = ts;
+        workers[wi].tree = tree;
+        workers[wi].fs = &fs;
+        workers[wi].value_json = value_json;
+        workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].nidx = nidx;
+        workers[wi].updated = 0;
+        workers[wi].skipped = 0;
+    }
+
+    {
+        int nthreads = parallel_threads();
+        if (nthreads > nshard_groups) nthreads = nshard_groups;
+        if (nthreads <= 1 || nshard_groups <= 2) {
+            for (int wi = 0; wi < nshard_groups; wi++) bulk_upd_shard_worker(&workers[wi]);
+        } else {
+            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
+            for (int b = 0; b < nshard_groups; b += nthreads) {
+                int n = nshard_groups - b;
+                if (n > nthreads) n = nthreads;
+                for (int t = 0; t < n; t++)
+                    pthread_create(&threads[t], NULL, bulk_upd_shard_worker, &workers[b + t]);
+                for (int t = 0; t < n; t++)
+                    pthread_join(threads[t], NULL);
+            }
+            free(threads);
+        }
+    }
+
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        updated += workers[wi].updated;
+        skipped += workers[wi].skipped;
+        free(workers[wi].recs);
+    }
+    free(workers);
+
+    log_msg(3, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
+
+    for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+    free(ctx.keys); free_criteria_tree(tree);
+    return 0;
+}
+
+/* ========== BULK UPDATE (DELIMITED TEXT FILE) ========== */
+/* Per-key partial update. Row shape: key<DELIM>v1<DELIM>v2<DELIM>... in
+   fields.conf active-field order (same as bulk-insert-delimited). Semantics
+   per 9a spec: update-only (key must exist — missing keys counted as
+   skipped); blank cell = leave that field alone; non-blank cell overwrites.
+   NOT an upsert. Phase 1 parses rows into records[] with line-span pointers
+   into the mmap'd CSV; Phase 2 runs shard-grouped parallel workers that
+   probe, patch, and update affected indexes under a single wrlock per
+   shard. Indexes are updated only when their value actually changed. */
+typedef struct {
+    char       *key;           /* owned null-terminated */
+    size_t      klen;
+    uint8_t     hash[16];
+    int         start_slot;
+    int         shard_id;
+    const char *line_end;      /* points into mmap'd CSV; valid until munmap */
+    const char *body_start;    /* span after key_end + delimiter */
+} BulkUpdDelimRec;
+
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const Schema     *sch;
+    TypedSchema      *ts;
+    const char      (*idx_fields)[256];
+    int               nidx;
+    const int        *active_indices;
+    int               active_count;
+    int               has_tombstones;
+    char              delimiter;
+    int               shard_id;
+    BulkUpdDelimRec  *recs;
+    int               count;
+    /* Results */
+    int               updated;
+    int               skipped;
+} BulkUpdDelimShardWork;
+
+static void *bulk_upd_delim_shard_worker(void *arg) {
+    BulkUpdDelimShardWork *w = (BulkUpdDelimShardWork *)arg;
+    if (w->count == 0) return NULL;
+
+    char shard[PATH_MAX];
+    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
+    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    if (!wh.map) { w->skipped += w->count; return NULL; }
+    uint8_t *map = wh.map;
+    uint32_t slots = wh.slots_per_shard;
+    uint32_t mask = slots - 1;
+
+    struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
+
+    for (int ki = 0; ki < w->count; ki++) {
+        BulkUpdDelimRec *rec = &w->recs[ki];
+
+        /* Probe for the record — must already exist */
         int slot = -1;
         for (uint32_t si = 0; si < slots; si++) {
-            uint32_t s = ((uint32_t)start_slot + si) & mask;
+            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
             SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(map + zoneB_off(s, slots, sch.slot_size), key, klen) == 0) {
+            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
+                h->key_len == rec->klen &&
+                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
                 slot = (int)s; break;
             }
         }
-
-        if (slot < 0) { ucache_write_release(wh); skipped++; continue; }
+        if (slot < 0) { w->skipped++; continue; }
 
         SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-        uint8_t *value_ptr = map + zoneB_off(slot, slots, sch.slot_size) + hdr->key_len;
+        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
 
-        /* Re-check criteria tree under wrlock (AND/OR supported) */
-        if (!criteria_match_tree(value_ptr, tree, &fs)) {
-            ucache_write_release(wh); skipped++; continue;
+        /* Re-parse field spans from the mmap'd CSV line. Cheaper than buffering
+           all spans in phase 1 (N*M*16 bytes for invoice-size schemas). */
+        int nvals = 0;
+        const char *vp = rec->body_start;
+        const char *line_end = rec->line_end;
+        while (nvals < w->active_count) {
+            const char *v_start = vp;
+            while (vp < line_end && *vp != w->delimiter) vp++;
+            vals[nvals].ptr = v_start;
+            vals[nvals].len = vp - v_start;
+            nvals++;
+            if (vp < line_end) vp++;
+            else if (nvals < w->active_count) {
+                while (nvals < w->active_count) {
+                    vals[nvals].ptr = line_end;
+                    vals[nvals].len = 0;
+                    nvals++;
+                }
+            }
         }
 
-        /* Collect old index values */
-        char idx_fields[MAX_FIELDS][256];
-        int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+        /* Capture old index values before patching. */
         char *old_idx_vals[MAX_FIELDS];
         memset(old_idx_vals, 0, sizeof(old_idx_vals));
-        for (int fi = 0; fi < nidx; fi++) {
-            if (strchr(idx_fields[fi], '+')) {
-                char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
+        for (int fi = 0; fi < w->nidx; fi++) {
+            if (strchr(w->idx_fields[fi], '+')) {
+                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
                 char cat[4096]; int cp = 0; int ok = 1;
                 char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
                 while (tok) {
-                    int fidx = typed_field_index(ts, tok);
+                    int fidx = typed_field_index(w->ts, tok);
                     if (fidx >= 0) {
-                        char *v = typed_get_field_str(ts, value_ptr, fidx);
+                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
                         if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
                         else { ok = 0; break; }
                     } else { ok = 0; break; }
@@ -1804,90 +2320,265 @@ int cmd_bulk_update(const char *db_root, const char *object,
                 cat[cp] = '\0';
                 old_idx_vals[fi] = (ok && cp > 0) ? strdup(cat) : NULL;
             } else {
-                int fidx = typed_field_index(ts, idx_fields[fi]);
-                old_idx_vals[fi] = typed_get_field_str(ts, value_ptr, fidx);
+                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
+                old_idx_vals[fi] = typed_get_field_str(w->ts, value_ptr, fidx);
             }
         }
 
-        /* Apply partial update — same logic as cmd_update */
-        const char *field_names[MAX_FIELDS];
-        char *field_vals[MAX_FIELDS];
-        for (int fi = 0; fi < ts->nfields; fi++) field_names[fi] = ts->fields[fi].name;
-        json_get_fields(value_json, field_names, ts->nfields, field_vals);
-
-        for (int fi = 0; fi < ts->nfields; fi++) {
-            if (field_vals[fi]) {
-                if (!ts->fields[fi].removed)
-                    encode_field(&ts->fields[fi], field_vals[fi], value_ptr + ts->fields[fi].offset);
-                free(field_vals[fi]);
+        /* Patch each non-blank field into the typed payload at its fixed offset.
+           Blank cells are intentionally left untouched — 9a "update-only, blank
+           cell leaves alone" semantics. */
+        if (!w->has_tombstones) {
+            for (int i = 0; i < w->active_count && i < nvals; i++) {
+                if (vals[i].len > 0)
+                    encode_field_len(&w->ts->fields[i], vals[i].ptr, vals[i].len,
+                                     value_ptr + w->ts->fields[i].offset);
+            }
+        } else {
+            for (int i = 0; i < w->active_count && i < nvals; i++) {
+                int fi = w->active_indices[i];
+                if (vals[i].len > 0)
+                    encode_field_len(&w->ts->fields[fi], vals[i].ptr, vals[i].len,
+                                     value_ptr + w->ts->fields[fi].offset);
             }
         }
 
-        /* auto_update fields */
-        for (int fi = 0; fi < ts->nfields; fi++) {
-            if (ts->fields[fi].removed) continue;
-            if (ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+        /* auto_update fields — refresh timestamp on every successful update */
+        for (int fi = 0; fi < w->ts->nfields; fi++) {
+            if (w->ts->fields[fi].removed) continue;
+            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
                 char tbuf[20];
                 time_t now = time(NULL);
                 struct tm tm;
                 localtime_r(&now, &tm);
-                if (ts->fields[fi].type == FT_DATE)
+                if (w->ts->fields[fi].type == FT_DATE)
                     snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
                 else
                     snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                              tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&ts->fields[fi], tbuf, value_ptr + ts->fields[fi].offset);
+                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
             }
         }
 
-        /* Update indexes for changed values */
-        if (nidx > 0) {
-            uint8_t *new_val = map + zoneB_off(slot, slots, sch.slot_size) + klen;
-            for (int fi = 0; fi < nidx; fi++) {
-                char *new_v = NULL;
-                if (strchr(idx_fields[fi], '+')) {
-                    char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
-                    char cat[4096]; int cp = 0; int ok = 1;
-                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                    while (tok) {
-                        int fidx = typed_field_index(ts, tok);
-                        if (fidx >= 0) {
-                            char *v = typed_get_field_str(ts, new_val, fidx);
-                            if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                            else { ok = 0; break; }
-                        } else { ok = 0; break; }
-                        tok = strtok_r(NULL, "+", &_tok_save);
-                    }
-                    cat[cp] = '\0';
-                    if (ok && cp > 0) new_v = strdup(cat);
-                } else {
-                    int fidx = typed_field_index(ts, idx_fields[fi]);
-                    new_v = typed_get_field_str(ts, new_val, fidx);
+        /* Compare old vs new index values and apply delta only where changed.
+           This is the "idx_changed_bitmap" optimisation from 9a — a blank CSV
+           cell on an indexed field leaves the field unchanged and therefore
+           does zero B+ tree work for that index. */
+        for (int fi = 0; fi < w->nidx; fi++) {
+            char *new_v = NULL;
+            if (strchr(w->idx_fields[fi], '+')) {
+                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
+                char cat[4096]; int cp = 0; int ok = 1;
+                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+                while (tok) {
+                    int fidx = typed_field_index(w->ts, tok);
+                    if (fidx >= 0) {
+                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
+                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
+                        else { ok = 0; break; }
+                    } else { ok = 0; break; }
+                    tok = strtok_r(NULL, "+", &_tok_save);
                 }
-                int changed = 0;
-                if (!old_idx_vals[fi] && new_v) changed = 1;
-                else if (old_idx_vals[fi] && !new_v) changed = 1;
-                else if (old_idx_vals[fi] && new_v && strcmp(old_idx_vals[fi], new_v) != 0) changed = 1;
-                if (changed) {
-                    if (old_idx_vals[fi]) delete_index_entry(db_root, object, idx_fields[fi], old_idx_vals[fi], hash);
-                    if (new_v) write_index_entry(db_root, object, idx_fields[fi], new_v, hash);
-                }
-                free(old_idx_vals[fi]);
-                free(new_v);
+                cat[cp] = '\0';
+                if (ok && cp > 0) new_v = strdup(cat);
+            } else {
+                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
+                new_v = typed_get_field_str(w->ts, value_ptr, fidx);
             }
+            int changed = 0;
+            if (!old_idx_vals[fi] && new_v) changed = 1;
+            else if (old_idx_vals[fi] && !new_v) changed = 1;
+            else if (old_idx_vals[fi] && new_v && strcmp(old_idx_vals[fi], new_v) != 0) changed = 1;
+            if (changed) {
+                if (old_idx_vals[fi]) delete_index_entry(w->db_root, w->object, w->idx_fields[fi], old_idx_vals[fi], rec->hash);
+                if (new_v) write_index_entry(w->db_root, w->object, w->idx_fields[fi], new_v, rec->hash);
+            }
+            free(old_idx_vals[fi]);
+            free(new_v);
         }
 
-        ucache_write_release(wh);
-        updated++;
+        w->updated++;
     }
 
-    log_msg(3, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
-    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
+    ucache_write_release(wh);
+    return NULL;
+}
 
-    for (int i = 0; i < matched; i++) free(ctx.keys[i]);
-    free(ctx.keys); free_criteria_tree(tree);
+int cmd_bulk_update_delimited(const char *db_root, const char *object,
+                               const char *filepath, char delimiter) {
+    if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
+
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"Delimited update requires typed fields (fields.conf)\"}\n");
+        return 1;
+    }
+
+    Schema sch = load_schema(db_root, object);
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+
+    int ifd = open(filepath, O_RDONLY);
+    if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
+    struct stat st; fstat(ifd, &st);
+    if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
+    const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
+    int data_mmaped = 1;
+    if (data == MAP_FAILED) {
+        char *buf = malloc(st.st_size);
+        if (!buf) { close(ifd); return 1; }
+        lseek(ifd, 0, SEEK_SET);
+        size_t rd = 0;
+        while (rd < (size_t)st.st_size) {
+            ssize_t n = read(ifd, buf + rd, st.st_size - rd);
+            if (n <= 0) break;
+            rd += n;
+        }
+        data = buf;
+        data_mmaped = 0;
+    } else {
+        madvise((void *)data, st.st_size, MADV_SEQUENTIAL);
+    }
+    close(ifd);
+
+    /* Active-field mapping — same as bulk-insert-delimited. */
+    int active_indices[MAX_FIELDS];
+    int active_count = 0;
+    int has_tombstones = 0;
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed) has_tombstones = 1;
+        else active_indices[active_count++] = i;
+    }
+
+    /* ===== Phase 1: parse every CSV row into records[]. Each record carries
+       an owned key and a (body_start, line_end) span into the mmap'd CSV so
+       phase 2 can re-scan the field values without buffering every span. */
+    int matched = 0, skipped = 0;
+    size_t rec_cap = 1024, rec_count = 0;
+    BulkUpdDelimRec *records = malloc(rec_cap * sizeof(BulkUpdDelimRec));
+    const char *rp = data;
+    const char *data_end = data + st.st_size;
+
+    while (rp < data_end) {
+        const char *eol = rp;
+        while (eol < data_end && *eol != '\n' && *eol != '\r') eol++;
+        if (eol == rp) {
+            rp = eol + 1;
+            if (rp < data_end && *(rp - 1) == '\r' && *rp == '\n') rp++;
+            continue;
+        }
+        const char *line_start = rp;
+        const char *line_end   = eol;
+        rp = eol;
+        if (rp < data_end && *rp == '\r') rp++;
+        if (rp < data_end && *rp == '\n') rp++;
+
+        const char *key_end = line_start;
+        while (key_end < line_end && *key_end != delimiter) key_end++;
+        if (key_end == line_end) continue;
+
+        size_t klen = key_end - line_start;
+        if ((int)klen > sch.max_key) { skipped++; continue; }
+
+        matched++;
+
+        if (rec_count >= rec_cap) {
+            rec_cap *= 2;
+            records = realloc(records, rec_cap * sizeof(BulkUpdDelimRec));
+        }
+        BulkUpdDelimRec *r = &records[rec_count++];
+        r->key = malloc(klen + 1);
+        memcpy(r->key, line_start, klen); r->key[klen] = '\0';
+        r->klen = klen;
+        r->body_start = key_end + 1;
+        r->line_end   = line_end;
+        compute_addr(r->key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+    }
+
+    /* ===== Phase 1.5: bucket by shard_id. */
+    int *shard_counts = calloc(sch.splits, sizeof(int));
+    for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
+    int nshard_groups = 0;
+    for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
+
+    BulkUpdDelimShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkUpdDelimShardWork)) : NULL;
+    int *shard_to_worker = malloc(sch.splits * sizeof(int));
+    {
+        int g = 0;
+        for (int s = 0; s < sch.splits; s++) {
+            if (shard_counts[s] > 0) {
+                workers[g].shard_id = s;
+                workers[g].recs = malloc(shard_counts[s] * sizeof(BulkUpdDelimRec));
+                workers[g].count = 0;
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
+            }
+        }
+    }
+    for (size_t i = 0; i < rec_count; i++) {
+        int w = shard_to_worker[records[i].shard_id];
+        workers[w].recs[workers[w].count++] = records[i];
+    }
+    free(records);
+    free(shard_counts);
+    free(shard_to_worker);
+
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        workers[wi].db_root = db_root;
+        workers[wi].object = object;
+        workers[wi].sch = &sch;
+        workers[wi].ts = ts;
+        workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].nidx = nidx;
+        workers[wi].active_indices = active_indices;
+        workers[wi].active_count = active_count;
+        workers[wi].has_tombstones = has_tombstones;
+        workers[wi].delimiter = delimiter;
+        workers[wi].updated = 0;
+        workers[wi].skipped = 0;
+    }
+
+    /* ===== Phase 2: parallel shard workers. */
+    {
+        int nthreads = parallel_threads();
+        if (nthreads > nshard_groups) nthreads = nshard_groups;
+        if (nthreads <= 1 || nshard_groups <= 2) {
+            for (int wi = 0; wi < nshard_groups; wi++)
+                bulk_upd_delim_shard_worker(&workers[wi]);
+        } else {
+            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
+            for (int b = 0; b < nshard_groups; b += nthreads) {
+                int n = nshard_groups - b;
+                if (n > nthreads) n = nthreads;
+                for (int t = 0; t < n; t++)
+                    pthread_create(&threads[t], NULL, bulk_upd_delim_shard_worker, &workers[b + t]);
+                for (int t = 0; t < n; t++)
+                    pthread_join(threads[t], NULL);
+            }
+            free(threads);
+        }
+    }
+
+    int updated = 0;
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        updated += workers[wi].updated;
+        skipped += workers[wi].skipped;
+        for (int i = 0; i < workers[wi].count; i++) free(workers[wi].recs[i].key);
+        free(workers[wi].recs);
+    }
+    free(workers);
+
+    if (data_mmaped) munmap((void *)data, st.st_size);
+    else free((void *)data);
+
+    log_msg(3, "BULK-UPDATE-DELIM %s matched=%d updated=%d skipped=%d",
+            object, matched, updated, skipped);
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
     return 0;
 }
 
