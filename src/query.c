@@ -600,6 +600,30 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         idx_pairs[i] = malloc(idx_pair_caps[i] * sizeof(BtEntry));
     }
 
+    /* Pre-resolve index field indices so the per-record loop doesn't re-scan
+       the schema for every record × every index. Saves O(records × indexes ×
+       nfields) strcmps on large bulk inserts. Composite indexes: up to 16
+       sub-fields each. */
+    int idx_field_indices[MAX_FIELDS][16];
+    int idx_field_counts[MAX_FIELDS];
+    int idx_is_composite[MAX_FIELDS];
+    for (int fi = 0; fi < nfields; fi++) {
+        idx_is_composite[fi] = (strchr(idx_fields[fi], '+') != NULL);
+        idx_field_counts[fi] = 0;
+        if (idx_is_composite[fi]) {
+            char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
+            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+            while (tok && idx_field_counts[fi] < 16) {
+                idx_field_indices[fi][idx_field_counts[fi]++] =
+                    ts ? typed_field_index(ts, tok) : -1;
+                tok = strtok_r(NULL, "+", &_tok_save);
+            }
+        } else {
+            idx_field_indices[fi][0] = ts ? typed_field_index(ts, idx_fields[fi]) : -1;
+            idx_field_counts[fi] = 1;
+        }
+    }
+
     const char *p = json_skip(json);
     int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}} */
     int is_array_format = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
@@ -762,29 +786,30 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
                             if (!is_update) count++;
 
                             /* Collect index entries for bulk write at end.
-                               Extract field values from typed binary — avoids a second JSON parse. */
+                               Extract field values from typed binary — avoids a second JSON parse.
+                               Field indices are pre-resolved above. */
                             if (nfields > 0) {
                                 for (int fi = 0; fi < nfields; fi++) {
                                     char *idx_val = NULL;
 
-                                    if (strchr(idx_fields[fi], '+')) {
-                                        char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255]='\0';
+                                    if (idx_is_composite[fi]) {
                                         char cat[4096]; int cp = 0; int ok = 1;
-                                        char *save = NULL;
-                                        char *tk = strtok_r(fb, "+", &save);
-                                        while (tk) {
-                                            int tidx = typed_field_index(ts, tk);
+                                        for (int si = 0; si < idx_field_counts[fi]; si++) {
+                                            int tidx = idx_field_indices[fi][si];
                                             char *v = (tidx >= 0) ? typed_get_field_str(ts, (const uint8_t *)typed_tmp, tidx) : NULL;
                                             if (!v || !v[0]) { ok = 0; free(v); break; }
                                             int sl = strlen(v);
                                             if (cp + sl < (int)sizeof(cat)) { memcpy(cat+cp, v, sl); cp += sl; }
                                             free(v);
-                                            tk = strtok_r(NULL, "+", &save);
                                         }
                                         cat[cp] = '\0';
-                                        if (ok && cp > 0) idx_val = strdup(cat);
+                                        if (ok && cp > 0) {
+                                            idx_val = malloc(cp + 1);
+                                            memcpy(idx_val, cat, cp);
+                                            idx_val[cp] = '\0';
+                                        }
                                     } else {
-                                        int tidx = typed_field_index(ts, idx_fields[fi]);
+                                        int tidx = idx_field_indices[fi][0];
                                         if (tidx >= 0) idx_val = typed_get_field_str(ts, (const uint8_t *)typed_tmp, tidx);
                                     }
 
