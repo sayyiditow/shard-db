@@ -3450,12 +3450,15 @@ static int parse_one_join(const char *obj_buf, JoinSpec *j) {
     memset(j, 0, sizeof(*j));
     j->type = JOIN_INNER;
 
-    char *o   = json_get_raw(obj_buf, "object");
-    char *l   = json_get_raw(obj_buf, "local");
-    char *r   = json_get_raw(obj_buf, "remote");
-    char *as  = json_get_raw(obj_buf, "as");
-    char *t   = json_get_raw(obj_buf, "type");
-    char *f   = json_get_field(obj_buf, "fields", 0);
+    JsonObj jobj;
+    json_parse_object(obj_buf, strlen(obj_buf), &jobj);
+
+    char *o   = json_obj_strdup(&jobj, "object");
+    char *l   = json_obj_strdup(&jobj, "local");
+    char *r   = json_obj_strdup(&jobj, "remote");
+    char *as  = json_obj_strdup(&jobj, "as");
+    char *t   = json_obj_strdup(&jobj, "type");
+    char *f   = json_obj_strdup_raw(&jobj, "fields");
 
     if (o)  { strncpy(j->object, o, 255); free(o); }
     if (l)  { strncpy(j->local_field, l, 255); free(l); }
@@ -4387,42 +4390,51 @@ static int process_batch(CollectedHash *batch, int batch_count,
                 if (njoins > 0) {
                     /* mr->json already holds the full tabular row "[...]"; just emit. */
                     OUT("%s%s", *printed ? "," : "", mr->json);
-                } else if (csv_delim) {
-                    csv_emit_cell(mr->key, csv_delim);
-                    if (proj_count > 0) {
-                        for (int fi = 0; fi < proj_count; fi++) {
-                            char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                            char *pv = json_get_raw(mr->json, proj_fields[fi]);
-                            csv_emit_cell(pv, csv_delim);
-                            free(pv);
+                } else if (csv_delim || rows_fmt) {
+                    /* Projection emit — parse mr->json once per row rather than
+                       walking it N times (once per projected field). On a
+                       100-match find projecting 3 fields this drops from 300
+                       json walks to 100 parses + 300 O(1) struct lookups. */
+                    JsonObj mjo;
+                    json_parse_object(mr->json, strlen(mr->json), &mjo);
+                    if (csv_delim) {
+                        csv_emit_cell(mr->key, csv_delim);
+                        if (proj_count > 0) {
+                            for (int fi = 0; fi < proj_count; fi++) {
+                                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                                char *pv = json_obj_strdup(&mjo, proj_fields[fi]);
+                                csv_emit_cell(pv, csv_delim);
+                                free(pv);
+                            }
+                        } else if (fs && fs->ts) {
+                            for (int fi = 0; fi < fs->ts->nfields; fi++) {
+                                if (fs->ts->fields[fi].removed) continue;
+                                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
+                                char *pv = json_obj_strdup(&mjo, fs->ts->fields[fi].name);
+                                csv_emit_cell(pv, csv_delim);
+                                free(pv);
+                            }
                         }
-                    } else if (fs && fs->ts) {
-                        for (int fi = 0; fi < fs->ts->nfields; fi++) {
-                            if (fs->ts->fields[fi].removed) continue;
-                            char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                            char *pv = json_get_raw(mr->json, fs->ts->fields[fi].name);
-                            csv_emit_cell(pv, csv_delim);
-                            free(pv);
+                        OUT("\n");
+                    } else {
+                        /* rows_fmt */
+                        OUT("%s[\"%s\"", *printed ? "," : "", mr->key);
+                        if (proj_count > 0) {
+                            for (int fi = 0; fi < proj_count; fi++) {
+                                char *pv = json_obj_strdup(&mjo, proj_fields[fi]);
+                                OUT(",\"%s\"", pv ? pv : "");
+                                free(pv);
+                            }
+                        } else if (fs && fs->ts) {
+                            for (int fi = 0; fi < fs->ts->nfields; fi++) {
+                                if (fs->ts->fields[fi].removed) continue;
+                                char *pv = json_obj_strdup(&mjo, fs->ts->fields[fi].name);
+                                OUT(",\"%s\"", pv ? pv : "");
+                                free(pv);
+                            }
                         }
+                        OUT("]");
                     }
-                    OUT("\n");
-                } else if (rows_fmt) {
-                    OUT("%s[\"%s\"", *printed ? "," : "", mr->key);
-                    if (proj_count > 0) {
-                        for (int fi = 0; fi < proj_count; fi++) {
-                            char *pv = json_get_raw(mr->json, proj_fields[fi]);
-                            OUT(",\"%s\"", pv ? pv : "");
-                            free(pv);
-                        }
-                    } else if (fs && fs->ts) {
-                        for (int fi = 0; fi < fs->ts->nfields; fi++) {
-                            if (fs->ts->fields[fi].removed) continue;
-                            char *pv = json_get_raw(mr->json, fs->ts->fields[fi].name);
-                            OUT(",\"%s\"", pv ? pv : "");
-                            free(pv);
-                        }
-                    }
-                    OUT("]");
                 } else {
                     OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", mr->key, mr->json);
                 }
@@ -4509,15 +4521,21 @@ enum SearchOp parse_op(const char *s) {
 /* ========== Reusable criteria parser ========== */
 
 /* Parse a single criterion object {"field":"x","op":"eq","value":"y"} into *c.
-   Helper for parse_criteria_json. */
+   Helper for parse_criteria_json. Called in a loop over every element of
+   the criteria array; parsing the sub-object once and indexing into the
+   JsonObj saves 5 JSON walks per criterion over the legacy json_get_raw
+   pattern. */
 static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     memset(c, 0, sizeof(*c));
 
-    char *f = json_get_raw(obj_buf, "field");
-    char *o = json_get_raw(obj_buf, "op");
-    char *v = json_get_raw(obj_buf, "value");
-    char *v_raw = json_get_field(obj_buf, "value", 0);
-    char *v2 = json_get_raw(obj_buf, "value2");
+    JsonObj cobj;
+    json_parse_object(obj_buf, strlen(obj_buf), &cobj);
+
+    char *f     = json_obj_strdup(&cobj, "field");
+    char *o     = json_obj_strdup(&cobj, "op");
+    char *v     = json_obj_strdup(&cobj, "value");
+    char *v_raw = json_obj_strdup_raw(&cobj, "value");
+    char *v2    = json_obj_strdup(&cobj, "value2");
 
     if (f) { strncpy(c->field, f, 255); free(f); }
     if (o) { c->op = parse_op(o); free(o); }
@@ -4786,8 +4804,10 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
         return NULL;
     }
 
-    char *or_arr  = json_get_field(obj_buf, "or",  0);
-    char *and_arr = or_arr ? NULL : json_get_field(obj_buf, "and", 0);
+    JsonObj tobj;
+    json_parse_object(obj_buf, strlen(obj_buf), &tobj);
+    char *or_arr  = json_obj_strdup_raw(&tobj, "or");
+    char *and_arr = or_arr ? NULL : json_obj_strdup_raw(&tobj, "and");
 
     if (or_arr || and_arr) {
         CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
@@ -4839,8 +4859,10 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
     }
 
     if (*p == '{') {
-        char *or_arr  = json_get_field(p, "or",  0);
-        char *and_arr = or_arr ? NULL : json_get_field(p, "and", 0);
+        JsonObj pobj;
+        json_parse_object(p, strlen(p), &pobj);
+        char *or_arr  = json_obj_strdup_raw(&pobj, "or");
+        char *and_arr = or_arr ? NULL : json_obj_strdup_raw(&pobj, "and");
         if (or_arr || and_arr) {
             CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
             if (!n) { free(or_arr); free(and_arr); if (err) *err = "out of memory"; return NULL; }
@@ -4857,9 +4879,8 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             return n;
         }
 
-        char *field = json_get_raw(p, "field");
-        if (field) {
-            free(field);
+        const char *field_v; size_t field_vl;
+        if (json_obj_get(&pobj, "field", &field_v, &field_vl)) {
             CriteriaNode *n = cnode_new(CNODE_LEAF);
             if (!n) { if (err) *err = "out of memory"; return NULL; }
             parse_one_criterion(p, &n->leaf);
@@ -7046,9 +7067,11 @@ static int parse_agg_specs(const char *json, AggSpec **out) {
         AggSpec *s = &specs[n];
         memset(s, 0, sizeof(*s));
 
-        char *fn = json_get_raw(buf, "fn");
-        char *field = json_get_raw(buf, "field");
-        char *alias = json_get_raw(buf, "alias");
+        JsonObj sobj;
+        json_parse_object(buf, len, &sobj);
+        char *fn    = json_obj_strdup(&sobj, "fn");
+        char *field = json_obj_strdup(&sobj, "field");
+        char *alias = json_obj_strdup(&sobj, "alias");
 
         if (fn) {
             if (strcmp(fn, "count") == 0) s->fn = AGG_COUNT;

@@ -325,6 +325,62 @@ const char *json_skip_value(const char *p);
 char *json_get_field(const char *json, const char *key, int strip_quotes);
 char *json_get_string(const char *json, const char *key);
 char *json_get_raw(const char *json, const char *key);
+
+/* ========== Single-pass JSON object parser ==========
+   shard-db's request / criterion / join / aggregate spec shapes are all
+   known small objects with a handful of keys. Walking the JSON once per
+   field extraction is pure waste — especially inside array loops where a
+   10-element criteria array + 5 reads per element = 50 walks over the
+   same sub-JSON. json_parse_object() walks once and materialises every
+   top-level {"name": value, ...} field as a (name, value) span pair into
+   a caller-provided JsonObj. Lookups become O(n) over the small array
+   (typically <20 entries), avoiding both the walk AND the per-field
+   malloc/memcpy that json_get_raw does. Values are spans pointing into
+   the original JSON — no allocation, no ownership transfer; the original
+   buffer must outlive the JsonObj. */
+
+#define JSON_OBJ_MAX_FIELDS 64
+
+typedef struct {
+    const char *name; size_t nlen;
+    const char *val;  size_t vlen;   /* raw span; includes quotes for strings, brackets for arrays/objects */
+} JsonField;
+
+typedef struct {
+    JsonField f[JSON_OBJ_MAX_FIELDS];
+    int n;
+} JsonObj;
+
+/* Parse the top-level object of `s`. Returns number of fields parsed (>=0),
+   or -1 on malformed input / overflow. Safe to call on NULL or non-object
+   input (returns -1). */
+int  json_parse_object(const char *s, size_t slen, JsonObj *out);
+
+/* Lookup by key. Returns 1 and fills (*val, *vlen) with the raw span
+   (quoted strings still have quotes). Returns 0 on miss. */
+int  json_obj_get(const JsonObj *o, const char *key, const char **val, size_t *vlen);
+
+/* Same as json_obj_get, but strips surrounding quotes if present. Use for
+   string / numeric / bool fields. For nested objects/arrays use json_obj_get
+   which returns the span with brackets intact for recursive parsing. */
+int  json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size_t *vlen);
+
+/* Convenience: parse an integer field. Returns `fallback` on miss. */
+int  json_obj_int(const JsonObj *o, const char *key, int fallback);
+
+/* Copy an unquoted string field into a caller-provided buffer (NUL-terminated).
+   Returns number of bytes written (0 if missing or empty). Fits most uses that
+   previously called json_get_raw + free. */
+int  json_obj_copy(const JsonObj *o, const char *key, char *buf, size_t bufsz);
+
+/* malloc-based wrapper for callers that still need a heap-owned NUL-terminated
+   string (e.g. for long-lived storage). Returns NULL if missing. Caller frees. */
+char *json_obj_strdup(const JsonObj *o, const char *key);
+
+/* Raw span variant used for nested arrays/objects that the caller will parse
+   further. Returns a malloc'd NUL-terminated copy including the surrounding
+   brackets/quotes. Same ownership semantics as json_get_field with strip=0. */
+char *json_obj_strdup_raw(const JsonObj *o, const char *key);
 int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values);
 char *json_get_string_or_array(const char *json, const char *key);
 char *extract_field_value(const char *json, const char *field_name);

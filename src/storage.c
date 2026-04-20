@@ -1602,19 +1602,26 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         OUT("\n");
         for (int i = 0; i < key_count; i++) {
             if (!entries[i].result_json) continue;
-            /* result_json shape: {"key":"k","value":{...}} — fields live under "value". */
+            /* result_json shape: {"key":"k","value":{...}} — fields live under
+               "value". Parse outer once, parse the value sub-object once, then
+               index per-field from the struct. Previously this walked each
+               record's JSON 1 + N times (once for value extraction, then once
+               per schema field). */
             csv_emit_cell(entries[i].key, csv_delim);
-            char *value_obj = json_get_field(entries[i].result_json, "value", 0);
+            JsonObj outer, value_obj;
+            json_parse_object(entries[i].result_json, strlen(entries[i].result_json), &outer);
+            const char *val_raw; size_t val_rawl;
+            int have_value = json_obj_get(&outer, "value", &val_raw, &val_rawl) &&
+                             json_parse_object(val_raw, val_rawl, &value_obj) >= 0;
             if (fs.ts) {
                 for (int fi = 0; fi < fs.ts->nfields; fi++) {
                     if (fs.ts->fields[fi].removed) continue;
                     char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                    char *pv = value_obj ? json_get_raw(value_obj, fs.ts->fields[fi].name) : NULL;
+                    char *pv = have_value ? json_obj_strdup(&value_obj, fs.ts->fields[fi].name) : NULL;
                     csv_emit_cell(pv, csv_delim);
                     free(pv);
                 }
             }
-            free(value_obj);
             OUT("\n");
             free(entries[i].result_json);
         }

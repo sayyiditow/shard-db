@@ -474,17 +474,23 @@ static void save_tokens_conf(const char *db_root) {
 
 /* Dispatch a JSON query object: {"mode":"get","object":"users","key":"k1",...} */
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
-    char *mode = json_get_raw(json, "mode");
+    /* Parse the request JSON top-level fields in a single pass. Every
+       json_obj_strdup() below is an O(n) lookup over this ~10-20 entry
+       array instead of an O(|json|) walk from the beginning — saves 15+
+       full-buffer walks per request compared to the legacy json_get_raw
+       pattern. The JsonObj holds spans into `json`, which lives for the
+       full dispatch. Helper is a drop-in for json_get_raw — same return
+       semantics (malloc'd NUL-terminated string, caller frees). */
+    JsonObj req;
+    json_parse_object(json, strlen(json), &req);
+
+    char *mode = json_obj_strdup(&req, "mode");
 
     /* Per-request statement timeout. Set unconditionally at the start of every
        dispatch so the next request on this worker thread never inherits a
        stale value. "timeout_ms":0 or absent → fall back to global g_timeout
        at QueryDeadline creation time (resolve_timeout_ms). */
-    {
-        char *tms = json_get_raw(json, "timeout_ms");
-        g_request_timeout_ms = tms ? (uint32_t)atoi(tms) : 0;
-        free(tms);
-    }
+    g_request_timeout_ms = (uint32_t)json_obj_int(&req, "timeout_ms", 0);
 
     /* Auth management modes — require trusted IP or valid token */
     if (mode && (strcmp(mode, "add-token") == 0 || strcmp(mode, "remove-token") == 0 ||
@@ -492,7 +498,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                  strcmp(mode, "list-tokens") == 0 || strcmp(mode, "list-ips") == 0)) {
         int authorized = is_ip_trusted(client_ip);
         if (!authorized) {
-            char *auth = json_get_raw(json, "auth");
+            char *auth = json_obj_strdup(&req, "auth");
             authorized = auth && is_token_valid(auth);
             free(auth);
         }
@@ -502,10 +508,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
 
         if (strcmp(mode, "add-token") == 0) {
-            char *token = json_get_raw(json, "token");
-            char *dir_scope = json_get_raw(json, "dir");     /* optional */
-            char *obj_scope = json_get_raw(json, "object");  /* optional, needs dir */
-            char *perm_str  = json_get_raw(json, "perm");    /* r | rw | rwx (default rw) */
+            char *token = json_obj_strdup(&req, "token");
+            char *dir_scope = json_obj_strdup(&req, "dir");     /* optional */
+            char *obj_scope = json_obj_strdup(&req, "object");  /* optional, needs dir */
+            char *perm_str  = json_obj_strdup(&req, "perm");    /* r | rw | rwx (default rw) */
 
             /* Validate dir if present */
             if (dir_scope && dir_scope[0] && !is_valid_dir(dir_scope)) {
@@ -565,7 +571,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(token); free(dir_scope); free(obj_scope); free(perm_str);
         } else if (strcmp(mode, "remove-token") == 0) {
-            char *token = json_get_raw(json, "token");
+            char *token = json_obj_strdup(&req, "token");
             if (token && token[0]) {
                 pthread_mutex_lock(&g_token_lock);
                 /* Remember scope (dir + obj) before removal so we know which
@@ -595,7 +601,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(token);
         } else if (strcmp(mode, "add-ip") == 0) {
-            char *ip = json_get_raw(json, "ip");
+            char *ip = json_obj_strdup(&req, "ip");
             if (ip && ip[0]) {
                 pthread_mutex_lock(&g_ip_lock);
                 ip_set_add(ip);
@@ -608,7 +614,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(ip);
         } else if (strcmp(mode, "remove-ip") == 0) {
-            char *ip = json_get_raw(json, "ip");
+            char *ip = json_obj_strdup(&req, "ip");
             if (ip && ip[0]) {
                 pthread_mutex_lock(&g_ip_lock);
                 int removed = ip_set_remove(ip);
@@ -668,9 +674,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             commands for that dir only; admin commands rejected.
          4. Otherwise reject. */
     if (!is_ip_trusted(client_ip)) {
-        char *auth = json_get_raw(json, "auth");
-        char *req_dir = json_get_raw(json, "dir");
-        char *req_obj = json_get_raw(json, "object");
+        char *auth = json_obj_strdup(&req, "auth");
+        char *req_dir = json_obj_strdup(&req, "dir");
+        char *req_obj = json_obj_strdup(&req, "object");
         int ok = auth && is_authorized(auth, req_dir, req_obj, mode);
         free(auth); free(req_dir); free(req_obj);
         if (!ok) {
@@ -696,7 +702,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
     /* stats — monitoring snapshot, no dir/object needed */
     if (mode && strcmp(mode, "stats") == 0) {
-        char *fmt = json_get_raw(json, "format");
+        char *fmt = json_obj_strdup(&req, "format");
         int as_table = (fmt && strcmp(fmt, "table") == 0);
         free(fmt);
 
@@ -800,13 +806,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
-    char *dir = json_get_raw(json, "dir");
-    char *object = json_get_raw(json, "object");
+    char *dir = json_obj_strdup(&req, "dir");
+    char *object = json_obj_strdup(&req, "object");
 
     /* shard-stats: object (and dir) are optional. When omitted, walk every
        dir/object. format="table" switches from JSON to a human ASCII table. */
     if (mode && strcmp(mode, "shard-stats") == 0 && !object) {
-        char *fmt = json_get_raw(json, "format");
+        char *fmt = json_obj_strdup(&req, "format");
         int as_table = (fmt && strcmp(fmt, "table") == 0);
         free(fmt);
         if (as_table) OUT("%-24s %-24s\n", "DIR", "OBJECT");
@@ -852,10 +858,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
     /* create-object bypasses dir validation (dir may not exist yet) */
     if (strcmp(mode, "create-object") == 0) {
-        char *fields_j = json_get_field(json, "fields", 0);
-        char *indexes_j = json_get_field(json, "indexes", 0);
-        char *splits_s = json_get_raw(json, "splits");
-        char *max_key_s = json_get_raw(json, "max_key");
+        char *fields_j = json_obj_strdup_raw(&req, "fields");
+        char *indexes_j = json_obj_strdup_raw(&req, "indexes");
+        char *splits_s = json_obj_strdup(&req, "splits");
+        char *max_key_s = json_obj_strdup(&req, "max_key");
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
@@ -893,12 +899,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     else if (took_rdlock) objlock_rdlock(db_root, object);
 
     if (strcmp(mode, "get") == 0) {
-        char *key = json_get_raw(json, "key");
-        char *keys = json_get_field(json, "keys", 0);
+        char *key = json_obj_strdup(&req, "key");
+        char *keys = json_obj_strdup_raw(&req, "keys");
         char *fields = json_get_string_or_array(json, "fields");
         if (keys) {
-            char *fmt = json_get_raw(json, "format");
-            char *delim = json_get_raw(json, "delimiter");
+            char *fmt = json_obj_strdup(&req, "format");
+            char *delim = json_obj_strdup(&req, "delimiter");
             cmd_get_multi(db_root, object, keys, fmt, delim);
             free(keys); free(fmt); free(delim);
         } else if (key) {
@@ -955,10 +961,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
         free(key); free(fields);
     } else if (strcmp(mode, "insert") == 0) {
-        char *key = json_get_raw(json, "key");
-        char *value = json_get_field(json, "value", 0);
-        char *if_cond = json_get_field(json, "if", 0);
-        char *ine_raw = json_get_raw(json, "if_not_exists");
+        char *key = json_obj_strdup(&req, "key");
+        char *value = json_obj_strdup_raw(&req, "value");
+        char *if_cond = json_obj_strdup_raw(&req, "if");
+        char *ine_raw = json_obj_strdup(&req, "if_not_exists");
         int if_not_exists = (ine_raw && strcmp(ine_raw, "true") == 0);
         free(ine_raw);
         if (key && value)
@@ -967,10 +973,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("{\"error\":\"Missing key or value\"}\n");
         free(key); free(value); free(if_cond);
     } else if (strcmp(mode, "update") == 0) {
-        char *key = json_get_raw(json, "key");
-        char *value = json_get_field(json, "value", 0);
-        char *if_cond = json_get_field(json, "if", 0);
-        char *dry_s = json_get_raw(json, "dry_run");
+        char *key = json_obj_strdup(&req, "key");
+        char *value = json_obj_strdup_raw(&req, "value");
+        char *if_cond = json_obj_strdup_raw(&req, "if");
+        char *dry_s = json_obj_strdup(&req, "dry_run");
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
         if (key && value)
             cmd_update(db_root, object, key, value, if_cond, dry);
@@ -978,19 +984,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("{\"error\":\"Missing key or value\"}\n");
         free(key); free(value); free(if_cond); free(dry_s);
     } else if (strcmp(mode, "delete") == 0) {
-        char *key = json_get_raw(json, "key");
-        char *if_cond = json_get_field(json, "if", 0);
-        char *dry_s = json_get_raw(json, "dry_run");
+        char *key = json_obj_strdup(&req, "key");
+        char *if_cond = json_obj_strdup_raw(&req, "if");
+        char *dry_s = json_obj_strdup(&req, "dry_run");
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
         if (key) cmd_delete(db_root, object, key, if_cond, dry);
         else OUT("{\"error\":\"Missing key\"}\n");
         free(key); free(if_cond); free(dry_s);
     } else if (strcmp(mode, "exists") == 0) {
-        char *key = json_get_raw(json, "key");
-        char *keys_json = json_get_field(json, "keys", 0);
+        char *key = json_obj_strdup(&req, "key");
+        char *keys_json = json_obj_strdup_raw(&req, "keys");
         if (keys_json) {
-            char *fmt = json_get_raw(json, "format");
-            char *delim = json_get_raw(json, "delimiter");
+            char *fmt = json_obj_strdup(&req, "format");
+            char *delim = json_obj_strdup(&req, "delimiter");
             cmd_exists_multi(db_root, object, keys_json, fmt, delim);
             free(keys_json); free(fmt); free(delim);
         } else if (key) {
@@ -1000,7 +1006,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
         free(key);
     } else if (strcmp(mode, "not-exists") == 0) {
-        char *keys_json = json_get_field(json, "keys", 0);
+        char *keys_json = json_obj_strdup_raw(&req, "keys");
         if (keys_json) {
             cmd_not_exists(db_root, object, keys_json);
             free(keys_json);
@@ -1010,20 +1016,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "size") == 0) {
         cmd_size(db_root, object);
     } else if (strcmp(mode, "count") == 0) {
-        char *criteria = json_get_field(json, "criteria", 0);
+        char *criteria = json_obj_strdup_raw(&req, "criteria");
         cmd_count(db_root, object, criteria);
         free(criteria);
     } else if (strcmp(mode, "find") == 0) {
-        char *criteria = json_get_field(json, "criteria", 0);
-        char *off_s = json_get_raw(json, "offset");
-        char *lim_s = json_get_raw(json, "limit");
+        char *criteria = json_obj_strdup_raw(&req, "criteria");
+        char *off_s = json_obj_strdup(&req, "offset");
+        char *lim_s = json_obj_strdup(&req, "limit");
         char *fields = json_get_string_or_array(json, "fields");
         char *excl = json_get_string_or_array(json, "excludedKeys");
-        char *fmt = json_get_raw(json, "format");
-        char *delim = json_get_raw(json, "delimiter");
-        char *join = json_get_field(json, "join", 0);
-        char *ob = json_get_raw(json, "order_by");
-        char *od = json_get_raw(json, "order");
+        char *fmt = json_obj_strdup(&req, "format");
+        char *delim = json_obj_strdup(&req, "delimiter");
+        char *join = json_obj_strdup_raw(&req, "join");
+        char *ob = json_obj_strdup(&req, "order_by");
+        char *od = json_obj_strdup(&req, "order");
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
         if (criteria || join)
@@ -1033,25 +1039,25 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
         free(delim); free(join); free(ob); free(od);
     } else if (strcmp(mode, "keys") == 0) {
-        char *off_s = json_get_raw(json, "offset");
-        char *lim_s = json_get_raw(json, "limit");
-        char *fmt = json_get_raw(json, "format");
-        char *delim = json_get_raw(json, "delimiter");
+        char *off_s = json_obj_strdup(&req, "offset");
+        char *lim_s = json_obj_strdup(&req, "limit");
+        char *fmt = json_obj_strdup(&req, "format");
+        char *delim = json_obj_strdup(&req, "delimiter");
         cmd_keys(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fmt, delim);
         free(off_s); free(lim_s); free(fmt); free(delim);
     } else if (strcmp(mode, "fetch") == 0) {
-        char *off_s = json_get_raw(json, "offset");
-        char *lim_s = json_get_raw(json, "limit");
+        char *off_s = json_obj_strdup(&req, "offset");
+        char *lim_s = json_obj_strdup(&req, "limit");
         char *fields = json_get_string_or_array(json, "fields");
-        char *cur = json_get_raw(json, "cursor");
-        char *fmt = json_get_raw(json, "format");
-        char *delim = json_get_raw(json, "delimiter");
+        char *cur = json_obj_strdup(&req, "cursor");
+        char *fmt = json_obj_strdup(&req, "format");
+        char *delim = json_obj_strdup(&req, "delimiter");
         cmd_fetch(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fields, cur, fmt, delim);
         free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim);
     } else if (strcmp(mode, "add-index") == 0) {
-        char *field = json_get_raw(json, "field");
-        char *fields_arr = json_get_field(json, "fields", 0);
-        char *force = json_get_raw(json, "force");
+        char *field = json_obj_strdup(&req, "field");
+        char *fields_arr = json_obj_strdup_raw(&req, "fields");
+        char *force = json_obj_strdup(&req, "force");
         int f = force && strcmp(force, "true") == 0;
         if (fields_arr)
             cmd_add_indexes(db_root, object, fields_arr, f);
@@ -1059,8 +1065,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_add_index(db_root, object, field, f);
         free(field); free(fields_arr); free(force);
     } else if (strcmp(mode, "remove-index") == 0) {
-        char *field = json_get_raw(json, "field");
-        char *fields_arr = json_get_field(json, "fields", 0);
+        char *field = json_obj_strdup(&req, "field");
+        char *fields_arr = json_obj_strdup_raw(&req, "fields");
         if (fields_arr)
             cmd_remove_indexes(db_root, object, fields_arr);
         else if (field)
@@ -1069,8 +1075,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("{\"error\":\"Missing field or fields\"}\n");
         free(field); free(fields_arr);
     } else if (strcmp(mode, "bulk-insert") == 0) {
-        char *file = json_get_raw(json, "file");
-        char *records = json_get_field(json, "records", 0);
+        char *file = json_obj_strdup(&req, "file");
+        char *records = json_obj_strdup_raw(&req, "records");
         if (records) {
             /* Inline records — pass string directly, no temp file */
             cmd_bulk_insert_string(db_root, object, records);
@@ -1080,25 +1086,25 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
         free(file);
     } else if (strcmp(mode, "bulk-insert-delimited") == 0) {
-        char *file = json_get_raw(json, "file");
-        char *delim = json_get_raw(json, "delimiter");
+        char *file = json_obj_strdup(&req, "file");
+        char *delim = json_obj_strdup(&req, "delimiter");
         char d = (delim && delim[0]) ? delim[0] : '|'; /* default pipe */
         cmd_bulk_insert_delimited(db_root, object, file, d);
         free(file); free(delim);
     } else if (strcmp(mode, "bulk-delete") == 0) {
-        char *crit_json = json_get_field(json, "criteria", 0);
+        char *crit_json = json_obj_strdup_raw(&req, "criteria");
         if (crit_json) {
             /* Criteria-based bulk delete */
-            char *lim_s = json_get_raw(json, "limit");
-            char *dry_s = json_get_raw(json, "dry_run");
+            char *lim_s = json_obj_strdup(&req, "limit");
+            char *dry_s = json_obj_strdup(&req, "dry_run");
             int lim = lim_s ? atoi(lim_s) : 0;
             int dry = (dry_s && strcmp(dry_s, "true") == 0);
             cmd_bulk_delete_criteria(db_root, object, crit_json, lim, dry);
             free(crit_json); free(lim_s); free(dry_s);
         } else {
             /* Key-list bulk delete (existing path) */
-            char *file = json_get_raw(json, "file");
-            char *keys = json_get_field(json, "keys", 0);
+            char *file = json_obj_strdup(&req, "file");
+            char *keys = json_obj_strdup_raw(&req, "keys");
             if (keys) {
                 char tmp[PATH_MAX];
                 snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bdel_%d.json", getpid());
@@ -1113,10 +1119,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(file);
         }
     } else if (strcmp(mode, "bulk-update") == 0) {
-        char *crit_json = json_get_field(json, "criteria", 0);
-        char *value = json_get_field(json, "value", 0);
-        char *lim_s = json_get_raw(json, "limit");
-        char *dry_s = json_get_raw(json, "dry_run");
+        char *crit_json = json_obj_strdup_raw(&req, "criteria");
+        char *value = json_obj_strdup_raw(&req, "value");
+        char *lim_s = json_obj_strdup(&req, "limit");
+        char *dry_s = json_obj_strdup(&req, "dry_run");
         int lim = lim_s ? atoi(lim_s) : 0;
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
         if (crit_json && value)
@@ -1127,21 +1133,21 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "vacuum") == 0) {
         /* Optional flags: "compact":true and "splits":N route to rebuild_object;
            no flags means fast in-place tombstone reclaim. */
-        char *compact_s = json_get_raw(json, "compact");
-        char *splits_s  = json_get_raw(json, "splits");
+        char *compact_s = json_obj_strdup(&req, "compact");
+        char *splits_s  = json_obj_strdup(&req, "splits");
         int compact = compact_s && strcmp(compact_s, "true") == 0;
         int new_splits = splits_s ? atoi(splits_s) : 0;
         cmd_vacuum(db_root, object, compact, new_splits);
         free(compact_s); free(splits_s);
     } else if (strcmp(mode, "rename-field") == 0) {
-        char *oldn = json_get_raw(json, "old");
-        char *newn = json_get_raw(json, "new");
+        char *oldn = json_obj_strdup(&req, "old");
+        char *newn = json_obj_strdup(&req, "new");
         if (oldn && newn) cmd_rename_field(db_root, object, oldn, newn);
         else OUT("{\"error\":\"Missing 'old' or 'new' field name\"}\n");
         free(oldn); free(newn);
     } else if (strcmp(mode, "add-field") == 0) {
         /* fields is a JSON array of spec lines, e.g. ["phone:varchar:20","dob:date"] */
-        char *fields_arr = json_get_field(json, "fields", 0);
+        char *fields_arr = json_obj_strdup_raw(&req, "fields");
         if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
         else {
             char lines[MAX_FIELDS][256];
@@ -1169,7 +1175,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
     } else if (strcmp(mode, "remove-field") == 0) {
         /* fields is a JSON array of field names, e.g. ["email","age"] */
-        char *fields_arr = json_get_field(json, "fields", 0);
+        char *fields_arr = json_obj_strdup_raw(&req, "fields");
         if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
         else {
             char names[MAX_FIELDS][256];
@@ -1198,7 +1204,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "recount") == 0) {
         cmd_recount(db_root, object);
     } else if (strcmp(mode, "shard-stats") == 0) {
-        char *fmt = json_get_raw(json, "format");
+        char *fmt = json_obj_strdup(&req, "format");
         cmd_shard_stats(db_root, object, fmt && strcmp(fmt, "table") == 0);
         free(fmt);
     } else if (strcmp(mode, "truncate") == 0) {
@@ -1206,10 +1212,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
     } else if (strcmp(mode, "put-file") == 0) {
-        char *data = json_get_raw(json, "data");
+        char *data = json_obj_strdup(&req, "data");
         if (data) {
-            char *filename = json_get_raw(json, "filename");
-            char *ine = json_get_raw(json, "if_not_exists");
+            char *filename = json_obj_strdup(&req, "filename");
+            char *ine = json_obj_strdup(&req, "if_not_exists");
             int if_not_exists = ine && strcmp(ine, "true") == 0;
             if (!filename)
                 OUT("{\"error\":\"filename is required when uploading via data\"}\n");
@@ -1217,45 +1223,45 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 cmd_put_file_b64(db_root, object, filename, data, strlen(data), if_not_exists);
             free(filename); free(ine);
         } else {
-            char *path = json_get_raw(json, "path");
+            char *path = json_obj_strdup(&req, "path");
             if (path) cmd_put_file(db_root, object, path);
             else OUT("{\"error\":\"put-file requires \\\"data\\\" (base64) or \\\"path\\\" (server-local)\"}\n");
             free(path);
         }
         free(data);
     } else if (strcmp(mode, "get-file") == 0) {
-        char *filename = json_get_raw(json, "filename");
+        char *filename = json_obj_strdup(&req, "filename");
         if (filename) cmd_get_file_b64(db_root, object, filename);
         else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
     } else if (strcmp(mode, "get-file-path") == 0) {
-        char *filename = json_get_raw(json, "filename");
+        char *filename = json_obj_strdup(&req, "filename");
         if (filename) cmd_get_file_path(db_root, object, filename);
         free(filename);
     } else if (strcmp(mode, "delete-file") == 0) {
-        char *filename = json_get_raw(json, "filename");
+        char *filename = json_obj_strdup(&req, "filename");
         if (filename) cmd_delete_file(db_root, object, filename);
         else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
     } else if (strcmp(mode, "aggregate") == 0) {
-        char *crit = json_get_field(json, "criteria", 0);
-        char *grp = json_get_field(json, "group_by", 0);
-        char *aggs = json_get_field(json, "aggregates", 0);
-        char *hav = json_get_field(json, "having", 0);
-        char *ob = json_get_raw(json, "order_by");
-        char *od = json_get_raw(json, "order");
-        char *lim_s = json_get_raw(json, "limit");
-        char *fmt = json_get_raw(json, "format");
-        char *delim = json_get_raw(json, "delimiter");
+        char *crit = json_obj_strdup_raw(&req, "criteria");
+        char *grp = json_obj_strdup_raw(&req, "group_by");
+        char *aggs = json_obj_strdup_raw(&req, "aggregates");
+        char *hav = json_obj_strdup_raw(&req, "having");
+        char *ob = json_obj_strdup(&req, "order_by");
+        char *od = json_obj_strdup(&req, "order");
+        char *lim_s = json_obj_strdup(&req, "limit");
+        char *fmt = json_obj_strdup(&req, "format");
+        char *delim = json_obj_strdup(&req, "delimiter");
         int desc = (od && strcmp(od, "desc") == 0);
         int lim = lim_s ? atoi(lim_s) : 0;
         cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim);
         free(crit); free(grp); free(aggs); free(hav);
         free(ob); free(od); free(lim_s); free(fmt); free(delim);
     } else if (strcmp(mode, "sequence") == 0) {
-        char *name = json_get_raw(json, "name");
-        char *action = json_get_raw(json, "action");
-        char *batch_s = json_get_raw(json, "batch");
+        char *name = json_obj_strdup(&req, "name");
+        char *action = json_obj_strdup(&req, "action");
+        char *batch_s = json_obj_strdup(&req, "batch");
         if (name && action)
             cmd_sequence(db_root, object, name, action, batch_s ? atoi(batch_s) : 1);
         else

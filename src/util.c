@@ -327,3 +327,113 @@ int valid_filename(const char *name) {
        we already rejected "..". Done. */
     return 1;
 }
+
+/* ========== Single-pass JSON object parser ==========
+   Walks `s` exactly once and records every top-level {"name": value, ...}
+   field as a (name, value) span in `out`. Values include surrounding quotes
+   for strings and brackets for nested arrays / objects — callers that want
+   an unquoted string use json_obj_unquoted(). Input must be NUL-terminated
+   (the per-value walkers json_skip / json_skip_value rely on it as a
+   secondary bound alongside the span length). */
+int json_parse_object(const char *s, size_t slen, JsonObj *out) {
+    if (!out) return -1;
+    out->n = 0;
+    if (!s) return -1;
+    const char *p = json_skip(s);
+    if (*p != '{') return -1;
+    p++;
+    const char *end = s + slen;
+    while (p < end && *p) {
+        p = json_skip(p);
+        if (*p == '}') return out->n;
+        if (*p == ',') { p++; continue; }
+        if (*p != '"') return -1;
+        p++;
+        const char *name_start = p;
+        while (p < end && *p && !(*p == '"' && *(p - 1) != '\\')) p++;
+        if (*p != '"') return -1;
+        size_t nlen = p - name_start;
+        p++;  /* closing " */
+        p = json_skip(p);
+        if (*p != ':') return -1;
+        p = json_skip(p + 1);
+        const char *val_start = p;
+        p = json_skip_value(p);
+        size_t vlen = p - val_start;
+        if (out->n >= JSON_OBJ_MAX_FIELDS) {
+            /* Too many fields for our fixed-size bucket. Abort; caller can
+               still fall back to the legacy per-field walker if this ever
+               fires in practice. */
+            return -1;
+        }
+        out->f[out->n].name = name_start;
+        out->f[out->n].nlen = nlen;
+        out->f[out->n].val  = val_start;
+        out->f[out->n].vlen = vlen;
+        out->n++;
+    }
+    return out->n;
+}
+
+int json_obj_get(const JsonObj *o, const char *key, const char **val, size_t *vlen) {
+    if (!o || !key) return 0;
+    size_t klen = strlen(key);
+    for (int i = 0; i < o->n; i++) {
+        if (o->f[i].nlen == klen && memcmp(o->f[i].name, key, klen) == 0) {
+            if (val)  *val  = o->f[i].val;
+            if (vlen) *vlen = o->f[i].vlen;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size_t *vlen) {
+    const char *v; size_t vl;
+    if (!json_obj_get(o, key, &v, &vl)) return 0;
+    if (vl >= 2 && v[0] == '"' && v[vl - 1] == '"') {
+        v++;
+        vl -= 2;
+    }
+    if (val)  *val  = v;
+    if (vlen) *vlen = vl;
+    return 1;
+}
+
+int json_obj_int(const JsonObj *o, const char *key, int fallback) {
+    const char *v; size_t vl;
+    if (!json_obj_unquoted(o, key, &v, &vl) || vl == 0) return fallback;
+    char buf[32];
+    size_t cl = vl < sizeof(buf) - 1 ? vl : sizeof(buf) - 1;
+    memcpy(buf, v, cl); buf[cl] = '\0';
+    return atoi(buf);
+}
+
+int json_obj_copy(const JsonObj *o, const char *key, char *buf, size_t bufsz) {
+    const char *v; size_t vl;
+    if (!json_obj_unquoted(o, key, &v, &vl) || vl == 0 || bufsz == 0) {
+        if (bufsz) buf[0] = '\0';
+        return 0;
+    }
+    size_t cl = vl < bufsz - 1 ? vl : bufsz - 1;
+    memcpy(buf, v, cl); buf[cl] = '\0';
+    return (int)cl;
+}
+
+char *json_obj_strdup(const JsonObj *o, const char *key) {
+    const char *v; size_t vl;
+    if (!json_obj_unquoted(o, key, &v, &vl)) return NULL;
+    char *s = malloc(vl + 1);
+    if (!s) return NULL;
+    memcpy(s, v, vl); s[vl] = '\0';
+    return s;
+}
+
+char *json_obj_strdup_raw(const JsonObj *o, const char *key) {
+    const char *v; size_t vl;
+    if (!json_obj_get(o, key, &v, &vl)) return NULL;
+    char *s = malloc(vl + 1);
+    if (!s) return NULL;
+    memcpy(s, v, vl); s[vl] = '\0';
+    return s;
+}
