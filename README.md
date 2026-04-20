@@ -228,6 +228,8 @@ shard-db status             # Check if running, print pid and port
 shard-db server             # Start in foreground (debug mode)
 ```
 
+`start` and `server` take an `flock` on `$DB_ROOT/.shard-db.lock` before accepting connections. A second `start` on the same `DB_ROOT` — even from a different directory, different port, or copied binary — fails fast with a clear error. The kernel releases the lock automatically on normal exit or crash (SIGKILL, power loss), so no stale-lock cleanup is ever needed.
+
 ### CRUD
 
 ```bash

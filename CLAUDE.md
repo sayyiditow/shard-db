@@ -154,6 +154,10 @@ All advanced queries go through `./shard-db query '<json>'`.
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
 
+### Single-instance guard
+
+`cmd_server` takes `flock(LOCK_EX | LOCK_NB)` on `$DB_ROOT/.shard-db.lock` before daemonizing. A second `./shard-db start` on the same `DB_ROOT` — even with a different port, a different config file, or a copied binary — fails fast with a clear error. The kernel holds the lock for the server's lifetime and releases it automatically on normal exit *or crash* (SIGKILL, power loss), so there's nothing to clean up manually. The lock file contains the running daemon's PID for `lsof`/`cat` visibility.
+
 ### Per-query memory cap
 
 `QUERY_BUFFER_MB` (default 500) bounds the intermediate buffers any single query can hold. Checked at 7 collection sites: ordered find buffer, aggregate buckets (shared atomic across parallel workers), bulk-delete/update key list, OR KeySet, `CollectCtx.entries` (btree hash collection), `ShardWorkCtx.results` (downstream of CollectCtx), per-worker aggregate hash tables (via the shared atomic). When exceeded the query aborts with `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.

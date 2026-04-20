@@ -1267,18 +1267,52 @@ void remove_pid_file(const char *db_root) {
 int cmd_server(const char *db_root, int daemonize) {
     int port = g_port;
 
+    /* Single-instance guard. flock on a per-DB_ROOT lock file prevents a
+       second shard-db process from attaching to the same data directory
+       (which would corrupt shared mmap state — the per-object rwlocks in
+       objlock.c are in-process only). The lock is held by the kernel for
+       the server process lifetime and released automatically on exit or
+       crash; fork() carries the open-file-description across so the
+       daemon child inherits the held lock after the parent returns. */
+    char lockpath[PATH_MAX];
+    snprintf(lockpath, sizeof(lockpath), "%s/.shard-db.lock", db_root);
+    int lock_fd = open(lockpath, O_CREAT | O_RDWR, 0644);
+    if (lock_fd < 0) {
+        fprintf(stderr, "Error: cannot open lock file %s: %s\n", lockpath, strerror(errno));
+        return 1;
+    }
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr,
+                "Error: another shard-db instance is already running on DB_ROOT=%s "
+                "(lock held on %s). Stop it first with './shard-db stop'.\n",
+                db_root, lockpath);
+        close(lock_fd);
+        return 1;
+    }
+
     if (daemonize) {
         pid_t pid = fork();
-        if (pid < 0) { perror("fork"); return 1; }
+        if (pid < 0) { perror("fork"); close(lock_fd); return 1; }
         if (pid > 0) {
             usleep(200000);
             OUT("shard-db started (pid %d, port %d)\n", pid, port);
+            /* Parent exits; child's fd keeps the OFD (and the flock) alive. */
             return 0;
         }
         setsid();
         freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
+    }
+
+    /* Record the running PID inside the lock file for operator visibility
+       (lsof / cat .shard-db.lock). Not load-bearing — the lock is what
+       enforces exclusion. */
+    char pidbuf[32];
+    int pidlen = snprintf(pidbuf, sizeof(pidbuf), "%d\n", (int)getpid());
+    if (ftruncate(lock_fd, 0) == 0) {
+        ssize_t _ignored = pwrite(lock_fd, pidbuf, pidlen, 0);
+        (void)_ignored;
     }
 
     /* TCP socket */
