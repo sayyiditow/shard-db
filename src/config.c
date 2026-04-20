@@ -929,17 +929,49 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
 
-    /* Extract all field values from JSON in one pass.
-       Tombstoned fields are skipped — their on-disk bytes stay at 0. */
-    const char *keys[MAX_FIELDS];
-    char *vals[MAX_FIELDS];
-    for (int i = 0; i < ts->nfields; i++) keys[i] = ts->fields[i].name;
-    json_get_fields(json, keys, ts->nfields, vals);
+    /* Walk the JSON object exactly once. For each top-level field we
+       encounter, match against the schema inline and call encode_field_len
+       on the (ptr, len) span directly — no intermediate storage, no
+       per-field malloc, no fixed-size bucket of unknown fields to cap.
+       Unknown fields are skipped via json_skip_value; they contribute
+       zero memory footprint. */
+    const char *p = json_skip(json);
+    if (*p != '{') return ts->total_size;
+    p++;
+    while (*p) {
+        p = json_skip(p);
+        if (*p == '}') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '"') break;
 
-    for (int i = 0; i < ts->nfields; i++) {
-        if (!ts->fields[i].removed)
-            encode_field(&ts->fields[i], vals[i], out + ts->fields[i].offset);
-        free(vals[i]);
+        p++;
+        const char *fname = p;
+        while (*p && !(*p == '"' && *(p - 1) != '\\')) p++;
+        size_t flen = p - fname;
+        if (*p == '"') p++;
+        p = json_skip(p);
+        if (*p != ':') break;
+        p = json_skip(p + 1);
+
+        const char *vstart = p;
+        p = json_skip_value(p);
+        size_t vlen = p - vstart;
+
+        /* Match against the schema. Linear scan is fine — typical schema
+           has <30 fields and the strcmp is short. */
+        for (int i = 0; i < ts->nfields; i++) {
+            if (ts->fields[i].removed) continue;
+            size_t klen = strlen(ts->fields[i].name);
+            if (flen != klen) continue;
+            if (memcmp(fname, ts->fields[i].name, klen) != 0) continue;
+            /* Strip surrounding quotes for string values; numeric/bool/
+               array/object literals pass through as-is. */
+            const char *ev = vstart; size_t el = vlen;
+            if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
+            if (el > 0)
+                encode_field_len(&ts->fields[i], ev, el, out + ts->fields[i].offset);
+            break;
+        }
     }
     return ts->total_size;
 }
@@ -1058,26 +1090,58 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
 
-    const char *keys[MAX_FIELDS];
-    char *vals[MAX_FIELDS];
-    for (int i = 0; i < ts->nfields; i++) keys[i] = ts->fields[i].name;
-    json_get_fields(json, keys, ts->nfields, vals);
+    /* Same inline-match walk as typed_encode, but with a bitmap of which
+       schema indices got a client value so we can apply defaults to the
+       unseen ones in a second pass. No intermediate storage, no per-field
+       mallocs, unknown-field-safe. */
+    char seen[MAX_FIELDS] = {0};
 
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed) { free(vals[i]); continue; }
+    const char *p = json_skip(json);
+    if (*p == '{') {
+        p++;
+        while (*p) {
+            p = json_skip(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; continue; }
+            if (*p != '"') break;
 
-        if (vals[i] && vals[i][0]) {
-            /* Client provided a value — use it (overrides any default) */
-            encode_field(&ts->fields[i], vals[i], out + ts->fields[i].offset);
-        } else if (ts->fields[i].default_kind != DK_NONE) {
-            /* No client value — apply default */
-            char gen_buf[256];
-            const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
-                                              db_root, object);
-            if (dv) encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
+            p++;
+            const char *fname = p;
+            while (*p && !(*p == '"' && *(p - 1) != '\\')) p++;
+            size_t flen = p - fname;
+            if (*p == '"') p++;
+            p = json_skip(p);
+            if (*p != ':') break;
+            p = json_skip(p + 1);
+
+            const char *vstart = p;
+            p = json_skip_value(p);
+            size_t vlen = p - vstart;
+
+            for (int i = 0; i < ts->nfields; i++) {
+                if (ts->fields[i].removed) continue;
+                size_t klen = strlen(ts->fields[i].name);
+                if (flen != klen) continue;
+                if (memcmp(fname, ts->fields[i].name, klen) != 0) continue;
+                const char *ev = vstart; size_t el = vlen;
+                if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
+                if (el > 0) {
+                    encode_field_len(&ts->fields[i], ev, el, out + ts->fields[i].offset);
+                    seen[i] = 1;
+                }
+                break;
+            }
         }
-        /* else: no value, no default → stays zeroed */
-        free(vals[i]);
+    }
+
+    /* Fields the client didn't provide → apply configured default if any. */
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed || seen[i]) continue;
+        if (ts->fields[i].default_kind == DK_NONE) continue;
+        char gen_buf[256];
+        const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
+                                          db_root, object);
+        if (dv) encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
     }
     return ts->total_size;
 }

@@ -336,7 +336,10 @@ const char *json_skip_value(const char *p);
    the original JSON — no allocation, no ownership transfer; the original
    buffer must outlive the JsonObj. */
 
-#define JSON_OBJ_MAX_FIELDS 64
+/* Maximum top-level fields we'll record per JsonObj. Sized at MAX_FIELDS so
+   any legit schema's request fits; clients sending more get rejected at
+   parse time rather than silently truncated. 8 KB of stack per call. */
+#define JSON_OBJ_MAX_FIELDS MAX_FIELDS
 
 typedef struct {
     const char *name; size_t nlen;
