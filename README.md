@@ -85,6 +85,7 @@ Place `db.env` in the working directory where you run shard-db.
 | `MAX_REQUEST_SIZE` | `33554432` | Max request size in bytes (32 MB) |
 | `FCACHE_MAX` | `4096` | Shard mmap cache capacity |
 | `BT_CACHE_MAX` | `256` | B+ tree index cache capacity |
+| `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap in MB — protects against one bad query monopolising RAM |
 | `SLOW_QUERY_MS` | `500` | Slow query log threshold in ms |
 
 ## Quick Start

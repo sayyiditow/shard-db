@@ -11,6 +11,7 @@ int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
 int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via FCACHE_MAX */
 int g_btcache_cap = 256;        /* B+ tree mmap cache capacity, configurable via BT_CACHE_MAX */
+size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024; /* 500 MB per-query intermediate cap, configurable via QUERY_BUFFER_MB */
 
 /* Monitoring counters */
 uint64_t g_ucache_hits = 0;
@@ -248,6 +249,10 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "BT_CACHE_MAX=", 13) == 0) {
             int n = atoi(p + 13);
             if (n >= 16 && n <= 1048576) g_btcache_cap = n;
+        } else if (strncmp(p, "QUERY_BUFFER_MB=", 16) == 0) {
+            long mb = atol(p + 16);
+            if (mb >= 1 && mb <= 1048576)  /* 1 MB floor, 1 TB ceiling */
+                g_query_buffer_max_bytes = (size_t)mb * 1024 * 1024;
         } else if (strncmp(p, "SLOW_QUERY_MS=", 14) == 0) {
             int n = atoi(p + 14);
             if (n == 0) {

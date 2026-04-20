@@ -1624,16 +1624,26 @@ typedef struct {
     int limit;
     QueryDeadline *deadline;
     int dl_counter;
+    size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
+    int budget_exceeded;
 } BulkCriteriaCtx;
 
 static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     BulkCriteriaCtx *bc = (BulkCriteriaCtx *)ctx;
+    if (bc->budget_exceeded) return 1;
     if (bc->limit > 0 && bc->count >= bc->limit) return 1;
     if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 1;
 
     const uint8_t *raw = block + hdr->key_len;
 
     if (!criteria_match_tree(raw, bc->tree, bc->fs)) return 0;
+
+    size_t key_bytes = sizeof(char *) + hdr->key_len + 1;
+    if (bc->buffer_bytes + key_bytes > g_query_buffer_max_bytes) {
+        bc->budget_exceeded = 1;
+        return 1;
+    }
+    bc->buffer_bytes += key_bytes;
 
     /* Match — collect the key */
     if (bc->count >= bc->cap) {
@@ -1671,12 +1681,18 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, fs.ts);
     QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
-    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0 };
+    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
     int matched = ctx.count;
 
     if (dl.timed_out) {
         OUT("{\"error\":\"query_timeout\"}\n");
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys); free_criteria_tree(tree);
+        return -1;
+    }
+    if (ctx.budget_exceeded) {
+        OUT(QUERY_BUFFER_ERR);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -1864,12 +1880,18 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, fs.ts);
     QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
-    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0 };
+    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
     int matched = ctx.count;
 
     if (dl.timed_out) {
         OUT("{\"error\":\"query_timeout\"}\n");
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys); free_criteria_tree(tree);
+        return -1;
+    }
+    if (ctx.budget_exceeded) {
+        OUT(QUERY_BUFFER_ERR);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -3911,6 +3933,7 @@ typedef struct {
     int check_primary;
     QueryDeadline *deadline;
     int dl_counter;
+    int budget_exceeded; /* set when collected bytes would exceed QUERY_BUFFER_MB */
 } CollectCtx;
 
 static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
@@ -3928,6 +3951,12 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     /* Stop at collection cap (set by caller per batch) */
     if (cc->collect_cap > 0 && (int)cc->count >= cc->collect_cap)
         return -1;
+
+    /* Per-query memory cap — 24 bytes per entry (CollectedHash) */
+    if ((cc->count + 1) * sizeof(CollectedHash) > g_query_buffer_max_bytes) {
+        cc->budget_exceeded = 1;
+        return -1;
+    }
 
     if (cc->count >= cc->cap) {
         cc->cap *= 2;
@@ -4438,6 +4467,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
 
     btree_dispatch(primary_idx_path, primary_crit, collect_hash_cb, &cc);
 
+    if (cc.budget_exceeded) { free(cc.entries); return -2; }  /* -2 = budget exceeded */
     if (cc.count == 0) { free(cc.entries); return 0; }
 
     int count = 0, printed = 0;
@@ -5018,9 +5048,12 @@ static void *or_child_worker(void *arg) {
 
 /* Build a KeySet by unioning the index lookups of every child of `or_node`.
    Every child must be a LEAF with an index (verified by the planner).
-   Caller owns the returned KeySet and must keyset_free() it. */
+   Caller owns the returned KeySet and must keyset_free() it.
+   If the OR's estimated capacity would exceed the per-query buffer cap, returns
+   NULL and sets *out_budget_exceeded = 1 when the pointer is non-NULL. */
 static KeySet *build_or_keyset(const char *db_root, const char *object,
-                               const CriteriaNode *or_node, QueryDeadline *dl) {
+                               const CriteriaNode *or_node, QueryDeadline *dl,
+                               int *out_budget_exceeded) {
     int n = or_node->n_children;
     if (n <= 0) return NULL;
 
@@ -5037,6 +5070,15 @@ static KeySet *build_or_keyset(const char *db_root, const char *object,
     }
     if (est_total < 1024) est_total = 1024;
     if (est_total > 1000000) est_total = 1000000;
+
+    /* Budget check: KeySet alloc is O(cap_pow2 * 24 bytes) — keys[] + state[].
+       Cap est_total to fit the per-query buffer cap. */
+    size_t ks_cap_guess = est_total * 2; /* keyset_new doubles + rounds up */
+    size_t ks_bytes = ks_cap_guess * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    if (ks_bytes > g_query_buffer_max_bytes) {
+        if (out_budget_exceeded) *out_budget_exceeded = 1;
+        return NULL;
+    }
 
     KeySet *ks = keyset_new(est_total);
     if (!ks) return NULL;
@@ -5139,8 +5181,8 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                const char **proj_fields, int proj_count,
                                FieldSchema *fs, int rows_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
-                               QueryDeadline *dl) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl);
+                               QueryDeadline *dl, int *out_budget_exceeded) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
@@ -5314,8 +5356,9 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
    both Shape C (pure OR) and hybrid (AND + OR) reach the correct records. */
 static void keyset_agg_from_or(const char *db_root, const char *object,
                                const Schema *sch, void *agg_ctx,
-                               CriteriaNode *or_node, QueryDeadline *dl) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl);
+                               CriteriaNode *or_node, QueryDeadline *dl,
+                               int *out_budget_exceeded) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
     if (!ks) return;
     if (dl->timed_out) { keyset_free(ks); return; }
 
@@ -5360,8 +5403,8 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
 static size_t keyset_count_from_or(const char *db_root, const char *object,
                                    const Schema *sch, CriteriaNode *tree,
                                    CriteriaNode *or_node, FieldSchema *fs,
-                                   QueryDeadline *dl) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl);
+                                   QueryDeadline *dl, int *out_budget_exceeded) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
@@ -5466,6 +5509,11 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             cc.deadline = &dl;
             btree_dispatch(plan.primary_idx_path, pc, collect_hash_cb, &cc);
 
+            if (cc.budget_exceeded) {
+                OUT(QUERY_BUFFER_ERR);
+                free(cc.entries); free_criteria_tree(tree);
+                return -1;
+            }
             size_t count = parallel_indexed_count(db_root, object, &sch,
                                                   cc.entries, (int)cc.count,
                                                   tree, &fs, &dl);
@@ -5475,9 +5523,11 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         }
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union. */
+        int budget_exceeded = 0;
         size_t count = keyset_count_from_or(db_root, object, &sch, tree, plan.or_node,
-                                            &fs, &dl);
-        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                                            &fs, &dl, &budget_exceeded);
+        if (budget_exceeded) OUT(QUERY_BUFFER_ERR);
+        else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("{\"count\":%zu}\n", count);
     } else {
         CountCtx ctx = { tree, &fs, 0, &dl, 0 };
@@ -5518,11 +5568,14 @@ typedef struct {
     QueryDeadline *deadline;
     int dl_counter;
     int order_is_numeric;
+    size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
+    int budget_exceeded;    /* set once we cross the cap — callback stops collecting */
     pthread_mutex_t lock;
 } OrderedCollectCtx;
 
 static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     OrderedCollectCtx *oc = (OrderedCollectCtx *)ctx;
+    if (oc->budget_exceeded) return 1;  /* stop scanning once cap hit */
     if (query_deadline_tick(oc->deadline, &oc->dl_counter)) return 1;
 
     /* Exclusion check */
@@ -5543,7 +5596,17 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
         sv = decode_field((const char *)raw, hdr->value_len, oc->order_field_name, oc->fs);
     }
 
+    size_t rec_len = (size_t)hdr->key_len + (size_t)hdr->value_len;
+    size_t row_bytes = sizeof(OrderedRow) + hdr->key_len + rec_len + (sv ? strlen(sv) + 1 : 0);
+
     pthread_mutex_lock(&oc->lock);
+    if (oc->buffer_bytes + row_bytes > g_query_buffer_max_bytes) {
+        oc->budget_exceeded = 1;
+        pthread_mutex_unlock(&oc->lock);
+        free(sv);
+        return 1;  /* stop scan */
+    }
+    oc->buffer_bytes += row_bytes;
     if (oc->count >= oc->cap) {
         oc->cap = oc->cap ? oc->cap * 2 : 256;
         oc->rows = realloc(oc->rows, oc->cap * sizeof(OrderedRow));
@@ -5554,7 +5617,6 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     memcpy(r->key, block, hdr->key_len);
     r->key[hdr->key_len] = '\0';
     r->value_len = hdr->value_len;
-    size_t rec_len = (size_t)hdr->key_len + (size_t)hdr->value_len;
     r->record = malloc(rec_len);
     memcpy(r->record, block, rec_len);
     r->sort_str = sv;
@@ -5710,6 +5772,19 @@ int cmd_find(const char *db_root, const char *object,
 
         scan_shards(data_dir, sch.slot_size, ordered_collect_cb, &oc);
 
+        if (oc.budget_exceeded) {
+            for (size_t i = 0; i < oc.count; i++) {
+                free(oc.rows[i].key); free(oc.rows[i].record); free(oc.rows[i].sort_str);
+            }
+            free(oc.rows);
+            pthread_mutex_destroy(&oc.lock);
+            OUT(QUERY_BUFFER_ERR);
+            free_excluded(&excluded);
+            free_criteria_tree(tree);
+            free_joins(joins, njoins);
+            return -1;
+        }
+
         int desc = (order_dir && (strcmp(order_dir, "desc") == 0 || strcmp(order_dir, "DESC") == 0));
         if (oc.count > 1)
             qsort(oc.rows, oc.count, sizeof(OrderedRow), desc ? cmp_row_desc : cmp_row_asc);
@@ -5777,17 +5852,37 @@ int cmd_find(const char *db_root, const char *object,
         enum SearchOp op = pc->op;
         int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
                              op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
-        idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
+        int rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                          rows_fmt, csv_delim, joins, njoins, &dl);
+        if (rc == -2) {
+            if (csv_delim) { /* nothing to close */ }
+            else if (has_joins || rows_fmt) OUT("]}\n");
+            else OUT("]\n");
+            free_excluded(&excluded); free_criteria_tree(tree); free_joins(joins, njoins);
+            OUT(QUERY_BUFFER_ERR);
+            return -1;
+        }
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* ===== OR INDEX-UNION FIND ===== */
+        int budget_exceeded = 0;
         keyset_find_from_or(db_root, object, &sch, tree, plan.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                            rows_fmt, csv_delim, joins, njoins, &dl);
+                            rows_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded);
+        if (budget_exceeded) {
+            /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
+            if (csv_delim) { /* no envelope to close */ }
+            else if (has_joins || rows_fmt) OUT("]}\n");
+            else OUT("]\n");
+            free_excluded(&excluded);
+            free_criteria_tree(tree);
+            free_joins(joins, njoins);
+            OUT(QUERY_BUFFER_ERR);
+            return -1;
+        }
     } else {
         /* ===== FULL SCAN FALLBACK ===== */
         AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
@@ -6669,6 +6764,11 @@ typedef struct {
     int total_buckets;
     QueryDeadline *deadline;
     int dl_counter;
+    /* QUERY_BUFFER_MB accounting. Parallel workers share a single atomic counter
+       (pointed to by shared_buffer_bytes); serial path reads/writes it like a
+       plain size_t. budget_exceeded flips per-ctx once the cap is hit. */
+    _Atomic size_t *shared_buffer_bytes;
+    int budget_exceeded;
 } AggCtx;
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
@@ -6821,6 +6921,22 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
         if (strcmp(b->group_key, key) == 0) return b;
     }
 
+    /* New bucket: charge against the shared budget before allocating. */
+    if (ctx->shared_buffer_bytes) {
+        size_t bucket_bytes = sizeof(AggBucket) + (size_t)(kp + 1) +
+                              (size_t)nvals * sizeof(char *) +
+                              (size_t)ctx->nspecs * sizeof(AggAccum);
+        for (int i = 0; i < nvals; i++) bucket_bytes += strlen(vals[i]) + 1;
+        size_t prev = atomic_fetch_add_explicit(ctx->shared_buffer_bytes,
+                                                bucket_bytes, memory_order_relaxed);
+        if (prev + bucket_bytes > g_query_buffer_max_bytes) {
+            atomic_fetch_sub_explicit(ctx->shared_buffer_bytes,
+                                      bucket_bytes, memory_order_relaxed);
+            ctx->budget_exceeded = 1;
+            return NULL;
+        }
+    }
+
     /* Create new bucket */
     AggBucket *b = calloc(1, sizeof(AggBucket));
     b->group_key = strdup(key);
@@ -6839,6 +6955,7 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
 
 static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ctx) {
     AggCtx *ctx = (AggCtx *)raw_ctx;
+    if (ctx->budget_exceeded) return 1;
     if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
     const uint8_t *raw = block + hdr->key_len;
 
@@ -6877,6 +6994,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         char *empty = "";
         bkt = agg_find_or_create(ctx, &empty, 1);
     }
+    if (!bkt) return 1;  /* budget exceeded — stop scan */
 
     /* Accumulate — typed direct-to-double for numeric specs, fallback for composite. */
     for (int i = 0; i < ctx->nspecs; i++) {
@@ -7015,6 +7133,7 @@ static void agg_ctx_clone_shared(AggCtx *dst, const AggCtx *src) {
     memset(dst, 0, sizeof(*dst));
     dst->tree = src->tree;
     dst->fs = src->fs;
+    dst->shared_buffer_bytes = src->shared_buffer_bytes;
     memcpy(dst->group_fields, src->group_fields, sizeof(src->group_fields));
     dst->ngroups = src->ngroups;
     memcpy(dst->group_tfs, src->group_tfs, sizeof(src->group_tfs));
@@ -7157,8 +7276,10 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
         free(threads);
     }
 
-    for (int g = 0; g < nshard_groups; g++)
+    for (int g = 0; g < nshard_groups; g++) {
+        if (workers[g].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[g].local);
+    }
     free(workers);
 }
 
@@ -7319,6 +7440,9 @@ int cmd_aggregate(const char *db_root, const char *object,
     ctx.nspecs = nspecs;
     QueryDeadline dl = { now_ms_coarse(), g_timeout * 1000, 0 };
     ctx.deadline = &dl;
+    _Atomic size_t agg_budget_bytes = 0;
+    atomic_init(&agg_budget_bytes, 0);
+    ctx.shared_buffer_bytes = &agg_budget_bytes;
 
     /* Parse group_by */
     if (group_by_json && group_by_json[0])
@@ -7364,13 +7488,16 @@ int cmd_aggregate(const char *db_root, const char *object,
 
         btree_dispatch(plan.primary_idx_path, pc, collect_hash_cb, &cc);
 
-        parallel_indexed_agg(&ctx, db_root, object, &sch, cc.entries, (int)cc.count);
+        if (cc.budget_exceeded) ctx.budget_exceeded = 1;
+        else parallel_indexed_agg(&ctx, db_root, object, &sch, cc.entries, (int)cc.count);
 
         free(cc.entries);
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union, feed each keyed
            record through agg_scan_cb (which re-checks the full tree). */
-        keyset_agg_from_or(db_root, object, &sch, &ctx, plan.or_node, &dl);
+        int budget_exceeded = 0;
+        keyset_agg_from_or(db_root, object, &sch, &ctx, plan.or_node, &dl, &budget_exceeded);
+        if (budget_exceeded) ctx.budget_exceeded = 1;
     } else {
         /* Full scan fallback */
         scan_shards(data_dir, sch.slot_size, agg_scan_cb, &ctx);
@@ -7378,6 +7505,12 @@ int cmd_aggregate(const char *db_root, const char *object,
 
     if (dl.timed_out) {
         OUT("{\"error\":\"query_timeout\"}\n");
+        free_criteria_tree(tree);
+        agg_free(&ctx);
+        return -1;
+    }
+    if (ctx.budget_exceeded) {
+        OUT(QUERY_BUFFER_ERR);
         free_criteria_tree(tree);
         agg_free(&ctx);
         return -1;

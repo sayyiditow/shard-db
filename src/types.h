@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -214,6 +215,11 @@ extern int g_max_threads;
 extern int g_workers;
 extern int g_index_page_size;
 extern int g_global_limit;
+extern size_t g_query_buffer_max_bytes;
+
+/* Canonical error message for per-query memory-cap exceeded. Single string so
+   callers don't drift apart; emit via OUT() at any of the 7 collection sites. */
+#define QUERY_BUFFER_ERR "{\"error\":\"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor\"}\n"
 extern int g_max_request_size;
 extern int g_fcache_cap;
 extern int g_btcache_cap;

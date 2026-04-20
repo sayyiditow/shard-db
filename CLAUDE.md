@@ -48,7 +48,7 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 
 ### Configuration
 
-- **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `SLOW_QUERY_MS` (floor 100ms, 0=off)
+- **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `QUERY_BUFFER_MB` (per-query intermediate buffer cap, default 500), `SLOW_QUERY_MS` (floor 100ms, 0=off)
 - **$DB_ROOT/tokens.conf** — API tokens (one per line)
 - **$DB_ROOT/allowed_ips.conf** — Trusted IPs (skip token check)
 - **$DB_ROOT/dirs.conf** — Allowed tenant directories
@@ -153,6 +153,12 @@ All advanced queries go through `./shard-db query '<json>'`.
  "fields":["id","name"],
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
+
+### Per-query memory cap
+
+`QUERY_BUFFER_MB` (default 500) bounds the intermediate buffers any single query can hold. Checked at 7 collection sites: ordered find buffer, aggregate buckets (shared atomic across parallel workers), bulk-delete/update key list, OR KeySet, `CollectCtx.entries` (btree hash collection), `ShardWorkCtx.results` (downstream of CollectCtx), per-worker aggregate hash tables (via the shared atomic). When exceeded the query aborts with `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
+
+Rough sizing: peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10-15% higher due to malloc chunk overhead not accounted for). Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, container limit, or `ulimit -v`) as a backstop.
 
 ### CSV / delimited export
 
