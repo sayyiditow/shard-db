@@ -92,7 +92,9 @@ char *extract_field_value(const char *json, const char *field_name) {
         for (int i = 0; i < nsub; i++) free(svals[i]);
         return (ok && pos > 0) ? strdup(cat) : NULL;
     }
-    return json_get_raw(json, field_name);
+    JsonObj jo;
+    json_parse_object(json, strlen(json), &jo);
+    return json_obj_strdup(&jo, field_name);
 }
 
 /* Build concatenated value for a composite index field like "status+invoiceDate"

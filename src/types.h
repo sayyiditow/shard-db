@@ -322,9 +322,6 @@ void sort_dedup_file(const char *path);
 /* JSON helpers */
 const char *json_skip(const char *p);
 const char *json_skip_value(const char *p);
-char *json_get_field(const char *json, const char *key, int strip_quotes);
-char *json_get_string(const char *json, const char *key);
-char *json_get_raw(const char *json, const char *key);
 
 /* ========== Single-pass JSON object parser ==========
    shard-db's request / criterion / join / aggregate spec shapes are all
@@ -381,8 +378,10 @@ char *json_obj_strdup(const JsonObj *o, const char *key);
    further. Returns a malloc'd NUL-terminated copy including the surrounding
    brackets/quotes. Same ownership semantics as json_get_field with strip=0. */
 char *json_obj_strdup_raw(const JsonObj *o, const char *key);
+
+/* String-or-array field → comma-separated malloc'd string, or NULL on miss. */
+char *json_obj_string_or_array(const JsonObj *o, const char *key);
 int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values);
-char *json_get_string_or_array(const char *json, const char *key);
 char *extract_field_value(const char *json, const char *field_name);
 
 /* Base64 (util.c, RFC 4648 standard alphabet) */

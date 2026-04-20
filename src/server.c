@@ -476,11 +476,10 @@ static void save_tokens_conf(const char *db_root) {
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     /* Parse the request JSON top-level fields in a single pass. Every
        json_obj_strdup() below is an O(n) lookup over this ~10-20 entry
-       array instead of an O(|json|) walk from the beginning — saves 15+
-       full-buffer walks per request compared to the legacy json_get_raw
-       pattern. The JsonObj holds spans into `json`, which lives for the
-       full dispatch. Helper is a drop-in for json_get_raw — same return
-       semantics (malloc'd NUL-terminated string, caller frees). */
+       array instead of an O(|json|) walk from the beginning — the whole
+       request is parsed exactly once regardless of how many fields
+       subsequent code extracts. The JsonObj holds spans into `json`,
+       which lives for the full dispatch. */
     JsonObj req;
     json_parse_object(json, strlen(json), &req);
 
@@ -901,7 +900,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     if (strcmp(mode, "get") == 0) {
         char *key = json_obj_strdup(&req, "key");
         char *keys = json_obj_strdup_raw(&req, "keys");
-        char *fields = json_get_string_or_array(json, "fields");
+        char *fields = json_obj_string_or_array(&req, "fields");
         if (keys) {
             char *fmt = json_obj_strdup(&req, "format");
             char *delim = json_obj_strdup(&req, "delimiter");
@@ -1023,8 +1022,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *criteria = json_obj_strdup_raw(&req, "criteria");
         char *off_s = json_obj_strdup(&req, "offset");
         char *lim_s = json_obj_strdup(&req, "limit");
-        char *fields = json_get_string_or_array(json, "fields");
-        char *excl = json_get_string_or_array(json, "excludedKeys");
+        char *fields = json_obj_string_or_array(&req, "fields");
+        char *excl = json_obj_string_or_array(&req, "excludedKeys");
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
         char *join = json_obj_strdup_raw(&req, "join");
@@ -1048,7 +1047,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "fetch") == 0) {
         char *off_s = json_obj_strdup(&req, "offset");
         char *lim_s = json_obj_strdup(&req, "limit");
-        char *fields = json_get_string_or_array(json, "fields");
+        char *fields = json_obj_string_or_array(&req, "fields");
         char *cur = json_obj_strdup(&req, "cursor");
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
@@ -1379,7 +1378,9 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        Writes must complete before the server exits; reads are safe to drop. */
     char *mode_for_write = NULL;
     if (is_json) {
-        mode_for_write = json_get_raw(trimmed, "mode");
+        JsonObj tmp;
+        json_parse_object(trimmed, strlen(trimmed), &tmp);
+        mode_for_write = json_obj_strdup(&tmp, "mode");
     } else {
         /* legacy: first field is the command */
         const char *p = trimmed;
@@ -1542,9 +1543,11 @@ timing:
         if (dt > (uint64_t)g_slow_query_ms) {
             char *mode = NULL, *dir_s = NULL, *obj_s = NULL;
             if (is_json) {
-                mode  = json_get_raw(trimmed, "mode");
-                dir_s = json_get_raw(trimmed, "dir");
-                obj_s = json_get_raw(trimmed, "object");
+                JsonObj tmp;
+                json_parse_object(trimmed, strlen(trimmed), &tmp);
+                mode  = json_obj_strdup(&tmp, "mode");
+                dir_s = json_obj_strdup(&tmp, "dir");
+                obj_s = json_obj_strdup(&tmp, "object");
             }
             log_slow_query(mode ? mode : (is_json ? "" : "legacy"),
                            dir_s ? dir_s : "",
@@ -2087,15 +2090,17 @@ int cmd_get_file_tcp(int port, const char *dir, const char *object,
     resp_z[resp_len] = '\0';
     free(resp);
 
-    /* Extract "data" — large field, base64 payload. */
-    char *data = json_get_raw(resp_z, "data");
+    /* Extract "data" (base64 payload) + "status" from the server response. */
+    JsonObj resp_obj;
+    json_parse_object(resp_z, resp_len, &resp_obj);
+    char *data = json_obj_strdup(&resp_obj, "data");
     if (!data) {
         /* Server returned error or unexpected shape — surface it verbatim. */
         fprintf(stderr, "%s\n", resp_z);
         free(resp_z);
         return 1;
     }
-    char *status = json_get_raw(resp_z, "status");
+    char *status = json_obj_strdup(&resp_obj, "status");
 
     size_t b64_len = strlen(data);
     size_t cap = b64_decoded_maxsize(b64_len);

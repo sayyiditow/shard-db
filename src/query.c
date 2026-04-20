@@ -659,7 +659,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
                 obj_heap = 1;
             }
 
-            id = json_get_string(obj_str, "id");
+            {
+                JsonObj rec;
+                json_parse_object(obj_str, obj_len, &rec);
+                id = json_obj_strdup(&rec, "id");
+            }
             char *dp = strstr(obj_str, "\"data\"");
             if (dp) {
                 dp += 6;
@@ -4523,8 +4527,7 @@ enum SearchOp parse_op(const char *s) {
 /* Parse a single criterion object {"field":"x","op":"eq","value":"y"} into *c.
    Helper for parse_criteria_json. Called in a loop over every element of
    the criteria array; parsing the sub-object once and indexing into the
-   JsonObj saves 5 JSON walks per criterion over the legacy json_get_raw
-   pattern. */
+   JsonObj saves 5 walks per criterion over the previous per-field parse. */
 static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     memset(c, 0, sizeof(*c));
 

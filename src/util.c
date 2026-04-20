@@ -72,104 +72,6 @@ const char *json_skip_value(const char *p) {
     return p;
 }
 
-/* Single-pass JSON field extraction.
-   Parses the top-level object once, returns value for the requested key.
-   Much faster than strstr per field — O(n) single scan vs O(n*k) for k fields. */
-char *json_get_field(const char *json, const char *key, int strip_quotes) {
-    const char *p = json_skip(json);
-    if (*p != '{') return NULL;
-    p++;
-    size_t keylen = strlen(key);
-
-    while (*p) {
-        p = json_skip(p);
-        if (*p == '}') return NULL;
-        if (*p == ',') { p++; continue; }
-
-        /* Parse field name */
-        if (*p != '"') return NULL;
-        p++;
-        const char *fname = p;
-        while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
-        size_t flen = p - fname;
-        if (*p == '"') p++;
-
-        p = json_skip(p);
-        if (*p != ':') return NULL;
-        p = json_skip(p + 1);
-
-        /* Check if this is our key */
-        if (flen == keylen && memcmp(fname, key, keylen) == 0) {
-            const char *vstart = p;
-            const char *vend = json_skip_value(p);
-            size_t vlen = vend - vstart;
-            char *out = malloc(vlen + 1);
-            memcpy(out, vstart, vlen);
-            out[vlen] = '\0';
-            if (strip_quotes && out[0] == '"' && vlen > 1 && out[vlen-1] == '"') {
-                memmove(out, out + 1, vlen - 2);
-                out[vlen - 2] = '\0';
-            }
-            return out;
-        }
-
-        /* Skip this value */
-        p = json_skip_value(p);
-    }
-    return NULL;
-}
-
-char *json_get_string(const char *json, const char *key) {
-    return json_get_field(json, key, 1);
-}
-
-char *json_get_raw(const char *json, const char *key) {
-    return json_get_field(json, key, 1);
-}
-
-/* Parse a JSON field that can be a string or array. Returns comma-separated string.
-   Input: "name,city" or ["name","city"] → returns "name,city" (malloc'd) */
-char *json_get_string_or_array(const char *json, const char *key) {
-    char *raw = json_get_field(json, key, 0);
-    if (!raw) return NULL;
-    if (raw[0] != '[') {
-        /* Already a plain string — strip quotes if present */
-        if (raw[0] == '"') {
-            size_t len = strlen(raw);
-            if (len > 1 && raw[len-1] == '"') {
-                memmove(raw, raw + 1, len - 2);
-                raw[len - 2] = '\0';
-            }
-        }
-        return raw;
-    }
-    /* Parse JSON array → comma-separated */
-    char result[MAX_LINE];
-    int pos = 0;
-    const char *p = raw + 1; /* skip [ */
-    int first = 1;
-    while (*p) {
-        while (*p == ' ' || *p == ',') p++;
-        if (*p == ']') break;
-        if (*p == '"') {
-            p++;
-            const char *start = p;
-            while (*p && *p != '"') p++;
-            size_t len = p - start;
-            if (!first && pos < MAX_LINE - 1) result[pos++] = ',';
-            if (pos + (int)len < MAX_LINE - 1) {
-                memcpy(result + pos, start, len);
-                pos += len;
-            }
-            first = 0;
-            if (*p == '"') p++;
-        } else p++;
-    }
-    result[pos] = '\0';
-    free(raw);
-    return strdup(result);
-}
-
 /* Extract multiple fields in a single pass. keys[i] -> out_values[i] (caller frees).
    Returns number of fields found. */
 int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values) {
@@ -436,4 +338,53 @@ char *json_obj_strdup_raw(const JsonObj *o, const char *key) {
     if (!s) return NULL;
     memcpy(s, v, vl); s[vl] = '\0';
     return s;
+}
+
+/* Flatten a string-or-array field into a malloc'd comma-separated string.
+   Matches json_get_string_or_array's legacy semantics but operates on the
+   pre-parsed span, avoiding the full json_get_field walk. */
+char *json_obj_string_or_array(const JsonObj *o, const char *key) {
+    const char *v; size_t vl;
+    if (!json_obj_get(o, key, &v, &vl) || vl == 0) return NULL;
+
+    /* Plain string: strip surrounding quotes if present. */
+    if (vl >= 2 && v[0] == '"' && v[vl - 1] == '"') {
+        char *out = malloc(vl - 1);
+        if (!out) return NULL;
+        memcpy(out, v + 1, vl - 2);
+        out[vl - 2] = '\0';
+        return out;
+    }
+    if (v[0] != '[') {
+        char *out = malloc(vl + 1);
+        if (!out) return NULL;
+        memcpy(out, v, vl); out[vl] = '\0';
+        return out;
+    }
+
+    /* JSON array of strings → comma-separated. */
+    char buf[MAX_LINE];
+    int pos = 0;
+    const char *p = v + 1;                    /* skip [ */
+    const char *end = v + vl;
+    int first = 1;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == ',')) p++;
+        if (p >= end || *p == ']') break;
+        if (*p == '"') {
+            p++;
+            const char *start = p;
+            while (p < end && *p != '"') p++;
+            size_t len = p - start;
+            if (!first && pos < MAX_LINE - 1) buf[pos++] = ',';
+            if (pos + (int)len < MAX_LINE - 1) {
+                memcpy(buf + pos, start, len);
+                pos += len;
+            }
+            first = 0;
+            if (p < end && *p == '"') p++;
+        } else p++;
+    }
+    buf[pos] = '\0';
+    return strdup(buf);
 }
