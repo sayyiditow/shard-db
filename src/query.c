@@ -1,5 +1,4 @@
 #include "types.h"
-#include "yyjson.h"
 
 /* ========== Probing helpers ========== */
 
@@ -820,92 +819,124 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         }
     }
 
-    /* ===== Phase 1: parse with yyjson (SIMD, ~10-15x faster than the
-       hand-rolled walker on invoice-shaped JSON). One doc for the whole
-       file; per-record work is tree traversal via yyjson_arr_iter /
-       yyjson_obj_iter. Supported inputs:
-         - Array:  [{"id":"k1","data":{...}}, ...]
-         - Object: {"k1":{...},"k2":{...}}  (key = id, value = data) */
-    yyjson_doc *doc = yyjson_read(json, len, 0);
-    if (!doc) {
-        fprintf(stderr, "Error: malformed JSON (yyjson parse failed)\n");
-        if (json_mmaped) munmap(json, len + 1); else free(json);
-        free(typed_tmp);
-        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
-        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        return 1;
-    }
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    int is_array_format = yyjson_is_arr(root);
-    int is_object_format = yyjson_is_obj(root);
-    if (!is_array_format && !is_object_format) {
+    const char *p = json_skip(json);
+    int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}} */
+    int is_array_format = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
+
+    if (!is_object_format && !is_array_format) {
         fprintf(stderr, "Error: Expected JSON object or array\n");
-        yyjson_doc_free(doc);
         if (json_mmaped) munmap(json, len + 1); else free(json);
         free(typed_tmp);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
         return 1;
     }
+    p++;
 
     int count = 0, errors = 0;
 
-    /* Per-record `id` + `payload` bump-allocated from one arena. */
+    /* ===== Phase 1: parse every record into a buffered records[] array. Per-record
+       `id` + `payload` (ts->total_size bytes) are bump-allocated from a single
+       BulkArena so the 2-mallocs-per-record cost is replaced by O(1) pointer
+       advance. Arena freed after Phase-2 workers join — ordering holds because
+       the post-phase merge loop reads records[i].id/.payload BEFORE arena_free. */
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
     BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
-    /* Shared lambda: consume one (id_val, data_val) pair into records[]. */
-    #define EMIT_RECORD(id_str, id_len, data_val) do {                       \
-        if ((id_str) && (data_val)) {                                        \
-            typed_encode_defaults_yy(ts, (data_val), typed_tmp,              \
-                                     ts->total_size, db_root, object);       \
-            if ((int)(id_len) > sc.max_key ||                                \
-                (int)ts->total_size > sc.max_value) {                        \
-                errors++;                                                    \
-            } else {                                                         \
-                char *id_copy = arena_strndup(&arena, (id_str), (id_len));   \
-                uint8_t *payload = arena_alloc(&arena, ts->total_size);      \
-                memcpy(payload, typed_tmp, ts->total_size);                  \
-                if (rec_count >= rec_cap) {                                  \
-                    rec_cap *= 2;                                            \
-                    records = realloc(records,                               \
-                                      rec_cap * sizeof(BulkInsRecord));      \
-                }                                                            \
-                BulkInsRecord *r = &records[rec_count++];                    \
-                r->id = id_copy;                                             \
-                r->payload = payload;                                        \
-                r->klen = (id_len);                                          \
-                compute_addr(id_copy, (id_len), sc.splits,                   \
-                             r->hash, &r->shard_id, &r->start_slot);         \
-            }                                                                \
-        }                                                                    \
-    } while (0)
+    while (*p) {
+        p = json_skip(p);
+        if (*p == ']' || *p == '}') break;
+        if (*p == ',') { p++; continue; }
 
-    if (is_array_format) {
-        yyjson_arr_iter arr_it = yyjson_arr_iter_with(root);
-        yyjson_val *rec;
-        while ((rec = yyjson_arr_iter_next(&arr_it))) {
-            if (!yyjson_is_obj(rec)) continue;
-            yyjson_val *idv = yyjson_obj_get(rec, "id");
-            yyjson_val *datav = yyjson_obj_get(rec, "data");
-            const char *id_str = idv ? yyjson_get_str(idv) : NULL;
-            size_t id_len = idv ? yyjson_get_len(idv) : 0;
-            EMIT_RECORD(id_str, id_len, datav);
+        char *id = NULL;
+        char *data = NULL;
+
+        if (is_object_format) {
+            /* Object format: "key": {...} */
+            if (*p != '"') { p++; continue; }
+            p++;
+            const char *key_start = p;
+            while (*p && *p != '"') p++;
+            size_t klen = p - key_start;
+            id = arena_strndup(&arena, key_start, klen);
+            if (*p == '"') p++;
+            p = json_skip(p);
+            if (*p == ':') p = json_skip(p + 1);
+
+            const char *vstart = p;
+            const char *vend = json_skip_value(p);
+            size_t vlen = vend - vstart;
+            data = malloc(vlen + 1);
+            memcpy(data, vstart, vlen); data[vlen] = '\0';
+            p = vend;
+        } else {
+            /* Array format: {"id":"k1","data":{...}} */
+            if (*p != '{') { p++; continue; }
+            const char *obj_start = p;
+            const char *obj_end = json_skip_value(p);
+            size_t obj_len = obj_end - obj_start;
+
+            char obj_buf[8192];
+            char *obj_str;
+            int obj_heap = 0;
+            if (obj_len < sizeof(obj_buf)) {
+                memcpy(obj_buf, obj_start, obj_len);
+                obj_buf[obj_len] = '\0';
+                obj_str = obj_buf;
+            } else {
+                obj_str = malloc(obj_len + 1);
+                memcpy(obj_str, obj_start, obj_len);
+                obj_str[obj_len] = '\0';
+                obj_heap = 1;
+            }
+
+            {
+                JsonObj rec;
+                json_parse_object(obj_str, obj_len, &rec);
+                const char *iv; size_t ivl;
+                if (json_obj_unquoted(&rec, "id", &iv, &ivl))
+                    id = arena_strndup(&arena, iv, ivl);
+            }
+            char *dp = strstr(obj_str, "\"data\"");
+            if (dp) {
+                dp += 6;
+                while (*dp == ' ' || *dp == ':') dp++;
+                const char *dstart = dp;
+                const char *dend = json_skip_value(dp);
+                size_t dlen = dend - dstart;
+                data = malloc(dlen + 1);
+                memcpy(data, dstart, dlen); data[dlen] = '\0';
+            }
+            if (obj_heap) free(obj_str);
+            p = obj_end;
         }
-    } else {
-        /* Object format: outer keys are ids, values are data objects. */
-        yyjson_obj_iter obj_it = yyjson_obj_iter_with(root);
-        yyjson_val *key;
-        while ((key = yyjson_obj_iter_next(&obj_it))) {
-            yyjson_val *datav = yyjson_obj_iter_get_val(key);
-            const char *id_str = yyjson_get_str(key);
-            size_t id_len = yyjson_get_len(key);
-            EMIT_RECORD(id_str, id_len, datav);
+
+        if (id && data) {
+            typed_encode_defaults(ts, data, typed_tmp, ts->total_size, db_root, object);
+            size_t klen = strlen(id);
+
+            if ((int)klen > sc.max_key || (int)ts->total_size > sc.max_value) {
+                errors++;
+                /* id lives in arena — dropped bytes are trivial, no free here */
+            } else {
+                /* Arena-allocated payload: survives until arena_free() post-Phase-2. */
+                uint8_t *payload = arena_alloc(&arena, ts->total_size);
+                memcpy(payload, typed_tmp, ts->total_size);
+
+                if (rec_count >= rec_cap) {
+                    rec_cap *= 2;
+                    records = realloc(records, rec_cap * sizeof(BulkInsRecord));
+                }
+                BulkInsRecord *r = &records[rec_count++];
+                r->id = id;
+                r->payload = payload;
+                r->klen = klen;
+                compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+            }
         }
+        if (data) free(data);
     }
-    #undef EMIT_RECORD
-    yyjson_doc_free(doc);
 
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
        writes and can hold the ucache wrlock once for the entire bucket. */

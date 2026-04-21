@@ -1,5 +1,4 @@
 #include "types.h"
-#include "yyjson.h"
 
 /* ========== Config ========== */
 
@@ -1140,80 +1139,6 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
     }
 
     /* Fields the client didn't provide → apply configured default if any. */
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed || seen[i]) continue;
-        if (ts->fields[i].default_kind == DK_NONE) continue;
-        char gen_buf[256];
-        const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
-                                          db_root, object);
-        if (dv) encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
-    }
-    return ts->total_size;
-}
-
-/* Same as typed_encode_defaults but takes a pre-parsed yyjson object instead
-   of a raw JSON string. Bulk-insert reuses a single yyjson_doc across the
-   whole file, so the per-record parse cost collapses from ~10 µs (custom
-   walker) to ~1 µs (already-parsed yyjson tree). */
-int typed_encode_defaults_yy(const TypedSchema *ts, void *data_obj_v,
-                             uint8_t *out, int out_size,
-                             const char *db_root, const char *object) {
-    yyjson_val *data_obj = (yyjson_val *)data_obj_v;
-    if (!ts || !ts->typed || out_size < ts->total_size) return -1;
-    memset(out, 0, ts->total_size);
-
-    char seen[MAX_FIELDS] = {0};
-
-    if (data_obj && yyjson_is_obj(data_obj)) {
-        yyjson_obj_iter it = yyjson_obj_iter_with(data_obj);
-        yyjson_val *key;
-        while ((key = yyjson_obj_iter_next(&it))) {
-            yyjson_val *val = yyjson_obj_iter_get_val(key);
-            const char *fname = yyjson_get_str(key);
-            size_t flen = yyjson_get_len(key);
-            if (!fname) continue;
-
-            for (int i = 0; i < ts->nfields; i++) {
-                if (ts->fields[i].removed) continue;
-                size_t klen = strlen(ts->fields[i].name);
-                if (flen != klen) continue;
-                if (memcmp(fname, ts->fields[i].name, klen) != 0) continue;
-
-                const char *ev = NULL;
-                size_t el = 0;
-                char numbuf[64];
-                if (yyjson_is_str(val)) {
-                    ev = yyjson_get_str(val);
-                    el = yyjson_get_len(val);
-                } else if (yyjson_is_int(val)) {
-                    el = (size_t)snprintf(numbuf, sizeof(numbuf), "%lld",
-                                          (long long)yyjson_get_sint(val));
-                    ev = numbuf;
-                } else if (yyjson_is_uint(val)) {
-                    el = (size_t)snprintf(numbuf, sizeof(numbuf), "%llu",
-                                          (unsigned long long)yyjson_get_uint(val));
-                    ev = numbuf;
-                } else if (yyjson_is_real(val)) {
-                    el = (size_t)snprintf(numbuf, sizeof(numbuf), "%.17g",
-                                          yyjson_get_real(val));
-                    ev = numbuf;
-                } else if (yyjson_is_bool(val)) {
-                    ev = yyjson_get_bool(val) ? "true" : "false";
-                    el = yyjson_get_bool(val) ? 4 : 5;
-                } else {
-                    /* null / array / nested object → skip (unsupported in
-                       typed storage; caller may treat as missing). */
-                    break;
-                }
-                if (el > 0 && ev) {
-                    encode_field_len(&ts->fields[i], ev, el, out + ts->fields[i].offset);
-                    seen[i] = 1;
-                }
-                break;
-            }
-        }
-    }
-
     for (int i = 0; i < ts->nfields; i++) {
         if (ts->fields[i].removed || seen[i]) continue;
         if (ts->fields[i].default_kind == DK_NONE) continue;

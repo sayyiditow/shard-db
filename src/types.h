@@ -415,9 +415,6 @@ void build_effective_root(char *out, size_t outlen, const char *dir);
 /* Typed field system */
 TypedSchema *load_typed_schema(const char *db_root, const char *object);
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size);
-int typed_encode_defaults_yy(const TypedSchema *ts, void *data_obj,
-                              uint8_t *out, int out_size,
-                              const char *db_root, const char *object);
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                           int out_size, const char *db_root, const char *object);
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
