@@ -214,6 +214,7 @@ extern uint32_t g_timeout;
 extern int g_port;
 extern int g_max_threads;
 extern int g_workers;
+extern int g_pool_chunk;
 extern int g_index_page_size;
 extern int g_global_limit;
 extern size_t g_query_buffer_max_bytes;
@@ -303,6 +304,10 @@ static inline int query_deadline_tick(QueryDeadline *d, int *counter) {
     return 0;
 }
 int parallel_threads(void);
+void parallel_pool_init(int nthreads);
+void parallel_pool_shutdown(void);
+int  parallel_pool_size(void);
+void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms);
 int ucache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);

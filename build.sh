@@ -1,5 +1,5 @@
 #!/bin/bash
-gcc -O2 -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c -Isrc -lpthread
+gcc -O2 -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c src/parallel.c -Isrc -lpthread
 mkdir -p build/bin build/db
 
 cp shard-db build/bin/
@@ -14,6 +14,7 @@ export LOG_LEVEL=3
 export LOG_RETAIN_DAYS=7
 export INDEX_PAGE_SIZE=4096
 export THREADS=0
+export POOL_CHUNK=0
 export WORKERS=0
 export GLOBAL_LIMIT=100000
 export MAX_REQUEST_SIZE=33554432

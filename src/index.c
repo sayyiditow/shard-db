@@ -169,7 +169,6 @@ void index_parallel(const char *db_root, const char *object,
     json_get_fields(value, unique_keys, unique_count, extracted);
 
     /* Now build index values and insert */
-    pthread_t threads[MAX_FIELDS];
     IndexThreadArg args[MAX_FIELDS];
     int tcount = 0;
 
@@ -227,12 +226,10 @@ void index_parallel(const char *db_root, const char *object,
         args[tcount].attr_val = idx_val;
         args[tcount].hash16 = hash16;
 
-        pthread_create(&threads[tcount], NULL, index_thread_fn, &args[tcount]);
         tcount++;
     }
 
-    for (int i = 0; i < tcount; i++)
-        pthread_join(threads[i], NULL);
+    parallel_for(index_thread_fn, args, tcount, sizeof(IndexThreadArg));
 
     /* Free extracted values and composite values */
     for (int i = 0; i < unique_count; i++) free(extracted[i]);
@@ -596,19 +593,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
         ib_count++;
     }
 
-    int nt = parallel_threads();
-    if (nt > ib_count) nt = ib_count;
-    if (nt <= 1) {
-        for (int i = 0; i < ib_count; i++) idx_build_worker_idx(&ib_args[i]);
-    } else {
-        pthread_t *it = malloc(nt * sizeof(pthread_t));
-        for (int b = 0; b < ib_count; b += nt) {
-            int n = ib_count - b; if (n > nt) n = nt;
-            for (int t = 0; t < n; t++) pthread_create(&it[t], NULL, idx_build_worker_idx, &ib_args[b + t]);
-            for (int t = 0; t < n; t++) pthread_join(it[t], NULL);
-        }
-        free(it);
-    }
+    parallel_for(idx_build_worker_idx, ib_args, ib_count, sizeof(IdxBuildArgIdx));
 
     for (int i = 0; i < ib_count; i++) {
         for (size_t ei = 0; ei < ib_args[i].pair_count; ei++) free((char *)ib_args[i].pairs[ei].value);

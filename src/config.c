@@ -4,8 +4,9 @@
 
 uint32_t g_timeout = 30;
 int g_port = 9199;
-int g_max_threads = 0;  /* 0 = auto (nproc) — for scan_shards */
+int g_max_threads = 0;  /* 0 = auto (4× cores) — compute thread pool size */
 int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
+int g_pool_chunk = 0;   /* 0 = auto (cores) — parallel_for() submit batch */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
@@ -240,6 +241,8 @@ int load_db_root(char *out, size_t outlen) {
             if (ps >= 1024 && ps <= 65536) g_index_page_size = ps;
         } else if (strncmp(p, "THREADS=", 8) == 0) {
             g_max_threads = atoi(p + 8);
+        } else if (strncmp(p, "POOL_CHUNK=", 11) == 0) {
+            g_pool_chunk = atoi(p + 11);
         } else if (strncmp(p, "WORKERS=", 8) == 0) {
             g_workers = atoi(p + 8);
         } else if (strncmp(p, "GLOBAL_LIMIT=", 13) == 0) {

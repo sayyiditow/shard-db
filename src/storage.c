@@ -76,7 +76,13 @@ static volatile uint64_t g_ucache_clock = 0;  /* monotonic counter for LRU */
 
 uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     uint8_t *p = mmap(addr, len, prot, flags, fd, off);
-    if (p != MAP_FAILED && len > 0) madvise(p, len, MADV_RANDOM);
+    if (p != MAP_FAILED && len > 0) {
+        madvise(p, len, MADV_RANDOM);
+        /* Hint kernel to back with 2MB huge pages — 512× fewer page table
+           entries and first-touch faults for a given data region. Harmless
+           if the kernel can't satisfy the hint. */
+        madvise(p, len, MADV_HUGEPAGE);
+    }
     return p;
 }
 
@@ -162,11 +168,17 @@ static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create, int 
         hdr.slots_per_shard = INITIAL_SLOTS;
         hdr.record_count = 0;
         size_t need = shard_file_size(INITIAL_SLOTS, slot_size_for_create);
+        int use_prealloc = 0;
         if (prealloc_mb > 0) {
             size_t chunk = (size_t)prealloc_mb * 1024 * 1024;
             if (chunk > need) need = chunk;
+            use_prealloc = 1;
         }
-        if (ftruncate(fd, need) < 0) return 0;
+        if (use_prealloc) {
+            if (posix_fallocate(fd, 0, need) != 0) return 0;
+        } else {
+            if (ftruncate(fd, need) < 0) return 0;
+        }
         if (pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return 0;
         return INITIAL_SLOTS;
     }
@@ -364,14 +376,21 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
     if (nfd < 0) { pthread_rwlock_unlock(&e->rwlock); return -1; }
 
     size_t new_size = shard_file_size(new_slots, slot_size);
+    int use_prealloc = 0;
     if (prealloc_mb > 0) {
         size_t chunk = (size_t)prealloc_mb * 1024 * 1024;
         if (chunk > new_size) new_size = chunk;
+        use_prealloc = 1;
     }
-    if (ftruncate(nfd, new_size) < 0) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    if (use_prealloc) {
+        if (posix_fallocate(nfd, 0, new_size) != 0) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    } else {
+        if (ftruncate(nfd, new_size) < 0) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    }
 
     uint8_t *nmap = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
     if (nmap == MAP_FAILED) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    madvise(nmap, new_size, MADV_HUGEPAGE);
 
     ShardHeader *nhdr = (ShardHeader *)nmap;
     nhdr->magic = SHARD_MAGIC;
@@ -1168,24 +1187,16 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
 
         ucache_write_release(wh);
 
-        /* Clean up index entries — parallel across indexes */
-        if (nidx > 1) {
+        /* Clean up index entries — parallel across indexes via shared pool */
+        if (nidx > 0) {
             DelIdxArg dia[MAX_FIELDS];
-            pthread_t dit[MAX_FIELDS];
             int dic = 0;
             for (int i = 0; i < nidx; i++) {
                 if (idx_vals[i] && idx_vals[i][0]) {
-                    dia[dic] = (DelIdxArg){ db_root, object, idx_fields[i], idx_vals[i], hash };
-                    pthread_create(&dit[dic], NULL, del_idx_fn, &dia[dic]);
-                    dic++;
+                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i], idx_vals[i], hash };
                 }
             }
-            for (int i = 0; i < dic; i++) pthread_join(dit[i], NULL);
-        } else {
-            for (int i = 0; i < nidx; i++) {
-                if (idx_vals[i] && idx_vals[i][0])
-                    delete_index_entry(db_root, object, idx_fields[i], idx_vals[i], hash);
-            }
+            parallel_for(del_idx_fn, dia, dic, sizeof(DelIdxArg));
         }
         for (int i = 0; i < nidx; i++) free(idx_vals[i]);
 
@@ -1312,19 +1323,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             workers[g].entries[i] = entries[sorted[gstarts[g] + i]];
     }
 
-    int nthreads = parallel_threads();
-    if (nthreads > nshard) nthreads = nshard;
-    if (nthreads <= 1 || nshard <= 2) {
-        for (int g = 0; g < nshard; g++) multi_exists_shard_worker(&workers[g]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard; b += nthreads) {
-            int n = nshard - b; if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++) pthread_create(&threads[t], NULL, multi_exists_shard_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++) pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
 
     /* Copy results back */
     for (int g = 0; g < nshard; g++)
@@ -1414,19 +1413,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             workers[g].entries[i] = entries[sorted[gstarts[g] + i]];
     }
 
-    int nthreads = parallel_threads();
-    if (nthreads > nshard) nthreads = nshard;
-    if (nthreads <= 1 || nshard <= 2) {
-        for (int g = 0; g < nshard; g++) multi_exists_shard_worker(&workers[g]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard; b += nthreads) {
-            int n = nshard - b; if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++) pthread_create(&threads[t], NULL, multi_exists_shard_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++) pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
 
     for (int g = 0; g < nshard; g++)
         for (int i = 0; i < workers[g].count; i++)
@@ -1576,19 +1563,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
     }
 
     /* Parallel fetch */
-    int nthreads = parallel_threads();
-    if (nthreads > nshard) nthreads = nshard;
-    if (nthreads <= 1 || nshard <= 2) {
-        for (int g = 0; g < nshard; g++) multi_get_shard_worker(&workers[g]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard; b += nthreads) {
-            int n = nshard - b; if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++) pthread_create(&threads[t], NULL, multi_get_shard_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++) pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(multi_get_shard_worker, workers, nshard, sizeof(MultiGetShardWork));
 
     /* Copy results back to entries array (workers have copies) */
     for (int g = 0; g < nshard; g++)

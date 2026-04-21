@@ -58,9 +58,7 @@ void scan_one_shard(const char *binpath, int slot_size,
 }
 
 typedef struct {
-    char **paths;
-    int start;
-    int end;
+    const char *path;
     int slot_size;
     scan_callback cb;
     void *ctx;
@@ -70,9 +68,9 @@ typedef struct {
 
 void *scan_worker(void *arg) {
     ScanWorkerArg *w = (ScanWorkerArg *)arg;
+    if (g_scan_stop) return NULL;
     g_out = w->parent_out ? w->parent_out : stdout;
-    for (int i = w->start; i < w->end && !g_scan_stop; i++)
-        scan_one_shard(w->paths[i], w->slot_size, w->cb, w->ctx, w->out_lock);
+    scan_one_shard(w->path, w->slot_size, w->cb, w->ctx, w->out_lock);
     return NULL;
 }
 
@@ -102,39 +100,14 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
 
     if (path_count == 0) { free(paths); return; }
 
-    /* Determine thread count */
-    int nthreads = parallel_threads();
-    if (nthreads > path_count) nthreads = path_count;
-    if (nthreads < 1) nthreads = 1;
-
-    /* Single thread for small datasets — no overhead */
-    if (nthreads == 1 || path_count <= 4) {
-        for (int i = 0; i < path_count; i++)
-            scan_one_shard(paths[i], slot_size, cb, ctx, NULL);
-    } else {
-        pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        ScanWorkerArg *args = malloc(nthreads * sizeof(ScanWorkerArg));
-
-        int per_thread = path_count / nthreads;
-        int remainder = path_count % nthreads;
-        int pos = 0;
-
-        for (int t = 0; t < nthreads; t++) {
-            int count = per_thread + (t < remainder ? 1 : 0);
-            args[t] = (ScanWorkerArg){ paths, pos, pos + count, slot_size,
-                                        cb, ctx, &out_lock, g_out };
-            pthread_create(&threads[t], NULL, scan_worker, &args[t]);
-            pos += count;
-        }
-
-        for (int t = 0; t < nthreads; t++)
-            pthread_join(threads[t], NULL);
-
-        free(threads);
-        free(args);
-        pthread_mutex_destroy(&out_lock);
+    pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
+    ScanWorkerArg *args = malloc(path_count * sizeof(ScanWorkerArg));
+    for (int i = 0; i < path_count; i++) {
+        args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, &out_lock, g_out };
     }
+    parallel_for(scan_worker, args, path_count, sizeof(ScanWorkerArg));
+    free(args);
+    pthread_mutex_destroy(&out_lock);
 
     for (int i = 0; i < path_count; i++) free(paths[i]);
     free(paths);
@@ -431,26 +404,7 @@ static int parallel_fetch_and_print(const char *db_root, const char *object,
         workers[g].result_count = 0;
     }
 
-    /* Parallel shard processing */
-    int nthreads = parallel_threads();
-    if (nthreads > nshard_groups) nthreads = nshard_groups;
-    if (nthreads < 1) nthreads = 1;
-
-    if (nthreads <= 1 || nshard_groups <= 2) {
-        for (int g = 0; g < nshard_groups; g++)
-            search_shard_worker(&workers[g]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int batch = 0; batch < nshard_groups; batch += nthreads) {
-            int this_batch = nshard_groups - batch;
-            if (this_batch > nthreads) this_batch = nthreads;
-            for (int t = 0; t < this_batch; t++)
-                pthread_create(&threads[t], NULL, search_shard_worker, &workers[batch + t]);
-            for (int t = 0; t < this_batch; t++)
-                pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(search_shard_worker, workers, nshard_groups, sizeof(SearchShardWork));
 
     /* Output results */
     int printed = 0;
@@ -532,12 +486,71 @@ static void *idx_build_worker(void *arg) {
 
 /* ---- Fast bulk insert using mmap ---- */
 
+/* Bump/arena allocator for phase-1 record buffers. Replaces 2 mallocs per
+   record (id + typed payload) with O(1) pointer-advance into pre-allocated
+   slabs. Freed as a whole after phase-2 workers join — arena pointers must
+   not outlive arena_free(). Chain grows by doubling when the current slab
+   fills; initial slab is 256 KB so tiny inputs don't over-reserve and big
+   inputs reach ~1 GB in ~12 doublings (≪ the malloc count avoided). */
+typedef struct BulkArena {
+    struct BulkArena *next;
+    uint8_t *base;
+    size_t used;
+    size_t cap;
+} BulkArena;
+
+static BulkArena *arena_new(size_t cap) {
+    BulkArena *a = malloc(sizeof(BulkArena));
+    if (!a) return NULL;
+    a->base = malloc(cap);
+    if (!a->base) { free(a); return NULL; }
+    a->next = NULL;
+    a->used = 0;
+    a->cap = cap;
+    return a;
+}
+
+static void *arena_alloc(BulkArena **head, size_t n) {
+    n = (n + 7) & ~(size_t)7;  /* 8-byte align */
+    BulkArena *a = *head;
+    if (a->used + n > a->cap) {
+        size_t new_cap = a->cap * 2;
+        if (n > new_cap) new_cap = n;
+        BulkArena *na = arena_new(new_cap);
+        if (!na) return NULL;
+        na->next = a;
+        *head = na;
+        a = na;
+    }
+    void *p = a->base + a->used;
+    a->used += n;
+    return p;
+}
+
+static char *arena_strndup(BulkArena **head, const char *src, size_t n) {
+    char *p = arena_alloc(head, n + 1);
+    if (!p) return NULL;
+    memcpy(p, src, n);
+    p[n] = '\0';
+    return p;
+}
+
+static void arena_free(BulkArena *a) {
+    while (a) {
+        BulkArena *next = a->next;
+        free(a->base);
+        free(a);
+        a = next;
+    }
+}
+
 /* Per-record buffered state collected in phase 1 (parse) and consumed in
-   phase 2 (write). Each record's payload is a ts->total_size typed buffer
-   owned by the record — freed after phase-2 is complete. */
+   phase 2 (write). `id` and `payload` are pointers into a BulkArena owned
+   by the caller of phase-1; records stay valid until arena_free() runs,
+   which happens after all phase-2 workers have joined. */
 typedef struct {
-    char     *id;           /* owned null-terminated key */
-    uint8_t  *payload;      /* owned typed payload (ts->total_size bytes) */
+    char     *id;           /* arena-owned null-terminated key */
+    uint8_t  *payload;      /* arena-owned typed payload (ts->total_size bytes) */
     size_t    klen;
     uint8_t   hash[16];
     int       start_slot;
@@ -823,9 +836,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     int count = 0, errors = 0;
 
     /* ===== Phase 1: parse every record into a buffered records[] array. Per-record
-       owned `id` + `payload` (ts->total_size bytes) so Phase 2 workers can replay
-       the probe+write loop without re-parsing or re-encoding. Ownership is
-       transferred into per-shard buckets in Phase 1.5 and freed after Phase 2. */
+       `id` + `payload` (ts->total_size bytes) are bump-allocated from a single
+       BulkArena so the 2-mallocs-per-record cost is replaced by O(1) pointer
+       advance. Arena freed after Phase-2 workers join — ordering holds because
+       the post-phase merge loop reads records[i].id/.payload BEFORE arena_free. */
+    BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
     BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
@@ -844,8 +859,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             const char *key_start = p;
             while (*p && *p != '"') p++;
             size_t klen = p - key_start;
-            id = malloc(klen + 1);
-            memcpy(id, key_start, klen); id[klen] = '\0';
+            id = arena_strndup(&arena, key_start, klen);
             if (*p == '"') p++;
             p = json_skip(p);
             if (*p == ':') p = json_skip(p + 1);
@@ -880,7 +894,9 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             {
                 JsonObj rec;
                 json_parse_object(obj_str, obj_len, &rec);
-                id = json_obj_strdup(&rec, "id");
+                const char *iv; size_t ivl;
+                if (json_obj_unquoted(&rec, "id", &iv, &ivl))
+                    id = arena_strndup(&arena, iv, ivl);
             }
             char *dp = strstr(obj_str, "\"data\"");
             if (dp) {
@@ -902,10 +918,10 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
 
             if ((int)klen > sc.max_key || (int)ts->total_size > sc.max_value) {
                 errors++;
-                free(id);
+                /* id lives in arena — dropped bytes are trivial, no free here */
             } else {
-                /* Own the payload — freed after Phase 2 completes. */
-                uint8_t *payload = malloc(ts->total_size);
+                /* Arena-allocated payload: survives until arena_free() post-Phase-2. */
+                uint8_t *payload = arena_alloc(&arena, ts->total_size);
                 memcpy(payload, typed_tmp, ts->total_size);
 
                 if (rec_count >= rec_cap) {
@@ -918,8 +934,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
                 r->klen = klen;
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
             }
-        } else {
-            if (id) free(id);
         }
         if (data) free(data);
     }
@@ -981,25 +995,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
        coordination needed. Batched pthread_create/join pattern matches
        bulk_del_shard_worker. Serial fallback when thread count ≤ 1 or workload
        is small enough that spawn/join overhead would dominate. */
-    {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads <= 1 || nshard_groups <= 2) {
-            for (int wi = 0; wi < nshard_groups; wi++)
-                bulk_insert_shard_worker(&workers[wi]);
-        } else {
-            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-            for (int b = 0; b < nshard_groups; b += nthreads) {
-                int n = nshard_groups - b;
-                if (n > nthreads) n = nthreads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&threads[t], NULL, bulk_insert_shard_worker, &workers[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(threads[t], NULL);
-            }
-            free(threads);
-        }
-    }
+    parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
+                 sizeof(BulkInsShardWork));
 
     /* Merge per-worker results into the caller's global counters and index arrays,
        then release per-worker scratch. BtEntry.value ownership transfers into
@@ -1022,16 +1019,14 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             free(ws->idx_pairs[fi]);
         }
 
-        for (size_t ri = 0; ri < ws->count; ri++) {
-            free(ws->records[ri].id);
-            free(ws->records[ri].payload);
-        }
+        /* records[ri].id / .payload live in the arena — freed in bulk below */
         free(ws->records);
         free(ws->idx_pairs);
         free(ws->idx_pair_counts);
         free(ws->idx_pair_caps);
     }
     free(workers);
+    arena_free(arena);
 
     /* Activate all dirty shards for THIS object — filter by path prefix */
     {
@@ -1051,22 +1046,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             act_args[act_count].slot_size = sc.slot_size;
             act_count++;
         }
-        int act_threads = parallel_threads();
-        if (act_threads > act_count) act_threads = act_count;
-        if (act_threads <= 1 || act_count <= 4) {
-            for (int i = 0; i < act_count; i++) activate_worker(&act_args[i]);
-        } else {
-            pthread_t *at = malloc(act_threads * sizeof(pthread_t));
-            for (int b = 0; b < act_count; b += act_threads) {
-                int n = act_count - b;
-                if (n > act_threads) n = act_threads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&at[t], NULL, activate_worker, &act_args[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(at[t], NULL);
-            }
-            free(at);
-        }
+        parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
         free(act_args);
     }
 
@@ -1089,22 +1069,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             ib_count++;
         }
 
-        int ib_threads = parallel_threads();
-        if (ib_threads > ib_count) ib_threads = ib_count;
-        if (ib_threads <= 1 || ib_count <= 1) {
-            for (int i = 0; i < ib_count; i++) idx_build_worker(&ib_args[i]);
-        } else {
-            pthread_t *it = malloc(ib_threads * sizeof(pthread_t));
-            for (int b = 0; b < ib_count; b += ib_threads) {
-                int n = ib_count - b;
-                if (n > ib_threads) n = ib_threads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&it[t], NULL, idx_build_worker, &ib_args[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(it[t], NULL);
-            }
-            free(it);
-        }
+        parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
 
         for (int i = 0; i < ib_count; i++) {
             for (size_t ei = 0; ei < ib_args[i].pair_count; ei++)
@@ -1248,10 +1213,11 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
 
     /* ===== Phase 1: parse every CSV line into a buffered records[] array. The
-       (ptr, len) span path stays zero-copy for the CSV body; we only allocate
-       owned `id` + typed `payload` to survive past Phase 1 into Phase 2. Once
-       a record is in the buffer, `bulk_insert_shard_worker` handles probe +
-       write identically to the JSON path. */
+       (ptr, len) span path stays zero-copy for the CSV body; `id` + typed
+       `payload` come from a single BulkArena (bump alloc, 8-byte aligned) so
+       the 2-mallocs-per-record cost disappears. Arena freed after Phase-2
+       workers join. */
+    BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
     BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
@@ -1323,10 +1289,9 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             continue;
         }
 
-        /* Own the key and typed payload — survives into Phase 2. */
-        char *id = malloc(klen + 1);
-        memcpy(id, id_start, klen); id[klen] = '\0';
-        uint8_t *payload = malloc(ts->total_size);
+        /* Arena-allocated key + typed payload — survive until arena_free() post-Phase-2. */
+        char *id = arena_strndup(&arena, id_start, klen);
+        uint8_t *payload = arena_alloc(&arena, ts->total_size);
         memcpy(payload, typed_tmp, ts->total_size);
 
         if (rec_count >= rec_cap) {
@@ -1390,26 +1355,11 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         ws->idx_pair_caps = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
     }
 
-    /* ===== Phase 2: parallel shard workers (reuses bulk_insert_shard_worker). */
-    {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads <= 1 || nshard_groups <= 2) {
-            for (int wi = 0; wi < nshard_groups; wi++)
-                bulk_insert_shard_worker(&workers[wi]);
-        } else {
-            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-            for (int b = 0; b < nshard_groups; b += nthreads) {
-                int n = nshard_groups - b;
-                if (n > nthreads) n = nthreads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&threads[t], NULL, bulk_insert_shard_worker, &workers[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(threads[t], NULL);
-            }
-            free(threads);
-        }
-    }
+    /* ===== Phase 2: parallel shard workers via shared pool.
+       All concurrent callers share one pool sized to ~4× cores by default;
+       oversubscription hides shard-rwlock stalls. */
+    parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
+                 sizeof(BulkInsShardWork));
 
     /* Merge per-worker results into caller's counters + index arrays. */
     for (int wi = 0; wi < nshard_groups; wi++) {
@@ -1430,16 +1380,14 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             free(ws->idx_pairs[fi]);
         }
 
-        for (size_t ri = 0; ri < ws->count; ri++) {
-            free(ws->records[ri].id);
-            free(ws->records[ri].payload);
-        }
+        /* records[ri].id / .payload live in the arena — freed in bulk below */
         free(ws->records);
         free(ws->idx_pairs);
         free(ws->idx_pair_counts);
         free(ws->idx_pair_caps);
     }
     free(workers);
+    arena_free(arena);
 
     /* Activate — parallel across shards for THIS object */
     {
@@ -1458,19 +1406,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             act_args[act_count].slot_size = sc.slot_size;
             act_count++;
         }
-        int nt = parallel_threads();
-        if (nt > act_count) nt = act_count;
-        if (nt <= 1 || act_count <= 4) {
-            for (int i = 0; i < act_count; i++) activate_worker(&act_args[i]);
-        } else {
-            pthread_t *at = malloc(nt * sizeof(pthread_t));
-            for (int b = 0; b < act_count; b += nt) {
-                int n = act_count - b; if (n > nt) n = nt;
-                for (int t = 0; t < n; t++) pthread_create(&at[t], NULL, activate_worker, &act_args[b + t]);
-                for (int t = 0; t < n; t++) pthread_join(at[t], NULL);
-            }
-            free(at);
-        }
+        parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
         free(act_args);
     }
 
@@ -1490,19 +1426,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             ib_args[ib_count].pair_count = idx_pair_counts[fi];
             ib_count++;
         }
-        int nt = parallel_threads();
-        if (nt > ib_count) nt = ib_count;
-        if (nt <= 1) {
-            for (int i = 0; i < ib_count; i++) idx_build_worker(&ib_args[i]);
-        } else {
-            pthread_t *it = malloc(nt * sizeof(pthread_t));
-            for (int b = 0; b < ib_count; b += nt) {
-                int n = ib_count - b; if (n > nt) n = nt;
-                for (int t = 0; t < n; t++) pthread_create(&it[t], NULL, idx_build_worker, &ib_args[b + t]);
-                for (int t = 0; t < n; t++) pthread_join(it[t], NULL);
-            }
-            free(it);
-        }
+        parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
         for (int i = 0; i < ib_count; i++) {
             for (size_t ei = 0; ei < ib_args[i].pair_count; ei++) free((char *)ib_args[i].pairs[ei].value);
             free(ib_args[i].pairs);
@@ -1771,19 +1695,7 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
     }
 
     /* Phase 1: Parallel shard tombstoning */
-    int nthreads = parallel_threads();
-    if (nthreads > nshard_groups) nthreads = nshard_groups;
-    if (nthreads <= 1 || nshard_groups <= 2) {
-        for (int g = 0; g < nshard_groups; g++) bulk_del_shard_worker(&workers[g]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard_groups; b += nthreads) {
-            int n = nshard_groups - b; if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++) pthread_create(&threads[t], NULL, bulk_del_shard_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++) pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(bulk_del_shard_worker, workers, nshard_groups, sizeof(BulkDelShardWork));
 
     /* Phase 2: Parallel index cleanup — one thread per index */
     int total_deleted = 0;
@@ -1811,20 +1723,7 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
             }
         }
 
-        int idx_threads = nidx;
-        if (idx_threads <= 1) {
-            for (int fi = 0; fi < nidx; fi++) bulk_del_idx_worker(&idx_workers[fi]);
-        } else {
-            pthread_t *it = malloc(idx_threads * sizeof(pthread_t));
-            int nt = parallel_threads();
-            if (nt > idx_threads) nt = idx_threads;
-            for (int b = 0; b < idx_threads; b += nt) {
-                int n = idx_threads - b; if (n > nt) n = nt;
-                for (int t = 0; t < n; t++) pthread_create(&it[t], NULL, bulk_del_idx_worker, &idx_workers[b + t]);
-                for (int t = 0; t < n; t++) pthread_join(it[t], NULL);
-            }
-            free(it);
-        }
+        parallel_for(bulk_del_idx_worker, idx_workers, nidx, sizeof(BulkDelIdxWork));
 
         for (int fi = 0; fi < nidx; fi++) {
             for (int i = 0; i < idx_workers[fi].count; i++) free(idx_workers[fi].vals[i]);
@@ -2181,24 +2080,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].skipped = 0;
     }
 
-    {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads <= 1 || nshard_groups <= 2) {
-            for (int wi = 0; wi < nshard_groups; wi++) bulk_upd_shard_worker(&workers[wi]);
-        } else {
-            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-            for (int b = 0; b < nshard_groups; b += nthreads) {
-                int n = nshard_groups - b;
-                if (n > nthreads) n = nthreads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&threads[t], NULL, bulk_upd_shard_worker, &workers[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(threads[t], NULL);
-            }
-            free(threads);
-        }
-    }
+    parallel_for(bulk_upd_shard_worker, workers, nshard_groups, sizeof(BulkUpdShardWork));
 
     for (int wi = 0; wi < nshard_groups; wi++) {
         updated += workers[wi].updated;
@@ -2553,25 +2435,8 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
     }
 
     /* ===== Phase 2: parallel shard workers. */
-    {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads <= 1 || nshard_groups <= 2) {
-            for (int wi = 0; wi < nshard_groups; wi++)
-                bulk_upd_delim_shard_worker(&workers[wi]);
-        } else {
-            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-            for (int b = 0; b < nshard_groups; b += nthreads) {
-                int n = nshard_groups - b;
-                if (n > nthreads) n = nthreads;
-                for (int t = 0; t < n; t++)
-                    pthread_create(&threads[t], NULL, bulk_upd_delim_shard_worker, &workers[b + t]);
-                for (int t = 0; t < n; t++)
-                    pthread_join(threads[t], NULL);
-            }
-            free(threads);
-        }
-    }
+    parallel_for(bulk_upd_delim_shard_worker, workers, nshard_groups,
+                 sizeof(BulkUpdDelimShardWork));
 
     int updated = 0;
     for (int wi = 0; wi < nshard_groups; wi++) {
@@ -3140,25 +3005,7 @@ int cmd_vacuum(const char *db_root, const char *object,
     closedir(d1);
 
     /* Parallel vacuum across all shards */
-    int nthreads = parallel_threads();
-    if (nthreads > shard_count) nthreads = shard_count;
-    if (nthreads < 1) nthreads = 1;
-
-    if (nthreads <= 1 || shard_count <= 4) {
-        for (int i = 0; i < shard_count; i++)
-            vacuum_worker(&shards[i]);
-    } else {
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < shard_count; b += nthreads) {
-            int n = shard_count - b;
-            if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++)
-                pthread_create(&threads[t], NULL, vacuum_worker, &shards[b + t]);
-            for (int t = 0; t < n; t++)
-                pthread_join(threads[t], NULL);
-        }
-        free(threads);
-    }
+    parallel_for(vacuum_worker, shards, shard_count, sizeof(VacuumWork));
 
     int cleaned = 0;
     for (int i = 0; i < shard_count; i++)
@@ -5022,19 +4869,7 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
     if (batch_count < 1024 || nshard_groups <= 2) {
         for (int g = 0; g < nshard_groups; g++) shard_count_worker(&workers[g]);
     } else {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads < 1) nthreads = 1;
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard_groups; b += nthreads) {
-            int n = nshard_groups - b;
-            if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++)
-                pthread_create(&threads[t], NULL, shard_count_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++)
-                pthread_join(threads[t], NULL);
-        }
-        free(threads);
+        parallel_for(shard_count_worker, workers, nshard_groups, sizeof(ShardCountCtx));
     }
 
     size_t total = 0;
@@ -5093,19 +4928,7 @@ static int process_batch(CollectedHash *batch, int batch_count,
         for (int g = 0; g < nshard_groups; g++)
             shard_find_worker(&workers[g]);
     } else {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads < 1) nthreads = 1;
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard_groups; b += nthreads) {
-            int n = nshard_groups - b;
-            if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++)
-                pthread_create(&threads[t], NULL, shard_find_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++)
-                pthread_join(threads[t], NULL);
-        }
-        free(threads);
+        parallel_for(shard_find_worker, workers, nshard_groups, sizeof(ShardWorkCtx));
     }
 
     /* Output matches, respecting offset/limit */
@@ -5851,16 +5674,7 @@ static KeySet *build_or_keyset(const char *db_root, const char *object,
         ctxs[i].deadline = dl;
     }
 
-    if (n < 2) {
-        or_child_worker(&ctxs[0]);
-    } else {
-        pthread_t *threads = calloc(n, sizeof(pthread_t));
-        for (int i = 0; i < n; i++)
-            pthread_create(&threads[i], NULL, or_child_worker, &ctxs[i]);
-        for (int i = 0; i < n; i++)
-            pthread_join(threads[i], NULL);
-        free(threads);
-    }
+    parallel_for(or_child_worker, ctxs, n, sizeof(OrChildWorkerCtx));
 
     free(ctxs);
     free(idx_paths);
@@ -6763,9 +6577,7 @@ int cmd_backup(const char *db_root, const char *object) {
    1M+ slots. Use atomic increment and skip the mutex. */
 
 typedef struct {
-    char **paths;
-    int start;
-    int end;
+    const char *path;
     int slot_size;
     int *counter; /* shared atomic counter */
 } RecountWorkerArg;
@@ -6773,41 +6585,36 @@ typedef struct {
 static void *recount_worker(void *arg) {
     RecountWorkerArg *w = (RecountWorkerArg *)arg;
     int local = 0;
-    for (int i = w->start; i < w->end; i++) {
-        /* Bypass ucache — it uses MADV_RANDOM which kills readahead for a
-           sequential scan. Open direct with MADV_SEQUENTIAL so the kernel
-           prefetches aggressively. Releases pages after we're done, too,
-           so recount doesn't pollute the page cache for hot random lookups. */
-        int fd = open(w->paths[i], O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st;
-        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); continue; }
-        uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) continue;
-        madvise(map, st.st_size, MADV_SEQUENTIAL);
+    /* Bypass ucache — MADV_RANDOM would kill readahead for a sequential
+       scan. Open direct + MADV_SEQUENTIAL + MADV_DONTNEED after so recount
+       doesn't evict hot random-lookup pages. */
+    int fd = open(w->path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return NULL; }
+    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return NULL;
+    madvise(map, st.st_size, MADV_SEQUENTIAL);
 
-        size_t file_size = st.st_size;
-        if (file_size < SHARD_HDR_SIZE) { munmap(map, file_size); continue; }
-        const ShardHeader *sh = (const ShardHeader *)map;
-        if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, file_size); continue; }
-        uint32_t shard_slots = sh->slots_per_shard;
-        if (file_size < shard_zoneA_end(shard_slots)) { munmap(map, file_size); continue; }
-        /* Zone A-only scan — 24B per slot vs full payload. */
-        size_t scan_end = shard_slots;
-        while (scan_end > 0) {
-            const SlotHeader *h = (const SlotHeader *)(map + zoneA_off(scan_end - 1));
-            if (h->flag != 0 || h->key_len != 0) break;
-            scan_end--;
-        }
-        for (size_t s = 0; s < scan_end; s++) {
-            const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(s));
-            if (hdr->flag == 1) local++;
-        }
-        madvise(map, file_size, MADV_DONTNEED);
-        munmap(map, file_size);
+    size_t file_size = st.st_size;
+    if (file_size < SHARD_HDR_SIZE) { munmap(map, file_size); return NULL; }
+    const ShardHeader *sh = (const ShardHeader *)map;
+    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, file_size); return NULL; }
+    uint32_t shard_slots = sh->slots_per_shard;
+    if (file_size < shard_zoneA_end(shard_slots)) { munmap(map, file_size); return NULL; }
+    size_t scan_end = shard_slots;
+    while (scan_end > 0) {
+        const SlotHeader *h = (const SlotHeader *)(map + zoneA_off(scan_end - 1));
+        if (h->flag != 0 || h->key_len != 0) break;
+        scan_end--;
     }
-    /* Single atomic add — no per-slot lock */
+    for (size_t s = 0; s < scan_end; s++) {
+        const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(s));
+        if (hdr->flag == 1) local++;
+    }
+    madvise(map, file_size, MADV_DONTNEED);
+    munmap(map, file_size);
     __sync_fetch_and_add(w->counter, local);
     return NULL;
 }
@@ -6938,29 +6745,11 @@ int cmd_recount(const char *db_root, const char *object) {
 
     int total = 0;
     if (path_count > 0) {
-        int nthreads = parallel_threads();
-        if (nthreads > path_count) nthreads = path_count;
-        if (nthreads < 1) nthreads = 1;
-
-        if (nthreads == 1 || path_count <= 4) {
-            RecountWorkerArg w = { paths, 0, path_count, sch.slot_size, &total };
-            recount_worker(&w);
-        } else {
-            pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-            RecountWorkerArg *args = malloc(nthreads * sizeof(RecountWorkerArg));
-            int per = path_count / nthreads;
-            int rem = path_count % nthreads;
-            int pos = 0;
-            for (int t = 0; t < nthreads; t++) {
-                int c = per + (t < rem ? 1 : 0);
-                args[t] = (RecountWorkerArg){ paths, pos, pos + c, sch.slot_size, &total };
-                pthread_create(&threads[t], NULL, recount_worker, &args[t]);
-                pos += c;
-            }
-            for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
-            free(threads);
-            free(args);
-        }
+        RecountWorkerArg *args = malloc(path_count * sizeof(RecountWorkerArg));
+        for (int i = 0; i < path_count; i++)
+            args[i] = (RecountWorkerArg){ paths[i], sch.slot_size, &total };
+        parallel_for(recount_worker, args, path_count, sizeof(RecountWorkerArg));
+        free(args);
     }
 
     for (int i = 0; i < path_count; i++) free(paths[i]);
@@ -8017,19 +7806,7 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
     if (batch_count < 1024 || nshard_groups <= 2) {
         for (int g = 0; g < nshard_groups; g++) shard_agg_worker(&workers[g]);
     } else {
-        int nthreads = parallel_threads();
-        if (nthreads > nshard_groups) nthreads = nshard_groups;
-        if (nthreads < 1) nthreads = 1;
-        pthread_t *threads = malloc(nthreads * sizeof(pthread_t));
-        for (int b = 0; b < nshard_groups; b += nthreads) {
-            int n = nshard_groups - b;
-            if (n > nthreads) n = nthreads;
-            for (int t = 0; t < n; t++)
-                pthread_create(&threads[t], NULL, shard_agg_worker, &workers[b + t]);
-            for (int t = 0; t < n; t++)
-                pthread_join(threads[t], NULL);
-        }
-        free(threads);
+        parallel_for(shard_agg_worker, workers, nshard_groups, sizeof(ShardAggCtx));
     }
 
     for (int g = 0; g < nshard_groups; g++) {
