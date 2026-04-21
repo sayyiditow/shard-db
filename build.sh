@@ -1,5 +1,5 @@
 #!/bin/bash
-gcc -O2 -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c src/parallel.c -Isrc -lpthread
+gcc -O2 -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c src/parallel.c src/yyjson.c -Isrc -lpthread
 mkdir -p build/bin build/db
 
 cp shard-db build/bin/
