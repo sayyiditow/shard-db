@@ -2,7 +2,9 @@
 # Run from project root regardless of CWD so `./shard-db` and `db.env` resolve.
 cd "$(dirname "$0")/.."
 # Pure key/value throughput — what shard-db looks like as a plain Map.
-# Schema: 1 field varchar(100), keys = 32-byte hex.
+# Schema: 1 field varchar(100), keys = 16-byte hex.
+# Matches the industry-standard 16B key / 100B value record shape used
+# by LMDB / LevelDB / RocksDB db_bench so numbers compare directly.
 # Usage: ./bench-kv.sh [record_count]
 
 COUNT=${1:-1000000}
@@ -15,7 +17,7 @@ OBJ="kvbench"
 
 echo "======================================"
 echo "  shard-db K/V benchmark ($COUNT records)"
-echo "  key=32B hex, value=varchar(100)"
+echo "  key=16B hex, value=varchar(100) — matches db_bench / LMDB shape"
 echo "======================================"
 
 grep -q "^default$" "$DB_ROOT/dirs.conf" 2>/dev/null || echo "default" >> "$DB_ROOT/dirs.conf"
@@ -33,16 +35,16 @@ sleep 0.5
 q() { echo "$1" | socat - TCP:localhost:$PORT 2>/dev/null | tr -d '\0'; }
 q_cli() { $BIN query "$1"; }
 
-# 256 splits keeps shard load manageable; max_key=32 max_value=100
-q_cli "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
+# 256 splits keeps shard load manageable; max_key=16 max_value=100
+q_cli "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":16,\"fields\":[\"v:varchar:100\"]}" > /dev/null
 
 echo ""
-echo "Generating $COUNT records (32B hex key, ~100B value)..."
+echo "Generating $COUNT records (16B hex key, ~100B value)..."
 python3 -c "
 import json, hashlib
 recs = []
 for i in range($COUNT):
-    k = hashlib.sha256(str(i).encode()).hexdigest()[:32]  # exactly 32 hex chars
+    k = hashlib.sha256(str(i).encode()).hexdigest()[:16]  # exactly 16 hex chars
     v = ('val_' + str(i)).ljust(100, 'x')[:100]
     recs.append({'id': k, 'data': {'v': v}})
 with open('/tmp/shard-db_kv.json','w') as f:

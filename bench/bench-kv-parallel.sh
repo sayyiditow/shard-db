@@ -21,7 +21,7 @@ echo "======================================"
 echo "  shard-db K/V parallel benchmark"
 echo "  $TOTAL records, ${CHUNK}/chunk, $CONNS connections"
 echo "  $NCHUNKS chunks"
-echo "  key=32B hex, value=varchar(100)"
+echo "  key=16B hex, value=varchar(100) — matches db_bench / LMDB shape"
 echo "======================================"
 
 grep -q "^default$" "$DB_ROOT/dirs.conf" 2>/dev/null || echo "default" >> "$DB_ROOT/dirs.conf"
@@ -47,7 +47,7 @@ for c in range(0, total, chunk_size):
     idx = c // chunk_size
     recs = []
     for i in range(c, end):
-        k = hashlib.sha256(str(i).encode()).hexdigest()[:32]
+        k = hashlib.sha256(str(i).encode()).hexdigest()[:16]
         v = ('val_' + str(i)).ljust(100, 'x')[:100]
         recs.append({'id': k, 'data': {'v': v}})
     with open(f'/tmp/shard-db_kv_par_{idx}.json', 'w') as f:
@@ -76,7 +76,7 @@ create_fresh() {
     $BIN query "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"$OBJ\"}" > /dev/null 2>&1
     rm -rf "$DB_ROOT/default/$OBJ"
     sed -i "/^default:$OBJ:/d" "$DB_ROOT/schema.conf" 2>/dev/null
-    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":32,\"fields\":[\"v:varchar:100\"]}" > /dev/null
+    $BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":$SPLITS,\"max_key\":16,\"fields\":[\"v:varchar:100\"]}" > /dev/null
 }
 
 # ==================== TEST 1a: Single JSON file (baseline) ====================

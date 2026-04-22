@@ -84,6 +84,8 @@ enum DefaultKind {
 
 typedef struct {
     char name[256];
+    int name_len;       /* cached strlen(name) — set once at load_typed_schema,
+                           skips a strlen per compare in the bulk-insert hot loops */
     enum FieldType type;
     int size;           /* storage bytes for this field */
     int offset;         /* byte offset within value region */

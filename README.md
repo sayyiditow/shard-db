@@ -9,24 +9,24 @@ A file-based sharded database written in C. Started as a key/value store; now a 
 
 ## Performance
 
-Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a standalone script in `bench/`.
+Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a standalone script in `bench/`. All numbers are from end-to-end runs with the server over TCP — **request parse, auth, encode, disk write, ACK** are all in the measurement. Nothing is bypassed.
 
-### 1. K/V single-threaded — 10M records (`bench-kv.sh 10000000`, `SPLITS=512`)
+### 1. K/V single-threaded — 10M records (`bench-kv.sh 10000000`, `SPLITS=256`)
 
-Schema: 32-byte hex key, one `varchar(100)` value.
+Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape used by LMDB / LevelDB / RocksDB `db_bench` so numbers compare directly. Unlike those embedded libraries, every request below crosses a TCP socket and goes through JSON/CSV parsing on the server.
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **709 k inserts/sec** (14.11 s) |
-| Bulk insert (CSV, 10M in one request) | **805 k inserts/sec** (12.42 s) |
-| GET ×10,000 (pipelined, 1 conn) | **15.4 k ops/sec** (651 ms) |
-| EXISTS ×10,000 hits (pipelined) | **15.4 k ops/sec** (648 ms) |
-| EXISTS ×10,000 all-miss (cold probe) | **65.4 k ops/sec** (151 ms) |
-| UPDATE ×10,000 (pipelined) | **14.5 k ops/sec** (692 ms) |
-| DELETE ×10,000 (pipelined) | **8.9 k ops/sec** (1.13 s) |
-| Parallel GET (5 conns × 10k) | **62.5 k ops/sec** (800 ms) |
-| Parallel UPDATE (5 conns × 10k) | **47.8 k ops/sec** (1.05 s) |
-| Disk footprint | 2.6 GB |
+| Bulk insert (JSON, 10M in one request) | **1.79 M inserts/sec** (5.60 s) |
+| Bulk insert (CSV, 10M in one request) | **2.24 M inserts/sec** (4.47 s) |
+| GET ×10,000 (pipelined, 1 conn) | **21.8 k ops/sec** (459 ms) |
+| EXISTS ×10,000 hits (pipelined) | **21.0 k ops/sec** (477 ms) |
+| EXISTS ×10,000 all-miss (cold probe) | **64.1 k ops/sec** (156 ms) |
+| UPDATE ×10,000 (pipelined) | **13.4 k ops/sec** (744 ms) |
+| DELETE ×10,000 (pipelined) | **8.7 k ops/sec** (1.14 s) |
+| Parallel GET (5 conns × 10k) | **86.0 k ops/sec** (581 ms) |
+| Parallel UPDATE (5 conns × 10k) | **48.1 k ops/sec** (1.04 s) |
+| Disk footprint | 2.3 GB |
 
 ### 2. K/V multi-threaded — 10M records, scaling across connections (`bench-kv-parallel.sh 10000000 1000000 10`, `SPLITS=1024`)
 
@@ -34,12 +34,14 @@ Same schema, bulk insert fanned out across TCP connections.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 10M | 15.61 s | **641 k/sec** |
-| Single CSV, 10M | 14.00 s | **714 k/sec** |
-| **Parallel JSON, 10 conns × 1M** | **8.74 s** | **1.14 M/sec** (1.8× single) |
-| **Parallel CSV, 10 conns × 1M** | **6.85 s** | **1.46 M/sec** (2.0× single) |
+| Single JSON, 10M | 7.40 s | **1.35 M/sec** |
+| Single CSV, 10M | 6.47 s | **1.55 M/sec** |
+| **Parallel JSON, 10 conns × 1M** | **5.45 s** | **1.84 M/sec** (1.36× single) |
+| **Parallel CSV, 10 conns × 1M** | **5.26 s** | **1.90 M/sec** (1.23× single) |
 
-Shard load distribution (1024 splits): avg 0.596, records stddev 6.2 %, 6 grows per shard.
+Shard load distribution (1024 splits): avg 0.596, records stddev 5.7 %, 6 grows per shard.
+
+**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **1.55 M/sec single-connection** and **1.90 M/sec** across 10 connections, over TCP with CSV parsing on the server. Single-connection parallel ratio is now only ~1.2-1.4× because the single-connection path is fast enough that dirty-page writeback is the ceiling — adding connections mostly shortens the wall clock, not the cost per record.
 
 ### 3. Queries on 1M users (`bench-queries.sh`)
 
@@ -47,21 +49,21 @@ Shard load distribution (1024 splits): avg 0.596, records stddev 6.2 %, 6 grows 
 
 | Operation class | Latency band |
 |---|---|
-| `count` metadata (no criteria) | **2 ms** (O(1) counter file) |
-| `count` indexed eq / between / in / lt / gt / lte / gte | **3–20 ms** |
+| `count` metadata (no criteria) | **3 ms** (O(1) counter file) |
+| `count` indexed eq / between / in / lt / gt / lte / gte | **4–19 ms** |
 | `count` indexed `starts` / `exists` | **3–21 ms** |
-| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **40–42 ms** |
-| `count` full-scan (non-indexed field) | **332–333 ms** |
-| `count` indexed + secondary filter | **31–63 ms** |
-| `find` limit 10 — any indexed op | **2–4 ms** |
-| `find` limit 10 — full scan on non-indexed | **3 ms** (Zone A probe + typed compare) |
-| `find` indexed + secondary filter | **2–3 ms** |
-| `aggregate count` (metadata) | **3 ms** |
-| `aggregate` where indexed-eq | **24–33 ms** |
-| `aggregate` where indexed range | **71–126 ms** |
-| `aggregate` full-scan (sum/avg/min/max) | **453 ms** |
-| `aggregate` group_by on full scan | **524–551 ms** |
-| `aggregate` group_by + having | **573 ms** |
+| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **41–49 ms** |
+| `count` full-scan (non-indexed field) | **309–354 ms** |
+| `count` indexed + secondary filter | **16–49 ms** |
+| `find` limit 10 — any indexed op | **2–3 ms** |
+| `find` limit 10 — full scan on non-indexed | **2–3 ms** (Zone A probe + typed compare) |
+| `find` indexed + secondary filter | **2 ms** |
+| `aggregate count` (metadata) | **2 ms** |
+| `aggregate` where indexed-eq | **11–18 ms** |
+| `aggregate` where indexed range | **53–107 ms** |
+| `aggregate` full-scan (sum/avg/min/max) | **415 ms** |
+| `aggregate` group_by on full scan | **469–490 ms** |
+| `aggregate` group_by + having | **549 ms** |
 
 All 17 search operators (`eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `not_in`, `like`, `not_like`, `contains`, `not_contains`, `starts`, `ends`, `exists`, `not_exists`) use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
 
@@ -71,20 +73,21 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **66.1 k/sec** (15.12 s) |
-| Bulk insert (with 14 indexes) | **54.9 k/sec** (18.21 s) — 20 % index overhead |
-| Add 14 indexes post-insert | **5.77 s** (single-pass, all 14 concurrent) |
+| Bulk insert (no indexes) | **99.1 k/sec** (10.09 s) |
+| Bulk insert (with 14 indexes) | **78.3 k/sec** (12.77 s) — 21 % index overhead |
+| Add 14 indexes post-insert | **5.83 s** (single-pass, all 14 concurrent) |
 | GET ×1000 (pipelined) | **43.5 k ops/sec** (23 ms) |
-| EXISTS ×1000 (pipelined) | **50.0 k ops/sec** (20 ms) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **3–4 ms** |
-| Indexed `contains` via leaf scan | 4–23 ms |
-| Indexed IN (2 values) | 3 ms |
-| Composite index eq / starts | 4 ms |
-| Indexed `range` | 3 ms |
+| EXISTS ×1000 (pipelined) | **55.6 k ops/sec** (18 ms) |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **3–5 ms** |
+| Indexed `contains` via leaf scan | 4–24 ms |
+| Indexed IN (2 values) | 4 ms |
+| Composite index eq / starts | 3–4 ms |
+| Indexed `range` | 2–4 ms |
 | Fetch page of 100 @ offset 5000 | 5 ms |
-| Single DELETE ×1000 (with 14 indexes) | **1.9 k/sec** (516 ms) |
-| Bulk DELETE ×1000 | **4.6 k/sec** (219 ms) |
-| VACUUM | 9 ms |
+| Keys (first 100) | 4 ms |
+| Single DELETE ×1000 (with 14 indexes) | **2.7 k/sec** (366 ms) |
+| Bulk DELETE ×1000 | **4.7 k/sec** (213 ms) |
+| VACUUM | 5 ms |
 | Disk footprint | 1.3 GB |
 
 ### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 100000 10`)
@@ -93,16 +96,16 @@ Same schema, 10 connections × 100 k records each.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 14.82 s | **67.5 k/sec** |
-| Single CSV, 1M, no indexes | 5.51 s | **181.5 k/sec** |
-| **Parallel JSON, 10 conns, no indexes** | **4.28 s** | **233.8 k/sec** (3.5× single-JSON) |
-| Parallel JSON, 10 conns, pre-existing 14 indexes | 6.45 s | **154.9 k/sec** |
-| **Parallel CSV, 10 conns, no indexes** | **3.41 s** | **293.2 k/sec** (1.6× single-CSV, 4.3× single-JSON) |
-| Parallel CSV, 10 conns, pre-existing 14 indexes | 5.47 s | **182.8 k/sec** |
+| Single JSON, 1M, no indexes | 9.42 s | **106 k/sec** |
+| Single CSV, 1M, no indexes | 5.42 s | **185 k/sec** |
+| **Parallel JSON, 10 conns, no indexes** | **4.53 s** | **221 k/sec** (2.1× single-JSON) |
+| Parallel JSON, 10 conns, pre-existing 14 indexes | 6.99 s | **143 k/sec** |
+| **Parallel CSV, 10 conns, no indexes** | **3.77 s** | **265 k/sec** (1.4× single-CSV) |
+| Parallel CSV, 10 conns, pre-existing 14 indexes | 6.49 s | **154 k/sec** |
 | Add 14 indexes after parallel bulk insert | ~5.7 s | (concurrent build across all 14) |
 | Disk footprint (with 14 indexes) | 1.3 GB |
 
-**Insert WITH indexes now beats load-then-index.** At 1M × 14 indexes: load (3.41 s) + add-indexes (5.68 s) = 9.09 s → 110 k/sec; insert with pre-existing indexes: 5.47 s → 183 k/sec. The parallel bulk-insert path maintains indexes cheaper than a post-hoc rebuild. **Recommended ingest pattern: create indexes up front, then parallel bulk-insert** — unless the schema is still evolving, in which case load-then-index is still fine.
+**Insert WITH indexes still beats load-then-index.** At 1M × 14 indexes: load (3.77 s) + add-indexes (5.64 s) = 9.41 s → 106 k/sec; insert with pre-existing indexes: 6.49 s → 154 k/sec. The parallel bulk-insert path maintains indexes cheaper than a post-hoc rebuild. **Recommended ingest pattern: create indexes up front, then parallel bulk-insert** — unless the schema is still evolving, in which case load-then-index is still fine.
 
 ### Notes
 

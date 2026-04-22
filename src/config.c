@@ -703,6 +703,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         if (name_len >= 256) name_len = 255;
         memcpy(tf->name, line, name_len);
         tf->name[name_len] = '\0';
+        tf->name_len = (int)name_len;
 
         /* Tombstone marker: line ends with ":removed". Strip it before
            type parsing so the type spec parses cleanly. The field's
@@ -962,12 +963,12 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
         size_t vlen = p - vstart;
 
         /* Match against the schema. Linear scan is fine — typical schema
-           has <30 fields and the strcmp is short. */
+           has <30 fields and the memcmp is short. name_len is cached on
+           the TypedField (set in load_typed_schema). */
         for (int i = 0; i < ts->nfields; i++) {
             if (ts->fields[i].removed) continue;
-            size_t klen = strlen(ts->fields[i].name);
-            if (flen != klen) continue;
-            if (memcmp(fname, ts->fields[i].name, klen) != 0) continue;
+            if ((int)flen != ts->fields[i].name_len) continue;
+            if (memcmp(fname, ts->fields[i].name, flen) != 0) continue;
             /* Strip surrounding quotes for string values; numeric/bool/
                array/object literals pass through as-is. */
             const char *ev = vstart; size_t el = vlen;
@@ -1124,9 +1125,8 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
 
             for (int i = 0; i < ts->nfields; i++) {
                 if (ts->fields[i].removed) continue;
-                size_t klen = strlen(ts->fields[i].name);
-                if (flen != klen) continue;
-                if (memcmp(fname, ts->fields[i].name, klen) != 0) continue;
+                if ((int)flen != ts->fields[i].name_len) continue;
+                if (memcmp(fname, ts->fields[i].name, flen) != 0) continue;
                 const char *ev = vstart; size_t el = vlen;
                 if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
                 if (el > 0) {

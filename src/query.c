@@ -782,7 +782,15 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     for (int i = 0; i < nfields; i++) field_ptrs[i] = idx_fields[i];
 
     TypedSchema *ts = load_typed_schema(db_root, object);
-    uint8_t *typed_tmp = ts ? malloc(ts->total_size) : NULL;
+
+    /* Invariant check hoisted out of the per-record loop — ts->total_size
+       and sc.max_value don't change during a bulk insert. */
+    if (ts && ts->total_size > sc.max_value) {
+        fprintf(stderr, "Error: typed record size %d exceeds max_value %d\n",
+                ts->total_size, sc.max_value);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        return 1;
+    }
 
     /* ucache handles shard caching */
 
@@ -826,7 +834,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     if (!is_object_format && !is_array_format) {
         fprintf(stderr, "Error: Expected JSON object or array\n");
         if (json_mmaped) munmap(json, len + 1); else free(json);
-        free(typed_tmp);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
         return 1;
@@ -850,7 +857,14 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         if (*p == ',') { p++; continue; }
 
         char *id = NULL;
-        char *data = NULL;
+        size_t klen = 0;
+        const char *data_ptr = NULL;  /* span into json mmap (object fmt) or obj_str (array fmt) */
+        /* obj_str owns the array-format record's NUL-terminated copy so
+           json_parse_object can walk it; must stay alive through the
+           typed_encode_defaults call below. Freed at end of iteration. */
+        char obj_buf[8192];
+        char *obj_str = NULL;
+        int obj_heap = 0;
 
         if (is_object_format) {
             /* Object format: "key": {...} */
@@ -858,18 +872,16 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             p++;
             const char *key_start = p;
             while (*p && *p != '"') p++;
-            size_t klen = p - key_start;
+            klen = p - key_start;
             id = arena_strndup(&arena, key_start, klen);
             if (*p == '"') p++;
             p = json_skip(p);
             if (*p == ':') p = json_skip(p + 1);
 
-            const char *vstart = p;
-            const char *vend = json_skip_value(p);
-            size_t vlen = vend - vstart;
-            data = malloc(vlen + 1);
-            memcpy(data, vstart, vlen); data[vlen] = '\0';
-            p = vend;
+            /* Data span points into the original mmap — NUL-terminated at
+               buffer end; typed_encode_defaults stops at the matching brace. */
+            data_ptr = p;
+            p = json_skip_value(p);
         } else {
             /* Array format: {"id":"k1","data":{...}} */
             if (*p != '{') { p++; continue; }
@@ -877,9 +889,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             const char *obj_end = json_skip_value(p);
             size_t obj_len = obj_end - obj_start;
 
-            char obj_buf[8192];
-            char *obj_str;
-            int obj_heap = 0;
             if (obj_len < sizeof(obj_buf)) {
                 memcpy(obj_buf, obj_start, obj_len);
                 obj_buf[obj_len] = '\0';
@@ -891,38 +900,31 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
                 obj_heap = 1;
             }
 
-            {
-                JsonObj rec;
-                json_parse_object(obj_str, obj_len, &rec);
-                const char *iv; size_t ivl;
-                if (json_obj_unquoted(&rec, "id", &iv, &ivl))
-                    id = arena_strndup(&arena, iv, ivl);
+            JsonObj rec;
+            json_parse_object(obj_str, obj_len, &rec);
+            const char *iv; size_t ivl;
+            if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
+                id = arena_strndup(&arena, iv, ivl);
+                klen = ivl;
             }
-            char *dp = strstr(obj_str, "\"data\"");
-            if (dp) {
-                dp += 6;
-                while (*dp == ' ' || *dp == ':') dp++;
-                const char *dstart = dp;
-                const char *dend = json_skip_value(dp);
-                size_t dlen = dend - dstart;
-                data = malloc(dlen + 1);
-                memcpy(data, dstart, dlen); data[dlen] = '\0';
+            const char *dv; size_t dl;
+            if (json_obj_get(&rec, "data", &dv, &dl)) {
+                data_ptr = dv;  /* span into obj_str */
+                (void)dl;       /* encoder finds matching brace itself */
             }
-            if (obj_heap) free(obj_str);
             p = obj_end;
         }
 
-        if (id && data) {
-            typed_encode_defaults(ts, data, typed_tmp, ts->total_size, db_root, object);
-            size_t klen = strlen(id);
-
-            if ((int)klen > sc.max_key || (int)ts->total_size > sc.max_value) {
+        if (id && data_ptr) {
+            if ((int)klen > sc.max_key) {
                 errors++;
                 /* id lives in arena — dropped bytes are trivial, no free here */
             } else {
-                /* Arena-allocated payload: survives until arena_free() post-Phase-2. */
+                /* Allocate payload in arena up front and encode the record
+                   directly into it — skips the typed_tmp bounce + memcpy. */
                 uint8_t *payload = arena_alloc(&arena, ts->total_size);
-                memcpy(payload, typed_tmp, ts->total_size);
+                typed_encode_defaults(ts, data_ptr, payload, ts->total_size,
+                                      db_root, object);
 
                 if (rec_count >= rec_cap) {
                     rec_cap *= 2;
@@ -935,7 +937,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
             }
         }
-        if (data) free(data);
+        if (obj_heap) free(obj_str);
     }
 
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
@@ -1053,7 +1055,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     /* ucache keeps mmaps open — OS flushes dirty pages */
     if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
     else free(json);
-    free(typed_tmp);
 
     /* Bulk write indexes — parallel across index fields */
     if (nfields > 0) {
@@ -1158,8 +1159,13 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     }
     close(ifd);
 
-    /* Init */
-    uint8_t *typed_tmp = malloc(ts->total_size);
+    /* Invariant check hoisted out of the per-record loop — ts->total_size
+       and sc.max_value don't change during a bulk insert. */
+    if (ts->total_size > sc.max_value) {
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"typed record size exceeds max_value\"}\n");
+        return 1;
+    }
 
     BtEntry **idx_pairs = calloc(nidx, sizeof(BtEntry *));
     size_t *idx_pair_counts = calloc(nidx, sizeof(size_t));
@@ -1247,8 +1253,11 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         const char *id_start = line_start;
         size_t klen = key_end - line_start;
 
+        /* Skip oversized keys before any encode work. (ts->total_size >
+           sc.max_value was already hoisted above.) */
+        if ((int)klen > sc.max_key) { errors++; continue; }
+
         /* Walk remaining spans into vals[] without copying. */
-        memset(typed_tmp, 0, ts->total_size);
         int nvals = 0;
         const char *vp = key_end + 1;
         while (nvals < active_count) {
@@ -1269,30 +1278,28 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             }
         }
 
+        /* Arena-allocated key + typed payload — survive until arena_free()
+           post-Phase-2. Encode directly into the arena payload (zero-init
+           first, then encode_field_len writes each field in place); skips
+           the typed_tmp bounce + memcpy that used to sit between them. */
+        char *id = arena_strndup(&arena, id_start, klen);
+        uint8_t *payload = arena_alloc(&arena, ts->total_size);
+        memset(payload, 0, ts->total_size);
+
         if (!has_tombstones) {
             for (int i = 0; i < active_count && i < nvals; i++) {
                 if (vals[i].len > 0)
                     encode_field_len(&ts->fields[i], vals[i].ptr, vals[i].len,
-                                     typed_tmp + ts->fields[i].offset);
+                                     payload + ts->fields[i].offset);
             }
         } else {
             for (int i = 0; i < active_count && i < nvals; i++) {
                 int fi = active_indices[i];
                 if (vals[i].len > 0)
                     encode_field_len(&ts->fields[fi], vals[i].ptr, vals[i].len,
-                                     typed_tmp + ts->fields[fi].offset);
+                                     payload + ts->fields[fi].offset);
             }
         }
-
-        if ((int)klen > sc.max_key || ts->total_size > sc.max_value) {
-            errors++;
-            continue;
-        }
-
-        /* Arena-allocated key + typed payload — survive until arena_free() post-Phase-2. */
-        char *id = arena_strndup(&arena, id_start, klen);
-        uint8_t *payload = arena_alloc(&arena, ts->total_size);
-        memcpy(payload, typed_tmp, ts->total_size);
 
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
@@ -1412,7 +1419,6 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
 
     if (data_mmaped) munmap((void *)data, st.st_size);
     else free((void *)data);
-    free(typed_tmp);
 
     /* Parallel index builds — uses file-scope idx_build_worker */
     if (nidx > 0) {
