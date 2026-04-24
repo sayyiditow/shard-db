@@ -34,6 +34,7 @@
 #define SHARD_HDR_SIZE   32          /* ShardHeader at file offset 0 */
 #define INITIAL_SLOTS    256         /* starting slots_per_shard for new shards */
 #define MIN_SPLITS       4
+#define DEFAULT_SPLITS   16          /* used by create-object when splits is omitted/0 */
 #define MAX_SPLITS       4096
 #define MAX_KEY_CEILING  1024        /* hard upper bound on per-object max_key
                                         (uint16 allows 65535, but keys near that

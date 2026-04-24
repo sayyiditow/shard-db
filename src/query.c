@@ -7251,24 +7251,32 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     }
     for (uint32_t s = max_slots; s > INITIAL_SLOTS; s >>= 1) grows++;
 
-    /* Hint: suggest raising splits if shards are both large and highly loaded */
+    /* Hint: sizing is driven by records-per-shard, not by load factor or doublings.
+       Bench sweet spot ≈ 78K-200K rec/shard; acceptable up to ~500K; degradation
+       past ~1M. `grows` is informational only — every real workload doubles many
+       times past INITIAL_SLOTS to stay under the 50% growth threshold, so it
+       doesn't distinguish "optimal" from "overloaded". */
     const char *hint = NULL;
     double avg_load = 0.0;
+    uint64_t rps = 0;
     if (nrows > 0) {
         avg_load = (double)total_records / ((double)max_slots * nrows);
-        if (grows >= 4 && avg_load > 0.35 && sch.splits < MAX_SPLITS) {
-            hint = "shards have grown heavily — consider raising splits for more parallelism (vacuum --splits=N)";
+        rps = total_records / (uint64_t)nrows;
+        if (rps > 1000000ULL) {
+            hint = (sch.splits < MAX_SPLITS)
+                ? "records-per-shard past sweet spot (>1M) — re-split with vacuum --splits=N"
+                : "at MAX_SPLITS with >1M records/shard — performance may degrade; consider partitioning across objects";
+        } else if (rps > 500000ULL && sch.splits < MAX_SPLITS) {
+            hint = "records-per-shard approaching upper band (>500K) — consider vacuum --splits=N";
         } else if (min_records > 0 && max_records > min_records * 4) {
             hint = "shard load is skewed — check key distribution";
-        } else if (grows == 0 && total_records > 0) {
-            hint = "no growth yet — INITIAL_SLOTS is sufficient for this load";
         }
     }
 
     if (as_table) {
-        OUT("splits=%d shards=%d total_records=%lu total_bytes=%lu max_grows=%d avg_load=%.3f\n",
+        OUT("splits=%d shards=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
             sch.splits, nrows, (unsigned long)total_records, (unsigned long)total_bytes,
-            grows, avg_load);
+            (unsigned long)rps, grows, avg_load);
         OUT("  %-8s %-10s %-10s %-8s %-14s\n", "shard", "slots", "records", "load", "bytes");
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
@@ -7286,7 +7294,7 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
                 i ? "," : "", rows[i].shard_id, rows[i].slots, rows[i].records,
                 load, (unsigned long)rows[i].file_bytes);
         }
-        OUT("],\"max_grows\":%d", grows);
+        OUT("],\"avg_rec_per_shard\":%lu,\"max_grows\":%d", (unsigned long)rps, grows);
         if (hint) OUT(",\"hint\":\"%s\"", hint);
         OUT("}\n");
     }
@@ -7705,7 +7713,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
 
     /* Defaults */
-    if (splits <= 0) splits = MIN_SPLITS;
+    if (splits <= 0) splits = DEFAULT_SPLITS;
     if (splits < MIN_SPLITS) splits = MIN_SPLITS;
     if (splits > MAX_SPLITS) splits = MAX_SPLITS;
     if (max_key <= 0) max_key = 64;

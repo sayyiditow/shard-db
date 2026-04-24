@@ -124,11 +124,45 @@ Don't change without a specific reason and a benchmark to prove it. 4096 is a sw
 
 Don't use network filesystems (NFS, CIFS) for `$DB_ROOT` unless you deeply trust their mmap semantics. Latency and coherence bugs compound.
 
+## Sizing `splits`
+
+`splits` is the number of shard files per object, fixed at `create-object` time and changeable only via `vacuum --splits=N` (re-hashes every record). The right value is driven by **records-per-shard**, not by load factor.
+
+**Sweet spot: 78K–200K records/shard.** Acceptable to ~500K; past ~1M you're saturating this design. (Validated on the parallel K/V bench: 10M rows at 128 splits = 78K rec/shard completed in 3.488s. 64 splits: 3.605s. 256 splits: 3.986s. 1024 splits: 5.454s — too many shards = too many small files = more syscalls per query.)
+
+| Expected rows | Recommended `splits` | Records/shard at target |
+|---------------|----------------------|-------------------------|
+| < 1M          | 8–32                 | up to ~125K             |
+| 1–10M         | 64                   | ~16K–156K               |
+| 10–25M        | 128                  | ~78K–195K (optimal band) |
+| 25–50M        | 256                  | ~98K–195K               |
+| 50–100M       | 512                  | ~98K–195K               |
+| 100–250M      | 512                  | ~200K–488K (acceptable) |
+| 250–500M      | 1024                 | ~244K–488K              |
+| 500M–1B       | 2048                 | ~244K–488K              |
+| 1–4B          | 4096 (MAX_SPLITS)    | ~244K–976K (at limit)   |
+
+Defaults: `create-object` with no `splits` gives **16** (fine for test objects and anything under ~2M rows). For bigger loads, set it explicitly up front — or re-split later with `vacuum --splits=N`.
+
+Past 4B rows you've hit `MAX_SPLITS=4096`. Partition across multiple objects or tenant dirs rather than trying to climb further — at that scale you want multiple B+ trees, not one larger one.
+
+### What `shard-stats` tells you
+
+```bash
+shard-db shard-stats <dir> <object>
+```
+
+Shows `avg_rec_per_shard` in the header. Compare it to the table above:
+
+- `avg_rec_per_shard > 1,000,000` → hint: `re-split with vacuum --splits=N` (or already at MAX_SPLITS: partition by object).
+- `avg_rec_per_shard > 500,000` with room to grow → hint: `consider vacuum --splits=N`.
+- `max_records > 4 × min_records` → hint: `shard load is skewed — check key distribution` (usually means non-random keys — prefix-heavy keys like `ord_0001`, `ord_0002` hash fine, but if you're slotting raw sequential integers, look at `cmd_shard_stats`).
+
 ## When to run `vacuum`
 
 - Tombstoned / active ratio > 10% and active > 1000 → `vacuum-check` flags it. Run `vacuum` (fast in-place reclaim).
 - After `remove-field` → `vacuum --compact` to shrink `slot_size`.
-- Shard skew (imbalanced load) → `vacuum --splits N` to reshard.
+- Shard skew (imbalanced load) or records-per-shard past the sweet spot → `vacuum --splits N` to reshard.
 
 `vacuum` takes a write lock for the rebuild duration. Schedule during low-traffic windows on big objects.
 

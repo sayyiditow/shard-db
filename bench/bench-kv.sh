@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 # Usage: ./bench-kv.sh [record_count]
 
 COUNT=${1:-1000000}
-SPLITS=${SPLITS:-256}
+SPLITS=${SPLITS:-128}
 BIN="./shard-db"
 DB_ROOT=$(grep DB_ROOT db.env | sed "s/.*[\"']\(.*\)[\"']/\1/")
 PORT=$(grep PORT db.env | sed "s/.*[\"']\{0,1\}\([0-9]*\).*/\1/")

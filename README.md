@@ -11,37 +11,37 @@ A file-based sharded database written in C. Started as a key/value store; now a 
 
 Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a standalone script in `bench/`. All numbers are from end-to-end runs with the server over TCP — **request parse, auth, encode, disk write, ACK** are all in the measurement. Nothing is bypassed.
 
-### 1. K/V single-threaded — 10M records (`bench-kv.sh 10000000`, `SPLITS=256`)
+### 1. K/V single-threaded — 10M records (`bench-kv.sh 10000000`, `SPLITS=128`)
 
 Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape used by LMDB / LevelDB / RocksDB `db_bench` so numbers compare directly. Unlike those embedded libraries, every request below crosses a TCP socket and goes through JSON/CSV parsing on the server.
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **1.79 M inserts/sec** (5.60 s) |
-| Bulk insert (CSV, 10M in one request) | **2.24 M inserts/sec** (4.47 s) |
-| GET ×10,000 (pipelined, 1 conn) | **21.8 k ops/sec** (459 ms) |
-| EXISTS ×10,000 hits (pipelined) | **21.0 k ops/sec** (477 ms) |
-| EXISTS ×10,000 all-miss (cold probe) | **64.1 k ops/sec** (156 ms) |
-| UPDATE ×10,000 (pipelined) | **13.4 k ops/sec** (744 ms) |
-| DELETE ×10,000 (pipelined) | **8.7 k ops/sec** (1.14 s) |
-| Parallel GET (5 conns × 10k) | **86.0 k ops/sec** (581 ms) |
-| Parallel UPDATE (5 conns × 10k) | **48.1 k ops/sec** (1.04 s) |
+| Bulk insert (JSON, 10M in one request) | **1.97 M inserts/sec** (5.08 s) |
+| Bulk insert (CSV, 10M in one request) | **2.39 M inserts/sec** (4.19 s) |
+| GET ×10,000 (pipelined, 1 conn) | **22.1 k ops/sec** (453 ms) |
+| EXISTS ×10,000 hits (pipelined) | **22.8 k ops/sec** (439 ms) |
+| EXISTS ×10,000 all-miss (cold probe) | **66.7 k ops/sec** (150 ms) |
+| UPDATE ×10,000 (pipelined) | **17.8 k ops/sec** (561 ms) |
+| DELETE ×10,000 (pipelined) | **9.05 k ops/sec** (1.11 s) |
+| Parallel GET (5 conns × 10k) | **91.2 k ops/sec** (548 ms) |
+| Parallel UPDATE (5 conns × 10k) | **62.9 k ops/sec** (795 ms) |
 | Disk footprint | 2.3 GB |
 
-### 2. K/V multi-threaded — 10M records, scaling across connections (`bench-kv-parallel.sh 10000000 1000000 10`, `SPLITS=1024`)
+### 2. K/V multi-threaded — 10M records, scaling across connections (`bench-kv-parallel.sh 10000000 1000000 10`, `SPLITS=128`)
 
-Same schema, bulk insert fanned out across TCP connections.
+Same schema, bulk insert fanned out across TCP connections. `SPLITS=128` is the sweet spot for 10M rows (≈78K records/shard — see the [Splits tuning note](#notes)); going to 1024 at this scale *slows* the benchmark.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 10M | 7.40 s | **1.35 M/sec** |
-| Single CSV, 10M | 6.47 s | **1.55 M/sec** |
-| **Parallel JSON, 10 conns × 1M** | **5.45 s** | **1.84 M/sec** (1.36× single) |
-| **Parallel CSV, 10 conns × 1M** | **5.26 s** | **1.90 M/sec** (1.23× single) |
+| Single JSON, 10M | 4.86 s | **2.06 M/sec** |
+| Single CSV, 10M | 4.27 s | **2.34 M/sec** |
+| **Parallel JSON, 10 conns × 1M** | **3.73 s** | **2.68 M/sec** (1.30× single) |
+| **Parallel CSV, 10 conns × 1M** | **3.67 s** | **2.72 M/sec** (1.16× single) |
 
-Shard load distribution (1024 splits): avg 0.596, records stddev 5.7 %, 6 grows per shard.
+Shard load distribution (128 splits): avg 0.596, records stddev 1.6 %, 9 grows per shard.
 
-**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **1.55 M/sec single-connection** and **1.90 M/sec** across 10 connections, over TCP with CSV parsing on the server. Single-connection parallel ratio is now only ~1.2-1.4× because the single-connection path is fast enough that dirty-page writeback is the ceiling — adding connections mostly shortens the wall clock, not the cost per record.
+**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **2.34 M/sec single-connection** (CSV) and **2.72 M/sec** across 10 connections, over TCP with CSV parsing on the server. Single-connection → parallel ratio is now only 1.16–1.30× because the single-connection path is already fast enough that CPU-bound mmap writeback is the ceiling — adding connections mostly shortens the wall clock, not the cost per record.
 
 ### 3. Queries on 1M users (`bench-queries.sh`)
 
@@ -50,82 +50,98 @@ Shard load distribution (1024 splits): avg 0.596, records stddev 5.7 %, 6 grows 
 | Operation class | Latency band |
 |---|---|
 | `count` metadata (no criteria) | **3 ms** (O(1) counter file) |
-| `count` indexed eq / between / in / lt / gt / lte / gte | **4–19 ms** |
+| `count` indexed eq / between / in / lt / gt / lte / gte | **3–12 ms** |
 | `count` indexed `starts` / `exists` | **3–21 ms** |
-| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **41–49 ms** |
-| `count` full-scan (non-indexed field) | **~20–50 ms** (scan-path is now lock-free; each shard runs concurrently) |
-| `count` indexed + secondary filter | **16–49 ms** |
-| `find` limit 10 — any indexed op | **2–3 ms** |
+| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **41–44 ms** |
+| `count` full-scan (non-indexed field) | **7–10 ms** (scan-path is lock-free; each shard runs concurrently) |
+| `count` indexed + secondary filter | **16–48 ms** |
+| `find` limit 10 — any indexed op | **2–4 ms** |
 | `find` limit 10 — full scan on non-indexed | **2–3 ms** (Zone A probe + typed compare) |
-| `find` indexed + secondary filter | **2 ms** |
-| `aggregate count` (metadata) | **2 ms** |
-| `aggregate` where indexed-eq | **11–18 ms** |
-| `aggregate` where indexed range | **53–107 ms** |
-| `aggregate` full-scan (sum/avg/min/max) | **415 ms** |
-| `aggregate` group_by on full scan | **469–490 ms** |
-| `aggregate` group_by + having | **549 ms** |
+| `find` indexed + secondary filter | **2–3 ms** |
+| `aggregate count` (metadata) | **3 ms** |
+| `aggregate` where indexed-eq | **12–21 ms** |
+| `aggregate` where indexed range | **54–114 ms** |
+| `aggregate` full-scan (sum/avg/min/max) | **419 ms** |
+| `aggregate` group_by on full scan | **221–279 ms** |
+| `aggregate` group_by + having | **326 ms** |
+| `find` cursor page 1 (ASC/DESC, indexed `order_by`) | **2–4 ms** |
+| `find` cursor continuation (mid-range seek) | **2–3 ms** |
 
 All 17 search operators (`eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `not_in`, `like`, `not_like`, `contains`, `not_contains`, `starts`, `ends`, `exists`, `not_exists`) use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
 
-### 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes (`bench-invoice.sh 1000000 persistent`)
+### 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes (`bench-invoice.sh 1000000 persistent`, `SPLITS=64`)
 
 Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmStatus+pdfSent`, `status+source`, `status+createdAt`, `status+invoiceDate`.
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **99.1 k/sec** (10.09 s) |
-| Bulk insert (with 14 indexes) | **78.3 k/sec** (12.77 s) — 21 % index overhead |
-| Add 14 indexes post-insert | **3.89 s** (single-pass, all 14 concurrent; scan-path is lock-free + binary index keys skip ASCII render) |
-| GET ×1000 (pipelined) | **43.5 k ops/sec** (23 ms) |
+| Bulk insert (no indexes) | **118.6 k/sec** (8.43 s) |
+| Bulk insert (with 14 indexes) | **83.3 k/sec** (12.00 s) — 30 % index overhead |
+| Add 14 indexes post-insert | **3.85 s** (single-pass, all 14 concurrent; scan-path is lock-free + binary index keys skip ASCII render) |
+| GET ×1000 (pipelined) | **40 k ops/sec** (25 ms) |
 | EXISTS ×1000 (pipelined) | **55.6 k ops/sec** (18 ms) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **3–5 ms** |
-| Indexed `contains` via leaf scan | 4–24 ms |
-| Indexed IN (2 values) | 4 ms |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **4 ms** |
+| Indexed `contains` via leaf scan | 3–25 ms |
+| Indexed IN (2 values) | 5 ms |
 | Composite index eq / starts | 3–4 ms |
-| Indexed `range` | 2–4 ms |
+| Indexed `range` | 3–4 ms |
 | Fetch page of 100 @ offset 5000 | 5 ms |
-| Keys (first 100) | 4 ms |
-| Single DELETE ×1000 (with 14 indexes) | **2.7 k/sec** (366 ms) |
-| Bulk DELETE ×1000 | **4.7 k/sec** (213 ms) |
+| Keys (first 100) | 3 ms |
+| Single DELETE ×1000 (with 14 indexes) | **2.83 k/sec** (353 ms) |
+| Bulk DELETE ×1000 | **4.74 k/sec** (211 ms) |
 | VACUUM | 5 ms |
 | Disk footprint | 1.3 GB |
 
-### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 100000 10`)
+### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 100000 10`, `SPLITS=64`)
 
 Same schema, 10 connections × 100 k records each.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 9.42 s | **106 k/sec** |
-| Single CSV, 1M, no indexes | 5.42 s | **185 k/sec** |
-| **Parallel JSON, 10 conns, no indexes** | **4.53 s** | **221 k/sec** (2.1× single-JSON) |
-| Parallel JSON, 10 conns, pre-existing 14 indexes | 6.99 s | **143 k/sec** |
-| **Parallel CSV, 10 conns, no indexes** | **3.77 s** | **265 k/sec** (1.4× single-CSV) |
-| Parallel CSV, 10 conns, pre-existing 14 indexes | 6.49 s | **154 k/sec** |
-| Add 14 indexes after parallel bulk insert | ~3.8 s | (concurrent build across all 14) |
+| Single JSON, 1M, no indexes | 7.97 s | **125 k/sec** |
+| Single CSV, 1M, no indexes | 4.09 s | **245 k/sec** |
+| **Parallel JSON, 10 conns, no indexes** | **3.66 s** | **273 k/sec** (2.18× single-JSON) |
+| Parallel JSON, 10 conns, pre-existing 14 indexes | 5.57 s | **180 k/sec** |
+| **Parallel CSV, 10 conns, no indexes** | **3.34 s** | **300 k/sec** (1.23× single-CSV) |
+| Parallel CSV, 10 conns, pre-existing 14 indexes | 5.10 s | **196 k/sec** |
+| Add 14 indexes after parallel bulk insert | ~3.7–3.9 s | (concurrent build across all 14) |
 | Disk footprint (with 14 indexes) | 1.3 GB |
 
-**Insert WITH indexes still beats load-then-index, margin narrower now.** At 1M × 14 indexes: load (4.11 s) + add-indexes (3.81 s) = 7.92 s → 126 k/sec; insert with pre-existing indexes: 6.28 s → 159 k/sec. Post-hoc rebuild is now fast enough (scan-path lock-free + binary index keys) that load-then-index is viable for evolving schemas; for static schemas, pre-existing indexes still win. **Recommended: create indexes up front when schema is stable; load-then-index when it isn't.**
+**Insert WITH indexes still beats load-then-index, margin is back.** At 1M × 14 indexes: load CSV (3.34 s) + add-indexes (3.72 s) = 7.06 s → 142 k/sec; insert CSV with pre-existing indexes: 5.10 s → **196 k/sec**. Post-hoc rebuild is fast (scan-path lock-free + binary index keys) so load-then-index stays viable for evolving schemas, but for static schemas pre-existing indexes win by ~40 %. **Recommended: create indexes up front when schema is stable; load-then-index when it isn't.**
 
 ### Notes
 
 - **File-descriptor limit.** At `SPLITS ≥ 512`, `ucache_grow_shard` briefly holds 2 fds per shard during migration, so peak can hit ~8,256 fds at the default `FCACHE_MAX=4096`. The server auto-raises its soft limit to the hard limit at startup (no privilege needed); if the hard limit itself is too low (shells default to 1024 on many distros), the startup WARN tells you exactly what to put in `/etc/security/limits.conf` or as `LimitNOFILE=` in a systemd unit.
-- **Splits tuning.** Use `splits:256–512` for single-connection bulk; `splits:1024+` for multi-connection bulk (fewer cross-request shard-lock collisions).
+- **Splits tuning.** Size `splits` to keep **records-per-shard in the 78K–200K sweet spot** (acceptable up to ~500K, degradation past ~1M). `create-object` defaults to `splits=16` when omitted — fine for test/demo loads, too low for anything above a few million rows. Pick from expected row count:
+
+    | Expected rows | Recommended `splits` | Records/shard at target |
+    |---------------|----------------------|-------------------------|
+    | < 1M          | 8–32                 | up to ~125K             |
+    | 1–10M         | 64                   | ~16K–156K               |
+    | 10–25M        | 128                  | ~78K–195K (optimal band) |
+    | 25–50M        | 256                  | ~98K–195K               |
+    | 50–100M       | 512                  | ~98K–195K               |
+    | 100–250M      | 512                  | ~200K–488K (acceptable) |
+    | 250–500M      | 1024                 | ~244K–488K              |
+    | 500M–1B       | 2048                 | ~244K–488K              |
+    | 1–4B          | 4096 (MAX_SPLITS)    | ~244K–976K (at limit)   |
+
+    Numbers are from the parallel K/V bench on 10M rows (128 splits fastest at 3.488s; 64 splits 3.605s; 256 splits 3.986s; 1024 splits 5.454s). Counter-intuitively, raising `splits` *beyond* the sweet spot slows things down even at 10 parallel connections — more shard files = more syscalls and mmap page faults per query, and shard-lock contention isn't the bottleneck at this scale. If you exceed ~1M records/shard you've saturated this design — split across multiple objects (or tenant dirs) rather than climbing past `MAX_SPLITS=4096`.
 - **CSV vs JSON.** CSV bulk insert is faster because the CSV path parses directly against the mmap'd file via `(ptr, len)` spans with zero per-line memcpy, while the JSON path materializes a `JsonObj` per record.
 
 ### Reproduce
 
 ```bash
-./bench/bench-kv.sh 10000000                          # scenario 1
-./bench/bench-kv-parallel.sh 10000000 1000000 10      # scenario 2 (add SPLITS=1024)
+./bench/bench-kv.sh 10000000                          # scenario 1 (default SPLITS=128)
+./bench/bench-kv-parallel.sh 10000000 1000000 10      # scenario 2 (default SPLITS=128)
 ./bench/create-user-object.sh && \
   ./bench/insert-users.sh 1000000 && \
   ./bench/bench-queries.sh                            # scenario 3
-./bench/bench-invoice.sh 1000000 persistent           # scenario 4
-./bench/bench-parallel.sh 1000000 100000 10           # scenario 5
+./bench/bench-invoice.sh 1000000 persistent           # scenario 4 (default SPLITS=64)
+./bench/bench-parallel.sh 1000000 100000 10           # scenario 5 (default SPLITS=64)
 ```
 
-Scripts self-resolve to the repo root regardless of CWD and start/stop the server automatically. All scripts honour `SPLITS=N` to override the default (256).
+Scripts self-resolve to the repo root regardless of CWD and start/stop the server automatically. All scripts honour `SPLITS=N` to override their per-script default (128 for the K/V scripts, 64 for the invoice scripts — matched to the [splits sizing table](#notes) for each record count).
 
 ## Features
 
