@@ -159,6 +159,28 @@ run "agg group by age having n>16000" \
     '{"mode":"aggregate","dir":"default","object":"users","group_by":["age"],"aggregates":[{"fn":"count","alias":"n"},{"fn":"avg","field":"balance","alias":"avg_bal"}],"having":[{"field":"n","op":"gt","value":"16000"}],"order_by":"avg_bal","order":"desc"}'
 
 echo ""
+
+# ==================== CURSOR (keyset pagination on find) ====================
+echo "--- CURSOR (keyset pagination) ---"
+echo "  [Page 1 — signal cursor mode with cursor:null]"
+run "cursor ASC page 1 (age, limit 100)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[],"order_by":"age","order":"asc","limit":100,"cursor":null,"fields":["username","age"]}'
+run "cursor DESC page 1 (age, limit 100)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[],"order_by":"age","order":"desc","limit":100,"cursor":null,"fields":["username","age"]}'
+run "cursor ASC page 1 + criteria (active=false)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[{"field":"active","op":"eq","value":"false"}],"order_by":"age","order":"asc","limit":100,"cursor":null,"fields":["username","age"]}'
+
+echo "  [Continuation — hand back a cursor to a mid-range position]"
+run "cursor ASC page N (age=50, continuation)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[],"order_by":"age","order":"asc","limit":100,"cursor":{"age":"50","key":"00000000000000000000000000000000"},"fields":["username","age"]}'
+run "cursor DESC page N (age=30, continuation)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[],"order_by":"age","order":"desc","limit":100,"cursor":{"age":"30","key":"ffffffffffffffffffffffffffffffff"},"fields":["username","age"]}'
+
+echo "  [Offset-based deep page for contrast — buffer-sort path]"
+run "offset 50000 limit 100 order_by age (no cursor, full buffer-sort)" \
+    '{"mode":"find","dir":"default","object":"users","criteria":[],"order_by":"age","order":"asc","offset":50000,"limit":100,"fields":["username","age"]}'
+
+echo ""
 echo "======================================"
 echo "  Benchmark complete"
 echo "======================================"

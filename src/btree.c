@@ -1184,12 +1184,29 @@ void btree_range_desc_ex(const char *path,
     /* Step 2: iterate leaves right-to-left. Within each leaf, decode entries
        forward (prefix compression forces forward reconstruction) into a
        local snapshot array, then replay entries in reverse applying the
-       [min, max] range filter. Stop early if the callback returns < 0. */
+       [min, max] range filter. Stop early if the callback returns < 0.
+
+       Leaves are key-ordered ascending. Before paying the decode cost on a
+       leaf, peek its slot-0 anchor key:
+         - If first_key > max_val → every entry in leaf is > max_val, skip.
+         - If first_key < min_val → every entry here still ≥ first_key but
+           prior (leftward) leaves can only have smaller keys. We stop the
+           whole walk after processing this leaf. */
     int stop = 0;
     for (int li = (int)leaf_count - 1; li >= 0 && !stop; li--) {
         uint8_t *page = bt_page(&bt, leaves[li]);
         BtPageHeader *ph = (BtPageHeader *)page;
         if (ph->count == 0) continue;
+
+        /* Cheap first-key peek: slot 0 is always an anchor, so one leaf_iter
+           step materialises its full key without touching the rest of the
+           leaf. */
+        LeafIter peek;
+        leaf_iter_init(&peek, page);
+        if (!leaf_iter_next(&peek)) continue;
+        int peek_vs_max = val_cmp(peek.key_buf, peek.key_len, max_val, max_len);
+        if (peek_vs_max > 0) continue;
+        if (max_exclusive && peek_vs_max == 0 && ph->count == 1) continue;
 
         DescEntrySnap *snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
         if (!snaps) break;
