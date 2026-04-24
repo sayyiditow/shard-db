@@ -27,7 +27,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-request-timeout.sh           # Per-request timeout_ms                (10)
 ./tests/test-bulk-update-delimited.sh     # CSV per-key partial update            (34)
 ./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (21)
-# Total: 404 tests
+./tests/test-find-cursor.sh               # Keyset cursor pagination on find      (41)
+# Total: 445 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -161,6 +162,34 @@ All advanced queries go through `./shard-db query '<json>'`.
  "fields":["id","name"],
  "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
 ```
+
+### Find cursor (keyset pagination)
+
+For deep pagination on large result sets, offset-based paging pays O(matches) per page (the full-scan buffer-sort path). A cursor driven off an indexed `order_by` field is O(limit) regardless of page depth.
+
+```json
+// Page 1 — signal cursor pagination with cursor:null (or cursor:{})
+{"mode":"find","dir":"t","object":"orders",
+ "criteria":[{"field":"status","op":"eq","value":"paid"}],
+ "order_by":"amount","order":"asc","limit":100,"cursor":null}
+
+// Response wraps rows and emits the next-page cursor
+{"rows":[...], "cursor":{"amount":"500.00","key":"ord_4912"}}
+
+// Page N+1 — hand back the previous page's cursor verbatim
+{"mode":"find", ..., "order_by":"amount","limit":100,
+ "cursor":{"amount":"500.00","key":"ord_4912"}}
+
+// Last page returns "cursor":null
+```
+
+Rules:
+- `order_by` field **must be indexed** — cursor queries reject otherwise with a clear error.
+- Cursor tie-breaks on `hash16(primary_key)` when multiple rows share the same `order_by` value, so pagination is stable even with ties.
+- `cursor:null` or `cursor:{}` in the request opts into cursor mode (page 1, walks from start/end).
+- Omitting `cursor` entirely keeps backward-compat behavior (unwrapped array, buffer-sort for `order_by`).
+- `format:"csv"` and `join` are not supported with cursor — use the non-cursor `find` path for those.
+- Cursor validation is strict on shape (must reference `order_by` field + `key`), not on content: a cursor whose key has been deleted since page 1 still seeks to the correct byte position, standard keyset semantics.
 
 ### Auth: scope + permissions
 

@@ -1059,14 +1059,15 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *join = json_obj_strdup_raw(&req, "join");
         char *ob = json_obj_strdup(&req, "order_by");
         char *od = json_obj_strdup(&req, "order");
+        char *cur = json_obj_strdup_raw(&req, "cursor");
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
         if (criteria || join)
             cmd_find(db_root, object, criteria ? criteria : "[]",
-                     off, lim, fields, excl, fmt, delim, join, ob, od);
+                     off, lim, fields, excl, fmt, delim, join, ob, od, cur);
         else OUT("{\"error\":\"Missing criteria\"}\n");
         free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
-        free(delim); free(join); free(ob); free(od);
+        free(delim); free(join); free(ob); free(od); free(cur);
     } else if (strcmp(mode, "keys") == 0) {
         char *off_s = json_obj_strdup(&req, "offset");
         char *lim_s = json_obj_strdup(&req, "limit");
@@ -1532,7 +1533,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         /* find\tobj\tcriteria\toff\tlim\tfields (excludedKeys/join/order_by via JSON mode only) */
         cmd_find(eff_root, object, arg1,
                  arg2[0] ? atoi(arg2) : 0, arg3[0] ? atoi(arg3) : 0,
-                 arg4[0] ? arg4 : NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                 arg4[0] ? arg4 : NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     } else if (strcasecmp(cmd, "backup") == 0) {
         cmd_backup(eff_root, object);
     } else if (strcasecmp(cmd, "add-index") == 0) {

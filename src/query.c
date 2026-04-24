@@ -6400,12 +6400,258 @@ static int typed_field_is_numeric(uint8_t ft) {
            ft == FT_BOOL || ft == FT_BYTE;
 }
 
+/* ========== Find cursor (keyset pagination) ==========
+   Client submits the cursor from the previous page's response as
+       "cursor": {"<order_by>": "<value>", "key": "<primary_key>"}
+   and we seek past that position in the order_by field's btree. Within a
+   run of equal order_by values, we tie-break on hash16(primary_key) so
+   pagination is stable even if the btree has many records sharing the
+   same order_by value.
+
+   Shape constraints (locked 2026-04-24 in cursor_design.md):
+   - transparent JSON, not opaque blob
+   - indexed order_by is hard-required; reject if not
+   - single-field order_by only; multi-field composite indexes are for
+     filter acceleration, not pagination
+   - strict shape validation at parse; cursor contents are NOT validated
+     against live data (stale cursors just seek to the last-known byte
+     position, matching standard keyset semantics) */
+typedef struct {
+    int    present;
+    char   value[1024];      /* textual value of the order_by field */
+    size_t vlen;
+    char   key[1024];        /* primary key string */
+    size_t klen;
+} FindCursor;
+
+/* Return codes:
+   0 with out->present=0 — "cursor" key present but empty/null (page 1 of
+                           cursor pagination: use wrapper response, walk
+                           from start, emit initial cursor)
+   0 with out->present=1 — cursor object populated (subsequent page)
+   -1                     — malformed cursor content (error message in *err)
+   1                      — cursor key entirely absent (not a cursor query;
+                           caller uses the regular find path) */
+static int parse_cursor_object(const char *cursor_json, const char *order_by,
+                               FindCursor *out, const char **err) {
+    out->present = 0;
+    out->vlen = 0;
+    out->klen = 0;
+    if (!cursor_json || !cursor_json[0]) return 1;
+
+    /* Opt-in-to-cursor-pagination shapes: "null" or "{}" → page 1. */
+    const char *p = json_skip(cursor_json);
+    if (strncmp(p, "null", 4) == 0) return 0;        /* page 1, no position */
+    if (*p != '{') { *err = "cursor must be a JSON object"; return -1; }
+
+    JsonObj c;
+    json_parse_object(cursor_json, strlen(cursor_json), &c);
+
+    /* Detect empty object {}. json_obj_strdup returns NULL for both empty
+       object and missing key; we distinguish by walking raw JSON. Treat
+       {} as page 1 (no position). */
+    int saw_any_pair = 0;
+    for (const char *q = p + 1; *q; q++) {
+        if (*q == '}') break;
+        if (*q != ' ' && *q != '\t' && *q != '\n') { saw_any_pair = 1; break; }
+    }
+    if (!saw_any_pair) return 0;                     /* page 1, empty object */
+
+    char *kv = json_obj_strdup(&c, "key");
+    if (!kv || !kv[0]) { free(kv); *err = "cursor missing 'key' field"; return -1; }
+    size_t klen = strlen(kv);
+    if (klen >= sizeof(out->key)) { free(kv); *err = "cursor key too long"; return -1; }
+    memcpy(out->key, kv, klen + 1);
+    out->klen = klen;
+    free(kv);
+
+    if (!order_by || !order_by[0]) {
+        *err = "cursor requires order_by";
+        return -1;
+    }
+    char *vv = json_obj_strdup(&c, order_by);
+    if (!vv) { *err = "cursor missing order_by field value"; return -1; }
+    size_t vlen = strlen(vv);
+    if (vlen >= sizeof(out->value)) { free(vv); *err = "cursor value too long"; return -1; }
+    memcpy(out->value, vv, vlen + 1);
+    out->vlen = vlen;
+    free(vv);
+
+    out->present = 1;
+    return 0;
+}
+
+/* Per-callback state for the cursor-driven btree walk. */
+typedef struct {
+    /* Walk bounds */
+    const uint8_t *cursor_value_bytes;  /* NULL on page 1 (no cursor) */
+    size_t         cursor_value_len;
+    uint8_t        cursor_hash16[16];   /* derived from cursor.key */
+    int            has_cursor;
+    int            desc;                /* 0=ASC, 1=DESC */
+
+    /* Record fetch context */
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    CriteriaNode  *remaining;           /* full criteria tree; order_by leaf stays in
+                                           because order_by leaf is either equality
+                                           (trivially satisfied by a cursor walk that
+                                           already visits matching btree entries) or
+                                           a range that we still want enforced. */
+
+    /* Emission */
+    const char   **proj_fields;
+    int            proj_count;
+    int            rows_fmt;
+    int            limit;
+    int            printed;
+
+    /* order_by resolution */
+    const TypedField *order_tf;         /* for value-str extraction */
+    int               order_field_idx;
+
+    /* Captured last-emitted cursor (raw bytes). Heap-owned, freed by caller. */
+    char          *last_value_str;
+    char          *last_key_str;
+
+    QueryDeadline *deadline;
+    int            dl_counter;
+} CursorFindCtx;
+
+static int cursor_find_cb(const char *val, size_t vlen,
+                          const uint8_t *hash16, void *ctx) {
+    CursorFindCtx *c = (CursorFindCtx *)ctx;
+    if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
+    if (c->printed >= c->limit) return -1;
+
+    /* Cursor tiebreak. Within a run of identical order_by values the btree
+       physical order is hash16-based (unstable w.r.t. insertion order, but
+       deterministic per-tree), so "strictly after cursor" means value >
+       cursor.value OR (value == cursor.value AND hash16 > cursor.hash16).
+       Mirror-flip for DESC. */
+    if (c->has_cursor) {
+        /* Length-aware compare: memcmp up to min length, then length tiebreak. */
+        size_t mlen = vlen < c->cursor_value_len ? vlen : c->cursor_value_len;
+        int vcmp = memcmp(val, c->cursor_value_bytes, mlen);
+        if (vcmp == 0) {
+            if (vlen < c->cursor_value_len) vcmp = -1;
+            else if (vlen > c->cursor_value_len) vcmp = 1;
+        }
+        if (!c->desc) {
+            if (vcmp < 0) return 0;                     /* shouldn't happen with range bounds */
+            if (vcmp == 0) {
+                int hcmp = memcmp(hash16, c->cursor_hash16, 16);
+                if (hcmp <= 0) return 0;                /* at or before cursor → skip */
+            }
+        } else {
+            if (vcmp > 0) return 0;                     /* shouldn't happen */
+            if (vcmp == 0) {
+                int hcmp = memcmp(hash16, c->cursor_hash16, 16);
+                if (hcmp >= 0) return 0;
+            }
+        }
+    }
+
+    /* Resolve hash16 → (shard, slot) and probe the shard for the record. */
+    int shard_id, start_slot;
+    addr_from_hash(hash16, c->sch->splits, &shard_id, &start_slot);
+    char shard_path[PATH_MAX];
+    build_shard_path(shard_path, sizeof(shard_path), c->db_root, c->object, shard_id);
+    FcacheRead fc = fcache_get_read(shard_path);
+    if (!fc.map) return 0;
+
+    uint32_t slots = fc.slots_per_shard;
+    uint32_t mask  = slots - 1;
+    int slot = -1;
+    for (uint32_t p = 0; p < slots; p++) {
+        uint32_t s = ((uint32_t)start_slot + p) & mask;
+        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
+        if (h->flag == 0 && h->key_len == 0) break;
+        if (h->flag != 1) continue;
+        if (memcmp(h->hash, hash16, 16) == 0) { slot = (int)s; break; }
+    }
+    if (slot < 0) { fcache_release(fc); return 0; }
+
+    SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(slot));
+    const uint8_t *key_start = fc.map + zoneB_off(slot, slots, c->sch->slot_size);
+    const uint8_t *raw = key_start + h->key_len;
+
+    /* Remaining criteria (full tree). Order_by leaf still gets checked — it
+       stays correct because the btree walk only visits entries that would
+       pass a range/eq on the indexed field, and range checks in the tree
+       agree with the range in the walk. */
+    if (c->remaining && !criteria_match_tree(raw, c->remaining, c->fs)) {
+        fcache_release(fc);
+        return 0;
+    }
+
+    /* Emit row. Supports json-default and rows_fmt. */
+    char key_buf[1024];
+    size_t klen = h->key_len < sizeof(key_buf) - 1 ? h->key_len : sizeof(key_buf) - 1;
+    memcpy(key_buf, key_start, klen);
+    key_buf[klen] = '\0';
+
+    if (c->rows_fmt) {
+        OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, h->value_len,
+                                        c->proj_fields[i], c->fs);
+                OUT(",\"%s\"", pv ? pv : "");
+                free(pv);
+            }
+        } else if (c->fs && c->fs->ts) {
+            for (int i = 0; i < c->fs->ts->nfields; i++) {
+                if (c->fs->ts->fields[i].removed) continue;
+                char *pv = typed_get_field_str(c->fs->ts, raw, i);
+                OUT(",\"%s\"", pv ? pv : "");
+                free(pv);
+            }
+        }
+        OUT("]");
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)raw, h->value_len,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)raw, h->value_len, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    /* Capture this row's (order_by_value, key) as the next-page cursor. Each
+       emit overwrites, so after the walk the stored pair is the last row
+       emitted — which is exactly what we send back. */
+    free(c->last_value_str);
+    free(c->last_key_str);
+    c->last_value_str = c->order_tf
+        ? typed_get_field_str(c->fs->ts, raw, c->order_field_idx)
+        : NULL;
+    c->last_key_str = strndup(key_buf, klen);
+
+    c->printed++;
+    fcache_release(fc);
+    return 0;
+}
+
 int cmd_find(const char *db_root, const char *object,
                     const char *criteria_json, int offset, int limit,
                     const char *proj_str, const char *excluded_csv,
                     const char *format, const char *delimiter,
                     const char *join_json,
-                    const char *order_by, const char *order_dir) {
+                    const char *order_by, const char *order_dir,
+                    const char *cursor_json) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
 
@@ -6463,6 +6709,150 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     compile_criteria_tree(tree, driver_fs.ts);
+
+    /* ===== CURSOR PATH (keyset pagination) =====
+       If the request carries "cursor": {...}, drive the walk off the
+       order_by field's btree directly, skipping the buffer-sort path. */
+    if (cursor_json && cursor_json[0]) {
+        const char *cerr = NULL;
+        FindCursor cur;
+        int cr = parse_cursor_object(cursor_json, order_by, &cur, &cerr);
+        if (cr < 0) {
+            OUT("{\"error\":\"%s\"}\n", cerr ? cerr : "invalid cursor");
+            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            return -1;
+        }
+        if (!order_by || !order_by[0]) {
+            OUT("{\"error\":\"cursor requires order_by\"}\n");
+            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            return -1;
+        }
+        if (has_joins) {
+            OUT("{\"error\":\"cursor with join is not supported\"}\n");
+            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            return -1;
+        }
+        if (csv_delim) {
+            OUT("{\"error\":\"cursor with format=csv is not supported\"}\n");
+            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            return -1;
+        }
+
+        /* order_by must be indexed (hard requirement for cursor). */
+        char idx_path[PATH_MAX];
+        snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx",
+                 db_root, object, order_by);
+        struct stat idx_st;
+        if (stat(idx_path, &idx_st) != 0 || idx_st.st_size == 0) {
+            OUT("{\"error\":\"cursor requires order_by field to be indexed\",\"field\":\"%s\"}\n",
+                order_by);
+            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            return -1;
+        }
+
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                   strcmp(order_dir, "DESC") == 0));
+
+        /* Resolve order_by's TypedField for encoding + value extraction. */
+        const TypedField *order_tf = NULL;
+        int order_field_idx = -1;
+        if (driver_fs.ts) {
+            for (int i = 0; i < driver_fs.ts->nfields; i++) {
+                if (strcmp(driver_fs.ts->fields[i].name, order_by) == 0) {
+                    order_tf = &driver_fs.ts->fields[i];
+                    order_field_idx = i;
+                    break;
+                }
+            }
+        }
+
+        /* Encode cursor value bytes for walk bounds. If cursor absent (page 1),
+           walk from start (ASC) or end (DESC); else walk from cursor position,
+           with tiebreak happening inside the callback. */
+        uint8_t cur_value_buf[1024];
+        size_t  cur_value_len = 0;
+        int     has_cur_bytes = 0;
+        if (cur.present) {
+            if (order_tf) {
+                encode_field_for_index(order_tf, cur.value, cur.vlen,
+                                       cur_value_buf, &cur_value_len);
+            } else {
+                /* Composite/unknown — raw bytes. */
+                size_t cap = sizeof(cur_value_buf);
+                cur_value_len = cur.vlen < cap ? cur.vlen : cap;
+                memcpy(cur_value_buf, cur.value, cur_value_len);
+            }
+            has_cur_bytes = 1;
+        }
+
+        /* Derive cursor hash16 from the primary key for tiebreak. */
+        QueryDeadline cdl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+        CursorFindCtx cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.cursor_value_bytes = has_cur_bytes ? cur_value_buf : NULL;
+        cc.cursor_value_len   = cur_value_len;
+        cc.has_cursor         = cur.present;
+        cc.desc               = desc;
+        if (cur.present) {
+            compute_hash_raw(cur.key, cur.klen, cc.cursor_hash16);
+        }
+        cc.db_root = db_root;
+        cc.object  = object;
+        cc.sch     = &sch;
+        cc.fs      = &driver_fs;
+        cc.remaining = tree;            /* full tree; filters apply per record */
+        cc.proj_fields = proj_count > 0 ? proj_fields : NULL;
+        cc.proj_count  = proj_count;
+        cc.rows_fmt    = rows_fmt;
+        cc.limit       = limit;
+        cc.printed     = 0;
+        cc.order_tf    = order_tf;
+        cc.order_field_idx = order_field_idx;
+        cc.deadline    = &cdl;
+
+        /* Cursor response always uses the {rows:[...],cursor:...} wrapper so
+           clients get a single stable shape regardless of rows_fmt. */
+        OUT("{\"rows\":[");
+        if (desc) {
+            /* DESC: walk backward. Upper bound = cursor value (inclusive),
+               lower bound = "". Ties still handled in the callback. */
+            const char *max_val_bytes = has_cur_bytes
+                ? (const char *)cur_value_buf : "\xff\xff\xff\xff";
+            size_t max_val_len = has_cur_bytes ? cur_value_len : 4;
+            btree_range_desc_ex(idx_path,
+                                "", 0, 0,
+                                max_val_bytes, max_val_len, 0,
+                                cursor_find_cb, &cc);
+        } else {
+            /* ASC: walk forward. Lower bound = cursor value (inclusive),
+               upper bound = "\xff\xff\xff\xff". Ties handled in callback. */
+            const char *min_val_bytes = has_cur_bytes
+                ? (const char *)cur_value_buf : "";
+            size_t min_val_len = has_cur_bytes ? cur_value_len : 0;
+            btree_range_ex(idx_path,
+                           min_val_bytes, min_val_len, 0,
+                           "\xff\xff\xff\xff", 4, 0,
+                           cursor_find_cb, &cc);
+        }
+        OUT("]");
+
+        /* Emit next-page cursor if we actually hit the limit (there might be
+           more). If printed < limit the walk drained to the end → null. */
+        if (cc.printed >= limit && cc.last_value_str && cc.last_key_str) {
+            OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}}",
+                order_by, cc.last_value_str, cc.last_key_str);
+        } else {
+            OUT(",\"cursor\":null}");
+        }
+        OUT("\n");
+
+        free(cc.last_value_str);
+        free(cc.last_key_str);
+        free_joins(joins, njoins);
+        free_criteria_tree(tree);
+        free_excluded(&excluded);
+        return 0;
+    }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
 

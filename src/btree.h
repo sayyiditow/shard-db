@@ -104,6 +104,16 @@ void btree_range_ex(const char *path,
                     const char *max_val, size_t max_len, int max_exclusive,
                     bt_result_cb cb, void *ctx);
 
+/* Same as btree_range_ex but emits entries in DESCENDING order. Used by
+   find-cursor's DESC pagination. Implementation walks the leaf chain
+   forward once to collect page IDs (no prev_leaf pointer in our header),
+   then iterates leaves right-to-left; within each leaf, entries are
+   decoded forward into a local array and played back in reverse. */
+void btree_range_desc_ex(const char *path,
+                         const char *min_val, size_t min_len, int min_exclusive,
+                         const char *max_val, size_t max_len, int max_exclusive,
+                         bt_result_cb cb, void *ctx);
+
 /* Bulk build from sorted array. Destroys existing index. */
 typedef struct {
     const char *value;

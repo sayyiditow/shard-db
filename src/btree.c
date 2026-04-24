@@ -1140,6 +1140,94 @@ void btree_range(const char *path,
     btree_range_ex(path, min_val, min_len, 0, max_val, max_len, 0, cb, ctx);
 }
 
+/* Descending range scan. See header for rationale. */
+typedef struct {
+    uint8_t key[BT_MAX_VAL_LEN];
+    size_t  key_len;
+    uint8_t hash[BT_HASH_SIZE];
+} DescEntrySnap;
+
+void btree_range_desc_ex(const char *path,
+                         const char *min_val, size_t min_len, int min_exclusive,
+                         const char *max_val, size_t max_len, int max_exclusive,
+                         bt_result_cb cb, void *ctx) {
+    BtFile bt;
+    if (bt_open_cached(&bt, path) != 0) return;
+    BtFileHeader *fh = (BtFileHeader *)bt.map;
+
+    /* Step 1: descend to leftmost leaf, then walk next_leaf chain to collect
+       every leaf page ID in forward order. We don't have prev_leaf in the
+       header, so reverse iteration has to replay this list backward. */
+    uint32_t *leaves = NULL;
+    size_t leaf_count = 0, leaf_cap = 0;
+
+    uint32_t page_id = fh->root_page;
+    while (1) {
+        uint8_t *page = bt_page(&bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->page_type == 1) break;
+        /* Internal node: next_leaf stores the leftmost child. */
+        page_id = ph->next_leaf;
+    }
+    while (page_id != 0) {
+        if (leaf_count >= leaf_cap) {
+            leaf_cap = leaf_cap ? leaf_cap * 2 : 1024;
+            uint32_t *nl = realloc(leaves, leaf_cap * sizeof(uint32_t));
+            if (!nl) { free(leaves); bt_close_cached(&bt); return; }
+            leaves = nl;
+        }
+        leaves[leaf_count++] = page_id;
+        BtPageHeader *ph = (BtPageHeader *)bt_page(&bt, page_id);
+        page_id = ph->next_leaf;
+    }
+
+    /* Step 2: iterate leaves right-to-left. Within each leaf, decode entries
+       forward (prefix compression forces forward reconstruction) into a
+       local snapshot array, then replay entries in reverse applying the
+       [min, max] range filter. Stop early if the callback returns < 0. */
+    int stop = 0;
+    for (int li = (int)leaf_count - 1; li >= 0 && !stop; li--) {
+        uint8_t *page = bt_page(&bt, leaves[li]);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->count == 0) continue;
+
+        DescEntrySnap *snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
+        if (!snaps) break;
+        size_t n = 0;
+
+        LeafIter it;
+        leaf_iter_init(&it, page);
+        while (leaf_iter_next(&it) && n < ph->count) {
+            size_t kl = it.key_len;
+            if (kl > BT_MAX_VAL_LEN) kl = BT_MAX_VAL_LEN;
+            memcpy(snaps[n].key, it.key_buf, kl);
+            snaps[n].key_len = kl;
+            memcpy(snaps[n].hash, it.hash, BT_HASH_SIZE);
+            n++;
+        }
+
+        for (int i = (int)n - 1; i >= 0 && !stop; i--) {
+            int cmp_max = val_cmp(snaps[i].key, snaps[i].key_len, max_val, max_len);
+            if (cmp_max > 0) continue;                 /* beyond max, skip */
+            if (max_exclusive && cmp_max == 0) continue;
+
+            int cmp_min = val_cmp(snaps[i].key, snaps[i].key_len, min_val, min_len);
+            if (cmp_min < 0) { stop = 1; break; }      /* below min, done */
+            if (min_exclusive && cmp_min == 0) continue;
+
+            if (cb((const char *)snaps[i].key, snaps[i].key_len,
+                   snaps[i].hash, ctx) < 0) {
+                stop = 1;
+                break;
+            }
+        }
+        free(snaps);
+    }
+
+    free(leaves);
+    bt_close_cached(&bt);
+}
+
 void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     btree_cache_invalidate(path);
     /* Delete existing file */
