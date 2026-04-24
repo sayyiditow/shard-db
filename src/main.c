@@ -136,6 +136,20 @@ int main(int argc, char *argv[]) {
             snprintf(json, sizeof(json), "{\"mode\":\"reindex\"}");
         return cmd_query_json(port, json);
     }
+    /* drop <dir> <obj>  [--if-exists]   — remove object data + config entirely */
+    if (strcmp(cmd, "drop") == 0 || strcmp(cmd, "drop-object") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: shard-db drop <dir> <obj> [--if-exists]\n");
+            return 1;
+        }
+        int if_exists = (argc >= 5 && strcmp(argv[4], "--if-exists") == 0);
+        char json[512];
+        snprintf(json, sizeof(json),
+            "{\"mode\":\"drop-object\",\"dir\":\"%s\",\"object\":\"%s\"%s}",
+            argv[2], argv[3], if_exists ? ",\"if_exists\":true" : "");
+        return cmd_query_json(port, json);
+    }
+
     if (strcmp(cmd, "stats") == 0)
         return cmd_query_json(port, "{\"mode\":\"stats\",\"format\":\"table\"}");
     if (strcmp(cmd, "db-dirs") == 0)

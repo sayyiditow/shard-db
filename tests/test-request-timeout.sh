@@ -48,15 +48,16 @@ sleep 0.5
 # Seed a large enough object so a full scan takes clearly measurable time.
 # Clock resolution is CLOCK_MONOTONIC_COARSE (~4 ms on Linux), so we aim for
 # scans in the 50-100 ms range and set timeout_ms=10 to get a reliable trip
-# without needing millisecond precision.
+# without needing millisecond precision. Sized for ~16-way parallel scan —
+# smaller counts complete in <10 ms on multicore and mask the deadline.
 $BIN query '{"mode":"create-object","dir":"default","object":"rt_big","splits":8,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:32"]}' > /dev/null
 
-# Bulk-insert 300k records — scan of this on a full filter reliably takes
-# tens of ms on modern hardware, well above the 4 ms clock resolution.
+# Bulk-insert 1.5M records — scan of this on a full filter reliably takes
+# ~100 ms under full shard-scan parallelism.
 SEED=$(mktemp)
 {
   printf '['
-  for i in $(seq 1 300000); do
+  for i in $(seq 1 1500000); do
     if [ $i -gt 1 ]; then printf ','; fi
     printf '{"id":"k%d","data":{"status":"paid","amount":%d,"note":"note_for_record_%d_padding_x"}}' "$i" $((i % 1000)) "$i"
   done

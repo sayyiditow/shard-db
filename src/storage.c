@@ -331,6 +331,21 @@ void ucache_write_release(FcacheRead h) {
         pthread_rwlock_unlock(&g_ucache[h.slot].rwlock);
 }
 
+/* Ask the kernel to start flushing this shard's dirty pages to disk —
+   non-blocking. sync_file_range(SYNC_FILE_RANGE_WRITE) is Linux-specific;
+   on other platforms we compile to a no-op (portable behavior: rely on the
+   kernel's background writeback daemons + the final msync-on-close for
+   durability). Called at end of bulk-insert shard workers so Phase 2's
+   dirty pages start draining while later phases run. */
+void ucache_nudge_writeback(int ucache_slot) {
+    if (!g_ucache || ucache_slot < 0 || ucache_slot >= g_ucache_slots) return;
+#ifdef __linux__
+    UCacheEntry *e = &g_ucache[ucache_slot];
+    if (e->fd >= 0)
+        sync_file_range(e->fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+#endif
+}
+
 /* Update ShardHeader.record_count atomically (mmap page is live). */
 void ucache_bump_record_count(int ucache_slot, int delta) {
     if (!g_ucache || ucache_slot < 0 || ucache_slot >= g_ucache_slots) return;
@@ -343,6 +358,67 @@ void ucache_bump_record_count(int ucache_slot, int delta) {
         uint32_t d = (uint32_t)(-delta);
         hdr->record_count = (hdr->record_count > d) ? hdr->record_count - d : 0;
     }
+}
+
+/* Parallel-rehash worker. Walks a range of OLD slots, atomically claims a
+   destination slot via CAS on SlotHeader.flag (0→1), then fills hash/lengths
+   and copies the payload. False sharing at the cache-line level is possible
+   (SlotHeader is 24 B, ~2-3 per 64 B line) but the destination is 2× the
+   source so probe collisions are rare at 50 % load. */
+typedef struct {
+    uint32_t start_slot;
+    uint32_t end_slot;
+    uint8_t *old_map;
+    uint8_t *nmap;
+    uint32_t old_slots;
+    uint32_t new_slots;
+    uint32_t new_mask;
+    int      slot_size;
+    _Atomic uint32_t *live_counter;
+} GrowRehashArg;
+
+static void *grow_rehash_worker(void *arg) {
+    GrowRehashArg *w = (GrowRehashArg *)arg;
+    uint32_t local_live = 0;
+
+    for (uint32_t s = w->start_slot; s < w->end_slot; s++) {
+        SlotHeader *h = (SlotHeader *)(w->old_map + zoneA_off(s));
+        /* Migrate activated records (flag=1) AND pending bulk-insert records
+           (flag=0 with key_len>0) — activation may not have fired yet. */
+        int pending_bulk = (h->flag == 0 && h->key_len > 0);
+        if (h->flag != 1 && !pending_bulk) continue;
+
+        uint32_t raw = ((uint32_t)h->hash[2] << 24) | ((uint32_t)h->hash[3] << 16)
+                     | ((uint32_t)h->hash[4] << 8)  |  (uint32_t)h->hash[5];
+        uint32_t start = raw & w->new_mask;
+
+        int placed = 0;
+        for (uint32_t i = 0; i < w->new_slots; i++) {
+            uint32_t ns = (start + i) & w->new_mask;
+            SlotHeader *nh = (SlotHeader *)(w->nmap + zoneA_off(ns));
+            uint16_t expected = 0;
+            if (__atomic_compare_exchange_n(&nh->flag, &expected, 1,
+                                             0,
+                                             __ATOMIC_ACQUIRE,
+                                             __ATOMIC_RELAXED)) {
+                /* Won the slot — write remaining header fields + payload.
+                   Other workers see flag=1 and skip past us. */
+                memcpy(nh->hash, h->hash, 16);
+                nh->key_len = h->key_len;
+                nh->value_len = h->value_len;
+                uint8_t *op = w->old_map + zoneB_off(s, w->old_slots, w->slot_size);
+                uint8_t *np = w->nmap  + zoneB_off(ns, w->new_slots, w->slot_size);
+                memcpy(np, op, (size_t)h->key_len + h->value_len);
+                placed = 1;
+                break;
+            }
+            /* CAS failed — slot taken by another worker, keep probing */
+        }
+        if (placed) local_live++;
+    }
+
+    atomic_fetch_add_explicit(w->live_counter, local_live, memory_order_relaxed);
+    return NULL;
 }
 
 /* Double slots_per_shard for this shard: build `.new`, rehash live
@@ -400,37 +476,50 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
     memset(nhdr->reserved, 0, sizeof(nhdr->reserved));
 
     uint32_t new_mask = new_slots - 1;
-    uint32_t live = 0;
+    _Atomic uint32_t live_atomic = 0;
 
-    for (uint32_t s = 0; s < old_slots; s++) {
-        SlotHeader *h = (SlotHeader *)(e->map + zoneA_off(s));
-        /* Migrate both activated records (flag=1) and pending bulk-insert
-           records (flag=0 with key_len>0). Bulk insert activates in batch
-           via activate_worker, which may not have run yet when grow fires. */
-        int pending_bulk = (h->flag == 0 && h->key_len > 0);
-        if (h->flag != 1 && !pending_bulk) continue;
-
-        uint32_t raw = ((uint32_t)h->hash[2] << 24) | ((uint32_t)h->hash[3] << 16)
-                     | ((uint32_t)h->hash[4] << 8)  |  (uint32_t)h->hash[5];
-        uint32_t start = raw & new_mask;
-
-        uint32_t ns = 0;
-        int placed = 0;
-        for (uint32_t i = 0; i < new_slots; i++) {
-            ns = (start + i) & new_mask;
-            SlotHeader *nh2 = (SlotHeader *)(nmap + zoneA_off(ns));
-            if (nh2->flag == 0 && nh2->key_len == 0) { placed = 1; break; }
-        }
-        if (!placed) continue;  /* should never happen with 50% load */
-
-        SlotHeader *nh2 = (SlotHeader *)(nmap + zoneA_off(ns));
-        memcpy(nh2, h, HEADER_SIZE);
-        nh2->flag = 1;  /* activate now — survives activate_worker skipping */
-        uint8_t *op = e->map + zoneB_off(s, old_slots, slot_size);
-        uint8_t *np = nmap + zoneB_off(ns, new_slots, slot_size);
-        memcpy(np, op, (size_t)h->key_len + h->value_len);
-        live++;
+    /* Parallel rehash. Raw pthreads (not the global pool) because grow is
+       often called from a pool task (bulk_insert_shard_worker) — submitting
+       nested parallel_for would deadlock when the pool is saturated.
+       Small shards stay serial to skip pthread_create overhead. */
+    int ng_threads = 1;
+    if (old_slots >= 10000) {
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        ng_threads = (nproc > 1) ? (int)nproc : 1;
+        if (ng_threads > 8) ng_threads = 8;
+        /* Don't spawn more threads than source chunks of 2048+ slots. */
+        uint32_t max_useful = old_slots / 2048;
+        if (max_useful == 0) max_useful = 1;
+        if ((uint32_t)ng_threads > max_useful) ng_threads = (int)max_useful;
     }
+
+    GrowRehashArg *gargs = calloc((size_t)ng_threads, sizeof(GrowRehashArg));
+    uint32_t chunk = old_slots / (uint32_t)ng_threads;
+    for (int t = 0; t < ng_threads; t++) {
+        gargs[t].start_slot = (uint32_t)t * chunk;
+        gargs[t].end_slot   = (t == ng_threads - 1) ? old_slots : ((uint32_t)t + 1) * chunk;
+        gargs[t].old_map    = e->map;
+        gargs[t].nmap       = nmap;
+        gargs[t].old_slots  = old_slots;
+        gargs[t].new_slots  = new_slots;
+        gargs[t].new_mask   = new_mask;
+        gargs[t].slot_size  = slot_size;
+        gargs[t].live_counter = &live_atomic;
+    }
+
+    if (ng_threads == 1) {
+        grow_rehash_worker(&gargs[0]);
+    } else {
+        pthread_t *tids = malloc((size_t)ng_threads * sizeof(pthread_t));
+        for (int t = 0; t < ng_threads; t++)
+            pthread_create(&tids[t], NULL, grow_rehash_worker, &gargs[t]);
+        for (int t = 0; t < ng_threads; t++)
+            pthread_join(tids[t], NULL);
+        free(tids);
+    }
+    free(gargs);
+
+    uint32_t live = atomic_load_explicit(&live_atomic, memory_order_relaxed);
     nhdr->record_count = live;
 
     msync(nmap, new_size, MS_SYNC);

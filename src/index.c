@@ -467,6 +467,7 @@ typedef struct {
     int is_composite;
     int field_indices[16];
     int field_index_count;
+    pthread_mutex_t lock;  /* protects pairs array append only */
 } IndexScanCtx;
 
 static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
@@ -476,8 +477,8 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     uint8_t *key_buf = NULL;
     size_t key_len = 0;
 
+    /* Key encoding is thread-local — no lock. */
     if (ic->is_composite) {
-        /* Composite stays on ASCII-concat path. */
         char cat[4096]; int cpos = 0; int ok = 1;
         for (int i = 0; i < ic->field_index_count; i++) {
             char *v = typed_get_field_str(ic->ts, (const uint8_t *)raw, ic->field_indices[i]);
@@ -490,7 +491,6 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
             key_len = (size_t)cpos;
         }
     } else {
-        /* Single field — typed binary → index-key bytes (skip ASCII render). */
         int fidx = ic->field_indices[0];
         if (fidx >= 0) {
             const TypedField *f = &ic->ts->fields[fidx];
@@ -502,6 +502,7 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     }
 
     if (key_buf && key_len > 0) {
+        pthread_mutex_lock(&ic->lock);
         if (ic->pair_count >= ic->pair_cap) {
             ic->pair_cap *= 2;
             ic->pairs = realloc(ic->pairs, ic->pair_cap * sizeof(BtEntry));
@@ -510,6 +511,7 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
         ic->pairs[ic->pair_count].vlen = key_len;
         memcpy(ic->pairs[ic->pair_count].hash, hdr->hash, 16);
         ic->pair_count++;
+        pthread_mutex_unlock(&ic->lock);
     } else {
         free(key_buf);
     }
@@ -548,6 +550,7 @@ int cmd_add_index(const char *db_root, const char *object,
     ic.pair_cap = 4096;
     ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
     ic.is_composite = (strchr(field, '+') != NULL);
+    pthread_mutex_init(&ic.lock, NULL);
 
     if (ic.is_composite) {
         char fbuf[256]; strncpy(fbuf, field, 255); fbuf[255] = '\0';
@@ -573,6 +576,7 @@ int cmd_add_index(const char *db_root, const char *object,
 
     for (size_t i = 0; i < ic.pair_count; i++) free((char *)ic.pairs[i].value);
     free(ic.pairs);
+    pthread_mutex_destroy(&ic.lock);
 
     /* Add to index.conf */
     mkdirp(dirname_of(conf_path));
@@ -609,6 +613,9 @@ typedef struct {
     BtEntry *pairs[MAX_FIELDS];
     size_t pair_count[MAX_FIELDS];
     size_t pair_cap[MAX_FIELDS];
+    /* Per-field mutex: the pairs arrays grow independently, so serializing
+       each separately lets different fields' appends happen in parallel. */
+    pthread_mutex_t lock[MAX_FIELDS];
 } MultiIndexCtx;
 
 static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
@@ -620,6 +627,7 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
         uint8_t *key_buf = NULL;
         size_t key_len = 0;
 
+        /* Key encoding is thread-local. */
         if (mc->is_composite[fi]) {
             char cat[4096]; int cpos = 0; int ok = 1;
             for (int si = 0; si < mc->field_index_count[fi]; si++) {
@@ -644,6 +652,7 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
         }
 
         if (key_buf && key_len > 0) {
+            pthread_mutex_lock(&mc->lock[fi]);
             if (mc->pair_count[fi] >= mc->pair_cap[fi]) {
                 mc->pair_cap[fi] *= 2;
                 mc->pairs[fi] = realloc(mc->pairs[fi], mc->pair_cap[fi] * sizeof(BtEntry));
@@ -652,6 +661,7 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
             mc->pairs[fi][mc->pair_count[fi]].vlen = key_len;
             memcpy(mc->pairs[fi][mc->pair_count[fi]].hash, hdr->hash, 16);
             mc->pair_count[fi]++;
+            pthread_mutex_unlock(&mc->lock[fi]);
         } else {
             free(key_buf);
         }
@@ -717,6 +727,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
         mc.is_composite[fi] = (strchr(actual_fields[fi], '+') != NULL);
         mc.pair_cap[fi] = 4096;
         mc.pairs[fi] = malloc(mc.pair_cap[fi] * sizeof(BtEntry));
+        pthread_mutex_init(&mc.lock[fi], NULL);
 
         if (mc.is_composite[fi]) {
             char fb[256]; strncpy(fb, actual_fields[fi], 255); fb[255] = '\0';
@@ -735,6 +746,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
     scan_shards(data_dir, sch.slot_size, multi_index_scan_cb, &mc);
+    for (int fi = 0; fi < actual_count; fi++) pthread_mutex_destroy(&mc.lock[fi]);
 
     /* Parallel sort + build — one thread per index */
     IdxBuildArgIdx *ib_args = malloc(actual_count * sizeof(IdxBuildArgIdx));

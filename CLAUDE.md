@@ -26,8 +26,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
 ./tests/test-request-timeout.sh           # Per-request timeout_ms                (10)
 ./tests/test-bulk-update-delimited.sh     # CSV per-key partial update            (34)
-./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (18)
-# Total: 401 tests
+./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (21)
+# Total: 404 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users

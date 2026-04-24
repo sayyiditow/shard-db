@@ -35,7 +35,7 @@ DB_ROOT=$(grep DB_ROOT db.env | sed "s/.*[\"']\(.*\)[\"']/\1/")
 mkdir -p "$DB_ROOT"
 grep -q "^default$" "$DB_ROOT/dirs.conf" 2>/dev/null || echo "default" >> "$DB_ROOT/dirs.conf"
 
-for obj in bi_int bi_num bi_date bi_varchar bi_comp; do
+for obj in bi_int bi_int_bulk bi_num bi_date bi_varchar bi_comp; do
     rm -rf "$DB_ROOT/default/$obj"
     sed -i "/^default:$obj:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 done
@@ -48,6 +48,24 @@ $BIN query '{"mode":"create-object","dir":"default","object":"bi_int","splits":2
 for n in -2147483647 -1000000 -1 0 1 1000000 2147483647; do
     $BIN insert default bi_int "k_$n" "{\"n\":$n}" > /dev/null
 done
+
+# Same fixture via bulk-insert to guard against write-side drift between
+# the single-record path (storage.c) and the bulk path (query.c).
+rm -rf "$DB_ROOT/default/bi_int_bulk"
+sed -i "/^default:bi_int_bulk:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_int_bulk","splits":2,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
+BULK=$(mktemp)
+cat > "$BULK" <<'EOF'
+[{"id":"b_min","data":{"n":-2147483647}},{"id":"b_-1m","data":{"n":-1000000}},{"id":"b_-1","data":{"n":-1}},{"id":"b_0","data":{"n":0}},{"id":"b_1","data":{"n":1}},{"id":"b_1m","data":{"n":1000000}},{"id":"b_max","data":{"n":2147483647}}]
+EOF
+$BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bi_int_bulk\",\"file\":\"$BULK\"}" > /dev/null
+rm -f "$BULK"
+R=$($BIN query '{"mode":"count","dir":"default","object":"bi_int_bulk","criteria":[{"field":"n","op":"eq","value":"-1"}]}')
+assert_eq "bulk-insert: eq -1 finds 1 (write path binary-correct)" '"count":1' "$R"
+R=$($BIN query '{"mode":"count","dir":"default","object":"bi_int_bulk","criteria":[{"field":"n","op":"lt","value":"0"}]}')
+assert_eq "bulk-insert: lt 0 finds 3 negatives" '"count":3' "$R"
+R=$($BIN query '{"mode":"count","dir":"default","object":"bi_int_bulk","criteria":[{"field":"n","op":"gte","value":"0"}]}')
+assert_eq "bulk-insert: gte 0 finds 4 non-negatives" '"count":4' "$R"
 
 R=$($BIN query '{"mode":"count","dir":"default","object":"bi_int","criteria":[{"field":"n","op":"eq","value":"-2147483647"}]}')
 assert_eq "eq MIN_INT" '"count":1' "$R"
@@ -119,7 +137,7 @@ assert_eq "post-reindex: varchar prefix still 2" '"count":2' "$R"
 
 echo "=== CLEANUP ==="
 $BIN stop > /dev/null 2>&1 || true
-for obj in bi_int bi_num bi_date bi_varchar bi_comp; do
+for obj in bi_int bi_int_bulk bi_num bi_date bi_varchar bi_comp; do
     rm -rf "$DB_ROOT/default/$obj"
     sed -i "/^default:$obj:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 done

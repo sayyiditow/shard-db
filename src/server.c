@@ -286,6 +286,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         "truncate", "vacuum", "backup", "recount",
         "add-field", "remove-field", "rename-field",
         "add-index", "remove-index",
+        "drop-object",
         NULL
     };
     for (int i = 0; obj[i]; i++)
@@ -875,12 +876,27 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *indexes_j = json_obj_strdup_raw(&req, "indexes");
         char *splits_s = json_obj_strdup(&req, "splits");
         char *max_key_s = json_obj_strdup(&req, "max_key");
+        char *ine_s = json_obj_strdup(&req, "if_not_exists");
+        int if_not_exists = ine_s && (strcmp(ine_s, "true") == 0 || strcmp(ine_s, "1") == 0);
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
-                          max_key_s ? atoi(max_key_s) : 0);
+                          max_key_s ? atoi(max_key_s) : 0,
+                          if_not_exists);
         free(fields_j); free(indexes_j);
-        free(splits_s); free(max_key_s);
+        free(splits_s); free(max_key_s); free(ine_s);
+        free(mode); free(dir); free(object);
+        return;
+    }
+
+    /* drop-object also bypasses the fields.conf pre-check below — the
+       command itself handles the "not found" case (idempotent with
+       if_exists:true, errors otherwise). */
+    if (strcmp(mode, "drop-object") == 0) {
+        char *ie_s = json_obj_strdup(&req, "if_exists");
+        int if_exists = ie_s && (strcmp(ie_s, "true") == 0 || strcmp(ie_s, "1") == 0);
+        cmd_drop_object(g_db_root, dir, object, if_exists);
+        free(ie_s);
         free(mode); free(dir); free(object);
         return;
     }

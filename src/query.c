@@ -10,7 +10,7 @@
 volatile int g_scan_stop = 0; /* shared stop flag for parallel scan */
 
 void scan_one_shard(const char *binpath, int slot_size,
-                           scan_callback cb, void *ctx, pthread_mutex_t *out_lock) {
+                           scan_callback cb, void *ctx) {
     /* Full-shard scans bypass the ucache (MADV_RANDOM hint is wrong for linear
        scans). Open direct with MADV_SEQUENTIAL for kernel readahead. */
     int fd = open(binpath, O_RDONLY);
@@ -38,19 +38,18 @@ void scan_one_shard(const char *binpath, int slot_size,
         scan_end--;
     }
 
+    /* Lock-free read loop: the callback is responsible for whatever
+       synchronization it needs (most read-only counters use atomics; the
+       few that emit output or mutate shared arrays take their own internal
+       mutex in their ctx struct). Scanning itself is pure read of mmap'd
+       data and must never serialize on a shared mutex — that eats all the
+       per-shard parallelism. */
     for (size_t i = 0; i < scan_end; i++) {
         if (g_scan_stop) break;
         const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(i));
         if (hdr->flag == 1) {
             const uint8_t *block = map + zoneB_off(i, shard_slots, slot_size);
-            int stop;
-            if (out_lock) {
-                pthread_mutex_lock(out_lock);
-                stop = cb(hdr, block, ctx);
-                pthread_mutex_unlock(out_lock);
-            } else {
-                stop = cb(hdr, block, ctx);
-            }
+            int stop = cb(hdr, block, ctx);
             if (stop) { g_scan_stop = 1; break; }
         }
     }
@@ -62,7 +61,6 @@ typedef struct {
     int slot_size;
     scan_callback cb;
     void *ctx;
-    pthread_mutex_t *out_lock;
     FILE *parent_out;  /* inherit g_out from parent thread */
 } ScanWorkerArg;
 
@@ -70,7 +68,7 @@ void *scan_worker(void *arg) {
     ScanWorkerArg *w = (ScanWorkerArg *)arg;
     if (g_scan_stop) return NULL;
     g_out = w->parent_out ? w->parent_out : stdout;
-    scan_one_shard(w->path, w->slot_size, w->cb, w->ctx, w->out_lock);
+    scan_one_shard(w->path, w->slot_size, w->cb, w->ctx);
     return NULL;
 }
 
@@ -100,14 +98,12 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
 
     if (path_count == 0) { free(paths); return; }
 
-    pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
     ScanWorkerArg *args = malloc(path_count * sizeof(ScanWorkerArg));
     for (int i = 0; i < path_count; i++) {
-        args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, &out_lock, g_out };
+        args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, g_out };
     }
     parallel_for(scan_worker, args, path_count, sizeof(ScanWorkerArg));
     free(args);
-    pthread_mutex_destroy(&out_lock);
 
     for (int i = 0; i < path_count; i++) free(paths[i]);
     free(paths);
@@ -581,6 +577,12 @@ typedef struct {
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
+    /* Phase-2 profiling: total worker wall time and time spent inside
+       ucache_grow_shard. Aggregated post-join to show "of this much
+       Phase 2 time, X ms was grow." Helps isolate rehash cost. */
+    uint64_t        wall_ms;
+    uint64_t        grow_ms;
+    int             grow_count;
     /* Per-worker index entry collection; merged post-phase into caller's
        global arrays. Each BtEntry.value is an owned malloc'd string. */
     BtEntry       **idx_pairs;        /* [nidx] */
@@ -598,6 +600,7 @@ typedef struct {
 static void *bulk_insert_shard_worker(void *arg) {
     BulkInsShardWork *sw = (BulkInsShardWork *)arg;
     if (sw->count == 0) return NULL;
+    uint64_t t_worker_start = now_ms_coarse();
 
     char shard_path[PATH_MAX];
     build_shard_path(shard_path, sizeof(shard_path), sw->db_root, sw->object, sw->shard_id);
@@ -636,7 +639,11 @@ static void *bulk_insert_shard_worker(void *arg) {
         if (slot < 0) {
             /* Shard full — release lock so grow can take it, grow, reacquire, retry */
             ucache_write_release(wh);
-            if (ucache_grow_shard(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb) < 0) {
+            uint64_t t_grow_start = now_ms_coarse();
+            int grow_result = ucache_grow_shard(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+            sw->grow_ms += now_ms_coarse() - t_grow_start;
+            sw->grow_count++;
+            if (grow_result < 0) {
                 /* All remaining records in this bucket fail */
                 for (size_t j = i; j < sw->count; j++)
                     log_msg(1, "INSERT_DROP shard=%d key=%s (shard full: cannot grow)",
@@ -682,9 +689,16 @@ static void *bulk_insert_shard_worker(void *arg) {
 
         if (!is_update) sw->inserted++;
 
-        /* Collect index entries from the typed payload */
+        /* Collect index entries from the typed payload.
+           Composite indexes use the legacy ASCII-concat path.
+           Single-field indexes use typed_field_to_index_key so the binary
+           representation matches what the read side encodes via
+           encode_field_for_index. Without this, every signed-numeric
+           indexed query misses (write ASCII, read sign-flipped binary). */
         for (int fi = 0; fi < sw->nidx; fi++) {
-            char *idx_val = NULL;
+            uint8_t *key_buf = NULL;
+            size_t key_len = 0;
+
             if (sw->idx_is_composite[fi]) {
                 char cat[4096]; int cp = 0; int ok = 1;
                 for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
@@ -695,35 +709,52 @@ static void *bulk_insert_shard_worker(void *arg) {
                     if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
                     free(v);
                 }
-                cat[cp] = '\0';
                 if (ok && cp > 0) {
-                    idx_val = malloc(cp + 1);
-                    memcpy(idx_val, cat, cp);
-                    idx_val[cp] = '\0';
+                    key_buf = malloc((size_t)cp);
+                    memcpy(key_buf, cat, (size_t)cp);
+                    key_len = (size_t)cp;
                 }
             } else {
                 int tidx = sw->idx_field_indices[fi][0];
-                if (tidx >= 0) idx_val = typed_get_field_str(sw->ts, r->payload, tidx);
+                if (tidx >= 0) {
+                    const TypedField *f = &sw->ts->fields[tidx];
+                    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+                    key_buf = malloc(cap);
+                    typed_field_to_index_key(sw->ts, r->payload, tidx, key_buf, &key_len);
+                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
+                }
             }
-            if (idx_val && idx_val[0]) {
+
+            if (key_buf && key_len > 0) {
                 if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
                     sw->idx_pair_caps[fi] = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
                     sw->idx_pairs[fi] = realloc(sw->idx_pairs[fi],
                                                 sw->idx_pair_caps[fi] * sizeof(BtEntry));
                 }
                 BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
-                bp->value = idx_val;
-                bp->vlen  = strlen(idx_val);
+                bp->value = (const char *)key_buf;
+                bp->vlen  = key_len;
                 memcpy(bp->hash, r->hash, 16);
             } else {
-                free(idx_val);
+                free(key_buf);
             }
         }
 
         i++;
     }
 
-    if (wh.map) ucache_write_release(wh);
+    if (wh.map) {
+        /* Note: we previously called ucache_nudge_writeback(wh.slot) here to
+           kick the kernel's writeback early, but sync_file_range(nbytes=0)
+           ended up blocking in balance_dirty_pages under concurrent
+           writeback from all 16 workers — turning "non-blocking nudge"
+           into "synchronous flush storm" at 5 M+ scale. Left the helper
+           in storage.c for future targeted use (e.g. ranged flush of just
+           what we touched) but no longer fire it on the shard-worker end
+           path. The regular kernel writeback daemons handle durability. */
+        ucache_write_release(wh);
+    }
+    sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }
 
@@ -731,6 +762,7 @@ static void *bulk_insert_shard_worker(void *arg) {
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str);
 
 int cmd_bulk_insert(const char *db_root, const char *object, const char *input) {
+    uint64_t t0 = now_ms_coarse();
     size_t len;
     char *json;
     int json_mmaped = 0;
@@ -992,6 +1024,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         ws->idx_pair_caps = nfields > 0 ? calloc(nfields, sizeof(size_t)) : NULL;
     }
 
+    uint64_t t1 = now_ms_coarse();  /* end of Phase 1 (parse + bucket) */
+
     /* ===== Phase 2: run shard workers in parallel. Each worker owns one shard's
        writes so ucache wrlocks are disjoint across workers — no cross-worker
        coordination needed. Batched pthread_create/join pattern matches
@@ -999,6 +1033,17 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
        is small enough that spawn/join overhead would dominate. */
     parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
+    uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
+
+    /* Phase-2 breakdown across workers. */
+    uint64_t grow_ms_total = 0, wall_ms_max = 0, wall_ms_sum = 0;
+    int grow_count_total = 0;
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        grow_ms_total  += workers[wi].grow_ms;
+        grow_count_total += workers[wi].grow_count;
+        wall_ms_sum    += workers[wi].wall_ms;
+        if (workers[wi].wall_ms > wall_ms_max) wall_ms_max = workers[wi].wall_ms;
+    }
 
     /* Merge per-worker results into the caller's global counters and index arrays,
        then release per-worker scratch. BtEntry.value ownership transfers into
@@ -1051,6 +1096,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
         free(act_args);
     }
+    uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     /* ucache keeps mmaps open — OS flushes dirty pages */
     if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
@@ -1084,6 +1130,18 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     free(idx_pair_caps);
 
     if (count > 0) update_count(db_root, object, count);
+
+    uint64_t t4 = now_ms_coarse();  /* end of Phase 4 (index build) */
+    log_msg(3, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
+            object, count,
+            (unsigned long)(t1 - t0),
+            (unsigned long)(t2 - t1),
+            grow_count_total,
+            (unsigned long)grow_ms_total,
+            (unsigned long)wall_ms_max,
+            (unsigned long)(t3 - t2),
+            (unsigned long)(t4 - t3),
+            (unsigned long)(t4 - t0));
 
     if (errors) {
         OUT("{\"count\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n", count, errors);
@@ -1779,6 +1837,8 @@ typedef struct {
     int dl_counter;
     size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
     int budget_exceeded;
+    pthread_mutex_t lock;   /* serializes only the keys-array append,
+                               not the per-record match */
 } BulkCriteriaCtx;
 
 static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
@@ -1791,22 +1851,32 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
 
     if (!criteria_match_tree(raw, bc->tree, bc->fs)) return 0;
 
+    /* Match — grow array and append under internal mutex. criteria_match_tree
+       above runs lock-free; only the shared-state mutation is serialized. */
     size_t key_bytes = sizeof(char *) + hdr->key_len + 1;
+    char *key = malloc(hdr->key_len + 1);
+    memcpy(key, block, hdr->key_len);
+    key[hdr->key_len] = '\0';
+
+    pthread_mutex_lock(&bc->lock);
+    if (bc->budget_exceeded || (bc->limit > 0 && bc->count >= bc->limit)) {
+        pthread_mutex_unlock(&bc->lock);
+        free(key);
+        return 1;
+    }
     if (bc->buffer_bytes + key_bytes > g_query_buffer_max_bytes) {
         bc->budget_exceeded = 1;
+        pthread_mutex_unlock(&bc->lock);
+        free(key);
         return 1;
     }
     bc->buffer_bytes += key_bytes;
-
-    /* Match — collect the key */
     if (bc->count >= bc->cap) {
         bc->cap = bc->cap ? bc->cap * 2 : 1024;
         bc->keys = realloc(bc->keys, bc->cap * sizeof(char *));
     }
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
     bc->keys[bc->count++] = key;
+    pthread_mutex_unlock(&bc->lock);
     return 0;
 }
 
@@ -1977,8 +2047,10 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, fs.ts);
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
-    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
+    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
+                            PTHREAD_MUTEX_INITIALIZER };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
+    pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
 
     if (dl.timed_out) {
@@ -2443,8 +2515,10 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, fs.ts);
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
-    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0 };
+    BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
+                            PTHREAD_MUTEX_INITIALIZER };
     scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
+    pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
 
     if (dl.timed_out) {
@@ -3021,17 +3095,28 @@ int cmd_exists(const char *db_root, const char *object, const char *key) {
 typedef struct {
     int offset; int limit; int count; int printed;
     char csv_delim;   /* 0 = JSON mode; else CSV (delim-less, single column) */
+    pthread_mutex_t lock;  /* serializes the emit section across parallel shards */
 } KeysCtx;
 
 int keys_cb(const SlotHeader *hdr, const uint8_t *block,
                     void *ctx) {
     KeysCtx *kc = (KeysCtx *)ctx;
-    if (kc->limit > 0 && kc->printed >= kc->limit) return 1; /* stop */
-    kc->count++;
-    if (kc->count <= kc->offset) return 0;
+
+    /* Copy the key bytes to a thread-local buffer outside the lock. */
     char kbuf[1024];
     size_t kl = hdr->key_len < sizeof(kbuf) - 1 ? hdr->key_len : sizeof(kbuf) - 1;
     memcpy(kbuf, block, kl); kbuf[kl] = '\0';
+
+    pthread_mutex_lock(&kc->lock);
+    if (kc->limit > 0 && kc->printed >= kc->limit) {
+        pthread_mutex_unlock(&kc->lock);
+        return 1;
+    }
+    kc->count++;
+    if (kc->count <= kc->offset) {
+        pthread_mutex_unlock(&kc->lock);
+        return 0;
+    }
     if (kc->csv_delim) {
         csv_emit_cell(kbuf, kc->csv_delim);
         OUT("\n");
@@ -3039,6 +3124,7 @@ int keys_cb(const SlotHeader *hdr, const uint8_t *block,
         OUT("%s\"%s\"", kc->printed ? "," : "", kbuf);
     }
     kc->printed++;
+    pthread_mutex_unlock(&kc->lock);
     return 0;
 }
 
@@ -3049,10 +3135,11 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
     Schema sch = load_schema(db_root, object);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    KeysCtx ctx = { offset, limit, 0, 0, csv_delim };
+    KeysCtx ctx = { offset, limit, 0, 0, csv_delim, PTHREAD_MUTEX_INITIALIZER };
     if (csv_delim) OUT("key\n");  /* header */
     else OUT("[");
     scan_shards(data_dir, sch.slot_size, keys_cb, &ctx);
+    pthread_mutex_destroy(&ctx.lock);
     if (!csv_delim) OUT("]\n");
     return 0;
 }
@@ -3409,6 +3496,8 @@ typedef struct {
     const char *db_root;
     QueryDeadline *deadline;
     int dl_counter;
+    pthread_mutex_t lock;  /* serializes the emit + counter section across
+                              parallel shard scans */
 } AdvSearchCtx;
 
 int match_criterion(const char *val_str, const SearchCriterion *c) {
@@ -4363,7 +4452,9 @@ static void emit_joined_columns(const char *driver_object,
 int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                           void *ctx) {
     AdvSearchCtx *sc = (AdvSearchCtx *)ctx;
-    if (sc->limit > 0 && sc->printed >= sc->limit) return 1; /* stop */
+    /* Best-effort pre-checks (no lock). The emit section below re-checks
+       limit under the lock to ensure we never over-emit. */
+    if (sc->limit > 0 && sc->printed >= sc->limit) return 1;
     if (query_deadline_tick(sc->deadline, &sc->dl_counter)) return 1;
 
     char *key = malloc(hdr->key_len + 1);
@@ -4375,12 +4466,10 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
 
     const char *raw = (const char *)block + hdr->key_len;
 
-    /* Check full criteria tree (AND/OR short-circuit) */
+    /* Criteria match + join resolution are thread-local reads, lock-free. */
     int match = criteria_match_tree((const uint8_t *)raw, sc->tree, sc->fs);
 
     if (match) {
-        /* For joined queries: evaluate joins first; inner-drops are skipped so
-           offset/limit reflect the actual emitted row count. */
         FcacheRead *join_handles = NULL;
         const uint8_t **join_raws = NULL;
         int dropped = 0;
@@ -4401,6 +4490,20 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
         }
 
         if (!dropped) {
+            /* Emit section — must serialize: OUT() bytes, sc->printed / sc->count
+               updates, and the "printed>0 ? comma" decision all depend on a
+               consistent view of shared state. */
+            pthread_mutex_lock(&sc->lock);
+            if (sc->limit > 0 && sc->printed >= sc->limit) {
+                pthread_mutex_unlock(&sc->lock);
+                if (sc->njoins > 0) {
+                    for (int i = 0; i < sc->njoins; i++)
+                        if (join_handles[i].map) fcache_release(join_handles[i]);
+                    free(join_handles); free(join_raws);
+                }
+                free(key);
+                return 1;
+            }
             sc->count++;
             if (sc->count > sc->offset) {
                 if (sc->njoins > 0) {
@@ -4456,6 +4559,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                 }
                 sc->printed++;
             }
+            pthread_mutex_unlock(&sc->lock);
         }
 
         if (sc->njoins > 0) {
@@ -4543,6 +4647,31 @@ static void encode_criterion_value(const TypedField *tf,
     encode_field_for_index(tf, val, vlen, buf, out_len);
 }
 
+/* Count-mode shortcut: operator has a positive counterpart so
+   count(neg) = count(*) - count(pos) is cheaper. NEQ / NOT_IN hit a
+   targeted positive set instead of walking the complement; NOT_EXISTS
+   also fixes a pre-existing count-inversion (the old path returned the
+   full index size instead of the inverse). */
+static int op_is_negatable(enum SearchOp op) {
+    return op == OP_NOT_EQUAL || op == OP_NOT_LIKE || op == OP_NOT_CONTAINS ||
+           op == OP_NOT_IN || op == OP_NOT_EXISTS;
+}
+
+static enum SearchOp op_invert(enum SearchOp op) {
+    switch (op) {
+    case OP_NOT_EQUAL:    return OP_EQUAL;
+    case OP_NOT_LIKE:     return OP_LIKE;
+    case OP_NOT_CONTAINS: return OP_CONTAINS;
+    case OP_NOT_IN:       return OP_IN;
+    case OP_NOT_EXISTS:   return OP_EXISTS;
+    default:              return op;
+    }
+}
+
+static int op_needs_check_primary(enum SearchOp op) {
+    return op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH;
+}
+
 /* Dispatch B+ tree query based on search operator. Used by find, count, aggregate.
    tf is the TypedField for pc->field (NULL for composite indexes or
    untyped objects — in that case values are passed as raw bytes, matching
@@ -4613,7 +4742,19 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
             break;
         }
         case OP_NOT_EQUAL:
-            /* Two exclusive ranges: everything before + everything after */
+            /* Boolean has exactly 2 values — neq X is equivalent to eq
+               other-value. Single point lookup instead of two range scans,
+               which saves a second tree descent at query time. Only
+               applies to FT_BOOL; every other type has too large a domain
+               to enumerate "everything except X" cheaply. */
+            if (tf && tf->type == FT_BOOL) {
+                int is_true = (pc->value[0] == 't' || pc->value[0] == 'T' ||
+                               pc->value[0] == '1');
+                uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
+                btree_search(idx_path, (const char *)inv, 1, cb, ctx);
+                break;
+            }
+            /* General case: two exclusive ranges covering everything except X. */
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             btree_range_ex(idx_path, "", 0, 0,
                           (const char *)buf1, len1, 1, cb, ctx);
@@ -6039,7 +6180,9 @@ static int count_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return 1;
     const uint8_t *raw = block + hdr->key_len;
     if (!criteria_match_tree(raw, cc->tree, cc->fs)) return 0;
-    cc->count++;
+    /* Concurrent shard workers all accumulate here — atomic increment so no
+       mutex is needed on the scan hot path. */
+    __atomic_fetch_add(&cc->count, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -6088,7 +6231,23 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
              tree->children[0]->kind == CNODE_LEAF);
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
-        if (is_single_leaf) {
+        if (is_single_leaf && op_is_negatable(op)) {
+            /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
+               where the positive match set is small; also the correct
+               answer for NOT_EXISTS (the old default-branch path visited
+               every indexed entry and returned count(exists) instead). */
+            SearchCriterion pos = *pc;
+            pos.op = op_invert(op);
+            int pos_cp = op_needs_check_primary(pos.op);
+            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
+            btree_dispatch(plan.primary_idx_path, &pos, pc_tf, idx_count_cb, &ic);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else {
+                int total = get_live_count(db_root, object);
+                size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
+                OUT("{\"count\":%zu}\n", neg);
+            }
+        } else if (is_single_leaf) {
             IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
             btree_dispatch(plan.primary_idx_path, pc, pc_tf, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -6483,8 +6642,10 @@ int cmd_find(const char *db_root, const char *object,
         AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
                              proj_fields, proj_count, excluded, &driver_fs,
                              rows_fmt, csv_delim,
-                             object, joins, njoins, db_root, &dl, 0 };
+                             object, joins, njoins, db_root, &dl, 0,
+                             PTHREAD_MUTEX_INITIALIZER };
         scan_shards(data_dir, sch.slot_size, adv_search_cb, &ctx);
+        pthread_mutex_destroy(&ctx.lock);
     }
 
     if (has_joins)
@@ -6597,11 +6758,11 @@ int cmd_backup(const char *db_root, const char *object) {
 
 /* ========== RECOUNT ========== */
 
-/* Recount uses its own parallel scan — no shared out_lock overhead.
-   The generic scan_shards wraps each callback invocation in a mutex to
-   serialize JSON output for find/keys. Recount doesn't
-   emit per-record output, just counts, so that mutex is pure waste at
-   1M+ slots. Use atomic increment and skip the mutex. */
+/* Recount uses its own parallel scan — historically a duplicate of
+   scan_shards that skipped the global output-serialization mutex.
+   scan_shards is now lock-free too (callbacks carry their own internal
+   sync), so this parallel variant is structurally identical. Kept as-is
+   to avoid churn; could be collapsed into scan_shards later. */
 
 typedef struct {
     const char *path;
@@ -7067,7 +7228,7 @@ static int validate_field_type(const char *field_spec) {
 
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
-                      int splits, int max_key) {
+                      int splits, int max_key, int if_not_exists) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -7079,6 +7240,25 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     if (!fields_json || !fields_json[0]) {
         OUT("{\"error\":\"fields is required — e.g. [\\\"name:varchar:30\\\",\\\"age:int\\\"]\"}\n");
         return 1;
+    }
+
+    /* Existence check: fields.conf presence is authoritative. If present, the
+       object was previously created — bail out before any destructive write
+       so we can't silently clobber fields.conf / index.conf / existing data. */
+    {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof(probe), "%s/%s/%s/fields.conf", db_root, dir, object);
+        struct stat st;
+        if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (if_not_exists) {
+                OUT("{\"status\":\"exists\",\"object\":\"%s\",\"dir\":\"%s\"}\n",
+                    object, dir);
+                return 0;
+            }
+            OUT("{\"error\":\"object already exists\",\"dir\":\"%s\",\"object\":\"%s\",\"hint\":\"pass \\\"if_not_exists\\\":true for idempotent create, or drop the object first\"}\n",
+                dir, object);
+            return 1;
+        }
     }
 
     /* Validate fields array — must be non-empty, every field must have a valid type */
@@ -7291,6 +7471,76 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     return 0;
 }
 
+/* ========== DROP OBJECT ==========
+   Removes everything for an object: data/ metadata/ indexes/ files/ dirs,
+   fields.conf, indexes/index.conf, the schema.conf entry, and invalidates
+   every in-memory cache that might hold state for it. Idempotent with
+   if_exists=1 — returns {"status":"not_found"} instead of an error. */
+
+int cmd_drop_object(const char *db_root, const char *dir, const char *object,
+                    int if_exists) {
+    if (!dir || !dir[0]) {
+        OUT("{\"error\":\"dir is required\"}\n");
+        return 1;
+    }
+    if (!object || !object[0]) {
+        OUT("{\"error\":\"object is required\"}\n");
+        return 1;
+    }
+
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s/%s", db_root, dir, object);
+    struct stat st;
+    if (stat(obj_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (if_exists) {
+            OUT("{\"status\":\"not_found\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+                dir, object);
+            return 0;
+        }
+        OUT("{\"error\":\"object not found\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 1;
+    }
+
+    /* Invalidate caches BEFORE removing files so no concurrent reader picks
+       up a stale mmap after we unlink the backing files. */
+    char eff_obj[PATH_MAX];
+    snprintf(eff_obj, sizeof(eff_obj), "%s/%s", dir, object);
+    fcache_invalidate(obj_dir);
+    invalidate_idx_cache(object);
+    invalidate_schema_caches(db_root, object);
+
+    /* Nuke the on-disk object tree entirely. */
+    rmrf(obj_dir);
+
+    /* Strip the "dir:object:..." line from schema.conf (atomic rewrite). */
+    char schema_path[PATH_MAX], tmp_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.new", schema_path);
+    FILE *in = fopen(schema_path, "r");
+    if (in) {
+        FILE *out = fopen(tmp_path, "w");
+        if (out) {
+            char line[1024];
+            char prefix[512];
+            int plen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
+            while (fgets(line, sizeof(line), in)) {
+                if (strncmp(line, prefix, (size_t)plen) == 0) continue;
+                fputs(line, out);
+            }
+            fclose(out);
+            fclose(in);
+            rename(tmp_path, schema_path);
+        } else {
+            fclose(in);
+        }
+    }
+
+    log_msg(3, "DROP-OBJECT %s/%s", dir, object);
+    OUT("{\"status\":\"dropped\",\"dir\":\"%s\",\"object\":\"%s\"}\n", dir, object);
+    return 0;
+}
+
 /* ========== AGGREGATE ========== */
 
 enum AggFn { AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX };
@@ -7339,6 +7589,11 @@ typedef struct {
        plain size_t. budget_exceeded flips per-ctx once the cap is hit. */
     _Atomic size_t *shared_buffer_bytes;
     int budget_exceeded;
+    /* Coarse mutex for hashtable + bucket accumulator updates when the scan
+       runs callbacks concurrently (scan_shards path). parallel_indexed_agg
+       pre-existed this and uses per-worker ctxs merged later, so the lock is
+       harmless there (no contention). */
+    pthread_mutex_t lock;
 } AggCtx;
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
@@ -7556,7 +7811,11 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         gvals[i] = gbuf[i];
     }
 
-    /* Find or create bucket */
+    /* Find or create bucket + accumulate under internal mutex.
+       criteria_match_tree + group extraction above are thread-local /
+       read-only; only hashtable insert and accumulator updates need
+       serialization. Mutex stays cheap because the sections are tiny. */
+    pthread_mutex_lock(&ctx->lock);
     AggBucket *bkt;
     if (ctx->ngroups > 0) {
         bkt = agg_find_or_create(ctx, gvals, ctx->ngroups);
@@ -7564,9 +7823,11 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         char *empty = "";
         bkt = agg_find_or_create(ctx, &empty, 1);
     }
-    if (!bkt) return 1;  /* budget exceeded — stop scan */
+    if (!bkt) {
+        pthread_mutex_unlock(&ctx->lock);
+        return 1;  /* budget exceeded — stop scan */
+    }
 
-    /* Accumulate — typed direct-to-double for numeric specs, fallback for composite. */
     for (int i = 0; i < ctx->nspecs; i++) {
         AggAccum *a = &bkt->accums[i];
         if (ctx->specs[i].fn == AGG_COUNT) { a->count++; continue; }
@@ -7589,6 +7850,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
             if (v > a->max) a->max = v;
         }
     }
+    pthread_mutex_unlock(&ctx->lock);
     return 0;
 }
 
@@ -7889,6 +8151,7 @@ static void agg_free(AggCtx *ctx) {
         }
     }
     free(ctx->specs);
+    pthread_mutex_destroy(&ctx->lock);
 }
 
 /* Format a double, removing trailing zeros */
@@ -7998,6 +8261,7 @@ int cmd_aggregate(const char *db_root, const char *object,
     ctx.fs = &fs;
     ctx.specs = specs;
     ctx.nspecs = nspecs;
+    pthread_mutex_init(&ctx.lock, NULL);
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     ctx.deadline = &dl;
     _Atomic size_t agg_budget_bytes = 0;

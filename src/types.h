@@ -509,6 +509,12 @@ void       fcache_release(FcacheRead h);
    INITIAL_SLOTS slots if missing; slot_size == 0 opens-only (fails if absent). */
 FcacheRead ucache_get_write(const char *path, int slot_size, int prealloc_mb);
 void       ucache_write_release(FcacheRead h);
+/* Non-blocking hint to the kernel to start flushing this shard's dirty pages
+   to disk. No-op on non-Linux. Intended for bulk-insert paths that would
+   otherwise accumulate dirty pages faster than the kernel's writeback
+   daemons can drain them (which pushes dirty_ratio over its threshold and
+   causes every subsequent write to stall in D-state). */
+void       ucache_nudge_writeback(int ucache_slot);
 /* Double slots_per_shard for this shard: rehash live records into a new file,
    atomic rename, swap mapping. Caller must NOT hold the entry wrlock. */
 int        ucache_grow_shard(const char *path, int slot_size, int prealloc_mb);
@@ -633,7 +639,12 @@ int cmd_get_file_b64(const char *db_root, const char *object, const char *filena
 int cmd_delete_file(const char *db_root, const char *object, const char *filename);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
-                      int splits, int max_key);
+                      int splits, int max_key, int if_not_exists);
+/* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
+   counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
+   the call idempotent (no-op if the object is already gone). */
+int cmd_drop_object(const char *db_root, const char *dir, const char *object,
+                    int if_exists);
 
 /* Schema mutations */
 int cmd_rename_field(const char *db_root, const char *object,
