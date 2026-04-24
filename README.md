@@ -53,7 +53,7 @@ Shard load distribution (1024 splits): avg 0.596, records stddev 5.7 %, 6 grows 
 | `count` indexed eq / between / in / lt / gt / lte / gte | **4–19 ms** |
 | `count` indexed `starts` / `exists` | **3–21 ms** |
 | `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **41–49 ms** |
-| `count` full-scan (non-indexed field) | **309–354 ms** |
+| `count` full-scan (non-indexed field) | **~20–50 ms** (scan-path is now lock-free; each shard runs concurrently) |
 | `count` indexed + secondary filter | **16–49 ms** |
 | `find` limit 10 — any indexed op | **2–3 ms** |
 | `find` limit 10 — full scan on non-indexed | **2–3 ms** (Zone A probe + typed compare) |
@@ -75,7 +75,7 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 |---|---|
 | Bulk insert (no indexes) | **99.1 k/sec** (10.09 s) |
 | Bulk insert (with 14 indexes) | **78.3 k/sec** (12.77 s) — 21 % index overhead |
-| Add 14 indexes post-insert | **5.83 s** (single-pass, all 14 concurrent) |
+| Add 14 indexes post-insert | **3.89 s** (single-pass, all 14 concurrent; scan-path is lock-free + binary index keys skip ASCII render) |
 | GET ×1000 (pipelined) | **43.5 k ops/sec** (23 ms) |
 | EXISTS ×1000 (pipelined) | **55.6 k ops/sec** (18 ms) |
 | Indexed eq `find` (any of 14 indexes, limit 10) | **3–5 ms** |
@@ -102,10 +102,10 @@ Same schema, 10 connections × 100 k records each.
 | Parallel JSON, 10 conns, pre-existing 14 indexes | 6.99 s | **143 k/sec** |
 | **Parallel CSV, 10 conns, no indexes** | **3.77 s** | **265 k/sec** (1.4× single-CSV) |
 | Parallel CSV, 10 conns, pre-existing 14 indexes | 6.49 s | **154 k/sec** |
-| Add 14 indexes after parallel bulk insert | ~5.7 s | (concurrent build across all 14) |
+| Add 14 indexes after parallel bulk insert | ~3.8 s | (concurrent build across all 14) |
 | Disk footprint (with 14 indexes) | 1.3 GB |
 
-**Insert WITH indexes still beats load-then-index.** At 1M × 14 indexes: load (3.77 s) + add-indexes (5.64 s) = 9.41 s → 106 k/sec; insert with pre-existing indexes: 6.49 s → 154 k/sec. The parallel bulk-insert path maintains indexes cheaper than a post-hoc rebuild. **Recommended ingest pattern: create indexes up front, then parallel bulk-insert** — unless the schema is still evolving, in which case load-then-index is still fine.
+**Insert WITH indexes still beats load-then-index, margin narrower now.** At 1M × 14 indexes: load (4.11 s) + add-indexes (3.81 s) = 7.92 s → 126 k/sec; insert with pre-existing indexes: 6.28 s → 159 k/sec. Post-hoc rebuild is now fast enough (scan-path lock-free + binary index keys) that load-then-index is viable for evolving schemas; for static schemas, pre-existing indexes still win. **Recommended: create indexes up front when schema is stable; load-then-index when it isn't.**
 
 ### Notes
 
