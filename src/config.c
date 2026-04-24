@@ -930,6 +930,223 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
     encode_field_len(f, val, val ? strlen(val) : 0, out);
 }
 
+/* Index-key encoder — see types.h for contract. Writes memcmp-sortable bytes
+   per type:
+     varchar  — raw content bytes, no 2-byte length prefix (vlen out)
+     bool     — 1 byte (0/1)
+     byte     — 1 byte unsigned
+     short    — 2 bytes BE int16 with top-bit flipped
+     int      — 4 bytes BE int32 with top-bit flipped
+     long     — 8 bytes BE int64 with top-bit flipped
+     numeric  — 8 bytes BE int64 × 10^S with top-bit flipped
+     date     — 4 bytes BE int32 with top-bit flipped (dates are always
+                positive but flip kept for consistency with other signed types)
+     datetime — 4 bytes BE flipped-int32 date + 2 bytes BE uint16 time
+     double   — 8 bytes BE with IEEE-754 total-order transform */
+void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+                            uint8_t *out, size_t *out_len) {
+    if (!val || vlen == 0) {
+        /* Empty / null input. For fixed-width fields we zero f->size bytes
+           and the caller sees a sort-minimum key. For varchar we emit zero
+           bytes (length=0 sorts before any non-empty). */
+        if (f->type == FT_VARCHAR) { *out_len = 0; return; }
+        memset(out, 0, f->size);
+        *out_len = f->size;
+        return;
+    }
+    switch (f->type) {
+    case FT_VARCHAR: {
+        /* Raw content, up to vlen bytes. No length prefix — val_cmp does the
+           length tiebreak. Cap at f->size - 2 to match on-disk content cap. */
+        size_t cap = (size_t)(f->size - 2);
+        if (vlen > cap) vlen = cap;
+        memcpy(out, val, vlen);
+        *out_len = vlen;
+        break;
+    }
+    case FT_LONG: {
+        char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int64_t v = strtoll(cbuf, NULL, 10);
+        uint64_t u = (uint64_t)v ^ (1ULL << 63);
+        out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
+        out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
+        out[4] = (u >> 24) & 0xFF; out[5] = (u >> 16) & 0xFF;
+        out[6] = (u >> 8) & 0xFF;  out[7] = u & 0xFF;
+        *out_len = 8;
+        break;
+    }
+    case FT_INT: {
+        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int32_t v = (int32_t)atoi(cbuf);
+        uint32_t u = (uint32_t)v ^ 0x80000000u;
+        out[0] = (u >> 24) & 0xFF; out[1] = (u >> 16) & 0xFF;
+        out[2] = (u >> 8) & 0xFF;  out[3] = u & 0xFF;
+        *out_len = 4;
+        break;
+    }
+    case FT_SHORT: {
+        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        int16_t v = (int16_t)atoi(cbuf);
+        uint16_t u = (uint16_t)v ^ 0x8000u;
+        out[0] = (u >> 8) & 0xFF; out[1] = u & 0xFF;
+        *out_len = 2;
+        break;
+    }
+    case FT_DOUBLE: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        double v = atof(cbuf);
+        uint64_t bits;
+        memcpy(&bits, &v, 8);
+        /* IEEE-754 total order: if sign bit set (negative), flip all bits;
+           else flip just the sign bit. Maps all doubles to a monotonic
+           unsigned key under memcmp. */
+        if (bits & (1ULL << 63)) bits = ~bits;
+        else bits ^= (1ULL << 63);
+        out[0] = (bits >> 56) & 0xFF; out[1] = (bits >> 48) & 0xFF;
+        out[2] = (bits >> 40) & 0xFF; out[3] = (bits >> 32) & 0xFF;
+        out[4] = (bits >> 24) & 0xFF; out[5] = (bits >> 16) & 0xFF;
+        out[6] = (bits >> 8) & 0xFF;  out[7] = bits & 0xFF;
+        *out_len = 8;
+        break;
+    }
+    case FT_BOOL: {
+        out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
+        *out_len = 1;
+        break;
+    }
+    case FT_BYTE: {
+        char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        out[0] = (uint8_t)atoi(cbuf);
+        *out_len = 1;
+        break;
+    }
+    case FT_DATE: {
+        char clean[16]; int ci = 0;
+        for (size_t i = 0; i < vlen && ci < 8; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
+        clean[ci] = '\0';
+        int32_t v = (int32_t)atoi(clean);
+        uint32_t u = (uint32_t)v ^ 0x80000000u;
+        out[0] = (u >> 24) & 0xFF; out[1] = (u >> 16) & 0xFF;
+        out[2] = (u >> 8) & 0xFF;  out[3] = u & 0xFF;
+        *out_len = 4;
+        break;
+    }
+    case FT_DATETIME: {
+        char clean[16]; int ci = 0;
+        for (size_t i = 0; i < vlen && ci < 14; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
+        while (ci < 14) clean[ci++] = '0';
+        clean[14] = '\0';
+        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
+        int32_t d = (int32_t)atoi(datebuf);
+        uint32_t du = (uint32_t)d ^ 0x80000000u;
+        out[0] = (du >> 24) & 0xFF; out[1] = (du >> 16) & 0xFF;
+        out[2] = (du >> 8) & 0xFF;  out[3] = du & 0xFF;
+        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
+        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
+        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
+        uint16_t t = (uint16_t)(hh * 3600 + mm * 60 + ss);
+        out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
+        *out_len = 6;
+        break;
+    }
+    case FT_NUMERIC: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        double dv = atof(cbuf);
+        int64_t scale = 1;
+        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
+        int64_t v = (int64_t)(dv * scale + (dv >= 0 ? 0.5 : -0.5));
+        uint64_t u = (uint64_t)v ^ (1ULL << 63);
+        out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
+        out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
+        out[4] = (u >> 24) & 0xFF; out[5] = (u >> 16) & 0xFF;
+        out[6] = (u >> 8) & 0xFF;  out[7] = u & 0xFF;
+        *out_len = 8;
+        break;
+    }
+    default:
+        memset(out, 0, f->size);
+        *out_len = f->size;
+        break;
+    }
+}
+
+/* Direct typed-binary → index-key. Reads the field's stored bytes at
+   f->offset and emits the same memcmp-sortable encoding as
+   encode_field_for_index would for equivalent text input. Skips the
+   typed→ASCII render step on integer/date/numeric fields. */
+void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
+                              int field_idx, uint8_t *out, size_t *out_len) {
+    const TypedField *f = &ts->fields[field_idx];
+    const uint8_t *src = data + f->offset;
+    switch (f->type) {
+    case FT_VARCHAR: {
+        /* Stored as [uint16 BE length][content]. Index key = raw content. */
+        int content_max = f->size - 2;
+        int len = ((int)src[0] << 8) | (int)src[1];
+        if (len > content_max) len = content_max;
+        if (len < 0) len = 0;
+        memcpy(out, src + 2, (size_t)len);
+        *out_len = (size_t)len;
+        break;
+    }
+    case FT_LONG:
+    case FT_NUMERIC: {
+        /* Stored BE signed — flip top bit for memcmp total-order. */
+        memcpy(out, src, 8);
+        out[0] ^= 0x80;
+        *out_len = 8;
+        break;
+    }
+    case FT_INT:
+    case FT_DATE: {
+        memcpy(out, src, 4);
+        out[0] ^= 0x80;
+        *out_len = 4;
+        break;
+    }
+    case FT_SHORT: {
+        memcpy(out, src, 2);
+        out[0] ^= 0x80;
+        *out_len = 2;
+        break;
+    }
+    case FT_DATETIME: {
+        /* int32 BE date (flip) + uint16 BE time (already unsigned). */
+        memcpy(out, src, 6);
+        out[0] ^= 0x80;
+        *out_len = 6;
+        break;
+    }
+    case FT_DOUBLE: {
+        /* Stored as host-byte-order memcpy of the double (see encode_field_len).
+           For index: reinterpret as uint64, apply IEEE-754 total-order flip,
+           emit big-endian. */
+        double v;
+        memcpy(&v, src, 8);
+        uint64_t bits;
+        memcpy(&bits, &v, 8);
+        if (bits & (1ULL << 63)) bits = ~bits;
+        else bits ^= (1ULL << 63);
+        out[0] = (bits >> 56) & 0xFF; out[1] = (bits >> 48) & 0xFF;
+        out[2] = (bits >> 40) & 0xFF; out[3] = (bits >> 32) & 0xFF;
+        out[4] = (bits >> 24) & 0xFF; out[5] = (bits >> 16) & 0xFF;
+        out[6] = (bits >> 8) & 0xFF;  out[7] = bits & 0xFF;
+        *out_len = 8;
+        break;
+    }
+    case FT_BOOL:
+    case FT_BYTE:
+        out[0] = src[0];
+        *out_len = 1;
+        break;
+    default:
+        *out_len = 0;
+        break;
+    }
+}
+
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);

@@ -464,11 +464,13 @@ static int bt_open(BtFile *bt, const char *path, int create) {
         bt->map_size = init_size;
 
         BtFileHeader *fh = (BtFileHeader *)bt->map;
-        fh->magic = 0x42545245;
+        fh->magic = BT_MAGIC;
         fh->root_page = 1;
         fh->page_count = 2;
         fh->height = 1;
         fh->entry_count = 0;
+        fh->key_type = 0;   /* FT_NONE — populated by typed bulk_build / caller */
+        fh->key_signed = 0;
 
         uint8_t *leaf = bt->map + bt_page_size;
         memset(leaf, 0, bt_page_size);
@@ -1306,7 +1308,7 @@ static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
     madvise(map, map_size, MADV_SEQUENTIAL);
 
     BtFileHeader *fh = (BtFileHeader *)map;
-    if (fh->magic != 0x42545245 || fh->entry_count == 0) {
+    if (fh->magic != BT_MAGIC || fh->entry_count == 0) {
         munmap(map, map_size); return NULL;
     }
 
@@ -1359,7 +1361,8 @@ extract_done:
 }
 
 static int bt_cmp_entry(const void *a, const void *b) {
-    return strcmp(((const BtEntry *)a)->value, ((const BtEntry *)b)->value);
+    const BtEntry *ea = a, *eb = b;
+    return val_cmp(ea->value, ea->vlen, eb->value, eb->vlen);
 }
 
 /* Sort new_entries, merge with existing B+ tree contents, rebuild.
@@ -1415,7 +1418,7 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
     if (hfd >= 0) {
         BtFileHeader hdr;
         if (read(hfd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr) &&
-            hdr.magic == 0x42545245) {
+            hdr.magic == BT_MAGIC) {
             existing_count = (size_t)hdr.entry_count;
         }
         close(hfd);
@@ -1468,7 +1471,8 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
 
     size_t ei = 0, ni = 0, ci = 0;
     while (ei < exist_count && ni < new_count) {
-        if (strcmp(existing[ei].value, new_entries[ni].value) <= 0)
+        if (val_cmp(existing[ei].value, existing[ei].vlen,
+                    new_entries[ni].value, new_entries[ni].vlen) <= 0)
             combined[ci++] = existing[ei++];
         else
             combined[ci++] = new_entries[ni++];

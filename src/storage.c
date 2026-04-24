@@ -869,27 +869,22 @@ int cmd_insert(const char *db_root, const char *object,
     char fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
     if (nfields > 0 && is_update && old_value) {
-        const char *keys_arr[MAX_FIELDS];
-        char *new_vals[MAX_FIELDS], *old_vals[MAX_FIELDS];
-        for (int i = 0; i < nfields; i++) keys_arr[i] = fields[i];
-        json_get_fields(value, keys_arr, nfields, new_vals);
-        json_get_fields(old_value, keys_arr, nfields, old_vals);
-
+        TypedSchema *idx_ts = load_typed_schema(db_root, object);
         for (int i = 0; i < nfields; i++) {
-            if (!new_vals[i] || new_vals[i][0] == '\0') {
-                free(new_vals[i]); free(old_vals[i]); continue;
-            }
+            uint8_t *new_key = NULL, *old_key = NULL;
+            size_t new_len = 0, old_len = 0;
+            int have_new = build_index_key_from_json(idx_ts, value, fields[i], &new_key, &new_len);
+            int have_old = build_index_key_from_json(idx_ts, old_value, fields[i], &old_key, &old_len);
             int changed = 0;
-            if (!old_vals[i]) { changed = 1; }
-            else if (strcmp(new_vals[i], old_vals[i]) != 0) { changed = 1; }
-
-            if (changed) {
-                if (old_vals[i] && old_vals[i][0])
-                    delete_index_entry(db_root, object, fields[i], old_vals[i], hash);
-                write_index_entry(db_root, object, fields[i], new_vals[i], hash);
+            if (have_new && !have_old) changed = 1;
+            else if (have_new && have_old) {
+                if (new_len != old_len || memcmp(new_key, old_key, new_len) != 0) changed = 1;
             }
-            free(new_vals[i]);
-            free(old_vals[i]);
+            if (changed) {
+                if (have_old) delete_index_entry(db_root, object, fields[i], old_key, old_len, hash);
+                if (have_new) write_index_entry(db_root, object, fields[i], new_key, new_len, hash);
+            }
+            free(new_key); free(old_key);
         }
     } else {
         index_parallel(db_root, object, value, hash, fields, nfields);
@@ -976,8 +971,12 @@ int cmd_update(const char *db_root, const char *object,
     /* Index fields — collect old values before modifying */
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-    char *old_idx_vals[MAX_FIELDS];
-    memset(old_idx_vals, 0, sizeof(old_idx_vals));
+    uint8_t *old_idx_bufs[MAX_FIELDS];
+    size_t  old_idx_lens[MAX_FIELDS];
+    int     old_idx_have[MAX_FIELDS];
+    memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+    memset(old_idx_lens, 0, sizeof(old_idx_lens));
+    memset(old_idx_have, 0, sizeof(old_idx_have));
 
     if (ts) {
         /* ===== TYPED BINARY: in-place field update at known offsets ===== */
@@ -988,27 +987,10 @@ int cmd_update(const char *db_root, const char *object,
         for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
         json_get_fields(partial_json, field_names, ts->nfields, field_vals);
 
-        /* Save old index values before modifying */
+        /* Save old index values (as index-key bytes) before modifying. */
         for (int i = 0; i < nidx; i++) {
-            if (strchr(idx_fields[i], '+')) {
-                char fb[256]; strncpy(fb, idx_fields[i], 255); fb[255] = '\0';
-                char cat[4096]; int cp = 0; int ok = 1;
-                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                while (tok) {
-                    int fi = typed_field_index(ts, tok);
-                    if (fi >= 0) {
-                        char *v = typed_get_field_str(ts, value_ptr, fi);
-                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                        else { ok = 0; break; }
-                    } else { ok = 0; break; }
-                    tok = strtok_r(NULL, "+", &_tok_save);
-                }
-                cat[cp] = '\0';
-                old_idx_vals[i] = (ok && cp > 0) ? strdup(cat) : NULL;
-            } else {
-                int fi = typed_field_index(ts, idx_fields[i]);
-                old_idx_vals[i] = typed_get_field_str(ts, value_ptr, fi);
-            }
+            old_idx_have[i] = build_index_key_from_record(ts, value_ptr, idx_fields[i],
+                                                         &old_idx_bufs[i], &old_idx_lens[i]);
         }
 
         /* Write changed fields directly at byte offsets — no decode/merge/re-encode.
@@ -1044,36 +1026,27 @@ int cmd_update(const char *db_root, const char *object,
         if (nidx > 0) {
             uint8_t *new_val = map + zoneB_off(slot, slots, sc.slot_size) + klen;
             for (int i = 0; i < nidx; i++) {
-                char *new_v = NULL;
-                if (strchr(idx_fields[i], '+')) {
-                    char fb[256]; strncpy(fb, idx_fields[i], 255); fb[255] = '\0';
-                    char cat[4096]; int cp = 0; int ok = 1;
-                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                    while (tok) {
-                        int fi = typed_field_index(ts, tok);
-                        if (fi >= 0) {
-                            char *v = typed_get_field_str(ts, new_val, fi);
-                            if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                            else { ok = 0; break; }
-                        } else { ok = 0; break; }
-                        tok = strtok_r(NULL, "+", &_tok_save);
-                    }
-                    cat[cp] = '\0';
-                    if (ok && cp > 0) new_v = strdup(cat);
-                } else {
-                    int fi = typed_field_index(ts, idx_fields[i]);
-                    new_v = typed_get_field_str(ts, new_val, fi);
-                }
+                uint8_t *new_buf = NULL;
+                size_t new_len = 0;
+                int have_new = build_index_key_from_record(ts, new_val, idx_fields[i],
+                                                          &new_buf, &new_len);
                 int changed = 0;
-                if (!old_idx_vals[i] && new_v) changed = 1;
-                else if (old_idx_vals[i] && !new_v) changed = 1;
-                else if (old_idx_vals[i] && new_v && strcmp(old_idx_vals[i], new_v) != 0) changed = 1;
-                if (changed) {
-                    if (old_idx_vals[i]) delete_index_entry(db_root, object, idx_fields[i], old_idx_vals[i], hash);
-                    if (new_v) write_index_entry(db_root, object, idx_fields[i], new_v, hash);
+                if (have_new && !old_idx_have[i]) changed = 1;
+                else if (!have_new && old_idx_have[i]) changed = 1;
+                else if (have_new && old_idx_have[i]) {
+                    if (new_len != old_idx_lens[i] ||
+                        memcmp(new_buf, old_idx_bufs[i], new_len) != 0) changed = 1;
                 }
-                free(old_idx_vals[i]);
-                free(new_v);
+                if (changed) {
+                    if (old_idx_have[i])
+                        delete_index_entry(db_root, object, idx_fields[i],
+                                           old_idx_bufs[i], old_idx_lens[i], hash);
+                    if (have_new)
+                        write_index_entry(db_root, object, idx_fields[i],
+                                          new_buf, new_len, hash);
+                }
+                free(old_idx_bufs[i]);
+                free(new_buf);
             }
         }
 
@@ -1085,10 +1058,17 @@ int cmd_update(const char *db_root, const char *object,
 }
 
 /* ========== DELETE helpers ========== */
-typedef struct { const char *db_root; const char *object; const char *field; const char *val; const uint8_t *hash; } DelIdxArg;
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const char *field;
+    const uint8_t *val;
+    size_t vlen;
+    const uint8_t *hash;
+} DelIdxArg;
 static void *del_idx_fn(void *arg) {
     DelIdxArg *a = (DelIdxArg *)arg;
-    delete_index_entry(a->db_root, a->object, a->field, a->val, a->hash);
+    delete_index_entry(a->db_root, a->object, a->field, a->val, a->vlen, a->hash);
     return NULL;
 }
 
@@ -1152,32 +1132,19 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
         /* Extract indexed field values BEFORE tombstoning, for index cleanup */
         char idx_fields[MAX_FIELDS][256];
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-        char *idx_vals[MAX_FIELDS];
-        memset(idx_vals, 0, sizeof(idx_vals));
+        uint8_t *idx_bufs[MAX_FIELDS];
+        size_t   idx_lens[MAX_FIELDS];
+        int      idx_have[MAX_FIELDS];
+        memset(idx_bufs, 0, sizeof(idx_bufs));
+        memset(idx_lens, 0, sizeof(idx_lens));
+        memset(idx_have, 0, sizeof(idx_have));
 
         if (nidx > 0) {
             const uint8_t *raw = (const uint8_t *)(map + zoneB_off(slot, slots, sc.slot_size) + h->key_len);
             TypedSchema *ts = load_typed_schema(db_root, object);
             for (int i = 0; i < nidx; i++) {
-                if (strchr(idx_fields[i], '+')) {
-                    char fb[256]; strncpy(fb, idx_fields[i], 255); fb[255] = '\0';
-                    char cat[4096]; int cp = 0; int ok = 1;
-                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                    while (tok) {
-                        int fidx = typed_field_index(ts, tok);
-                        if (fidx >= 0) {
-                            char *v = typed_get_field_str(ts, raw, fidx);
-                            if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
-                            else { ok = 0; break; }
-                        } else { ok = 0; break; }
-                        tok = strtok_r(NULL, "+", &_tok_save);
-                    }
-                    cat[cp] = '\0';
-                    if (ok && cp > 0) idx_vals[i] = strdup(cat);
-                } else {
-                    int fidx = typed_field_index(ts, idx_fields[i]);
-                    idx_vals[i] = typed_get_field_str(ts, raw, fidx);
-                }
+                idx_have[i] = build_index_key_from_record(ts, raw, idx_fields[i],
+                                                         &idx_bufs[i], &idx_lens[i]);
             }
         }
 
@@ -1192,13 +1159,14 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
             DelIdxArg dia[MAX_FIELDS];
             int dic = 0;
             for (int i = 0; i < nidx; i++) {
-                if (idx_vals[i] && idx_vals[i][0]) {
-                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i], idx_vals[i], hash };
+                if (idx_have[i]) {
+                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i],
+                                              idx_bufs[i], idx_lens[i], hash };
                 }
             }
             parallel_for(del_idx_fn, dia, dic, sizeof(DelIdxArg));
         }
-        for (int i = 0; i < nidx; i++) free(idx_vals[i]);
+        for (int i = 0; i < nidx; i++) free(idx_bufs[i]);
 
         update_counts(db_root, object, -1, 1);
         log_msg(3, "DELETE %s.%s", object, key);

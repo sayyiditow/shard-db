@@ -23,17 +23,26 @@
 #define BT_HASH_SIZE    16      /* raw xxh128 bytes */
 #define BT_MAX_VAL_LEN  512    /* max value length */
 
+/* File magic. "BTRF" (v2) = binary-native keys with per-type sign flip.
+   The v1 "BTRE" magic (0x42545245) is rejected on open — run
+   ./shard-db reindex to rebuild. */
+#define BT_MAGIC_V1  0x42545245u  /* legacy string-keyed format */
+#define BT_MAGIC     0x42545246u  /* current: binary-native keys */
+
 /* Configurable page size — set before first use */
 extern int bt_page_size; /* default 4096, set from db.env INDEX_PAGE_SIZE */
 
 /* File header (page 0) */
 typedef struct __attribute__((packed)) {
-    uint32_t magic;         /* 0x42545245 = "BTRE" */
+    uint32_t magic;         /* BT_MAGIC */
     uint32_t root_page;     /* page id of root */
     uint32_t page_count;    /* total pages allocated */
     uint32_t height;        /* tree height (1 = root is leaf) */
     uint64_t entry_count;   /* total entries */
-    uint8_t  reserved[4096 - 24]; /* header always occupies first page */
+    uint8_t  key_type;      /* FT_* of indexed field (FT_VARCHAR for composite) */
+    uint8_t  key_signed;    /* 1 if sign-flip applied at encode, 0 for raw-bytes */
+    uint8_t  _pad[2];
+    uint8_t  reserved[4096 - 28]; /* header always occupies first page */
 } BtFileHeader;
 
 /* Page header (first 20 bytes of every page) */

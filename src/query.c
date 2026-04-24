@@ -1469,8 +1469,10 @@ typedef struct {
     TypedSchema *ts;
     /* Results */
     int deleted;
-    /* Collected index deletions: [nidx][key_count] */
-    char ***idx_vals; /* idx_vals[idx_i][key_j] = field value or NULL */
+    /* Collected index deletions: [nidx][key_count] — parallel (val, vlen).
+       val is malloc'd index-key bytes (or NULL). */
+    uint8_t ***idx_vals;
+    size_t  **idx_lens;
 } BulkDelShardWork;
 
 static void *bulk_del_shard_worker(void *arg) {
@@ -1513,28 +1515,17 @@ static void *bulk_del_shard_worker(void *arg) {
                 h->key_len == klen &&
                 memcmp(map + zoneB_off(s, slots, sw->sch->slot_size), sw->keys[ki], klen) == 0) {
 
-                /* Extract index values before tombstoning */
+                /* Extract index values (as index-key bytes) before tombstoning */
                 if (sw->nidx > 0 && sw->ts) {
                     const uint8_t *raw = map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len;
                     for (int fi = 0; fi < sw->nidx; fi++) {
-                        if (strchr(sw->idx_fields[fi], '+')) {
-                            char fb[256]; strncpy(fb, sw->idx_fields[fi], 255); fb[255] = '\0';
-                            char cat[4096]; int cp = 0; int ok = 1;
-                            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                            while (tok) {
-                                int fidx = typed_field_index(sw->ts, tok);
-                                if (fidx >= 0) {
-                                    char *v = typed_get_field_str(sw->ts, raw, fidx);
-                                    if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                                    else { ok = 0; break; }
-                                } else { ok = 0; break; }
-                                tok = strtok_r(NULL, "+", &_tok_save);
-                            }
-                            cat[cp] = '\0';
-                            sw->idx_vals[fi][ki] = (ok && cp > 0) ? strdup(cat) : NULL;
+                        uint8_t *buf = NULL; size_t blen = 0;
+                        if (build_index_key_from_record(sw->ts, raw, sw->idx_fields[fi], &buf, &blen)) {
+                            sw->idx_vals[fi][ki] = buf;
+                            sw->idx_lens[fi][ki] = blen;
                         } else {
-                            int fidx = typed_field_index(sw->ts, sw->idx_fields[fi]);
-                            sw->idx_vals[fi][ki] = typed_get_field_str(sw->ts, raw, fidx);
+                            sw->idx_vals[fi][ki] = NULL;
+                            sw->idx_lens[fi][ki] = 0;
                         }
                     }
                 }
@@ -1562,7 +1553,8 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *field;
-    char **vals;
+    uint8_t **vals;
+    size_t   *vlens;
     uint8_t (*hashes)[16];
     int count;
 } BulkDelIdxWork;
@@ -1570,8 +1562,9 @@ typedef struct {
 static void *bulk_del_idx_worker(void *arg) {
     BulkDelIdxWork *iw = (BulkDelIdxWork *)arg;
     for (int i = 0; i < iw->count; i++) {
-        if (iw->vals[i] && iw->vals[i][0])
-            delete_index_entry(iw->db_root, iw->object, iw->field, iw->vals[i], iw->hashes[i]);
+        if (iw->vals[i] && iw->vlens[i] > 0)
+            delete_index_entry(iw->db_root, iw->object, iw->field,
+                               iw->vals[i], iw->vlens[i], iw->hashes[i]);
     }
     return NULL;
 }
@@ -1687,10 +1680,13 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
         workers[g].nidx = nidx;
         workers[g].ts = ts;
         workers[g].deleted = 0;
-        /* Allocate idx_vals */
-        workers[g].idx_vals = calloc(nidx, sizeof(char **));
-        for (int fi = 0; fi < nidx; fi++)
-            workers[g].idx_vals[fi] = calloc(cnt, sizeof(char *));
+        /* Allocate idx_vals + idx_lens (parallel arrays) */
+        workers[g].idx_vals = calloc(nidx, sizeof(uint8_t **));
+        workers[g].idx_lens = calloc(nidx, sizeof(size_t *));
+        for (int fi = 0; fi < nidx; fi++) {
+            workers[g].idx_vals[fi] = calloc(cnt, sizeof(uint8_t *));
+            workers[g].idx_lens[fi] = calloc(cnt, sizeof(size_t));
+        }
 
         for (int i = 0; i < cnt; i++) {
             int oi = order[group_starts[g] + i];
@@ -1708,20 +1704,23 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
     for (int g = 0; g < nshard_groups; g++) total_deleted += workers[g].deleted;
 
     if (nidx > 0 && total_deleted > 0) {
-        /* Flatten idx_vals across all shard groups: for each index, collect all (val, hash) pairs */
+        /* Flatten idx_vals+idx_lens across all shard groups: per index,
+           collect (val, vlen, hash) triples. */
         BulkDelIdxWork *idx_workers = malloc(nidx * sizeof(BulkDelIdxWork));
         for (int fi = 0; fi < nidx; fi++) {
             idx_workers[fi].db_root = db_root;
             idx_workers[fi].object = object;
             idx_workers[fi].field = idx_fields[fi];
-            idx_workers[fi].vals = malloc(key_count * sizeof(char *));
+            idx_workers[fi].vals = malloc(key_count * sizeof(uint8_t *));
+            idx_workers[fi].vlens = malloc(key_count * sizeof(size_t));
             idx_workers[fi].hashes = malloc(key_count * sizeof(uint8_t[16]));
             idx_workers[fi].count = 0;
             for (int g = 0; g < nshard_groups; g++) {
                 for (int ki = 0; ki < workers[g].key_count; ki++) {
-                    if (workers[g].idx_vals[fi][ki]) {
+                    if (workers[g].idx_vals[fi][ki] && workers[g].idx_lens[fi][ki] > 0) {
                         int c = idx_workers[fi].count;
                         idx_workers[fi].vals[c] = workers[g].idx_vals[fi][ki];
+                        idx_workers[fi].vlens[c] = workers[g].idx_lens[fi][ki];
                         memcpy(idx_workers[fi].hashes[c], workers[g].hashes[ki], 16);
                         idx_workers[fi].count++;
                     }
@@ -1734,6 +1733,7 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
         for (int fi = 0; fi < nidx; fi++) {
             for (int i = 0; i < idx_workers[fi].count; i++) free(idx_workers[fi].vals[i]);
             free(idx_workers[fi].vals);
+            free(idx_workers[fi].vlens);
             free(idx_workers[fi].hashes);
         }
         free(idx_workers);
@@ -1744,8 +1744,12 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
         free(workers[g].keys);
         free(workers[g].hashes);
         free(workers[g].shard_slots);
-        for (int fi = 0; fi < nidx; fi++) free(workers[g].idx_vals[fi]);
+        for (int fi = 0; fi < nidx; fi++) {
+            free(workers[g].idx_vals[fi]);
+            free(workers[g].idx_lens[fi]);
+        }
         free(workers[g].idx_vals);
+        free(workers[g].idx_lens);
     }
     free(workers);
 
@@ -1870,29 +1874,16 @@ static void *bulk_upd_shard_worker(void *arg) {
 
         if (!criteria_match_tree(value_ptr, w->tree, w->fs)) { w->skipped++; continue; }
 
-        /* Collect old index values */
-        char *old_idx_vals[MAX_FIELDS];
-        memset(old_idx_vals, 0, sizeof(old_idx_vals));
+        /* Collect old index values (as index-key bytes) */
+        uint8_t *old_idx_bufs[MAX_FIELDS];
+        size_t   old_idx_lens[MAX_FIELDS];
+        int      old_idx_have[MAX_FIELDS];
+        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+        memset(old_idx_lens, 0, sizeof(old_idx_lens));
+        memset(old_idx_have, 0, sizeof(old_idx_have));
         for (int fi = 0; fi < w->nidx; fi++) {
-            if (strchr(w->idx_fields[fi], '+')) {
-                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
-                char cat[4096]; int cp = 0; int ok = 1;
-                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                while (tok) {
-                    int fidx = typed_field_index(w->ts, tok);
-                    if (fidx >= 0) {
-                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
-                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                        else { ok = 0; break; }
-                    } else { ok = 0; break; }
-                    tok = strtok_r(NULL, "+", &_tok_save);
-                }
-                cat[cp] = '\0';
-                old_idx_vals[fi] = (ok && cp > 0) ? strdup(cat) : NULL;
-            } else {
-                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
-                old_idx_vals[fi] = typed_get_field_str(w->ts, value_ptr, fidx);
-            }
+            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
+                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
         }
 
         /* Apply partial update */
@@ -1932,36 +1923,26 @@ static void *bulk_upd_shard_worker(void *arg) {
         if (w->nidx > 0) {
             uint8_t *new_val = map + zoneB_off(slot, slots, w->sch->slot_size) + rec->klen;
             for (int fi = 0; fi < w->nidx; fi++) {
-                char *new_v = NULL;
-                if (strchr(w->idx_fields[fi], '+')) {
-                    char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
-                    char cat[4096]; int cp = 0; int ok = 1;
-                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                    while (tok) {
-                        int fidx = typed_field_index(w->ts, tok);
-                        if (fidx >= 0) {
-                            char *v = typed_get_field_str(w->ts, new_val, fidx);
-                            if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                            else { ok = 0; break; }
-                        } else { ok = 0; break; }
-                        tok = strtok_r(NULL, "+", &_tok_save);
-                    }
-                    cat[cp] = '\0';
-                    if (ok && cp > 0) new_v = strdup(cat);
-                } else {
-                    int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
-                    new_v = typed_get_field_str(w->ts, new_val, fidx);
-                }
+                uint8_t *new_buf = NULL; size_t new_len = 0;
+                int have_new = build_index_key_from_record(w->ts, new_val, w->idx_fields[fi],
+                                                          &new_buf, &new_len);
                 int changed = 0;
-                if (!old_idx_vals[fi] && new_v) changed = 1;
-                else if (old_idx_vals[fi] && !new_v) changed = 1;
-                else if (old_idx_vals[fi] && new_v && strcmp(old_idx_vals[fi], new_v) != 0) changed = 1;
-                if (changed) {
-                    if (old_idx_vals[fi]) delete_index_entry(w->db_root, w->object, w->idx_fields[fi], old_idx_vals[fi], rec->hash);
-                    if (new_v) write_index_entry(w->db_root, w->object, w->idx_fields[fi], new_v, rec->hash);
+                if (have_new && !old_idx_have[fi]) changed = 1;
+                else if (!have_new && old_idx_have[fi]) changed = 1;
+                else if (have_new && old_idx_have[fi]) {
+                    if (new_len != old_idx_lens[fi] ||
+                        memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
                 }
-                free(old_idx_vals[fi]);
-                free(new_v);
+                if (changed) {
+                    if (old_idx_have[fi])
+                        delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                           old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
+                    if (have_new)
+                        write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                          new_buf, new_len, rec->hash);
+                }
+                free(old_idx_bufs[fi]);
+                free(new_buf);
             }
         }
 
@@ -2197,29 +2178,16 @@ static void *bulk_upd_delim_shard_worker(void *arg) {
             }
         }
 
-        /* Capture old index values before patching. */
-        char *old_idx_vals[MAX_FIELDS];
-        memset(old_idx_vals, 0, sizeof(old_idx_vals));
+        /* Capture old index values (as index-key bytes) before patching. */
+        uint8_t *old_idx_bufs[MAX_FIELDS];
+        size_t   old_idx_lens[MAX_FIELDS];
+        int      old_idx_have[MAX_FIELDS];
+        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+        memset(old_idx_lens, 0, sizeof(old_idx_lens));
+        memset(old_idx_have, 0, sizeof(old_idx_have));
         for (int fi = 0; fi < w->nidx; fi++) {
-            if (strchr(w->idx_fields[fi], '+')) {
-                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
-                char cat[4096]; int cp = 0; int ok = 1;
-                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                while (tok) {
-                    int fidx = typed_field_index(w->ts, tok);
-                    if (fidx >= 0) {
-                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
-                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                        else { ok = 0; break; }
-                    } else { ok = 0; break; }
-                    tok = strtok_r(NULL, "+", &_tok_save);
-                }
-                cat[cp] = '\0';
-                old_idx_vals[fi] = (ok && cp > 0) ? strdup(cat) : NULL;
-            } else {
-                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
-                old_idx_vals[fi] = typed_get_field_str(w->ts, value_ptr, fidx);
-            }
+            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
+                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
         }
 
         /* Patch each non-blank field into the typed payload at its fixed offset.
@@ -2264,36 +2232,26 @@ static void *bulk_upd_delim_shard_worker(void *arg) {
            cell on an indexed field leaves the field unchanged and therefore
            does zero B+ tree work for that index. */
         for (int fi = 0; fi < w->nidx; fi++) {
-            char *new_v = NULL;
-            if (strchr(w->idx_fields[fi], '+')) {
-                char fb[256]; strncpy(fb, w->idx_fields[fi], 255); fb[255] = '\0';
-                char cat[4096]; int cp = 0; int ok = 1;
-                char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                while (tok) {
-                    int fidx = typed_field_index(w->ts, tok);
-                    if (fidx >= 0) {
-                        char *v = typed_get_field_str(w->ts, value_ptr, fidx);
-                        if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                        else { ok = 0; break; }
-                    } else { ok = 0; break; }
-                    tok = strtok_r(NULL, "+", &_tok_save);
-                }
-                cat[cp] = '\0';
-                if (ok && cp > 0) new_v = strdup(cat);
-            } else {
-                int fidx = typed_field_index(w->ts, w->idx_fields[fi]);
-                new_v = typed_get_field_str(w->ts, value_ptr, fidx);
-            }
+            uint8_t *new_buf = NULL; size_t new_len = 0;
+            int have_new = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
+                                                      &new_buf, &new_len);
             int changed = 0;
-            if (!old_idx_vals[fi] && new_v) changed = 1;
-            else if (old_idx_vals[fi] && !new_v) changed = 1;
-            else if (old_idx_vals[fi] && new_v && strcmp(old_idx_vals[fi], new_v) != 0) changed = 1;
-            if (changed) {
-                if (old_idx_vals[fi]) delete_index_entry(w->db_root, w->object, w->idx_fields[fi], old_idx_vals[fi], rec->hash);
-                if (new_v) write_index_entry(w->db_root, w->object, w->idx_fields[fi], new_v, rec->hash);
+            if (have_new && !old_idx_have[fi]) changed = 1;
+            else if (!have_new && old_idx_have[fi]) changed = 1;
+            else if (have_new && old_idx_have[fi]) {
+                if (new_len != old_idx_lens[fi] ||
+                    memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
             }
-            free(old_idx_vals[fi]);
-            free(new_v);
+            if (changed) {
+                if (old_idx_have[fi])
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                      new_buf, new_len, rec->hash);
+            }
+            free(old_idx_bufs[fi]);
+            free(new_buf);
         }
 
         w->updated++;
@@ -2552,32 +2510,19 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
             ucache_write_release(wh); skipped++; continue;
         }
 
-        /* Extract indexed field values BEFORE tombstoning */
+        /* Extract indexed field values (as index-key bytes) BEFORE tombstoning */
         char idx_fields[MAX_FIELDS][256];
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-        char *idx_vals[MAX_FIELDS];
-        memset(idx_vals, 0, sizeof(idx_vals));
+        uint8_t *idx_bufs[MAX_FIELDS];
+        size_t   idx_lens[MAX_FIELDS];
+        int      idx_have[MAX_FIELDS];
+        memset(idx_bufs, 0, sizeof(idx_bufs));
+        memset(idx_lens, 0, sizeof(idx_lens));
+        memset(idx_have, 0, sizeof(idx_have));
         if (nidx > 0) {
             for (int fi = 0; fi < nidx; fi++) {
-                if (strchr(idx_fields[fi], '+')) {
-                    char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
-                    char cat[4096]; int cp = 0; int ok = 1;
-                    char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-                    while (tok) {
-                        int fidx = typed_field_index(ts, tok);
-                        if (fidx >= 0) {
-                            char *v = typed_get_field_str(ts, value_ptr, fidx);
-                            if (v) { int sl = strlen(v); memcpy(cat+cp, v, sl); cp += sl; free(v); }
-                            else { ok = 0; break; }
-                        } else { ok = 0; break; }
-                        tok = strtok_r(NULL, "+", &_tok_save);
-                    }
-                    cat[cp] = '\0';
-                    idx_vals[fi] = (ok && cp > 0) ? strdup(cat) : NULL;
-                } else {
-                    int fidx = typed_field_index(ts, idx_fields[fi]);
-                    idx_vals[fi] = typed_get_field_str(ts, value_ptr, fidx);
-                }
+                idx_have[fi] = build_index_key_from_record(ts, value_ptr, idx_fields[fi],
+                                                          &idx_bufs[fi], &idx_lens[fi]);
             }
         }
 
@@ -2588,9 +2533,10 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
         /* Index cleanup */
         for (int fi = 0; fi < nidx; fi++) {
-            if (idx_vals[fi] && idx_vals[fi][0])
-                delete_index_entry(db_root, object, idx_fields[fi], idx_vals[fi], hash);
-            free(idx_vals[fi]);
+            if (idx_have[fi])
+                delete_index_entry(db_root, object, idx_fields[fi],
+                                   idx_bufs[fi], idx_lens[fi], hash);
+            free(idx_bufs[fi]);
         }
 
         deleted++;
@@ -4234,6 +4180,9 @@ static int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
     return 0;
 }
 
+/* Forward decl — definition lives near btree_dispatch below. */
+static const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field);
+
 /* Btree search callback — captures the first hash hit. */
 typedef struct { uint8_t hash[16]; int found; } JoinBtHit;
 static int join_bt_first_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
@@ -4262,7 +4211,18 @@ static int lookup_remote(const JoinSpec *j, const char *db_root,
         compute_addr(local_key, local_len, j->remote_sch.splits, hash, &shard_id, &start_slot);
     } else {
         JoinBtHit hit = {{0}, 0};
-        btree_search(j->remote_idx_path, local_key, local_len, join_bt_first_cb, &hit);
+        /* Encode local_key as an index key for the REMOTE field's type —
+           that's how the remote .idx stores its values. */
+        const TypedField *rem_tf = resolve_idx_field(j->remote_fs.ts, j->remote_field);
+        uint8_t keybuf[1032];
+        size_t keylen;
+        if (rem_tf) {
+            encode_field_for_index(rem_tf, local_key, local_len, keybuf, &keylen);
+            btree_search(j->remote_idx_path, (const char *)keybuf, keylen, join_bt_first_cb, &hit);
+        } else {
+            /* Composite remote field or untyped — raw passthrough. */
+            btree_search(j->remote_idx_path, local_key, local_len, join_bt_first_cb, &hit);
+        }
         if (!hit.found) return 0;
         memcpy(hash, hit.hash, 16);
         addr_from_hash(hash, j->remote_sch.splits, &shard_id, &start_slot);
@@ -4558,51 +4518,106 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     return 0;
 }
 
-/* Dispatch B+ tree query based on search operator. Used by find, count, aggregate. */
+/* Look up TypedField for a criterion's indexed field. Returns NULL for
+   composite indexes (pc->field contains '+') or when the field isn't in
+   the typed schema — both cases fall through to raw-byte index semantics. */
+static const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field) {
+    if (!ts || !field || !field[0]) return NULL;
+    if (strchr(field, '+')) return NULL;
+    int fi = typed_field_index(ts, field);
+    return (fi >= 0) ? &ts->fields[fi] : NULL;
+}
+
+/* Encode a criterion value for index lookup. If tf is NULL (composite index
+   or unknown field), returns the text as raw bytes. Otherwise emits
+   memcmp-sortable bytes matching what the write side stored. Output written
+   into caller's buf; *out_len set. */
+static void encode_criterion_value(const TypedField *tf,
+                                   const char *val, size_t vlen,
+                                   uint8_t *buf, size_t *out_len) {
+    if (!tf) {
+        memcpy(buf, val, vlen);
+        *out_len = vlen;
+        return;
+    }
+    encode_field_for_index(tf, val, vlen, buf, out_len);
+}
+
+/* Dispatch B+ tree query based on search operator. Used by find, count, aggregate.
+   tf is the TypedField for pc->field (NULL for composite indexes or
+   untyped objects — in that case values are passed as raw bytes, matching
+   the legacy ASCII storage of composite indexes). */
 static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
+                           const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
+    /* Stack buffers for encoded key bytes. Max fixed-type output is 8 B;
+       varchar caps at f->size - 2 ≤ 65533 — BT_MAX_VAL_LEN = 512 in practice.
+       Keep generous for the "contains text + 4 sentinel bytes" suffix cases. */
+    uint8_t buf1[1032], buf2[1032];
+    size_t len1 = 0, len2 = 0;
+
     switch (pc->op) {
         case OP_EQUAL:
-            btree_search(idx_path, pc->value, strlen(pc->value), cb, ctx);
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
             break;
         case OP_GREATER_EQ:
-            btree_range(idx_path, pc->value, strlen(pc->value),
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            btree_range(idx_path, (const char *)buf1, len1,
                        "\xff\xff\xff\xff", 4, cb, ctx);
             break;
         case OP_GREATER:
-            btree_range_ex(idx_path, pc->value, strlen(pc->value), 1,
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            btree_range_ex(idx_path, (const char *)buf1, len1, 1,
                           "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         case OP_LESS_EQ:
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             btree_range(idx_path, "", 0,
-                       pc->value, strlen(pc->value), cb, ctx);
+                       (const char *)buf1, len1, cb, ctx);
             break;
         case OP_LESS:
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             btree_range_ex(idx_path, "", 0, 0,
-                          pc->value, strlen(pc->value), 1, cb, ctx);
+                          (const char *)buf1, len1, 1, cb, ctx);
             break;
         case OP_BETWEEN:
-            btree_range(idx_path, pc->value, strlen(pc->value),
-                       pc->value2, strlen(pc->value2), cb, ctx);
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            encode_criterion_value(tf, pc->value2, strlen(pc->value2), buf2, &len2);
+            btree_range(idx_path, (const char *)buf1, len1,
+                       (const char *)buf2, len2, cb, ctx);
             break;
         case OP_IN:
-            for (int iv = 0; iv < pc->in_count; iv++)
-                btree_search(idx_path, pc->in_values[iv],
-                            strlen(pc->in_values[iv]), cb, ctx);
+            for (int iv = 0; iv < pc->in_count; iv++) {
+                encode_criterion_value(tf, pc->in_values[iv],
+                                       strlen(pc->in_values[iv]), buf1, &len1);
+                btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
+            }
             break;
         case OP_STARTS_WITH: {
-            size_t plen = strlen(pc->value);
-            char end_val[1028];
-            memcpy(end_val, pc->value, plen);
-            memset(end_val + plen, 0xff, 4);
-            btree_range(idx_path, pc->value, plen, end_val, plen + 4, cb, ctx);
+            /* Prefix-match only makes sense on raw-byte keys (varchar or
+               composite). For signed numeric keys with their top-bit flip,
+               "starts with X" isn't meaningful — fall through to raw bytes. */
+            int raw_prefix = (!tf || tf->type == FT_VARCHAR);
+            size_t plen;
+            if (raw_prefix) {
+                plen = strlen(pc->value);
+                memcpy(buf1, pc->value, plen);
+            } else {
+                encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &plen);
+            }
+            memcpy(buf2, buf1, plen);
+            memset(buf2 + plen, 0xff, 4);
+            btree_range(idx_path, (const char *)buf1, plen,
+                        (const char *)buf2, plen + 4, cb, ctx);
             break;
         }
         case OP_NOT_EQUAL:
             /* Two exclusive ranges: everything before + everything after */
+            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             btree_range_ex(idx_path, "", 0, 0,
-                          pc->value, strlen(pc->value), 1, cb, ctx);
-            btree_range_ex(idx_path, pc->value, strlen(pc->value), 1,
+                          (const char *)buf1, len1, 1, cb, ctx);
+            btree_range_ex(idx_path, (const char *)buf1, len1, 1,
                           "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         default:
@@ -5040,7 +5055,9 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     cc.check_primary = check_primary;
     cc.deadline = dl;
 
-    btree_dispatch(primary_idx_path, primary_crit, collect_hash_cb, &cc);
+    btree_dispatch(primary_idx_path, primary_crit,
+                   resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
+                   collect_hash_cb, &cc);
 
     if (cc.budget_exceeded) { free(cc.entries); return -2; }  /* -2 = budget exceeded */
     if (cc.count == 0) { free(cc.entries); return 0; }
@@ -5625,7 +5642,10 @@ static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, vo
 
 static void *or_child_worker(void *arg) {
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)arg;
-    btree_dispatch(w->idx_path, (SearchCriterion *)w->leaf, or_collect_cb, w);
+    TypedSchema *ts = load_typed_schema(w->db_root, w->object);
+    btree_dispatch(w->idx_path, (SearchCriterion *)w->leaf,
+                   resolve_idx_field(ts, w->leaf->field),
+                   or_collect_cb, w);
     return NULL;
 }
 
@@ -6067,9 +6087,10 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             (tree->kind == CNODE_AND && tree->n_children == 1 &&
              tree->children[0]->kind == CNODE_LEAF);
 
+        const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
         if (is_single_leaf) {
             IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
-            btree_dispatch(plan.primary_idx_path, pc, idx_count_cb, &ic);
+            btree_dispatch(plan.primary_idx_path, pc, pc_tf, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("{\"count\":%zu}\n", ic.count);
         } else {
@@ -6081,7 +6102,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             cc.primary_crit = pc;
             cc.check_primary = check_primary;
             cc.deadline = &dl;
-            btree_dispatch(plan.primary_idx_path, pc, collect_hash_cb, &cc);
+            btree_dispatch(plan.primary_idx_path, pc, pc_tf, collect_hash_cb, &cc);
 
             if (cc.budget_exceeded) {
                 OUT(QUERY_BUFFER_ERR);
@@ -8025,7 +8046,9 @@ int cmd_aggregate(const char *db_root, const char *object,
         cc.check_primary = check_primary;
         cc.deadline = &dl;
 
-        btree_dispatch(plan.primary_idx_path, pc, collect_hash_cb, &cc);
+        btree_dispatch(plan.primary_idx_path, pc,
+                       resolve_idx_field(fs.ts, pc->field),
+                       collect_hash_cb, &cc);
 
         if (cc.budget_exceeded) ctx.budget_exceeded = 1;
         else parallel_indexed_agg(&ctx, db_root, object, &sch, cc.entries, (int)cc.count);

@@ -423,6 +423,44 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx);
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
+
+/* Index-key encoder: parses a textual value and emits memcmp-sortable bytes.
+   Signed types get a top-bit flip (MIN→0x00..., 0→0x80..., MAX→0xFF...).
+   Doubles get IEEE-754 total-order flip (positive: flip sign bit; negative:
+   flip all bits). Varchar/byte/bool/composite are raw bytes, no flip.
+   Output length returned via *out_len — callers must reserve at least
+   f->size bytes (varchar: up to vlen bytes, no 2-byte length prefix). */
+void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+                            uint8_t *out, size_t *out_len);
+
+/* Typed-binary → index-key encoder. Reads field bytes from a typed record
+   (at the field's fixed offset) and emits the same memcmp-sortable bytes
+   that encode_field_for_index would produce for the equivalent text input.
+   Used by index scan paths that already hold typed binary records and want
+   to skip the typed→ASCII→index-bytes roundtrip. */
+void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
+                              int field_idx, uint8_t *out, size_t *out_len);
+
+/* Build an index key from a typed record for a (possibly composite) spec.
+   Single-field: binary-encoded bytes (typed_field_to_index_key).
+   Composite ("a+b+c"): ASCII-concatenated values — kept on the legacy string
+   path by design, since composite semantics are "whatever the user typed".
+   Returns 1 on success with malloc'd *out_val and *out_len set; caller frees.
+   Returns 0 if any sub-field is missing/empty or spec is unknown. */
+int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
+                                const char *spec,
+                                uint8_t **out_val, size_t *out_len);
+
+/* Build an index key from a JSON object for a (possibly composite) spec.
+   Extracts the necessary fields from json, then encodes:
+     single-field → encode_field_for_index (binary),
+     composite    → ASCII concatenation (legacy path).
+   Returns 1 on success with malloc'd *out_val and *out_len set; caller
+   frees. ts may be NULL (untyped object) — in that case every field is
+   treated as raw varchar text. Returns 0 on missing/empty values. */
+int build_index_key_from_json(const TypedSchema *ts, const char *json,
+                              const char *spec,
+                              uint8_t **out_val, size_t *out_len);
 int typed_field_index(const TypedSchema *ts, const char *name);
 void parse_field_type(const char *spec, TypedField *f);
 
@@ -507,11 +545,23 @@ char parse_csv_delim(const char *s);
 int cmd_not_exists(const char *db_root, const char *object, const char *keys_json);
 
 /* index.c */
-void write_index_entry(const char *db_root, const char *object, const char *field, const char *attr_val, const uint8_t hash16[16]);
-void delete_index_entry(const char *db_root, const char *object, const char *field, const char *attr_val, const uint8_t hash16[16]);
+/* Value is raw index-key bytes (see encode_field_for_index /
+   typed_field_to_index_key). Composite indexes pass the ASCII-concatenated
+   string + its strlen; single-field indexes pass encoded bytes + their true
+   length. vlen may be 0 (empty key sorts before all others). */
+void write_index_entry(const char *db_root, const char *object, const char *field,
+                       const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
+void delete_index_entry(const char *db_root, const char *object, const char *field,
+                        const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
 void index_parallel(const char *db_root, const char *object, const char *value, const uint8_t hash16[16], char fields[][256], int nfields);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
+
+/* Rebuild every index for matching objects. NULL filters match all. The
+   no-filter form walks every (dir, object) in schema.conf; tenant form walks
+   every object under <dir>; object form rebuilds one. Writes a single
+   summary JSON to OUT; per-object progress goes to the info log. */
+int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 

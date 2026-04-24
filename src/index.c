@@ -38,21 +38,23 @@ static void *idx_build_worker_idx(void *arg) {
 
 /* Wrapper for insert-time indexing — uses B+ tree */
 void write_index_entry(const char *db_root, const char *object,
-                              const char *field, const char *attr_val,
+                              const char *field,
+                              const uint8_t *val, size_t vlen,
                               const uint8_t hash16[16]) {
     char idx_path[PATH_MAX];
     snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
     mkdirp(dirname_of(idx_path));
-    btree_insert(idx_path, attr_val, strlen(attr_val), hash16);
+    btree_insert(idx_path, (const char *)val, vlen, hash16);
 }
 
 /* Delete from index — uses B+ tree */
 void delete_index_entry(const char *db_root, const char *object,
-                               const char *field, const char *attr_val,
+                               const char *field,
+                               const uint8_t *val, size_t vlen,
                                const uint8_t hash16[16]) {
     char idx_path[PATH_MAX];
     snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
-    btree_delete(idx_path, attr_val, strlen(attr_val), hash16);
+    btree_delete(idx_path, (const char *)val, vlen, hash16);
 }
 
 /* ========== Parallel indexing ========== */
@@ -61,13 +63,14 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *field;
-    const char *attr_val;
+    uint8_t *val;               /* heap-owned bytes (index-key encoding); freed by caller */
+    size_t vlen;
     const uint8_t *hash16;
 } IndexThreadArg;
 
 void *index_thread_fn(void *arg) {
     IndexThreadArg *a = (IndexThreadArg *)arg;
-    write_index_entry(a->db_root, a->object, a->field, a->attr_val, a->hash16);
+    write_index_entry(a->db_root, a->object, a->field, a->val, a->vlen, a->hash16);
     return NULL;
 }
 
@@ -137,17 +140,17 @@ void index_parallel(const char *db_root, const char *object,
                            char fields[][256], int nfields) {
     if (nfields <= 0) return;
 
+    TypedSchema *ts = load_typed_schema(db_root, object);
+
     /* Collect all unique sub-field names from single + composite indexes */
     const char *unique_keys[MAX_FIELDS * 4];
     int unique_count = 0;
     for (int i = 0; i < nfields; i++) {
         if (strchr(fields[i], '+')) {
-            /* Composite — split and add sub-fields */
             char fbuf[256];
             strncpy(fbuf, fields[i], 255); fbuf[255] = '\0';
             char *_tok_save = NULL; char *tok = strtok_r(fbuf, "+", &_tok_save);
             while (tok) {
-                /* Check if already in unique list */
                 int found = 0;
                 for (int j = 0; j < unique_count; j++)
                     if (strcmp(unique_keys[j], tok) == 0) { found = 1; break; }
@@ -160,27 +163,26 @@ void index_parallel(const char *db_root, const char *object,
             for (int j = 0; j < unique_count; j++)
                 if (strcmp(unique_keys[j], fields[i]) == 0) { found = 1; break; }
             if (!found && unique_count < MAX_FIELDS * 4)
-                unique_keys[unique_count++] = fields[i]; /* no strdup needed — points to fields */
+                unique_keys[unique_count++] = fields[i];
         }
     }
 
-    /* Single-pass extraction of ALL unique sub-fields */
     char *extracted[MAX_FIELDS * 4];
     json_get_fields(value, unique_keys, unique_count, extracted);
 
-    /* Now build index values and insert */
     IndexThreadArg args[MAX_FIELDS];
     int tcount = 0;
 
-    /* Temporary storage for composite values */
-    char *composite_vals[MAX_FIELDS];
-    memset(composite_vals, 0, sizeof(composite_vals));
+    /* Heap-owned per-index key buffers — freed after parallel_for returns. */
+    uint8_t *idx_keys[MAX_FIELDS];
+    memset(idx_keys, 0, sizeof(idx_keys));
 
     for (int i = 0; i < nfields; i++) {
-        char *idx_val = NULL;
+        uint8_t *key_buf = NULL;
+        size_t key_len = 0;
 
         if (strchr(fields[i], '+')) {
-            /* Composite index — concatenate sub-field values */
+            /* Composite — ASCII concat of sub-field values (raw bytes). */
             char fbuf[256];
             strncpy(fbuf, fields[i], 255); fbuf[255] = '\0';
             char result[4096];
@@ -188,7 +190,6 @@ void index_parallel(const char *db_root, const char *object,
             int all_present = 1;
             char *_tok_save = NULL; char *tok = strtok_r(fbuf, "+", &_tok_save);
             while (tok) {
-                /* Find this sub-field in extracted values */
                 for (int j = 0; j < unique_count; j++) {
                     if (strcmp(unique_keys[j], tok) == 0) {
                         if (!extracted[j] || extracted[j][0] == '\0') { all_present = 0; break; }
@@ -203,38 +204,55 @@ void index_parallel(const char *db_root, const char *object,
                 if (!all_present) break;
                 tok = strtok_r(NULL, "+", &_tok_save);
             }
-            result[pos] = '\0';
             if (all_present && pos > 0) {
-                composite_vals[i] = strdup(result);
-                idx_val = composite_vals[i];
+                key_buf = malloc((size_t)pos);
+                memcpy(key_buf, result, (size_t)pos);
+                key_len = (size_t)pos;
             }
         } else {
-            /* Single field — find in extracted */
+            /* Single field — encode textual JSON value as index-key bytes. */
+            const char *txt = NULL;
             for (int j = 0; j < unique_count; j++) {
                 if (strcmp(unique_keys[j], fields[i]) == 0) {
-                    idx_val = extracted[j];
+                    txt = extracted[j];
                     break;
+                }
+            }
+            if (txt && txt[0]) {
+                int fidx = ts ? typed_field_index(ts, fields[i]) : -1;
+                if (fidx >= 0) {
+                    const TypedField *f = &ts->fields[fidx];
+                    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+                    key_buf = malloc(cap);
+                    encode_field_for_index(f, txt, strlen(txt), key_buf, &key_len);
+                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
+                } else {
+                    /* Unknown to typed schema (e.g. legacy untyped object) —
+                       fall back to raw bytes so index still builds. */
+                    size_t sl = strlen(txt);
+                    key_buf = malloc(sl);
+                    memcpy(key_buf, txt, sl);
+                    key_len = sl;
                 }
             }
         }
 
-        if (!idx_val || idx_val[0] == '\0') continue;
+        if (!key_buf || key_len == 0) { free(key_buf); continue; }
 
+        idx_keys[tcount] = key_buf;
         args[tcount].db_root = db_root;
         args[tcount].object = object;
         args[tcount].field = fields[i];
-        args[tcount].attr_val = idx_val;
+        args[tcount].val = key_buf;
+        args[tcount].vlen = key_len;
         args[tcount].hash16 = hash16;
-
         tcount++;
     }
 
     parallel_for(index_thread_fn, args, tcount, sizeof(IndexThreadArg));
 
-    /* Free extracted values and composite values */
+    for (int i = 0; i < tcount; i++) free(idx_keys[i]);
     for (int i = 0; i < unique_count; i++) free(extracted[i]);
-    for (int i = 0; i < nfields; i++) free(composite_vals[i]);
-    /* Free strdup'd unique keys (only those from composite splits) */
     for (int i = 0; i < unique_count; i++) {
         int is_field = 0;
         for (int j = 0; j < nfields; j++)
@@ -255,9 +273,121 @@ int cmp_str_numeric(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
-/* Comparators for raw structs (used by add-index sort) */
+/* Build an index key from a typed record for a (possibly composite) spec.
+   See types.h for contract. */
+int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
+                                const char *spec,
+                                uint8_t **out_val, size_t *out_len) {
+    if (!ts || !record || !spec || !out_val || !out_len) return 0;
+    *out_val = NULL;
+    *out_len = 0;
+
+    if (strchr(spec, '+')) {
+        /* Composite — ASCII concat per field, stays on the string path. */
+        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
+        char cat[4096]; int cp = 0; int ok = 1;
+        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+        while (tok) {
+            int fi = typed_field_index(ts, tok);
+            if (fi < 0) { ok = 0; break; }
+            char *v = typed_get_field_str(ts, record, fi);
+            if (!v) { ok = 0; break; }
+            int sl = strlen(v);
+            if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
+            free(v);
+            tok = strtok_r(NULL, "+", &_tok_save);
+        }
+        if (!ok || cp == 0) return 0;
+        *out_val = malloc((size_t)cp);
+        memcpy(*out_val, cat, (size_t)cp);
+        *out_len = (size_t)cp;
+        return 1;
+    }
+
+    /* Single field — typed binary → index-key bytes. */
+    int fi = typed_field_index(ts, spec);
+    if (fi < 0) return 0;
+    const TypedField *f = &ts->fields[fi];
+    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+    uint8_t *buf = malloc(cap);
+    size_t blen = 0;
+    typed_field_to_index_key(ts, record, fi, buf, &blen);
+    if (blen == 0) { free(buf); return 0; }
+    *out_val = buf;
+    *out_len = blen;
+    return 1;
+}
+
+/* Build an index key from JSON for a (possibly composite) spec.
+   See types.h for contract. */
+int build_index_key_from_json(const TypedSchema *ts, const char *json,
+                              const char *spec,
+                              uint8_t **out_val, size_t *out_len) {
+    if (!json || !spec || !out_val || !out_len) return 0;
+    *out_val = NULL;
+    *out_len = 0;
+
+    if (strchr(spec, '+')) {
+        /* Composite — extract each sub-field and ASCII-concat. */
+        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
+        const char *subs[16]; int nsub = 0;
+        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+        while (tok && nsub < 16) { subs[nsub++] = tok; tok = strtok_r(NULL, "+", &_tok_save); }
+        char *vals[16];
+        json_get_fields(json, subs, nsub, vals);
+        char cat[4096]; int cp = 0; int ok = 1;
+        for (int i = 0; i < nsub; i++) {
+            if (!vals[i] || vals[i][0] == '\0') { ok = 0; break; }
+            int sl = strlen(vals[i]);
+            if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, vals[i], sl); cp += sl; }
+        }
+        for (int i = 0; i < nsub; i++) free(vals[i]);
+        if (!ok || cp == 0) return 0;
+        *out_val = malloc((size_t)cp);
+        memcpy(*out_val, cat, (size_t)cp);
+        *out_len = (size_t)cp;
+        return 1;
+    }
+
+    /* Single field — extract text, encode to index bytes. */
+    JsonObj jo;
+    json_parse_object(json, strlen(json), &jo);
+    char *txt = json_obj_strdup(&jo, spec);
+    if (!txt || !txt[0]) { free(txt); return 0; }
+
+    int fi = ts ? typed_field_index(ts, spec) : -1;
+    if (fi >= 0) {
+        const TypedField *f = &ts->fields[fi];
+        size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+        uint8_t *buf = malloc(cap);
+        size_t blen = 0;
+        encode_field_for_index(f, txt, strlen(txt), buf, &blen);
+        free(txt);
+        if (blen == 0) { free(buf); return 0; }
+        *out_val = buf;
+        *out_len = blen;
+        return 1;
+    }
+
+    /* Untyped — passthrough raw bytes. */
+    size_t sl = strlen(txt);
+    *out_val = malloc(sl);
+    memcpy(*out_val, txt, sl);
+    *out_len = sl;
+    free(txt);
+    return 1;
+}
+
+/* Comparators for raw structs (used by add-index sort). Length-aware so
+   binary keys with embedded NULs compare correctly. */
 int cmp_btentry_fn(const void *a, const void *b) {
-    return strcmp(((const BtEntry *)a)->value, ((const BtEntry *)b)->value);
+    const BtEntry *ea = a, *eb = b;
+    size_t m = ea->vlen < eb->vlen ? ea->vlen : eb->vlen;
+    int r = memcmp(ea->value, eb->value, m);
+    if (r) return r;
+    if (ea->vlen < eb->vlen) return -1;
+    if (ea->vlen > eb->vlen) return 1;
+    return 0;
 }
 int cmp_str_raw(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);
@@ -343,32 +473,45 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     IndexScanCtx *ic = (IndexScanCtx *)ctx;
     const char *raw = (const char *)(block + hdr->key_len);
     size_t raw_len = hdr->value_len;
-    char *attr = NULL;
+    uint8_t *key_buf = NULL;
+    size_t key_len = 0;
 
     if (ic->is_composite) {
+        /* Composite stays on ASCII-concat path. */
         char cat[4096]; int cpos = 0; int ok = 1;
         for (int i = 0; i < ic->field_index_count; i++) {
             char *v = typed_get_field_str(ic->ts, (const uint8_t *)raw, ic->field_indices[i]);
             if (v) { int sl = strlen(v); memcpy(cat + cpos, v, sl); cpos += sl; free(v); }
             else { ok = 0; break; }
         }
-        cat[cpos] = '\0';
-        if (ok && cpos > 0) attr = strdup(cat);
+        if (ok && cpos > 0) {
+            key_buf = malloc((size_t)cpos);
+            memcpy(key_buf, cat, (size_t)cpos);
+            key_len = (size_t)cpos;
+        }
     } else {
-        attr = typed_get_field_str(ic->ts, (const uint8_t *)raw, ic->field_indices[0]);
+        /* Single field — typed binary → index-key bytes (skip ASCII render). */
+        int fidx = ic->field_indices[0];
+        if (fidx >= 0) {
+            const TypedField *f = &ic->ts->fields[fidx];
+            size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+            key_buf = malloc(cap);
+            typed_field_to_index_key(ic->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
+            if (key_len == 0) { free(key_buf); key_buf = NULL; }
+        }
     }
 
-    if (attr && attr[0]) {
+    if (key_buf && key_len > 0) {
         if (ic->pair_count >= ic->pair_cap) {
             ic->pair_cap *= 2;
             ic->pairs = realloc(ic->pairs, ic->pair_cap * sizeof(BtEntry));
         }
-        ic->pairs[ic->pair_count].value = attr;
-        ic->pairs[ic->pair_count].vlen = strlen(attr);
+        ic->pairs[ic->pair_count].value = (const char *)key_buf;
+        ic->pairs[ic->pair_count].vlen = key_len;
         memcpy(ic->pairs[ic->pair_count].hash, hdr->hash, 16);
         ic->pair_count++;
     } else {
-        free(attr);
+        free(key_buf);
     }
     return 0;
 }
@@ -474,7 +617,9 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
     size_t raw_len = hdr->value_len;
 
     for (int fi = 0; fi < mc->nfields; fi++) {
-        char *attr = NULL;
+        uint8_t *key_buf = NULL;
+        size_t key_len = 0;
+
         if (mc->is_composite[fi]) {
             char cat[4096]; int cpos = 0; int ok = 1;
             for (int si = 0; si < mc->field_index_count[fi]; si++) {
@@ -482,23 +627,33 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
                 if (v) { int sl = strlen(v); memcpy(cat + cpos, v, sl); cpos += sl; free(v); }
                 else { ok = 0; break; }
             }
-            cat[cpos] = '\0';
-            if (ok && cpos > 0) attr = strdup(cat);
+            if (ok && cpos > 0) {
+                key_buf = malloc((size_t)cpos);
+                memcpy(key_buf, cat, (size_t)cpos);
+                key_len = (size_t)cpos;
+            }
         } else {
-            attr = typed_get_field_str(mc->ts, (const uint8_t *)raw, mc->field_indices[fi][0]);
+            int fidx = mc->field_indices[fi][0];
+            if (fidx >= 0) {
+                const TypedField *f = &mc->ts->fields[fidx];
+                size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+                key_buf = malloc(cap);
+                typed_field_to_index_key(mc->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
+                if (key_len == 0) { free(key_buf); key_buf = NULL; }
+            }
         }
 
-        if (attr && attr[0]) {
+        if (key_buf && key_len > 0) {
             if (mc->pair_count[fi] >= mc->pair_cap[fi]) {
                 mc->pair_cap[fi] *= 2;
                 mc->pairs[fi] = realloc(mc->pairs[fi], mc->pair_cap[fi] * sizeof(BtEntry));
             }
-            mc->pairs[fi][mc->pair_count[fi]].value = attr;
-            mc->pairs[fi][mc->pair_count[fi]].vlen = strlen(attr);
+            mc->pairs[fi][mc->pair_count[fi]].value = (const char *)key_buf;
+            mc->pairs[fi][mc->pair_count[fi]].vlen = key_len;
             memcpy(mc->pairs[fi][mc->pair_count[fi]].hash, hdr->hash, 16);
             mc->pair_count[fi]++;
         } else {
-            free(attr);
+            free(key_buf);
         }
     }
     return 0;
@@ -754,5 +909,97 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
     invalidate_idx_cache(object);
     log_msg(3, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
     OUT("{\"status\":\"removed\",\"count\":%d,\"not_indexed\":%d}\n", removed, missing);
+    return 0;
+}
+
+/* ========== REINDEX ==========
+   Rebuilds every index for matching objects. Triggered by the v1→v2 btree
+   format migration; safe to run repeatedly (idempotent).
+
+   Walks $DB_ROOT/schema.conf, filters by (dir, object), and for each target
+   rebuilds every index listed in that object's indexes/index.conf via
+   cmd_add_indexes(..., force=1). cmd_add_indexes's per-call OUT is redirected
+   to /dev/null during the loop so reindex emits a single summary document.
+   Per-object progress is logged at info level only. */
+
+int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter) {
+    char scpath[PATH_MAX];
+    snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
+    FILE *sf = fopen(scpath, "r");
+    if (!sf) {
+        OUT("{\"error\":\"cannot open schema.conf\"}\n");
+        return 1;
+    }
+
+    FILE *devnull = fopen("/dev/null", "w");
+    FILE *saved_out = g_out;
+
+    uint64_t t0 = now_ms_coarse();
+    int objects_rebuilt = 0;
+    int objects_skipped = 0;
+    int indexes_rebuilt = 0;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), sf)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+
+        /* Parse "dir:object:..." — only the first two colon-separated tokens. */
+        char *c1 = strchr(line, ':');
+        if (!c1) continue;
+        *c1 = '\0';
+        const char *dir = line;
+        char *rest = c1 + 1;
+        char *c2 = strchr(rest, ':');
+        if (!c2) continue;
+        *c2 = '\0';
+        const char *obj = rest;
+
+        if (dir_filter && strcmp(dir, dir_filter) != 0) continue;
+        if (obj_filter && strcmp(obj, obj_filter) != 0) continue;
+
+        char eff_root[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
+
+        char icpath[PATH_MAX];
+        snprintf(icpath, sizeof(icpath), "%s/%s/indexes/index.conf", eff_root, obj);
+        FILE *ic = fopen(icpath, "r");
+        if (!ic) { objects_skipped++; continue; }
+
+        /* Build a JSON fields array from index.conf lines. */
+        char fields_json[8192];
+        int pos = snprintf(fields_json, sizeof(fields_json), "[");
+        int nf = 0;
+        char fline[512];
+        while (fgets(fline, sizeof(fline), ic)) {
+            fline[strcspn(fline, "\n")] = '\0';
+            if (!fline[0]) continue;
+            int avail = (int)sizeof(fields_json) - pos - 8;
+            if (avail <= 0) break;
+            pos += snprintf(fields_json + pos, avail,
+                            "%s\"%s\"", nf ? "," : "", fline);
+            nf++;
+        }
+        fclose(ic);
+        snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
+
+        if (nf == 0) { objects_skipped++; continue; }
+
+        /* force=1 drops existing .idx files first, then rebuilds. */
+        g_out = devnull ? devnull : saved_out;
+        cmd_add_indexes(eff_root, obj, fields_json, 1);
+        g_out = saved_out;
+
+        objects_rebuilt++;
+        indexes_rebuilt += nf;
+        log_msg(3, "REINDEX %s/%s: rebuilt %d indexes", dir, obj, nf);
+    }
+    fclose(sf);
+    if (devnull) fclose(devnull);
+
+    uint64_t t1 = now_ms_coarse();
+    OUT("{\"status\":\"reindexed\",\"objects\":%d,\"skipped\":%d,\"indexes\":%d,\"duration_ms\":%llu}\n",
+        objects_rebuilt, objects_skipped, indexes_rebuilt,
+        (unsigned long long)(t1 - t0));
     return 0;
 }

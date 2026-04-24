@@ -118,6 +118,24 @@ int main(int argc, char *argv[]) {
             snprintf(json, sizeof(json), "{\"mode\":\"shard-stats\",\"format\":\"table\"}");
         return cmd_query_json(port, json);
     }
+
+    /* reindex — rebuild every index for matching objects.
+         shard-db reindex                   (all dirs × all objects)
+         shard-db reindex <dir>             (all objects in one tenant)
+         shard-db reindex <dir> <obj>       (one object) */
+    if (strcmp(cmd, "reindex") == 0) {
+        char json[512];
+        if (argc >= 4)
+            snprintf(json, sizeof(json),
+                "{\"mode\":\"reindex\",\"dir\":\"%s\",\"object\":\"%s\"}",
+                argv[2], argv[3]);
+        else if (argc == 3)
+            snprintf(json, sizeof(json),
+                "{\"mode\":\"reindex\",\"dir\":\"%s\"}", argv[2]);
+        else
+            snprintf(json, sizeof(json), "{\"mode\":\"reindex\"}");
+        return cmd_query_json(port, json);
+    }
     if (strcmp(cmd, "stats") == 0)
         return cmd_query_json(port, "{\"mode\":\"stats\",\"format\":\"table\"}");
     if (strcmp(cmd, "db-dirs") == 0)

@@ -276,6 +276,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         "stats", "db-dirs", "vacuum-check", "shard-stats",
         "add-token", "remove-token", "list-tokens",
         "add-ip", "remove-ip", "list-ips",
+        "reindex",
         NULL
     };
     for (int i = 0; srv[i]; i++)
@@ -802,6 +803,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
         OUT("]\n");
         free(mode);
+        return;
+    }
+
+    /* reindex — walk schema.conf, optionally filtered by dir/object, and
+       rebuild every index. Server-admin scope regardless of filter because
+       the no-filter form crosses tenants. */
+    if (mode && strcmp(mode, "reindex") == 0) {
+        char *dir_f = json_obj_strdup(&req, "dir");
+        char *obj_f = json_obj_strdup(&req, "object");
+        const char *df = (dir_f && dir_f[0]) ? dir_f : NULL;
+        const char *of = (obj_f && obj_f[0]) ? obj_f : NULL;
+        cmd_reindex(g_db_root, df, of);
+        free(dir_f); free(obj_f); free(mode);
         return;
     }
 
