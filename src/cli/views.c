@@ -149,6 +149,66 @@ static void json_array_iter(const char *vstart, size_t vlen,
    Text + JSON object display
    ============================================================ */
 
+int tui_preview_json(const char *title, const char *body) {
+    int rows, cols;
+    int top = 0;
+    int blen = (int)strlen(body);
+    int line_starts[4096];
+    int nlines = 0;
+    int pos = 0;
+    line_starts[nlines++] = 0;
+    while (pos < blen && nlines < 4095) {
+        if (body[pos] == '\n') line_starts[nlines++] = pos + 1;
+        pos++;
+    }
+    line_starts[nlines] = blen;
+
+    for (;;) {
+        getmaxyx(stdscr, rows, cols);
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, " %s ", title ? title : "");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        int view_rows = rows - 5;
+        for (int i = 0; i < view_rows && top + i < nlines; i++) {
+            int s = line_starts[top + i];
+            int e = line_starts[top + i + 1];
+            int len = e - s;
+            if (len > 0 && body[s + len - 1] == '\n') len--;
+            if (len > cols - 4) len = cols - 4;
+            mvprintw(2 + i, 2, "%.*s", len, body + s);
+        }
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 3, 4,
+            "↑↓/jk scroll   r/⏎ run   ←/q/ESC back to edit   (line %d/%d)",
+            top + 1, nlines);
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP: case 'k':   if (top > 0) top--; break;
+            case KEY_DOWN: case 'j': if (top < nlines - 1) top++; break;
+            case KEY_PPAGE: case 'b':
+                top -= rows - 6;
+                if (top < 0) top = 0;
+                break;
+            case KEY_NPAGE: case ' ': case 'f':
+                top += rows - 6;
+                if (top > nlines - 1) top = nlines - 1;
+                break;
+            case 'g': case KEY_HOME: top = 0; break;
+            case 'G': case KEY_END:  top = nlines - 1; break;
+            case 'r': case '\n': case '\r': case KEY_ENTER:
+                return 1;
+            case 'q': case 27: case KEY_LEFT: case 'h':
+                return 0;
+        }
+    }
+}
+
 void tui_show_text(const char *title, const char *body) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);

@@ -110,6 +110,12 @@ int tui_form(const char *title, FormField *fields, int nfields);
 /* Display a multi-line text body in a scrollable pane. */
 void tui_show_text(const char *title, const char *body);
 
+/* Preview a JSON request and let the user copy / run / back-out. Returns
+   1 = run, 0 = back to the previous form (re-show with sticky values).
+   Body is shown scrollable and unmodified so terminal-select copies the
+   exact wire format. */
+int tui_preview_json(const char *title, const char *body);
+
 /* Render a JSON object as key:value pairs in a pane. Naive parser — handles
    the response shapes shard-db emits. */
 void tui_show_object(const char *title, const char *json);

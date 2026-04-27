@@ -431,7 +431,9 @@ static void query_update(CliConn *c) {
     }
 }
 
-/* Keys: paginated key listing (no values). */
+/* Keys: paginated key listing (no values). format:rows wraps the response as
+   {"columns":["key"],"rows":[["k1"],["k2"],...]} → tui_show_table gives us
+   horizontal scroll for free. */
 static void query_keys(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -442,11 +444,14 @@ static void query_keys(CliConn *c) {
         if (tui_form("keys — paging", fs, 2) != 0) return;
         char req[512];
         snprintf(req, sizeof(req),
-            "{\"mode\":\"keys\",\"dir\":\"%s\",\"object\":\"%s\",\"offset\":%d,\"limit\":%d}",
+            "{\"mode\":\"keys\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"offset\":%d,\"limit\":%d,\"format\":\"rows\"}",
             oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value));
+        int act = tui_preview_json("keys — query JSON (r=run  ←=back to edit)", req);
+        if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "keys failed"); continue; }
-        tui_show_text("keys", resp);
+        tui_show_table("keys", resp);
         free(resp);
     }
 }
@@ -490,12 +495,13 @@ static void query_fetch(CliConn *c) {
         char req[2048];
         snprintf(req, sizeof(req),
             "{\"mode\":\"fetch\",\"dir\":\"%s\",\"object\":\"%s\","
-            "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
+            "\"offset\":%d,\"limit\":%d,\"fields\":%s,\"format\":\"rows\"}",
             oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value), fields_json);
+        int act = tui_preview_json("fetch — query JSON (r=run  ←=back to edit)", req);
+        if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "fetch failed"); continue; }
-        if (resp[0] == '[') tui_show_table("fetch result", resp);
-        else                show_response("fetch result", resp);
+        tui_show_table("fetch result", resp);
         free(resp);
     }
 }
@@ -602,79 +608,161 @@ static int build_agg_specs(const ObjectInfo *oi, char **specs_out) {
     }
 }
 
+/* Extract aggregate aliases from a packed specs JSON, e.g.
+   [{"fn":"sum","field":"amount","alias":"total"},...] → ["total","..."].
+   Used to populate the order_by dropdown so the user picks an alias by name
+   instead of typing it. Returns count; out is filled with NULL-term'd
+   pointers into the heap (caller frees each + the array). */
+static int extract_agg_aliases(const char *specs, char ***out) {
+    int cap = 8, n = 0;
+    char **arr = malloc(cap * sizeof(char *));
+    const char *p = specs;
+    while (*p) {
+        const char *q = strstr(p, "\"alias\"");
+        if (!q) break;
+        q = strchr(q, ':');
+        if (!q) break;
+        q++;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q != '"') { p = q; continue; }
+        q++;
+        const char *s = q;
+        while (*q && *q != '"') q++;
+        size_t L = (size_t)(q - s);
+        if (n >= cap) { cap *= 2; arr = realloc(arr, cap * sizeof(char *)); }
+        arr[n] = malloc(L + 1);
+        memcpy(arr[n], s, L);
+        arr[n][L] = '\0';
+        n++;
+        p = q + 1;
+    }
+    *out = arr;
+    return n;
+}
+
 static void query_aggregate(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    /* group_by: multi-pick from fields. Default = none (no grouping). */
+    /* Sticky group_by selection across re-runs. */
     int *grp_sel = calloc(oi.nfields, sizeof(int));
     const char *fld_choices[MAX_FIELDS_CACHED + 1];
     for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
     fld_choices[oi.nfields] = NULL;
 
+    /* Outer loop: criteria. ← in criteria → exit op. */
     for (;;) {
         char *crit = NULL;
         if (tui_criteria_builder(&oi, &crit) != 0) { free(grp_sel); return; }
 
-        char *specs = NULL;
-        if (build_agg_specs(&oi, &specs) != 0) { free(crit); break; }
+        /* Spec loop: ← in specs → re-show criteria. */
+        for (;;) {
+            char *specs = NULL;
+            if (build_agg_specs(&oi, &specs) != 0) { free(crit); crit = NULL; break; }
 
-        if (tui_multi_pick("group_by — fields to group on (skip → no grouping)",
-                           fld_choices, oi.nfields, grp_sel) != 0) {
-            free(crit); free(specs); continue;
-        }
+            /* Aliases drive order_by dropdown. */
+            char **aliases;
+            int n_aliases = extract_agg_aliases(specs, &aliases);
+            const char **ord_choices = malloc((n_aliases + 2) * sizeof(*ord_choices));
+            ord_choices[0] = "(none)";
+            for (int i = 0; i < n_aliases; i++) ord_choices[1 + i] = aliases[i];
+            ord_choices[1 + n_aliases] = NULL;
 
-        FormField fs[2] = {0};
-        fs[0].label = "limit"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "100");
-        fs[1].label = "order"; fs[1].kind = FF_CHOICE;
-        static const char *const ord[] = { "asc", "desc", NULL };
-        fs[1].choices = ord; snprintf(fs[1].value, sizeof(fs[1].value), "asc");
-        if (tui_form("aggregate — final params", fs, 2) != 0) {
-            free(crit); free(specs); continue;
-        }
+            /* group_by + form loop: ← in form → re-show group_by;
+               ← in group_by → re-show specs. */
+            for (;;) {
+                if (tui_multi_pick(
+                        "group_by — fields to group on (skip → no grouping)",
+                        fld_choices, oi.nfields, grp_sel) != 0) break;
 
-        /* Build group_by JSON array. */
-        char grp_json[512] = "[]";
-        int grp_picked = 0;
-        for (int i = 0; i < oi.nfields; i++) if (grp_sel[i]) grp_picked++;
-        if (grp_picked > 0) {
-            size_t off = 0;
-            off += snprintf(grp_json + off, sizeof(grp_json) - off, "[");
-            int first = 1;
-            for (int i = 0; i < oi.nfields; i++) {
-                if (!grp_sel[i]) continue;
-                off += snprintf(grp_json + off, sizeof(grp_json) - off,
-                    "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
-                first = 0;
+                FormField fs[3] = {0};
+                fs[0].label = "limit";    fs[0].kind = FF_NUMBER;
+                snprintf(fs[0].value, sizeof(fs[0].value), "100");
+                fs[1].label = "order_by"; fs[1].kind = FF_CHOICE;
+                fs[1].choices = ord_choices;
+                snprintf(fs[1].value, sizeof(fs[1].value), "%s",
+                         n_aliases > 0 ? aliases[0] : "(none)");
+                fs[2].label = "order";    fs[2].kind = FF_CHOICE;
+                static const char *const ord_dir[] = { "asc", "desc", NULL };
+                fs[2].choices = ord_dir;
+                snprintf(fs[2].value, sizeof(fs[2].value), "desc");
+
+                /* Form ↔ result inner loop. */
+                for (;;) {
+                    if (tui_form("aggregate — limit / order_by / order", fs, 3) != 0)
+                        goto next_group;  /* ← in form → re-show group_by */
+
+                    /* Build group_by JSON array. */
+                    char grp_json[512] = "[]";
+                    int grp_picked = 0;
+                    for (int i = 0; i < oi.nfields; i++) if (grp_sel[i]) grp_picked++;
+                    if (grp_picked > 0) {
+                        size_t off = 0;
+                        off += snprintf(grp_json + off, sizeof(grp_json) - off, "[");
+                        int first = 1;
+                        for (int i = 0; i < oi.nfields; i++) {
+                            if (!grp_sel[i]) continue;
+                            off += snprintf(grp_json + off, sizeof(grp_json) - off,
+                                "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
+                            first = 0;
+                        }
+                        snprintf(grp_json + off, sizeof(grp_json) - off, "]");
+                    }
+
+                    int limv = atoi(fs[0].value);
+                    if (limv < 0) limv = 0;
+
+                    /* order_by is optional. (none) → omit the field. */
+                    char ob_clause[128] = "";
+                    if (strcmp(fs[1].value, "(none)") != 0 && fs[1].value[0])
+                        snprintf(ob_clause, sizeof(ob_clause),
+                                 ",\"order_by\":\"%s\"", fs[1].value);
+
+                    char *req = malloc(strlen(crit) + strlen(specs) + 1024);
+                    sprintf(req,
+                        "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\","
+                        "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s%s,"
+                        "\"order\":\"%s\",\"limit\":%d}",
+                        oi.dir, oi.object, crit, specs, grp_json, ob_clause,
+                        fs[2].value, limv);
+
+                    int act = tui_preview_json(
+                        "aggregate — query JSON (r=run  ←=back to edit)", req);
+                    if (act != 1) { free(req); continue; }
+
+                    char *resp = NULL; size_t rlen = 0;
+                    int rc = cli_query(c, req, &resp, &rlen);
+                    free(req);
+                    if (rc != 0 || !resp) {
+                        tui_alert("error", "aggregate failed");
+                        free(resp); continue;
+                    }
+                    if (resp[0] == '[' || (resp[0] == '{' && strstr(resp, "rows")))
+                        tui_show_table("aggregate result", resp);
+                    else
+                        show_response("aggregate result", resp);
+                    free(resp);
+                    /* result dismissed → loop back to form */
+                }
+            next_group:
+                /* group_by/form layer exited — break to re-show spec builder. */
+                break;
             }
-            snprintf(grp_json + off, sizeof(grp_json) - off, "]");
+            for (int i = 0; i < n_aliases; i++) free(aliases[i]);
+            free(aliases);
+            free(ord_choices);
+            free(specs);
         }
-
-        char *req = malloc(strlen(crit) + strlen(specs) + 1024);
-        sprintf(req,
-            "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\","
-            "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s,"
-            "\"order\":\"%s\",\"limit\":%d}",
-            oi.dir, oi.object, crit, specs, grp_json,
-            fs[1].value, atoi(fs[0].value));
-        free(crit); free(specs);
-
-        char *resp = NULL; size_t rlen = 0;
-        int rc = cli_query(c, req, &resp, &rlen);
-        free(req);
-        if (rc != 0 || !resp) { tui_alert("error", "aggregate failed"); free(resp); continue; }
-        if (resp[0] == '[')      tui_show_table("aggregate result", resp);
-        else                     show_response("aggregate result", resp);
-        free(resp);
+        if (crit) free(crit);
     }
-    free(grp_sel);
 }
 
 static void query_count(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    /* Loop: criteria builder ↔ result. ← in builder exits the op. */
+    /* Loop: criteria builder → preview → result. ← in builder exits the op,
+       ← in preview returns to criteria, ← in result returns to criteria. */
     for (;;) {
         char *crit = NULL;
         if (tui_criteria_builder(&oi, &crit) != 0) return;
@@ -685,14 +773,15 @@ static void query_count(CliConn *c) {
             oi.dir, oi.object, crit);
         free(crit);
 
+        int act = tui_preview_json("count — query JSON (r=run  ←=back to edit)", req);
+        if (act != 1) { free(req); continue; }
+
         char *resp = NULL; size_t rlen = 0;
         int rc = cli_query(c, req, &resp, &rlen);
         free(req);
         if (rc != 0) { tui_alert("error", "count failed"); continue; }
         show_response("count result", resp);
         free(resp);
-        /* result dismissed → loop back to criteria builder
-           (rows are NOT sticky — fresh builder each iteration) */
     }
 }
 
@@ -754,19 +843,22 @@ static void query_find(CliConn *c) {
             int limv = atoi(fs[1].value);
             if (limv <= 0) limv = 50;
 
+            /* format:rows so the response is {"columns":[..],"rows":[[..]]}
+               which tui_show_table renders directly with horizontal scroll. */
             char *req = malloc(strlen(crit) + 1024);
             sprintf(req,
                 "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
-                "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
+                "\"offset\":%d,\"limit\":%d,\"fields\":%s,\"format\":\"rows\"}",
                 oi.dir, oi.object, crit, offv, limv, fields_json);
+
+            int act = tui_preview_json("find — query JSON (r=run  ←=back to edit)", req);
+            if (act != 1) { free(req); continue; }
 
             char *resp = NULL; size_t rlen = 0;
             int rc = cli_query(c, req, &resp, &rlen);
             free(req);
             if (rc != 0 || !resp) { tui_alert("error", "find failed"); free(resp); continue; }
-
-            if (resp[0] == '[') tui_show_table("find result", resp);
-            else                show_response("find result", resp);
+            tui_show_table("find result", resp);
             free(resp);
             /* result dismissed → loop back to paging form */
         }
