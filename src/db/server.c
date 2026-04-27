@@ -2346,6 +2346,374 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
     return 0;
 }
 
+/* ========== Schema export / import (CLI argv form) ==========
+   Mirrors the TUI's Migrate menu (src/cli/main.c::migrate_export /
+   migrate_import) so the two are wire-compatible — manifests written by
+   one can be imported by the other. Uses only the existing JSON modes
+   db-dirs / list-objects / describe-object / create-object. */
+
+/* Internal: walk a top-level JSON string array, invoking cb(elem, len, ctx)
+   for each element. Returns 0 on success. */
+static int walk_string_array(const char *s,
+                             void (*cb)(const char *, size_t, void *),
+                             void *ctx) {
+    const char *p = json_skip(s);
+    if (*p != '[') return -1;
+    p++;
+    while (*p) {
+        p = json_skip(p);
+        if (*p == ']') return 0;
+        if (*p == ',') { p++; continue; }
+        if (*p != '"') return -1;
+        p++;
+        const char *start = p;
+        while (*p && !(*p == '"' && p[-1] != '\\')) p++;
+        if (*p != '"') return -1;
+        cb(start, (size_t)(p - start), ctx);
+        p++;
+    }
+    return -1;
+}
+
+/* Internal: walk a top-level JSON object array, invoking cb(elem_start,
+   elem_len, ctx) for each {...} element. Element span includes the outer
+   braces. Returns 0 on success. */
+static int walk_object_array(const char *s,
+                             void (*cb)(const char *, size_t, void *),
+                             void *ctx) {
+    const char *p = json_skip(s);
+    if (*p != '[') return -1;
+    p++;
+    while (*p) {
+        p = json_skip(p);
+        if (*p == ']') return 0;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') return -1;
+        const char *start = p;
+        const char *eov = json_skip_value(p);
+        cb(start, (size_t)(eov - start), ctx);
+        p = eov;
+    }
+    return -1;
+}
+
+/* Compose a fields.conf-style spec ("name:type[:size|P,S]") from one
+   describe-object field entry — same shape create-object expects. */
+static void field_obj_to_spec(const char *obj, size_t len,
+                              char *out, size_t out_sz) {
+    JsonObj fo;
+    if (json_parse_object(obj, len, &fo) <= 0) { out[0] = '\0'; return; }
+    char name[64] = "", type[16] = "";
+    json_obj_copy(&fo, "name", name, sizeof(name));
+    json_obj_copy(&fo, "type", type, sizeof(type));
+    int size  = json_obj_int(&fo, "size",  0);
+    int scale = json_obj_int(&fo, "scale", 0);
+    if (strcmp(type, "varchar") == 0) {
+        /* describe-object reports on-disk size including the 2-byte length
+           prefix; create-object expects content size, so subtract. */
+        int n = size - 2;
+        if (n < 0) n = 0;
+        snprintf(out, out_sz, "%s:%s:%d", name, type, n);
+    } else if (strcmp(type, "numeric") == 0) {
+        snprintf(out, out_sz, "%s:%s:18,%d", name, type, scale);
+    } else {
+        snprintf(out, out_sz, "%s:%s", name, type);
+    }
+}
+
+typedef struct {
+    FILE *out;
+    int   first_object;   /* tracks whether to emit a leading comma */
+    int   total;          /* objects written */
+} ExportCtx;
+
+/* Per-field cb: append a JSON-quoted spec into the in-flight fields array. */
+typedef struct {
+    FILE *out;
+    int   first;
+} EmitFieldsCtx;
+
+static void emit_one_field(const char *obj, size_t len, void *vctx) {
+    EmitFieldsCtx *ec = (EmitFieldsCtx *)vctx;
+    char spec[256];
+    field_obj_to_spec(obj, len, spec, sizeof(spec));
+    if (!spec[0]) return;
+    fprintf(ec->out, "%s\"%s\"", ec->first ? "" : ",", spec);
+    ec->first = 0;
+}
+
+static void emit_one_index(const char *str, size_t len, void *vctx) {
+    EmitFieldsCtx *ec = (EmitFieldsCtx *)vctx;
+    fprintf(ec->out, "%s\"%.*s\"", ec->first ? "" : ",", (int)len, str);
+    ec->first = 0;
+}
+
+typedef struct {
+    int  port;
+    char dir[64];
+    ExportCtx *exp;
+} DescribeCtx;
+
+/* Per-object cb invoked by walk_string_array on the list-objects response.
+   Drives one describe-object query and emits a manifest entry. */
+static void describe_one_object(const char *str, size_t len, void *vctx) {
+    DescribeCtx *dc = (DescribeCtx *)vctx;
+    if (len >= 64) return;
+    char object[64];
+    memcpy(object, str, len); object[len] = '\0';
+
+    char req[256];
+    int rl = snprintf(req, sizeof(req),
+        "{\"mode\":\"describe-object\",\"dir\":\"%s\",\"object\":\"%s\"}",
+        dc->dir, object);
+    if (rl <= 0 || rl >= (int)sizeof(req)) return;
+
+    char *resp = NULL; size_t resp_len = 0;
+    if (query_collect(dc->port, req, (size_t)rl, &resp, &resp_len) != 0 || !resp) {
+        fprintf(stderr, "warn: describe-object %s/%s failed; skipping\n",
+                dc->dir, object);
+        free(resp);
+        return;
+    }
+
+    JsonObj o;
+    if (json_parse_object(resp, resp_len, &o) <= 0) {
+        fprintf(stderr, "warn: describe-object %s/%s returned malformed JSON\n",
+                dc->dir, object);
+        free(resp);
+        return;
+    }
+    /* Bail if the response is an error envelope. */
+    const char *errv; size_t errl;
+    if (json_obj_get(&o, "error", &errv, &errl)) {
+        fprintf(stderr, "warn: describe-object %s/%s: %.*s\n",
+                dc->dir, object, (int)errl, errv);
+        free(resp);
+        return;
+    }
+
+    int splits  = json_obj_int(&o, "splits",  0);
+    int max_key = json_obj_int(&o, "max_key", 0);
+
+    if (!dc->exp->first_object) fprintf(dc->exp->out, ",\n");
+    fprintf(dc->exp->out,
+        "    {\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"fields\":[",
+        dc->dir, object, splits, max_key);
+
+    const char *fv; size_t fl;
+    if (json_obj_get(&o, "fields", &fv, &fl)) {
+        char *fields_buf = malloc(fl + 1);
+        memcpy(fields_buf, fv, fl); fields_buf[fl] = '\0';
+        EmitFieldsCtx ec = { dc->exp->out, 1 };
+        walk_object_array(fields_buf, emit_one_field, &ec);
+        free(fields_buf);
+    }
+    fprintf(dc->exp->out, "],\"indexes\":[");
+
+    const char *iv; size_t il;
+    if (json_obj_get(&o, "indexes", &iv, &il)) {
+        char *idx_buf = malloc(il + 1);
+        memcpy(idx_buf, iv, il); idx_buf[il] = '\0';
+        EmitFieldsCtx ec = { dc->exp->out, 1 };
+        walk_string_array(idx_buf, emit_one_index, &ec);
+        free(idx_buf);
+    }
+    fprintf(dc->exp->out, "]}");
+
+    dc->exp->first_object = 0;
+    dc->exp->total++;
+    free(resp);
+}
+
+typedef struct {
+    int  port;
+    ExportCtx *exp;
+} TenantCtx;
+
+/* Per-tenant cb invoked by walk_string_array on the db-dirs response.
+   Lists objects under that tenant and describes each. */
+static void describe_one_tenant(const char *str, size_t len, void *vctx) {
+    TenantCtx *tc = (TenantCtx *)vctx;
+    if (len >= 64) return;
+    DescribeCtx dc;
+    dc.port = tc->port;
+    dc.exp  = tc->exp;
+    memcpy(dc.dir, str, len); dc.dir[len] = '\0';
+
+    char req[128];
+    int rl = snprintf(req, sizeof(req),
+        "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dc.dir);
+    if (rl <= 0 || rl >= (int)sizeof(req)) return;
+
+    char *resp = NULL; size_t resp_len = 0;
+    if (query_collect(tc->port, req, (size_t)rl, &resp, &resp_len) != 0 || !resp) {
+        fprintf(stderr, "warn: list-objects %s failed; skipping tenant\n", dc.dir);
+        free(resp);
+        return;
+    }
+    JsonObj o;
+    if (json_parse_object(resp, resp_len, &o) <= 0) {
+        fprintf(stderr, "warn: list-objects %s returned malformed JSON\n", dc.dir);
+        free(resp);
+        return;
+    }
+    const char *ov; size_t ol;
+    if (json_obj_get(&o, "objects", &ov, &ol)) {
+        char *objs_buf = malloc(ol + 1);
+        memcpy(objs_buf, ov, ol); objs_buf[ol] = '\0';
+        walk_string_array(objs_buf, describe_one_object, &dc);
+        free(objs_buf);
+    }
+    free(resp);
+}
+
+/* Manifest is JSON; contains schema and index definitions only — no data,
+   no tokens. out_path may be NULL or "-" to write to stdout. */
+int cmd_export_schema(int port, const char *out_path) {
+    char *resp = NULL; size_t resp_len = 0;
+    if (query_collect(port, "{\"mode\":\"db-dirs\"}", 19, &resp, &resp_len) != 0
+        || !resp) {
+        fprintf(stderr, "Error: db-dirs query failed\n");
+        free(resp);
+        return 1;
+    }
+
+    FILE *out;
+    int close_out = 0;
+    if (!out_path || !out_path[0] || strcmp(out_path, "-") == 0) {
+        out = stdout;
+    } else {
+        out = fopen(out_path, "w");
+        if (!out) {
+            fprintf(stderr, "Error: cannot open %s for writing: %s\n",
+                    out_path, strerror(errno));
+            free(resp);
+            return 1;
+        }
+        close_out = 1;
+    }
+
+    fprintf(out, "{\n  \"version\": \"2026.05\",\n  \"dirs\": [");
+    /* Re-use the same response twice: once to emit the dirs[] list, then
+       walk it again to drive list-objects + describe-object. */
+    {
+        EmitFieldsCtx ec = { out, 1 };
+        walk_string_array(resp, emit_one_index, &ec);
+    }
+    fprintf(out, "],\n  \"objects\": [\n");
+
+    ExportCtx exp = { out, 1, 0 };
+    TenantCtx tc = { port, &exp };
+    walk_string_array(resp, describe_one_tenant, &tc);
+
+    fprintf(out, "\n  ]\n}\n");
+    if (close_out) fclose(out);
+    free(resp);
+
+    fprintf(stderr, "exported %d object%s%s%s\n",
+            exp.total, exp.total == 1 ? "" : "s",
+            close_out ? " to " : "",
+            close_out ? out_path : "");
+    return 0;
+}
+
+typedef struct {
+    int  port;
+    int  if_not_exists;
+    int  created;
+    int  skipped;
+    int  failed;
+} ImportCtx;
+
+/* Per-object cb on the manifest's objects[] array. Wraps the entry into a
+   create-object request and dispatches it. */
+static void import_one_object(const char *elem, size_t len, void *vctx) {
+    ImportCtx *ic = (ImportCtx *)vctx;
+    if (len < 2) { ic->failed++; return; }
+
+    /* Manifest entry shape is {"dir":...,"object":...,"splits":...,
+       "max_key":...,"fields":[...],"indexes":[...]} — exactly what
+       create-object expects, so we just prepend mode + optional
+       if_not_exists between the opening brace and the first key. */
+    size_t cap = len + 256;
+    char *req = malloc(cap);
+    if (!req) { ic->failed++; return; }
+    int rl;
+    if (ic->if_not_exists) {
+        rl = snprintf(req, cap,
+            "{\"mode\":\"create-object\",\"if_not_exists\":true,%.*s",
+            (int)(len - 1), elem + 1);
+    } else {
+        rl = snprintf(req, cap,
+            "{\"mode\":\"create-object\",%.*s",
+            (int)(len - 1), elem + 1);
+    }
+    if (rl <= 0 || rl >= (int)cap) { free(req); ic->failed++; return; }
+
+    char *resp = NULL; size_t resp_len = 0;
+    if (query_collect(ic->port, req, (size_t)rl, &resp, &resp_len) != 0 || !resp) {
+        ic->failed++; free(req); free(resp);
+        return;
+    }
+    if (strstr(resp, "\"status\":\"created\""))      ic->created++;
+    else if (strstr(resp, "\"status\":\"exists\""))  ic->skipped++;
+    else if (strstr(resp, "\"error\""))              ic->failed++;
+    else                                             ic->created++;
+    free(req);
+    free(resp);
+}
+
+int cmd_import_schema(int port, const char *in_path, int if_not_exists) {
+    if (!in_path || !in_path[0]) {
+        fprintf(stderr, "Error: input path required\n");
+        return 1;
+    }
+    FILE *f = fopen(in_path, "r");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open %s: %s\n", in_path, strerror(errno));
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100L * 1024 * 1024) {
+        fprintf(stderr, "Error: manifest is empty or larger than 100 MB\n");
+        fclose(f);
+        return 1;
+    }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return 1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fprintf(stderr, "Error: short read on %s\n", in_path);
+        free(buf); fclose(f); return 1;
+    }
+    buf[sz] = '\0';
+    fclose(f);
+
+    /* Find the top-level "objects" array and walk it. */
+    const char *p = strstr(buf, "\"objects\"");
+    if (!p) {
+        fprintf(stderr, "Error: manifest missing 'objects' array\n");
+        free(buf);
+        return 1;
+    }
+    p = strchr(p, '[');
+    if (!p) {
+        fprintf(stderr, "Error: malformed manifest\n");
+        free(buf);
+        return 1;
+    }
+
+    ImportCtx ic = { port, if_not_exists, 0, 0, 0 };
+    walk_object_array(p, import_one_object, &ic);
+    free(buf);
+
+    fprintf(stderr,
+        "import complete: created=%d skipped=%d failed=%d\n",
+        ic.created, ic.skipped, ic.failed);
+    return ic.failed > 0 ? 1 : 0;
+}
+
 /* CLI: read local file, base64-encode, send put-file JSON, print server response. */
 int cmd_put_file_tcp(int port, const char *dir, const char *object,
                      const char *local_path, int if_not_exists) {

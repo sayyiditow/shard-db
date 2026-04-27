@@ -741,6 +741,11 @@ int cmd_put_file_tcp(int port, const char *dir, const char *object,
                      const char *local_path, int if_not_exists);
 int cmd_get_file_tcp(int port, const char *dir, const char *object,
                      const char *filename, const char *out_path);
+/* Schema migration: walk db-dirs / list-objects / describe-object to write a
+   JSON manifest; replay via create-object. No data, no tokens — schema only.
+   out_path NULL or "-" writes manifest to stdout. */
+int cmd_export_schema(int port, const char *out_path);
+int cmd_import_schema(int port, const char *in_path, int if_not_exists);
 int read_server_port(const char *db_root);
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip);
 void server_process_fast(const char *db_root, const char *line, const char *client_ip);

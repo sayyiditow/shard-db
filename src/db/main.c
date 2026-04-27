@@ -50,6 +50,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "                                       Download file (base64 over TCP)\n");
         fprintf(stderr, "  delete-file <dir> <object> <filename> Remove a stored file\n");
         fprintf(stderr, "  get-file-path <object> <filename>    Get server-local file path\n");
+        fprintf(stderr, "  export-schema [out_path]             Write JSON manifest of all schemas\n");
+        fprintf(stderr, "  import-schema <in_path> [--if-not-exists]\n");
+        fprintf(stderr, "                                       Replay manifest as create-object calls\n");
         fprintf(stderr, "\nSchema mutations (via JSON query):\n");
         fprintf(stderr, "  query '{\"mode\":\"rename-field\",\"dir\":\"...\",\"object\":\"...\",\"old\":\"...\",\"new\":\"...\"}'\n");
         fprintf(stderr, "  query '{\"mode\":\"remove-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"f1\",\"f2\"]}'\n");
@@ -266,6 +269,23 @@ int main(int argc, char *argv[]) {
         }
         const char *out_path = (argc >= 6) ? argv[5] : NULL;
         return cmd_get_file_tcp(port, argv[2], argv[3], argv[4], out_path);
+    }
+    /* Schema migration — local→prod bootstrap. No data, no tokens.
+         shard-db export-schema [out_path]                 (stdout if absent or "-")
+         shard-db import-schema <in_path> [--if-not-exists] */
+    if (strcmp(cmd, "export-schema") == 0) {
+        const char *out = (argc >= 3) ? argv[2] : NULL;
+        return cmd_export_schema(port, out);
+    }
+    if (strcmp(cmd, "import-schema") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: shard-db import-schema <in_path> [--if-not-exists]\n");
+            return 1;
+        }
+        int ine = 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--if-not-exists") == 0) ine = 1;
+        return cmd_import_schema(port, argv[2], ine);
     }
     if (strcmp(cmd, "delete-file") == 0) {
         if (argc < 5) {
