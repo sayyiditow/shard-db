@@ -367,58 +367,67 @@ static void query_single_key(CliConn *c, const char *mode, const char *result_ti
 static void query_get(CliConn *c)    { query_single_key(c, "get",    "get result"); }
 static void query_exists(CliConn *c) { query_single_key(c, "exists", "exists");     }
 
-/* Multi-key get: server's `get` mode accepts a `keys` array and returns the
-   find-shape array of records — one row per matching key. Same UX shape as
-   single get but the form takes a comma-separated list of keys. */
-static void query_get_many(CliConn *c) {
+/* Pack a CSV string of comma-separated values into a JSON array. */
+static void csv_to_json_array(const char *csv, char *out, size_t out_sz) {
+    size_t off = 0;
+    off += snprintf(out + off, out_sz - off, "[");
+    const char *p = csv;
+    int first = 1;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != ',') p++;
+        size_t L = (size_t)(p - s);
+        while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\t')) L--;
+        if (L == 0) continue;
+        off += snprintf(out + off, out_sz - off,
+            "%s\"%.*s\"", first ? "" : ",", (int)L, s);
+        first = 0;
+    }
+    snprintf(out + off, out_sz - off, "]");
+}
+
+/* Multi-key wrapper for get/exists. Both daemon modes accept a `keys` array
+   and return shapes the unified renderer handles. */
+static void query_keys_op(CliConn *c, const char *mode, const char *result_title) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
     FormField fs[1] = {0};
     fs[0].label = "keys (comma-separated)"; fs[0].kind = FF_TEXT;
     char title[128];
-    snprintf(title, sizeof(title), "get many from %s/%s", oi.dir, oi.object);
+    snprintf(title, sizeof(title), "%s many in %s/%s", mode, oi.dir, oi.object);
 
     for (;;) {
         if (tui_form(title, fs, 1) != 0) return;
-        if (!fs[0].value[0]) { tui_alert("get many", "at least one key required"); continue; }
+        if (!fs[0].value[0]) { tui_alert(mode, "at least one key required"); continue; }
 
-        /* Pack CSV → JSON array. */
-        char keys_json[2048] = "[";
-        size_t off = 1;
-        const char *p = fs[0].value;
-        int first = 1;
-        while (*p) {
-            while (*p == ' ' || *p == ',') p++;
-            if (!*p) break;
-            const char *s = p;
-            while (*p && *p != ',') p++;
-            size_t L = (size_t)(p - s);
-            /* Strip trailing whitespace */
-            while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\t')) L--;
-            if (L == 0) continue;
-            off += snprintf(keys_json + off, sizeof(keys_json) - off,
-                "%s\"%.*s\"", first ? "" : ",", (int)L, s);
-            first = 0;
-        }
-        snprintf(keys_json + off, sizeof(keys_json) - off, "]");
+        char keys_json[2048];
+        csv_to_json_array(fs[0].value, keys_json, sizeof(keys_json));
 
         char req[4096];
         snprintf(req, sizeof(req),
-            "{\"mode\":\"get\",\"dir\":\"%s\",\"object\":\"%s\",\"keys\":%s}",
-            oi.dir, oi.object, keys_json);
+            "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\",\"keys\":%s}",
+            mode, oi.dir, oi.object, keys_json);
 
-        int act = tui_preview_json("get many — query JSON (r=run  ←=back to edit)", req);
+        char preview_title[128];
+        snprintf(preview_title, sizeof(preview_title),
+                 "%s many — query JSON (r=run  ←=back to edit)", mode);
+        int act = tui_preview_json(preview_title, req);
         if (act != 1) continue;
 
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) {
-            tui_alert("error", "get many failed"); continue;
+            tui_alert("error", mode); continue;
         }
-        tui_show_table("get many", resp);
+        tui_show_table(result_title, resp);
         free(resp);
     }
 }
+
+static void query_get_many(CliConn *c)    { query_keys_op(c, "get",    "get many");    }
+static void query_exists_many(CliConn *c) { query_keys_op(c, "exists", "exists many"); }
 
 static void query_delete(CliConn *c) {
     ObjectInfo oi;
@@ -961,32 +970,34 @@ static void menu_query(void) {
     int sel = 0;
     for (;;) {
         MenuItem items[] = {
-            { "insert",    "single insert by key with field values" },
-            { "get",       "fetch a single record by key" },
-            { "get many",  "fetch multiple records by comma-separated keys" },
-            { "update",    "update fields on an existing record" },
-            { "delete",    "delete a single record by key (confirms)" },
-            { "exists",    "check whether a key is present" },
-            { "find",      "criteria builder + offset/limit, table output" },
-            { "count",     "criteria builder, returns matching count" },
-            { "aggregate", "sum/avg/min/max/count + group_by + criteria" },
-            { "keys",      "paginated key listing (no values)" },
-            { "fetch",     "paginated record listing (no criteria)" },
+            { "insert",       "single insert by key with field values" },
+            { "get",          "fetch a single record by key" },
+            { "get many",     "fetch multiple records by comma-separated keys" },
+            { "update",       "update fields on an existing record" },
+            { "delete",       "delete a single record by key (confirms)" },
+            { "exists",       "check whether a key is present" },
+            { "exists many",  "check presence of multiple keys at once" },
+            { "find",         "criteria builder + offset/limit, table output" },
+            { "count",        "criteria builder, returns matching count" },
+            { "aggregate",    "sum/avg/min/max/count + group_by + criteria" },
+            { "keys",         "paginated key listing (no values)" },
+            { "fetch",        "paginated record listing (no criteria)" },
         };
-        int choice = tui_menu_at("Query", items, 11, &sel);
+        int choice = tui_menu_at("Query", items, 12, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0:  query_insert(c);    break;
-            case 1:  query_get(c);       break;
-            case 2:  query_get_many(c);  break;
-            case 3:  query_update(c);    break;
-            case 4:  query_delete(c);    break;
-            case 5:  query_exists(c);    break;
-            case 6:  query_find(c);      break;
-            case 7:  query_count(c);     break;
-            case 8:  query_aggregate(c); break;
-            case 9:  query_keys(c);      break;
-            case 10: query_fetch(c);     break;
+            case 0:  query_insert(c);       break;
+            case 1:  query_get(c);          break;
+            case 2:  query_get_many(c);     break;
+            case 3:  query_update(c);       break;
+            case 4:  query_delete(c);       break;
+            case 5:  query_exists(c);       break;
+            case 6:  query_exists_many(c);  break;
+            case 7:  query_find(c);         break;
+            case 8:  query_count(c);        break;
+            case 9:  query_aggregate(c);    break;
+            case 10: query_keys(c);         break;
+            case 11: query_fetch(c);        break;
         }
     }
 }
