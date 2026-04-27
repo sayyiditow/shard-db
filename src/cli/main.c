@@ -564,11 +564,14 @@ static char *pack_aggs(const AggRow *rows, int n) {
     return out;
 }
 
-static int build_agg_specs(const ObjectInfo *oi, char **specs_out) {
-    AggRow rows[MAX_AGG_ROWS];
-    int n = 0;
+/* Sticky variant — caller owns rows[]/n_io so the spec list survives
+   across re-runs (same pattern as tui_criteria_builder). */
+static int build_agg_specs(const ObjectInfo *oi,
+                           AggRow *rows, int *n_io,
+                           char **specs_out) {
     int sel = 0;
     for (;;) {
+        int n = *n_io;
         MenuItem items[MAX_AGG_ROWS + 2];
         char labels[MAX_AGG_ROWS + 2][128];
         int total = 0;
@@ -599,12 +602,17 @@ static int build_agg_specs(const ObjectInfo *oi, char **specs_out) {
         if (choice == idx_add) {
             if (n >= MAX_AGG_ROWS) { tui_alert("aggregate", "max specs reached"); continue; }
             AggRow row;
-            if (prompt_one_agg(oi, &row) == 0) { rows[n++] = row; sel = idx_add; }
+            if (prompt_one_agg(oi, &row) == 0) {
+                rows[n++] = row;
+                *n_io = n;
+                sel = idx_add;
+            }
             continue;
         }
         if (tui_confirm("remove this aggregate?")) {
             for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
             n--;
+            *n_io = n;
             if (sel >= n) sel = n;
         }
     }
@@ -652,23 +660,50 @@ static void query_aggregate(CliConn *c) {
     for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
     fld_choices[oi.nfields] = NULL;
 
+    /* Sticky criteria + agg-spec rows across re-runs. */
+    CritRow crit_rows[MAX_CRIT_ROWS];
+    int crit_n = 0;
+    AggRow agg_rows[MAX_AGG_ROWS];
+    int agg_n = 0;
+
+    /* Sticky form fields for limit / order_by / order — kept outside all
+       loops so the user's choices persist when they ← from the result. */
+    static const char *const ord_dir[] = { "asc", "desc", NULL };
+    FormField fs[3] = {0};
+    fs[0].label = "limit";    fs[0].kind = FF_NUMBER;
+    snprintf(fs[0].value, sizeof(fs[0].value), "100");
+    fs[1].label = "order_by"; fs[1].kind = FF_CHOICE;
+    snprintf(fs[1].value, sizeof(fs[1].value), "(none)");
+    fs[2].label = "order";    fs[2].kind = FF_CHOICE;
+    fs[2].choices = ord_dir;
+    snprintf(fs[2].value, sizeof(fs[2].value), "desc");
+
     /* Outer loop: criteria. ← in criteria → exit op. */
     for (;;) {
         char *crit = NULL;
-        if (tui_criteria_builder(&oi, &crit) != 0) { free(grp_sel); return; }
+        if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) { free(grp_sel); return; }
 
         /* Spec loop: ← in specs → re-show criteria. */
         for (;;) {
             char *specs = NULL;
-            if (build_agg_specs(&oi, &specs) != 0) { free(crit); crit = NULL; break; }
+            if (build_agg_specs(&oi, agg_rows, &agg_n, &specs) != 0) { free(crit); crit = NULL; break; }
 
-            /* Aliases drive order_by dropdown. */
+            /* Aliases drive order_by dropdown — rebuilt each time the spec
+               list changes. */
             char **aliases;
             int n_aliases = extract_agg_aliases(specs, &aliases);
             const char **ord_choices = malloc((n_aliases + 2) * sizeof(*ord_choices));
             ord_choices[0] = "(none)";
             for (int i = 0; i < n_aliases; i++) ord_choices[1 + i] = aliases[i];
             ord_choices[1 + n_aliases] = NULL;
+            fs[1].choices = ord_choices;
+
+            /* If the previously-chosen order_by alias no longer exists in
+               the rebuilt list, reset it to (none). */
+            int found = 0;
+            for (int i = 0; ord_choices[i]; i++)
+                if (strcmp(ord_choices[i], fs[1].value) == 0) { found = 1; break; }
+            if (!found) snprintf(fs[1].value, sizeof(fs[1].value), "(none)");
 
             /* group_by + form loop: ← in form → re-show group_by;
                ← in group_by → re-show specs. */
@@ -676,18 +711,6 @@ static void query_aggregate(CliConn *c) {
                 if (tui_multi_pick(
                         "group_by — fields to group on (skip → no grouping)",
                         fld_choices, oi.nfields, grp_sel) != 0) break;
-
-                FormField fs[3] = {0};
-                fs[0].label = "limit";    fs[0].kind = FF_NUMBER;
-                snprintf(fs[0].value, sizeof(fs[0].value), "100");
-                fs[1].label = "order_by"; fs[1].kind = FF_CHOICE;
-                fs[1].choices = ord_choices;
-                snprintf(fs[1].value, sizeof(fs[1].value), "%s",
-                         n_aliases > 0 ? aliases[0] : "(none)");
-                fs[2].label = "order";    fs[2].kind = FF_CHOICE;
-                static const char *const ord_dir[] = { "asc", "desc", NULL };
-                fs[2].choices = ord_dir;
-                snprintf(fs[2].value, sizeof(fs[2].value), "desc");
 
                 /* Form ↔ result inner loop. */
                 for (;;) {
@@ -763,11 +786,16 @@ static void query_count(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
+    /* Caller-owned criteria state — sticky across runs so ← from result
+       returns to a builder still showing the rows you typed. */
+    CritRow crit_rows[MAX_CRIT_ROWS];
+    int crit_n = 0;
+
     /* Loop: criteria builder → preview → result. ← in builder exits the op,
        ← in preview returns to criteria, ← in result returns to criteria. */
     for (;;) {
         char *crit = NULL;
-        if (tui_criteria_builder(&oi, &crit) != 0) return;
+        if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) return;
 
         char *req = malloc(strlen(crit) + 256);
         sprintf(req,
@@ -803,11 +831,15 @@ static void query_find(CliConn *c) {
     for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
     fld_choices[oi.nfields] = NULL;
 
+    /* Sticky criteria — survive across re-runs of the find loop. */
+    CritRow crit_rows[MAX_CRIT_ROWS];
+    int crit_n = 0;
+
     /* Outer loop: criteria → form → result → form → result …
        ← in form → re-show criteria. ← in criteria → exit op. */
     for (;;) {
         char *crit = NULL;
-        if (tui_criteria_builder(&oi, &crit) != 0) { free(fld_sel); return; }
+        if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) { free(fld_sel); return; }
 
         for (;;) {
             if (tui_form("find — paging", fs, 2) != 0) {

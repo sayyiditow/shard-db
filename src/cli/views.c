@@ -968,13 +968,8 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
    (field dropdown, op dropdown, value text). ⏎ on an existing row offers
    to delete it. [✓] submit packs the rows into a JSON array. */
 
-#define MAX_CRIT_ROWS 16
-
-typedef struct {
-    char field[64];
-    char op[16];
-    char value[256];
-} CritRow;
+/* CritRow + MAX_CRIT_ROWS now declared in cli.h so callers can own the
+   builder state and have it survive across re-runs. */
 
 static const char *const OPS_ALL[] = {
     "eq","neq","lt","gt","lte","gte","between","in","not_in",
@@ -1069,13 +1064,14 @@ static char *pack_criteria(const CritRow *rows, int n) {
     return out;
 }
 
-int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
-    CritRow rows[MAX_CRIT_ROWS];
-    int n = 0;
+int tui_criteria_builder(const ObjectInfo *oi,
+                         CritRow *rows, int *n_io,
+                         char **criteria_out) {
     int sel = 0;
 
     for (;;) {
         /* Build the menu from current rows + [+ add] + [✓ submit]. */
+        int n = *n_io;
         MenuItem items[MAX_CRIT_ROWS + 2];
         char labels[MAX_CRIT_ROWS + 2][160];
         int total = 0;
@@ -1117,6 +1113,7 @@ int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
             CritRow row;
             if (prompt_one_criterion(oi, &row) == 0) {
                 rows[n++] = row;
+                *n_io = n;
                 sel = idx_add;  /* keep highlight on [+ add] for fast repeat */
             }
             continue;
@@ -1125,6 +1122,7 @@ int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
         if (tui_confirm("remove this criterion?")) {
             for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
             n--;
+            *n_io = n;
             if (sel >= n) sel = n;  /* keep cursor in range after delete */
         }
     }

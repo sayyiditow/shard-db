@@ -160,9 +160,22 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
 
 /* ---- Criteria builder ----
 
-   Build a JSON criteria array via a row-per-leaf form. Returns 0 on submit
-   with criteria_out set to a malloc'd JSON array (caller frees), or -1 on
-   cancel. AND-only for Phase 1 — OR/nested via raw JSON in v1.1. */
-int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out);
+   One leaf of the criteria. Caller-owned so the builder state survives
+   across re-runs (count → result → ← back keeps the rows the user typed). */
+typedef struct {
+    char field[64];
+    char op[16];
+    char value[256];
+} CritRow;
+
+#define MAX_CRIT_ROWS 16
+
+/* List-with-actions UX over an in/out CritRow array. *n_io is the current
+   row count; the builder updates rows[] and n_io as the user adds, edits,
+   and deletes. Returns 0 on submit with criteria_out set to a malloc'd
+   JSON array (caller frees), or -1 on cancel. AND-only. */
+int tui_criteria_builder(const ObjectInfo *oi,
+                         CritRow *rows, int *n_io,
+                         char **criteria_out);
 
 #endif
