@@ -5909,16 +5909,42 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
     return ks;
 }
 
+/* Below this threshold for the most-selective leaf, fan out the candidates as
+   record fetches and post-filter via criteria_match_tree — cheaper than
+   walking remaining indexed leaves' btrees in full just to confirm.
+
+   Cost model (1M-row table, 1M-entry second leaf):
+     N candidates, fetch+filter:           N × ~1.2µs
+     full second-leaf btree walk + probe:  ~M × ~0.1µs
+   Crossover at N ≈ M/12. 10000 is conservative-correct: falls back when
+   fallback is clearly faster, stays on intersection when both sides large. */
+#define INTERSECT_MIN_PRIMARY 10000
+
 /* Intersect N indexed leaves' candidate hash sets. Most-selective leaf walked
    first; subsequent walks probe the running set and accumulate survivors.
+
+   When the first (most-selective) leaf returns < INTERSECT_MIN_PRIMARY hits,
+   sets *out_small_primary=1 and returns the first leaf's KeySet — caller fans
+   out those hashes as record fetches and applies the full tree as post-filter,
+   which beats walking subsequent leaves' btrees in full.
+
    Caller frees the returned KeySet. */
 static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
                                         SearchCriterion **leaves,
                                         char paths[][PATH_MAX], int n,
-                                        QueryDeadline *dl) {
+                                        QueryDeadline *dl,
+                                        int *out_small_primary) {
+    *out_small_primary = 0;
     if (n < 2) return NULL;
     KeySet *running = build_keyset_from_leaf(db_root, object, leaves[0], paths[0], dl);
     if (!running || dl->timed_out) { keyset_free(running); return NULL; }
+
+    /* Small-primary heuristic: skip the second-leaf btree walk; let the
+       caller fan out a record-fetch + post-filter pass instead. */
+    if (keyset_size(running) < INTERSECT_MIN_PRIMARY) {
+        *out_small_primary = 1;
+        return running;
+    }
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
@@ -5941,16 +5967,69 @@ static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
     return running;
 }
 
-/* count(intersection) — caller checks dl->timed_out for error reporting. */
+/* Iterate a KeySet, computing shard_id + start_slot from each hash, into a
+   CollectedHash[] suitable for parallel_indexed_count / process_batch /
+   parallel_indexed_agg. Caller frees *out_entries. */
+typedef struct {
+    CollectedHash *entries;
+    size_t count;
+    size_t cap;
+    int splits;
+} KeysetToBatchCtx;
+
+static int keyset_to_batch_cb(const uint8_t hash[16], void *ctx) {
+    KeysetToBatchCtx *kc = (KeysetToBatchCtx *)ctx;
+    if (kc->count >= kc->cap) return -1;  /* shouldn't happen — cap = keyset_size */
+    CollectedHash *e = &kc->entries[kc->count++];
+    memcpy(e->hash, hash, 16);
+    addr_from_hash(hash, kc->splits, &e->shard_id, &e->start_slot);
+    return 0;
+}
+
+static int keyset_to_collected_hashes(KeySet *ks, int splits,
+                                      CollectedHash **out_entries, size_t *out_count) {
+    size_t cap = keyset_size(ks);
+    if (cap == 0) { *out_entries = NULL; *out_count = 0; return 0; }
+    CollectedHash *entries = malloc(cap * sizeof(CollectedHash));
+    if (!entries) return -1;
+    KeysetToBatchCtx kc = { entries, 0, cap, splits };
+    keyset_iter(ks, keyset_to_batch_cb, &kc);
+    *out_entries = entries;
+    *out_count = kc.count;
+    return 0;
+}
+
+/* count(intersection) — caller checks dl->timed_out for error reporting.
+   Small-primary path: hand the first leaf's hashes off to parallel_indexed_count
+   with the full tree as post-filter (cheaper than walking subsequent btrees). */
 static size_t keyset_count_from_intersect(const char *db_root, const char *object,
-                                          QueryPlan *plan, QueryDeadline *dl) {
+                                          const Schema *sch, QueryPlan *plan,
+                                          CriteriaNode *tree, FieldSchema *fs,
+                                          QueryDeadline *dl) {
+    int small_primary = 0;
     KeySet *result = intersect_indexed_leaves(db_root, object,
                                               plan->intersect_leaves,
                                               plan->intersect_paths,
-                                              plan->intersect_count, dl);
+                                              plan->intersect_count, dl,
+                                              &small_primary);
     if (!result) return 0;
-    size_t n = keyset_size(result);
+
+    if (!small_primary) {
+        size_t n = keyset_size(result);
+        keyset_free(result);
+        return n;
+    }
+
+    /* Small first leaf: skip the second-leaf btree walk(s). Convert to a
+       CollectedHash[] and feed parallel_indexed_count with the full tree. */
+    CollectedHash *batch = NULL;
+    size_t batch_count = 0;
+    int rc = keyset_to_collected_hashes(result, sch->splits, &batch, &batch_count);
     keyset_free(result);
+    if (rc != 0 || batch_count == 0) { free(batch); return 0; }
+    size_t n = parallel_indexed_count(db_root, object, sch, batch,
+                                      (int)batch_count, tree, fs, dl);
+    free(batch);
     return n;
 }
 
@@ -6302,22 +6381,27 @@ static int keyset_find_from_or(const char *db_root, const char *object,
 }
 
 /* AND index-intersection find: build KeySet from intersection of N indexed
-   leaves (most-selective first), then emit. Stage 1's all-eligible restriction
-   means no rematch is ever needed — the intersection already enforces every
-   leaf in the AND tree. */
+   leaves (most-selective first), then emit. When the first leaf is small,
+   skip the second-leaf btree walks and pass the full tree as post-filter via
+   keyset_emit_find. */
 static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       const Schema *sch, QueryPlan *plan,
+                                      CriteriaNode *tree,
                                       ExcludedKeys *excluded, int offset, int limit,
                                       const char **proj_fields, int proj_count,
                                       FieldSchema *fs, int rows_fmt, char csv_delim,
                                       JoinSpec *joins, int njoins, QueryDeadline *dl) {
+    int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object,
                                           plan->intersect_leaves,
                                           plan->intersect_paths,
-                                          plan->intersect_count, dl);
+                                          plan->intersect_count, dl,
+                                          &small_primary);
     if (!ks) return 0;
+    /* Small primary: pass the full tree so emit re-checks every leaf via
+       criteria_match_tree. Big primary: intersection already exact, skip rematch. */
     int rc = keyset_emit_find(db_root, object, sch, ks,
-                              NULL,
+                              small_primary ? tree : NULL,
                               excluded, offset, limit,
                               proj_fields, proj_count, fs, rows_fmt, csv_delim,
                               joins, njoins, dl);
@@ -6383,19 +6467,33 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
 }
 
 /* AND index-intersection aggregate: build KeySet from intersection, then walk.
-   Caller must set agg_ctx->tree=NULL so agg_scan_cb skips the redundant
-   criteria_match_tree call (Stage 1 all-eligible restriction guarantees the
-   intersection result is exact). */
-static void keyset_agg_from_intersect(const char *db_root, const char *object,
-                                      const Schema *sch, void *agg_ctx,
-                                      QueryPlan *plan, QueryDeadline *dl) {
+   For the big-primary path agg_ctx->tree must be NULL (intersection exact;
+   skip redundant rematch). For small-primary agg_ctx->tree must be the full
+   original tree so agg_scan_cb post-filters via criteria_match_tree.
+   Returns 1 if it took the small-primary path (caller already set tree=NULL
+   and may want to know it was the fallback). */
+static int keyset_agg_from_intersect(const char *db_root, const char *object,
+                                     const Schema *sch, void *agg_ctx,
+                                     QueryPlan *plan, CriteriaNode *full_tree,
+                                     CriteriaNode **agg_ctx_tree_field,
+                                     QueryDeadline *dl) {
+    int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object,
                                           plan->intersect_leaves,
                                           plan->intersect_paths,
-                                          plan->intersect_count, dl);
-    if (!ks) return;
+                                          plan->intersect_count, dl,
+                                          &small_primary);
+    if (!ks) return 0;
+
+    if (small_primary) {
+        /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
+           AggCtx lives further down the file — caller passes &ctx.tree to
+           avoid a forward decl. */
+        *agg_ctx_tree_field = full_tree;
+    }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
     keyset_free(ks);
+    return small_primary;
 }
 
 /* Count records matching `tree` by iterating a KeySet built from the OR branch.
@@ -6544,7 +6642,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     } else if (plan.kind == PRIMARY_INTERSECT) {
         /* AND of indexed leaves on rangeable ops — intersect candidate hash
            sets via KeySet, no record fetch needed for count. */
-        size_t count = keyset_count_from_intersect(db_root, object, &plan, &dl);
+        size_t count = keyset_count_from_intersect(db_root, object, &sch, &plan,
+                                                   tree, &fs, &dl);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("{\"count\":%zu}\n", count);
     } else if (plan.kind == PRIMARY_KEYSET) {
@@ -7264,7 +7363,7 @@ int cmd_find(const char *db_root, const char *object,
         pthread_mutex_destroy(&oc.lock);
     } else if (plan.kind == PRIMARY_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
-        keyset_find_from_intersect(db_root, object, &sch, &plan,
+        keyset_find_from_intersect(db_root, object, &sch, &plan, tree,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
@@ -8983,10 +9082,13 @@ int cmd_aggregate(const char *db_root, const char *object,
     } else if (plan.kind == PRIMARY_INTERSECT) {
         /* AND of indexed leaves on rangeable ops — build intersection KeySet,
            walk, aggregate. Nullify ctx.tree so agg_scan_cb skips the redundant
-           criteria_match_tree call (intersection already exact). */
+           criteria_match_tree call (intersection already exact); the small-
+           primary fallback path inside keyset_agg_from_intersect restores tree
+           when needed for post-filtering. */
         CriteriaNode *saved_tree = ctx.tree;
         ctx.tree = NULL;
-        keyset_agg_from_intersect(db_root, object, &sch, &ctx, &plan, &dl);
+        keyset_agg_from_intersect(db_root, object, &sch, &ctx, &plan,
+                                  saved_tree, &ctx.tree, &dl);
         ctx.tree = saved_tree;
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union, feed each keyed
