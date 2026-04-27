@@ -2016,15 +2016,21 @@ static void menu_migrate(void) {
 static void bulk_insert_json(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
-    FormField fs[1] = {0};
+    static const char *const yn[] = { "no", "yes", NULL };
+    FormField fs[2] = {0};
     fs[0].label = "JSON file path"; fs[0].kind = FF_TEXT;
+    fs[1].label = "if_not_exists (skip dupes)"; fs[1].kind = FF_CHOICE;
+    fs[1].choices = yn;
+    snprintf(fs[1].value, sizeof(fs[1].value), "no");
     for (;;) {
-        if (tui_form("bulk-insert from JSON file", fs, 1) != 0) return;
+        if (tui_form("bulk-insert from JSON file", fs, 2) != 0) return;
         if (!fs[0].value[0]) { tui_alert("bulk-insert", "path required"); continue; }
+        int ifne = strcmp(fs[1].value, "yes") == 0;
         char req[2048];
         snprintf(req, sizeof(req),
-            "{\"mode\":\"bulk-insert\",\"dir\":\"%s\",\"object\":\"%s\",\"file\":\"%s\"}",
-            oi.dir, oi.object, fs[0].value);
+            "{\"mode\":\"bulk-insert\",\"dir\":\"%s\",\"object\":\"%s\",\"file\":\"%s\"%s}",
+            oi.dir, oi.object, fs[0].value,
+            ifne ? ",\"if_not_exists\":true" : "");
         int act = tui_preview_json("bulk-insert — query JSON", req);
         if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
@@ -2039,19 +2045,25 @@ static void bulk_insert_json(CliConn *c) {
 static void bulk_insert_csv(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
-    FormField fs[2] = {0};
+    static const char *const yn[] = { "no", "yes", NULL };
+    FormField fs[3] = {0};
     fs[0].label = "CSV file path"; fs[0].kind = FF_TEXT;
     fs[1].label = "delimiter";     fs[1].kind = FF_TEXT;
     snprintf(fs[1].value, sizeof(fs[1].value), "|");
+    fs[2].label = "if_not_exists (skip dupes)"; fs[2].kind = FF_CHOICE;
+    fs[2].choices = yn;
+    snprintf(fs[2].value, sizeof(fs[2].value), "no");
     for (;;) {
-        if (tui_form("bulk-insert from CSV file", fs, 2) != 0) return;
+        if (tui_form("bulk-insert from CSV file", fs, 3) != 0) return;
         if (!fs[0].value[0]) { tui_alert("bulk-insert", "path required"); continue; }
         if (!fs[1].value[0]) { tui_alert("bulk-insert", "delimiter required"); continue; }
+        int ifne = strcmp(fs[2].value, "yes") == 0;
         char req[2048];
         snprintf(req, sizeof(req),
             "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"%s\",\"object\":\"%s\","
-            "\"file\":\"%s\",\"delimiter\":\"%c\"}",
-            oi.dir, oi.object, fs[0].value, fs[1].value[0]);
+            "\"file\":\"%s\",\"delimiter\":\"%c\"%s}",
+            oi.dir, oi.object, fs[0].value, fs[1].value[0],
+            ifne ? ",\"if_not_exists\":true" : "");
         int act = tui_preview_json("bulk-insert-delimited — query JSON", req);
         if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
@@ -2067,9 +2079,14 @@ static void bulk_update_criteria(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    /* Sticky criteria + new-values across re-runs. */
+    /* Sticky matching-criteria, CAS-guard criteria, and new-values across
+       re-runs. The CAS guard is re-verified per record under the wrlock,
+       closing the phase-1/phase-2 race window — same semantics as the
+       single-op `if`. */
     CritRow crit_rows[MAX_CRIT_ROWS];
     int crit_n = 0;
+    CritRow if_rows[MAX_CRIT_ROWS];
+    int if_n = 0;
 
     /* "value" form has one field per writable schema field. Empty fields
        are skipped (no change applied); non-empty become the new value. */
@@ -2080,14 +2097,18 @@ static void bulk_update_criteria(CliConn *c) {
         value_fs[i].kind  = FF_TEXT;
     }
 
-    /* Final form: limit + dry_run choice. */
+    /* Final form: limit + dry_run + optional CAS guard. */
     static const char *const yn[] = { "yes", "no", NULL };
-    FormField extra_fs[2] = {0};
+    static const char *const ny[] = { "no", "yes", NULL };
+    FormField extra_fs[3] = {0};
     extra_fs[0].label = "limit (0 = all)"; extra_fs[0].kind = FF_NUMBER;
     snprintf(extra_fs[0].value, sizeof(extra_fs[0].value), "0");
     extra_fs[1].label = "dry_run";          extra_fs[1].kind = FF_CHOICE;
     extra_fs[1].choices = yn;
     snprintf(extra_fs[1].value, sizeof(extra_fs[1].value), "yes");
+    extra_fs[2].label = "with `if` CAS guard?"; extra_fs[2].kind = FF_CHOICE;
+    extra_fs[2].choices = ny;
+    snprintf(extra_fs[2].value, sizeof(extra_fs[2].value), "no");
 
     for (;;) {
         char *crit = NULL;
@@ -2097,8 +2118,14 @@ static void bulk_update_criteria(CliConn *c) {
         for (;;) {
             if (tui_form("bulk-update — values to set (empty = leave alone)",
                          value_fs, nf) != 0) { free(crit); break; }
-            if (tui_form("bulk-update — limit / dry_run",
-                         extra_fs, 2) != 0) continue;
+            if (tui_form("bulk-update — limit / dry_run / CAS guard",
+                         extra_fs, 3) != 0) continue;
+
+            char *if_json = NULL;
+            if (strcmp(extra_fs[2].value, "yes") == 0) {
+                if (tui_criteria_builder(&oi, if_rows, &if_n, &if_json) != 0)
+                    continue;
+            }
 
             /* Build "value" object from non-empty fields. */
             char value_json[4096] = "{";
@@ -2116,11 +2143,29 @@ static void bulk_update_criteria(CliConn *c) {
             int dry = strcmp(extra_fs[1].value, "yes") == 0;
             int limv = atoi(extra_fs[0].value);
 
-            char *req = malloc(strlen(crit) + strlen(value_json) + 1024);
-            sprintf(req,
-                "{\"mode\":\"bulk-update\",\"dir\":\"%s\",\"object\":\"%s\","
-                "\"criteria\":%s,\"value\":%s,\"limit\":%d,\"dry_run\":%s}",
-                oi.dir, oi.object, crit, value_json, limv, dry ? "true" : "false");
+            /* Empty if-array (user said yes but added zero rows) → omit
+               the field; daemon's `cas_ncrit > 0` gate would skip it
+               anyway, but keeping the wire small is clearer. */
+            int has_if = (if_json && if_n > 0);
+
+            size_t req_cap = strlen(crit) + strlen(value_json) + 1024
+                             + (has_if ? strlen(if_json) : 0);
+            char *req = malloc(req_cap);
+            if (has_if) {
+                snprintf(req, req_cap,
+                    "{\"mode\":\"bulk-update\",\"dir\":\"%s\",\"object\":\"%s\","
+                    "\"criteria\":%s,\"value\":%s,\"if\":%s,"
+                    "\"limit\":%d,\"dry_run\":%s}",
+                    oi.dir, oi.object, crit, value_json, if_json,
+                    limv, dry ? "true" : "false");
+            } else {
+                snprintf(req, req_cap,
+                    "{\"mode\":\"bulk-update\",\"dir\":\"%s\",\"object\":\"%s\","
+                    "\"criteria\":%s,\"value\":%s,\"limit\":%d,\"dry_run\":%s}",
+                    oi.dir, oi.object, crit, value_json,
+                    limv, dry ? "true" : "false");
+            }
+            free(if_json);
 
             int act = tui_preview_json("bulk-update — query JSON", req);
             if (act != 1) { free(req); continue; }
@@ -2167,35 +2212,63 @@ static void bulk_delete_criteria(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
+    /* Sticky matching-criteria + CAS-guard criteria across re-runs. */
     CritRow crit_rows[MAX_CRIT_ROWS];
     int crit_n = 0;
+    CritRow if_rows[MAX_CRIT_ROWS];
+    int if_n = 0;
 
     static const char *const yn[] = { "yes", "no", NULL };
-    FormField extra_fs[2] = {0};
+    static const char *const ny[] = { "no", "yes", NULL };
+    FormField extra_fs[3] = {0};
     extra_fs[0].label = "limit (0 = all)"; extra_fs[0].kind = FF_NUMBER;
     snprintf(extra_fs[0].value, sizeof(extra_fs[0].value), "0");
     extra_fs[1].label = "dry_run";          extra_fs[1].kind = FF_CHOICE;
     extra_fs[1].choices = yn;
     snprintf(extra_fs[1].value, sizeof(extra_fs[1].value), "yes");
+    extra_fs[2].label = "with `if` CAS guard?"; extra_fs[2].kind = FF_CHOICE;
+    extra_fs[2].choices = ny;
+    snprintf(extra_fs[2].value, sizeof(extra_fs[2].value), "no");
 
     for (;;) {
         char *crit = NULL;
         if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) return;
 
         for (;;) {
-            if (tui_form("bulk-delete — limit / dry_run", extra_fs, 2) != 0) {
+            if (tui_form("bulk-delete — limit / dry_run / CAS guard",
+                         extra_fs, 3) != 0) {
                 free(crit); break;
             }
             int dry = strcmp(extra_fs[1].value, "yes") == 0;
             int limv = atoi(extra_fs[0].value);
 
-            if (!dry && !tui_confirm("dry_run=no — really delete matching records?")) continue;
+            char *if_json = NULL;
+            if (strcmp(extra_fs[2].value, "yes") == 0) {
+                if (tui_criteria_builder(&oi, if_rows, &if_n, &if_json) != 0)
+                    continue;
+            }
 
-            char *req = malloc(strlen(crit) + 512);
-            sprintf(req,
-                "{\"mode\":\"bulk-delete\",\"dir\":\"%s\",\"object\":\"%s\","
-                "\"criteria\":%s,\"limit\":%d,\"dry_run\":%s}",
-                oi.dir, oi.object, crit, limv, dry ? "true" : "false");
+            if (!dry && !tui_confirm("dry_run=no — really delete matching records?")) {
+                free(if_json); continue;
+            }
+
+            int has_if = (if_json && if_n > 0);
+
+            size_t req_cap = strlen(crit) + 512 + (has_if ? strlen(if_json) : 0);
+            char *req = malloc(req_cap);
+            if (has_if) {
+                snprintf(req, req_cap,
+                    "{\"mode\":\"bulk-delete\",\"dir\":\"%s\",\"object\":\"%s\","
+                    "\"criteria\":%s,\"if\":%s,\"limit\":%d,\"dry_run\":%s}",
+                    oi.dir, oi.object, crit, if_json,
+                    limv, dry ? "true" : "false");
+            } else {
+                snprintf(req, req_cap,
+                    "{\"mode\":\"bulk-delete\",\"dir\":\"%s\",\"object\":\"%s\","
+                    "\"criteria\":%s,\"limit\":%d,\"dry_run\":%s}",
+                    oi.dir, oi.object, crit, limv, dry ? "true" : "false");
+            }
+            free(if_json);
 
             int act = tui_preview_json("bulk-delete — query JSON", req);
             if (act != 1) { free(req); continue; }

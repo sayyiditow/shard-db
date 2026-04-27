@@ -610,13 +610,24 @@ int cmd_exists(const char *db_root, const char *object, const char *key);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);
 int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format, const char *delimiter);
 int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *delimiter, const char *join_json, const char *order_by, const char *order_dir, const char *cursor_json);
-int cmd_bulk_insert(const char *db_root, const char *object, const char *input);
-int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str);
-int cmd_bulk_insert_delimited(const char *db_root, const char *object, const char *filepath, char delimiter);
+/* if_not_exists=1 makes bulk-insert idempotent — keys that already exist
+   are skipped instead of overwritten, and the response carries a "skipped"
+   counter alongside "inserted". */
+int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
+                    int if_not_exists);
+int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str,
+                           int if_not_exists);
+int cmd_bulk_insert_delimited(const char *db_root, const char *object,
+                              const char *filepath, char delimiter,
+                              int if_not_exists);
 int cmd_bulk_delete(const char *db_root, const char *object, const char *input);
+/* if_json (optional) is a JSON object {field:value,...} re-verified under
+   the wrlock per record in phase 2 — same optimistic-concurrency semantics
+   as single-op `if`. Records that match the criteria but fail the if are
+   counted as skipped. NULL/"" means no CAS check. */
 int cmd_bulk_update(const char *db_root, const char *object,
                     const char *criteria_json, const char *value_json,
-                    int limit, int dry_run);
+                    const char *if_json, int limit, int dry_run);
 /* Per-key partial update from a delimited text file. Row shape:
    key<DELIM>field1<DELIM>field2<DELIM>... in fields.conf active-field order.
    Semantics: update-only, key must exist, blank cell = leave alone,
@@ -624,7 +635,8 @@ int cmd_bulk_update(const char *db_root, const char *object,
 int cmd_bulk_update_delimited(const char *db_root, const char *object,
                                const char *filepath, char delimiter);
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
-                             const char *criteria_json, int limit, int dry_run);
+                             const char *criteria_json, const char *if_json,
+                             int limit, int dry_run);
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits);
 int rebuild_object(const char *db_root, const char *object,

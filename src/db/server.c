@@ -1199,30 +1199,35 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "bulk-insert") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *records = json_obj_strdup_raw(&req, "records");
+        char *ifne_s = json_obj_strdup(&req, "if_not_exists");
+        int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
         if (records) {
             /* Inline records — pass string directly, no temp file */
-            cmd_bulk_insert_string(db_root, object, records);
+            cmd_bulk_insert_string(db_root, object, records, ifne);
             free(records);
         } else {
-            cmd_bulk_insert(db_root, object, file);
+            cmd_bulk_insert(db_root, object, file, ifne);
         }
-        free(file);
+        free(file); free(ifne_s);
     } else if (strcmp(mode, "bulk-insert-delimited") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
+        char *ifne_s = json_obj_strdup(&req, "if_not_exists");
+        int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
         char d = (delim && delim[0]) ? delim[0] : '|'; /* default pipe */
-        cmd_bulk_insert_delimited(db_root, object, file, d);
-        free(file); free(delim);
+        cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
+        free(file); free(delim); free(ifne_s);
     } else if (strcmp(mode, "bulk-delete") == 0) {
         char *crit_json = json_obj_strdup_raw(&req, "criteria");
         if (crit_json) {
             /* Criteria-based bulk delete */
             char *lim_s = json_obj_strdup(&req, "limit");
             char *dry_s = json_obj_strdup(&req, "dry_run");
+            char *if_json = json_obj_strdup_raw(&req, "if");
             int lim = lim_s ? atoi(lim_s) : 0;
             int dry = (dry_s && strcmp(dry_s, "true") == 0);
-            cmd_bulk_delete_criteria(db_root, object, crit_json, lim, dry);
-            free(crit_json); free(lim_s); free(dry_s);
+            cmd_bulk_delete_criteria(db_root, object, crit_json, if_json, lim, dry);
+            free(crit_json); free(lim_s); free(dry_s); free(if_json);
         } else {
             /* Key-list bulk delete (existing path) */
             char *file = json_obj_strdup(&req, "file");
@@ -1245,13 +1250,14 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *value = json_obj_strdup_raw(&req, "value");
         char *lim_s = json_obj_strdup(&req, "limit");
         char *dry_s = json_obj_strdup(&req, "dry_run");
+        char *if_json = json_obj_strdup_raw(&req, "if");
         int lim = lim_s ? atoi(lim_s) : 0;
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
         if (crit_json && value)
-            cmd_bulk_update(db_root, object, crit_json, value, lim, dry);
+            cmd_bulk_update(db_root, object, crit_json, value, if_json, lim, dry);
         else
             OUT("{\"error\":\"Missing criteria or value\"}\n");
-        free(crit_json); free(value); free(lim_s); free(dry_s);
+        free(crit_json); free(value); free(lim_s); free(dry_s); free(if_json);
     } else if (strcmp(mode, "bulk-update-delimited") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
@@ -1650,7 +1656,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "remove-index") == 0) {
         cmd_remove_index(eff_root, object, arg1);
     } else if (strcasecmp(cmd, "bulk-insert") == 0) {
-        cmd_bulk_insert(eff_root, object, arg1[0] ? arg1 : NULL);
+        cmd_bulk_insert(eff_root, object, arg1[0] ? arg1 : NULL, 0);
     } else if (strcasecmp(cmd, "bulk-delete") == 0) {
         cmd_bulk_delete(eff_root, object, arg1[0] ? arg1 : NULL);
     } else if (strcasecmp(cmd, "vacuum") == 0) {

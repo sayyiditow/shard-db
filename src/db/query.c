@@ -590,6 +590,10 @@ typedef struct {
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
+    /* CAS: when if_not_exists is set, an existing-key probe match is treated
+       as a no-op and counted in `skipped` instead of overwriting. */
+    int             if_not_exists;
+    int             skipped;
     /* Phase-2 profiling: total worker wall time and time spent inside
        ucache_grow_shard. Aggregated post-join to show "of this much
        Phase 2 time, X ms was grow." Helps isolate rehash cost. */
@@ -682,6 +686,13 @@ static void *bulk_insert_shard_worker(void *arg) {
         SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
         int is_update = (existing->flag == 1 &&
                          memcmp(existing->hash, r->hash, 16) == 0);
+        if (is_update && sw->if_not_exists) {
+            /* CAS: caller asked us not to overwrite — count as skipped and
+               leave the existing record alone. */
+            sw->skipped++;
+            i++;
+            continue;
+        }
         SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
         memset(hdr, 0, HEADER_SIZE);
         memcpy(hdr->hash, r->hash, 16);
@@ -772,9 +783,10 @@ static void *bulk_insert_shard_worker(void *arg) {
 }
 
 /* Internal: bulk insert from a json string already in memory (no file I/O) */
-int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str);
+int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str, int if_not_exists);
 
-int cmd_bulk_insert(const char *db_root, const char *object, const char *input) {
+int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
+                    int if_not_exists) {
     uint64_t t0 = now_ms_coarse();
     size_t len;
     char *json;
@@ -1032,6 +1044,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
         ws->idx_is_composite = idx_is_composite;
         ws->inserted = 0;
         ws->errors = 0;
+        ws->skipped = 0;
+        ws->if_not_exists = if_not_exists;
         ws->idx_pairs = nfields > 0 ? calloc(nfields, sizeof(BtEntry *)) : NULL;
         ws->idx_pair_counts = nfields > 0 ? calloc(nfields, sizeof(size_t)) : NULL;
         ws->idx_pair_caps = nfields > 0 ? calloc(nfields, sizeof(size_t)) : NULL;
@@ -1061,10 +1075,12 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
     /* Merge per-worker results into the caller's global counters and index arrays,
        then release per-worker scratch. BtEntry.value ownership transfers into
        the global idx_pairs — freed later by the idx-build cleanup. */
+    int skipped_total = 0;
     for (int wi = 0; wi < nshard_groups; wi++) {
         BulkInsShardWork *ws = &workers[wi];
         count  += ws->inserted;
         errors += ws->errors;
+        skipped_total += ws->skipped;
 
         for (int fi = 0; fi < nfields; fi++) {
             size_t add = ws->idx_pair_counts[fi];
@@ -1157,16 +1173,21 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input) 
             (unsigned long)(t4 - t0));
 
     if (errors) {
-        OUT("{\"count\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n", count, errors);
+        OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
+            count, skipped_total, errors);
         fprintf(stderr, "%d errors during bulk insert (see info log for dropped keys)\n", errors);
+    } else if (skipped_total > 0) {
+        OUT("{\"inserted\":%d,\"skipped\":%d}\n", count, skipped_total);
     } else {
+        /* Backward-compat: no skipped column when caller didn't ask for CAS. */
         OUT("{\"count\":%d}\n", count);
     }
     return errors > 0 ? 1 : 0;
 }
 
 /* Bulk insert from a string already in memory — no temp file needed */
-int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str) {
+int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str,
+                           int if_not_exists) {
     /* Write to a memfd (in-memory file) so cmd_bulk_insert can mmap it */
     size_t slen = strlen(json_str);
     int memfd = memfd_create("shard-db_bulk", 0);
@@ -1176,7 +1197,7 @@ int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_s
         snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bulk_%d_%d.json", getpid(), (int)pthread_self());
         FILE *tf = fopen(tmp, "w");
         if (tf) { fwrite(json_str, 1, slen, tf); fclose(tf); }
-        int r = cmd_bulk_insert(db_root, object, tmp);
+        int r = cmd_bulk_insert(db_root, object, tmp, if_not_exists);
         unlink(tmp);
         return r;
     }
@@ -1184,7 +1205,7 @@ int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_s
     write(memfd, json_str, slen);
     char fdpath[64];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", memfd);
-    int r = cmd_bulk_insert(db_root, object, fdpath);
+    int r = cmd_bulk_insert(db_root, object, fdpath, if_not_exists);
     close(memfd);
     return r;
 }
@@ -1192,7 +1213,8 @@ int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_s
 /* ========== BULK INSERT (DELIMITED TEXT FILE) ========== */
 
 int cmd_bulk_insert_delimited(const char *db_root, const char *object,
-                               const char *filepath, char delimiter) {
+                               const char *filepath, char delimiter,
+                               int if_not_exists) {
     if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
 
     /* Must have typed schema — delimited values map to fields.conf order */
@@ -1428,6 +1450,8 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         ws->idx_is_composite = idx_is_composite;
         ws->inserted = 0;
         ws->errors = 0;
+        ws->skipped = 0;
+        ws->if_not_exists = if_not_exists;
         ws->idx_pairs = nidx > 0 ? calloc(nidx, sizeof(BtEntry *)) : NULL;
         ws->idx_pair_counts = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
         ws->idx_pair_caps = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
@@ -1440,10 +1464,12 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
                  sizeof(BulkInsShardWork));
 
     /* Merge per-worker results into caller's counters + index arrays. */
+    int delim_skipped_total = 0;
     for (int wi = 0; wi < nshard_groups; wi++) {
         BulkInsShardWork *ws = &workers[wi];
         count  += ws->inserted;
         errors += ws->errors;
+        delim_skipped_total += ws->skipped;
 
         for (int fi = 0; fi < nidx; fi++) {
             size_t add = ws->idx_pair_counts[fi];
@@ -1514,8 +1540,11 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
 
     if (count > 0) update_count(db_root, object, count);
     if (errors) {
-        OUT("{\"count\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n", count, errors);
+        OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
+            count, delim_skipped_total, errors);
         fprintf(stderr, "%d errors during delimited import (see info log for dropped keys)\n", errors);
+    } else if (delim_skipped_total > 0) {
+        OUT("{\"inserted\":%d,\"skipped\":%d}\n", count, delim_skipped_total);
     } else {
         OUT("{\"count\":%d}\n", count);
     }
@@ -1915,6 +1944,11 @@ typedef struct {
     int            shard_id;
     BulkUpdRec    *recs;
     int            count;
+    /* CAS: optional `if` condition re-verified per record under the wrlock.
+       NULL/empty = no CAS check. Same SearchCriterion[] shape single-op
+       cmd_update uses, which makes cas_check directly applicable. */
+    SearchCriterion *cas_crit;
+    int              cas_ncrit;
     /* Results */
     int            updated;
     int            skipped;
@@ -1956,6 +1990,14 @@ static void *bulk_upd_shard_worker(void *arg) {
         uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
 
         if (!criteria_match_tree(value_ptr, w->tree, w->fs)) { w->skipped++; continue; }
+
+        /* Per-record CAS — re-verify the `if` condition under the wrlock.
+           Race window between phase-1 scan and phase-2 write is closed
+           here; failures count as skipped, not errors. */
+        if (w->cas_crit && w->cas_ncrit > 0 &&
+            !cas_check(w->ts, value_ptr, w->cas_crit, w->cas_ncrit)) {
+            w->skipped++; continue;
+        }
 
         /* Collect old index values (as index-key bytes) */
         uint8_t *old_idx_bufs[MAX_FIELDS];
@@ -2038,7 +2080,7 @@ static void *bulk_upd_shard_worker(void *arg) {
 
 int cmd_bulk_update(const char *db_root, const char *object,
                     const char *criteria_json, const char *value_json,
-                    int limit, int dry_run) {
+                    const char *if_json, int limit, int dry_run) {
     Schema sch = load_schema(db_root, object);
     const char *perr = NULL;
     CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
@@ -2050,6 +2092,14 @@ int cmd_bulk_update(const char *db_root, const char *object,
     if (!tree) {
         OUT("{\"error\":\"Missing criteria\"}\n");
         return 1;
+    }
+
+    /* Parse optional `if` once into the SearchCriterion[] shape that
+       cas_check expects. Workers share the parsed array read-only. */
+    SearchCriterion *cas_crit = NULL;
+    int cas_ncrit = 0;
+    if (if_json && if_json[0]) {
+        parse_criteria_json(if_json, &cas_crit, &cas_ncrit);
     }
 
     /* Phase 1: Scan — collect matching keys (read-only) */
@@ -2068,12 +2118,14 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     if (dl.timed_out) {
         OUT("{\"error\":\"query_timeout\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
     }
     if (ctx.budget_exceeded) {
         OUT(QUERY_BUFFER_ERR);
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -2081,6 +2133,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     if (dry_run) {
         OUT("{\"matched\":%d,\"updated\":0,\"skipped\":0,\"dry_run\":true}\n", matched);
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
@@ -2148,6 +2201,8 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].value_json = value_json;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
         workers[wi].nidx = nidx;
+        workers[wi].cas_crit = cas_crit;
+        workers[wi].cas_ncrit = cas_ncrit;
         workers[wi].updated = 0;
         workers[wi].skipped = 0;
     }
@@ -2164,6 +2219,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     log_msg(3, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
 
+    if (cas_crit) free_criteria(cas_crit, cas_ncrit);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
     return 0;
@@ -2506,7 +2562,8 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 }
 
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
-                             const char *criteria_json, int limit, int dry_run) {
+                             const char *criteria_json, const char *if_json,
+                             int limit, int dry_run) {
     Schema sch = load_schema(db_root, object);
     const char *perr = NULL;
     CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
@@ -2518,6 +2575,13 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (!tree) {
         OUT("{\"error\":\"Missing criteria\"}\n");
         return 1;
+    }
+
+    /* Optional `if` for per-record CAS, re-verified under wrlock in phase 2. */
+    SearchCriterion *cas_crit = NULL;
+    int cas_ncrit = 0;
+    if (if_json && if_json[0]) {
+        parse_criteria_json(if_json, &cas_crit, &cas_ncrit);
     }
 
     /* Phase 1: Scan — collect matching keys (read-only) */
@@ -2536,12 +2600,14 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     if (dl.timed_out) {
         OUT("{\"error\":\"query_timeout\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
     }
     if (ctx.budget_exceeded) {
         OUT(QUERY_BUFFER_ERR);
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -2549,6 +2615,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     if (dry_run) {
         OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":0,\"dry_run\":true}\n", matched);
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
@@ -2597,6 +2664,13 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
             ucache_write_release(wh); skipped++; continue;
         }
 
+        /* Per-record CAS — same optimistic-concurrency check single-op
+           cmd_delete uses. Failures count as skipped, not errors. */
+        if (cas_crit && cas_ncrit > 0 &&
+            !cas_check(ts, value_ptr, cas_crit, cas_ncrit)) {
+            ucache_write_release(wh); skipped++; continue;
+        }
+
         /* Extract indexed field values (as index-key bytes) BEFORE tombstoning */
         char idx_fields[MAX_FIELDS][256];
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
@@ -2637,6 +2711,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     log_msg(3, "BULK-DELETE %s matched=%d deleted=%d skipped=%d", object, matched, deleted, skipped);
     OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
 
+    if (cas_crit) free_criteria(cas_crit, cas_ncrit);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
     return 0;

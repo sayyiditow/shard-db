@@ -33,7 +33,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-and-intersection.sh          # AND index intersection (count/find/agg) (27)
 ./tests/test-describe.sh                  # list-objects + describe-object        (26)
 ./tests/test-tenant-mgmt.sh               # add-dir/remove-dir + remove-token by fingerprint (17)
-# Total: 527 tests
+./tests/test-bulk-cas.sh                  # CAS on bulk-insert / bulk-update / bulk-delete (58)
+# Total: 585 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
