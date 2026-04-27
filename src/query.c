@@ -270,6 +270,31 @@ static int cmp_by_shard(const void *a, const void *b) {
     return ((const CollectedHash *)a)->shard_id - ((const CollectedHash *)b)->shard_id;
 }
 
+/* Sort `batch` in place by shard_id and split into per-shard groups. The
+   group_starts[i]/group_sizes[i] pair describes a contiguous run of entries
+   with the same shard_id, suitable for fan-out to per-shard workers.
+   Returns the number of groups emitted (≤ max_groups). Excess shards beyond
+   max_groups fold into the final group — same behavior the inline copies
+   shipped before this was extracted. */
+static int shard_group_batch(CollectedHash *batch, int batch_count,
+                             int *group_starts, int *group_sizes,
+                             int max_groups) {
+    if (batch_count == 0) return 0;
+    qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
+    int n = 0;
+    int prev_sid = -1;
+    for (int i = 0; i < batch_count && n < max_groups; i++) {
+        if (batch[i].shard_id != prev_sid) {
+            group_starts[n] = i;
+            if (n > 0) group_sizes[n - 1] = i - group_starts[n - 1];
+            prev_sid = batch[i].shard_id;
+            n++;
+        }
+    }
+    if (n > 0) group_sizes[n - 1] = batch_count - group_starts[n - 1];
+    return n;
+}
+
 /* Collecting callback for B+ tree traversal */
 typedef struct {
     CollectedHash *entries;
@@ -368,23 +393,11 @@ static int parallel_fetch_and_print(const char *db_root, const char *object,
         return printed;
     }
 
-    /* Sort by shard_id */
-    qsort(entries, count, sizeof(CollectedHash), cmp_by_shard);
-
-    /* Group by shard */
-    int nshard_groups = 0;
+    /* Sort by shard_id and split into per-shard groups (heap arrays — count
+       can exceed the stack-friendly cap used by other call sites). */
     int *group_starts = malloc((count + 1) * sizeof(int));
-    int *group_sizes = malloc((count + 1) * sizeof(int));
-    int prev_sid = -1;
-    for (size_t i = 0; i < count; i++) {
-        if (entries[i].shard_id != prev_sid) {
-            group_starts[nshard_groups] = i;
-            if (nshard_groups > 0) group_sizes[nshard_groups - 1] = i - group_starts[nshard_groups - 1];
-            prev_sid = entries[i].shard_id;
-            nshard_groups++;
-        }
-    }
-    if (nshard_groups > 0) group_sizes[nshard_groups - 1] = count - group_starts[nshard_groups - 1];
+    int *group_sizes  = malloc((count + 1) * sizeof(int));
+    int nshard_groups = shard_group_batch(entries, (int)count, group_starts, group_sizes, (int)count + 1);
 
     /* Allocate per-shard workers */
     SearchShardWork *workers = calloc(nshard_groups, sizeof(SearchShardWork));
@@ -4998,23 +5011,8 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
                                      const Schema *sch, CollectedHash *batch,
                                      int batch_count, CriteriaNode *tree,
                                      FieldSchema *fs, QueryDeadline *dl) {
-    if (batch_count == 0) return 0;
-    qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
-
-    int nshard_groups = 0;
     int group_starts[1024], group_sizes[1024];
-    int prev_sid = -1;
-    for (int i = 0; i < batch_count && nshard_groups < 1024; i++) {
-        if (batch[i].shard_id != prev_sid) {
-            group_starts[nshard_groups] = i;
-            if (nshard_groups > 0)
-                group_sizes[nshard_groups - 1] = i - group_starts[nshard_groups - 1];
-            prev_sid = batch[i].shard_id;
-            nshard_groups++;
-        }
-    }
-    if (nshard_groups > 0)
-        group_sizes[nshard_groups - 1] = batch_count - group_starts[nshard_groups - 1];
+    int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
     ShardCountCtx *workers = calloc(nshard_groups, sizeof(ShardCountCtx));
     for (int g = 0; g < nshard_groups; g++) {
@@ -5050,21 +5048,8 @@ static int process_batch(CollectedHash *batch, int batch_count,
                          int rows_fmt, char csv_delim,
                          JoinSpec *joins, int njoins, QueryDeadline *dl) {
 
-    qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
-
-    /* Group by shard_id */
-    int nshard_groups = 0;
     int group_starts[1024], group_sizes[1024]; /* max 1K shards in a batch */
-    int prev_sid = -1;
-    for (int i = 0; i < batch_count && nshard_groups < 1024; i++) {
-        if (batch[i].shard_id != prev_sid) {
-            group_starts[nshard_groups] = i;
-            if (nshard_groups > 0) group_sizes[nshard_groups - 1] = i - group_starts[nshard_groups - 1];
-            prev_sid = batch[i].shard_id;
-            nshard_groups++;
-        }
-    }
-    if (nshard_groups > 0) group_sizes[nshard_groups - 1] = batch_count - group_starts[nshard_groups - 1];
+    int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
     /* Allocate workers */
     ShardWorkCtx *workers = calloc(nshard_groups, sizeof(ShardWorkCtx));
@@ -8461,23 +8446,8 @@ static void *shard_agg_worker(void *arg) {
 static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
                                  const char *object, const Schema *sch,
                                  CollectedHash *batch, int batch_count) {
-    if (batch_count == 0) return;
-    qsort(batch, batch_count, sizeof(CollectedHash), cmp_by_shard);
-
-    int nshard_groups = 0;
     int group_starts[1024], group_sizes[1024];
-    int prev_sid = -1;
-    for (int i = 0; i < batch_count && nshard_groups < 1024; i++) {
-        if (batch[i].shard_id != prev_sid) {
-            group_starts[nshard_groups] = i;
-            if (nshard_groups > 0)
-                group_sizes[nshard_groups - 1] = i - group_starts[nshard_groups - 1];
-            prev_sid = batch[i].shard_id;
-            nshard_groups++;
-        }
-    }
-    if (nshard_groups > 0)
-        group_sizes[nshard_groups - 1] = batch_count - group_starts[nshard_groups - 1];
+    int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
     ShardAggCtx *workers = calloc(nshard_groups, sizeof(ShardAggCtx));
     for (int g = 0; g < nshard_groups; g++) {
