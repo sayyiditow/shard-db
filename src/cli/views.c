@@ -435,6 +435,29 @@ static void table_free(Table *t) {
             free(t->cells[r][c]);
 }
 
+/* Callback: row entry is a single scalar (string/number/bool). Used by
+   shapes like `["k1","k2",...]` (keys mode) — emits a one-column "value"
+   table. Header is set by tui_show_table before iterating. */
+static int row_collect_string_cb(const char *elem, size_t len, void *ctx) {
+    Table *t = (Table *)ctx;
+    if (t->nrows >= MAX_ROWS) return 1;
+    int row = t->nrows++;
+    for (int i = 0; i < MAX_COLS; i++) t->cells[row][i] = NULL;
+    char *cell;
+    if (len > 0 && elem[0] == '"') {
+        cell = malloc(len);
+        json_string_into(elem, len, cell, len);
+    } else {
+        cell = malloc(len + 1);
+        memcpy(cell, elem, len);
+        cell[len] = '\0';
+    }
+    t->cells[row][0] = cell;
+    int w = (int)strlen(cell);
+    if (w > t->widths[0]) t->widths[0] = (w > 64 ? 64 : w);
+    return 0;
+}
+
 /* Callback: row entry is a JSON ARRAY of scalar values aligned to t.cols
    (filled in advance by tui_show_table's columns parser). One element per
    column; mismatched lengths fill missing cells with empty strings. */
@@ -473,23 +496,36 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
     return 0;
 }
 
-void tui_show_table(const char *title, const char *json_array) {
+void tui_show_table(const char *title, const char *json) {
     Table t;
     memset(&t, 0, sizeof(t));
 
-    /* Two server response shapes to handle:
-       (a) {"columns":[...],"rows":[[v1,v2],...]} — format=rows envelope,
-           rows are arrays aligned to columns.
-       (b) [{"key":"k","value":{...}}, ...] — default find/fetch shape,
-           rows are objects whose keys we discover. */
-    const char *arr = json_array;
-    int columns_path = 0;
-    if (*arr == '{') {
-        size_t cols_len, rows_len;
-        const char *cols_v = json_find_key(arr, "columns", &cols_len);
-        const char *rows_v = json_find_key(arr, "rows", &rows_len);
+    /* tui_show_table is the single render path for every data-returning
+       JSON response. Five shapes the daemon emits today, all handled here:
+
+         1. {"columns":[...],"rows":[[v1,v2],...]}     — find/fetch format=rows
+         2. {"results":[{...}], "cursor":...}          — fetch default
+         3. {"rows":[...]}                             — generic envelope
+         4. [{...},{...}]                              — find default, agg group_by
+         5. ["s1","s2"]                                — keys default
+         6. {"k1":"v1","k2":"v2"}                      — count, exists, agg scalar
+
+       (1) drives column names + array rows. (2)/(3) just unwrap and recurse.
+       (4) auto-detects columns from each object's keys (special-cases "value"
+       to flatten a nested record). (5) becomes a single-column "value" table.
+       (6) becomes a two-column "metric/value" table. */
+
+    const char *arr = json;
+    int rendered = 0;
+
+    if (*json == '{') {
+        size_t cols_len, rows_len, res_len;
+        const char *cols_v = json_find_key(json, "columns", &cols_len);
+        const char *rows_v = json_find_key(json, "rows", &rows_len);
+        const char *res_v  = json_find_key(json, "results", &res_len);
+
         if (cols_v && rows_v) {
-            /* Path (a): parse columns first, then rows-as-arrays. */
+            /* Shape 1: explicit columns + array rows. */
             const char *cp = cols_v + 1;
             const char *cend = cols_v + cols_len - 1;
             while (cp < cend && t.ncols < MAX_COLS) {
@@ -510,14 +546,75 @@ void tui_show_table(const char *title, const char *json_array) {
                 if (*cp == ',') cp++;
             }
             json_array_iter(rows_v, rows_len, row_collect_array_cb, &t);
-            columns_path = 1;
-        } else if (rows_v) {
+            rendered = 1;
+        } else if (res_v) {       /* Shape 2: unwrap and re-point. */
+            arr = res_v;
+        } else if (rows_v) {       /* Shape 3: unwrap and re-point. */
             arr = rows_v;
+        } else {
+            /* Shape 6: plain object → 2-column metric/value table. */
+            snprintf(t.cols[0], sizeof(t.cols[0]), "metric");
+            snprintf(t.cols[1], sizeof(t.cols[0]), "value");
+            t.widths[0] = 6; t.widths[1] = 5;
+            t.ncols = 2;
+
+            const char *p = skip_ws(json) + 1;  /* past leading { */
+            while (*p && t.nrows < MAX_ROWS) {
+                p = skip_ws(p);
+                if (*p == '}') break;
+                if (*p != '"') break;
+                p++;
+                const char *ks = p;
+                while (*p && *p != '"') p++;
+                size_t klen = (size_t)(p - ks);
+                if (*p == '"') p++;
+                p = skip_ws(p);
+                if (*p != ':') break;
+                p++;
+                p = skip_ws(p);
+                const char *vs = p;
+                skip_value(&p);
+                size_t vlen = (size_t)(p - vs);
+
+                int row = t.nrows++;
+                t.cells[row][0] = malloc(klen + 1);
+                memcpy(t.cells[row][0], ks, klen);
+                t.cells[row][0][klen] = '\0';
+                if ((int)klen > t.widths[0]) t.widths[0] = klen > 32 ? 32 : (int)klen;
+
+                t.cells[row][1] = malloc(vlen + 1);
+                if (vlen > 0 && vs[0] == '"') {
+                    json_string_into(vs, vlen, t.cells[row][1], vlen + 1);
+                } else {
+                    memcpy(t.cells[row][1], vs, vlen);
+                    t.cells[row][1][vlen] = '\0';
+                }
+                int w = (int)strlen(t.cells[row][1]);
+                if (w > t.widths[1]) t.widths[1] = (w > 64 ? 64 : w);
+
+                p = skip_ws(p);
+                if (*p == ',') p++;
+            }
+            rendered = 1;
         }
     }
-    if (!columns_path) {
-        /* Path (b): legacy auto-detect from object keys. */
-        json_array_iter(arr, strlen(arr), row_collect_cb, &t);
+
+    if (!rendered && *arr == '[') {
+        /* Peek the first element to choose object-row vs string-row path. */
+        const char *q = arr + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q == '{') {
+            /* Shape 4: array of objects — auto-detect columns from keys. */
+            json_array_iter(arr, strlen(arr), row_collect_cb, &t);
+        } else if (*q == ']') {
+            /* Empty array. */
+        } else {
+            /* Shape 5: array of scalars → single-column "value" table. */
+            snprintf(t.cols[0], sizeof(t.cols[0]), "value");
+            t.widths[0] = 5;
+            t.ncols = 1;
+            json_array_iter(arr, strlen(arr), row_collect_string_cb, &t);
+        }
     }
 
     if (t.ncols == 0 || t.nrows == 0) {

@@ -22,9 +22,12 @@ static CliConn *get_conn(void) {
 
 static void show_response(const char *title, const char *json) {
     if (!json || !*json) { tui_alert(title, "(empty response)"); return; }
-    /* Show as kv-pairs if it parses as object; else raw. */
-    if (json[0] == '{') tui_show_object(title, json);
-    else                tui_show_text(title, json);
+    /* tui_show_table is the unified renderer for every JSON response shape
+       the daemon emits — array of objects, array of strings, columns+rows
+       envelope, results-wrapped fetch, scalar object, etc. Same UX (header,
+       horizontal scroll, j/k navigation) for find / fetch / keys / count /
+       aggregate / exists / get. */
+    tui_show_table(title, json);
 }
 
 /* Run an external command and capture output via popen. */
@@ -431,9 +434,8 @@ static void query_update(CliConn *c) {
     }
 }
 
-/* Keys: paginated key listing (no values). format:rows wraps the response as
-   {"columns":["key"],"rows":[["k1"],["k2"],...]} → tui_show_table gives us
-   horizontal scroll for free. */
+/* Keys: paginated key listing (no values). Server always returns
+   ["k1","k2",...]; tui_show_table renders as a single-column table. */
 static void query_keys(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -445,7 +447,7 @@ static void query_keys(CliConn *c) {
         char req[512];
         snprintf(req, sizeof(req),
             "{\"mode\":\"keys\",\"dir\":\"%s\",\"object\":\"%s\","
-            "\"offset\":%d,\"limit\":%d,\"format\":\"rows\"}",
+            "\"offset\":%d,\"limit\":%d}",
             oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value));
         int act = tui_preview_json("keys — query JSON (r=run  ←=back to edit)", req);
         if (act != 1) continue;
@@ -495,7 +497,7 @@ static void query_fetch(CliConn *c) {
         char req[2048];
         snprintf(req, sizeof(req),
             "{\"mode\":\"fetch\",\"dir\":\"%s\",\"object\":\"%s\","
-            "\"offset\":%d,\"limit\":%d,\"fields\":%s,\"format\":\"rows\"}",
+            "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
             oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value), fields_json);
         int act = tui_preview_json("fetch — query JSON (r=run  ←=back to edit)", req);
         if (act != 1) continue;
@@ -843,12 +845,14 @@ static void query_find(CliConn *c) {
             int limv = atoi(fs[1].value);
             if (limv <= 0) limv = 50;
 
-            /* format:rows so the response is {"columns":[..],"rows":[[..]]}
-               which tui_show_table renders directly with horizontal scroll. */
+            /* No format hint — tui_show_table handles every shape the
+               daemon emits today (default array-of-objects, format=rows
+               envelope, scalars, plain objects). One render path for all
+               data-returning queries. */
             char *req = malloc(strlen(crit) + 1024);
             sprintf(req,
                 "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
-                "\"offset\":%d,\"limit\":%d,\"fields\":%s,\"format\":\"rows\"}",
+                "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
                 oi.dir, oi.object, crit, offv, limv, fields_json);
 
             int act = tui_preview_json("find — query JSON (r=run  ←=back to edit)", req);
