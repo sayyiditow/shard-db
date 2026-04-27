@@ -411,7 +411,7 @@ void tui_show_table(const char *title, const char *json_array) {
         for (int c = 0; c < t.ncols; c++) {
             int w = t.widths[c] + 2;
             if (x >= 0 && x < cols)
-                mvprintw(2, x, " %-*.*s│", t.widths[c], t.widths[c], t.cols[c]);
+                mvprintw(2, x, " %-*.*s|", t.widths[c], t.widths[c], t.cols[c]);
             x += w + 1;
         }
         attroff(A_BOLD | COLOR_PAIR(1));
@@ -426,7 +426,7 @@ void tui_show_table(const char *title, const char *json_array) {
                 int w = t.widths[c] + 2;
                 const char *cell = t.cells[row][c] ? t.cells[row][c] : "";
                 if (x >= 0 && x < cols)
-                    mvprintw(4 + i, x, " %-*.*s│", t.widths[c], t.widths[c], cell);
+                    mvprintw(4 + i, x, " %-*.*s|", t.widths[c], t.widths[c], cell);
                 x += w + 1;
             }
         }
@@ -465,6 +465,31 @@ typedef struct {
     char value[64];
 } StatRow;
 
+/* Emit one StatRow with `prefix.child = value` formatting, scalar values
+   only — caller flattens nested objects manually. */
+static int emit_row(StatRow *rows, int n, int max_rows,
+                    const char *prefix,
+                    const char *kstart, size_t klen,
+                    const char *vstart, size_t vlen) {
+    if (n >= max_rows) return n;
+    char metric[64];
+    if (prefix && prefix[0])
+        snprintf(metric, sizeof(metric), "%s.%.*s", prefix, (int)klen, kstart);
+    else
+        snprintf(metric, sizeof(metric), "%.*s", (int)klen, kstart);
+    snprintf(rows[n].metric, sizeof(rows[n].metric), "%s", metric);
+    if (vlen > 0 && vstart[0] == '"')
+        json_string_into(vstart, vlen, rows[n].value, sizeof(rows[n].value));
+    else if (vlen > 0 && vstart[0] == '[')
+        snprintf(rows[n].value, sizeof(rows[n].value), "<array>");
+    else {
+        size_t L = vlen < sizeof(rows[n].value) - 1 ? vlen : sizeof(rows[n].value) - 1;
+        memcpy(rows[n].value, vstart, L);
+        rows[n].value[L] = '\0';
+    }
+    return n + 1;
+}
+
 static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
     int n = 0;
     const char *p = skip_ws(json);
@@ -486,17 +511,37 @@ static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
         const char *vs = p;
         skip_value(&p);
         size_t vlen = (size_t)(p - vs);
-        if (klen >= sizeof(rows[n].metric)) klen = sizeof(rows[n].metric) - 1;
-        memcpy(rows[n].metric, ks, klen);
-        rows[n].metric[klen] = '\0';
-        if (vlen > 0 && vs[0] == '"')
-            json_string_into(vs, vlen, rows[n].value, sizeof(rows[n].value));
-        else {
-            size_t L = vlen < sizeof(rows[n].value) - 1 ? vlen : sizeof(rows[n].value) - 1;
-            memcpy(rows[n].value, vs, L);
-            rows[n].value[L] = '\0';
+
+        /* Flatten one level of nested object: ucache → ucache.used,
+           ucache.total, … (much more readable than dumping the JSON). */
+        if (vlen > 0 && vs[0] == '{') {
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "%.*s", (int)klen, ks);
+            const char *np = vs + 1;
+            const char *nend = vs + vlen - 1;
+            while (np < nend && n < max_rows) {
+                np = skip_ws(np);
+                if (*np == '}' || np >= nend) break;
+                if (*np != '"') break;
+                np++;
+                const char *nks = np;
+                while (np < nend && *np != '"') np++;
+                size_t nklen = (size_t)(np - nks);
+                if (np < nend) np++;
+                np = skip_ws(np);
+                if (*np != ':') break;
+                np++;
+                np = skip_ws(np);
+                const char *nvs = np;
+                skip_value(&np);
+                size_t nvlen = (size_t)(np - nvs);
+                n = emit_row(rows, n, max_rows, prefix, nks, nklen, nvs, nvlen);
+                np = skip_ws(np);
+                if (*np == ',') np++;
+            }
+        } else {
+            n = emit_row(rows, n, max_rows, NULL, ks, klen, vs, vlen);
         }
-        n++;
         p = skip_ws(p);
         if (*p == ',') p++;
     }
@@ -540,16 +585,17 @@ void tui_stats_live(CliConn *c, int interval_sec) {
             if (wm > 32) wm = 32;
             if (wv > 32) wv = 32;
 
-            /* Header row. */
+            /* Header row. ASCII | column separator (some terminals/locales
+               render Unicode box-drawing chars as garbage like ~T~B). */
             attron(A_BOLD | COLOR_PAIR(1));
-            mvprintw(2, 4, " %-*s │ %*s ", wm, "metric", wv, "value");
+            mvprintw(2, 4, " %-*s | %*s ", wm, "metric", wv, "value");
             attroff(A_BOLD | COLOR_PAIR(1));
             mvhline(3, 4, ACS_HLINE, wm + wv + 7);
 
             int view = rows - 7;
             for (int i = 0; i < view && top + i < n; i++) {
                 int r = top + i;
-                mvprintw(4 + i, 4, " %-*.*s │ %*.*s ",
+                mvprintw(4 + i, 4, " %-*.*s | %*.*s ",
                          wm, wm, stat_rows[r].metric,
                          wv, wv, stat_rows[r].value);
             }

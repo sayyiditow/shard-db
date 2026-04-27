@@ -662,6 +662,11 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
 int cmd_list_objects(const char *db_root, const char *dir);
 int cmd_describe_object(const char *db_root, const char *dir, const char *object);
 
+/* Tenant directory lifecycle (writes dirs.conf, mutates g_dirs). Server-admin
+   operations — exposed as add-dir / remove-dir JSON modes. */
+int dirs_add(const char *db_root, const char *dir);
+int dirs_remove(const char *db_root, const char *dir, int check_empty);
+
 /* Schema mutations */
 int cmd_rename_field(const char *db_root, const char *object,
                      const char *old_name, const char *new_name);

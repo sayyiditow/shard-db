@@ -277,6 +277,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         "stats", "db-dirs", "vacuum-check", "shard-stats",
         "add-token", "remove-token", "list-tokens",
         "add-ip", "remove-ip", "list-ips",
+        "add-dir", "remove-dir",
         "reindex",
         NULL
     };
@@ -494,10 +495,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        at QueryDeadline creation time (resolve_timeout_ms). */
     g_request_timeout_ms = (uint32_t)json_obj_int(&req, "timeout_ms", 0);
 
-    /* Auth management modes — require trusted IP or valid token */
+    /* Auth + tenant management modes — require trusted IP or valid token */
     if (mode && (strcmp(mode, "add-token") == 0 || strcmp(mode, "remove-token") == 0 ||
                  strcmp(mode, "add-ip") == 0 || strcmp(mode, "remove-ip") == 0 ||
-                 strcmp(mode, "list-tokens") == 0 || strcmp(mode, "list-ips") == 0)) {
+                 strcmp(mode, "list-tokens") == 0 || strcmp(mode, "list-ips") == 0 ||
+                 strcmp(mode, "add-dir") == 0 || strcmp(mode, "remove-dir") == 0)) {
         int authorized = is_ip_trusted(client_ip);
         if (!authorized) {
             char *auth = json_obj_strdup(&req, "auth");
@@ -574,34 +576,72 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(token); free(dir_scope); free(obj_scope); free(perm_str);
         } else if (strcmp(mode, "remove-token") == 0) {
             char *token = json_obj_strdup(&req, "token");
-            if (token && token[0]) {
+            char *fp    = json_obj_strdup(&req, "fingerprint");
+            if (!token || !token[0]) { free(token); token = NULL; }
+            if (!fp    || !fp[0])    { free(fp);    fp    = NULL; }
+
+            if (!token && !fp) {
+                OUT("{\"error\":\"Missing token or fingerprint\"}\n");
+                free(token); free(fp);
+            } else {
                 pthread_mutex_lock(&g_token_lock);
-                /* Remember scope (dir + obj) before removal so we know which
-                   file to rewrite. */
-                char rm_dir[256] = "", rm_obj[256] = "";
-                int found = 0;
-                uint32_t idx = str_hash(token) % g_token_cap;
-                for (int i = 0; i < g_token_cap; i++) {
-                    int slot = (idx + i) % g_token_cap;
-                    if (!g_token_set_used[slot]) break;
-                    if (strcmp(g_token_set[slot], token) == 0) {
-                        strncpy(rm_dir, g_token_scope[slot],     sizeof(rm_dir) - 1);
-                        strncpy(rm_obj, g_token_scope_obj[slot], sizeof(rm_obj) - 1);
-                        found = 1;
-                        break;
+                /* Resolve to a concrete token. fingerprint mode: walk the
+                   table looking for entries whose "abcd...wxyz" form matches.
+                   Multiple matches → ambiguous. */
+                char rm_token[256] = "", rm_dir[256] = "", rm_obj[256] = "";
+                int matches = 0;
+
+                if (token) {
+                    uint32_t idx = str_hash(token) % g_token_cap;
+                    for (int i = 0; i < g_token_cap; i++) {
+                        int slot = (idx + i) % g_token_cap;
+                        if (!g_token_set_used[slot]) break;
+                        if (strcmp(g_token_set[slot], token) == 0) {
+                            strncpy(rm_token, g_token_set[slot],       sizeof(rm_token) - 1);
+                            strncpy(rm_dir,   g_token_scope[slot],     sizeof(rm_dir)   - 1);
+                            strncpy(rm_obj,   g_token_scope_obj[slot], sizeof(rm_obj)   - 1);
+                            matches = 1;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < g_token_cap; i++) {
+                        if (!g_token_set_used[i]) continue;
+                        int tlen = (int)strlen(g_token_set[i]);
+                        char this_fp[32];
+                        if (tlen > 10)
+                            snprintf(this_fp, sizeof(this_fp),
+                                     "%.4s...%s", g_token_set[i], g_token_set[i] + tlen - 4);
+                        else
+                            snprintf(this_fp, sizeof(this_fp), "****");
+                        if (strcmp(this_fp, fp) != 0) continue;
+                        if (matches) { matches++; break; }  /* ambiguous */
+                        strncpy(rm_token, g_token_set[i],       sizeof(rm_token) - 1);
+                        strncpy(rm_dir,   g_token_scope[i],     sizeof(rm_dir)   - 1);
+                        strncpy(rm_obj,   g_token_scope_obj[i], sizeof(rm_obj)   - 1);
+                        matches = 1;
                     }
                 }
-                int removed = token_set_remove(token);
-                if (removed && found)
-                    save_tokens_conf_full(raw_db_root,
-                                          rm_dir[0] ? rm_dir : NULL,
-                                          rm_obj[0] ? rm_obj : NULL);
+
+                int removed = 0;
+                if (matches == 1) {
+                    removed = token_set_remove(rm_token);
+                    if (removed)
+                        save_tokens_conf_full(raw_db_root,
+                                              rm_dir[0] ? rm_dir : NULL,
+                                              rm_obj[0] ? rm_obj : NULL);
+                }
                 pthread_mutex_unlock(&g_token_lock);
-                OUT("{\"status\":\"%s\"}\n", removed ? "token_removed" : "token_not_found");
-            } else {
-                OUT("{\"error\":\"Missing token\"}\n");
+
+                if (matches > 1)
+                    OUT("{\"error\":\"ambiguous fingerprint — multiple tokens match\"}\n");
+                else if (matches == 0)
+                    OUT("{\"status\":\"token_not_found\"}\n");
+                else
+                    OUT("{\"status\":\"%s\"}\n", removed ? "token_removed" : "token_not_found");
+
+                free(token); free(fp);
             }
-            free(token);
         } else if (strcmp(mode, "add-ip") == 0) {
             char *ip = json_obj_strdup(&req, "ip");
             if (ip && ip[0]) {
@@ -664,6 +704,40 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 printed++;
             }
             OUT("]\n");
+        } else if (strcmp(mode, "add-dir") == 0) {
+            char *dir = json_obj_strdup(&req, "dir");
+            if (!dir || !dir[0]) {
+                OUT("{\"error\":\"Missing dir\"}\n");
+            } else {
+                int rc = dirs_add(raw_db_root, dir);
+                if (rc == 0)
+                    OUT("{\"status\":\"dir_added\",\"dir\":\"%s\"}\n", dir);
+                else if (rc == 1)
+                    OUT("{\"status\":\"dir_exists\",\"dir\":\"%s\"}\n", dir);
+                else if (rc == -2)
+                    OUT("{\"error\":\"invalid dir name (no /,\\\\,..,control chars; max 64 bytes)\"}\n");
+                else
+                    OUT("{\"error\":\"add-dir failed\"}\n");
+            }
+            free(dir);
+        } else if (strcmp(mode, "remove-dir") == 0) {
+            char *dir = json_obj_strdup(&req, "dir");
+            char *ce_s = json_obj_strdup(&req, "check_empty");
+            int check_empty = !(ce_s && (strcmp(ce_s, "false") == 0 || strcmp(ce_s, "0") == 0));
+            if (!dir || !dir[0]) {
+                OUT("{\"error\":\"Missing dir\"}\n");
+            } else {
+                int rc = dirs_remove(raw_db_root, dir, check_empty);
+                if (rc == 0)
+                    OUT("{\"status\":\"dir_removed\",\"dir\":\"%s\"}\n", dir);
+                else if (rc == 1)
+                    OUT("{\"status\":\"dir_not_found\",\"dir\":\"%s\"}\n", dir);
+                else if (rc == -2)
+                    OUT("{\"error\":\"dir is not empty — drop objects first or pass check_empty:false\",\"dir\":\"%s\"}\n", dir);
+                else
+                    OUT("{\"error\":\"remove-dir failed\"}\n");
+            }
+            free(dir); free(ce_s);
         }
         free(mode);
         return;

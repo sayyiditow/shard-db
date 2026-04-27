@@ -56,7 +56,7 @@ static void draw_title(const char *title) {
     attron(COLOR_PAIR(1) | A_BOLD);
     mvprintw(0, 0, "  shard-cli  ");
     attroff(A_BOLD);
-    mvprintw(0, 14, "│ %.*s", cols - 16, title);
+    mvprintw(0, 14, "| %.*s", cols - 16, title);
     attroff(COLOR_PAIR(1));
     mvhline(1, 0, ACS_HLINE, cols);
 }

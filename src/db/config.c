@@ -368,6 +368,129 @@ int is_valid_dir(const char *dir) {
     return 0;
 }
 
+/* Validate a tenant dir name: no path separators, no control chars, no
+   leading dot or "..", reasonable length. Mirrors is_valid_dir's contract
+   so add-dir can't sneak a malicious value past is_valid_dir later. */
+static int dir_name_ok(const char *dir) {
+    if (!dir || !dir[0]) return 0;
+    size_t L = strlen(dir);
+    if (L > 64) return 0;
+    if (dir[0] == '.' || dir[0] == '/') return 0;
+    for (const char *p = dir; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32) return 0;
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') return 0;
+    }
+    if (strstr(dir, "..")) return 0;
+    return 1;
+}
+
+/* Add a new tenant dir. Returns 0 on success, 1 if already exists,
+   negative on validation error. Persists to dirs.conf and creates the
+   on-disk subdirectory. */
+int dirs_add(const char *db_root, const char *dir) {
+    if (!dir_name_ok(dir)) return -2;
+
+    pthread_mutex_lock(&g_dirs_lock);
+    uint32_t idx = str_hash(dir) % DIRS_BUCKETS;
+    int free_slot = -1;
+    for (int i = 0; i < DIRS_BUCKETS; i++) {
+        int slot = (idx + i) % DIRS_BUCKETS;
+        if (!g_dirs_used[slot]) { if (free_slot < 0) free_slot = slot; break; }
+        if (strcmp(g_dirs[slot], dir) == 0) {
+            pthread_mutex_unlock(&g_dirs_lock);
+            return 1;  /* already exists */
+        }
+    }
+    if (free_slot < 0) { pthread_mutex_unlock(&g_dirs_lock); return -1; }
+    strncpy(g_dirs[free_slot], dir, 255);
+    g_dirs[free_slot][255] = '\0';
+    g_dirs_used[free_slot] = 1;
+    g_dirs_count++;
+
+    /* Append to dirs.conf. Atomic enough for single-writer admin ops. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/dirs.conf", db_root);
+    FILE *f = fopen(path, "a");
+    if (f) { fprintf(f, "%s\n", dir); fclose(f); }
+
+    /* Create on-disk tenant dir so create-object has a place to land. */
+    char dir_path[PATH_MAX];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dir);
+    mkdir(dir_path, 0755);
+
+    pthread_mutex_unlock(&g_dirs_lock);
+    return 0;
+}
+
+/* Remove a tenant dir. Returns 0 on success, 1 if not found, -2 if
+   check_empty=1 and the on-disk dir still has entries. The on-disk
+   dir itself is NOT deleted (data preserved); operator removes it
+   manually if they want full cleanup. After remove, the in-memory
+   set is reloaded from dirs.conf to repack the hash chains (linear-
+   probe deletion would otherwise break is_valid_dir lookups). */
+int dirs_remove(const char *db_root, const char *dir, int check_empty) {
+    if (!dir || !dir[0]) return -1;
+
+    if (check_empty) {
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dir);
+        DIR *d = opendir(dir_path);
+        if (d) {
+            struct dirent *de;
+            int has_content = 0;
+            while ((de = readdir(d)) != NULL) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                /* Allow tokens.conf to remain — that's a fileystem artifact, not data */
+                if (strcmp(de->d_name, "tokens.conf") == 0) continue;
+                has_content = 1;
+                break;
+            }
+            closedir(d);
+            if (has_content) return -2;
+        }
+    }
+
+    pthread_mutex_lock(&g_dirs_lock);
+    int found = 0;
+    uint32_t idx = str_hash(dir) % DIRS_BUCKETS;
+    for (int i = 0; i < DIRS_BUCKETS; i++) {
+        int slot = (idx + i) % DIRS_BUCKETS;
+        if (!g_dirs_used[slot]) break;
+        if (strcmp(g_dirs[slot], dir) == 0) { found = 1; break; }
+    }
+    if (!found) { pthread_mutex_unlock(&g_dirs_lock); return 1; }
+
+    /* Rewrite dirs.conf without this entry (atomic via tmp + rename). */
+    char path[PATH_MAX], tmp[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/dirs.conf", db_root);
+    snprintf(tmp,  sizeof(tmp),  "%s.new", path);
+    FILE *in = fopen(path, "r");
+    FILE *out = fopen(tmp, "w");
+    if (in && out) {
+        char line[256];
+        while (fgets(line, sizeof(line), in)) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s", line);
+            buf[strcspn(buf, "\n")] = '\0';
+            if (strcmp(buf, dir) == 0) continue;
+            fputs(line, out);
+        }
+        fclose(in); fclose(out);
+        rename(tmp, path);
+    } else {
+        if (in)  fclose(in);
+        if (out) fclose(out);
+        unlink(tmp);
+    }
+    pthread_mutex_unlock(&g_dirs_lock);
+    /* Reload to repack the in-memory hash set; safe to call after the file
+       rewrite because lock was released. */
+    load_dirs();
+    return 0;
+}
+
 /* Build effective root: $DB_ROOT/<dir> */
 void build_effective_root(char *out, size_t outlen, const char *dir) {
     snprintf(out, outlen, "%s/%s", g_db_root, dir);

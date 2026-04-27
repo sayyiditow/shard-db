@@ -1150,51 +1150,179 @@ static void auth_list_ips(CliConn *c) {
 static const char *const SCOPE_CHOICES[] = { "global", "tenant", "object", NULL };
 static const char *const PERM_CHOICES[]  = { "r", "rw", "rwx", NULL };
 
-static void auth_add_token(CliConn *c) {
-    FormField fs[4] = {0};
-    fs[0].label = "token";   fs[0].kind = FF_TEXT;
-    fs[1].label = "scope";   fs[1].kind = FF_CHOICE; fs[1].choices = SCOPE_CHOICES; snprintf(fs[1].value, sizeof(fs[1].value), "global");
-    fs[2].label = "dir";     fs[2].kind = FF_TEXT;  /* required for tenant/object */
-    fs[3].label = "perm";    fs[3].kind = FF_CHOICE; fs[3].choices = PERM_CHOICES; snprintf(fs[3].value, sizeof(fs[3].value), "rw");
-    if (tui_form("add-token (object scope: also fill object below; rerun)", fs, 4) != 0) return;
-    if (!fs[0].value[0]) { tui_alert("add-token", "token required"); return; }
+/* Read 16 random bytes from /dev/urandom and emit as 32 hex chars. */
+static int gen_random_token(char *out, size_t out_sz) {
+    if (out_sz < 33) return -1;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    unsigned char raw[16];
+    size_t n = fread(raw, 1, sizeof(raw), f);
+    fclose(f);
+    if (n != sizeof(raw)) return -1;
+    static const char *hex = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i*2]     = hex[raw[i] >> 4];
+        out[i*2 + 1] = hex[raw[i] & 0x0f];
+    }
+    out[32] = '\0';
+    return 0;
+}
 
-    /* Build request based on scope. */
+static void auth_add_token(CliConn *c) {
+    /* Step 1: scope */
+    FormField fs0[1] = {0};
+    fs0[0].label = "scope"; fs0[0].kind = FF_CHOICE; fs0[0].choices = SCOPE_CHOICES;
+    snprintf(fs0[0].value, sizeof(fs0[0].value), "global");
+    if (tui_form("add-token: pick scope (←→ cycle)", fs0, 1) != 0) return;
+
+    char chosen_dir[64] = "", chosen_obj[64] = "";
+
+    /* Step 2: tenant + (optionally) object pickers when scope demands. */
+    if (strcmp(fs0[0].value, "tenant") == 0) {
+        char *d = pick_tenant(c);
+        if (!d) return;
+        snprintf(chosen_dir, sizeof(chosen_dir), "%s", d);
+        free(d);
+    } else if (strcmp(fs0[0].value, "object") == 0) {
+        ObjectInfo oi;
+        if (pick_object(c, &oi) != 0) return;
+        snprintf(chosen_dir, sizeof(chosen_dir), "%s", oi.dir);
+        snprintf(chosen_obj, sizeof(chosen_obj), "%s", oi.object);
+    }
+
+    /* Step 3: perm */
+    FormField fs1[1] = {0};
+    fs1[0].label = "perm"; fs1[0].kind = FF_CHOICE; fs1[0].choices = PERM_CHOICES;
+    snprintf(fs1[0].value, sizeof(fs1[0].value), "rw");
+    if (tui_form("add-token: pick perm (r=read, rw=write, rwx=admin)", fs1, 1) != 0) return;
+
+    /* Step 4: auto-generate the token. */
+    char tok[64];
+    if (gen_random_token(tok, sizeof(tok)) != 0) {
+        tui_alert("add-token", "could not read /dev/urandom"); return;
+    }
+
     char req[2048];
-    if (strcmp(fs[1].value, "global") == 0) {
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"add-token\",\"token\":\"%s\",\"perm\":\"%s\"}",
-            fs[0].value, fs[3].value);
-    } else if (strcmp(fs[1].value, "tenant") == 0) {
-        if (!fs[2].value[0]) { tui_alert("add-token", "dir required for tenant scope"); return; }
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"add-token\",\"token\":\"%s\",\"dir\":\"%s\",\"perm\":\"%s\"}",
-            fs[0].value, fs[2].value, fs[3].value);
-    } else {
-        /* object scope — second form for the object name. */
-        FormField fs2[1] = {0};
-        fs2[0].label = "object"; fs2[0].kind = FF_TEXT;
-        if (tui_form("add-token: object name", fs2, 1) != 0) return;
-        if (!fs2[0].value[0] || !fs[2].value[0]) {
-            tui_alert("add-token", "dir + object required for object scope"); return;
-        }
+    if (chosen_dir[0] && chosen_obj[0]) {
         snprintf(req, sizeof(req),
             "{\"mode\":\"add-token\",\"token\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\",\"perm\":\"%s\"}",
-            fs[0].value, fs[2].value, fs2[0].value, fs[3].value);
+            tok, chosen_dir, chosen_obj, fs1[0].value);
+    } else if (chosen_dir[0]) {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"add-token\",\"token\":\"%s\",\"dir\":\"%s\",\"perm\":\"%s\"}",
+            tok, chosen_dir, fs1[0].value);
+    } else {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"add-token\",\"token\":\"%s\",\"perm\":\"%s\"}",
+            tok, fs1[0].value);
     }
     char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "add-token failed");
-    else { show_response("add-token", resp); free(resp); }
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "add-token failed"); return;
+    }
+    if (strstr(resp, "\"error\"")) {
+        tui_alert("add-token", resp);
+    } else {
+        char body[1024];
+        snprintf(body, sizeof(body),
+            "Token created. SAVE THIS — it is shown only once:\n\n"
+            "  %s\n\n"
+            "scope: %s%s%s%s\n"
+            "perm : %s\n",
+            tok,
+            chosen_dir[0] ? chosen_dir : "global",
+            chosen_obj[0] ? "/" : "",
+            chosen_obj[0] ? chosen_obj : "",
+            chosen_dir[0] ? "" : "",
+            fs1[0].value);
+        tui_alert("add-token — copy this token", body);
+    }
+    free(resp);
+}
+
+/* Pick a token row from the list-tokens response. Returns the chosen
+   fingerprint (caller frees) or NULL. */
+static char *pick_token_fingerprint(CliConn *c) {
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, "{\"mode\":\"list-tokens\"}", &resp, &rlen) != 0) {
+        tui_alert("error", "list-tokens failed"); return NULL;
+    }
+    /* Walk array, build one menu line per token: "fp   scope   perm". */
+    int max = 256;
+    char (*labels)[160] = malloc(max * sizeof(*labels));
+    char (*fps)[64]     = malloc(max * sizeof(*fps));
+    int n = 0;
+    const char *p = resp;
+    while (*p && *p != '[') p++;
+    if (*p != '[') { free(labels); free(fps); free(resp); tui_alert("tokens", "(empty)"); return NULL; }
+    p++;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
+        if (*p == ']' || !*p) break;
+        if (*p != '{') break;
+        const char *start = p;
+        int depth = 0;
+        do {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            if (*p) p++;
+        } while (depth > 0 && *p);
+        size_t L = (size_t)(p - start);
+        /* Pull fp/scope/perm from this object slice. */
+        char fp[64] = "", scope[64] = "", perm[8] = "";
+        const char *q = start;
+        const char *end = start + L;
+        while (q < end) {
+            if (*q != '"') { q++; continue; }
+            q++;
+            const char *ks = q;
+            while (q < end && *q != '"') q++;
+            size_t klen = (size_t)(q - ks);
+            if (q < end) q++;
+            while (q < end && (*q == ' ' || *q == ':' || *q == '\t')) q++;
+            if (*q != '"') continue;
+            q++;
+            const char *vs = q;
+            while (q < end && *q != '"') { if (*q == '\\' && q+1<end) q++; q++; }
+            size_t vlen = (size_t)(q - vs);
+            if (q < end) q++;
+            if (klen == 5 && memcmp(ks, "token", 5) == 0)
+                snprintf(fp, sizeof(fp), "%.*s", (int)vlen, vs);
+            else if (klen == 5 && memcmp(ks, "scope", 5) == 0)
+                snprintf(scope, sizeof(scope), "%.*s", (int)vlen, vs);
+            else if (klen == 4 && memcmp(ks, "perm", 4) == 0)
+                snprintf(perm, sizeof(perm), "%.*s", (int)vlen, vs);
+        }
+        snprintf(labels[n], sizeof(labels[0]), "%-15s  %-30s  %s", fp, scope, perm);
+        snprintf(fps[n], sizeof(fps[0]), "%s", fp);
+        n++;
+    }
+    free(resp);
+    if (n == 0) {
+        free(labels); free(fps);
+        tui_alert("tokens", "(no tokens registered)");
+        return NULL;
+    }
+    MenuItem *items = calloc(n, sizeof(*items));
+    for (int i = 0; i < n; i++) items[i].label = labels[i];
+    int idx = tui_menu("pick token to remove (fingerprint  scope  perm)", items, n);
+    free(items);
+    char *out = NULL;
+    if (idx >= 0) out = strdup(fps[idx]);
+    free(labels); free(fps);
+    return out;
 }
 
 static void auth_remove_token(CliConn *c) {
-    FormField fs[1] = {0};
-    fs[0].label = "token"; fs[0].kind = FF_TEXT;
-    if (tui_form("remove-token (paste full token)", fs, 1) != 0) return;
-    if (!fs[0].value[0]) return;
-    if (!tui_confirm("remove this token?")) return;
-    char req[1024];
-    snprintf(req, sizeof(req), "{\"mode\":\"remove-token\",\"token\":\"%s\"}", fs[0].value);
+    char *fp = pick_token_fingerprint(c);
+    if (!fp) return;
+    char prompt[128];
+    snprintf(prompt, sizeof(prompt), "remove token '%s' ?", fp);
+    if (!tui_confirm(prompt)) { free(fp); return; }
+    char req[256];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"remove-token\",\"fingerprint\":\"%s\"}", fp);
+    free(fp);
     char *resp = NULL; size_t rlen = 0;
     if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "remove-token failed");
     else { show_response("remove-token", resp); free(resp); }
@@ -1552,6 +1680,77 @@ static void menu_migrate(void) {
     }
 }
 
+/* ---- Tenants menu ---- add/remove tenant directories. */
+
+static void tenants_list(CliConn *c) {
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
+        tui_alert("error", "db-dirs failed"); return;
+    }
+    tui_show_text("tenants", resp);
+    free(resp);
+}
+
+static void tenants_add(CliConn *c) {
+    FormField fs[1] = {0};
+    fs[0].label = "tenant name"; fs[0].kind = FF_TEXT;
+    if (tui_form("add-dir (no /, \\, .., control chars; max 64 bytes)", fs, 1) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("add-dir", "name required"); return; }
+    char req[256];
+    snprintf(req, sizeof(req), "{\"mode\":\"add-dir\",\"dir\":\"%s\"}", fs[0].value);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "add-dir failed");
+    else { show_response("add-dir", resp); free(resp); }
+}
+
+static void tenants_remove(CliConn *c) {
+    char *dir = pick_tenant(c);
+    if (!dir) return;
+
+    /* Default: empty-check enforced. Offer a "force" choice. */
+    static const char *const force_choices[] = { "no (refuse if non-empty)", "yes (force)", NULL };
+    FormField fs[1] = {0};
+    fs[0].label = "force"; fs[0].kind = FF_CHOICE; fs[0].choices = force_choices;
+    snprintf(fs[0].value, sizeof(fs[0].value), "no (refuse if non-empty)");
+    if (tui_form("remove-dir options", fs, 1) != 0) { free(dir); return; }
+    int force = (fs[0].value[0] == 'y');
+
+    char prompt[128];
+    snprintf(prompt, sizeof(prompt), "remove tenant '%s'?%s",
+             dir, force ? " (force, even if non-empty)" : "");
+    if (!tui_confirm(prompt)) { free(dir); return; }
+
+    char req[256];
+    if (force) snprintf(req, sizeof(req),
+        "{\"mode\":\"remove-dir\",\"dir\":\"%s\",\"check_empty\":\"false\"}", dir);
+    else       snprintf(req, sizeof(req),
+        "{\"mode\":\"remove-dir\",\"dir\":\"%s\"}", dir);
+    free(dir);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "remove-dir failed");
+    else { show_response("remove-dir", resp); free(resp); }
+}
+
+static void menu_tenants(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[] = {
+            { "list",       "show all tenant directories" },
+            { "add-dir",    "register a new tenant (creates the on-disk dir too)" },
+            { "remove-dir", "remove a tenant from dirs.conf (data preserved on disk)" },
+        };
+        int choice = tui_menu_at("Tenants", items, 3, &sel);
+        if (choice < 0) return;
+        switch (choice) {
+            case 0: tenants_list(c);   break;
+            case 1: tenants_add(c);    break;
+            case 2: tenants_remove(c); break;
+        }
+    }
+}
+
 /* ---- Files menu ---- put/get shell out to ./shard-db (file I/O + base64
    already there); delete-file is a plain JSON request via cli_query. */
 
@@ -1761,6 +1960,7 @@ int main(int argc, char **argv) {
             { "Query",       "insert / get / update / delete / find / count / aggregate / keys / fetch / exists" },
             { "Schema",      "create/drop object, fields, indexes, reindex" },
             { "Maintenance", "vacuum / recount / truncate / backup" },
+            { "Tenants",     "list / add / remove tenant directories" },
             { "Auth",        "tokens and trusted-IP allowlist" },
             { "Files",       "put-file / get-file / delete-file (per object)" },
             { "Migrate",     "export/import schema to bootstrap another DB (no data)" },
@@ -1768,19 +1968,20 @@ int main(int argc, char **argv) {
             { "Stats",       "live counters, refreshes every 5s" },
             { "Quit",        "exit shard-cli" },
         };
-        int choice = tui_menu_at("main menu", items, 11, &top_sel);
-        if (choice < 0 || choice == 10) break;
+        int choice = tui_menu_at("main menu", items, 12, &top_sel);
+        if (choice < 0 || choice == 11) break;
         switch (choice) {
-            case 0: menu_server();      break;
-            case 1: menu_browse();      break;
-            case 2: menu_query();       break;
-            case 3: menu_schema();      break;
-            case 4: menu_maintenance(); break;
-            case 5: menu_auth();        break;
-            case 6: menu_files();       break;
-            case 7: menu_migrate();     break;
-            case 8: menu_diagnostics(); break;
-            case 9: menu_stats();       break;
+            case 0:  menu_server();      break;
+            case 1:  menu_browse();      break;
+            case 2:  menu_query();       break;
+            case 3:  menu_schema();      break;
+            case 4:  menu_maintenance(); break;
+            case 5:  menu_tenants();     break;
+            case 6:  menu_auth();        break;
+            case 7:  menu_files();       break;
+            case 8:  menu_migrate();     break;
+            case 9:  menu_diagnostics(); break;
+            case 10: menu_stats();       break;
         }
     }
 
