@@ -1552,6 +1552,171 @@ static void menu_migrate(void) {
     }
 }
 
+/* ---- Files menu ---- put/get shell out to ./shard-db (file I/O + base64
+   already there); delete-file is a plain JSON request via cli_query. */
+
+static void files_put(CliConn *c) {
+    (void)c;
+    ObjectInfo oi;
+    if (pick_object(get_conn(), &oi) != 0) return;
+    FormField fs[1] = {0};
+    fs[0].label = "local file path"; fs[0].kind = FF_TEXT;
+    for (;;) {
+        if (tui_form("put-file ← local path", fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("put-file", "path required"); continue; }
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+            "./shard-db put-file '%s' '%s' '%s' 2>&1",
+            oi.dir, oi.object, fs[0].value);
+        char *out = run_capture(cmd);
+        tui_alert("put-file", out ? out : "(no output)");
+        free(out);
+    }
+}
+
+static void files_get(CliConn *c) {
+    (void)c;
+    ObjectInfo oi;
+    if (pick_object(get_conn(), &oi) != 0) return;
+    FormField fs[2] = {0};
+    fs[0].label = "filename";    fs[0].kind = FF_TEXT;
+    fs[1].label = "save-as path"; fs[1].kind = FF_TEXT;  /* blank = stdout */
+    for (;;) {
+        if (tui_form("get-file → local path", fs, 2) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("get-file", "filename required"); continue; }
+        char cmd[2048];
+        if (fs[1].value[0]) {
+            snprintf(cmd, sizeof(cmd),
+                "./shard-db get-file '%s' '%s' '%s' '%s' 2>&1",
+                oi.dir, oi.object, fs[0].value, fs[1].value);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                "./shard-db get-file '%s' '%s' '%s' 2>&1 | head -c 4096",
+                oi.dir, oi.object, fs[0].value);
+        }
+        char *out = run_capture(cmd);
+        tui_alert("get-file", out ? out : "(no output)");
+        free(out);
+    }
+}
+
+static void files_delete(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[1] = {0};
+    fs[0].label = "filename"; fs[0].kind = FF_TEXT;
+    for (;;) {
+        if (tui_form("delete-file", fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("delete-file", "filename required"); continue; }
+        char prompt[256];
+        snprintf(prompt, sizeof(prompt), "delete '%s' from %s/%s?",
+                 fs[0].value, oi.dir, oi.object);
+        if (!tui_confirm(prompt)) continue;
+        char req[1024];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"delete-file\",\"dir\":\"%s\",\"object\":\"%s\",\"filename\":\"%s\"}",
+            oi.dir, oi.object, fs[0].value);
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "delete-file failed");
+        else { show_response("delete-file", resp); free(resp); }
+    }
+}
+
+static void menu_files(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[] = {
+            { "put-file",    "upload a local file to <dir>/<obj>/files/" },
+            { "get-file",    "download a stored file to a local path" },
+            { "delete-file", "remove a stored file by name (confirms)" },
+        };
+        int choice = tui_menu_at("Files", items, 3, &sel);
+        if (choice < 0) return;
+        switch (choice) {
+            case 0: files_put(c);    break;
+            case 1: files_get(c);    break;
+            case 2: files_delete(c); break;
+        }
+    }
+}
+
+/* ---- Diagnostics menu ---- per-shard, vacuum advisory, quick size. */
+
+static void diag_shard_stats(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    char req[256];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"shard-stats\",\"dir\":\"%s\",\"object\":\"%s\"}",
+        oi.dir, oi.object);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "shard-stats failed"); return;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "shard-stats %s/%s", oi.dir, oi.object);
+    /* Response is a JSON array of {shard, slots, used, ...} per shard. */
+    if (resp[0] == '[') tui_show_table(title, resp);
+    else                show_response(title, resp);
+    free(resp);
+}
+
+static void diag_vacuum_check(CliConn *c) {
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, "{\"mode\":\"vacuum-check\"}", &resp, &rlen) != 0) {
+        tui_alert("error", "vacuum-check failed"); return;
+    }
+    if (resp[0] == '[') {
+        /* Empty array → "no objects need vacuum". */
+        if (strncmp(resp, "[]", 2) == 0)
+            tui_alert("vacuum-check", "no objects currently need vacuum");
+        else
+            tui_show_table("vacuum-check", resp);
+    } else {
+        show_response("vacuum-check", resp);
+    }
+    free(resp);
+}
+
+static void diag_size(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    char req[256];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"size\",\"dir\":\"%s\",\"object\":\"%s\"}",
+        oi.dir, oi.object);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "size failed"); return;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "size %s/%s", oi.dir, oi.object);
+    show_response(title, resp);
+    free(resp);
+}
+
+static void menu_diagnostics(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[] = {
+            { "shard-stats",  "per-shard load table for one object (find hot shards)" },
+            { "vacuum-check", "objects with high tombstone ratios" },
+            { "size",         "quick record count for one object" },
+        };
+        int choice = tui_menu_at("Diagnostics", items, 3, &sel);
+        if (choice < 0) return;
+        switch (choice) {
+            case 0: diag_shard_stats(c);  break;
+            case 1: diag_vacuum_check(c); break;
+            case 2: diag_size(c);         break;
+        }
+    }
+}
+
 /* ---- Stats menu ---- */
 
 static void menu_stats(void) {
@@ -1593,16 +1758,18 @@ int main(int argc, char **argv) {
         MenuItem items[] = {
             { "Server",      "start / stop / status" },
             { "Browse",      "tenants → objects → describe" },
-            { "Query",       "insert / get / find / count / exists" },
+            { "Query",       "insert / get / update / delete / find / count / aggregate / keys / fetch / exists" },
             { "Schema",      "create/drop object, fields, indexes, reindex" },
             { "Maintenance", "vacuum / recount / truncate / backup" },
             { "Auth",        "tokens and trusted-IP allowlist" },
+            { "Files",       "put-file / get-file / delete-file (per object)" },
             { "Migrate",     "export/import schema to bootstrap another DB (no data)" },
+            { "Diagnostics", "shard-stats / vacuum-check / size" },
             { "Stats",       "live counters, refreshes every 5s" },
             { "Quit",        "exit shard-cli" },
         };
-        int choice = tui_menu_at("main menu", items, 9, &top_sel);
-        if (choice < 0 || choice == 8) break;
+        int choice = tui_menu_at("main menu", items, 11, &top_sel);
+        if (choice < 0 || choice == 10) break;
         switch (choice) {
             case 0: menu_server();      break;
             case 1: menu_browse();      break;
@@ -1610,8 +1777,10 @@ int main(int argc, char **argv) {
             case 3: menu_schema();      break;
             case 4: menu_maintenance(); break;
             case 5: menu_auth();        break;
-            case 6: menu_migrate();     break;
-            case 7: menu_stats();       break;
+            case 6: menu_files();       break;
+            case 7: menu_migrate();     break;
+            case 8: menu_diagnostics(); break;
+            case 9: menu_stats();       break;
         }
     }
 
