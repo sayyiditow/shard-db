@@ -435,17 +435,90 @@ static void table_free(Table *t) {
             free(t->cells[r][c]);
 }
 
-void tui_show_table(const char *title, const char *json_array) {
-    /* Strip outer "rows":[...] envelope if present (shard-db rows mode). */
-    const char *arr = json_array;
-    if (*arr == '{') {
-        size_t vlen;
-        const char *v = json_find_key(arr, "rows", &vlen);
-        if (v) arr = v;
+/* Callback: row entry is a JSON ARRAY of scalar values aligned to t.cols
+   (filled in advance by tui_show_table's columns parser). One element per
+   column; mismatched lengths fill missing cells with empty strings. */
+static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
+    Table *t = (Table *)ctx;
+    if (t->nrows >= MAX_ROWS) return 1;
+    if (len < 2 || elem[0] != '[') return 0;
+    int row = t->nrows++;
+    for (int i = 0; i < MAX_COLS; i++) t->cells[row][i] = NULL;
+
+    const char *p = elem + 1;
+    const char *end = elem + len - 1;
+    int col = 0;
+    while (p < end && col < t->ncols) {
+        p = skip_ws(p);
+        if (*p == ']') break;
+        const char *vstart = p;
+        skip_value(&p);
+        size_t vlen = (size_t)(p - vstart);
+        char *cell;
+        if (vlen > 0 && vstart[0] == '"') {
+            cell = malloc(vlen);
+            json_string_into(vstart, vlen, cell, vlen);
+        } else {
+            cell = malloc(vlen + 1);
+            memcpy(cell, vstart, vlen);
+            cell[vlen] = '\0';
+        }
+        t->cells[row][col] = cell;
+        int w = (int)strlen(cell);
+        if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
+        col++;
+        p = skip_ws(p);
+        if (*p == ',') p++;
     }
+    return 0;
+}
+
+void tui_show_table(const char *title, const char *json_array) {
     Table t;
     memset(&t, 0, sizeof(t));
-    json_array_iter(arr, strlen(arr), row_collect_cb, &t);
+
+    /* Two server response shapes to handle:
+       (a) {"columns":[...],"rows":[[v1,v2],...]} — format=rows envelope,
+           rows are arrays aligned to columns.
+       (b) [{"key":"k","value":{...}}, ...] — default find/fetch shape,
+           rows are objects whose keys we discover. */
+    const char *arr = json_array;
+    int columns_path = 0;
+    if (*arr == '{') {
+        size_t cols_len, rows_len;
+        const char *cols_v = json_find_key(arr, "columns", &cols_len);
+        const char *rows_v = json_find_key(arr, "rows", &rows_len);
+        if (cols_v && rows_v) {
+            /* Path (a): parse columns first, then rows-as-arrays. */
+            const char *cp = cols_v + 1;
+            const char *cend = cols_v + cols_len - 1;
+            while (cp < cend && t.ncols < MAX_COLS) {
+                cp = skip_ws(cp);
+                if (*cp == ']') break;
+                const char *vstart = cp;
+                skip_value(&cp);
+                size_t vlen = (size_t)(cp - vstart);
+                char tmp[64];
+                if (vlen > 0 && vstart[0] == '"')
+                    json_string_into(vstart, vlen, tmp, sizeof(tmp));
+                else
+                    snprintf(tmp, sizeof(tmp), "%.*s", (int)vlen, vstart);
+                int idx = t.ncols++;
+                snprintf(t.cols[idx], sizeof(t.cols[0]), "%s", tmp);
+                t.widths[idx] = (int)strlen(tmp);
+                cp = skip_ws(cp);
+                if (*cp == ',') cp++;
+            }
+            json_array_iter(rows_v, rows_len, row_collect_array_cb, &t);
+            columns_path = 1;
+        } else if (rows_v) {
+            arr = rows_v;
+        }
+    }
+    if (!columns_path) {
+        /* Path (b): legacy auto-detect from object keys. */
+        json_array_iter(arr, strlen(arr), row_collect_cb, &t);
+    }
 
     if (t.ncols == 0 || t.nrows == 0) {
         tui_show_text(title, "(no rows)");
