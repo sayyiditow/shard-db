@@ -1440,9 +1440,57 @@ Manage tokens and IPs (requires trusted IP or valid token):
 
 Token and IP lists are persisted to `$DB_ROOT/tokens.conf` and `$DB_ROOT/allowed_ips.conf`.
 
-## TLS Encryption (HAProxy recommended)
+## TLS Encryption
 
-shard-db speaks plaintext TCP. Put a TLS-terminating reverse proxy in front — zero code changes required. **HAProxy is the recommended default**: it was purpose-built for TCP+TLS termination, has the best sustained throughput of the common options, reloads certs without dropping connections, and is trivial to configure for a single TCP backend. nginx (`stream` module) works just as well with slightly fuller features; stunnel is the minimal option if you want something tiny.
+Two supported paths — pick whichever fits your ops:
+
+1. **Native TLS** (built in, OpenSSL-backed) — single binary, single port, one db.env knob. Zero proxy required.
+2. **Reverse-proxy termination** (HAProxy / nginx / stunnel) — keep shard-db plaintext on loopback, terminate TLS in the proxy. Right choice when you already have a cert pipeline (cert-manager, Vault, ACME) and a proxy fleet.
+
+Both modes are first-class. Native is faster to set up; proxy is cleaner if you already run nginx/HAProxy for other services.
+
+### Option 1: Native TLS (recommended for greenfield)
+
+Set five fields in `db.env`:
+
+```bash
+export TLS_ENABLE=1
+export TLS_CERT="/etc/shard-db/cert.pem"   # server cert (chain ok)
+export TLS_KEY="/etc/shard-db/key.pem"     # server private key
+export TLS_CA="/etc/shard-db/ca.pem"       # client-side: CA bundle to verify the server (optional, falls back to OS trust store)
+export TLS_SKIP_VERIFY=0                   # client-side dev escape hatch
+```
+
+Restart the daemon. `PORT` now speaks TLS 1.3 only — plaintext clients are rejected at handshake. The CLI auto-wraps every connection with TLS using the same db.env, so `./shard-db query '{"mode":"db-dirs"}'` just works.
+
+**Generate a self-signed cert for dev / internal**:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout /etc/shard-db/key.pem -out /etc/shard-db/cert.pem -days 365 \
+    -subj "/CN=your-host" \
+    -addext "subjectAltName=DNS:your-host,IP:10.0.0.5"
+chmod 600 /etc/shard-db/key.pem
+```
+
+For production: Let's Encrypt or your internal CA.
+
+**Verify the handshake**:
+
+```bash
+echo '{"mode":"ping"}' | openssl s_client -connect your-host:9199 -tls1_3 -quiet 2>/dev/null
+```
+
+**Notes**:
+- TLS 1.3 only. TLS 1.2 ClientHello gets a protocol-version alert. Every modern client lib speaks 1.3 — OpenSSL ≥1.1.1, Java 8u261+, Go 1.12+, Python 3.7+.
+- Cipher policy: TLS 1.3's mandatory AEAD set (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305). No knob.
+- Client identity is still token-based (existing `tokens.conf`); native TLS does not enable mTLS.
+- Cert hot-reload on SIGHUP is not implemented yet — restart the daemon to rotate.
+- macOS build: `brew install openssl@3` (one-time); `build.sh` finds it via `brew --prefix`.
+
+### Option 2: Reverse-proxy termination (HAProxy / nginx / stunnel)
+
+Keep `TLS_ENABLE=0` (default). Put a TLS-terminating reverse proxy in front. **HAProxy** is the cleanest default: purpose-built for TCP+TLS, best sustained throughput of the common options, reloads certs without dropping connections, trivial config for a single TCP backend. nginx (`stream` module) is equivalent with slightly fuller features; stunnel is the minimal option for low-traffic / dev setups.
 
 In all three cases, the **client code is identical** — just a standard TLS socket to the proxy's port.
 

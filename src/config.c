@@ -17,6 +17,14 @@ int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set vi
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
 _Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */
 
+/* Native TLS — defaults: disabled. db.env opts in via TLS_ENABLE=1.
+   When enabled, both the daemon and the CLI speak TLS 1.3 only. */
+int g_tls_enable = 0;
+int g_tls_skip_verify = 0;
+char g_tls_cert[PATH_MAX] = {0};
+char g_tls_key[PATH_MAX] = {0};
+char g_tls_ca[PATH_MAX] = {0};
+
 /* Monitoring counters */
 uint64_t g_ucache_hits = 0;
 uint64_t g_ucache_misses = 0;
@@ -274,6 +282,25 @@ int load_db_root(char *out, size_t outlen) {
                 if (n > 600000) n = 600000;
                 g_slow_query_ms = n;
             }
+        } else if (strncmp(p, "TLS_ENABLE=", 11) == 0) {
+            g_tls_enable = (atoi(p + 11) != 0);
+        } else if (strncmp(p, "TLS_SKIP_VERIFY=", 16) == 0) {
+            g_tls_skip_verify = (atoi(p + 16) != 0);
+        } else if (strncmp(p, "TLS_CERT=", 9) == 0 ||
+                   strncmp(p, "TLS_KEY=", 8) == 0 ||
+                   strncmp(p, "TLS_CA=", 7) == 0) {
+            char *dst = NULL;
+            size_t cap = 0;
+            const char *vp;
+            if      (strncmp(p, "TLS_CERT=", 9) == 0) { dst = g_tls_cert; cap = sizeof(g_tls_cert); vp = p + 9; }
+            else if (strncmp(p, "TLS_KEY=",  8) == 0) { dst = g_tls_key;  cap = sizeof(g_tls_key);  vp = p + 8; }
+            else                                       { dst = g_tls_ca;   cap = sizeof(g_tls_ca);   vp = p + 7; }
+            if (*vp == '"' || *vp == '\'') vp++;
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof(tmp), "%s", vp);
+            char *end3 = tmp + strlen(tmp) - 1;
+            while (end3 > tmp && (*end3 == '\n' || *end3 == '\r' || *end3 == '"' || *end3 == '\'')) *end3-- = '\0';
+            snprintf(dst, cap, "%s", tmp);
         }
     }
     fclose(f);

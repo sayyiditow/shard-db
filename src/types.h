@@ -260,6 +260,15 @@ extern __thread FILE *g_out;
 #define OUT(...) fprintf(g_out ? g_out : stdout, __VA_ARGS__)
 extern int g_log_retain_days;
 
+/* Native TLS — when g_tls_enable=1, server requires TLS on PORT and CLI
+   wraps every connection with TLS too. Plain connections are rejected.
+   Cert/key paths validated at startup; daemon refuses to start if missing. */
+extern int g_tls_enable;
+extern int g_tls_skip_verify;            /* client-side dev-only: skip CA verify */
+extern char g_tls_cert[PATH_MAX];
+extern char g_tls_key[PATH_MAX];
+extern char g_tls_ca[PATH_MAX];
+
 /* Monitoring / stats */
 extern uint64_t g_ucache_hits;
 extern uint64_t g_ucache_misses;

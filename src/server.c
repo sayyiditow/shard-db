@@ -1,4 +1,5 @@
 #include "types.h"
+#include "tls.h"
 
 /* Forward decls for monitoring counters (defined lower in this file). */
 extern volatile int active_threads;
@@ -1620,10 +1621,35 @@ void *worker_thread(void *arg) {
         if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) == 0)
             inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip));
 
-        /* Per-connection output stream — no dup2, thread-safe */
-        int out_fd = dup(cfd);  /* separate fd for writing */
-        FILE *out = fdopen(out_fd, "w");
-        FILE *cf = fdopen(cfd, "r");
+        /* Per-connection streams — TLS wraps SSL via tls_fopen (one FILE*
+           in r+ mode; reads and writes share the same SSL session); plain
+           mode uses dup + two fdopen handles, as before. */
+        int out_fd = -1;
+        FILE *cf = NULL, *out = NULL;
+        if (g_tls_enable) {
+            SSL *ssl = tls_accept(cfd);
+            if (!ssl) {
+                /* Handshake failed — drop the connection silently (logged in tls.c). */
+                close(cfd);
+                pthread_mutex_lock(&thread_count_lock);
+                active_threads--;
+                pthread_mutex_unlock(&thread_count_lock);
+                continue;
+            }
+            cf = tls_fopen(ssl);
+            if (!cf) {
+                tls_close(ssl, cfd);
+                pthread_mutex_lock(&thread_count_lock);
+                active_threads--;
+                pthread_mutex_unlock(&thread_count_lock);
+                continue;
+            }
+            out = cf;  /* same handle for both directions */
+        } else {
+            out_fd = dup(cfd);  /* separate fd for writing */
+            out = fdopen(out_fd, "w");
+            cf = fdopen(cfd, "r");
+        }
         if (cf && out) {
             g_out = out;  /* thread-local: all OUT()/fprintf(g_out,...) goes to this client */
             int buf_size = g_max_request_size > 0 ? g_max_request_size : MAX_LINE;
@@ -1666,10 +1692,12 @@ void *worker_thread(void *arg) {
             }
             free(line);
             g_out = stdout;  /* restore for safety */
-            fclose(cf);  /* closes cfd */
-            fclose(out); /* closes out_fd */
+            fclose(cf);                  /* closes cfd; in TLS mode, runs SSL_shutdown + SSL_free */
+            if (out != cf) fclose(out);  /* plain mode: close the duped write fd too */
         } else {
-            if (out) fclose(out); else close(out_fd);
+            /* Only reachable when plain-mode fdopen failed; TLS path already
+               continue'd on tls_fopen failure above. */
+            if (out) fclose(out); else if (out_fd >= 0) close(out_fd);
             if (cf) fclose(cf); else close(cfd);
         }
 
@@ -1790,6 +1818,27 @@ int cmd_server(const char *db_root, int daemonize) {
         (void)_ignored;
     }
 
+    /* TLS init — if enabled, refuse to start without readable cert/key.
+       Done before bind/listen so a misconfig fails fast and visibly. */
+    if (g_tls_enable) {
+        if (g_tls_cert[0] == '\0' || g_tls_key[0] == '\0') {
+            fprintf(stderr, "Error: TLS_ENABLE=1 but TLS_CERT and/or TLS_KEY not set in db.env\n");
+            return 1;
+        }
+        if (access(g_tls_cert, R_OK) != 0) {
+            fprintf(stderr, "Error: TLS_CERT not readable: %s (%s)\n", g_tls_cert, strerror(errno));
+            return 1;
+        }
+        if (access(g_tls_key, R_OK) != 0) {
+            fprintf(stderr, "Error: TLS_KEY not readable: %s (%s)\n", g_tls_key, strerror(errno));
+            return 1;
+        }
+        if (tls_server_init(g_tls_cert, g_tls_key) != 0) {
+            fprintf(stderr, "Error: TLS context init failed (see preceding tls: ... message)\n");
+            return 1;
+        }
+    }
+
     /* TCP socket */
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) { perror("socket"); return 1; }
@@ -1849,10 +1898,11 @@ int cmd_server(const char *db_root, int daemonize) {
         pthread_create(&pool[i], NULL, worker_thread, wa);
     }
 
-    fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us)\n",
-            port, getpid(), nthreads, g_timeout);
+    fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",
+            port, getpid(), nthreads, g_timeout, g_tls_enable ? "on" : "off");
     fflush(stdout);
-    log_msg(3, "SERVER START port=%d pid=%d workers=%d", port, getpid(), nthreads);
+    log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
+            port, getpid(), nthreads, g_tls_enable);
 
     /* epoll-based accept loop */
     int epfd = epoll_create1(0);
@@ -1900,6 +1950,7 @@ int cmd_server(const char *db_root, int daemonize) {
     parallel_pool_shutdown();
     fcache_shutdown();
     bt_cache_shutdown();
+    tls_shutdown();
     log_msg(3, "SERVER STOP pid=%d", getpid());
     log_shutdown();
     fprintf(stdout, "shard-db stopped (pid=%d)\n", getpid());
@@ -1962,20 +2013,96 @@ int cmd_status(const char *db_root) {
     return 1;
 }
 
-/* TCP client — connect to port */
-int cmd_query(int port, int argc, char **argv) {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) { perror("socket"); return 1; }
+/* ========== Client connection helpers (plain or TLS) ==========
 
+   client_connect() returns a ClientConn holding fd plus an optional SSL*.
+   TLS state is init'd lazily on first call. client_send/client_recv branch
+   on c->ssl so call sites stay backend-agnostic. */
+
+typedef struct {
+    int  fd;
+    SSL *ssl;
+} ClientConn;
+
+static int ensure_tls_client_ctx(void) {
+    static int tried = 0;
+    if (g_tls_client_ctx) return 0;
+    if (tried) return -1;
+    tried = 1;
+    if (g_tls_skip_verify)
+        fprintf(stderr, "WARN: TLS_SKIP_VERIFY=1 — server certificate is NOT verified (development only)\n");
+    return tls_client_init(g_tls_ca, g_tls_skip_verify);
+}
+
+static int client_connect(int port, ClientConn *c) {
+    c->fd = -1; c->ssl = NULL;
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) return -1;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     addr.sin_port = htons(port);
-
     if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sfd); return -1;
+    }
+    c->fd = sfd;
+    if (g_tls_enable) {
+        if (ensure_tls_client_ctx() != 0) { close(sfd); c->fd = -1; return -1; }
+        const char *server_name = getenv("TLS_SERVER_NAME");
+        if (!server_name || !*server_name) server_name = "localhost";
+        SSL *ssl = tls_connect(sfd, server_name);
+        if (!ssl) { close(sfd); c->fd = -1; return -1; }
+        c->ssl = ssl;
+    }
+    return 0;
+}
+
+static int client_send_all(ClientConn *c, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t w = 0;
+    while (w < len) {
+        int chunk = (int)((len - w) > 0x7FFFFFFF ? 0x7FFFFFFF : (len - w));
+        int n;
+        if (c->ssl) {
+            n = SSL_write(c->ssl, p + w, chunk);
+            if (n <= 0) return -1;
+        } else {
+            ssize_t r = write(c->fd, p + w, (size_t)chunk);
+            if (r < 0) { if (errno == EINTR) continue; return -1; }
+            if (r == 0) return -1;
+            n = (int)r;
+        }
+        w += (size_t)n;
+    }
+    return 0;
+}
+
+static ssize_t client_recv(ClientConn *c, void *buf, size_t len) {
+    if (c->ssl) {
+        int chunk = (int)(len > 0x7FFFFFFF ? 0x7FFFFFFF : len);
+        int n = SSL_read(c->ssl, buf, chunk);
+        if (n > 0) return n;
+        int err = SSL_get_error(c->ssl, n);
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        if (err == SSL_ERROR_SYSCALL && n == 0) return 0;
+        return -1;
+    }
+    return read(c->fd, buf, len);
+}
+
+static void client_close(ClientConn *c) {
+    if (c->ssl) tls_close(c->ssl, c->fd);
+    else if (c->fd >= 0) close(c->fd);
+    c->fd = -1; c->ssl = NULL;
+}
+
+/* TCP client — connect to port */
+int cmd_query(int port, int argc, char **argv) {
+    ClientConn cc;
+    if (client_connect(port, &cc) != 0) {
         fprintf(stderr, "Error: Cannot connect to port %d\n", port);
-        close(sfd); return 1;
+        return 1;
     }
 
     /* Protocol: all args separated by Unit Separator (0x1F) */
@@ -1986,48 +2113,44 @@ int cmd_query(int port, int argc, char **argv) {
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", argv[i]);
     }
     buf[pos++] = '\n';
-    write(sfd, buf, pos);
+    if (client_send_all(&cc, buf, (size_t)pos) != 0) { client_close(&cc); return 1; }
 
     char rbuf[8192];
     ssize_t n;
-    while ((n = read(sfd, rbuf, sizeof(rbuf))) > 0) {
+    while ((n = client_recv(&cc, rbuf, sizeof(rbuf))) > 0) {
         for (ssize_t j = 0; j < n; j++) {
             if (rbuf[j] == '\0') {
                 write(STDOUT_FILENO, rbuf, j);
-                close(sfd);
+                client_close(&cc);
                 return 0;
             }
         }
         write(STDOUT_FILENO, rbuf, n);
     }
-    close(sfd);
+    client_close(&cc);
     return 0;
 }
 
 /* Send raw JSON query to server */
 int cmd_query_json(int port, const char *json) {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) { perror("socket"); return 1; }
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
-    if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    ClientConn cc;
+    if (client_connect(port, &cc) != 0) {
         fprintf(stderr, "{\"error\":\"Cannot connect to port %d\"}\n", port);
-        close(sfd); return 1;
+        return 1;
     }
-    write(sfd, json, strlen(json));
-    write(sfd, "\n", 1);
+    if (client_send_all(&cc, json, strlen(json)) != 0 ||
+        client_send_all(&cc, "\n", 1) != 0) {
+        client_close(&cc); return 1;
+    }
     char rbuf[8192];
     ssize_t n;
-    while ((n = read(sfd, rbuf, sizeof(rbuf))) > 0) {
+    while ((n = client_recv(&cc, rbuf, sizeof(rbuf))) > 0) {
         for (ssize_t j = 0; j < n; j++) {
-            if (rbuf[j] == '\0') { write(STDOUT_FILENO, rbuf, j); close(sfd); return 0; }
+            if (rbuf[j] == '\0') { write(STDOUT_FILENO, rbuf, j); client_close(&cc); return 0; }
         }
         write(STDOUT_FILENO, rbuf, n);
     }
-    close(sfd);
+    client_close(&cc);
     return 0;
 }
 
@@ -2049,36 +2172,32 @@ static int write_all(int fd, const void *buf, size_t len) {
 /* Connect to local server, send JSON line, return accumulated response (up to first \0).
    Caller frees *out. Returns 0 on success, -1 on error. */
 static int query_collect(int port, const char *json, size_t json_len, char **out, size_t *out_len) {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) return -1;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
-    if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sfd); return -1; }
+    ClientConn cc;
+    if (client_connect(port, &cc) != 0) return -1;
 
-    if (write_all(sfd, json, json_len) != 0) { close(sfd); return -1; }
-    if (write_all(sfd, "\n", 1) != 0) { close(sfd); return -1; }
+    if (client_send_all(&cc, json, json_len) != 0 ||
+        client_send_all(&cc, "\n", 1) != 0) {
+        client_close(&cc); return -1;
+    }
 
     size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { close(sfd); return -1; }
+    if (!buf) { client_close(&cc); return -1; }
 
     char rbuf[8192];
     ssize_t n;
-    while ((n = read(sfd, rbuf, sizeof(rbuf))) > 0) {
+    while ((n = client_recv(&cc, rbuf, sizeof(rbuf))) > 0) {
         for (ssize_t j = 0; j < n; j++) {
             if (rbuf[j] == '\0') {
                 if (len + j > cap) {
                     while (cap < len + j) cap *= 2;
                     char *nb = realloc(buf, cap);
-                    if (!nb) { free(buf); close(sfd); return -1; }
+                    if (!nb) { free(buf); client_close(&cc); return -1; }
                     buf = nb;
                 }
                 memcpy(buf + len, rbuf, j);
                 len += j;
-                close(sfd);
+                client_close(&cc);
                 *out = buf; *out_len = len;
                 return 0;
             }
@@ -2086,13 +2205,13 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
         if (len + (size_t)n > cap) {
             while (cap < len + (size_t)n) cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); close(sfd); return -1; }
+            if (!nb) { free(buf); client_close(&cc); return -1; }
             buf = nb;
         }
         memcpy(buf + len, rbuf, n);
         len += (size_t)n;
     }
-    close(sfd);
+    client_close(&cc);
     /* EOF with no \0 sentinel — still return what we got. */
     *out = buf; *out_len = len;
     return 0;

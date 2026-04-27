@@ -28,7 +28,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-bulk-update-delimited.sh     # CSV per-key partial update            (34)
 ./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (21)
 ./tests/test-find-cursor.sh               # Keyset cursor pagination on find      (41)
-# Total: 445 tests
+./tests/test-tls.sh                       # Native TLS 1.3 (auto-skips if no openssl) (12)
+# Total: 457 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -47,7 +48,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 - **storage.c** — Hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache
 - **index.c** — B+ tree indexing, parallel indexing
 - **query.c** — Find, count, aggregate, joins, bulk ops, maintenance
-- **server.c** — Multi-threaded TCP server (epoll), JSON dispatch, auth (token + IP allowlist), stats. **Plaintext TCP only — no native TLS**; terminate TLS at a reverse proxy (nginx `stream` module recommended; HAProxy or stunnel also work).
+- **server.c** — Multi-threaded TCP server (epoll), JSON dispatch, auth (token + IP allowlist), stats. Optional native TLS 1.3 via OpenSSL (single-port, opt-in via `TLS_ENABLE=1` in db.env); plaintext TCP otherwise. Reverse-proxy termination (nginx `stream`, HAProxy, stunnel) remains a fully supported alternative for shops with existing cert pipelines.
+- **tls.c / tls.h** — OpenSSL wrapper: server/client `SSL_CTX` init, handshake helpers, `tls_fopen()` wraps an `SSL *` as a stdio `FILE *` via `fopencookie` (Linux) / `funopen` (macOS) so every existing `OUT()` / `fgets()` call site stays untouched.
 - **main.c** — CLI entry point
 - **btree.h / btree.c** — B+ tree index (page-based, prefix-compressed leaves, mmap'd)
 - **objlock.c** — Per-object rwlock (normal ops share; vacuum/rebuild exclusive)
@@ -234,6 +236,25 @@ Localhost (127.0.0.1/::1) is trusted by default (typical deployment: loopback-co
 `list-tokens` returns `{"token":"fingerprint","scope":"global"|"<dir>"|"<dir>/<obj>","perm":"r|rw|rwx"}` per entry. Full tokens are never echoed.
 
 Token storage: open-addressed hash table sized by `TOKEN_CAP` (default 1024 buckets). Lookup O(1), lock-free reads. Bump `TOKEN_CAP` in db.env if you expect more than ~700 tokens in total across all scopes.
+
+### Native TLS
+
+Optional in-process TLS termination via OpenSSL. Off by default; opt in by setting `TLS_ENABLE=1` in db.env. Single-port model — when enabled, `PORT` becomes TLS-only and plaintext clients are rejected. Reverse-proxy termination (nginx, HAProxy, stunnel) remains supported as the alternative for shops with existing cert pipelines.
+
+```
+TLS_ENABLE=0                          # 0/1; default 0 (plaintext TCP)
+TLS_CERT=/etc/shard-db/cert.pem       # server cert, PEM (chain ok)
+TLS_KEY=/etc/shard-db/key.pem         # server private key, PEM
+TLS_CA=/etc/shard-db/ca.pem           # client-side: CA bundle to verify server (defaults to OS trust store if empty)
+TLS_SKIP_VERIFY=0                     # client-side: skip server cert verify (dev only — emits stderr warning)
+```
+
+- **TLS 1.3 only.** `SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION)` enforced both directions; TLS 1.2 ClientHello gets a protocol-version alert. Relax with a one-line change to `tls_server_init` if you ever need 1.2 compat — but every modern client (OpenSSL ≥1.1.1, Java 8u261+, Go 1.12+, Python 3.7+) speaks 1.3.
+- **Cipher policy**: TLS 1.3's mandatory AEAD set (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305). No db.env knob to bikeshed.
+- **Client identity**: tokens (existing `tokens.conf` machinery), not mTLS. Single identity layer; mTLS would duplicate.
+- **Hostname verification** uses `SSL_set1_host`. SNI / verify name defaults to `localhost` (CLI connects to 127.0.0.1); override via `TLS_SERVER_NAME` env var.
+- Server refuses to start if `TLS_ENABLE=1` and cert/key are missing, unreadable, or mismatched (`SSL_CTX_check_private_key`).
+- Cert hot-reload on SIGHUP is **not** implemented yet. Cert rotation = daemon restart.
 
 ### Single-instance guard
 
