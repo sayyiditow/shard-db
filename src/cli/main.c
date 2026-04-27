@@ -61,15 +61,30 @@ static void menu_server(void) {
         };
         int choice = tui_menu_at("Server", items, 3, &sel);
         if (choice < 0) return;
-        const char *cmd = NULL;
-        switch (choice) {
-            case 0: cmd = "./shard-db start  2>&1"; break;
-            case 1: cmd = "./shard-db stop   2>&1"; break;
-            case 2: cmd = "./shard-db status 2>&1"; break;
-        }
-        char *out = run_capture(cmd);
-        /* Re-open connection on next request — the daemon may have just stopped/started. */
+        /* Close our connection BEFORE start/stop. Stop especially needs this:
+           the daemon's shutdown waits for worker threads to exit, and a
+           worker blocked on fgets reading our idle TUI connection would
+           wedge pthread_join. Daemon also closes our fd on SIGTERM (see
+           handle_shutdown), so this is belt-and-suspenders. */
         if (g_conn) { cli_close(g_conn); g_conn = NULL; }
+        const char *cmd = NULL;
+        const char *stat = NULL;
+        switch (choice) {
+            case 0: cmd = "./shard-db start  2>&1"; stat = "starting daemon..."; break;
+            case 1: cmd = "./shard-db stop   2>&1"; stat = "stopping daemon (drains writes)..."; break;
+            case 2: cmd = "./shard-db status 2>&1"; stat = "checking status...";  break;
+        }
+        tui_status("%s", stat);
+        /* Quick repaint so the status bar shows the in-progress message
+           before run_capture blocks. */
+        int rows, cols; getmaxyx(stdscr, rows, cols);
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 1, 0, " %.*s", cols - 1, stat);
+        attroff(COLOR_PAIR(3));
+        refresh();
+        char *out = run_capture(cmd);
+        tui_status("connected to %s:%d  tls=%s",
+                   g_cli_host, g_cli_port, g_cli_tls_enable ? "on" : "off");
         tui_alert(items[choice].label, out ? out : "(no output)");
         free(out);
     }

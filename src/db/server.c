@@ -1344,6 +1344,15 @@ volatile int active_threads = 0;
 volatile int in_flight_writes = 0;    /* write/schema modes; shutdown waits for these */
 pthread_mutex_t thread_count_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Per-worker active client fd (indexed by worker id; -1 = idle). On SIGTERM
+   the signal handler shutdown(SHUT_RDWR)s any non-idle fd so workers' fgets
+   returns EOF — without this, an idle TCP/TLS client (e.g. a shard-cli holding
+   the menu open) wedges pthread_join for the full 30-second stop deadline.
+   shutdown() is async-signal-safe; closed/reused fds yield EBADF and are
+   harmless. */
+static int *g_worker_cfds = NULL;
+static int  g_worker_cfds_n = 0;
+
 /* Work queue for thread pool */
 typedef struct {
     int *queue;
@@ -1413,6 +1422,13 @@ void handle_shutdown(int sig) {
     /* Wake all waiting workers */
     pthread_cond_broadcast(&g_work_queue.not_empty);
     pthread_cond_broadcast(&g_work_queue.not_full);
+    /* Force-close any idle client connections so workers' fgets returns EOF.
+       Otherwise pthread_join hangs until the client disconnects — for
+       persistent TUI clients that's effectively forever. */
+    for (int i = 0; i < g_worker_cfds_n; i++) {
+        int fd = __atomic_load_n(&g_worker_cfds[i], __ATOMIC_ACQUIRE);
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
 }
 
 /* Fast process — stdout already redirected to client by worker thread */
@@ -1627,6 +1643,10 @@ void *worker_thread(void *arg) {
         int cfd = wq_pop(&g_work_queue);
         if (cfd < 0) break;
 
+        /* Register so handle_shutdown can shutdown(SHUT_RDWR) this fd on
+           SIGTERM, unblocking our fgets if the client is idle. */
+        __atomic_store_n(&g_worker_cfds[wa->id], cfd, __ATOMIC_RELEASE);
+
         pthread_mutex_lock(&thread_count_lock);
         active_threads++;
         pthread_mutex_unlock(&thread_count_lock);
@@ -1647,6 +1667,7 @@ void *worker_thread(void *arg) {
             SSL *ssl = tls_accept(cfd);
             if (!ssl) {
                 /* Handshake failed — drop the connection silently (logged in tls.c). */
+                __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
                 close(cfd);
                 pthread_mutex_lock(&thread_count_lock);
                 active_threads--;
@@ -1655,6 +1676,7 @@ void *worker_thread(void *arg) {
             }
             cf = tls_fopen(ssl);
             if (!cf) {
+                __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
                 tls_close(ssl, cfd);
                 pthread_mutex_lock(&thread_count_lock);
                 active_threads--;
@@ -1709,11 +1731,15 @@ void *worker_thread(void *arg) {
             }
             free(line);
             g_out = stdout;  /* restore for safety */
+            /* Clear the registered fd BEFORE fclose so handle_shutdown can't
+               race a kernel-reused fd number. */
+            __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
             fclose(cf);                  /* closes cfd; in TLS mode, runs SSL_shutdown + SSL_free */
             if (out != cf) fclose(out);  /* plain mode: close the duped write fd too */
         } else {
             /* Only reachable when plain-mode fdopen failed; TLS path already
                continue'd on tls_fopen failure above. */
+            __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
             if (out) fclose(out); else if (out_fd >= 0) close(out_fd);
             if (cf) fclose(cf); else close(cfd);
         }
@@ -1907,6 +1933,12 @@ int cmd_server(const char *db_root, int daemonize) {
 
     /* Init work queue and thread pool */
     wq_init(&g_work_queue, nthreads * 64);
+    /* Per-worker active-cfd table for SIGTERM-time shutdown(SHUT_RDWR).
+       Allocate before threads spawn so worker_thread can safely write to it
+       and handle_shutdown can safely read. */
+    g_worker_cfds = malloc(nthreads * sizeof(int));
+    for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
+    g_worker_cfds_n = nthreads;
     pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
     for (int i = 0; i < nthreads; i++) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
