@@ -2,7 +2,7 @@
 
 Hard caps and practical bounds. Everything here is enforced at compile time unless noted.
 
-## Hard-coded constants (`src/types.h`)
+## Hard-coded constants (`src/db/types.h`)
 
 | Constant | Value | Meaning |
 |---|---|---|

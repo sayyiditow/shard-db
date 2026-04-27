@@ -29,7 +29,7 @@ esac
 # -flto: link-time optimization (cross-TU inlining; usually helps perf, definitely
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut).
-gcc -O2 -flto -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c src/parallel.c src/tls.c -Isrc $OSSL_CFLAGS $OSSL_LDFLAGS -lpthread -lssl -lcrypto
+gcc -O2 -flto -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/db/index.c src/db/query.c src/db/server.c src/db/main.c src/db/btree.c src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS -lpthread -lssl -lcrypto
 strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no

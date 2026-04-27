@@ -12,8 +12,9 @@ shardkv
 bench-asan.log
 
 # Runtime state — must never be committed
-db/
-logs/
+# Anchored to repo root so src/db/ (daemon source) isn't excluded.
+/db/
+/logs/
 *.pid
 
 # Per-instance config (operators populate these on the server)

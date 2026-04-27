@@ -43,7 +43,7 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 
 ## Architecture
 
-### Source files (src/)
+### Daemon source files (src/db/)
 
 - **types.h** — Shared types, externs, function declarations
 - **util.c** — Utilities, JSON helpers

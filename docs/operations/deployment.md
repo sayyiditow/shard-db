@@ -81,7 +81,7 @@ sudo journalctl -u shard-db -f
 shard-db listens on all interfaces by default (the `PORT` in db.env). **Bind to localhost only and put a reverse proxy in front** for any non-trivial deployment:
 
 - Bind to `127.0.0.1`: prevents direct access from outside, forces traffic through the proxy, keeps TLS at the edge.
-- Today, the bind address is hard-coded in `src/server.c`. For production, wrap with a proxy even if you want it "open" — IP/TLS gating is easier there.
+- Today, the bind address is hard-coded in `src/db/server.c`. For production, wrap with a proxy even if you want it "open" — IP/TLS gating is easier there.
 
 ## TLS via HAProxy (recommended)
 
