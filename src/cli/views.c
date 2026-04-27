@@ -496,7 +496,10 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
     return 0;
 }
 
-void tui_show_table(const char *title, const char *json) {
+/* tui_show_table returns 0 on close (q/←/ESC), 1 if user pressed 'e' to
+   request CSV export. Callers that pass a JSON response can re-issue the
+   underlying request with format:"csv" and write the result to a file. */
+int tui_show_table(const char *title, const char *json) {
     Table t;
     memset(&t, 0, sizeof(t));
 
@@ -633,7 +636,7 @@ void tui_show_table(const char *title, const char *json) {
     if (t.ncols == 0 || t.nrows == 0) {
         tui_show_text(title, "(no rows)");
         table_free(&t);
-        return;
+        return 0;
     }
 
     int rows, cols;
@@ -675,7 +678,8 @@ void tui_show_table(const char *title, const char *json) {
         }
 
         attron(COLOR_PAIR(3));
-        mvprintw(rows - 2, 4, "↑↓/jk row  ←→/hl scroll-x  q/ESC close   row %d/%d",
+        mvprintw(rows - 2, 4,
+                 "↑↓/jk row  ←→/hl scroll-x  e export-csv  q/ESC close   row %d/%d",
                  top + 1, t.nrows);
         attroff(COLOR_PAIR(3));
         refresh();
@@ -691,7 +695,8 @@ void tui_show_table(const char *title, const char *json) {
             case 'G': case KEY_END:   top = t.nrows - 1; break;
             case KEY_LEFT: case 'h':  hscroll -= 8; if (hscroll < 0) hscroll = 0; break;
             case KEY_RIGHT: case 'l': hscroll += 8; break;
-            case 'q': case 27:        table_free(&t); return;
+            case 'e':                 table_free(&t); return 1;
+            case 'q': case 27:        table_free(&t); return 0;
         }
     }
 }

@@ -20,6 +20,51 @@ static CliConn *get_conn(void) {
     return g_conn;
 }
 
+/* Build a sibling JSON request with format:"csv" injected. The user's `req`
+   was built without "format" — splice it in just before the closing brace.
+   Caller frees the returned malloc'd string. */
+static char *with_format_csv(const char *req) {
+    size_t L = strlen(req);
+    if (L < 2 || req[L - 1] != '}') return strdup(req);
+    char *out = malloc(L + 32);
+    if (!out) return NULL;
+    snprintf(out, L + 32, "%.*s,\"format\":\"csv\"}", (int)(L - 1), req);
+    return out;
+}
+
+/* Re-issue the request with format:"csv" and write the response body to
+   `path`. Returns 0 on success. */
+static int export_csv(CliConn *c, const char *req, const char *path) {
+    char *csv_req = with_format_csv(req);
+    if (!csv_req) return -1;
+    char *resp = NULL; size_t rlen = 0;
+    int rc = cli_query(c, csv_req, &resp, &rlen);
+    free(csv_req);
+    if (rc != 0 || !resp) { free(resp); return -1; }
+    FILE *f = fopen(path, "w");
+    if (!f) { free(resp); return -1; }
+    fwrite(resp, 1, rlen, f);
+    fclose(f);
+    free(resp);
+    return 0;
+}
+
+/* Prompt for an output path, then export. Run after tui_show_table returns 1. */
+static void prompt_and_export_csv(CliConn *c, const char *req) {
+    FormField fs[1] = {0};
+    fs[0].label = "output path"; fs[0].kind = FF_TEXT;
+    snprintf(fs[0].value, sizeof(fs[0].value), "/tmp/shard-cli-export.csv");
+    if (tui_form("export → CSV file", fs, 1) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("export", "path required"); return; }
+    if (export_csv(c, req, fs[0].value) != 0) {
+        tui_alert("export", "failed — check path is writable");
+        return;
+    }
+    char msg[512];
+    snprintf(msg, sizeof(msg), "exported to %s", fs[0].value);
+    tui_alert("export", msg);
+}
+
 static void show_response(const char *title, const char *json) {
     if (!json || !*json) { tui_alert(title, "(empty response)"); return; }
     /* tui_show_table is the unified renderer for every JSON response shape
@@ -423,8 +468,9 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
         if (cli_query(c, req, &resp, &rlen) != 0) {
             tui_alert("error", mode); continue;
         }
-        tui_show_table(result_title, resp);
+        int act_after = tui_show_table(result_title, resp);
         free(resp);
+        if (act_after == 1) prompt_and_export_csv(c, req);
     }
 }
 
@@ -517,8 +563,9 @@ static void query_keys(CliConn *c) {
         if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "keys failed"); continue; }
-        tui_show_table("keys", resp);
+        int act_after = tui_show_table("keys", resp);
         free(resp);
+        if (act_after == 1) prompt_and_export_csv(c, req);
     }
 }
 
@@ -567,8 +614,9 @@ static void query_fetch(CliConn *c) {
         if (act != 1) continue;
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "fetch failed"); continue; }
-        tui_show_table("fetch result", resp);
+        int act_after = tui_show_table("fetch result", resp);
         free(resp);
+        if (act_after == 1) prompt_and_export_csv(c, req);
     }
 }
 
@@ -745,11 +793,13 @@ static void query_aggregate(CliConn *c) {
     for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
     fld_choices[oi.nfields] = NULL;
 
-    /* Sticky criteria + agg-spec rows across re-runs. */
+    /* Sticky criteria + agg-spec + having rows across re-runs. */
     CritRow crit_rows[MAX_CRIT_ROWS];
     int crit_n = 0;
     AggRow agg_rows[MAX_AGG_ROWS];
     int agg_n = 0;
+    CritRow having_rows[MAX_CRIT_ROWS];
+    int having_n = 0;
 
     /* Sticky form fields for limit / order_by / order — kept outside all
        loops so the user's choices persist when they ← from the result. */
@@ -790,6 +840,35 @@ static void query_aggregate(CliConn *c) {
                 if (strcmp(ord_choices[i], fs[1].value) == 0) { found = 1; break; }
             if (!found) snprintf(fs[1].value, sizeof(fs[1].value), "(none)");
 
+            /* having — second criteria layer that operates on aggregate
+               aliases instead of object fields. Build a synthetic
+               ObjectInfo whose fields[] holds the aliases so the same
+               criteria builder works. */
+            ObjectInfo having_oi;
+            memset(&having_oi, 0, sizeof(having_oi));
+            snprintf(having_oi.dir,    sizeof(having_oi.dir),    "%s", oi.dir);
+            snprintf(having_oi.object, sizeof(having_oi.object), "%s — having (post-group filter)",
+                     oi.object);
+            having_oi.nfields = n_aliases > MAX_FIELDS_CACHED ? MAX_FIELDS_CACHED : n_aliases;
+            for (int i = 0; i < having_oi.nfields; i++) {
+                snprintf(having_oi.fields[i].name, sizeof(having_oi.fields[i].name),
+                         "%s", aliases[i]);
+            }
+
+            char *having_json = NULL;
+            if (having_oi.nfields == 0) {
+                /* No aliases yet — skip having entirely. */
+                having_json = strdup("[]");
+            } else if (tui_criteria_builder(&having_oi, having_rows, &having_n,
+                                            &having_json) != 0) {
+                /* ← in having → re-show spec builder. */
+                for (int i = 0; i < n_aliases; i++) free(aliases[i]);
+                free(aliases);
+                free(ord_choices);
+                free(specs);
+                continue;
+            }
+
             /* group_by + form loop: ← in form → re-show group_by;
                ← in group_by → re-show specs. */
             for (;;) {
@@ -828,13 +907,13 @@ static void query_aggregate(CliConn *c) {
                         snprintf(ob_clause, sizeof(ob_clause),
                                  ",\"order_by\":\"%s\"", fs[1].value);
 
-                    char *req = malloc(strlen(crit) + strlen(specs) + 1024);
+                    char *req = malloc(strlen(crit) + strlen(specs) + strlen(having_json) + 1024);
                     sprintf(req,
                         "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\","
-                        "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s%s,"
-                        "\"order\":\"%s\",\"limit\":%d}",
-                        oi.dir, oi.object, crit, specs, grp_json, ob_clause,
-                        fs[2].value, limv);
+                        "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s,"
+                        "\"having\":%s%s,\"order\":\"%s\",\"limit\":%d}",
+                        oi.dir, oi.object, crit, specs, grp_json,
+                        having_json, ob_clause, fs[2].value, limv);
 
                     int act = tui_preview_json(
                         "aggregate — query JSON (r=run  ←=back to edit)", req);
@@ -842,17 +921,14 @@ static void query_aggregate(CliConn *c) {
 
                     char *resp = NULL; size_t rlen = 0;
                     int rc = cli_query(c, req, &resp, &rlen);
-                    free(req);
                     if (rc != 0 || !resp) {
                         tui_alert("error", "aggregate failed");
-                        free(resp); continue;
+                        free(resp); free(req); continue;
                     }
-                    if (resp[0] == '[' || (resp[0] == '{' && strstr(resp, "rows")))
-                        tui_show_table("aggregate result", resp);
-                    else
-                        show_response("aggregate result", resp);
+                    int act_after = tui_show_table("aggregate result", resp);
                     free(resp);
-                    /* result dismissed → loop back to form */
+                    if (act_after == 1) prompt_and_export_csv(c, req);
+                    free(req);
                 }
             next_group:
                 /* group_by/form layer exited — break to re-show spec builder. */
@@ -862,6 +938,7 @@ static void query_aggregate(CliConn *c) {
             free(aliases);
             free(ord_choices);
             free(specs);
+            free(having_json);
         }
         if (crit) free(crit);
     }
@@ -893,10 +970,11 @@ static void query_count(CliConn *c) {
 
         char *resp = NULL; size_t rlen = 0;
         int rc = cli_query(c, req, &resp, &rlen);
-        free(req);
-        if (rc != 0) { tui_alert("error", "count failed"); continue; }
-        show_response("count result", resp);
+        if (rc != 0) { tui_alert("error", "count failed"); free(req); continue; }
+        int act_after = tui_show_table("count result", resp);
         free(resp);
+        if (act_after == 1) prompt_and_export_csv(c, req);
+        free(req);
     }
 }
 
@@ -905,9 +983,24 @@ static void query_find(CliConn *c) {
     if (pick_object(c, &oi) != 0) return;
 
     /* Sticky paging form values across re-runs. */
-    FormField fs[2] = {0};
-    fs[0].label = "offset"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "0");
-    fs[1].label = "limit";  fs[1].kind = FF_NUMBER; snprintf(fs[1].value, sizeof(fs[1].value), "50");
+    static const char *const ord_dir_find[] = { "asc", "desc", NULL };
+    /* order_by choices = "(none)" + each object field name. */
+    const char *ord_by_choices[MAX_FIELDS_CACHED + 2];
+    ord_by_choices[0] = "(none)";
+    for (int i = 0; i < oi.nfields; i++) ord_by_choices[1 + i] = oi.fields[i].name;
+    ord_by_choices[1 + oi.nfields] = NULL;
+
+    FormField fs[4] = {0};
+    fs[0].label = "offset";   fs[0].kind = FF_NUMBER;
+    snprintf(fs[0].value, sizeof(fs[0].value), "0");
+    fs[1].label = "limit";    fs[1].kind = FF_NUMBER;
+    snprintf(fs[1].value, sizeof(fs[1].value), "50");
+    fs[2].label = "order_by"; fs[2].kind = FF_CHOICE;
+    fs[2].choices = ord_by_choices;
+    snprintf(fs[2].value, sizeof(fs[2].value), "(none)");
+    fs[3].label = "order";    fs[3].kind = FF_CHOICE;
+    fs[3].choices = ord_dir_find;
+    snprintf(fs[3].value, sizeof(fs[3].value), "asc");
 
     /* Sticky field selection — start with all fields selected. */
     int *fld_sel = calloc(oi.nfields, sizeof(int));
@@ -927,7 +1020,7 @@ static void query_find(CliConn *c) {
         if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) { free(fld_sel); return; }
 
         for (;;) {
-            if (tui_form("find — paging", fs, 2) != 0) {
+            if (tui_form("find — paging / order", fs, 4) != 0) {
                 /* ← in paging form → back to criteria builder */
                 free(crit);
                 break;
@@ -962,6 +1055,14 @@ static void query_find(CliConn *c) {
             int limv = atoi(fs[1].value);
             if (limv <= 0) limv = 50;
 
+            /* order_by is optional. (none) → omit. */
+            char ob_clause[160] = "";
+            if (strcmp(fs[2].value, "(none)") != 0 && fs[2].value[0]) {
+                snprintf(ob_clause, sizeof(ob_clause),
+                    ",\"order_by\":\"%s\",\"order\":\"%s\"",
+                    fs[2].value, fs[3].value);
+            }
+
             /* No format hint — tui_show_table handles every shape the
                daemon emits today (default array-of-objects, format=rows
                envelope, scalars, plain objects). One render path for all
@@ -969,18 +1070,21 @@ static void query_find(CliConn *c) {
             char *req = malloc(strlen(crit) + 1024);
             sprintf(req,
                 "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
-                "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
-                oi.dir, oi.object, crit, offv, limv, fields_json);
+                "\"offset\":%d,\"limit\":%d,\"fields\":%s%s}",
+                oi.dir, oi.object, crit, offv, limv, fields_json, ob_clause);
 
             int act = tui_preview_json("find — query JSON (r=run  ←=back to edit)", req);
             if (act != 1) { free(req); continue; }
 
             char *resp = NULL; size_t rlen = 0;
             int rc = cli_query(c, req, &resp, &rlen);
-            free(req);
-            if (rc != 0 || !resp) { tui_alert("error", "find failed"); free(resp); continue; }
-            tui_show_table("find result", resp);
+            if (rc != 0 || !resp) {
+                tui_alert("error", "find failed"); free(resp); free(req); continue;
+            }
+            int act_after = tui_show_table("find result", resp);
             free(resp);
+            if (act_after == 1) prompt_and_export_csv(c, req);
+            free(req);
             /* result dismissed → loop back to paging form */
         }
         /* form loop exited → re-show criteria builder */

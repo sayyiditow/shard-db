@@ -132,8 +132,9 @@ int tui_preview_json(const char *title, const char *body);
 void tui_show_object(const char *title, const char *json);
 
 /* Render a JSON array of objects as a table. Caller picks columns, or we
-   auto-detect from the first row's keys. */
-void tui_show_table(const char *title, const char *json_array);
+   auto-detect from the first row's keys. Returns 0 on close, 1 if user
+   pressed 'e' to request CSV export — caller re-issues with format:"csv". */
+int tui_show_table(const char *title, const char *json_array);
 
 /* Live-refresh stats: poll {"mode":"stats"} every interval_sec until user
    presses q/ESC. */
