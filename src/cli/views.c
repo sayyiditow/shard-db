@@ -1,0 +1,641 @@
+/* Output panels: text view, JSON object as kv-pairs, JSON array as table,
+   live stats refresh, describe-object helper, criteria builder.
+
+   Tiny JSON parser tailored to shard-db response shapes — handles strings,
+   numbers, booleans, null, nested objects/arrays. Not RFC 8259 perfect; enough
+   for menu population and result display. */
+
+#define _GNU_SOURCE
+#include "cli.h"
+
+#include <stdarg.h>
+#include <unistd.h>
+
+/* ============================================================
+   Tiny JSON parser
+   ============================================================ */
+
+static const char *skip_ws(const char *p) {
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+/* If *p is at a JSON value, advance *p past the entire value (string/number/
+   bool/null/object/array). Returns the start byte offset (so caller can copy
+   the slice). Updates *p to one past the value. */
+static const char *skip_value(const char **p) {
+    *p = skip_ws(*p);
+    const char *start = *p;
+    if (**p == '"') {
+        (*p)++;
+        while (**p && **p != '"') {
+            if (**p == '\\' && *(*p + 1)) (*p)++;
+            (*p)++;
+        }
+        if (**p == '"') (*p)++;
+    } else if (**p == '{' || **p == '[') {
+        char open = **p, close = (open == '{' ? '}' : ']');
+        int depth = 0;
+        do {
+            if (**p == '"') {
+                (*p)++;
+                while (**p && **p != '"') {
+                    if (**p == '\\' && *(*p + 1)) (*p)++;
+                    (*p)++;
+                }
+                if (**p == '"') (*p)++;
+                continue;
+            }
+            if (**p == open) depth++;
+            else if (**p == close) depth--;
+            if (**p) (*p)++;
+        } while (depth > 0 && **p);
+    } else {
+        while (**p && **p != ',' && **p != '}' && **p != ']' &&
+               **p != ' ' && **p != '\n' && **p != '\t' && **p != '\r')
+            (*p)++;
+    }
+    return start;
+}
+
+/* Find a top-level "key" inside a JSON object string. Returns pointer to the
+   value start (just past the colon's whitespace), or NULL. *value_len is set
+   to the length of the value's verbatim slice. */
+static const char *json_find_key(const char *json, const char *key, size_t *value_len) {
+    size_t klen = strlen(key);
+    const char *p = skip_ws(json);
+    if (*p != '{') return NULL;
+    p++;
+    while (*p) {
+        p = skip_ws(p);
+        if (*p == '}') return NULL;
+        if (*p != '"') return NULL;
+        p++;
+        const char *kstart = p;
+        while (*p && *p != '"') p++;
+        size_t this_klen = p - kstart;
+        if (*p == '"') p++;
+        p = skip_ws(p);
+        if (*p != ':') return NULL;
+        p++;
+        p = skip_ws(p);
+        const char *vstart = p;
+        skip_value(&p);
+        if (this_klen == klen && memcmp(kstart, key, klen) == 0) {
+            *value_len = (size_t)(p - vstart);
+            return vstart;
+        }
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+    return NULL;
+}
+
+/* Copy an unescaped JSON string value into out (max out_sz-1 bytes). The
+   value at vstart is `"...."` with quotes; this strips them and unescapes
+   common escapes. Returns 0 on success. */
+static int json_string_into(const char *vstart, size_t vlen, char *out, size_t out_sz) {
+    if (vlen < 2 || vstart[0] != '"') {
+        /* Not a string — emit verbatim slice. */
+        size_t n = vlen < out_sz - 1 ? vlen : out_sz - 1;
+        memcpy(out, vstart, n);
+        out[n] = '\0';
+        return 0;
+    }
+    const char *p = vstart + 1;
+    const char *end = vstart + vlen - 1; /* points at closing quote */
+    size_t o = 0;
+    while (p < end && o < out_sz - 1) {
+        if (*p == '\\' && p + 1 < end) {
+            switch (p[1]) {
+                case 'n': out[o++] = '\n'; break;
+                case 't': out[o++] = '\t'; break;
+                case 'r': out[o++] = '\r'; break;
+                case '"': out[o++] = '"';  break;
+                case '\\': out[o++] = '\\'; break;
+                case '/': out[o++] = '/';  break;
+                default:  out[o++] = p[1]; break;
+            }
+            p += 2;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/* Iterate elements of a JSON array slice (vstart includes the [ ]). Calls
+   cb for each element with its verbatim slice. Stops when cb returns nonzero. */
+static void json_array_iter(const char *vstart, size_t vlen,
+                            int (*cb)(const char *elem, size_t len, void *ctx),
+                            void *ctx) {
+    if (vlen < 2 || vstart[0] != '[') return;
+    const char *p = vstart + 1;
+    const char *end = vstart + vlen - 1; /* points at closing ] */
+    while (p < end) {
+        p = skip_ws(p);
+        if (p >= end || *p == ']') break;
+        const char *estart = p;
+        skip_value(&p);
+        size_t elen = (size_t)(p - estart);
+        if (cb(estart, elen, ctx) != 0) return;
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+}
+
+/* ============================================================
+   Text + JSON object display
+   ============================================================ */
+
+void tui_show_text(const char *title, const char *body) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    int top = 0;
+    /* Pre-split the body into lines for vertical scroll. */
+    int line_starts[4096];
+    int nlines = 0;
+    int pos = 0;
+    line_starts[nlines++] = 0;
+    int blen = (int)strlen(body);
+    while (pos < blen && nlines < 4095) {
+        if (body[pos] == '\n') line_starts[nlines++] = pos + 1;
+        pos++;
+    }
+    line_starts[nlines] = blen;
+
+    for (;;) {
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, " %s ", title ? title : "");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        int view_rows = rows - 4;
+        for (int i = 0; i < view_rows && top + i < nlines; i++) {
+            int s = line_starts[top + i];
+            int e = line_starts[top + i + 1];
+            int len = e - s;
+            if (len > 0 && body[s + len - 1] == '\n') len--;
+            if (len > cols - 4) len = cols - 4;
+            mvprintw(2 + i, 2, "%.*s", len, body + s);
+        }
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 2, 4, "↑↓/jk scroll   q/ESC close   line %d/%d",
+                 top + 1, nlines);
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP: case 'k':   if (top > 0) top--; break;
+            case KEY_DOWN: case 'j': if (top < nlines - 1) top++; break;
+            case KEY_PPAGE: case 'b':
+                top -= rows - 6;
+                if (top < 0) top = 0;
+                break;
+            case KEY_NPAGE: case ' ': case 'f':
+                top += rows - 6;
+                if (top > nlines - 1) top = nlines - 1;
+                break;
+            case 'g': case KEY_HOME: top = 0; break;
+            case 'G': case KEY_END:  top = nlines - 1; break;
+            case 'q': case 27: return;
+        }
+    }
+}
+
+void tui_show_object(const char *title, const char *json) {
+    /* Pretty-print: walk top-level keys, emit as "key: value" lines. */
+    char buf[16384];
+    size_t bo = 0;
+    const char *p = skip_ws(json);
+    if (*p != '{') {
+        tui_show_text(title, json);
+        return;
+    }
+    p++;
+    while (*p && bo < sizeof(buf) - 1) {
+        p = skip_ws(p);
+        if (*p == '}' || *p == '\0') break;
+        if (*p != '"') break;
+        p++;
+        const char *kstart = p;
+        while (*p && *p != '"') p++;
+        size_t klen = (size_t)(p - kstart);
+        if (*p == '"') p++;
+        p = skip_ws(p);
+        if (*p != ':') break;
+        p++;
+        p = skip_ws(p);
+        const char *vstart = p;
+        skip_value(&p);
+        size_t vlen = (size_t)(p - vstart);
+
+        bo += snprintf(buf + bo, sizeof(buf) - bo, "%-14.*s : ", (int)klen, kstart);
+        if (vlen > 0 && vstart[0] == '"') {
+            char tmp[2048];
+            json_string_into(vstart, vlen, tmp, sizeof(tmp));
+            bo += snprintf(buf + bo, sizeof(buf) - bo, "%s\n", tmp);
+        } else {
+            size_t n = vlen < (sizeof(buf) - bo - 2) ? vlen : (sizeof(buf) - bo - 2);
+            memcpy(buf + bo, vstart, n); bo += n;
+            if (bo < sizeof(buf) - 1) buf[bo++] = '\n';
+        }
+
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+    buf[bo] = '\0';
+    tui_show_text(title, buf);
+}
+
+/* ============================================================
+   Table rendering — JSON array of objects → columnar
+   ============================================================ */
+
+#define MAX_COLS 16
+#define MAX_ROWS 4096
+
+typedef struct {
+    char  cols[MAX_COLS][32];     /* column names */
+    int   ncols;
+    char *cells[MAX_ROWS][MAX_COLS];  /* malloc'd */
+    int   nrows;
+    int   widths[MAX_COLS];
+} Table;
+
+static int table_col_index(Table *t, const char *name, size_t len) {
+    if (len >= sizeof(t->cols[0])) len = sizeof(t->cols[0]) - 1;
+    for (int i = 0; i < t->ncols; i++) {
+        if (strncmp(t->cols[i], name, len) == 0 && t->cols[i][len] == '\0')
+            return i;
+    }
+    if (t->ncols >= MAX_COLS) return -1;
+    int idx = t->ncols++;
+    memcpy(t->cols[idx], name, len);
+    t->cols[idx][len] = '\0';
+    t->widths[idx] = (int)len;
+    return idx;
+}
+
+static int row_collect_cb(const char *elem, size_t len, void *ctx) {
+    Table *t = (Table *)ctx;
+    if (t->nrows >= MAX_ROWS) return 1;
+    if (len < 2 || elem[0] != '{') return 0;
+    /* For "key" responses (find): {"key":"..","value":{...}} — flatten value
+       into top-level columns. */
+    int row = t->nrows++;
+    for (int i = 0; i < MAX_COLS; i++) t->cells[row][i] = NULL;
+
+    /* Walk keys */
+    const char *p = elem + 1;
+    const char *end = elem + len - 1;
+    while (p < end) {
+        p = skip_ws(p);
+        if (*p != '"') break;
+        p++;
+        const char *kstart = p;
+        while (p < end && *p != '"') p++;
+        size_t klen = (size_t)(p - kstart);
+        if (p < end) p++;
+        p = skip_ws(p);
+        if (*p != ':') break;
+        p++;
+        p = skip_ws(p);
+        const char *vstart = p;
+        skip_value(&p);
+        size_t vlen = (size_t)(p - vstart);
+
+        if (klen == 5 && memcmp(kstart, "value", 5) == 0 &&
+            vlen > 0 && vstart[0] == '{') {
+            /* Recurse into value object as flat columns. */
+            const char *vp = vstart + 1;
+            const char *vend = vstart + vlen - 1;
+            while (vp < vend) {
+                vp = skip_ws(vp);
+                if (*vp != '"') break;
+                vp++;
+                const char *kk = vp;
+                while (vp < vend && *vp != '"') vp++;
+                size_t kkl = (size_t)(vp - kk);
+                if (vp < vend) vp++;
+                vp = skip_ws(vp);
+                if (*vp != ':') break;
+                vp++;
+                vp = skip_ws(vp);
+                const char *vv = vp;
+                skip_value(&vp);
+                size_t vvl = (size_t)(vp - vv);
+                int col = table_col_index(t, kk, kkl);
+                if (col >= 0) {
+                    char *cell;
+                    if (vvl > 0 && vv[0] == '"') {
+                        cell = malloc(vvl);
+                        json_string_into(vv, vvl, cell, vvl);
+                    } else {
+                        cell = malloc(vvl + 1);
+                        memcpy(cell, vv, vvl);
+                        cell[vvl] = '\0';
+                    }
+                    t->cells[row][col] = cell;
+                    int w = (int)strlen(cell);
+                    if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
+                }
+                vp = skip_ws(vp);
+                if (*vp == ',') vp++;
+            }
+        } else {
+            int col = table_col_index(t, kstart, klen);
+            if (col >= 0) {
+                char *cell;
+                if (vlen > 0 && vstart[0] == '"') {
+                    cell = malloc(vlen);
+                    json_string_into(vstart, vlen, cell, vlen);
+                } else {
+                    cell = malloc(vlen + 1);
+                    memcpy(cell, vstart, vlen);
+                    cell[vlen] = '\0';
+                }
+                t->cells[row][col] = cell;
+                int w = (int)strlen(cell);
+                if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
+            }
+        }
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+static void table_free(Table *t) {
+    for (int r = 0; r < t->nrows; r++)
+        for (int c = 0; c < t->ncols; c++)
+            free(t->cells[r][c]);
+}
+
+void tui_show_table(const char *title, const char *json_array) {
+    /* Strip outer "rows":[...] envelope if present (shard-db rows mode). */
+    const char *arr = json_array;
+    if (*arr == '{') {
+        size_t vlen;
+        const char *v = json_find_key(arr, "rows", &vlen);
+        if (v) arr = v;
+    }
+    Table t;
+    memset(&t, 0, sizeof(t));
+    json_array_iter(arr, strlen(arr), row_collect_cb, &t);
+
+    if (t.ncols == 0 || t.nrows == 0) {
+        tui_show_text(title, "(no rows)");
+        table_free(&t);
+        return;
+    }
+
+    int rows, cols;
+    int top = 0, hscroll = 0;
+    for (;;) {
+        getmaxyx(stdscr, rows, cols);
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, " %s [%d row%s × %d col%s] ",
+                 title ? title : "", t.nrows, t.nrows == 1 ? "" : "s",
+                 t.ncols, t.ncols == 1 ? "" : "s");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        /* Header */
+        int x = 2 - hscroll;
+        attron(A_BOLD | COLOR_PAIR(1));
+        for (int c = 0; c < t.ncols; c++) {
+            int w = t.widths[c] + 2;
+            if (x >= 0 && x < cols)
+                mvprintw(2, x, " %-*.*s│", t.widths[c], t.widths[c], t.cols[c]);
+            x += w + 1;
+        }
+        attroff(A_BOLD | COLOR_PAIR(1));
+        mvhline(3, 0, ACS_HLINE, cols);
+
+        /* Rows */
+        int view = rows - 6;
+        for (int i = 0; i < view && top + i < t.nrows; i++) {
+            int row = top + i;
+            x = 2 - hscroll;
+            for (int c = 0; c < t.ncols; c++) {
+                int w = t.widths[c] + 2;
+                const char *cell = t.cells[row][c] ? t.cells[row][c] : "";
+                if (x >= 0 && x < cols)
+                    mvprintw(4 + i, x, " %-*.*s│", t.widths[c], t.widths[c], cell);
+                x += w + 1;
+            }
+        }
+
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 2, 4, "↑↓/jk row  ←→/hl scroll-x  q/ESC close   row %d/%d",
+                 top + 1, t.nrows);
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP: case 'k':    if (top > 0) top--; break;
+            case KEY_DOWN: case 'j':  if (top < t.nrows - 1) top++; break;
+            case KEY_PPAGE: case 'b': top -= view; if (top < 0) top = 0; break;
+            case KEY_NPAGE: case ' ': top += view;
+                                       if (top > t.nrows - 1) top = t.nrows - 1; break;
+            case 'g': case KEY_HOME:  top = 0; break;
+            case 'G': case KEY_END:   top = t.nrows - 1; break;
+            case KEY_LEFT: case 'h':  hscroll -= 8; if (hscroll < 0) hscroll = 0; break;
+            case KEY_RIGHT: case 'l': hscroll += 8; break;
+            case 'q': case 27:        table_free(&t); return;
+        }
+    }
+}
+
+/* ============================================================
+   Stats live refresh
+   ============================================================ */
+
+void tui_stats_live(CliConn *c, int interval_sec) {
+    int rows, cols;
+    halfdelay(interval_sec * 10);  /* deciseconds */
+    int tick = 0;
+    for (;;) {
+        char *resp = NULL;
+        size_t rlen = 0;
+        int rc = cli_query(c, "{\"mode\":\"stats\"}", &resp, &rlen);
+
+        getmaxyx(stdscr, rows, cols);
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, " stats — refresh every %ds (tick %d) ", interval_sec, tick++);
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        if (rc != 0 || !resp) {
+            attron(COLOR_PAIR(4));
+            mvprintw(3, 4, "connection error");
+            attroff(COLOR_PAIR(4));
+        } else {
+            /* Render JSON keys as kv lines (same as tui_show_object but inline). */
+            int row = 3;
+            const char *p = skip_ws(resp);
+            if (*p == '{') {
+                p++;
+                while (*p && row < rows - 3) {
+                    p = skip_ws(p);
+                    if (*p == '}') break;
+                    if (*p != '"') break;
+                    p++;
+                    const char *ks = p;
+                    while (*p && *p != '"') p++;
+                    int klen = (int)(p - ks);
+                    if (*p == '"') p++;
+                    p = skip_ws(p);
+                    if (*p != ':') break;
+                    p++;
+                    p = skip_ws(p);
+                    const char *vs = p;
+                    skip_value(&p);
+                    int vlen = (int)(p - vs);
+                    char vbuf[256];
+                    if (vlen > 0 && vs[0] == '"')
+                        json_string_into(vs, vlen, vbuf, sizeof(vbuf));
+                    else {
+                        int n = vlen < (int)sizeof(vbuf) - 1 ? vlen : (int)sizeof(vbuf) - 1;
+                        memcpy(vbuf, vs, n); vbuf[n] = '\0';
+                    }
+                    mvprintw(row++, 4, "%-22.*s  %s", klen, ks, vbuf);
+                    p = skip_ws(p);
+                    if (*p == ',') p++;
+                }
+            } else {
+                mvprintw(3, 4, "%s", resp);
+            }
+            free(resp);
+        }
+
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 2, 4, "q/ESC close");
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+        if (ch == 'q' || ch == 27) break;
+    }
+    cbreak();  /* leave halfdelay mode */
+}
+
+/* ============================================================
+   describe-object → ObjectInfo cache
+   ============================================================ */
+
+int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo *oi) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"describe-object\",\"dir\":\"%s\",\"object\":\"%s\"}",
+             dir, object);
+    char *resp = NULL;
+    size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0 || !resp) {
+        if (resp) free(resp);
+        return -1;
+    }
+    /* Reject error responses early. */
+    size_t vlen;
+    if (json_find_key(resp, "error", &vlen)) { free(resp); return -1; }
+
+    memset(oi, 0, sizeof(*oi));
+    snprintf(oi->dir,    sizeof(oi->dir),    "%s", dir);
+    snprintf(oi->object, sizeof(oi->object), "%s", object);
+
+    const char *v;
+    if ((v = json_find_key(resp, "splits", &vlen)))    oi->splits = atoi(v);
+    if ((v = json_find_key(resp, "max_key", &vlen)))   oi->max_key = atoi(v);
+    if ((v = json_find_key(resp, "max_value", &vlen))) oi->max_value = atoi(v);
+    if ((v = json_find_key(resp, "record_count", &vlen))) oi->record_count = atoi(v);
+
+    /* fields[] */
+    if ((v = json_find_key(resp, "fields", &vlen)) && vlen > 0 && v[0] == '[') {
+        const char *p = v + 1;
+        const char *end = v + vlen - 1;
+        while (p < end && oi->nfields < MAX_FIELDS_CACHED) {
+            p = skip_ws(p);
+            if (*p == ']') break;
+            if (*p != '{') break;
+            const char *fstart = p;
+            skip_value(&p);
+            size_t flen = (size_t)(p - fstart);
+            CachedField *fld = &oi->fields[oi->nfields];
+            const char *fv;
+            size_t fvlen;
+            char tmp[256];
+            if ((fv = json_find_key(fstart, "name", &fvlen))) {
+                /* json_find_key here works because skip_value left fstart..p as
+                   a complete object; passing fstart with NUL after isn't safe,
+                   but json_find_key only looks for keys, stops at }. Need a
+                   bounded variant — write our own walk below. */
+                (void)fvlen;
+            }
+            /* Walk fstart..fstart+flen as an object directly. */
+            const char *fp = fstart + 1;
+            const char *fend = fstart + flen - 1;
+            while (fp < fend) {
+                fp = skip_ws(fp);
+                if (*fp != '"') break;
+                fp++;
+                const char *kk = fp;
+                while (fp < fend && *fp != '"') fp++;
+                size_t kkl = (size_t)(fp - kk);
+                if (fp < fend) fp++;
+                fp = skip_ws(fp);
+                if (*fp != ':') break;
+                fp++;
+                fp = skip_ws(fp);
+                const char *vv = fp;
+                skip_value(&fp);
+                size_t vvl = (size_t)(fp - vv);
+                if (kkl == 4 && memcmp(kk, "name", 4) == 0)
+                    json_string_into(vv, vvl, fld->name, sizeof(fld->name));
+                else if (kkl == 4 && memcmp(kk, "type", 4) == 0)
+                    json_string_into(vv, vvl, fld->type, sizeof(fld->type));
+                else if (kkl == 4 && memcmp(kk, "size", 4) == 0) {
+                    json_string_into(vv, vvl, tmp, sizeof(tmp));
+                    fld->size = atoi(tmp);
+                }
+                else if (kkl == 5 && memcmp(kk, "scale", 5) == 0) {
+                    json_string_into(vv, vvl, tmp, sizeof(tmp));
+                    fld->scale = atoi(tmp);
+                }
+                fp = skip_ws(fp);
+                if (*fp == ',') fp++;
+            }
+            oi->nfields++;
+            p = skip_ws(p);
+            if (*p == ',') p++;
+        }
+    }
+
+    /* indexes[] (array of strings) */
+    if ((v = json_find_key(resp, "indexes", &vlen)) && vlen > 0 && v[0] == '[') {
+        const char *p = v + 1;
+        const char *end = v + vlen - 1;
+        while (p < end && oi->nindexes < MAX_FIELDS_CACHED) {
+            p = skip_ws(p);
+            if (*p == ']') break;
+            const char *estart = p;
+            skip_value(&p);
+            size_t elen = (size_t)(p - estart);
+            json_string_into(estart, elen,
+                             oi->indexes[oi->nindexes],
+                             sizeof(oi->indexes[0]));
+            oi->nindexes++;
+            p = skip_ws(p);
+            if (*p == ',') p++;
+        }
+    }
+
+    free(resp);
+    return 0;
+}

@@ -32,9 +32,14 @@ esac
 gcc -O2 -flto -o shard-db src/util.c src/config.c src/storage.c src/index.c src/query.c src/server.c src/main.c src/btree.c src/objlock.c src/keyset.c src/parallel.c src/tls.c -Isrc $OSSL_CFLAGS $OSSL_LDFLAGS -lpthread -lssl -lcrypto
 strip shard-db
 
+# shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
+# pthread/daemon code. Self-contained connection helper in src/cli/conn.c.
+gcc -O2 -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS -lncursesw -lssl -lcrypto
+strip shard-cli
+
 mkdir -p build/bin build/db
 
-cp shard-db build/bin/
+cp shard-db shard-cli build/bin/
 cp start.sh stop.sh status.sh build/bin/ 2>/dev/null || true
 
 cat > build/bin/db.env << 'EOF'

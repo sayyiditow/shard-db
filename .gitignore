@@ -1,6 +1,7 @@
 # Build output
 build/
 shard-db
+shard-cli
 shardkv
 *.o
 *.a
