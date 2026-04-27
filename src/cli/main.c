@@ -2001,6 +2001,241 @@ static void menu_migrate(void) {
     }
 }
 
+/* ---- Bulk menu ---- mass-insert / update / delete via files or criteria.
+
+   bulk-insert (JSON file): server reads a JSON array of {"id":"k","data":{...}}
+   bulk-insert-delimited:    server reads a CSV file with header row
+   bulk-update (criteria):   updates fields on every record matching criteria
+   bulk-update-delimited:    CSV with key + per-field overrides
+   bulk-delete (criteria):   deletes every matching record (with limit/dry_run)
+
+   We pass file paths through `file` so the daemon does the file I/O — keeps
+   the wire small even for huge imports. dry_run on the criteria-driven ops
+   reports what would be affected without making changes. */
+
+static void bulk_insert_json(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[1] = {0};
+    fs[0].label = "JSON file path"; fs[0].kind = FF_TEXT;
+    for (;;) {
+        if (tui_form("bulk-insert from JSON file", fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("bulk-insert", "path required"); continue; }
+        char req[2048];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"%s\",\"object\":\"%s\",\"file\":\"%s\"}",
+            oi.dir, oi.object, fs[0].value);
+        int act = tui_preview_json("bulk-insert — query JSON", req);
+        if (act != 1) continue;
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "bulk-insert failed"); continue;
+        }
+        show_response("bulk-insert result", resp);
+        free(resp);
+    }
+}
+
+static void bulk_insert_csv(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[2] = {0};
+    fs[0].label = "CSV file path"; fs[0].kind = FF_TEXT;
+    fs[1].label = "delimiter";     fs[1].kind = FF_TEXT;
+    snprintf(fs[1].value, sizeof(fs[1].value), "|");
+    for (;;) {
+        if (tui_form("bulk-insert from CSV file", fs, 2) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("bulk-insert", "path required"); continue; }
+        if (!fs[1].value[0]) { tui_alert("bulk-insert", "delimiter required"); continue; }
+        char req[2048];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"file\":\"%s\",\"delimiter\":\"%c\"}",
+            oi.dir, oi.object, fs[0].value, fs[1].value[0]);
+        int act = tui_preview_json("bulk-insert-delimited — query JSON", req);
+        if (act != 1) continue;
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "bulk-insert-delimited failed"); continue;
+        }
+        show_response("bulk-insert result", resp);
+        free(resp);
+    }
+}
+
+static void bulk_update_criteria(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    /* Sticky criteria + new-values across re-runs. */
+    CritRow crit_rows[MAX_CRIT_ROWS];
+    int crit_n = 0;
+
+    /* "value" form has one field per writable schema field. Empty fields
+       are skipped (no change applied); non-empty become the new value. */
+    int nf = oi.nfields;
+    FormField *value_fs = calloc(nf, sizeof(*value_fs));
+    for (int i = 0; i < nf; i++) {
+        value_fs[i].label = oi.fields[i].name;
+        value_fs[i].kind  = FF_TEXT;
+    }
+
+    /* Final form: limit + dry_run choice. */
+    static const char *const yn[] = { "yes", "no", NULL };
+    FormField extra_fs[2] = {0};
+    extra_fs[0].label = "limit (0 = all)"; extra_fs[0].kind = FF_NUMBER;
+    snprintf(extra_fs[0].value, sizeof(extra_fs[0].value), "0");
+    extra_fs[1].label = "dry_run";          extra_fs[1].kind = FF_CHOICE;
+    extra_fs[1].choices = yn;
+    snprintf(extra_fs[1].value, sizeof(extra_fs[1].value), "yes");
+
+    for (;;) {
+        char *crit = NULL;
+        if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) {
+            free(value_fs); return;
+        }
+        for (;;) {
+            if (tui_form("bulk-update — values to set (empty = leave alone)",
+                         value_fs, nf) != 0) { free(crit); break; }
+            if (tui_form("bulk-update — limit / dry_run",
+                         extra_fs, 2) != 0) continue;
+
+            /* Build "value" object from non-empty fields. */
+            char value_json[4096] = "{";
+            size_t off = 1;
+            int emitted = 0;
+            for (int i = 0; i < nf; i++) {
+                if (!value_fs[i].value[0]) continue;
+                off += snprintf(value_json + off, sizeof(value_json) - off,
+                    "%s\"%s\":\"%s\"",
+                    emitted ? "," : "", oi.fields[i].name, value_fs[i].value);
+                emitted++;
+            }
+            snprintf(value_json + off, sizeof(value_json) - off, "}");
+
+            int dry = strcmp(extra_fs[1].value, "yes") == 0;
+            int limv = atoi(extra_fs[0].value);
+
+            char *req = malloc(strlen(crit) + strlen(value_json) + 1024);
+            sprintf(req,
+                "{\"mode\":\"bulk-update\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"criteria\":%s,\"value\":%s,\"limit\":%d,\"dry_run\":%s}",
+                oi.dir, oi.object, crit, value_json, limv, dry ? "true" : "false");
+
+            int act = tui_preview_json("bulk-update — query JSON", req);
+            if (act != 1) { free(req); continue; }
+            char *resp = NULL; size_t rlen = 0;
+            int rc = cli_query(c, req, &resp, &rlen);
+            free(req);
+            if (rc != 0 || !resp) {
+                tui_alert("error", "bulk-update failed");
+                free(resp); continue;
+            }
+            show_response("bulk-update result", resp);
+            free(resp);
+        }
+    }
+}
+
+static void bulk_update_csv(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[2] = {0};
+    fs[0].label = "CSV file path"; fs[0].kind = FF_TEXT;
+    fs[1].label = "delimiter";     fs[1].kind = FF_TEXT;
+    snprintf(fs[1].value, sizeof(fs[1].value), ",");
+    for (;;) {
+        if (tui_form("bulk-update from CSV (key + field overrides)", fs, 2) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("bulk-update", "path required"); continue; }
+        char req[2048];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-update-delimited\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"file\":\"%s\",\"delimiter\":\"%c\"}",
+            oi.dir, oi.object, fs[0].value, fs[1].value[0]);
+        int act = tui_preview_json("bulk-update-delimited — query JSON", req);
+        if (act != 1) continue;
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "bulk-update-delimited failed"); continue;
+        }
+        show_response("bulk-update result", resp);
+        free(resp);
+    }
+}
+
+static void bulk_delete_criteria(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    CritRow crit_rows[MAX_CRIT_ROWS];
+    int crit_n = 0;
+
+    static const char *const yn[] = { "yes", "no", NULL };
+    FormField extra_fs[2] = {0};
+    extra_fs[0].label = "limit (0 = all)"; extra_fs[0].kind = FF_NUMBER;
+    snprintf(extra_fs[0].value, sizeof(extra_fs[0].value), "0");
+    extra_fs[1].label = "dry_run";          extra_fs[1].kind = FF_CHOICE;
+    extra_fs[1].choices = yn;
+    snprintf(extra_fs[1].value, sizeof(extra_fs[1].value), "yes");
+
+    for (;;) {
+        char *crit = NULL;
+        if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) return;
+
+        for (;;) {
+            if (tui_form("bulk-delete — limit / dry_run", extra_fs, 2) != 0) {
+                free(crit); break;
+            }
+            int dry = strcmp(extra_fs[1].value, "yes") == 0;
+            int limv = atoi(extra_fs[0].value);
+
+            if (!dry && !tui_confirm("dry_run=no — really delete matching records?")) continue;
+
+            char *req = malloc(strlen(crit) + 512);
+            sprintf(req,
+                "{\"mode\":\"bulk-delete\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"criteria\":%s,\"limit\":%d,\"dry_run\":%s}",
+                oi.dir, oi.object, crit, limv, dry ? "true" : "false");
+
+            int act = tui_preview_json("bulk-delete — query JSON", req);
+            if (act != 1) { free(req); continue; }
+            char *resp = NULL; size_t rlen = 0;
+            int rc = cli_query(c, req, &resp, &rlen);
+            free(req);
+            if (rc != 0 || !resp) {
+                tui_alert("error", "bulk-delete failed");
+                free(resp); continue;
+            }
+            show_response("bulk-delete result", resp);
+            free(resp);
+        }
+    }
+}
+
+static void menu_bulk(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[] = {
+            { "bulk-insert (JSON file)",     "import a JSON array of {id, data} entries" },
+            { "bulk-insert (CSV file)",      "import a delimited file with header row" },
+            { "bulk-update (criteria)",      "change fields on every record matching" },
+            { "bulk-update (CSV file)",      "CSV per-key overrides (key + new field values)" },
+            { "bulk-delete (criteria)",      "delete every matching record (dry_run by default)" },
+        };
+        int choice = tui_menu_at("Bulk", items, 5, &sel);
+        if (choice < 0) return;
+        switch (choice) {
+            case 0: bulk_insert_json(c);     break;
+            case 1: bulk_insert_csv(c);      break;
+            case 2: bulk_update_criteria(c); break;
+            case 3: bulk_update_csv(c);      break;
+            case 4: bulk_delete_criteria(c); break;
+        }
+    }
+}
+
 /* ---- Tenants menu ---- add/remove tenant directories. */
 
 static void tenants_list(CliConn *c) {
@@ -2279,6 +2514,7 @@ int main(int argc, char **argv) {
             { "Server",      "start / stop / status" },
             { "Browse",      "tenants → objects → describe" },
             { "Query",       "insert / get / update / delete / find / count / aggregate / keys / fetch / exists" },
+            { "Bulk",        "bulk-insert / bulk-update / bulk-delete (file or criteria)" },
             { "Schema",      "create/drop object, fields, indexes, reindex" },
             { "Maintenance", "vacuum / recount / truncate / backup" },
             { "Tenants",     "list / add / remove tenant directories" },
@@ -2289,20 +2525,21 @@ int main(int argc, char **argv) {
             { "Stats",       "live counters, refreshes every 5s" },
             { "Quit",        "exit shard-cli" },
         };
-        int choice = tui_menu_at("main menu", items, 12, &top_sel);
-        if (choice < 0 || choice == 11) break;
+        int choice = tui_menu_at("main menu", items, 13, &top_sel);
+        if (choice < 0 || choice == 12) break;
         switch (choice) {
             case 0:  menu_server();      break;
             case 1:  menu_browse();      break;
             case 2:  menu_query();       break;
-            case 3:  menu_schema();      break;
-            case 4:  menu_maintenance(); break;
-            case 5:  menu_tenants();     break;
-            case 6:  menu_auth();        break;
-            case 7:  menu_files();       break;
-            case 8:  menu_migrate();     break;
-            case 9:  menu_diagnostics(); break;
-            case 10: menu_stats();       break;
+            case 3:  menu_bulk();        break;
+            case 4:  menu_schema();      break;
+            case 5:  menu_maintenance(); break;
+            case 6:  menu_tenants();     break;
+            case 7:  menu_auth();        break;
+            case 8:  menu_files();       break;
+            case 9:  menu_migrate();     break;
+            case 10: menu_diagnostics(); break;
+            case 11: menu_stats();       break;
         }
     }
 
