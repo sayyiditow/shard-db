@@ -9,8 +9,9 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ## Build & Test
 
 ```bash
-./build.sh                          # compile + populate build/bin/db.env + build/db/schema.conf
-# or: gcc -O2 -o shard-db src/*.c -Isrc -lpthread
+./build.sh                          # compile shard-db + shard-cli, populate build/bin/
+# Builds two binaries: shard-db (daemon, ~324K stripped) and shard-cli
+# (ncurses TUI, ~60K stripped, separate from the daemon).
 
 # Tests — all in tests/ folder, start/stop server automatically, portable CWD
 ./tests/test-objlock.sh                   # Schema mutation locking + key ceiling (18)
@@ -55,6 +56,18 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 - **main.c** — CLI entry point
 - **btree.h / btree.c** — B+ tree index (page-based, prefix-compressed leaves, mmap'd)
 - **objlock.c** — Per-object rwlock (normal ops share; vacuum/rebuild exclusive)
+
+### shard-cli (src/cli/)
+
+Separate ncurses TUI binary. Connects to the daemon over the same TCP+TLS wire as the existing CLI; reads `HOST`/`PORT`/`TLS_ENABLE`/`TLS_CA`/`TLS_SKIP_VERIFY`/`TOKEN` from environment (source `db.env` before launch).
+
+- **cli.h** — declarations for connection, widgets, views, criteria builder, ObjectInfo cache.
+- **conn.c** — self-contained TCP+TLS client (mirrors server.c's `ClientConn` but doesn't link the daemon source).
+- **widgets.c** — primitives: menu, pick (single-value picker), form (FF_TEXT/FF_NUMBER/FF_CHOICE), alert/confirm modals, status bar.
+- **views.c** — output panels: text scroll, JSON object as kv-pairs, JSON array as table, live stats refresh; tiny JSON parser tailored to shard-db response shapes; `describe_object()` populates an `ObjectInfo` cache; `tui_criteria_builder()` 6-row × 3-column form that emits a JSON criteria array.
+- **main.c** — entry, env load, top-level menu dispatch.
+
+Top-level menus: **Server** (start/stop/status), **Browse** (db-dirs → list-objects → describe-object), **Query** (insert/get/find/count/exists with criteria builder), **Schema** (create/drop-object, add/remove/rename-field, add/remove-index), **Maintenance** (vacuum/recount/truncate/backup), **Auth** (list/add/remove tokens + trusted IPs), **Stats** (5s live refresh). Builds to `./shard-cli` at the repo root, copied to `build/bin/` alongside `shard-db`. Daemon code is untouched — the TUI just composes existing JSON modes.
 
 ### Configuration
 
