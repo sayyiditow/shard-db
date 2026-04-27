@@ -641,97 +641,70 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
 }
 
 /* ============================================================
-   Criteria builder — field-by-field grid that emits a JSON criteria array
-   ============================================================ */
+   Criteria builder — list-with-actions UX
+   ============================================================
 
-#define MAX_CRIT_ROWS 6
+   See the accumulated criteria as a menu. [+] add opens a 3-field form
+   (field dropdown, op dropdown, value text). ⏎ on an existing row offers
+   to delete it. [✓] submit packs the rows into a JSON array. */
 
-static const char *const OPS_VARCHAR[] = {
+#define MAX_CRIT_ROWS 16
+
+typedef struct {
+    char field[64];
+    char op[16];
+    char value[256];
+} CritRow;
+
+static const char *const OPS_ALL[] = {
     "eq","neq","lt","gt","lte","gte","between","in","not_in",
     "like","not_like","contains","not_contains","starts","ends",
     "exists","not_exists", NULL
 };
-static const char *const OPS_NUMERIC[] = {
-    "eq","neq","lt","gt","lte","gte","between","in","not_in",
-    "exists","not_exists", NULL
-};
 
-/* True if the typed-field type is "string-y" — varchar/byte. The numeric
-   ops list applies to everything else (int/long/short/double/numeric/date/
-   datetime/bool). */
-static int field_is_textish(const char *type) {
-    return strcmp(type, "varchar") == 0 || strcmp(type, "byte") == 0;
+/* Open a single-criterion form. Returns 0 on submit, -1 on cancel. */
+static int prompt_one_criterion(const ObjectInfo *oi, CritRow *out) {
+    /* Build field-name choices on the stack (NULL-terminated). */
+    int nfc = oi->nfields;
+    if (nfc <= 0) { tui_alert("criteria", "object has no fields"); return -1; }
+    const char *field_choices[MAX_FIELDS_CACHED + 1];
+    for (int i = 0; i < nfc; i++) field_choices[i] = oi->fields[i].name;
+    field_choices[nfc] = NULL;
+
+    FormField fs[3] = {0};
+    fs[0].label   = "field"; fs[0].kind = FF_CHOICE; fs[0].choices = field_choices;
+    snprintf(fs[0].value, sizeof(fs[0].value), "%s", oi->fields[0].name);
+    fs[1].label   = "op";    fs[1].kind = FF_CHOICE; fs[1].choices = OPS_ALL;
+    snprintf(fs[1].value, sizeof(fs[1].value), "eq");
+    fs[2].label   = "value"; fs[2].kind = FF_TEXT;
+
+    if (tui_form("add criterion (←→ cycle dropdowns)", fs, 3) != 0) return -1;
+    if (!fs[0].value[0]) return -1;
+    snprintf(out->field, sizeof(out->field), "%s", fs[0].value);
+    snprintf(out->op,    sizeof(out->op),    "%s", fs[1].value);
+    snprintf(out->value, sizeof(out->value), "%s", fs[2].value);
+    return 0;
 }
 
-int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
-    /* Build choice arrays for field dropdown — first entry "(none)" so
-       leaving a row blank skips it. */
-    int n_choices = oi->nfields + 1;
-    const char **field_choices = calloc(n_choices + 1, sizeof(*field_choices));
-    field_choices[0] = "(none)";
-    for (int i = 0; i < oi->nfields; i++) field_choices[1 + i] = oi->fields[i].name;
-    field_choices[n_choices] = NULL;
-
-    /* Form: 3 fields per row × MAX_CRIT_ROWS. */
-    FormField fields[MAX_CRIT_ROWS * 3];
-    char labels[MAX_CRIT_ROWS][16];
-    for (int r = 0; r < MAX_CRIT_ROWS; r++) {
-        snprintf(labels[r], sizeof(labels[r]), "row %d field", r + 1);
-        FormField *ff = &fields[r * 3 + 0];
-        ff->label   = labels[r];
-        ff->kind    = FF_CHOICE;
-        ff->choices = field_choices;
-        snprintf(ff->value, sizeof(ff->value), "(none)");
-
-        ff = &fields[r * 3 + 1];
-        ff->label   = "         op";
-        ff->kind    = FF_CHOICE;
-        ff->choices = OPS_VARCHAR;  /* widest list — dynamically appropriate at submit */
-        snprintf(ff->value, sizeof(ff->value), "eq");
-
-        ff = &fields[r * 3 + 2];
-        ff->label   = "      value";
-        ff->kind    = FF_TEXT;
-        ff->choices = NULL;
-        ff->value[0] = '\0';
-    }
-
-    int rc = tui_form("criteria builder (AND across rows; (none) skips)",
-                      fields, MAX_CRIT_ROWS * 3);
-    free(field_choices);
-    if (rc != 0) {
-        *criteria_out = NULL;
-        return -1;
-    }
-
-    /* Pack non-empty rows as JSON array. */
+/* Pack accumulated rows into a JSON array string. Caller frees. */
+static char *pack_criteria(const CritRow *rows, int n) {
     size_t cap = 1024;
     char *out = malloc(cap);
-    if (!out) return -1;
+    if (!out) return NULL;
     size_t off = 0;
     off += snprintf(out + off, cap - off, "[");
-    int emitted = 0;
-    for (int r = 0; r < MAX_CRIT_ROWS; r++) {
-        const char *fld = fields[r * 3 + 0].value;
-        if (!*fld || strcmp(fld, "(none)") == 0) continue;
-        const char *op  = fields[r * 3 + 1].value;
-        const char *val = fields[r * 3 + 2].value;
-
-        /* Detect field type for value-quoting choice. Numeric types pass
-           the value as a string anyway in shard-db's wire format, so always
-           quote for safety. */
-        (void)field_is_textish;
-        (void)OPS_NUMERIC;
-
-        if (off + 256 + strlen(val) >= cap) {
+    for (int i = 0; i < n; i++) {
+        const char *fld = rows[i].field;
+        const char *op  = rows[i].op;
+        const char *val = rows[i].value;
+        if (off + 512 + strlen(val) >= cap) {
             cap *= 2;
             char *nb = realloc(out, cap);
-            if (!nb) { free(out); return -1; }
+            if (!nb) { free(out); return NULL; }
             out = nb;
         }
-        if (emitted) off += snprintf(out + off, cap - off, ",");
+        if (i) off += snprintf(out + off, cap - off, ",");
 
-        /* For BETWEEN, expect the value to be "lo,hi" — split. */
         if (strcmp(op, "between") == 0) {
             char vbuf[1024];
             snprintf(vbuf, sizeof(vbuf), "%s", val);
@@ -745,7 +718,6 @@ int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
             off += snprintf(out + off, cap - off,
                 "{\"field\":\"%s\",\"op\":\"%s\"}", fld, op);
         } else if (strcmp(op, "in") == 0 || strcmp(op, "not_in") == 0) {
-            /* value should be comma-separated: a,b,c → ["a","b","c"]. */
             off += snprintf(out + off, cap - off,
                 "{\"field\":\"%s\",\"op\":\"%s\",\"value\":[", fld, op);
             const char *p = val;
@@ -758,7 +730,9 @@ int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
                 size_t L = (size_t)(p - s);
                 if (off + L + 8 >= cap) {
                     cap *= 2;
-                    out = realloc(out, cap);
+                    char *nb = realloc(out, cap);
+                    if (!nb) { free(out); return NULL; }
+                    out = nb;
                 }
                 off += snprintf(out + off, cap - off,
                     "%s\"%.*s\"", first ? "" : ",", (int)L, s);
@@ -770,9 +744,68 @@ int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
                 "{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\"}",
                 fld, op, val);
         }
-        emitted++;
     }
     off += snprintf(out + off, cap - off, "]");
-    *criteria_out = out;
-    return 0;
+    return out;
+}
+
+int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
+    CritRow rows[MAX_CRIT_ROWS];
+    int n = 0;
+    int sel = 0;
+
+    for (;;) {
+        /* Build the menu from current rows + [+ add] + [✓ submit]. */
+        MenuItem items[MAX_CRIT_ROWS + 2];
+        char labels[MAX_CRIT_ROWS + 2][160];
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            snprintf(labels[total], sizeof(labels[0]),
+                     "%-20s  %-6s  %s", rows[i].field, rows[i].op, rows[i].value);
+            items[total].label = labels[total];
+            items[total].hint  = "⏎/→ to remove this criterion";
+            total++;
+        }
+        snprintf(labels[total], sizeof(labels[0]), "[+] add criterion");
+        items[total].label = labels[total];
+        items[total].hint  = (n < MAX_CRIT_ROWS)
+                              ? "open a form for the next field/op/value"
+                              : "(max criteria reached)";
+        int idx_add = total;
+        total++;
+        snprintf(labels[total], sizeof(labels[0]),
+                 "[✓] submit  (%d criteri%s, AND'd)",
+                 n, n == 1 ? "on" : "a");
+        items[total].label = labels[total];
+        items[total].hint  = "build the JSON array and continue";
+        int idx_submit = total;
+        total++;
+
+        char title[128];
+        snprintf(title, sizeof(title), "criteria for %s/%s", oi->dir, oi->object);
+        int choice = tui_menu_at(title, items, total, &sel);
+        if (choice < 0) {
+            *criteria_out = NULL;
+            return -1;
+        }
+        if (choice == idx_submit) {
+            *criteria_out = pack_criteria(rows, n);
+            return *criteria_out ? 0 : -1;
+        }
+        if (choice == idx_add) {
+            if (n >= MAX_CRIT_ROWS) continue;
+            CritRow row;
+            if (prompt_one_criterion(oi, &row) == 0) {
+                rows[n++] = row;
+                sel = idx_add;  /* keep highlight on [+ add] for fast repeat */
+            }
+            continue;
+        }
+        /* Existing row — confirm-delete. */
+        if (tui_confirm("remove this criterion?")) {
+            for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
+            n--;
+            if (sel >= n) sel = n;  /* keep cursor in range after delete */
+        }
+    }
 }

@@ -274,7 +274,8 @@ static void query_insert(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    /* Form: key + one row per writable field. */
+    /* Form: key + one row per writable field. Sticky across re-runs so the
+       user can change just the key (or one field) and submit again. */
     int nf = oi.nfields + 1;
     FormField *fs = calloc(nf, sizeof(*fs));
     fs[0].label = "key";
@@ -285,159 +286,171 @@ static void query_insert(CliConn *c) {
     }
     char title[128];
     snprintf(title, sizeof(title), "insert into %s/%s", oi.dir, oi.object);
-    int rc = tui_form(title, fs, nf);
-    if (rc != 0) { free(fs); return; }
-    if (!fs[0].value[0]) { tui_alert("insert", "key required"); free(fs); return; }
 
-    /* Build {"mode":"insert","dir":"...","object":"...","key":"...","data":{...}} */
-    size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
-    off += snprintf(req + off, cap - off,
-        "{\"mode\":\"insert\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"data\":{",
-        oi.dir, oi.object, fs[0].value);
-    int emitted = 0;
-    for (int i = 0; i < oi.nfields; i++) {
-        if (!fs[1 + i].value[0]) continue;  /* skip empty — defaults apply */
-        if (off + 256 + strlen(fs[1 + i].value) >= cap) {
-            cap *= 2;
-            req = realloc(req, cap);
-        }
+    for (;;) {
+        if (tui_form(title, fs, nf) != 0) { free(fs); return; }
+        if (!fs[0].value[0]) { tui_alert("insert", "key required"); continue; }
+
+        size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
         off += snprintf(req + off, cap - off,
-            "%s\"%s\":\"%s\"",
-            emitted ? "," : "",
-            oi.fields[i].name, fs[1 + i].value);
-        emitted++;
-    }
-    off += snprintf(req + off, cap - off, "}}");
-    free(fs);
+            "{\"mode\":\"insert\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"data\":{",
+            oi.dir, oi.object, fs[0].value);
+        int emitted = 0;
+        for (int i = 0; i < oi.nfields; i++) {
+            if (!fs[1 + i].value[0]) continue;  /* skip empty — defaults apply */
+            if (off + 256 + strlen(fs[1 + i].value) >= cap) {
+                cap *= 2;
+                req = realloc(req, cap);
+            }
+            off += snprintf(req + off, cap - off,
+                "%s\"%s\":\"%s\"",
+                emitted ? "," : "",
+                oi.fields[i].name, fs[1 + i].value);
+            emitted++;
+        }
+        off += snprintf(req + off, cap - off, "}}");
 
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) {
-        tui_alert("error", "insert failed");
-    } else {
-        show_response("insert result", resp);
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "insert failed");
+        else { show_response("insert result", resp); free(resp); }
+        free(req);
+        /* result dismissed → loop back to form with sticky values */
+    }
+}
+
+/* Single-key form for get/exists. Loops on form ↔ result so ← in result
+   re-shows the form with the previous key pre-filled. ← in form exits. */
+static void query_single_key(CliConn *c, const char *mode, const char *result_title) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    FormField fs[1] = {0};
+    fs[0].label = "key";
+    fs[0].kind  = FF_TEXT;
+    char title[128];
+    snprintf(title, sizeof(title), "%s in %s/%s", mode, oi.dir, oi.object);
+
+    for (;;) {
+        if (tui_form(title, fs, 1) != 0) return;  /* ← in form → exit op */
+        if (!fs[0].value[0]) { tui_alert(mode, "key required"); continue; }
+
+        char req[1024];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
+            mode, oi.dir, oi.object, fs[0].value);
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", mode); continue; }
+        show_response(result_title, resp);
         free(resp);
+        /* result dismissed → loop back to form with sticky value */
     }
-    free(req);
 }
 
-static void query_get(CliConn *c) {
-    ObjectInfo oi;
-    if (pick_object(c, &oi) != 0) return;
-
-    FormField fs[1] = {0};
-    fs[0].label = "key";
-    fs[0].kind  = FF_TEXT;
-    char title[128];
-    snprintf(title, sizeof(title), "get from %s/%s", oi.dir, oi.object);
-    if (tui_form(title, fs, 1) != 0) return;
-    if (!fs[0].value[0]) { tui_alert("get", "key required"); return; }
-
-    char req[1024];
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"get\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
-        oi.dir, oi.object, fs[0].value);
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "get failed"); return; }
-    show_response("get result", resp);
-    free(resp);
-}
-
-static void query_exists(CliConn *c) {
-    ObjectInfo oi;
-    if (pick_object(c, &oi) != 0) return;
-
-    FormField fs[1] = {0};
-    fs[0].label = "key";
-    fs[0].kind  = FF_TEXT;
-    char title[128];
-    snprintf(title, sizeof(title), "exists in %s/%s", oi.dir, oi.object);
-    if (tui_form(title, fs, 1) != 0) return;
-    if (!fs[0].value[0]) { tui_alert("exists", "key required"); return; }
-
-    char req[1024];
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"exists\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
-        oi.dir, oi.object, fs[0].value);
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "exists failed"); return; }
-    show_response("exists", resp);
-    free(resp);
-}
+static void query_get(CliConn *c)    { query_single_key(c, "get",    "get result"); }
+static void query_exists(CliConn *c) { query_single_key(c, "exists", "exists");     }
 
 static void query_count(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    char *crit = NULL;
-    if (tui_criteria_builder(&oi, &crit) != 0) return;
+    /* Loop: criteria builder ↔ result. ← in builder exits the op. */
+    for (;;) {
+        char *crit = NULL;
+        if (tui_criteria_builder(&oi, &crit) != 0) return;
 
-    char req[8192];
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s}",
-        oi.dir, oi.object, crit);
-    free(crit);
+        char *req = malloc(strlen(crit) + 256);
+        sprintf(req,
+            "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s}",
+            oi.dir, oi.object, crit);
+        free(crit);
 
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "count failed"); return; }
-    show_response("count result", resp);
-    free(resp);
+        char *resp = NULL; size_t rlen = 0;
+        int rc = cli_query(c, req, &resp, &rlen);
+        free(req);
+        if (rc != 0) { tui_alert("error", "count failed"); continue; }
+        show_response("count result", resp);
+        free(resp);
+        /* result dismissed → loop back to criteria builder
+           (rows are NOT sticky — fresh builder each iteration) */
+    }
 }
 
 static void query_find(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    char *crit = NULL;
-    if (tui_criteria_builder(&oi, &crit) != 0) return;
-
-    /* Second form: offset, limit, fields (CSV). */
-    FormField fs[3] = {0};
+    /* Sticky paging form values across re-runs. */
+    FormField fs[2] = {0};
     fs[0].label = "offset"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "0");
     fs[1].label = "limit";  fs[1].kind = FF_NUMBER; snprintf(fs[1].value, sizeof(fs[1].value), "50");
-    fs[2].label = "fields"; fs[2].kind = FF_TEXT;   /* comma-separated, blank=all */
-    if (tui_form("find — paging", fs, 3) != 0) { free(crit); return; }
 
-    /* Build fields JSON array if user typed any. */
-    char fields_json[1024] = "[]";
-    if (fs[2].value[0]) {
-        size_t off = 0;
-        off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
-        const char *p = fs[2].value;
-        int first = 1;
-        while (*p) {
-            while (*p == ' ' || *p == ',') p++;
-            if (!*p) break;
-            const char *s = p;
-            while (*p && *p != ',') p++;
-            size_t L = (size_t)(p - s);
-            off += snprintf(fields_json + off, sizeof(fields_json) - off,
-                "%s\"%.*s\"", first ? "" : ",", (int)L, s);
-            first = 0;
+    /* Sticky field selection — start with all fields selected. */
+    int *fld_sel = calloc(oi.nfields, sizeof(int));
+    if (fld_sel) for (int i = 0; i < oi.nfields; i++) fld_sel[i] = 1;
+    const char *fld_choices[MAX_FIELDS_CACHED + 1];
+    for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
+    fld_choices[oi.nfields] = NULL;
+
+    /* Outer loop: criteria → form → result → form → result …
+       ← in form → re-show criteria. ← in criteria → exit op. */
+    for (;;) {
+        char *crit = NULL;
+        if (tui_criteria_builder(&oi, &crit) != 0) { free(fld_sel); return; }
+
+        for (;;) {
+            if (tui_form("find — paging", fs, 2) != 0) {
+                /* ← in paging form → back to criteria builder */
+                free(crit);
+                break;
+            }
+
+            /* Field picker: multi-select from oi.fields. ← here → back to form. */
+            if (tui_multi_pick("fields to project (space toggle, ⏎ confirm, ← back)",
+                               fld_choices, oi.nfields, fld_sel) != 0) {
+                /* user cancelled field pick → re-show form */
+                continue;
+            }
+
+            /* Build fields JSON array. Empty selection → empty array (= all
+               fields in the response). */
+            char fields_json[1024] = "[]";
+            int picked = 0;
+            for (int i = 0; i < oi.nfields; i++) if (fld_sel[i]) picked++;
+            if (picked > 0 && picked < oi.nfields) {
+                size_t off = 0;
+                off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
+                int first = 1;
+                for (int i = 0; i < oi.nfields; i++) {
+                    if (!fld_sel[i]) continue;
+                    off += snprintf(fields_json + off, sizeof(fields_json) - off,
+                        "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
+                    first = 0;
+                }
+                snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+            }
+
+            int offv = atoi(fs[0].value);
+            int limv = atoi(fs[1].value);
+            if (limv <= 0) limv = 50;
+
+            char *req = malloc(strlen(crit) + 1024);
+            sprintf(req,
+                "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
+                "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
+                oi.dir, oi.object, crit, offv, limv, fields_json);
+
+            char *resp = NULL; size_t rlen = 0;
+            int rc = cli_query(c, req, &resp, &rlen);
+            free(req);
+            if (rc != 0 || !resp) { tui_alert("error", "find failed"); free(resp); continue; }
+
+            if (resp[0] == '[') tui_show_table("find result", resp);
+            else                show_response("find result", resp);
+            free(resp);
+            /* result dismissed → loop back to paging form */
         }
-        snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+        /* form loop exited → re-show criteria builder */
     }
-
-    int offv = atoi(fs[0].value);
-    int limv = atoi(fs[1].value);
-    if (limv <= 0) limv = 50;
-
-    /* "format":"rows" — flat tabular shape easy for tui_show_table. */
-    char *req = malloc(strlen(crit) + 1024);
-    sprintf(req,
-        "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
-        "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
-        oi.dir, oi.object, crit, offv, limv, fields_json);
-    free(crit);
-
-    char *resp = NULL; size_t rlen = 0;
-    int rc = cli_query(c, req, &resp, &rlen);
-    free(req);
-    if (rc != 0 || !resp) { tui_alert("error", "find failed"); free(resp); return; }
-
-    /* If response is an array of objects, show as table; otherwise raw. */
-    if (resp[0] == '[') tui_show_table("find result", resp);
-    else                show_response("find result", resp);
-    free(resp);
 }
 
 static void menu_query(void) {

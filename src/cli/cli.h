@@ -81,6 +81,12 @@ int tui_menu_at(const char *title, const MenuItem *items, int nitems, int *sel);
    selection. Returns the chosen string (caller must NOT free) or NULL. */
 const char *tui_pick(const char *title, const char *const *values, int nvalues);
 
+/* Multi-pick: caller-owned `selected[i]` is in/out (0/1 for each value).
+   Space toggles the highlighted row, ⏎ confirms, ←/q/ESC cancels.
+   Returns 0 on confirm, -1 on cancel. */
+int tui_multi_pick(const char *title, const char *const *values, int nvalues,
+                   int *selected);
+
 /* ---- Form widget ---- */
 
 typedef enum {

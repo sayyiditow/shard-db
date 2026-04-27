@@ -190,6 +190,52 @@ int tui_menu(const char *title, const MenuItem *items, int nitems) {
     return tui_menu_at(title, items, nitems, &local);
 }
 
+int tui_multi_pick(const char *title, const char *const *values, int nvalues,
+                   int *selected) {
+    if (nvalues <= 0) {
+        tui_alert(title, "(no items)");
+        return -1;
+    }
+    int sel = 0;
+    for (;;) {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, " %s ", title ? title : "");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        int top = 3;
+        for (int i = 0; i < nvalues; i++) {
+            int row = top + i;
+            if (row >= rows - 3) break;
+            const char *check = selected[i] ? "[x]" : "[ ]";
+            if (i == sel) attron(COLOR_PAIR(2) | A_REVERSE);
+            mvprintw(row, 4, " %s  %-30s ", check, values[i]);
+            if (i == sel) attroff(COLOR_PAIR(2) | A_REVERSE);
+        }
+
+        attron(COLOR_PAIR(3));
+        mvprintw(rows - 2, 4, "↑↓/jk move   space toggle   ⏎ confirm   ←/q/ESC cancel");
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP: case 'k':   if (sel > 0) sel--; break;
+            case KEY_DOWN: case 'j': if (sel < nvalues - 1) sel++; break;
+            case KEY_HOME: case 'g': sel = 0; break;
+            case KEY_END:  case 'G': sel = nvalues - 1; break;
+            case ' ':                selected[sel] = !selected[sel]; break;
+            case '\n': case '\r': case KEY_ENTER:
+                return 0;
+            case 'q': case 27: case KEY_LEFT: case 'h':
+                return -1;
+        }
+    }
+}
+
 const char *tui_pick(const char *title, const char *const *values, int nvalues) {
     if (nvalues <= 0) {
         tui_alert(title, "(no items)");
