@@ -29,7 +29,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (21)
 ./tests/test-find-cursor.sh               # Keyset cursor pagination on find      (41)
 ./tests/test-tls.sh                       # Native TLS 1.3 (auto-skips if no openssl) (12)
-# Total: 457 tests
+./tests/test-and-intersection.sh          # AND index intersection (count/find/agg) (27)
+# Total: 484 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -312,13 +313,30 @@ o2|paid|50|"a,comma,here"
 ]
 ```
 
-Planner picks one of four paths automatically:
-- **Pure AND** → primary-indexed-leaf scan (today's path).
+Planner picks one of five paths automatically:
+- **Pure AND, single indexed leaf** → primary-indexed-leaf scan, post-filter siblings via `criteria_match_tree`.
+- **Pure AND, 2+ indexed leaves on rangeable ops** → `PRIMARY_INTERSECT` (see "AND index intersection" below) — intersect candidate hash sets via KeySet, skip per-record fetch for count.
 - **AND + OR, indexed AND sibling** → indexed leaf drives candidates, OR sub-tree evaluated per record via tree match.
 - **Pure OR, every child indexed** → per-child B+ tree lookups unioned into a concurrent KeySet (xxh128 hashes, lock-free CAS inserts); pure-OR count returns `|KeySet|` directly without fetching records.
 - **OR with non-indexed child** → full parallel shard scan, tree match per record.
 
 Hybrid (non-indexed AND + fully-indexed OR) uses KeySet as primary-candidate source and applies the AND siblings as a post-filter. Max nesting depth is `MAX_CRITERIA_DEPTH = 16`. Empty `or:[]` / `and:[]` → `{"error":"empty or/and"}`.
+
+### AND index intersection
+
+When the criteria tree is a pure AND of 2+ indexed leaves on btree-rangeable operators (eq/lt/gt/lte/gte/between/in/starts_with), the planner picks `PRIMARY_INTERSECT`: walk each leaf's btree into a KeySet (xxh128 hashes, the same lock-free hash set used by OR-union), intersect candidate sets, **skip the per-record fetch + criteria_match_tree pass entirely** for count, and use the survivor list directly for find / aggregate.
+
+Example: `count(status=paid AND region=us AND amount>150)` over a 5M-row table where `status=paid` matches ~1.4M but the 3-way intersection is ~50k. Today's primary-leaf path pays ~150ns per primary record fetch — ~210ms. Intersection walks three btrees (~30ms) and probes a KeySet (~5ms) — ~35ms. Speedup is bigger when the selectivity gap between primary and intersection is wider, and bigger again for `find` with deep `offset` because the limit/offset apply to the small survivor set, not the primary set.
+
+Eligibility:
+- All AND children must be **indexed** **leaves** with **rangeable operators** (eq, lt, gt, lte, gte, between, in, starts_with). Mixed trees (e.g., one `like` leaf alongside indexed eq leaves) fall back to `PRIMARY_LEAF`.
+- Substring/suffix operators (like, contains, ends_with, not_like, not_contains) need full-record access by definition; they can't drive intersection.
+- Large-set operators (neq, not_in) build near-everything KeySets — the existing primary-leaf path with the count-shortcut (`count(neq X) = count(*) - count(eq X)`) is tighter, so they stay there.
+- Pure OR, hybrid AND+OR, single leaf, and full-scan all keep their existing paths.
+
+Leaves are walked most-selective-first by `op_selectivity_rank` (eq < starts_with < between < in < range), so the smallest candidate set bounds the running intersection. Cardinality estimation from index stats is future work.
+
+`MAX_INTERSECT_LEAVES = 8` caps the number of intersected leaves; trees with more than 8 indexed eligible leaves fall back to `PRIMARY_LEAF`. There is currently no abandon-on-selective-primary heuristic — for queries like `id=X AND status=anything` where the primary leaf has very few candidates, intersection still walks the second leaf's full btree to probe. Add bench coverage and tune if it shows up as a real workload regression.
 
 ### Aggregation
 
@@ -386,7 +404,9 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 
 - `CriteriaNode` (types.h) + `parse_criteria_tree` / `criteria_match_tree` / `compile_criteria_tree` (query.c): AND/OR tree form of criteria. Leaves hold a pre-compiled `CompiledCriterion` so the hot path stays zero-malloc-per-record
 - `KeySet` (keyset.c): lock-free open-addressed hash table of 16-byte xxh128 keys; lives on the OR index-union fast path
-- `choose_primary_source` (query.c): planner that picks `PRIMARY_LEAF` / `PRIMARY_KEYSET` / `PRIMARY_NONE` based on indexability of the tree's leaves
+- `choose_primary_source` (query.c): planner that picks `PRIMARY_LEAF` / `PRIMARY_KEYSET` / `PRIMARY_INTERSECT` / `PRIMARY_NONE` based on indexability + operator class of the tree's leaves
+- `intersect_indexed_leaves` / `keyset_count_from_intersect` / `keyset_find_from_intersect` / `keyset_agg_from_intersect` (query.c): AND-intersection executors. Walk N leaves' btrees into KeySets, intersect via `intersect_probe_cb`, then for count return |result|, for find/agg call the shared `keyset_emit_find` / `keyset_emit_agg` helpers (also used by the OR-union paths) with `tree=NULL` to skip the redundant `criteria_match_tree`
+- `shard_group_batch` (query.c): qsort `CollectedHash[]` by `shard_id` and split into per-shard groups for fan-out — extracted helper used by `process_batch`, `parallel_indexed_count`, `parallel_indexed_agg`, and the search dispatcher
 - `match_typed()` / `CompiledCriterion` (query.c): typed-binary criterion matching — zero malloc per record, direct byte compares
 - `scan_shards()`: parallel mmap-based shard scanner (one thread per shard group)
 - `index_parallel()`: spawns pthread per index field during bulk insert
