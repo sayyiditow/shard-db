@@ -14,6 +14,11 @@ void tui_init(void) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
+    /* ncurses default ESCDELAY is 1000ms — way too slow for "ESC = back".
+       25ms is the standard recommendation; fast enough that single ESC
+       feels instant, slow enough that real escape sequences (arrow keys
+       etc) still arrive together. */
+    set_escdelay(25);
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -149,7 +154,7 @@ int tui_menu(const char *title, const MenuItem *items, int nitems) {
             mvprintw(rows - 3, 4, "%.*s", cols - 8, items[sel].hint);
             attroff(COLOR_PAIR(3));
         }
-        mvprintw(rows - 2, 4, "↑↓/jk select   ⏎ open   q/ESC back");
+        mvprintw(rows - 2, 4, "↑↓/jk select   →/⏎ open   ←/q/ESC back");
         draw_status_bar();
         refresh();
 
@@ -159,8 +164,10 @@ int tui_menu(const char *title, const MenuItem *items, int nitems) {
             case KEY_DOWN:  case 'j': if (sel < nitems - 1) sel++; break;
             case KEY_HOME:  case 'g': sel = 0; break;
             case KEY_END:   case 'G': sel = nitems - 1; break;
-            case '\n': case '\r': case KEY_ENTER: return sel;
-            case 'q': case 27: return -1;
+            case '\n': case '\r': case KEY_ENTER:
+            case KEY_RIGHT: case 'l':
+                return sel;
+            case 'q': case 27: case KEY_LEFT: case 'h': return -1;
             default:
                 if (ch >= '1' && ch <= '9') {
                     int n = ch - '1';

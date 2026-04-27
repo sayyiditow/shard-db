@@ -52,24 +52,26 @@ static char *run_capture(const char *cmd) {
 /* ---- Server menu ---- */
 
 static void menu_server(void) {
-    MenuItem items[] = {
-        { "start",   "Daemonize ./shard-db on PORT" },
-        { "stop",    "SIGTERM the running daemon (drains in-flight writes)" },
-        { "status",  "Print PID/port if running" },
-    };
-    int choice = tui_menu("Server", items, 3);
-    if (choice < 0) return;
-    const char *cmd = NULL;
-    switch (choice) {
-        case 0: cmd = "./shard-db start  2>&1"; break;
-        case 1: cmd = "./shard-db stop   2>&1"; break;
-        case 2: cmd = "./shard-db status 2>&1"; break;
+    for (;;) {
+        MenuItem items[] = {
+            { "start",   "Daemonize ./shard-db on PORT" },
+            { "stop",    "SIGTERM the running daemon (drains in-flight writes)" },
+            { "status",  "Print PID/port if running" },
+        };
+        int choice = tui_menu("Server", items, 3);
+        if (choice < 0) return;
+        const char *cmd = NULL;
+        switch (choice) {
+            case 0: cmd = "./shard-db start  2>&1"; break;
+            case 1: cmd = "./shard-db stop   2>&1"; break;
+            case 2: cmd = "./shard-db status 2>&1"; break;
+        }
+        char *out = run_capture(cmd);
+        /* Re-open connection on next request — the daemon may have just stopped/started. */
+        if (g_conn) { cli_close(g_conn); g_conn = NULL; }
+        tui_alert(items[choice].label, out ? out : "(no output)");
+        free(out);
     }
-    char *out = run_capture(cmd);
-    /* Re-open connection on next request — the daemon may have just stopped/started. */
-    if (g_conn) { cli_close(g_conn); g_conn = NULL; }
-    tui_alert(items[choice].label, out ? out : "(no output)");
-    free(out);
 }
 
 /* ---- Browse menu ---- */
@@ -138,118 +140,133 @@ static int collect_string_array(const char *resp, const char *key,
     return 0;
 }
 
+/* Loop at the object-pick level: ←/q goes back to tenant pick; describe view
+   closes back to the object pick. Each level loops until user backs out. */
 static void menu_browse_object_list(CliConn *c, const char *dir) {
-    char req[256];
-    snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dir);
-    char *resp = NULL;
-    size_t rlen = 0;
-    if (cli_query(c, req, &resp, &rlen) != 0) {
-        tui_alert("error", "list-objects failed");
-        return;
-    }
-    char **objs;
-    int n = 0;
-    if (collect_string_array(resp, "objects", &objs, &n) != 0 || n == 0) {
-        if (n == 0) tui_alert(dir, "(no objects in this tenant)");
-        else        tui_alert("parse error", resp);
+    for (;;) {
+        char req[256];
+        snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dir);
+        char *resp = NULL;
+        size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "list-objects failed");
+            return;
+        }
+        char **objs;
+        int n = 0;
+        if (collect_string_array(resp, "objects", &objs, &n) != 0 || n == 0) {
+            if (n == 0) tui_alert(dir, "(no objects in this tenant)");
+            else        tui_alert("parse error", resp);
+            free(resp);
+            return;
+        }
         free(resp);
-        return;
+        char title[128];
+        snprintf(title, sizeof(title), "%s — pick object", dir);
+        const char **view = malloc(n * sizeof(*view));
+        for (int i = 0; i < n; i++) view[i] = objs[i];
+        const char *picked = tui_pick(title, view, n);
+        free(view);
+        char obj_copy[64] = "";
+        if (picked) snprintf(obj_copy, sizeof(obj_copy), "%s", picked);
+        for (int i = 0; i < n; i++) free(objs[i]);
+        free(objs);
+        if (!obj_copy[0]) return;  /* user backed out → return to tenant pick */
+        browse_object(c, dir, obj_copy);
+        /* describe view dismissed → loop back to object pick */
     }
-    free(resp);
-    char title[128];
-    snprintf(title, sizeof(title), "%s — pick object", dir);
-    /* Make a const view of objs for tui_pick. */
-    const char **view = malloc(n * sizeof(*view));
-    for (int i = 0; i < n; i++) view[i] = objs[i];
-    const char *picked = tui_pick(title, view, n);
-    free(view);
-    if (picked) browse_object(c, dir, picked);
-    for (int i = 0; i < n; i++) free(objs[i]);
-    free(objs);
 }
 
 static void menu_browse(void) {
     CliConn *c = get_conn();
     if (!c) return;
-    char *resp = NULL;
-    size_t rlen = 0;
-    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
-        tui_alert("error", "db-dirs failed");
-        return;
-    }
-    char **dirs;
-    int n = 0;
-    if (collect_string_array(resp, NULL, &dirs, &n) != 0 || n == 0) {
-        if (n == 0) tui_alert("Browse", "(no allowed tenants — add to dirs.conf)");
-        else        tui_alert("parse error", resp);
+    /* Tenant-pick loop: ← in tenant pick returns to the main menu. */
+    for (;;) {
+        char *resp = NULL;
+        size_t rlen = 0;
+        if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
+            tui_alert("error", "db-dirs failed");
+            return;
+        }
+        char **dirs;
+        int n = 0;
+        if (collect_string_array(resp, NULL, &dirs, &n) != 0 || n == 0) {
+            if (n == 0) tui_alert("Browse", "(no allowed tenants — add to dirs.conf)");
+            else        tui_alert("parse error", resp);
+            free(resp);
+            return;
+        }
         free(resp);
-        return;
+        const char **view = malloc(n * sizeof(*view));
+        for (int i = 0; i < n; i++) view[i] = dirs[i];
+        const char *picked = tui_pick("Browse — pick tenant", view, n);
+        free(view);
+        char dir_copy[64] = "";
+        if (picked) snprintf(dir_copy, sizeof(dir_copy), "%s", picked);
+        for (int i = 0; i < n; i++) free(dirs[i]);
+        free(dirs);
+        if (!dir_copy[0]) return;  /* ← in tenant pick → back to main menu */
+        menu_browse_object_list(c, dir_copy);
     }
-    free(resp);
-    const char **view = malloc(n * sizeof(*view));
-    for (int i = 0; i < n; i++) view[i] = dirs[i];
-    const char *picked = tui_pick("Browse — pick tenant", view, n);
-    free(view);
-    if (picked) menu_browse_object_list(c, picked);
-    for (int i = 0; i < n; i++) free(dirs[i]);
-    free(dirs);
 }
 
 /* ---- Query menu ---- */
 
-/* Pick a tenant + object via two list pickers; populate ObjectInfo. Returns
-   0 on success, -1 if the user backs out at any step. */
+/* Pick a tenant + object via two list pickers; populate ObjectInfo.
+   Loops at each level so ←/q in object pick re-shows the tenant pick;
+   ←/q in tenant pick returns -1 (caller drops back to its menu). */
 static int pick_object(CliConn *c, ObjectInfo *oi) {
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
-        tui_alert("error", "db-dirs failed");
-        return -1;
-    }
-    char **dirs = NULL; int ndirs = 0;
-    collect_string_array(resp, NULL, &dirs, &ndirs);
-    free(resp);
-    if (ndirs == 0) { tui_alert("query", "no tenants — add to dirs.conf"); return -1; }
+    for (;;) {
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
+            tui_alert("error", "db-dirs failed");
+            return -1;
+        }
+        char **dirs = NULL; int ndirs = 0;
+        collect_string_array(resp, NULL, &dirs, &ndirs);
+        free(resp);
+        if (ndirs == 0) { tui_alert("query", "no tenants — add to dirs.conf"); return -1; }
 
-    const char **vd = malloc(ndirs * sizeof(*vd));
-    for (int i = 0; i < ndirs; i++) vd[i] = dirs[i];
-    const char *dir = tui_pick("pick tenant", vd, ndirs);
-    free(vd);
-    if (!dir) {
+        const char **vd = malloc(ndirs * sizeof(*vd));
+        for (int i = 0; i < ndirs; i++) vd[i] = dirs[i];
+        const char *dir = tui_pick("pick tenant", vd, ndirs);
+        free(vd);
+        char dir_copy[64] = "";
+        if (dir) snprintf(dir_copy, sizeof(dir_copy), "%s", dir);
         for (int i = 0; i < ndirs; i++) free(dirs[i]);
         free(dirs);
-        return -1;
-    }
-    char dir_copy[64];
-    snprintf(dir_copy, sizeof(dir_copy), "%s", dir);
-    for (int i = 0; i < ndirs; i++) free(dirs[i]);
-    free(dirs);
+        if (!dir_copy[0]) return -1;  /* ← in tenant pick → back to caller's menu */
 
-    char req[256];
-    snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dir_copy);
-    if (cli_query(c, req, &resp, &rlen) != 0) {
-        tui_alert("error", "list-objects failed");
-        return -1;
-    }
-    char **objs = NULL; int nobjs = 0;
-    collect_string_array(resp, "objects", &objs, &nobjs);
-    free(resp);
-    if (nobjs == 0) { tui_alert(dir_copy, "(no objects)"); return -1; }
+        /* Object pick loop: ← here re-shows tenant pick. */
+        for (;;) {
+            char req[256];
+            snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dir_copy);
+            if (cli_query(c, req, &resp, &rlen) != 0) {
+                tui_alert("error", "list-objects failed");
+                return -1;
+            }
+            char **objs = NULL; int nobjs = 0;
+            collect_string_array(resp, "objects", &objs, &nobjs);
+            free(resp);
+            if (nobjs == 0) { tui_alert(dir_copy, "(no objects)"); break; }
 
-    const char **vo = malloc(nobjs * sizeof(*vo));
-    for (int i = 0; i < nobjs; i++) vo[i] = objs[i];
-    const char *obj = tui_pick("pick object", vo, nobjs);
-    free(vo);
-    char obj_copy[64] = "";
-    if (obj) snprintf(obj_copy, sizeof(obj_copy), "%s", obj);
-    for (int i = 0; i < nobjs; i++) free(objs[i]);
-    free(objs);
-    if (!obj) return -1;
+            const char **vo = malloc(nobjs * sizeof(*vo));
+            for (int i = 0; i < nobjs; i++) vo[i] = objs[i];
+            const char *obj = tui_pick("pick object", vo, nobjs);
+            free(vo);
+            char obj_copy[64] = "";
+            if (obj) snprintf(obj_copy, sizeof(obj_copy), "%s", obj);
+            for (int i = 0; i < nobjs; i++) free(objs[i]);
+            free(objs);
+            if (!obj_copy[0]) break;  /* ← in object pick → re-show tenant pick */
 
-    if (describe_object(c, dir_copy, obj_copy, oi) != 0) {
-        tui_alert("error", "describe-object failed");
-        return -1;
+            if (describe_object(c, dir_copy, obj_copy, oi) != 0) {
+                tui_alert("error", "describe-object failed");
+                continue;  /* let user pick a different object */
+            }
+            return 0;
+        }
     }
-    return 0;
 }
 
 static void query_insert(CliConn *c) {
@@ -425,27 +442,31 @@ static void query_find(CliConn *c) {
 static void menu_query(void) {
     CliConn *c = get_conn();
     if (!c) return;
-    MenuItem items[] = {
-        { "insert", "single insert by key with field values" },
-        { "get",    "fetch a single record by key" },
-        { "exists", "check whether a key is present" },
-        { "find",   "criteria builder + offset/limit, table output" },
-        { "count",  "criteria builder, returns matching count" },
-    };
-    int sel = tui_menu("Query", items, 5);
-    if (sel < 0) return;
-    switch (sel) {
-        case 0: query_insert(c); break;
-        case 1: query_get(c);    break;
-        case 2: query_exists(c); break;
-        case 3: query_find(c);   break;
-        case 4: query_count(c);  break;
+    for (;;) {
+        MenuItem items[] = {
+            { "insert", "single insert by key with field values" },
+            { "get",    "fetch a single record by key" },
+            { "exists", "check whether a key is present" },
+            { "find",   "criteria builder + offset/limit, table output" },
+            { "count",  "criteria builder, returns matching count" },
+        };
+        int sel = tui_menu("Query", items, 5);
+        if (sel < 0) return;
+        switch (sel) {
+            case 0: query_insert(c); break;
+            case 1: query_get(c);    break;
+            case 2: query_exists(c); break;
+            case 3: query_find(c);   break;
+            case 4: query_count(c);  break;
+        }
     }
 }
 
 /* ---- Schema menu ---- */
 
-/* Pick a tenant alone (no object). Returns malloc'd dir or NULL. */
+/* Pick a tenant alone (no object). Returns malloc'd dir or NULL when user
+   backs out (←/q at the picker). Single-level pick — caller handles its own
+   loop / fallback if it wants to repeat. */
 static char *pick_tenant(CliConn *c) {
     char *resp = NULL; size_t rlen = 0;
     if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) return NULL;
@@ -635,6 +656,36 @@ static void schema_add_index(CliConn *c) {
     else { show_response("add-index", resp); free(resp); }
 }
 
+static void schema_reindex(CliConn *c) {
+    MenuItem items[] = {
+        { "all",      "rebuild every index in every tenant (slow on big DBs)" },
+        { "tenant",   "rebuild every index in one tenant" },
+        { "object",   "rebuild indexes for a single object" },
+    };
+    int sel = tui_menu("reindex scope", items, 3);
+    if (sel < 0) return;
+
+    char req[1024];
+    if (sel == 0) {
+        if (!tui_confirm("reindex EVERYTHING — this can take minutes")) return;
+        snprintf(req, sizeof(req), "{\"mode\":\"reindex\"}");
+    } else if (sel == 1) {
+        char *dir = pick_tenant(c);
+        if (!dir) return;
+        snprintf(req, sizeof(req), "{\"mode\":\"reindex\",\"dir\":\"%s\"}", dir);
+        free(dir);
+    } else {
+        ObjectInfo oi;
+        if (pick_object(c, &oi) != 0) return;
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"reindex\",\"dir\":\"%s\",\"object\":\"%s\"}",
+            oi.dir, oi.object);
+    }
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "reindex failed");
+    else { show_response("reindex", resp); free(resp); }
+}
+
 static void schema_remove_index(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -658,24 +709,31 @@ static void schema_remove_index(CliConn *c) {
 static void menu_schema(void) {
     CliConn *c = get_conn();
     if (!c) return;
-    MenuItem items[] = {
-        { "create-object", "name + splits + max_key + fields/indexes CSV" },
-        { "drop-object",   "delete an object and all its data (confirm prompt)" },
-        { "add-field",     "extend schema by appending typed fields" },
-        { "remove-field",  "tombstone a field (data reclaimed on vacuum)" },
-        { "rename-field",  "metadata-only rename, preserves data" },
-        { "add-index",     "build a new index (single or composite)" },
-        { "remove-index",  "drop an existing index" },
-    };
-    int sel = tui_menu("Schema", items, 7);
-    switch (sel) {
-        case 0: schema_create_object(c); break;
-        case 1: schema_drop_object(c);   break;
-        case 2: schema_add_field(c);     break;
-        case 3: schema_remove_field(c);  break;
-        case 4: schema_rename_field(c);  break;
-        case 5: schema_add_index(c);     break;
-        case 6: schema_remove_index(c);  break;
+    /* Loop the schema menu so ← inside a sub-action returns here, not all
+       the way to the main menu. ← in this menu returns to the main menu. */
+    for (;;) {
+        MenuItem items[] = {
+            { "create-object", "name + splits + max_key + fields/indexes CSV" },
+            { "drop-object",   "delete an object and all its data (confirm prompt)" },
+            { "add-field",     "extend schema by appending typed fields" },
+            { "remove-field",  "tombstone a field (data reclaimed on vacuum)" },
+            { "rename-field",  "metadata-only rename, preserves data" },
+            { "add-index",     "build a new index (single or composite)" },
+            { "remove-index",  "drop an existing index" },
+            { "reindex",       "rebuild indexes (all / tenant / object)" },
+        };
+        int sel = tui_menu("Schema", items, 8);
+        if (sel < 0) return;
+        switch (sel) {
+            case 0: schema_create_object(c); break;
+            case 1: schema_drop_object(c);   break;
+            case 2: schema_add_field(c);     break;
+            case 3: schema_remove_field(c);  break;
+            case 4: schema_rename_field(c);  break;
+            case 5: schema_add_index(c);     break;
+            case 6: schema_remove_index(c);  break;
+            case 7: schema_reindex(c);       break;
+        }
     }
 }
 
@@ -701,18 +759,21 @@ static void simple_op(CliConn *c, const char *mode, const char *title, int confi
 static void menu_maintenance(void) {
     CliConn *c = get_conn();
     if (!c) return;
-    MenuItem items[] = {
-        { "vacuum",   "compact tombstones + (optional) reshard" },
-        { "recount",  "rebuild record count from on-disk slots" },
-        { "truncate", "delete all records (confirm)" },
-        { "backup",   "snapshot copy of the object's data" },
-    };
-    int sel = tui_menu("Maintenance", items, 4);
-    switch (sel) {
-        case 0: simple_op(c, "vacuum",   "vacuum",   0); break;
-        case 1: simple_op(c, "recount",  "recount",  0); break;
-        case 2: simple_op(c, "truncate", "truncate", 1); break;
-        case 3: simple_op(c, "backup",   "backup",   0); break;
+    for (;;) {
+        MenuItem items[] = {
+            { "vacuum",   "compact tombstones + (optional) reshard" },
+            { "recount",  "rebuild record count from on-disk slots" },
+            { "truncate", "delete all records (confirm)" },
+            { "backup",   "snapshot copy of the object's data" },
+        };
+        int sel = tui_menu("Maintenance", items, 4);
+        if (sel < 0) return;
+        switch (sel) {
+            case 0: simple_op(c, "vacuum",   "vacuum",   0); break;
+            case 1: simple_op(c, "recount",  "recount",  0); break;
+            case 2: simple_op(c, "truncate", "truncate", 1); break;
+            case 3: simple_op(c, "backup",   "backup",   0); break;
+        }
     }
 }
 
@@ -830,22 +891,25 @@ static void auth_remove_ip(CliConn *c) {
 static void menu_auth(void) {
     CliConn *c = get_conn();
     if (!c) return;
-    MenuItem items[] = {
-        { "list-tokens",  "fingerprint + scope + perm of every token" },
-        { "add-token",    "global / tenant / object scope, r|rw|rwx perm" },
-        { "remove-token", "paste full token to remove" },
-        { "list-ips",     "trusted IPs (bypass token check)" },
-        { "add-ip",       "add a trusted IP (v4 or v6)" },
-        { "remove-ip",    "pick a trusted IP to remove" },
-    };
-    int sel = tui_menu("Auth", items, 6);
-    switch (sel) {
-        case 0: auth_list_tokens(c);  break;
-        case 1: auth_add_token(c);    break;
-        case 2: auth_remove_token(c); break;
-        case 3: auth_list_ips(c);     break;
-        case 4: auth_add_ip(c);       break;
-        case 5: auth_remove_ip(c);    break;
+    for (;;) {
+        MenuItem items[] = {
+            { "list-tokens",  "fingerprint + scope + perm of every token" },
+            { "add-token",    "global / tenant / object scope, r|rw|rwx perm" },
+            { "remove-token", "paste full token to remove" },
+            { "list-ips",     "trusted IPs (bypass token check)" },
+            { "add-ip",       "add a trusted IP (v4 or v6)" },
+            { "remove-ip",    "pick a trusted IP to remove" },
+        };
+        int sel = tui_menu("Auth", items, 6);
+        if (sel < 0) return;
+        switch (sel) {
+            case 0: auth_list_tokens(c);  break;
+            case 1: auth_add_token(c);    break;
+            case 2: auth_remove_token(c); break;
+            case 3: auth_list_ips(c);     break;
+            case 4: auth_add_ip(c);       break;
+            case 5: auth_remove_ip(c);    break;
+        }
     }
 }
 
