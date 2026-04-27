@@ -6103,21 +6103,20 @@ static void release_record_read(KeysetRecordRead *r) {
    Honours offset/limit at emit time. Excluded keys, joins, projections, and
    rows_fmt all mirror the behaviour of idx_find_parallel / adv_search_cb.
    Returns the number of rows printed. */
-static int keyset_find_from_or(const char *db_root, const char *object,
-                               const Schema *sch, CriteriaNode *tree,
-                               CriteriaNode *or_node,
-                               ExcludedKeys *excluded, int offset, int limit,
-                               const char **proj_fields, int proj_count,
-                               FieldSchema *fs, int rows_fmt, char csv_delim,
-                               JoinSpec *joins, int njoins,
-                               QueryDeadline *dl, int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
-    if (!ks) return 0;
-    if (dl->timed_out) { keyset_free(ks); return 0; }
-
-    /* Pure-OR (root itself is the or_node) — every KeySet member matches,
-       no need to re-evaluate the tree against each record. */
-    int need_rematch = (tree != or_node && tree->kind != CNODE_OR);
+/* Walk a pre-built KeySet, fetch each record, optionally re-match against a
+   tree, and emit per the requested format. Used by both OR-union and AND-
+   intersection paths (the difference is just how the KeySet was built and
+   whether rematch is needed). Caller owns the KeySet lifecycle. */
+static int keyset_emit_find(const char *db_root, const char *object,
+                            const Schema *sch, KeySet *ks,
+                            CriteriaNode *tree_for_rematch,  /* NULL = skip */
+                            ExcludedKeys *excluded, int offset, int limit,
+                            const char **proj_fields, int proj_count,
+                            FieldSchema *fs, int rows_fmt, char csv_delim,
+                            JoinSpec *joins, int njoins, QueryDeadline *dl) {
+    int need_rematch = (tree_for_rematch != NULL);
+    CriteriaNode *tree = tree_for_rematch;
+    (void)tree;  /* used only when need_rematch */
 
     int count = 0, printed = 0;
     int dl_counter = 0;
@@ -6273,8 +6272,57 @@ static int keyset_find_from_or(const char *db_root, const char *object,
         if (!found) continue;
     }
 
-    keyset_free(ks);
     return printed;
+}
+
+/* OR index-union find: build KeySet from indexed-OR children, then emit. */
+static int keyset_find_from_or(const char *db_root, const char *object,
+                               const Schema *sch, CriteriaNode *tree,
+                               CriteriaNode *or_node,
+                               ExcludedKeys *excluded, int offset, int limit,
+                               const char **proj_fields, int proj_count,
+                               FieldSchema *fs, int rows_fmt, char csv_delim,
+                               JoinSpec *joins, int njoins,
+                               QueryDeadline *dl, int *out_budget_exceeded) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
+    if (!ks) return 0;
+    if (dl->timed_out) { keyset_free(ks); return 0; }
+
+    /* Pure-OR (root itself is the or_node) — every KeySet member matches,
+       no need to re-evaluate the tree against each record. */
+    int need_rematch = (tree != or_node && tree->kind != CNODE_OR);
+
+    int rc = keyset_emit_find(db_root, object, sch, ks,
+                              need_rematch ? tree : NULL,
+                              excluded, offset, limit,
+                              proj_fields, proj_count, fs, rows_fmt, csv_delim,
+                              joins, njoins, dl);
+    keyset_free(ks);
+    return rc;
+}
+
+/* AND index-intersection find: build KeySet from intersection of N indexed
+   leaves (most-selective first), then emit. Stage 1's all-eligible restriction
+   means no rematch is ever needed — the intersection already enforces every
+   leaf in the AND tree. */
+static int keyset_find_from_intersect(const char *db_root, const char *object,
+                                      const Schema *sch, QueryPlan *plan,
+                                      ExcludedKeys *excluded, int offset, int limit,
+                                      const char **proj_fields, int proj_count,
+                                      FieldSchema *fs, int rows_fmt, char csv_delim,
+                                      JoinSpec *joins, int njoins, QueryDeadline *dl) {
+    KeySet *ks = intersect_indexed_leaves(db_root, object,
+                                          plan->intersect_leaves,
+                                          plan->intersect_paths,
+                                          plan->intersect_count, dl);
+    if (!ks) return 0;
+    int rc = keyset_emit_find(db_root, object, sch, ks,
+                              NULL,
+                              excluded, offset, limit,
+                              proj_fields, proj_count, fs, rows_fmt, csv_delim,
+                              joins, njoins, dl);
+    keyset_free(ks);
+    return rc;
 }
 
 /* Forward decl — defined below. */
@@ -6283,14 +6331,12 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
 /* Run the aggregate pipeline over records keyed by an OR index-union KeySet.
    Tree-match is performed by agg_scan_cb itself (it checks ctx->tree), so
    both Shape C (pure OR) and hybrid (AND + OR) reach the correct records. */
-static void keyset_agg_from_or(const char *db_root, const char *object,
-                               const Schema *sch, void *agg_ctx,
-                               CriteriaNode *or_node, QueryDeadline *dl,
-                               int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
-    if (!ks) return;
-    if (dl->timed_out) { keyset_free(ks); return; }
-
+/* Walk a pre-built KeySet and feed each record through agg_scan_cb. agg_scan_cb
+   reads ctx->tree internally — caller nullifies tree to skip rematch (used by
+   AND-intersection where the keyset is already exact). */
+static void keyset_emit_agg(const char *db_root, const char *object,
+                            const Schema *sch, KeySet *ks, void *agg_ctx,
+                            QueryDeadline *dl) {
     int dl_counter = 0;
     for (size_t b = 0; b < ks->cap; b++) {
         if (query_deadline_tick(dl, &dl_counter)) break;
@@ -6323,6 +6369,32 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
         }
         munmap(map, st.st_size);
     }
+}
+
+static void keyset_agg_from_or(const char *db_root, const char *object,
+                               const Schema *sch, void *agg_ctx,
+                               CriteriaNode *or_node, QueryDeadline *dl,
+                               int *out_budget_exceeded) {
+    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
+    if (!ks) return;
+    if (dl->timed_out) { keyset_free(ks); return; }
+    keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
+    keyset_free(ks);
+}
+
+/* AND index-intersection aggregate: build KeySet from intersection, then walk.
+   Caller must set agg_ctx->tree=NULL so agg_scan_cb skips the redundant
+   criteria_match_tree call (Stage 1 all-eligible restriction guarantees the
+   intersection result is exact). */
+static void keyset_agg_from_intersect(const char *db_root, const char *object,
+                                      const Schema *sch, void *agg_ctx,
+                                      QueryPlan *plan, QueryDeadline *dl) {
+    KeySet *ks = intersect_indexed_leaves(db_root, object,
+                                          plan->intersect_leaves,
+                                          plan->intersect_paths,
+                                          plan->intersect_count, dl);
+    if (!ks) return;
+    keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
     keyset_free(ks);
 }
 
@@ -7055,14 +7127,6 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
-    /* Stage 1: find doesn't yet consume PRIMARY_INTERSECT (Stage 2 wires it).
-       Downgrade to PRIMARY_LEAF using the most-selective intersection leaf so
-       behavior matches today exactly until the find executor is in place. */
-    if (plan.kind == PRIMARY_INTERSECT) {
-        plan.kind = PRIMARY_LEAF;
-        plan.primary_leaf = plan.intersect_leaves[0];
-        memcpy(plan.primary_idx_path, plan.intersect_paths[0], PATH_MAX);
-    }
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
@@ -7198,6 +7262,13 @@ int cmd_find(const char *db_root, const char *object,
         }
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
+    } else if (plan.kind == PRIMARY_INTERSECT) {
+        /* ===== AND INDEX-INTERSECTION FIND ===== */
+        keyset_find_from_intersect(db_root, object, &sch, &plan,
+                                   &excluded, offset, limit,
+                                   proj_fields, proj_count,
+                                   (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                                   rows_fmt, csv_delim, joins, njoins, &dl);
     } else if (plan.kind == PRIMARY_LEAF) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         SearchCriterion *pc = plan.primary_leaf;
@@ -8881,12 +8952,6 @@ int cmd_aggregate(const char *db_root, const char *object,
     }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
-    /* Stage 1: aggregate doesn't yet consume PRIMARY_INTERSECT — downgrade. */
-    if (plan.kind == PRIMARY_INTERSECT) {
-        plan.kind = PRIMARY_LEAF;
-        plan.primary_leaf = plan.intersect_leaves[0];
-        memcpy(plan.primary_idx_path, plan.intersect_paths[0], PATH_MAX);
-    }
 
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
@@ -8915,6 +8980,14 @@ int cmd_aggregate(const char *db_root, const char *object,
         else parallel_indexed_agg(&ctx, db_root, object, &sch, cc.entries, (int)cc.count);
 
         free(cc.entries);
+    } else if (plan.kind == PRIMARY_INTERSECT) {
+        /* AND of indexed leaves on rangeable ops — build intersection KeySet,
+           walk, aggregate. Nullify ctx.tree so agg_scan_cb skips the redundant
+           criteria_match_tree call (intersection already exact). */
+        CriteriaNode *saved_tree = ctx.tree;
+        ctx.tree = NULL;
+        keyset_agg_from_intersect(db_root, object, &sch, &ctx, &plan, &dl);
+        ctx.tree = saved_tree;
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union, feed each keyed
            record through agg_scan_cb (which re-checks the full tree). */
