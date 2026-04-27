@@ -656,6 +656,12 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 int cmd_drop_object(const char *db_root, const char *dir, const char *object,
                     int if_exists);
 
+/* Object discovery — used by shard-cli to populate menus. Both are read-level
+   operations: list-objects needs tenant scope (or broader); describe-object
+   needs object scope (or broader). */
+int cmd_list_objects(const char *db_root, const char *dir);
+int cmd_describe_object(const char *db_root, const char *dir, const char *object);
+
 /* Schema mutations */
 int cmd_rename_field(const char *db_root, const char *object,
                      const char *old_name, const char *new_name);

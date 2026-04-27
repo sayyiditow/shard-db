@@ -865,6 +865,15 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
+    /* list-objects only needs `dir` — dispatch before the mode/dir/object
+       required-field check below. Auth was checked earlier; cmd_list_objects
+       emits its own dir-required error if dir is empty. */
+    if (mode && strcmp(mode, "list-objects") == 0) {
+        cmd_list_objects(g_db_root, dir ? dir : "");
+        free(mode); free(dir); free(object);
+        return;
+    }
+
     if (!mode || !dir || !object) {
         OUT("{\"error\":\"Missing mode, dir, or object\"}\n");
         free(mode); free(dir); free(object);
@@ -918,6 +927,14 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     struct stat obj_st;
     if (stat(obj_check, &obj_st) != 0) {
         OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
+        free(mode); free(dir); free(object);
+        return;
+    }
+
+    /* describe-object — read-only schema/index/count snapshot. No object lock
+       needed since we're just reading static metadata + an atomic counter. */
+    if (strcmp(mode, "describe-object") == 0) {
+        cmd_describe_object(g_db_root, dir, object);
         free(mode); free(dir); free(object);
         return;
     }

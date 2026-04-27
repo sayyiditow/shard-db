@@ -30,7 +30,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-find-cursor.sh               # Keyset cursor pagination on find      (41)
 ./tests/test-tls.sh                       # Native TLS 1.3 (auto-skips if no openssl) (12)
 ./tests/test-and-intersection.sh          # AND index intersection (count/find/agg) (27)
-# Total: 484 tests
+./tests/test-describe.sh                  # list-objects + describe-object        (26)
+# Total: 510 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -150,6 +151,10 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db shard-stats <dir> <obj>                # Per-shard load table
 ./shard-db db-dirs                                # List allowed tenant dirs
 ./shard-db vacuum-check                           # Objects needing vacuum
+
+# Object discovery (JSON-only — used by shard-cli to populate menus)
+./shard-db query '{"mode":"list-objects","dir":"<dir>"}'
+./shard-db query '{"mode":"describe-object","dir":"<dir>","object":"<obj>"}'
 ```
 
 ## JSON query protocol

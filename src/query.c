@@ -8317,6 +8317,137 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
     return 0;
 }
 
+/* List the objects under a tenant. Reads schema.conf for entries that begin
+   with "<dir>:". Used by shard-cli's tenant browser. */
+int cmd_list_objects(const char *db_root, const char *dir) {
+    if (!dir || !dir[0]) { OUT("{\"error\":\"dir is required\"}\n"); return 1; }
+    if (!is_valid_dir(dir)) {
+        OUT("{\"error\":\"unknown dir\",\"dir\":\"%s\"}\n", dir);
+        return 1;
+    }
+
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    FILE *f = fopen(schema_path, "r");
+    OUT("{\"dir\":\"%s\",\"objects\":[", dir);
+    if (f) {
+        char prefix[512];
+        int plen = snprintf(prefix, sizeof(prefix), "%s:", dir);
+        char line[1024];
+        int printed = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            if (strncmp(line, prefix, (size_t)plen) != 0) continue;
+            const char *name_start = line + plen;
+            const char *name_end = strchr(name_start, ':');
+            if (!name_end || name_end == name_start) continue;
+            OUT("%s\"%.*s\"", printed ? "," : "",
+                (int)(name_end - name_start), name_start);
+            printed++;
+        }
+        fclose(f);
+    }
+    OUT("]}\n");
+    return 0;
+}
+
+static const char *field_type_str(enum FieldType t) {
+    switch (t) {
+        case FT_VARCHAR:  return "varchar";
+        case FT_LONG:     return "long";
+        case FT_INT:      return "int";
+        case FT_SHORT:    return "short";
+        case FT_DOUBLE:   return "double";
+        case FT_BOOL:     return "bool";
+        case FT_BYTE:     return "byte";
+        case FT_NUMERIC:  return "numeric";
+        case FT_DATE:     return "date";
+        case FT_DATETIME: return "datetime";
+        default:          return "unknown";
+    }
+}
+
+/* Describe an object: schema (typed fields), indexes, splits, max_key, max_value,
+   live record_count. Used by shard-cli to populate criteria builders + table
+   headers without forcing the caller to read the on-disk fields.conf. */
+int cmd_describe_object(const char *db_root, const char *dir, const char *object) {
+    if (!dir || !dir[0])    { OUT("{\"error\":\"dir is required\"}\n"); return 1; }
+    if (!object || !object[0]) { OUT("{\"error\":\"object is required\"}\n"); return 1; }
+
+    char obj_root[PATH_MAX];
+    snprintf(obj_root, sizeof(obj_root), "%s/%s/%s", db_root, dir, object);
+    struct stat st;
+    if (stat(obj_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        OUT("{\"error\":\"object not found\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 1;
+    }
+
+    /* load_schema / load_typed_schema take an `effective_root` (db_root/dir)
+       and the bare object name as separate args. eff_obj kept around for
+       get_live_count which uses the joined form. */
+    char effective_root[PATH_MAX];
+    snprintf(effective_root, sizeof(effective_root), "%s/%s", db_root, dir);
+    char eff_obj[PATH_MAX];
+    snprintf(eff_obj, sizeof(eff_obj), "%s/%s", dir, object);
+
+    Schema sch = load_schema(effective_root, object);
+    TypedSchema *ts = load_typed_schema(effective_root, object);
+
+    OUT("{\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"max_value\":%d,\"slot_size\":%d",
+        dir, object, sch.splits, sch.max_key, sch.max_value, sch.slot_size);
+
+    OUT(",\"fields\":[");
+    if (ts && ts->nfields > 0) {
+        int printed = 0;
+        for (int i = 0; i < ts->nfields; i++) {
+            const TypedField *f = &ts->fields[i];
+            if (f->removed) continue;
+            OUT("%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%d",
+                printed ? "," : "", f->name, field_type_str(f->type), f->size);
+            if (f->type == FT_NUMERIC)
+                OUT(",\"scale\":%d", f->numeric_scale);
+            switch (f->default_kind) {
+                case DK_LITERAL:     OUT(",\"default\":\"%s\"", f->default_val); break;
+                case DK_AUTO_CREATE: OUT(",\"default\":\"auto_create\""); break;
+                case DK_AUTO_UPDATE: OUT(",\"default\":\"auto_update\""); break;
+                case DK_SEQ:         OUT(",\"default\":\"seq(%s)\"", f->default_val); break;
+                case DK_UUID:        OUT(",\"default\":\"uuid()\""); break;
+                case DK_RANDOM:      OUT(",\"default\":\"random(%s)\"", f->default_val); break;
+                case DK_NONE:        break;
+            }
+            OUT("}");
+            printed++;
+        }
+    }
+    OUT("]");
+
+    /* Index list: read $obj_root/indexes/index.conf — one declared index
+       per line. The .idx files only materialize after the first insert, so
+       scanning them would miss empty objects. */
+    OUT(",\"indexes\":[");
+    char idx_conf[PATH_MAX];
+    snprintf(idx_conf, sizeof(idx_conf), "%s/indexes/index.conf", obj_root);
+    FILE *iconf = fopen(idx_conf, "r");
+    if (iconf) {
+        char line[256];
+        int printed = 0;
+        while (fgets(line, sizeof(line), iconf)) {
+            char *end = line + strlen(line);
+            while (end > line && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ')) *--end = '\0';
+            if (line[0] == '\0' || line[0] == '#') continue;
+            OUT("%s\"%s\"", printed ? "," : "", line);
+            printed++;
+        }
+        fclose(iconf);
+    }
+    OUT("]");
+
+    int rc_count = get_live_count(db_root, eff_obj);
+    OUT(",\"record_count\":%d}\n", rc_count);
+    return 0;
+}
+
 /* ========== AGGREGATE ========== */
 
 enum AggFn { AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX };
