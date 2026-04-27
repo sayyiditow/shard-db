@@ -52,13 +52,14 @@ static char *run_capture(const char *cmd) {
 /* ---- Server menu ---- */
 
 static void menu_server(void) {
+    int sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "start",   "Daemonize ./shard-db on PORT" },
             { "stop",    "SIGTERM the running daemon (drains in-flight writes)" },
             { "status",  "Print PID/port if running" },
         };
-        int choice = tui_menu("Server", items, 3);
+        int choice = tui_menu_at("Server", items, 3, &sel);
         if (choice < 0) return;
         const char *cmd = NULL;
         switch (choice) {
@@ -442,6 +443,7 @@ static void query_find(CliConn *c) {
 static void menu_query(void) {
     CliConn *c = get_conn();
     if (!c) return;
+    int sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "insert", "single insert by key with field values" },
@@ -450,9 +452,9 @@ static void menu_query(void) {
             { "find",   "criteria builder + offset/limit, table output" },
             { "count",  "criteria builder, returns matching count" },
         };
-        int sel = tui_menu("Query", items, 5);
-        if (sel < 0) return;
-        switch (sel) {
+        int choice = tui_menu_at("Query", items, 5, &sel);
+        if (choice < 0) return;
+        switch (choice) {
             case 0: query_insert(c); break;
             case 1: query_get(c);    break;
             case 2: query_exists(c); break;
@@ -710,7 +712,10 @@ static void menu_schema(void) {
     CliConn *c = get_conn();
     if (!c) return;
     /* Loop the schema menu so ← inside a sub-action returns here, not all
-       the way to the main menu. ← in this menu returns to the main menu. */
+       the way to the main menu. ← in this menu returns to the main menu.
+       sel persists across iterations so back-nav lands on the previously-
+       used row, not at the top. */
+    int sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "create-object", "name + splits + max_key + fields/indexes CSV" },
@@ -722,9 +727,9 @@ static void menu_schema(void) {
             { "remove-index",  "drop an existing index" },
             { "reindex",       "rebuild indexes (all / tenant / object)" },
         };
-        int sel = tui_menu("Schema", items, 8);
-        if (sel < 0) return;
-        switch (sel) {
+        int choice = tui_menu_at("Schema", items, 8, &sel);
+        if (choice < 0) return;
+        switch (choice) {
             case 0: schema_create_object(c); break;
             case 1: schema_drop_object(c);   break;
             case 2: schema_add_field(c);     break;
@@ -759,6 +764,7 @@ static void simple_op(CliConn *c, const char *mode, const char *title, int confi
 static void menu_maintenance(void) {
     CliConn *c = get_conn();
     if (!c) return;
+    int sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "vacuum",   "compact tombstones + (optional) reshard" },
@@ -766,9 +772,9 @@ static void menu_maintenance(void) {
             { "truncate", "delete all records (confirm)" },
             { "backup",   "snapshot copy of the object's data" },
         };
-        int sel = tui_menu("Maintenance", items, 4);
-        if (sel < 0) return;
-        switch (sel) {
+        int choice = tui_menu_at("Maintenance", items, 4, &sel);
+        if (choice < 0) return;
+        switch (choice) {
             case 0: simple_op(c, "vacuum",   "vacuum",   0); break;
             case 1: simple_op(c, "recount",  "recount",  0); break;
             case 2: simple_op(c, "truncate", "truncate", 1); break;
@@ -891,6 +897,7 @@ static void auth_remove_ip(CliConn *c) {
 static void menu_auth(void) {
     CliConn *c = get_conn();
     if (!c) return;
+    int sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "list-tokens",  "fingerprint + scope + perm of every token" },
@@ -900,15 +907,303 @@ static void menu_auth(void) {
             { "add-ip",       "add a trusted IP (v4 or v6)" },
             { "remove-ip",    "pick a trusted IP to remove" },
         };
-        int sel = tui_menu("Auth", items, 6);
-        if (sel < 0) return;
-        switch (sel) {
+        int choice = tui_menu_at("Auth", items, 6, &sel);
+        if (choice < 0) return;
+        switch (choice) {
             case 0: auth_list_tokens(c);  break;
             case 1: auth_add_token(c);    break;
             case 2: auth_remove_token(c); break;
             case 3: auth_list_ips(c);     break;
             case 4: auth_add_ip(c);       break;
             case 5: auth_remove_ip(c);    break;
+        }
+    }
+}
+
+/* ---- Migrate menu ---- schema export/import for local→prod bootstrap.
+   No data, no tokens — just object/dir/index definitions. Roundtrip uses
+   the existing db-dirs, list-objects, describe-object, and create-object
+   modes; no server-side changes needed. */
+
+/* Reconstruct the "name:type[:size][:scale]" spec string the daemon expects
+   when it parses a fields.conf entry. describe-object emits the on-disk
+   varchar size (= N+2 for the length prefix), so we strip 2 to recover the
+   user-facing N. Numeric P (precision) isn't preserved — describe-object
+   only round-trips S (scale) — so we default P=18 (max int64 digits) on
+   export. P is informational; it doesn't affect storage. */
+static void cached_field_to_spec(const CachedField *fd, char *out, size_t out_sz) {
+    if (strcmp(fd->type, "varchar") == 0) {
+        int n = fd->size - 2;
+        if (n < 0) n = 0;
+        snprintf(out, out_sz, "%s:%s:%d", fd->name, fd->type, n);
+    } else if (strcmp(fd->type, "numeric") == 0) {
+        snprintf(out, out_sz, "%s:%s:18,%d", fd->name, fd->type, fd->scale);
+    } else {
+        snprintf(out, out_sz, "%s:%s", fd->name, fd->type);
+    }
+}
+
+static void migrate_export(CliConn *c) {
+    FormField fs[1] = {0};
+    fs[0].label = "output path"; fs[0].kind = FF_TEXT;
+    snprintf(fs[0].value, sizeof(fs[0].value), "schema.json");
+    if (tui_form("export-schema → file", fs, 1) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("export", "output path required"); return; }
+
+    FILE *out = fopen(fs[0].value, "w");
+    if (!out) { tui_alert("export", "cannot open output file for writing"); return; }
+
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
+        tui_alert("error", "db-dirs failed"); fclose(out); return;
+    }
+    char **dirs = NULL; int ndirs = 0;
+    collect_string_array(resp, NULL, &dirs, &ndirs);
+    free(resp);
+
+    fprintf(out, "{\n");
+    fprintf(out, "  \"version\": \"2026.05\",\n");
+    fprintf(out, "  \"dirs\": [");
+    for (int i = 0; i < ndirs; i++) fprintf(out, "%s\"%s\"", i ? "," : "", dirs[i]);
+    fprintf(out, "],\n");
+    fprintf(out, "  \"objects\": [\n");
+
+    int total = 0;
+    int first = 1;
+    for (int i = 0; i < ndirs; i++) {
+        char req[256];
+        snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dirs[i]);
+        char *list_resp = NULL;
+        if (cli_query(c, req, &list_resp, &rlen) != 0) continue;
+        char **objs = NULL; int nobjs = 0;
+        collect_string_array(list_resp, "objects", &objs, &nobjs);
+        free(list_resp);
+        for (int j = 0; j < nobjs; j++) {
+            ObjectInfo oi;
+            if (describe_object(c, dirs[i], objs[j], &oi) != 0) continue;
+            if (!first) fprintf(out, ",\n");
+            fprintf(out,
+                "    {\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"fields\":[",
+                oi.dir, oi.object, oi.splits, oi.max_key);
+            for (int f = 0; f < oi.nfields; f++) {
+                char spec[256];
+                cached_field_to_spec(&oi.fields[f], spec, sizeof(spec));
+                fprintf(out, "%s\"%s\"", f ? "," : "", spec);
+            }
+            fprintf(out, "],\"indexes\":[");
+            for (int x = 0; x < oi.nindexes; x++)
+                fprintf(out, "%s\"%s\"", x ? "," : "", oi.indexes[x]);
+            fprintf(out, "]}");
+            first = 0;
+            total++;
+        }
+        for (int j = 0; j < nobjs; j++) free(objs[j]);
+        free(objs);
+    }
+    fprintf(out, "\n  ]\n}\n");
+    fclose(out);
+
+    for (int i = 0; i < ndirs; i++) free(dirs[i]);
+    free(dirs);
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "exported %d object%s across %d tenant%s to %s\n\n"
+        "no data and no tokens were copied — only schema/index definitions.\n"
+        "use migrate import on the prod machine to recreate.",
+        total, total == 1 ? "" : "s",
+        ndirs, ndirs == 1 ? "" : "s", fs[0].value);
+    tui_alert("export-schema", msg);
+}
+
+/* Walk a JSON array of object entries and dispatch one create-object per row.
+   Each row has dir/object/splits/max_key/fields[]/indexes[]. We pass the
+   entry's `fields` and `indexes` arrays through verbatim — the manifest's
+   shape exactly matches what create-object expects. */
+typedef struct {
+    CliConn *c;
+    int      created;
+    int      skipped;   /* if_not_exists hit */
+    int      failed;
+    int      if_not_exists;
+} ImportCtx;
+
+static int import_object_cb(const char *elem, size_t len, void *ctx) {
+    ImportCtx *ic = (ImportCtx *)ctx;
+
+    /* Wedge "if_not_exists":true into the create-object request between
+       its closing brace and the elem's bytes. Easiest: copy elem verbatim,
+       prepend mode + suffix-inject the flag. */
+    char dir[64] = "", object[64] = "";
+    /* We need dir+object to log progress; everything else passed through. */
+    /* Tiny manual scan for our two keys. */
+    const char *p = elem, *end = elem + len;
+    while (p < end) {
+        const char *k = strchr(p, '"');
+        if (!k || k >= end) break;
+        k++;
+        const char *kend = strchr(k, '"');
+        if (!kend || kend >= end) break;
+        size_t klen = (size_t)(kend - k);
+        const char *colon = strchr(kend, ':');
+        if (!colon || colon >= end) break;
+        const char *vs = colon + 1;
+        while (vs < end && (*vs == ' ' || *vs == '\t')) vs++;
+        if (vs >= end) break;
+        if (klen == 3 && memcmp(k, "dir", 3) == 0 && *vs == '"') {
+            const char *ve = strchr(vs + 1, '"');
+            if (ve && (size_t)(ve - vs - 1) < sizeof(dir)) {
+                memcpy(dir, vs + 1, ve - vs - 1);
+                dir[ve - vs - 1] = '\0';
+            }
+        } else if (klen == 6 && memcmp(k, "object", 6) == 0 && *vs == '"') {
+            const char *ve = strchr(vs + 1, '"');
+            if (ve && (size_t)(ve - vs - 1) < sizeof(object)) {
+                memcpy(object, vs + 1, ve - vs - 1);
+                object[ve - vs - 1] = '\0';
+            }
+        }
+        p = colon + 1;
+        /* Skip past this value naively — fine since we only care about two
+           keys and any miss just means we move on. */
+        const char *next = strchr(p, ',');
+        if (!next || next >= end) break;
+        p = next + 1;
+    }
+
+    /* Build request: prepend mode, append if_not_exists if requested. */
+    size_t req_cap = len + 256;
+    char *req = malloc(req_cap);
+    /* The manifest entry is {"dir":"...","object":"...","splits":...,...}.
+       create-object expects the same shape under mode "create-object", so
+       we just prepend "mode":"create-object", into the entry. */
+    if (len < 2) { free(req); ic->failed++; return 0; }
+    int n;
+    if (ic->if_not_exists) {
+        n = snprintf(req, req_cap,
+            "{\"mode\":\"create-object\",\"if_not_exists\":true,%.*s",
+            (int)(len - 1), elem + 1);
+    } else {
+        n = snprintf(req, req_cap,
+            "{\"mode\":\"create-object\",%.*s",
+            (int)(len - 1), elem + 1);
+    }
+    (void)n;
+
+    char *resp = NULL; size_t rlen = 0;
+    int rc = cli_query(ic->c, req, &resp, &rlen);
+    free(req);
+    if (rc != 0 || !resp) { ic->failed++; if (resp) free(resp); return 0; }
+    /* Parse status/error from response. */
+    if (strstr(resp, "\"status\":\"created\""))    ic->created++;
+    else if (strstr(resp, "\"status\":\"exists\""))ic->skipped++;
+    else if (strstr(resp, "\"error\":"))           ic->failed++;
+    else                                           ic->created++;
+    free(resp);
+    return 0;
+}
+
+/* Walk the JSON manifest array. Reuses the json_array_iter logic from views.c
+   indirectly via collect_string_array isn't quite the right shape — we need
+   the per-element raw slice. So mini-walker inline. */
+static int import_walk_objects(const char *manifest, ImportCtx *ic) {
+    /* Find "objects": [ ... ]. */
+    const char *p = strstr(manifest, "\"objects\"");
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    p++;
+    int depth = 0;
+    const char *elem_start = NULL;
+    while (*p) {
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (*p == '"') p++;
+            continue;
+        }
+        if (*p == '{') {
+            if (depth == 0) elem_start = p;
+            depth++;
+        } else if (*p == '}') {
+            depth--;
+            if (depth == 0 && elem_start) {
+                size_t len = (size_t)(p - elem_start + 1);
+                import_object_cb(elem_start, len, ic);
+                elem_start = NULL;
+            }
+        } else if (*p == ']' && depth == 0) {
+            return 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static void migrate_import(CliConn *c) {
+    FormField fs[2] = {0};
+    fs[0].label = "input path"; fs[0].kind = FF_TEXT;
+    snprintf(fs[0].value, sizeof(fs[0].value), "schema.json");
+    static const char *const ne_choices[] = { "skip-existing", "fail-on-collision", NULL };
+    fs[1].label = "on collision"; fs[1].kind = FF_CHOICE; fs[1].choices = ne_choices;
+    snprintf(fs[1].value, sizeof(fs[1].value), "skip-existing");
+    if (tui_form("import-schema ← file", fs, 2) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("import", "input path required"); return; }
+
+    FILE *in = fopen(fs[0].value, "r");
+    if (!in) { tui_alert("import", "cannot open file for reading"); return; }
+    fseek(in, 0, SEEK_END);
+    long sz = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100*1024*1024) {
+        tui_alert("import", "manifest is empty or larger than 100 MB");
+        fclose(in); return;
+    }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { tui_alert("import", "out of memory"); fclose(in); return; }
+    if (fread(buf, 1, (size_t)sz, in) != (size_t)sz) {
+        tui_alert("import", "short read");
+        free(buf); fclose(in); return;
+    }
+    buf[sz] = '\0';
+    fclose(in);
+
+    ImportCtx ic = { c, 0, 0, 0,
+                     strcmp(fs[1].value, "skip-existing") == 0 ? 1 : 0 };
+    if (import_walk_objects(buf, &ic) != 0) {
+        tui_alert("import", "manifest is missing 'objects' array — not a valid export");
+        free(buf); return;
+    }
+    free(buf);
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "import complete:\n"
+        "  created : %d\n"
+        "  skipped : %d   (already existed)\n"
+        "  failed  : %d\n\n"
+        "no data was copied — only schema/index definitions.",
+        ic.created, ic.skipped, ic.failed);
+    tui_alert("import-schema", msg);
+}
+
+static void menu_migrate(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[] = {
+            { "export schema", "write all dir/object/index definitions to a JSON file (no data)" },
+            { "import schema", "replay an exported manifest against this DB (recreate objects)" },
+        };
+        int choice = tui_menu_at("Migrate", items, 2, &sel);
+        if (choice < 0) return;
+        switch (choice) {
+            case 0: migrate_export(c); break;
+            case 1: migrate_import(c); break;
         }
     }
 }
@@ -949,19 +1244,21 @@ int main(int argc, char **argv) {
     tui_status("connected to %s:%d  tls=%s",
                g_cli_host, g_cli_port, g_cli_tls_enable ? "on" : "off");
 
+    int top_sel = 0;
     for (;;) {
         MenuItem items[] = {
             { "Server",      "start / stop / status" },
             { "Browse",      "tenants → objects → describe" },
             { "Query",       "insert / get / find / count / exists" },
-            { "Schema",      "create/drop object, fields, indexes" },
+            { "Schema",      "create/drop object, fields, indexes, reindex" },
             { "Maintenance", "vacuum / recount / truncate / backup" },
             { "Auth",        "tokens and trusted-IP allowlist" },
+            { "Migrate",     "export/import schema to bootstrap another DB (no data)" },
             { "Stats",       "live counters, refreshes every 5s" },
             { "Quit",        "exit shard-cli" },
         };
-        int choice = tui_menu("main menu", items, 8);
-        if (choice < 0 || choice == 7) break;
+        int choice = tui_menu_at("main menu", items, 9, &top_sel);
+        if (choice < 0 || choice == 8) break;
         switch (choice) {
             case 0: menu_server();      break;
             case 1: menu_browse();      break;
@@ -969,7 +1266,8 @@ int main(int argc, char **argv) {
             case 3: menu_schema();      break;
             case 4: menu_maintenance(); break;
             case 5: menu_auth();        break;
-            case 6: menu_stats();       break;
+            case 6: menu_migrate();     break;
+            case 7: menu_stats();       break;
         }
     }
 

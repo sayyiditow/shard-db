@@ -71,6 +71,12 @@ typedef struct {
 /* Show a vertical menu, return index of selection (-1 if user pressed q/ESC). */
 int tui_menu(const char *title, const MenuItem *items, int nitems);
 
+/* Same as tui_menu but uses *sel as the initial highlight position and writes
+   the user's last position back. Use this in section menus that loop on their
+   own dispatch so back-navigation returns to the previously-highlighted row
+   instead of jumping to the top. */
+int tui_menu_at(const char *title, const MenuItem *items, int nitems, int *sel);
+
 /* Pick a single value from a list of strings — used for tenant/object/field
    selection. Returns the chosen string (caller must NOT free) or NULL. */
 const char *tui_pick(const char *title, const char *const *values, int nvalues);

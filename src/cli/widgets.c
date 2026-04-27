@@ -131,9 +131,9 @@ int tui_confirm(const char *prompt) {
     return rc;
 }
 
-int tui_menu(const char *title, const MenuItem *items, int nitems) {
-    int sel = 0;
+int tui_menu_at(const char *title, const MenuItem *items, int nitems, int *sel_io) {
     if (nitems == 0) return -1;
+    int sel = (sel_io && *sel_io >= 0 && *sel_io < nitems) ? *sel_io : 0;
     for (;;) {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -166,16 +166,28 @@ int tui_menu(const char *title, const MenuItem *items, int nitems) {
             case KEY_END:   case 'G': sel = nitems - 1; break;
             case '\n': case '\r': case KEY_ENTER:
             case KEY_RIGHT: case 'l':
+                if (sel_io) *sel_io = sel;
                 return sel;
-            case 'q': case 27: case KEY_LEFT: case 'h': return -1;
+            case 'q': case 27: case KEY_LEFT: case 'h':
+                if (sel_io) *sel_io = sel;
+                return -1;
             default:
                 if (ch >= '1' && ch <= '9') {
                     int n = ch - '1';
-                    if (n < nitems) return n;
+                    if (n < nitems) {
+                        sel = n;
+                        if (sel_io) *sel_io = sel;
+                        return n;
+                    }
                 }
                 break;
         }
     }
+}
+
+int tui_menu(const char *title, const MenuItem *items, int nitems) {
+    int local = 0;
+    return tui_menu_at(title, items, nitems, &local);
 }
 
 const char *tui_pick(const char *title, const char *const *values, int nvalues) {
