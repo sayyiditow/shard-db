@@ -5707,22 +5707,116 @@ static CriteriaNode *find_fully_indexed_or(CriteriaNode *root,
 }
 
 typedef enum {
-    PRIMARY_NONE,     /* full scan */
-    PRIMARY_LEAF,     /* single indexed leaf drives btree_range */
-    PRIMARY_KEYSET    /* OR sub-tree drives index-union into a KeySet */
+    PRIMARY_NONE,         /* full scan */
+    PRIMARY_LEAF,         /* single indexed leaf drives btree_range */
+    PRIMARY_KEYSET,       /* OR sub-tree drives index-union into a KeySet */
+    PRIMARY_INTERSECT     /* AND of 2+ indexed leaves intersected via KeySet */
 } PrimaryKind;
+
+#define MAX_INTERSECT_LEAVES 8
 
 typedef struct {
     PrimaryKind kind;
     SearchCriterion *primary_leaf;   /* PRIMARY_LEAF */
     char primary_idx_path[PATH_MAX];
     CriteriaNode *or_node;           /* PRIMARY_KEYSET */
+
+    /* PRIMARY_INTERSECT: ordered (most-selective-first) by op_selectivity_rank.
+       Excess indexed leaves beyond MAX_INTERSECT_LEAVES stay as post-filters
+       in criteria_match_tree. */
+    SearchCriterion *intersect_leaves[MAX_INTERSECT_LEAVES];
+    char intersect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
+    int intersect_count;
 } QueryPlan;
+
+/* True if the operator yields a precise btree candidate set without needing
+   per-record verification. Excludes substring/suffix ops (LIKE/CONTAINS/...
+   need check_primary) and large-set ops (NEQ/NOT_IN/NOT_LIKE/NOT_CONTAINS —
+   intersecting with a near-everything set wastes work; the existing primary-
+   leaf path with subtraction shortcut is already tighter for these). */
+static int op_eligible_for_intersect(enum SearchOp op) {
+    return op == OP_EQUAL ||
+           op == OP_LESS || op == OP_GREATER ||
+           op == OP_LESS_EQ || op == OP_GREATER_EQ ||
+           op == OP_BETWEEN || op == OP_IN ||
+           op == OP_STARTS_WITH;
+}
+
+/* Lower rank = more selective ⇒ walk first to bound the running intersection.
+   No stats yet; this is an operator-class heuristic, refined later. */
+static int op_selectivity_rank(enum SearchOp op) {
+    switch (op) {
+        case OP_EQUAL:       return 0;
+        case OP_STARTS_WITH: return 1;
+        case OP_BETWEEN:     return 2;
+        case OP_IN:          return 3;
+        case OP_LESS_EQ:
+        case OP_GREATER_EQ:
+        case OP_LESS:
+        case OP_GREATER:     return 4;
+        default:             return 9;
+    }
+}
+
+/* Collect indexable AND-children whose ops are intersection-eligible, sorted
+   by selectivity rank. Returns the count (≥2 → intersection plan viable).
+
+   Stage 1 restriction: ALL AND children must be eligible+indexed. Mixed
+   trees (e.g., one LIKE leaf alongside indexed eq/range leaves) stay on
+   PRIMARY_LEAF where the existing path post-filters via criteria_match_tree.
+   Stage 2+ will lift this to feed intersection survivors into the post-filter
+   pipeline for mixed trees. */
+static int find_intersect_leaves(CriteriaNode *root,
+                                 const char *db_root, const char *object,
+                                 SearchCriterion *out_leaves[MAX_INTERSECT_LEAVES],
+                                 char out_paths[MAX_INTERSECT_LEAVES][PATH_MAX]) {
+    if (!root || root->kind != CNODE_AND) return 0;
+    if (root->n_children < 2 || root->n_children > MAX_INTERSECT_LEAVES) return 0;
+    int n = 0;
+    for (int i = 0; i < root->n_children; i++) {
+        CriteriaNode *c = root->children[i];
+        if (c->kind != CNODE_LEAF) return 0;
+        if (!op_eligible_for_intersect(c->leaf.op)) return 0;
+        char path[PATH_MAX];
+        if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) return 0;
+        out_leaves[n] = &c->leaf;
+        memcpy(out_paths[n], path, PATH_MAX);
+        n++;
+    }
+    if (n < 2) return 0;
+    /* Insertion sort by selectivity rank — n is tiny (≤ MAX_INTERSECT_LEAVES). */
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0; j--) {
+            int a = op_selectivity_rank(out_leaves[j]->op);
+            int b = op_selectivity_rank(out_leaves[j-1]->op);
+            if (a >= b) break;
+            SearchCriterion *tl = out_leaves[j];
+            out_leaves[j] = out_leaves[j-1];
+            out_leaves[j-1] = tl;
+            char tp[PATH_MAX];
+            memcpy(tp, out_paths[j], PATH_MAX);
+            memcpy(out_paths[j], out_paths[j-1], PATH_MAX);
+            memcpy(out_paths[j-1], tp, PATH_MAX);
+        }
+    }
+    return n;
+}
 
 static QueryPlan choose_primary_source(CriteriaNode *tree,
                                        const char *db_root, const char *object) {
     QueryPlan p = {0};
     if (!tree) { p.kind = PRIMARY_NONE; return p; }
+
+    /* Try intersection first — if 2+ indexable AND-leaves on rangeable ops
+       exist, intersecting candidate hashes is faster than primary-leaf +
+       per-record post-filter for selective queries. */
+    int ni = find_intersect_leaves(tree, db_root, object,
+                                   p.intersect_leaves, p.intersect_paths);
+    if (ni >= 2) {
+        p.kind = PRIMARY_INTERSECT;
+        p.intersect_count = ni;
+        return p;
+    }
 
     char idx_path[PATH_MAX] = "";
     SearchCriterion *leaf = find_primary_leaf(tree, db_root, object,
@@ -5743,6 +5837,121 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
 
     p.kind = PRIMARY_NONE;
     return p;
+}
+
+/* ========== AND index-intersection (KeySet fast path) ==========
+
+   For pure AND trees where every child is an indexed leaf on a btree-rangeable
+   operator: walk each leaf's btree, intersect candidate hash sets via KeySet,
+   skip the per-record fetch + criteria_match_tree loop entirely. Win compounds
+   when the primary leaf has many matches but the intersection is small —
+   today's primary-leaf path pays O(primary_matches) record fetches; this path
+   pays O(sum of btree walks). */
+
+typedef struct {
+    KeySet *running;       /* KeySet from prior leaves (probe target) */
+    KeySet *out;           /* survivors that hit `running` for this leaf */
+    QueryDeadline *deadline;
+    int dl_counter;
+} IntersectProbeCtx;
+
+/* btree callback for the second-and-later leaves: drop hashes that aren't
+   already in `running`, surviving hashes go into `out`. */
+static int intersect_probe_cb(const char *val, size_t vlen,
+                              const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;
+    IntersectProbeCtx *p = (IntersectProbeCtx *)ctx;
+    if (query_deadline_tick(p->deadline, &p->dl_counter)) return -1;
+    if (keyset_contains(p->running, hash16))
+        keyset_insert(p->out, hash16);
+    return 0;
+}
+
+/* Estimate KeySet capacity from index file size. anchor count ≈ size / page,
+   ~16 leaf entries per anchor block. Generous oversize is fine — KeySet is
+   open-addressed and tolerates load factor up to 0.5 by construction. */
+static size_t leaf_capacity_hint(const char *idx_path) {
+    struct stat st;
+    if (stat(idx_path, &st) != 0 || st.st_size == 0) return 256;
+    size_t hint = (size_t)(st.st_size / 4096) * 16;
+    if (hint < 256) hint = 256;
+    if (hint > 10000000) hint = 10000000; /* cap at 10M to avoid runaway alloc */
+    return hint;
+}
+
+typedef struct {
+    KeySet *ks;
+    QueryDeadline *deadline;
+    int dl_counter;
+} IntersectCollectCtx;
+
+/* btree callback for the first leaf: every hit drops into the seed KeySet. */
+static int intersect_collect_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;
+    IntersectCollectCtx *c = (IntersectCollectCtx *)ctx;
+    if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
+    keyset_insert(c->ks, hash16);
+    return 0;
+}
+
+/* Walk the first leaf's btree into a fresh KeySet. */
+static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
+                                      SearchCriterion *leaf, const char *idx_path,
+                                      QueryDeadline *dl) {
+    KeySet *ks = keyset_new(leaf_capacity_hint(idx_path));
+    if (!ks) return NULL;
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    IntersectCollectCtx c = { ks, dl, 0 };
+    btree_dispatch((char *)idx_path, leaf, resolve_idx_field(ts, leaf->field),
+                   intersect_collect_cb, &c);
+    if (dl->timed_out) { keyset_free(ks); return NULL; }
+    return ks;
+}
+
+/* Intersect N indexed leaves' candidate hash sets. Most-selective leaf walked
+   first; subsequent walks probe the running set and accumulate survivors.
+   Caller frees the returned KeySet. */
+static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
+                                        SearchCriterion **leaves,
+                                        char paths[][PATH_MAX], int n,
+                                        QueryDeadline *dl) {
+    if (n < 2) return NULL;
+    KeySet *running = build_keyset_from_leaf(db_root, object, leaves[0], paths[0], dl);
+    if (!running || dl->timed_out) { keyset_free(running); return NULL; }
+
+    TypedSchema *ts = load_typed_schema(db_root, object);
+
+    for (int i = 1; i < n; i++) {
+        size_t cur = keyset_size(running);
+        if (cur == 0) break;  /* empty intersection — short-circuit */
+
+        KeySet *next = keyset_new(cur);  /* intersection cardinality ≤ |running| */
+        if (!next) { keyset_free(running); return NULL; }
+
+        IntersectProbeCtx p = { running, next, dl, 0 };
+        btree_dispatch(paths[i], leaves[i],
+                       resolve_idx_field(ts, leaves[i]->field),
+                       intersect_probe_cb, &p);
+
+        keyset_free(running);
+        running = next;
+        if (dl->timed_out) { keyset_free(running); return NULL; }
+    }
+    return running;
+}
+
+/* count(intersection) — caller checks dl->timed_out for error reporting. */
+static size_t keyset_count_from_intersect(const char *db_root, const char *object,
+                                          QueryPlan *plan, QueryDeadline *dl) {
+    KeySet *result = intersect_indexed_leaves(db_root, object,
+                                              plan->intersect_leaves,
+                                              plan->intersect_paths,
+                                              plan->intersect_count, dl);
+    if (!result) return 0;
+    size_t n = keyset_size(result);
+    keyset_free(result);
+    return n;
 }
 
 /* ========== OR index-union (KeySet fast path) ========== */
@@ -6260,6 +6469,12 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             else OUT("{\"count\":%zu}\n", count);
             free(cc.entries);
         }
+    } else if (plan.kind == PRIMARY_INTERSECT) {
+        /* AND of indexed leaves on rangeable ops — intersect candidate hash
+           sets via KeySet, no record fetch needed for count. */
+        size_t count = keyset_count_from_intersect(db_root, object, &plan, &dl);
+        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+        else OUT("{\"count\":%zu}\n", count);
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union. */
         int budget_exceeded = 0;
@@ -6840,6 +7055,14 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Stage 1: find doesn't yet consume PRIMARY_INTERSECT (Stage 2 wires it).
+       Downgrade to PRIMARY_LEAF using the most-selective intersection leaf so
+       behavior matches today exactly until the find executor is in place. */
+    if (plan.kind == PRIMARY_INTERSECT) {
+        plan.kind = PRIMARY_LEAF;
+        plan.primary_leaf = plan.intersect_leaves[0];
+        memcpy(plan.primary_idx_path, plan.intersect_paths[0], PATH_MAX);
+    }
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
@@ -8658,6 +8881,12 @@ int cmd_aggregate(const char *db_root, const char *object,
     }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Stage 1: aggregate doesn't yet consume PRIMARY_INTERSECT — downgrade. */
+    if (plan.kind == PRIMARY_INTERSECT) {
+        plan.kind = PRIMARY_LEAF;
+        plan.primary_leaf = plan.intersect_leaves[0];
+        memcpy(plan.primary_idx_path, plan.intersect_paths[0], PATH_MAX);
+    }
 
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
