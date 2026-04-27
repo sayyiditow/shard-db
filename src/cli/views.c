@@ -457,13 +457,61 @@ void tui_show_table(const char *title, const char *json_array) {
    Stats live refresh
    ============================================================ */
 
+/* Render a JSON object's top-level keys as a 2-column table (metric / value).
+   Used by stats live refresh. Keeps drift-friendly column widths so values
+   are right-aligned for easy diff-spotting. */
+typedef struct {
+    char metric[64];
+    char value[64];
+} StatRow;
+
+static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
+    int n = 0;
+    const char *p = skip_ws(json);
+    if (*p != '{') return 0;
+    p++;
+    while (*p && n < max_rows) {
+        p = skip_ws(p);
+        if (*p == '}') break;
+        if (*p != '"') break;
+        p++;
+        const char *ks = p;
+        while (*p && *p != '"') p++;
+        size_t klen = (size_t)(p - ks);
+        if (*p == '"') p++;
+        p = skip_ws(p);
+        if (*p != ':') break;
+        p++;
+        p = skip_ws(p);
+        const char *vs = p;
+        skip_value(&p);
+        size_t vlen = (size_t)(p - vs);
+        if (klen >= sizeof(rows[n].metric)) klen = sizeof(rows[n].metric) - 1;
+        memcpy(rows[n].metric, ks, klen);
+        rows[n].metric[klen] = '\0';
+        if (vlen > 0 && vs[0] == '"')
+            json_string_into(vs, vlen, rows[n].value, sizeof(rows[n].value));
+        else {
+            size_t L = vlen < sizeof(rows[n].value) - 1 ? vlen : sizeof(rows[n].value) - 1;
+            memcpy(rows[n].value, vs, L);
+            rows[n].value[L] = '\0';
+        }
+        n++;
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+    return n;
+}
+
 void tui_stats_live(CliConn *c, int interval_sec) {
     int rows, cols;
     halfdelay(interval_sec * 10);  /* deciseconds */
     int tick = 0;
+    StatRow stat_rows[64];
+    int top = 0;
+
     for (;;) {
-        char *resp = NULL;
-        size_t rlen = 0;
+        char *resp = NULL; size_t rlen = 0;
         int rc = cli_query(c, "{\"mode\":\"stats\"}", &resp, &rlen);
 
         getmaxyx(stdscr, rows, cols);
@@ -478,51 +526,47 @@ void tui_stats_live(CliConn *c, int interval_sec) {
             mvprintw(3, 4, "connection error");
             attroff(COLOR_PAIR(4));
         } else {
-            /* Render JSON keys as kv lines (same as tui_show_object but inline). */
-            int row = 3;
-            const char *p = skip_ws(resp);
-            if (*p == '{') {
-                p++;
-                while (*p && row < rows - 3) {
-                    p = skip_ws(p);
-                    if (*p == '}') break;
-                    if (*p != '"') break;
-                    p++;
-                    const char *ks = p;
-                    while (*p && *p != '"') p++;
-                    int klen = (int)(p - ks);
-                    if (*p == '"') p++;
-                    p = skip_ws(p);
-                    if (*p != ':') break;
-                    p++;
-                    p = skip_ws(p);
-                    const char *vs = p;
-                    skip_value(&p);
-                    int vlen = (int)(p - vs);
-                    char vbuf[256];
-                    if (vlen > 0 && vs[0] == '"')
-                        json_string_into(vs, vlen, vbuf, sizeof(vbuf));
-                    else {
-                        int n = vlen < (int)sizeof(vbuf) - 1 ? vlen : (int)sizeof(vbuf) - 1;
-                        memcpy(vbuf, vs, n); vbuf[n] = '\0';
-                    }
-                    mvprintw(row++, 4, "%-22.*s  %s", klen, ks, vbuf);
-                    p = skip_ws(p);
-                    if (*p == ',') p++;
-                }
-            } else {
-                mvprintw(3, 4, "%s", resp);
-            }
+            int n = parse_stats_into(resp, stat_rows, 64);
             free(resp);
+
+            /* Compute column widths. */
+            int wm = (int)strlen("metric"), wv = (int)strlen("value");
+            for (int i = 0; i < n; i++) {
+                int lm = (int)strlen(stat_rows[i].metric);
+                int lv = (int)strlen(stat_rows[i].value);
+                if (lm > wm) wm = lm;
+                if (lv > wv) wv = lv;
+            }
+            if (wm > 32) wm = 32;
+            if (wv > 32) wv = 32;
+
+            /* Header row. */
+            attron(A_BOLD | COLOR_PAIR(1));
+            mvprintw(2, 4, " %-*s │ %*s ", wm, "metric", wv, "value");
+            attroff(A_BOLD | COLOR_PAIR(1));
+            mvhline(3, 4, ACS_HLINE, wm + wv + 7);
+
+            int view = rows - 7;
+            for (int i = 0; i < view && top + i < n; i++) {
+                int r = top + i;
+                mvprintw(4 + i, 4, " %-*.*s │ %*.*s ",
+                         wm, wm, stat_rows[r].metric,
+                         wv, wv, stat_rows[r].value);
+            }
+            attron(COLOR_PAIR(3));
+            mvprintw(rows - 3, 4, "%d metric%s", n, n == 1 ? "" : "s");
+            attroff(COLOR_PAIR(3));
         }
 
         attron(COLOR_PAIR(3));
-        mvprintw(rows - 2, 4, "q/ESC close");
+        mvprintw(rows - 2, 4, "↑↓/jk scroll   q/ESC/← close");
         attroff(COLOR_PAIR(3));
         refresh();
 
         int ch = getch();
-        if (ch == 'q' || ch == 27) break;
+        if (ch == 'q' || ch == 27 || ch == KEY_LEFT || ch == 'h') break;
+        if (ch == KEY_UP   || ch == 'k') { if (top > 0) top--; }
+        if (ch == KEY_DOWN || ch == 'j') top++;
     }
     cbreak();  /* leave halfdelay mode */
 }
