@@ -552,6 +552,19 @@ void tui_show_table(const char *title, const char *json) {
         } else if (rows_v) {       /* Shape 3: unwrap and re-point. */
             arr = rows_v;
         } else {
+            /* Shape 4 (single): {"key":"...","value":{...}} — single record
+               from `get`. Treat as a 1-element array so the same column-
+               extraction logic find/fetch use kicks in (key + nested value
+               fields flattened into one row). */
+            size_t klen, vvl;
+            const char *k_v = json_find_key(json, "key", &klen);
+            const char *v_v = json_find_key(json, "value", &vvl);
+            if (k_v && v_v && vvl > 0 && v_v[0] == '{') {
+                row_collect_cb(json, strlen(json), &t);
+                rendered = 1;
+            }
+        }
+        if (!rendered && *json == '{' && !cols_v && !rows_v && !res_v) {
             /* Shape 6: plain object → 2-column metric/value table. */
             snprintf(t.cols[0], sizeof(t.cols[0]), "metric");
             snprintf(t.cols[1], sizeof(t.cols[0]), "value");

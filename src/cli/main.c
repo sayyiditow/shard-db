@@ -367,6 +367,59 @@ static void query_single_key(CliConn *c, const char *mode, const char *result_ti
 static void query_get(CliConn *c)    { query_single_key(c, "get",    "get result"); }
 static void query_exists(CliConn *c) { query_single_key(c, "exists", "exists");     }
 
+/* Multi-key get: server's `get` mode accepts a `keys` array and returns the
+   find-shape array of records — one row per matching key. Same UX shape as
+   single get but the form takes a comma-separated list of keys. */
+static void query_get_many(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    FormField fs[1] = {0};
+    fs[0].label = "keys (comma-separated)"; fs[0].kind = FF_TEXT;
+    char title[128];
+    snprintf(title, sizeof(title), "get many from %s/%s", oi.dir, oi.object);
+
+    for (;;) {
+        if (tui_form(title, fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("get many", "at least one key required"); continue; }
+
+        /* Pack CSV → JSON array. */
+        char keys_json[2048] = "[";
+        size_t off = 1;
+        const char *p = fs[0].value;
+        int first = 1;
+        while (*p) {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+            const char *s = p;
+            while (*p && *p != ',') p++;
+            size_t L = (size_t)(p - s);
+            /* Strip trailing whitespace */
+            while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\t')) L--;
+            if (L == 0) continue;
+            off += snprintf(keys_json + off, sizeof(keys_json) - off,
+                "%s\"%.*s\"", first ? "" : ",", (int)L, s);
+            first = 0;
+        }
+        snprintf(keys_json + off, sizeof(keys_json) - off, "]");
+
+        char req[4096];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"get\",\"dir\":\"%s\",\"object\":\"%s\",\"keys\":%s}",
+            oi.dir, oi.object, keys_json);
+
+        int act = tui_preview_json("get many — query JSON (r=run  ←=back to edit)", req);
+        if (act != 1) continue;
+
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "get many failed"); continue;
+        }
+        tui_show_table("get many", resp);
+        free(resp);
+    }
+}
+
 static void query_delete(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -910,6 +963,7 @@ static void menu_query(void) {
         MenuItem items[] = {
             { "insert",    "single insert by key with field values" },
             { "get",       "fetch a single record by key" },
+            { "get many",  "fetch multiple records by comma-separated keys" },
             { "update",    "update fields on an existing record" },
             { "delete",    "delete a single record by key (confirms)" },
             { "exists",    "check whether a key is present" },
@@ -919,19 +973,20 @@ static void menu_query(void) {
             { "keys",      "paginated key listing (no values)" },
             { "fetch",     "paginated record listing (no criteria)" },
         };
-        int choice = tui_menu_at("Query", items, 10, &sel);
+        int choice = tui_menu_at("Query", items, 11, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0: query_insert(c);    break;
-            case 1: query_get(c);       break;
-            case 2: query_update(c);    break;
-            case 3: query_delete(c);    break;
-            case 4: query_exists(c);    break;
-            case 5: query_find(c);      break;
-            case 6: query_count(c);     break;
-            case 7: query_aggregate(c); break;
-            case 8: query_keys(c);      break;
-            case 9: query_fetch(c);     break;
+            case 0:  query_insert(c);    break;
+            case 1:  query_get(c);       break;
+            case 2:  query_get_many(c);  break;
+            case 3:  query_update(c);    break;
+            case 4:  query_delete(c);    break;
+            case 5:  query_exists(c);    break;
+            case 6:  query_find(c);      break;
+            case 7:  query_count(c);     break;
+            case 8:  query_aggregate(c); break;
+            case 9:  query_keys(c);      break;
+            case 10: query_fetch(c);     break;
         }
     }
 }
