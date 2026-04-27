@@ -6,14 +6,6 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/* Stub for criteria builder until the next commit wires up the form. */
-int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
-    (void)oi;
-    *criteria_out = strdup("[]");
-    tui_alert("not yet", "criteria builder lands in the next commit — empty criteria for now");
-    return 0;
-}
-
 /* ---- helpers ---- */
 
 static CliConn *g_conn = NULL;
@@ -203,6 +195,254 @@ static void menu_browse(void) {
     free(dirs);
 }
 
+/* ---- Query menu ---- */
+
+/* Pick a tenant + object via two list pickers; populate ObjectInfo. Returns
+   0 on success, -1 if the user backs out at any step. */
+static int pick_object(CliConn *c, ObjectInfo *oi) {
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
+        tui_alert("error", "db-dirs failed");
+        return -1;
+    }
+    char **dirs = NULL; int ndirs = 0;
+    collect_string_array(resp, NULL, &dirs, &ndirs);
+    free(resp);
+    if (ndirs == 0) { tui_alert("query", "no tenants — add to dirs.conf"); return -1; }
+
+    const char **vd = malloc(ndirs * sizeof(*vd));
+    for (int i = 0; i < ndirs; i++) vd[i] = dirs[i];
+    const char *dir = tui_pick("pick tenant", vd, ndirs);
+    free(vd);
+    if (!dir) {
+        for (int i = 0; i < ndirs; i++) free(dirs[i]);
+        free(dirs);
+        return -1;
+    }
+    char dir_copy[64];
+    snprintf(dir_copy, sizeof(dir_copy), "%s", dir);
+    for (int i = 0; i < ndirs; i++) free(dirs[i]);
+    free(dirs);
+
+    char req[256];
+    snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dir_copy);
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "list-objects failed");
+        return -1;
+    }
+    char **objs = NULL; int nobjs = 0;
+    collect_string_array(resp, "objects", &objs, &nobjs);
+    free(resp);
+    if (nobjs == 0) { tui_alert(dir_copy, "(no objects)"); return -1; }
+
+    const char **vo = malloc(nobjs * sizeof(*vo));
+    for (int i = 0; i < nobjs; i++) vo[i] = objs[i];
+    const char *obj = tui_pick("pick object", vo, nobjs);
+    free(vo);
+    char obj_copy[64] = "";
+    if (obj) snprintf(obj_copy, sizeof(obj_copy), "%s", obj);
+    for (int i = 0; i < nobjs; i++) free(objs[i]);
+    free(objs);
+    if (!obj) return -1;
+
+    if (describe_object(c, dir_copy, obj_copy, oi) != 0) {
+        tui_alert("error", "describe-object failed");
+        return -1;
+    }
+    return 0;
+}
+
+static void query_insert(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    /* Form: key + one row per writable field. */
+    int nf = oi.nfields + 1;
+    FormField *fs = calloc(nf, sizeof(*fs));
+    fs[0].label = "key";
+    fs[0].kind  = FF_TEXT;
+    for (int i = 0; i < oi.nfields; i++) {
+        fs[1 + i].label = oi.fields[i].name;
+        fs[1 + i].kind  = FF_TEXT;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "insert into %s/%s", oi.dir, oi.object);
+    int rc = tui_form(title, fs, nf);
+    if (rc != 0) { free(fs); return; }
+    if (!fs[0].value[0]) { tui_alert("insert", "key required"); free(fs); return; }
+
+    /* Build {"mode":"insert","dir":"...","object":"...","key":"...","data":{...}} */
+    size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
+    off += snprintf(req + off, cap - off,
+        "{\"mode\":\"insert\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"data\":{",
+        oi.dir, oi.object, fs[0].value);
+    int emitted = 0;
+    for (int i = 0; i < oi.nfields; i++) {
+        if (!fs[1 + i].value[0]) continue;  /* skip empty — defaults apply */
+        if (off + 256 + strlen(fs[1 + i].value) >= cap) {
+            cap *= 2;
+            req = realloc(req, cap);
+        }
+        off += snprintf(req + off, cap - off,
+            "%s\"%s\":\"%s\"",
+            emitted ? "," : "",
+            oi.fields[i].name, fs[1 + i].value);
+        emitted++;
+    }
+    off += snprintf(req + off, cap - off, "}}");
+    free(fs);
+
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "insert failed");
+    } else {
+        show_response("insert result", resp);
+        free(resp);
+    }
+    free(req);
+}
+
+static void query_get(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    FormField fs[1] = {0};
+    fs[0].label = "key";
+    fs[0].kind  = FF_TEXT;
+    char title[128];
+    snprintf(title, sizeof(title), "get from %s/%s", oi.dir, oi.object);
+    if (tui_form(title, fs, 1) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("get", "key required"); return; }
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"get\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
+        oi.dir, oi.object, fs[0].value);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "get failed"); return; }
+    show_response("get result", resp);
+    free(resp);
+}
+
+static void query_exists(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    FormField fs[1] = {0};
+    fs[0].label = "key";
+    fs[0].kind  = FF_TEXT;
+    char title[128];
+    snprintf(title, sizeof(title), "exists in %s/%s", oi.dir, oi.object);
+    if (tui_form(title, fs, 1) != 0) return;
+    if (!fs[0].value[0]) { tui_alert("exists", "key required"); return; }
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"exists\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
+        oi.dir, oi.object, fs[0].value);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "exists failed"); return; }
+    show_response("exists", resp);
+    free(resp);
+}
+
+static void query_count(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    char *crit = NULL;
+    if (tui_criteria_builder(&oi, &crit) != 0) return;
+
+    char req[8192];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s}",
+        oi.dir, oi.object, crit);
+    free(crit);
+
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "count failed"); return; }
+    show_response("count result", resp);
+    free(resp);
+}
+
+static void query_find(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    char *crit = NULL;
+    if (tui_criteria_builder(&oi, &crit) != 0) return;
+
+    /* Second form: offset, limit, fields (CSV). */
+    FormField fs[3] = {0};
+    fs[0].label = "offset"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "0");
+    fs[1].label = "limit";  fs[1].kind = FF_NUMBER; snprintf(fs[1].value, sizeof(fs[1].value), "50");
+    fs[2].label = "fields"; fs[2].kind = FF_TEXT;   /* comma-separated, blank=all */
+    if (tui_form("find — paging", fs, 3) != 0) { free(crit); return; }
+
+    /* Build fields JSON array if user typed any. */
+    char fields_json[1024] = "[]";
+    if (fs[2].value[0]) {
+        size_t off = 0;
+        off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
+        const char *p = fs[2].value;
+        int first = 1;
+        while (*p) {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+            const char *s = p;
+            while (*p && *p != ',') p++;
+            size_t L = (size_t)(p - s);
+            off += snprintf(fields_json + off, sizeof(fields_json) - off,
+                "%s\"%.*s\"", first ? "" : ",", (int)L, s);
+            first = 0;
+        }
+        snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+    }
+
+    int offv = atoi(fs[0].value);
+    int limv = atoi(fs[1].value);
+    if (limv <= 0) limv = 50;
+
+    /* "format":"rows" — flat tabular shape easy for tui_show_table. */
+    char *req = malloc(strlen(crit) + 1024);
+    sprintf(req,
+        "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
+        "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
+        oi.dir, oi.object, crit, offv, limv, fields_json);
+    free(crit);
+
+    char *resp = NULL; size_t rlen = 0;
+    int rc = cli_query(c, req, &resp, &rlen);
+    free(req);
+    if (rc != 0 || !resp) { tui_alert("error", "find failed"); free(resp); return; }
+
+    /* If response is an array of objects, show as table; otherwise raw. */
+    if (resp[0] == '[') tui_show_table("find result", resp);
+    else                show_response("find result", resp);
+    free(resp);
+}
+
+static void menu_query(void) {
+    CliConn *c = get_conn();
+    if (!c) return;
+    MenuItem items[] = {
+        { "insert", "single insert by key with field values" },
+        { "get",    "fetch a single record by key" },
+        { "exists", "check whether a key is present" },
+        { "find",   "criteria builder + offset/limit, table output" },
+        { "count",  "criteria builder, returns matching count" },
+    };
+    int sel = tui_menu("Query", items, 5);
+    if (sel < 0) return;
+    switch (sel) {
+        case 0: query_insert(c); break;
+        case 1: query_get(c);    break;
+        case 2: query_exists(c); break;
+        case 3: query_find(c);   break;
+        case 4: query_count(c);  break;
+    }
+}
+
 /* ---- Stats menu ---- */
 
 static void menu_stats(void) {
@@ -243,7 +483,7 @@ int main(int argc, char **argv) {
         MenuItem items[] = {
             { "Server",   "start / stop / status" },
             { "Browse",   "tenants → objects → describe" },
-            { "Query",    "(coming next commit) insert / get / find / count / exists" },
+            { "Query",    "insert / get / find / count / exists" },
             { "Stats",    "live counters, refreshes every 5s" },
             { "Quit",     "exit shard-cli" },
         };
@@ -252,10 +492,8 @@ int main(int argc, char **argv) {
         switch (choice) {
             case 0: menu_server(); break;
             case 1: menu_browse(); break;
-            case 2: tui_alert("Query",
-                              "insert / get / find / count / exists land in the next commit.\n"
-                              "For now, use ./shard-db query '{...}' from the shell."); break;
-            case 3: menu_stats(); break;
+            case 2: menu_query();  break;
+            case 3: menu_stats();  break;
         }
     }
 

@@ -639,3 +639,140 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
     free(resp);
     return 0;
 }
+
+/* ============================================================
+   Criteria builder — field-by-field grid that emits a JSON criteria array
+   ============================================================ */
+
+#define MAX_CRIT_ROWS 6
+
+static const char *const OPS_VARCHAR[] = {
+    "eq","neq","lt","gt","lte","gte","between","in","not_in",
+    "like","not_like","contains","not_contains","starts","ends",
+    "exists","not_exists", NULL
+};
+static const char *const OPS_NUMERIC[] = {
+    "eq","neq","lt","gt","lte","gte","between","in","not_in",
+    "exists","not_exists", NULL
+};
+
+/* True if the typed-field type is "string-y" — varchar/byte. The numeric
+   ops list applies to everything else (int/long/short/double/numeric/date/
+   datetime/bool). */
+static int field_is_textish(const char *type) {
+    return strcmp(type, "varchar") == 0 || strcmp(type, "byte") == 0;
+}
+
+int tui_criteria_builder(const ObjectInfo *oi, char **criteria_out) {
+    /* Build choice arrays for field dropdown — first entry "(none)" so
+       leaving a row blank skips it. */
+    int n_choices = oi->nfields + 1;
+    const char **field_choices = calloc(n_choices + 1, sizeof(*field_choices));
+    field_choices[0] = "(none)";
+    for (int i = 0; i < oi->nfields; i++) field_choices[1 + i] = oi->fields[i].name;
+    field_choices[n_choices] = NULL;
+
+    /* Form: 3 fields per row × MAX_CRIT_ROWS. */
+    FormField fields[MAX_CRIT_ROWS * 3];
+    char labels[MAX_CRIT_ROWS][16];
+    for (int r = 0; r < MAX_CRIT_ROWS; r++) {
+        snprintf(labels[r], sizeof(labels[r]), "row %d field", r + 1);
+        FormField *ff = &fields[r * 3 + 0];
+        ff->label   = labels[r];
+        ff->kind    = FF_CHOICE;
+        ff->choices = field_choices;
+        snprintf(ff->value, sizeof(ff->value), "(none)");
+
+        ff = &fields[r * 3 + 1];
+        ff->label   = "         op";
+        ff->kind    = FF_CHOICE;
+        ff->choices = OPS_VARCHAR;  /* widest list — dynamically appropriate at submit */
+        snprintf(ff->value, sizeof(ff->value), "eq");
+
+        ff = &fields[r * 3 + 2];
+        ff->label   = "      value";
+        ff->kind    = FF_TEXT;
+        ff->choices = NULL;
+        ff->value[0] = '\0';
+    }
+
+    int rc = tui_form("criteria builder (AND across rows; (none) skips)",
+                      fields, MAX_CRIT_ROWS * 3);
+    free(field_choices);
+    if (rc != 0) {
+        *criteria_out = NULL;
+        return -1;
+    }
+
+    /* Pack non-empty rows as JSON array. */
+    size_t cap = 1024;
+    char *out = malloc(cap);
+    if (!out) return -1;
+    size_t off = 0;
+    off += snprintf(out + off, cap - off, "[");
+    int emitted = 0;
+    for (int r = 0; r < MAX_CRIT_ROWS; r++) {
+        const char *fld = fields[r * 3 + 0].value;
+        if (!*fld || strcmp(fld, "(none)") == 0) continue;
+        const char *op  = fields[r * 3 + 1].value;
+        const char *val = fields[r * 3 + 2].value;
+
+        /* Detect field type for value-quoting choice. Numeric types pass
+           the value as a string anyway in shard-db's wire format, so always
+           quote for safety. */
+        (void)field_is_textish;
+        (void)OPS_NUMERIC;
+
+        if (off + 256 + strlen(val) >= cap) {
+            cap *= 2;
+            char *nb = realloc(out, cap);
+            if (!nb) { free(out); return -1; }
+            out = nb;
+        }
+        if (emitted) off += snprintf(out + off, cap - off, ",");
+
+        /* For BETWEEN, expect the value to be "lo,hi" — split. */
+        if (strcmp(op, "between") == 0) {
+            char vbuf[1024];
+            snprintf(vbuf, sizeof(vbuf), "%s", val);
+            char *comma = strchr(vbuf, ',');
+            const char *lo = vbuf, *hi = "";
+            if (comma) { *comma = '\0'; hi = comma + 1; }
+            off += snprintf(out + off, cap - off,
+                "{\"field\":\"%s\",\"op\":\"between\",\"value\":\"%s\",\"value2\":\"%s\"}",
+                fld, lo, hi);
+        } else if (strcmp(op, "exists") == 0 || strcmp(op, "not_exists") == 0) {
+            off += snprintf(out + off, cap - off,
+                "{\"field\":\"%s\",\"op\":\"%s\"}", fld, op);
+        } else if (strcmp(op, "in") == 0 || strcmp(op, "not_in") == 0) {
+            /* value should be comma-separated: a,b,c → ["a","b","c"]. */
+            off += snprintf(out + off, cap - off,
+                "{\"field\":\"%s\",\"op\":\"%s\",\"value\":[", fld, op);
+            const char *p = val;
+            int first = 1;
+            while (*p) {
+                while (*p == ' ' || *p == ',') p++;
+                if (!*p) break;
+                const char *s = p;
+                while (*p && *p != ',') p++;
+                size_t L = (size_t)(p - s);
+                if (off + L + 8 >= cap) {
+                    cap *= 2;
+                    out = realloc(out, cap);
+                }
+                off += snprintf(out + off, cap - off,
+                    "%s\"%.*s\"", first ? "" : ",", (int)L, s);
+                first = 0;
+            }
+            off += snprintf(out + off, cap - off, "]}");
+        } else {
+            off += snprintf(out + off, cap - off,
+                "{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\"}",
+                fld, op, val);
+        }
+        emitted++;
+    }
+    off += snprintf(out + off, cap - off, "]");
+    *criteria_out = out;
+    return 0;
+}
