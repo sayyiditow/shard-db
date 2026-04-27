@@ -380,7 +380,7 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
     int n_keys = 0;
 
     char title[128];
-    snprintf(title, sizeof(title), "%s many in %s/%s — TAB adds, ⏎ submits",
+    snprintf(title, sizeof(title), "%s multiple in %s/%s — TAB adds, ⏎ submits",
              mode, oi.dir, oi.object);
 
     for (;;) {
@@ -415,7 +415,7 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
 
         char preview_title[128];
         snprintf(preview_title, sizeof(preview_title),
-                 "%s many — query JSON (r=run  ←=back to edit)", mode);
+                 "%s multiple — query JSON (r=run  ←=back to edit)", mode);
         int act = tui_preview_json(preview_title, req);
         if (act != 1) continue;
 
@@ -428,8 +428,8 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
     }
 }
 
-static void query_get_many(CliConn *c)    { query_keys_op(c, "get",    "get many");    }
-static void query_exists_many(CliConn *c) { query_keys_op(c, "exists", "exists many"); }
+static void query_get_many(CliConn *c)    { query_keys_op(c, "get",    "get multiple");    }
+static void query_exists_many(CliConn *c) { query_keys_op(c, "exists", "exists multiple"); }
 
 static void query_delete(CliConn *c) {
     ObjectInfo oi;
@@ -995,11 +995,11 @@ static void menu_query(void) {
         MenuItem items[] = {
             { "insert",       "single insert by key with field values" },
             { "get",          "fetch a single record by key" },
-            { "get many",     "fetch multiple records by comma-separated keys" },
+            { "get multiple", "fetch multiple records by key (TAB adds each)" },
             { "update",       "update fields on an existing record" },
             { "delete",       "delete a single record by key (confirms)" },
             { "exists",       "check whether a key is present" },
-            { "exists many",  "check presence of multiple keys at once" },
+            { "exists multiple", "check presence of multiple keys (TAB adds each)" },
             { "find",         "criteria builder + offset/limit, table output" },
             { "count",        "criteria builder, returns matching count" },
             { "aggregate",    "sum/avg/min/max/count + group_by + criteria" },

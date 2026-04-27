@@ -294,12 +294,12 @@ int tui_list_input(const char *title, const char *item_label,
         if (sel < 0)
             mvprintw(rows - 3, 4,
                 "type to enter   TAB add to list   ⏎ submit (%d item%s)   "
-                "←/ESC back   BACKSPACE pop last",
+                "BACKSPACE pop last   ESC back",
                 n, n == 1 ? "" : "s");
         else
             mvprintw(rows - 3, 4,
                 "↑↓ navigate   d/DEL remove   ⏎ edit   TAB back to input   "
-                "←/ESC cancel");
+                "←/q/ESC cancel");
         attroff(COLOR_PAIR(3));
         refresh();
 
@@ -373,7 +373,11 @@ int tui_list_input(const char *title, const char *item_label,
             case KEY_UP:
                 if (n > 0) sel = n - 1;
                 break;
-            case 'q': case 27: case KEY_LEFT:
+            case 27:
+                /* Only ESC cancels in input mode — q is a valid key character
+                   the user might type, and ←/h could be cursor navigation
+                   (not supported yet, but reserved). To exit, press ↑ to
+                   move focus to a list row and use q/←/ESC there. */
                 return -1;
             default:
                 if (ch >= 32 && ch < 127 && L < LIST_ITEM_MAX - 1) {
