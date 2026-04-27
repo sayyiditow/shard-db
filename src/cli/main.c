@@ -364,6 +364,312 @@ static void query_single_key(CliConn *c, const char *mode, const char *result_ti
 static void query_get(CliConn *c)    { query_single_key(c, "get",    "get result"); }
 static void query_exists(CliConn *c) { query_single_key(c, "exists", "exists");     }
 
+static void query_delete(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[1] = {0};
+    fs[0].label = "key"; fs[0].kind = FF_TEXT;
+    char title[128];
+    snprintf(title, sizeof(title), "delete from %s/%s", oi.dir, oi.object);
+    for (;;) {
+        if (tui_form(title, fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("delete", "key required"); continue; }
+        char prompt[256];
+        snprintf(prompt, sizeof(prompt), "delete '%s' from %s/%s?",
+                 fs[0].value, oi.dir, oi.object);
+        if (!tui_confirm(prompt)) continue;
+        char req[1024];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"delete\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\"}",
+            oi.dir, oi.object, fs[0].value);
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "delete failed"); continue; }
+        show_response("delete result", resp);
+        free(resp);
+    }
+}
+
+/* Update: form with key + one row per field. Empty fields are skipped on
+   submit (server keeps the existing value), so the user only fills in what
+   they want to change. */
+static void query_update(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    int nf = oi.nfields + 1;
+    FormField *fs = calloc(nf, sizeof(*fs));
+    fs[0].label = "key"; fs[0].kind = FF_TEXT;
+    for (int i = 0; i < oi.nfields; i++) {
+        fs[1 + i].label = oi.fields[i].name;
+        fs[1 + i].kind  = FF_TEXT;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "update %s/%s", oi.dir, oi.object);
+
+    for (;;) {
+        if (tui_form(title, fs, nf) != 0) { free(fs); return; }
+        if (!fs[0].value[0]) { tui_alert("update", "key required"); continue; }
+
+        size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
+        off += snprintf(req + off, cap - off,
+            "{\"mode\":\"update\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"value\":{",
+            oi.dir, oi.object, fs[0].value);
+        int emitted = 0;
+        for (int i = 0; i < oi.nfields; i++) {
+            if (!fs[1 + i].value[0]) continue;
+            if (off + 256 + strlen(fs[1 + i].value) >= cap) { cap *= 2; req = realloc(req, cap); }
+            off += snprintf(req + off, cap - off,
+                "%s\"%s\":\"%s\"",
+                emitted ? "," : "", oi.fields[i].name, fs[1 + i].value);
+            emitted++;
+        }
+        off += snprintf(req + off, cap - off, "}}");
+
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "update failed");
+        else { show_response("update result", resp); free(resp); }
+        free(req);
+    }
+}
+
+/* Keys: paginated key listing (no values). */
+static void query_keys(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[2] = {0};
+    fs[0].label = "offset"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "0");
+    fs[1].label = "limit";  fs[1].kind = FF_NUMBER; snprintf(fs[1].value, sizeof(fs[1].value), "100");
+    for (;;) {
+        if (tui_form("keys — paging", fs, 2) != 0) return;
+        char req[512];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"keys\",\"dir\":\"%s\",\"object\":\"%s\",\"offset\":%d,\"limit\":%d}",
+            oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value));
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "keys failed"); continue; }
+        tui_show_text("keys", resp);
+        free(resp);
+    }
+}
+
+/* Fetch: paginated record listing without criteria. Same UX as find but
+   without the criteria builder (and the server walks insertion order). */
+static void query_fetch(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[2] = {0};
+    fs[0].label = "offset"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "0");
+    fs[1].label = "limit";  fs[1].kind = FF_NUMBER; snprintf(fs[1].value, sizeof(fs[1].value), "50");
+
+    int *fld_sel = calloc(oi.nfields, sizeof(int));
+    if (fld_sel) for (int i = 0; i < oi.nfields; i++) fld_sel[i] = 1;
+    const char *fld_choices[MAX_FIELDS_CACHED + 1];
+    for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
+    fld_choices[oi.nfields] = NULL;
+
+    for (;;) {
+        if (tui_form("fetch — paging", fs, 2) != 0) { free(fld_sel); return; }
+        if (tui_multi_pick("fields to project (space toggle, ⏎ confirm)",
+                           fld_choices, oi.nfields, fld_sel) != 0) continue;
+
+        char fields_json[1024] = "[]";
+        int picked = 0;
+        for (int i = 0; i < oi.nfields; i++) if (fld_sel[i]) picked++;
+        if (picked > 0 && picked < oi.nfields) {
+            size_t off = 0;
+            off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
+            int first = 1;
+            for (int i = 0; i < oi.nfields; i++) {
+                if (!fld_sel[i]) continue;
+                off += snprintf(fields_json + off, sizeof(fields_json) - off,
+                    "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
+                first = 0;
+            }
+            snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+        }
+
+        char req[2048];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"fetch\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"offset\":%d,\"limit\":%d,\"fields\":%s}",
+            oi.dir, oi.object, atoi(fs[0].value), atoi(fs[1].value), fields_json);
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) { tui_alert("error", "fetch failed"); continue; }
+        if (resp[0] == '[') tui_show_table("fetch result", resp);
+        else                show_response("fetch result", resp);
+        free(resp);
+    }
+}
+
+/* Aggregate spec — one row per (fn, field, alias). count and exists don't
+   need a field; sum/avg/min/max do. List-with-actions UX same as criteria. */
+typedef struct {
+    char fn[16];
+    char field[64];
+    char alias[64];
+} AggRow;
+
+#define MAX_AGG_ROWS 8
+
+static const char *const AGG_FNS[] = { "count", "sum", "avg", "min", "max", NULL };
+
+static int prompt_one_agg(const ObjectInfo *oi, AggRow *out) {
+    const char *field_choices[MAX_FIELDS_CACHED + 2];
+    field_choices[0] = "(none)";
+    for (int i = 0; i < oi->nfields; i++) field_choices[1 + i] = oi->fields[i].name;
+    field_choices[1 + oi->nfields] = NULL;
+
+    FormField fs[3] = {0};
+    fs[0].label = "function"; fs[0].kind = FF_CHOICE; fs[0].choices = AGG_FNS;
+    snprintf(fs[0].value, sizeof(fs[0].value), "count");
+    fs[1].label = "field";    fs[1].kind = FF_CHOICE; fs[1].choices = field_choices;
+    snprintf(fs[1].value, sizeof(fs[1].value), "(none)");
+    fs[2].label = "alias";    fs[2].kind = FF_TEXT;
+    snprintf(fs[2].value, sizeof(fs[2].value), "n");
+
+    if (tui_form("add aggregate (sum/avg/min/max need field; count is optional)", fs, 3) != 0)
+        return -1;
+    snprintf(out->fn,    sizeof(out->fn),    "%s", fs[0].value);
+    snprintf(out->field, sizeof(out->field), "%s", fs[1].value);
+    snprintf(out->alias, sizeof(out->alias), "%s", fs[2].value[0] ? fs[2].value : "n");
+    return 0;
+}
+
+static char *pack_aggs(const AggRow *rows, int n) {
+    if (n <= 0) return strdup("[]");
+    size_t cap = 1024;
+    char *out = malloc(cap);
+    size_t off = 0;
+    off += snprintf(out + off, cap - off, "[");
+    for (int i = 0; i < n; i++) {
+        if (off + 256 >= cap) { cap *= 2; out = realloc(out, cap); }
+        if (strcmp(rows[i].field, "(none)") == 0 || rows[i].field[0] == '\0') {
+            off += snprintf(out + off, cap - off,
+                "%s{\"fn\":\"%s\",\"alias\":\"%s\"}",
+                i ? "," : "", rows[i].fn, rows[i].alias);
+        } else {
+            off += snprintf(out + off, cap - off,
+                "%s{\"fn\":\"%s\",\"field\":\"%s\",\"alias\":\"%s\"}",
+                i ? "," : "", rows[i].fn, rows[i].field, rows[i].alias);
+        }
+    }
+    off += snprintf(out + off, cap - off, "]");
+    return out;
+}
+
+static int build_agg_specs(const ObjectInfo *oi, char **specs_out) {
+    AggRow rows[MAX_AGG_ROWS];
+    int n = 0;
+    int sel = 0;
+    for (;;) {
+        MenuItem items[MAX_AGG_ROWS + 2];
+        char labels[MAX_AGG_ROWS + 2][128];
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            const char *f = (rows[i].field[0] && strcmp(rows[i].field, "(none)") != 0)
+                            ? rows[i].field : "*";
+            snprintf(labels[total], sizeof(labels[0]),
+                     "%-6s %-20s as %s", rows[i].fn, f, rows[i].alias);
+            items[total].label = labels[total];
+            items[total].hint  = "⏎/→ to remove";
+            total++;
+        }
+        snprintf(labels[total], sizeof(labels[0]), "[+] add aggregate");
+        items[total].label = labels[total];
+        items[total].hint  = "open form for the next fn/field/alias";
+        int idx_add = total;
+        total++;
+        snprintf(labels[total], sizeof(labels[0]), "[✓] submit (%d aggregate%s)",
+                 n, n == 1 ? "" : "s");
+        items[total].label = labels[total];
+        items[total].hint  = "build the JSON aggregates array and continue";
+        int idx_submit = total;
+        total++;
+
+        int choice = tui_menu_at("aggregate spec builder", items, total, &sel);
+        if (choice < 0) { *specs_out = NULL; return -1; }
+        if (choice == idx_submit) { *specs_out = pack_aggs(rows, n); return 0; }
+        if (choice == idx_add) {
+            if (n >= MAX_AGG_ROWS) { tui_alert("aggregate", "max specs reached"); continue; }
+            AggRow row;
+            if (prompt_one_agg(oi, &row) == 0) { rows[n++] = row; sel = idx_add; }
+            continue;
+        }
+        if (tui_confirm("remove this aggregate?")) {
+            for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
+            n--;
+            if (sel >= n) sel = n;
+        }
+    }
+}
+
+static void query_aggregate(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    /* group_by: multi-pick from fields. Default = none (no grouping). */
+    int *grp_sel = calloc(oi.nfields, sizeof(int));
+    const char *fld_choices[MAX_FIELDS_CACHED + 1];
+    for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
+    fld_choices[oi.nfields] = NULL;
+
+    for (;;) {
+        char *crit = NULL;
+        if (tui_criteria_builder(&oi, &crit) != 0) { free(grp_sel); return; }
+
+        char *specs = NULL;
+        if (build_agg_specs(&oi, &specs) != 0) { free(crit); break; }
+
+        if (tui_multi_pick("group_by — fields to group on (skip → no grouping)",
+                           fld_choices, oi.nfields, grp_sel) != 0) {
+            free(crit); free(specs); continue;
+        }
+
+        FormField fs[2] = {0};
+        fs[0].label = "limit"; fs[0].kind = FF_NUMBER; snprintf(fs[0].value, sizeof(fs[0].value), "100");
+        fs[1].label = "order"; fs[1].kind = FF_CHOICE;
+        static const char *const ord[] = { "asc", "desc", NULL };
+        fs[1].choices = ord; snprintf(fs[1].value, sizeof(fs[1].value), "asc");
+        if (tui_form("aggregate — final params", fs, 2) != 0) {
+            free(crit); free(specs); continue;
+        }
+
+        /* Build group_by JSON array. */
+        char grp_json[512] = "[]";
+        int grp_picked = 0;
+        for (int i = 0; i < oi.nfields; i++) if (grp_sel[i]) grp_picked++;
+        if (grp_picked > 0) {
+            size_t off = 0;
+            off += snprintf(grp_json + off, sizeof(grp_json) - off, "[");
+            int first = 1;
+            for (int i = 0; i < oi.nfields; i++) {
+                if (!grp_sel[i]) continue;
+                off += snprintf(grp_json + off, sizeof(grp_json) - off,
+                    "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
+                first = 0;
+            }
+            snprintf(grp_json + off, sizeof(grp_json) - off, "]");
+        }
+
+        char *req = malloc(strlen(crit) + strlen(specs) + 1024);
+        sprintf(req,
+            "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s,"
+            "\"order\":\"%s\",\"limit\":%d}",
+            oi.dir, oi.object, crit, specs, grp_json,
+            fs[1].value, atoi(fs[0].value));
+        free(crit); free(specs);
+
+        char *resp = NULL; size_t rlen = 0;
+        int rc = cli_query(c, req, &resp, &rlen);
+        free(req);
+        if (rc != 0 || !resp) { tui_alert("error", "aggregate failed"); free(resp); continue; }
+        if (resp[0] == '[')      tui_show_table("aggregate result", resp);
+        else                     show_response("aggregate result", resp);
+        free(resp);
+    }
+    free(grp_sel);
+}
+
 static void query_count(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -474,20 +780,30 @@ static void menu_query(void) {
     int sel = 0;
     for (;;) {
         MenuItem items[] = {
-            { "insert", "single insert by key with field values" },
-            { "get",    "fetch a single record by key" },
-            { "exists", "check whether a key is present" },
-            { "find",   "criteria builder + offset/limit, table output" },
-            { "count",  "criteria builder, returns matching count" },
+            { "insert",    "single insert by key with field values" },
+            { "get",       "fetch a single record by key" },
+            { "update",    "update fields on an existing record" },
+            { "delete",    "delete a single record by key (confirms)" },
+            { "exists",    "check whether a key is present" },
+            { "find",      "criteria builder + offset/limit, table output" },
+            { "count",     "criteria builder, returns matching count" },
+            { "aggregate", "sum/avg/min/max/count + group_by + criteria" },
+            { "keys",      "paginated key listing (no values)" },
+            { "fetch",     "paginated record listing (no criteria)" },
         };
-        int choice = tui_menu_at("Query", items, 5, &sel);
+        int choice = tui_menu_at("Query", items, 10, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0: query_insert(c); break;
-            case 1: query_get(c);    break;
-            case 2: query_exists(c); break;
-            case 3: query_find(c);   break;
-            case 4: query_count(c);  break;
+            case 0: query_insert(c);    break;
+            case 1: query_get(c);       break;
+            case 2: query_update(c);    break;
+            case 3: query_delete(c);    break;
+            case 4: query_exists(c);    break;
+            case 5: query_find(c);      break;
+            case 6: query_count(c);     break;
+            case 7: query_aggregate(c); break;
+            case 8: query_keys(c);      break;
+            case 9: query_fetch(c);     break;
         }
     }
 }
