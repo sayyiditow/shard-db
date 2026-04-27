@@ -584,22 +584,31 @@ typedef struct {
 
 static const char *const AGG_FNS[] = { "count", "sum", "avg", "min", "max", NULL };
 
+/* *out is in/out — pre-filled values turn this into an edit dialog,
+   empty values get sensible defaults for "add new". */
 static int prompt_one_agg(const ObjectInfo *oi, AggRow *out) {
     const char *field_choices[MAX_FIELDS_CACHED + 2];
     field_choices[0] = "(none)";
     for (int i = 0; i < oi->nfields; i++) field_choices[1 + i] = oi->fields[i].name;
     field_choices[1 + oi->nfields] = NULL;
 
+    int editing = (out->fn[0] != '\0');
+
     FormField fs[3] = {0};
     fs[0].label = "function"; fs[0].kind = FF_CHOICE; fs[0].choices = AGG_FNS;
-    snprintf(fs[0].value, sizeof(fs[0].value), "count");
+    snprintf(fs[0].value, sizeof(fs[0].value), "%s",
+             editing ? out->fn : "count");
     fs[1].label = "field";    fs[1].kind = FF_CHOICE; fs[1].choices = field_choices;
-    snprintf(fs[1].value, sizeof(fs[1].value), "(none)");
+    snprintf(fs[1].value, sizeof(fs[1].value), "%s",
+             editing && out->field[0] ? out->field : "(none)");
     fs[2].label = "alias";    fs[2].kind = FF_TEXT;
-    snprintf(fs[2].value, sizeof(fs[2].value), "n");
+    snprintf(fs[2].value, sizeof(fs[2].value), "%s",
+             editing ? out->alias : "n");
 
-    if (tui_form("add aggregate (sum/avg/min/max need field; count is optional)", fs, 3) != 0)
-        return -1;
+    const char *title = editing
+        ? "edit aggregate (sum/avg/min/max need field; count is optional)"
+        : "add aggregate (sum/avg/min/max need field; count is optional)";
+    if (tui_form(title, fs, 3) != 0) return -1;
     snprintf(out->fn,    sizeof(out->fn),    "%s", fs[0].value);
     snprintf(out->field, sizeof(out->field), "%s", fs[1].value);
     snprintf(out->alias, sizeof(out->alias), "%s", fs[2].value[0] ? fs[2].value : "n");
@@ -645,7 +654,7 @@ static int build_agg_specs(const ObjectInfo *oi,
             snprintf(labels[total], sizeof(labels[0]),
                      "%-6s %-20s as %s", rows[i].fn, f, rows[i].alias);
             items[total].label = labels[total];
-            items[total].hint  = "⏎/→ to remove";
+            items[total].hint  = "⏎ edit   d/DEL delete";
             total++;
         }
         snprintf(labels[total], sizeof(labels[0]), "[+] add aggregate");
@@ -665,7 +674,7 @@ static int build_agg_specs(const ObjectInfo *oi,
         if (choice == idx_submit) { *specs_out = pack_aggs(rows, n); return 0; }
         if (choice == idx_add) {
             if (n >= MAX_AGG_ROWS) { tui_alert("aggregate", "max specs reached"); continue; }
-            AggRow row;
+            AggRow row = {0};  /* empty → prompt uses defaults */
             if (prompt_one_agg(oi, &row) == 0) {
                 rows[n++] = row;
                 *n_io = n;
@@ -673,11 +682,23 @@ static int build_agg_specs(const ObjectInfo *oi,
             }
             continue;
         }
-        if (tui_confirm("remove this aggregate?")) {
-            for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
-            n--;
-            *n_io = n;
-            if (sel >= n) sel = n;
+        /* Existing row — small action menu: edit, delete. */
+        MenuItem actions[] = {
+            { "edit",   "change function, field, or alias" },
+            { "delete", "remove this aggregate from the list" },
+        };
+        int act = tui_menu("aggregate action", actions, 2);
+        if (act == 0) {
+            AggRow edit_row = rows[choice];
+            if (prompt_one_agg(oi, &edit_row) == 0)
+                rows[choice] = edit_row;
+        } else if (act == 1) {
+            if (tui_confirm("delete this aggregate?")) {
+                for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
+                n--;
+                *n_io = n;
+                if (sel >= n) sel = n;
+            }
         }
     }
 }

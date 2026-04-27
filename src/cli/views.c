@@ -990,23 +990,33 @@ static const char *const OPS_ALL[] = {
     "exists","not_exists", NULL
 };
 
-/* Open a single-criterion form. Returns 0 on submit, -1 on cancel. */
+/* Open a single-criterion form. *out is in/out: pre-filled values turn this
+   into an edit dialog; empty values get sensible defaults for "add new".
+   Returns 0 on submit, -1 on cancel. */
 static int prompt_one_criterion(const ObjectInfo *oi, CritRow *out) {
-    /* Build field-name choices on the stack (NULL-terminated). */
     int nfc = oi->nfields;
     if (nfc <= 0) { tui_alert("criteria", "object has no fields"); return -1; }
     const char *field_choices[MAX_FIELDS_CACHED + 1];
     for (int i = 0; i < nfc; i++) field_choices[i] = oi->fields[i].name;
     field_choices[nfc] = NULL;
 
+    int editing = (out->field[0] != '\0');
+
     FormField fs[3] = {0};
     fs[0].label   = "field"; fs[0].kind = FF_CHOICE; fs[0].choices = field_choices;
-    snprintf(fs[0].value, sizeof(fs[0].value), "%s", oi->fields[0].name);
+    snprintf(fs[0].value, sizeof(fs[0].value), "%s",
+             editing ? out->field : oi->fields[0].name);
     fs[1].label   = "op";    fs[1].kind = FF_CHOICE; fs[1].choices = OPS_ALL;
-    snprintf(fs[1].value, sizeof(fs[1].value), "eq");
+    snprintf(fs[1].value, sizeof(fs[1].value), "%s",
+             editing ? out->op : "eq");
     fs[2].label   = "value"; fs[2].kind = FF_TEXT;
+    snprintf(fs[2].value, sizeof(fs[2].value), "%s",
+             editing ? out->value : "");
 
-    if (tui_form("add criterion (←→ cycle dropdowns)", fs, 3) != 0) return -1;
+    const char *title = editing
+        ? "edit criterion (←→ cycle dropdowns)"
+        : "add criterion (←→ cycle dropdowns)";
+    if (tui_form(title, fs, 3) != 0) return -1;
     if (!fs[0].value[0]) return -1;
     snprintf(out->field, sizeof(out->field), "%s", fs[0].value);
     snprintf(out->op,    sizeof(out->op),    "%s", fs[1].value);
@@ -1092,7 +1102,7 @@ int tui_criteria_builder(const ObjectInfo *oi,
             snprintf(labels[total], sizeof(labels[0]),
                      "%-20s  %-6s  %s", rows[i].field, rows[i].op, rows[i].value);
             items[total].label = labels[total];
-            items[total].hint  = "⏎/→ to remove this criterion";
+            items[total].hint  = "⏎ edit   d/DEL delete";
             total++;
         }
         snprintf(labels[total], sizeof(labels[0]), "[+] add criterion");
@@ -1123,7 +1133,7 @@ int tui_criteria_builder(const ObjectInfo *oi,
         }
         if (choice == idx_add) {
             if (n >= MAX_CRIT_ROWS) continue;
-            CritRow row;
+            CritRow row = {0};  /* empty → prompt uses defaults */
             if (prompt_one_criterion(oi, &row) == 0) {
                 rows[n++] = row;
                 *n_io = n;
@@ -1131,12 +1141,23 @@ int tui_criteria_builder(const ObjectInfo *oi,
             }
             continue;
         }
-        /* Existing row — confirm-delete. */
-        if (tui_confirm("remove this criterion?")) {
-            for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
-            n--;
-            *n_io = n;
-            if (sel >= n) sel = n;  /* keep cursor in range after delete */
+        /* Existing row — small action menu: edit, delete. */
+        MenuItem actions[] = {
+            { "edit",   "change field, op, or value" },
+            { "delete", "remove this criterion from the list" },
+        };
+        int act = tui_menu("criterion action", actions, 2);
+        if (act == 0) {
+            CritRow edit_row = rows[choice];
+            if (prompt_one_criterion(oi, &edit_row) == 0)
+                rows[choice] = edit_row;
+        } else if (act == 1) {
+            if (tui_confirm("delete this criterion?")) {
+                for (int i = choice; i < n - 1; i++) rows[i] = rows[i + 1];
+                n--;
+                *n_io = n;
+                if (sel >= n) sel = n;
+            }
         }
     }
 }
