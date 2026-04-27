@@ -367,46 +367,48 @@ static void query_single_key(CliConn *c, const char *mode, const char *result_ti
 static void query_get(CliConn *c)    { query_single_key(c, "get",    "get result"); }
 static void query_exists(CliConn *c) { query_single_key(c, "exists", "exists");     }
 
-/* Pack a CSV string of comma-separated values into a JSON array. */
-static void csv_to_json_array(const char *csv, char *out, size_t out_sz) {
-    size_t off = 0;
-    off += snprintf(out + off, out_sz - off, "[");
-    const char *p = csv;
-    int first = 1;
-    while (*p) {
-        while (*p == ' ' || *p == ',') p++;
-        if (!*p) break;
-        const char *s = p;
-        while (*p && *p != ',') p++;
-        size_t L = (size_t)(p - s);
-        while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\t')) L--;
-        if (L == 0) continue;
-        off += snprintf(out + off, out_sz - off,
-            "%s\"%.*s\"", first ? "" : ",", (int)L, s);
-        first = 0;
-    }
-    snprintf(out + off, out_sz - off, "]");
-}
-
 /* Multi-key wrapper for get/exists. Both daemon modes accept a `keys` array
    and return shapes the unified renderer handles. */
 static void query_keys_op(CliConn *c, const char *mode, const char *result_title) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
 
-    FormField fs[1] = {0};
-    fs[0].label = "keys (comma-separated)"; fs[0].kind = FF_TEXT;
+    /* Sticky list across re-runs — comes back from the result with the
+       same keys still entered. */
+    char keys[64][LIST_ITEM_MAX];
+    memset(keys, 0, sizeof(keys));
+    int n_keys = 0;
+
     char title[128];
-    snprintf(title, sizeof(title), "%s many in %s/%s", mode, oi.dir, oi.object);
+    snprintf(title, sizeof(title), "%s many in %s/%s — TAB adds, ⏎ submits",
+             mode, oi.dir, oi.object);
 
     for (;;) {
-        if (tui_form(title, fs, 1) != 0) return;
-        if (!fs[0].value[0]) { tui_alert(mode, "at least one key required"); continue; }
+        if (tui_list_input(title, "key", keys, 64, &n_keys) != 0) return;
 
-        char keys_json[2048];
-        csv_to_json_array(fs[0].value, keys_json, sizeof(keys_json));
+        /* Build keys JSON array from the accumulated list. */
+        char keys_json[8192];
+        size_t off = 0;
+        off += snprintf(keys_json + off, sizeof(keys_json) - off, "[");
+        for (int i = 0; i < n_keys; i++) {
+            /* Basic JSON-string escape for embedded quotes/backslashes. */
+            const char *s = keys[i];
+            off += snprintf(keys_json + off, sizeof(keys_json) - off,
+                "%s\"", i ? "," : "");
+            for (; *s && off + 6 < sizeof(keys_json); s++) {
+                if (*s == '"' || *s == '\\') {
+                    keys_json[off++] = '\\';
+                    keys_json[off++] = *s;
+                } else {
+                    keys_json[off++] = *s;
+                }
+            }
+            keys_json[off++] = '"';
+        }
+        keys_json[off++] = ']';
+        keys_json[off]   = '\0';
 
-        char req[4096];
+        char req[16384];
         snprintf(req, sizeof(req),
             "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\",\"keys\":%s}",
             mode, oi.dir, oi.object, keys_json);

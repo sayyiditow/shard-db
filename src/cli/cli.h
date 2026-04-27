@@ -105,6 +105,17 @@ typedef struct {
 /* Render a form, let the user edit. Returns 0 on submit, -1 on cancel. */
 int tui_form(const char *title, FormField *fields, int nfields);
 
+/* List input — TAB appends the current input to the accumulated list and
+   clears the input. ENTER submits (the in-progress input is appended too if
+   non-empty). BACKSPACE on empty input pops the last item back so the user
+   can edit it. ↑↓ moves the highlight; DEL removes the highlighted row.
+   `items` is in/out — caller pre-fills *n_io with whatever's already there
+   (typically 0 on first call) and the widget updates both. ESC/← cancels.
+   Returns 0 on submit, -1 on cancel. */
+#define LIST_ITEM_MAX 256
+int tui_list_input(const char *title, const char *item_label,
+                   char items[][LIST_ITEM_MAX], int max, int *n_io);
+
 /* ---- Output views ---- */
 
 /* Display a multi-line text body in a scrollable pane. */

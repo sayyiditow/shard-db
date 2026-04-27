@@ -249,6 +249,142 @@ const char *tui_pick(const char *title, const char *const *values, int nvalues) 
     return idx >= 0 ? values[idx] : NULL;
 }
 
+int tui_list_input(const char *title, const char *item_label,
+                   char items[][LIST_ITEM_MAX], int max, int *n_io) {
+    char input[LIST_ITEM_MAX] = "";
+    int sel = -1;  /* -1 = focus on input; 0..n-1 = focus on a row */
+
+    for (;;) {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        erase();
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(0, 0, "  shard-cli  ");
+        attroff(A_BOLD);
+        mvprintw(0, 14, "| %.*s", cols - 16, title ? title : "");
+        attroff(COLOR_PAIR(1));
+        mvhline(1, 0, ACS_HLINE, cols);
+
+        int top = 3;
+        int n = *n_io;
+        for (int i = 0; i < n; i++) {
+            int row = top + i;
+            if (row >= rows - 6) break;
+            if (i == sel) attron(COLOR_PAIR(2) | A_REVERSE);
+            mvprintw(row, 4, " %2d. %-*s ",
+                     i + 1, cols - 12, items[i]);
+            if (i == sel) attroff(COLOR_PAIR(2) | A_REVERSE);
+        }
+        if (n == 0) {
+            attron(COLOR_PAIR(3));
+            mvprintw(top, 4, "(empty — type a %s and press TAB to add)",
+                     item_label ? item_label : "value");
+            attroff(COLOR_PAIR(3));
+        }
+
+        int input_row = rows - 5;
+        attron(sel < 0 ? (COLOR_PAIR(2) | A_REVERSE) : A_UNDERLINE);
+        mvprintw(input_row, 4, " %s: %-*s ",
+                 item_label ? item_label : "value",
+                 cols - 12 - (int)strlen(item_label ? item_label : "value"),
+                 input);
+        attroff(sel < 0 ? (COLOR_PAIR(2) | A_REVERSE) : A_UNDERLINE);
+
+        attron(COLOR_PAIR(3));
+        if (sel < 0)
+            mvprintw(rows - 3, 4,
+                "type to enter   TAB add to list   ⏎ submit (%d item%s)   "
+                "←/ESC back   BACKSPACE pop last",
+                n, n == 1 ? "" : "s");
+        else
+            mvprintw(rows - 3, 4,
+                "↑↓ navigate   d/DEL remove   ⏎ edit   TAB back to input   "
+                "←/ESC cancel");
+        attroff(COLOR_PAIR(3));
+        refresh();
+
+        int ch = getch();
+
+        /* Item-row focus mode. */
+        if (sel >= 0) {
+            switch (ch) {
+                case KEY_UP: case 'k':   if (sel > 0) sel--; break;
+                case KEY_DOWN: case 'j': if (sel < n - 1) sel++; break;
+                case '\t':                sel = -1; break;
+                case 'd': case KEY_DC: case 127: case 8: case KEY_BACKSPACE:
+                    /* Remove highlighted. */
+                    for (int i = sel; i < n - 1; i++)
+                        memcpy(items[i], items[i + 1], LIST_ITEM_MAX);
+                    items[n - 1][0] = '\0';
+                    n--;
+                    *n_io = n;
+                    if (sel >= n) sel = n - 1;
+                    if (n == 0) sel = -1;
+                    break;
+                case '\n': case '\r': case KEY_ENTER:
+                    /* Pull the row back into the input for editing. */
+                    snprintf(input, sizeof(input), "%s", items[sel]);
+                    for (int i = sel; i < n - 1; i++)
+                        memcpy(items[i], items[i + 1], LIST_ITEM_MAX);
+                    items[n - 1][0] = '\0';
+                    n--;
+                    *n_io = n;
+                    sel = -1;
+                    break;
+                case 'q': case 27: case KEY_LEFT: case 'h':
+                    return -1;
+            }
+            continue;
+        }
+
+        /* Input focus mode. */
+        size_t L = strlen(input);
+        switch (ch) {
+            case '\t':
+                if (L > 0) {
+                    if (n >= max) { tui_alert(title, "list is full"); break; }
+                    snprintf(items[n], LIST_ITEM_MAX, "%s", input);
+                    *n_io = ++n;
+                    input[0] = '\0';
+                }
+                break;
+            case '\n': case '\r': case KEY_ENTER:
+                if (L > 0) {
+                    if (n >= max) { tui_alert(title, "list is full"); break; }
+                    snprintf(items[n], LIST_ITEM_MAX, "%s", input);
+                    *n_io = ++n;
+                    input[0] = '\0';
+                }
+                if (*n_io == 0) {
+                    tui_alert(title, "list is empty — type a value and TAB or ⏎ to add");
+                    break;
+                }
+                return 0;
+            case KEY_BACKSPACE: case 127: case 8:
+                if (L > 0) {
+                    input[L - 1] = '\0';
+                } else if (n > 0) {
+                    /* Pop last item back into input for re-edit. */
+                    snprintf(input, sizeof(input), "%s", items[n - 1]);
+                    items[n - 1][0] = '\0';
+                    *n_io = --n;
+                }
+                break;
+            case KEY_UP:
+                if (n > 0) sel = n - 1;
+                break;
+            case 'q': case 27: case KEY_LEFT:
+                return -1;
+            default:
+                if (ch >= 32 && ch < 127 && L < LIST_ITEM_MAX - 1) {
+                    input[L] = (char)ch;
+                    input[L + 1] = '\0';
+                }
+                break;
+        }
+    }
+}
+
 int tui_form(const char *title, FormField *fields, int nfields) {
     int sel = 0;
     if (nfields <= 0) return -1;
