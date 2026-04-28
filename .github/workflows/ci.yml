@@ -15,9 +15,19 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & test (Linux x86_64)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Build & test (Linux ${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 25
+    strategy:
+      # Don't cancel the other arch when one fails — we want full signal.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            # GitHub-hosted ARM64 runner; free for public repos.
+            runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +60,9 @@ jobs:
       - name: OR criteria (test-or-logic)
         run: ./tests/test-or-logic.sh
 
+      - name: AND index intersection (test-and-intersection)
+        run: ./tests/test-and-intersection.sh
+
       - name: CSV export (test-csv-export)
         run: ./tests/test-csv-export.sh
 
@@ -59,5 +72,55 @@ jobs:
       - name: Per-object tokens + perms (test-token-perms)
         run: ./tests/test-token-perms.sh
 
+      - name: Tenant management (test-tenant-mgmt)
+        run: ./tests/test-tenant-mgmt.sh
+
       - name: Per-request timeout_ms (test-request-timeout)
         run: ./tests/test-request-timeout.sh
+
+      - name: Binary-native B+ tree keys + reindex (test-binary-index)
+        run: ./tests/test-binary-index.sh
+
+      - name: Keyset cursor pagination (test-find-cursor)
+        run: ./tests/test-find-cursor.sh
+
+      - name: Native TLS 1.3 (test-tls)
+        run: ./tests/test-tls.sh
+
+      - name: list-objects + describe-object (test-describe)
+        run: ./tests/test-describe.sh
+
+      - name: CSV per-key partial update (test-bulk-update-delimited)
+        run: ./tests/test-bulk-update-delimited.sh
+
+      - name: JSON per-key partial update (test-bulk-update-json)
+        run: ./tests/test-bulk-update-json.sh
+
+      - name: bulk-insert as upsert + idx drift (test-bulk-upsert)
+        run: ./tests/test-bulk-upsert.sh
+
+      - name: CAS on bulk ops (test-bulk-cas)
+        run: ./tests/test-bulk-cas.sh
+
+      - name: export-schema / import-schema (test-schema-export)
+        run: ./tests/test-schema-export.sh
+
+      - name: Prometheus text-format exposition (test-stats-prom)
+        run: ./tests/test-stats-prom.sh
+
+      - name: Aggregate NEQ algebraic shortcut (test-agg-neq-shortcut)
+        run: ./tests/test-agg-neq-shortcut.sh
+
+      - name: Package binary
+        # Tag artifact uploads by arch so both binaries can coexist.
+        run: |
+          tarball="shard-db-${{ matrix.arch }}.tar.gz"
+          tar -C build/bin -czf "$tarball" shard-db shard-cli
+          ls -l "$tarball"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-db-${{ matrix.arch }}
+          path: shard-db-${{ matrix.arch }}.tar.gz
+          retention-days: 14
