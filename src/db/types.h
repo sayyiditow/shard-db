@@ -59,6 +59,15 @@ static inline int index_splits_for(int splits) {
 static inline int idx_shard_for_data_shard(int data_shard) {
     return data_shard / 4;
 }
+
+/* Index shard id for a record given its xxh128 hash. Mirrors what the
+   data path would compute (data_shard = hash16[0..1] % splits) and then
+   maps that to its index shard (data_shard / 4). Used by every site that
+   needs to route an indexed value to the right per-shard btree file. */
+static inline int idx_shard_for_hash(const uint8_t hash16[16], int splits) {
+    int data_shard = ((uint16_t)hash16[0] << 8 | (uint16_t)hash16[1]) % splits;
+    return data_shard / 4;
+}
 #define MAX_KEY_CEILING  1024        /* hard upper bound on per-object max_key
                                         (uint16 allows 65535, but keys near that
                                         size bloat slot_size; 1024 is plenty —
@@ -526,6 +535,9 @@ void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot
 void compute_addr(const char *key, size_t key_len, int splits, uint8_t hash_out[16], int *shard_id, int *slot);
 void build_shard_path(char *buf, size_t buflen, const char *db_root, const char *object, int shard_id);
 void build_shard_filename(char *buf, size_t buflen, const char *data_dir, int shard_id);
+void build_idx_path(char *buf, size_t buflen,
+                    const char *db_root, const char *object,
+                    const char *field, int idx_shard_id);
 uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, off_t off);
 
 /* Unified shard cache (ucache) — persistent MAP_SHARED mmap per shard.

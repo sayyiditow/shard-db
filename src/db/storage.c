@@ -42,11 +42,16 @@ void build_shard_path(char *buf, size_t buflen,
     build_shard_filename(buf, buflen, dd, shard_id);
 }
 
+/* Canonical layout for per-shard indexes:
+       <db_root>/<object>/indexes/<field>/<NNN>.idx
+   where NNN is 3 hex digits matching the data shard filename pattern.
+   Composite indexes (field name contains '+') get the literal name as
+   the directory; the path-encoded form is fine on POSIX filesystems. */
 void build_idx_path(char *buf, size_t buflen,
                            const char *db_root, const char *object,
                            const char *field, int idx_shard_id) {
-    snprintf(buf, buflen, "%s/%s/indexes/%s/%04x.idx",
-             db_root, object, field, idx_shard_id);
+    snprintf(buf, buflen, "%s/%s/indexes/%s/%03x.idx",
+             db_root, object, field, idx_shard_id & 0xFFF);
 }
 
 /* ========== Unified Shard Cache (ucache) ==========
