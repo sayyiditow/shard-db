@@ -1693,18 +1693,19 @@ static void *bulk_del_shard_worker(void *arg) {
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, shard_id);
-    int fd = open(shard, O_RDWR);
-    if (fd < 0) return NULL;
-    flock(fd, LOCK_EX);
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { flock(fd, LOCK_UN); close(fd); return NULL; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) { flock(fd, LOCK_UN); close(fd); return NULL; }
 
+    /* Use the persistent ucache write path: per-entry rwlock serializes
+       writers but readers stay live, and the mmap is shared with the
+       reader pool. The previous open + flock + mmap MAP_SHARED + munmap
+       per worker dropped + reopened the kernel mapping every time, so
+       bulk-delete paid the page-fault hit on each call AND held a
+       cross-process flock that blocked concurrent readers using the same
+       file via ucache. */
+    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    if (!wh.map) return NULL;
+    uint8_t *map = wh.map;
     ShardHeader *sh = (ShardHeader *)map;
-    if ((size_t)st.st_size < SHARD_HDR_SIZE || sh->magic != SHARD_MAGIC) {
-        munmap(map, st.st_size); flock(fd, LOCK_UN); close(fd); return NULL;
-    }
+    if (sh->magic != SHARD_MAGIC) { ucache_write_release(wh); return NULL; }
     uint32_t slots = sh->slots_per_shard;
     uint32_t mask = slots - 1;
     uint32_t tombstoned_here = 0;
@@ -1749,9 +1750,7 @@ static void *bulk_del_shard_worker(void *arg) {
         sh->record_count = (sh->record_count > tombstoned_here)
             ? sh->record_count - tombstoned_here : 0;
     }
-    munmap(map, st.st_size);
-    flock(fd, LOCK_UN);
-    close(fd);
+    ucache_write_release(wh);
     return NULL;
 }
 
@@ -5806,17 +5805,15 @@ static void *shard_find_worker(void *arg) {
     int sid = sw->entries[0].shard_id;
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
-    int fd = open(shard, O_RDONLY);
-    if (fd < 0) return NULL;
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { close(fd); return NULL; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    if ((size_t)st.st_size < SHARD_HDR_SIZE) { munmap(map, st.st_size); return NULL; }
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, st.st_size); return NULL; }
-    uint32_t slots = sh->slots_per_shard;
+
+    /* Use the persistent shard mmap cache. Per-call open + mmap + munmap
+       was paying ~100µs of page-fault + TLB-flush per shard per query —
+       visible on `find` indexed paths as a 2-3x slowdown vs the README
+       baseline despite the actual btree work being microseconds. */
+    FcacheRead fc = fcache_get_read(shard);
+    if (!fc.map) return NULL;
+    uint8_t *map = fc.map;
+    uint32_t slots = fc.slots_per_shard;
     uint32_t mask = slots - 1;
 
     for (int ei = 0; ei < sw->entry_count; ei++) {
@@ -5910,7 +5907,7 @@ static void *shard_find_worker(void *arg) {
             break;
         }
     }
-    munmap(map, st.st_size);
+    fcache_release(fc);
     return NULL;
 }
 
@@ -7147,8 +7144,7 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
    start + length into *out_val, *out_len. Returns 0 on success, -1 not found.
    Caller holds the returned pointer only for the duration of the mmap lease. */
 typedef struct {
-    uint8_t *map;
-    size_t map_len;
+    FcacheRead fc;            /* persistent shard mmap; fcache_release on free */
     const uint8_t *val;
     size_t val_len;
 } KeysetRecordRead;
@@ -7162,42 +7158,33 @@ static int read_record_by_hash(const char *db_root, const char *object,
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-    int fd = open(shard, O_RDONLY);
-    if (fd < 0) return -1;
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)SHARD_HDR_SIZE) {
-        close(fd); return -1;
-    }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return -1;
 
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) {
-        munmap(map, st.st_size); return -1;
-    }
-    uint32_t slots = sh->slots_per_shard;
+    /* Persistent ucache mapping — same as every other read worker. The
+       previous open + mmap MAP_PRIVATE per call paid page-fault + close
+       overhead per KeySet entry, swamping the actual record probe. */
+    FcacheRead fc = fcache_get_read(shard);
+    if (!fc.map) return -1;
+    uint32_t slots = fc.slots_per_shard;
     uint32_t mask  = slots - 1;
 
     for (uint32_t p = 0; p < slots; p++) {
         uint32_t s = ((uint32_t)slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
         if (h->flag == 0 && h->key_len == 0) break;
         if (h->flag != 1) continue;
         if (memcmp(h->hash, hash, 16) != 0) continue;
 
-        out->map = map;
-        out->map_len = st.st_size;
-        out->val = map + zoneB_off(s, slots, sch->slot_size) + h->key_len;
+        out->fc = fc;
+        out->val = fc.map + zoneB_off(s, slots, sch->slot_size) + h->key_len;
         out->val_len = h->value_len;
         return 0;
     }
-    munmap(map, st.st_size);
+    fcache_release(fc);
     return -1;
 }
 
 static void release_record_read(KeysetRecordRead *r) {
-    if (r && r->map) { munmap(r->map, r->map_len); r->map = NULL; }
+    if (r && r->fc.map) { fcache_release(r->fc); r->fc.map = NULL; }
 }
 
 /* Emit records matching `tree` by iterating a KeySet built from the OR branch.
@@ -7238,21 +7225,17 @@ static int keyset_emit_find(const char *db_root, const char *object,
            record. For now, extract the key via a follow-up scan. */
         release_record_read(&r);
 
-        /* Re-walk for key + value together. Do it in-line (cheap — one mmap open). */
+        /* Re-walk for key + value together via the persistent ucache. The
+           prior open + mmap MAP_PRIVATE per KeySet hit was paying ~100µs
+           page-fault overhead per emitted row. */
         int sid, slt;
         addr_from_hash(ks->keys[b], sch->splits, &sid, &slt);
         char shard[PATH_MAX];
         build_shard_path(shard, sizeof(shard), db_root, object, sid);
-        int fd = open(shard, O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st;
-        if (fstat(fd, &st) != 0 || st.st_size < (off_t)SHARD_HDR_SIZE) { close(fd); continue; }
-        uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) continue;
-        const ShardHeader *sh = (const ShardHeader *)map;
-        if (sh->magic != SHARD_MAGIC) { munmap(map, st.st_size); continue; }
-        uint32_t slots = sh->slots_per_shard;
+        FcacheRead fc = fcache_get_read(shard);
+        if (!fc.map) continue;
+        uint8_t *map = fc.map;
+        uint32_t slots = fc.slots_per_shard;
         uint32_t mask = slots - 1;
 
         int found = 0;
@@ -7369,7 +7352,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
             found = 1;
             break;
         }
-        munmap(map, st.st_size);
+        fcache_release(fc);
         if (!found) continue;
     }
 
@@ -7451,28 +7434,21 @@ static void keyset_emit_agg(const char *db_root, const char *object,
         addr_from_hash(ks->keys[b], sch->splits, &sid, &slt);
         char shard[PATH_MAX];
         build_shard_path(shard, sizeof(shard), db_root, object, sid);
-        int fd = open(shard, O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st;
-        if (fstat(fd, &st) != 0 || st.st_size < (off_t)SHARD_HDR_SIZE) { close(fd); continue; }
-        uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) continue;
-        const ShardHeader *sh = (const ShardHeader *)map;
-        if (sh->magic != SHARD_MAGIC) { munmap(map, st.st_size); continue; }
-        uint32_t slots = sh->slots_per_shard;
+        FcacheRead fc = fcache_get_read(shard);
+        if (!fc.map) continue;
+        uint32_t slots = fc.slots_per_shard;
         uint32_t mask = slots - 1;
         for (uint32_t p = 0; p < slots; p++) {
             uint32_t s = ((uint32_t)slt + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag != 1) continue;
             if (memcmp(h->hash, ks->keys[b], 16) != 0) continue;
-            const uint8_t *block = map + zoneB_off(s, slots, sch->slot_size);
+            const uint8_t *block = fc.map + zoneB_off(s, slots, sch->slot_size);
             agg_scan_cb(h, block, agg_ctx);
             break;
         }
-        munmap(map, st.st_size);
+        fcache_release(fc);
     }
 }
 
