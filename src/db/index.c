@@ -55,16 +55,69 @@ void btree_idx_delete(const char *db_root, const char *object,
     btree_delete(idx_path, value, vlen, hash);
 }
 
+/* Per-shard parallel-walk machinery. parallel_for spawns one task per shard,
+   each calls the appropriate single-file btree_search/range/range_ex on its
+   shard. The shared `cb` and `ctx` must be thread-safe — callers that need
+   per-worker state are responsible (see idx_count_cb's atomic counter and
+   collect_hash_cb's mutex). KeySet-based callbacks (intersect_*, or_*) are
+   already lock-free. Avoid nesting: parent callers must NOT themselves run
+   under parallel_for or the pool can deadlock. */
+
+typedef struct {
+    char idx_path[PATH_MAX];
+    int op;                  /* 0 = search, 1 = range, 2 = range_ex */
+    const char *value;
+    size_t vlen;
+    const char *min_val;
+    size_t      min_len;
+    int         min_exclusive;
+    const char *max_val;
+    size_t      max_len;
+    int         max_exclusive;
+    bt_result_cb cb;
+    void *ctx;
+} ShardWalkArg;
+
+static void *shard_walk_worker(void *arg) {
+    ShardWalkArg *sw = (ShardWalkArg *)arg;
+    switch (sw->op) {
+        case 0: btree_search(sw->idx_path, sw->value, sw->vlen,
+                             sw->cb, sw->ctx); break;
+        case 1: btree_range(sw->idx_path,
+                            sw->min_val, sw->min_len,
+                            sw->max_val, sw->max_len,
+                            sw->cb, sw->ctx); break;
+        case 2: btree_range_ex(sw->idx_path,
+                               sw->min_val, sw->min_len, sw->min_exclusive,
+                               sw->max_val, sw->max_len, sw->max_exclusive,
+                               sw->cb, sw->ctx); break;
+    }
+    return NULL;
+}
+
+static void shard_walk_dispatch(const char *db_root, const char *object,
+                                const char *field, int splits,
+                                ShardWalkArg *tmpl,
+                                bt_result_cb cb, void *ctx) {
+    int n = index_splits_for(splits);
+    ShardWalkArg *args = malloc((size_t)n * sizeof(ShardWalkArg));
+    for (int s = 0; s < n; s++) {
+        args[s] = *tmpl;
+        build_idx_path(args[s].idx_path, sizeof(args[s].idx_path),
+                       db_root, object, field, s);
+        args[s].cb = cb;
+        args[s].ctx = ctx;
+    }
+    parallel_for(shard_walk_worker, args, n, sizeof(ShardWalkArg));
+    free(args);
+}
+
 void btree_idx_search(const char *db_root, const char *object,
                       const char *field, int splits,
                       const char *value, size_t vlen,
                       bt_result_cb cb, void *ctx) {
-    int n = index_splits_for(splits);
-    for (int s = 0; s < n; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        btree_search(idx_path, value, vlen, cb, ctx);
-    }
+    ShardWalkArg t = {{0}, .op = 0, .value = value, .vlen = vlen};
+    shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
 }
 
 void btree_idx_range(const char *db_root, const char *object,
@@ -72,12 +125,10 @@ void btree_idx_range(const char *db_root, const char *object,
                      const char *min_val, size_t min_len,
                      const char *max_val, size_t max_len,
                      bt_result_cb cb, void *ctx) {
-    int n = index_splits_for(splits);
-    for (int s = 0; s < n; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        btree_range(idx_path, min_val, min_len, max_val, max_len, cb, ctx);
-    }
+    ShardWalkArg t = {{0}, .op = 1,
+                      .min_val = min_val, .min_len = min_len,
+                      .max_val = max_val, .max_len = max_len};
+    shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
 }
 
 void btree_idx_range_ex(const char *db_root, const char *object,
@@ -85,15 +136,10 @@ void btree_idx_range_ex(const char *db_root, const char *object,
                         const char *min_val, size_t min_len, int min_exclusive,
                         const char *max_val, size_t max_len, int max_exclusive,
                         bt_result_cb cb, void *ctx) {
-    int n = index_splits_for(splits);
-    for (int s = 0; s < n; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        btree_range_ex(idx_path,
-                       min_val, min_len, min_exclusive,
-                       max_val, max_len, max_exclusive,
-                       cb, ctx);
-    }
+    ShardWalkArg t = {{0}, .op = 2,
+                      .min_val = min_val, .min_len = min_len, .min_exclusive = min_exclusive,
+                      .max_val = max_val, .max_len = max_len, .max_exclusive = max_exclusive};
+    shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
 }
 
 /* ----- Globally-ordered walk (for cursor pagination) =====
