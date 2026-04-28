@@ -6637,11 +6637,20 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
        the full scan. Keep regex on the full-scan path; revisit only with
        a real workload signal. */
     if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) return 0;
-    char p[PATH_MAX];
-    snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->field);
-    struct stat st;
-    if (stat(p, &st) != 0 || st.st_size == 0) return 0;
-    if (out_idx_path) strncpy(out_idx_path, p, out_sz - 1);
+
+    /* Per-shard layout: index lives at <obj>/indexes/<field>/<NNN>.idx with
+       splits/4 shards. btree_idx_exists checks for any non-empty shard.
+       Old single-file <field>.idx layout is gone; load_splits trips into
+       the schema cache so this stays cheap on the planner hot path. */
+    Schema sch = load_schema(db_root, object);
+    if (!btree_idx_exists(db_root, object, c->field, sch.splits)) return 0;
+    if (out_idx_path) {
+        /* out_idx_path is now an opaque tag for callers that want a
+           non-empty string to mean "indexed". The per-shard wrappers
+           rebuild the real per-shard paths internally from (field, splits). */
+        snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
+                 db_root, object, c->field);
+    }
     return 1;
 }
 
@@ -10375,11 +10384,10 @@ int cmd_aggregate(const char *db_root, const char *object,
             }
         }
         if (algebraic) {
-            char idx_path[PATH_MAX];
-            snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx",
-                     db_root, object, tree->leaf.field);
-            struct stat st;
-            if (stat(idx_path, &st) == 0) neq_eligible = 1;
+            /* Per-shard layout — check the new <field>/<NNN>.idx layout. */
+            Schema sch_neq = load_schema(db_root, object);
+            if (btree_idx_exists(db_root, object, tree->leaf.field, sch_neq.splits))
+                neq_eligible = 1;
         }
     }
 
