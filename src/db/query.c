@@ -5424,6 +5424,44 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
                         (const char *)buf2, plen + 4, cb, ctx);
             break;
         }
+        case OP_LIKE: {
+            /* CS LIKE: leverage the pattern's % placement to narrow the btree
+               read. Only meaningful on varchar / composite (raw-byte) keys.
+                 "foo"   (no %)  → point lookup, same as OP_EQUAL.
+                 "foo%"  (trail) → prefix range, same as OP_STARTS_WITH.
+                 "%foo"  (lead)  → suffix match — no shortcut, full leaf scan.
+                 "%foo%" (both)  → substring — no shortcut, full leaf scan.
+               compile_one already classified this into pc->value's % placement;
+               we re-derive here because btree_dispatch sees only SearchCriterion.
+               Callbacks still apply check_primary; for LK_EXACT/LK_PREFIX that's
+               a redundant per-entry confirm but cheap. */
+            const char *pat = pc->value;
+            size_t pl = strlen(pat);
+            int lead = (pl >= 1 && pat[0] == '%');
+            int trail = (pl >= 1 && pat[pl-1] == '%');
+            int raw_prefix = (!tf || tf->type == FT_VARCHAR);
+
+            if (!lead && !trail && raw_prefix) {
+                /* Exact byte match — point lookup. */
+                encode_criterion_value(tf, pat, pl, buf1, &len1);
+                btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
+                break;
+            }
+            if (!lead && trail && raw_prefix) {
+                /* "foo%" — strip trailing % and use prefix range scan. */
+                size_t needle_len = pl - 1;
+                memcpy(buf1, pat, needle_len);
+                memcpy(buf2, buf1, needle_len);
+                memset(buf2 + needle_len, 0xff, 4);
+                btree_range(idx_path, (const char *)buf1, needle_len,
+                            (const char *)buf2, needle_len + 4, cb, ctx);
+                break;
+            }
+            /* Substring / suffix / non-varchar → full leaf scan; per-entry
+               filter via check_primary in the callback handles correctness. */
+            btree_range(idx_path, "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            break;
+        }
         case OP_NOT_EQUAL:
             /* Boolean has exactly 2 values — neq X is equivalent to eq
                other-value. Single point lookup instead of two range scans,
