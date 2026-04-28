@@ -106,6 +106,7 @@ int main(int argc, char *argv[]) {
        Usage:
          shard-db shard-stats [dir] [object]
          shard-db stats
+         shard-db stats-prom                       (Prometheus text-format exposition)
          shard-db db-dirs
          shard-db vacuum-check                   */
     if (strcmp(cmd, "shard-stats") == 0) {
@@ -155,6 +156,8 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(cmd, "stats") == 0)
         return cmd_query_json(port, "{\"mode\":\"stats\",\"format\":\"table\"}");
+    if (strcmp(cmd, "stats-prom") == 0)
+        return cmd_query_json(port, "{\"mode\":\"stats-prom\"}");
     if (strcmp(cmd, "db-dirs") == 0)
         return cmd_query_json(port, "{\"mode\":\"db-dirs\"}");
     if (strcmp(cmd, "vacuum-check") == 0)

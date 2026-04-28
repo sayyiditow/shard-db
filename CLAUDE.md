@@ -35,7 +35,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-tenant-mgmt.sh               # add-dir/remove-dir + remove-token by fingerprint (17)
 ./tests/test-bulk-cas.sh                  # CAS on bulk-insert / bulk-update / bulk-delete (58)
 ./tests/test-schema-export.sh             # export-schema / import-schema CLI argv form (40)
-# Total: 625 tests
+./tests/test-stats-prom.sh                # Prometheus text-format exposition     (57)
+# Total: 682 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -164,6 +165,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 
 # Diagnostics
 ./shard-db stats                                  # Global (connections, in-flight, cache hit, slow log)
+./shard-db stats-prom                             # Same counters, Prometheus text-format exposition
 ./shard-db shard-stats <dir> <obj>                # Per-shard load table
 ./shard-db db-dirs                                # List allowed tenant dirs
 ./shard-db vacuum-check                           # Objects needing vacuum

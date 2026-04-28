@@ -274,7 +274,7 @@ typedef enum {
 static AdminLevel mode_admin_level(const char *mode) {
     if (!mode) return ADMIN_NONE;
     static const char *srv[] = {
-        "stats", "db-dirs", "vacuum-check", "shard-stats",
+        "stats", "stats-prom", "db-dirs", "vacuum-check", "shard-stats",
         "add-token", "remove-token", "list-tokens",
         "add-ip", "remove-ip", "list-ips",
         "add-dir", "remove-dir",
@@ -838,6 +838,77 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             pthread_mutex_unlock(&g_slow_query_lock);
             OUT("]}}\n");
         }
+        free(mode);
+        return;
+    }
+
+    /* stats-prom — Prometheus text-format exposition of the same counters as `stats`.
+       Same atomics, different formatter. Counter names follow Prom conventions:
+       _total suffix on monotonic counters, units in name (_seconds, _bytes), snake_case. */
+    if (mode && strcmp(mode, "stats-prom") == 0) {
+        int uc_used = 0, uc_total = 0; size_t uc_bytes = 0;
+        int bc_used = 0, bc_total = 0; size_t bc_bytes = 0;
+        ucache_stats(&uc_used, &uc_total, &uc_bytes);
+        bt_cache_stats(&bc_used, &bc_total, &bc_bytes);
+        uint64_t u_hits   = __atomic_load_n(&g_ucache_hits,    __ATOMIC_RELAXED);
+        uint64_t u_miss   = __atomic_load_n(&g_ucache_misses,  __ATOMIC_RELAXED);
+        uint64_t b_hits   = __atomic_load_n(&g_bt_cache_hits,  __ATOMIC_RELAXED);
+        uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
+        uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
+        uint64_t uptime   = now_ms() - g_server_start_ms;
+        int at = active_threads > 0 ? active_threads - 1 : 0;
+
+        OUT("# HELP shard_db_uptime_seconds Time since server start.\n");
+        OUT("# TYPE shard_db_uptime_seconds gauge\n");
+        OUT("shard_db_uptime_seconds %.3f\n", uptime / 1000.0);
+
+        OUT("# HELP shard_db_active_threads Worker threads currently servicing requests.\n");
+        OUT("# TYPE shard_db_active_threads gauge\n");
+        OUT("shard_db_active_threads %d\n", at);
+
+        OUT("# HELP shard_db_in_flight_writes Write/schema requests currently executing.\n");
+        OUT("# TYPE shard_db_in_flight_writes gauge\n");
+        OUT("shard_db_in_flight_writes %d\n", in_flight_writes);
+
+        OUT("# HELP shard_db_ucache_used Currently occupied ucache slots.\n");
+        OUT("# TYPE shard_db_ucache_used gauge\n");
+        OUT("shard_db_ucache_used %d\n", uc_used);
+        OUT("# HELP shard_db_ucache_capacity Total ucache slot capacity.\n");
+        OUT("# TYPE shard_db_ucache_capacity gauge\n");
+        OUT("shard_db_ucache_capacity %d\n", uc_total);
+        OUT("# HELP shard_db_ucache_bytes Bytes of memory mapped by ucache.\n");
+        OUT("# TYPE shard_db_ucache_bytes gauge\n");
+        OUT("shard_db_ucache_bytes %zu\n", uc_bytes);
+        OUT("# HELP shard_db_ucache_hits_total Cumulative ucache hits.\n");
+        OUT("# TYPE shard_db_ucache_hits_total counter\n");
+        OUT("shard_db_ucache_hits_total %lu\n", u_hits);
+        OUT("# HELP shard_db_ucache_misses_total Cumulative ucache misses.\n");
+        OUT("# TYPE shard_db_ucache_misses_total counter\n");
+        OUT("shard_db_ucache_misses_total %lu\n", u_miss);
+
+        OUT("# HELP shard_db_bt_cache_used Currently occupied B+ tree cache slots.\n");
+        OUT("# TYPE shard_db_bt_cache_used gauge\n");
+        OUT("shard_db_bt_cache_used %d\n", bc_used);
+        OUT("# HELP shard_db_bt_cache_capacity Total B+ tree cache slot capacity.\n");
+        OUT("# TYPE shard_db_bt_cache_capacity gauge\n");
+        OUT("shard_db_bt_cache_capacity %d\n", bc_total);
+        OUT("# HELP shard_db_bt_cache_bytes Bytes of memory mapped by the B+ tree cache.\n");
+        OUT("# TYPE shard_db_bt_cache_bytes gauge\n");
+        OUT("shard_db_bt_cache_bytes %zu\n", bc_bytes);
+        OUT("# HELP shard_db_bt_cache_hits_total Cumulative B+ tree cache hits.\n");
+        OUT("# TYPE shard_db_bt_cache_hits_total counter\n");
+        OUT("shard_db_bt_cache_hits_total %lu\n", b_hits);
+        OUT("# HELP shard_db_bt_cache_misses_total Cumulative B+ tree cache misses.\n");
+        OUT("# TYPE shard_db_bt_cache_misses_total counter\n");
+        OUT("shard_db_bt_cache_misses_total %lu\n", b_miss);
+
+        OUT("# HELP shard_db_slow_query_threshold_milliseconds Slow-query log threshold (0 = disabled).\n");
+        OUT("# TYPE shard_db_slow_query_threshold_milliseconds gauge\n");
+        OUT("shard_db_slow_query_threshold_milliseconds %d\n", g_slow_query_ms);
+        OUT("# HELP shard_db_slow_query_total Cumulative requests slower than the threshold.\n");
+        OUT("# TYPE shard_db_slow_query_total counter\n");
+        OUT("shard_db_slow_query_total %lu\n", slow_n);
+
         free(mode);
         return;
     }
