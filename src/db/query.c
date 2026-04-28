@@ -219,6 +219,12 @@ struct CompiledCriterion {
     int64_t  *in_i64;
     double   *in_f64;
     int       in_count;
+
+    /* OP_REGEX / OP_NOT_REGEX: pre-compiled POSIX extended regex.
+       Heap-allocated so free_compiled_criteria can regfree+free safely
+       even when the criterion is reused across many records. */
+    regex_t  *re;
+    int       re_compiled;        /* 1 iff regcomp succeeded; 0 → no match */
 };
 
 /* Fetch a record by its hex hash and print as JSON. Returns 1 if found. */
@@ -4126,6 +4132,19 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             for (int i = 0; i < c->in_count; i++)
                 if (strcmp(val_str, c->in_values[i]) == 0) return 0;
             return 1;
+        case OP_REGEX:
+        case OP_NOT_REGEX:
+            /* Legacy/composite path: no pre-compiled regex available
+               (CompiledCriterion lives in the typed path). Compile inline
+               per-call — slow but rare; typed-binary records use the fast
+               path in match_typed_varchar. */
+            {
+                regex_t r;
+                if (regcomp(&r, c->value, REG_EXTENDED | REG_NOSUB) != 0) return 0;
+                int hit = (regexec(&r, val_str, 0, NULL, 0) == 0);
+                regfree(&r);
+                return c->op == OP_REGEX ? hit : !hit;
+            }
         case OP_LEN_EQ:
         case OP_LEN_NEQ:
         case OP_LEN_LESS:
@@ -4310,6 +4329,22 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         return;
     }
 
+    /* Regex ops: compile pattern once with REG_EXTENDED. REG_NOSUB is
+       deliberately omitted — REG_STARTEND in match_typed_varchar relies
+       on pmatch[0] being honored, which REG_NOSUB suppresses. The
+       per-call subgroup-tracking cost is small for the patterns users
+       actually write. Failed regcomp leaves re_compiled=0 → no record
+       matches OP_REGEX, every record matches OP_NOT_REGEX. */
+    if (cc->op == OP_REGEX || cc->op == OP_NOT_REGEX) {
+        cc->re = malloc(sizeof(regex_t));
+        if (cc->re && regcomp(cc->re, c->value, REG_EXTENDED) == 0) {
+            cc->re_compiled = 1;
+        } else if (cc->re) {
+            free(cc->re); cc->re = NULL;
+        }
+        return;
+    }
+
     /* Type-specific parsing of scalar rvalue */
     switch (cc->ftype) {
     case FT_LONG:
@@ -4442,6 +4477,10 @@ void free_compiled_criteria(CompiledCriterion *arr, int n) {
         free(arr[i].needle_lc);
         free(arr[i].in_i64);
         free(arr[i].in_f64);
+        if (arr[i].re) {
+            if (arr[i].re_compiled) regfree(arr[i].re);
+            free(arr[i].re);
+        }
     }
     free(arr);
 }
@@ -4581,6 +4620,17 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_LEN_LESS_EQ:    return elen <= (int)cc->i1;
     case OP_LEN_GREATER_EQ: return elen >= (int)cc->i1;
     case OP_LEN_BETWEEN:    return elen >= (int)cc->i1 && elen <= (int)cc->i2;
+    case OP_REGEX:
+    case OP_NOT_REGEX: {
+        if (!cc->re_compiled) return cc->op == OP_REGEX ? 0 : 1;
+        /* REG_STARTEND lets regexec consume (ptr, len) directly so we
+           don't need to copy + NUL-terminate every record's value. */
+        regmatch_t pm[1];
+        pm[0].rm_so = 0;
+        pm[0].rm_eo = elen;
+        int rc = regexec(cc->re, hay, 0, pm, REG_STARTEND);
+        return cc->op == OP_REGEX ? (rc == 0) : (rc != 0);
+    }
     /* Field-vs-field is intercepted in match_typed before per-type dispatch;
        these labels exist only to keep the switch exhaustive (silences -Wswitch). */
     case OP_EQ_FIELD: case OP_NEQ_FIELD:
@@ -6041,6 +6091,8 @@ enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "gt_field") == 0) return OP_GT_FIELD;
     if (strcmp(s, "lte_field") == 0) return OP_LTE_FIELD;
     if (strcmp(s, "gte_field") == 0) return OP_GTE_FIELD;
+    if (strcmp(s, "regex") == 0) return OP_REGEX;
+    if (strcmp(s, "not_regex") == 0 || strcmp(s, "nregex") == 0) return OP_NOT_REGEX;
     return OP_EQUAL;
 }
 
@@ -6474,6 +6526,12 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
         c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
         c->op == OP_LTE_FIELD || c->op == OP_GTE_FIELD) return 0;
+    /* Regex needs full content of every value to match — btree leaf bytes
+       could carry it, but the per-entry regexec cost dominates so the
+       indexed path's only saving is record-fetch avoidance, marginal vs
+       the full scan. Keep regex on the full-scan path; revisit only with
+       a real workload signal. */
+    if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) return 0;
     char p[PATH_MAX];
     snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->field);
     struct stat st;

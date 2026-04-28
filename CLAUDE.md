@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-shard-db is a file-based database in C with a key/value foundation plus full query features (find, count, aggregate, joins, CAS). Inspired by chronicle-db. xxh128 hashing, mmap for reads and writes, typed binary records via fields.conf, linear probing, per-shard rwlock, multi-threaded TCP server, async logging, 36 search operators.
+shard-db is a file-based database in C with a key/value foundation plus full query features (find, count, aggregate, joins, CAS). Inspired by chronicle-db. xxh128 hashing, mmap for reads and writes, typed binary records via fields.conf, linear probing, per-shard rwlock, multi-threaded TCP server, async logging, 38 search operators.
 
 ## Build & Test
 
@@ -43,7 +43,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
 ./tests/test-list-files.sh                # list-files mode + prefix + pagination (27)
 ./tests/test-field-vs-field.sh            # eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (24)
-# Total: 857 tests
+./tests/test-regex.sh                     # POSIX regex / not_regex on varchar    (23)
+# Total: 880 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -130,7 +131,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 - **B+ tree** with prefix-compressed leaves (anchors every K=16 entries, two-stage bsearch)
 - Single field: `indexes:["name"]`
 - Composite: `indexes:["country+zip"]` (concatenated field values)
-- **All 36 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists, len_eq, len_neq, len_lt, len_gt, len_lte, len_gte, len_between (length ops on varchar — answered from btree leaf entry's vlen, no record fetch), ilike, not_ilike, icontains, not_icontains, istarts, iends (case-insensitive variants — full leaf scan with per-entry tolower compare), eq_field, neq_field, lt_field, gt_field, lte_field, gte_field (field-vs-field on the same record — full scan only; RHS is per-record so no btree shortcut).
+- **All 38 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists, len_eq, len_neq, len_lt, len_gt, len_lte, len_gte, len_between (length ops on varchar — answered from btree leaf entry's vlen, no record fetch), ilike, not_ilike, icontains, not_icontains, istarts, iends (case-insensitive variants — full leaf scan with per-entry tolower compare), eq_field, neq_field, lt_field, gt_field, lte_field, gte_field (field-vs-field on the same record — full scan only; RHS is per-record so no btree shortcut), regex, not_regex (POSIX extended regex on varchar — compiled once at criteria time, REG_STARTEND on the hot path; full scan only).
 - **Case-sensitivity**: `eq, neq, like, not_like, contains, not_contains, starts, ends` are byte-exact (case-SENSITIVE). `ilike, not_ilike, icontains, not_icontains, istarts, iends` are case-INSENSITIVE (ASCII tolower).
 
 ## Commands

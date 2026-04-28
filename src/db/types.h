@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <regex.h>
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "btree.h"
@@ -171,7 +172,10 @@ enum SearchOp {
        typed field type (varchar↔varchar, int↔int, …). Always full-scan;
        no clean indexed shortcut because the RHS is per-record. */
     OP_EQ_FIELD, OP_NEQ_FIELD,
-    OP_LT_FIELD, OP_GT_FIELD, OP_LTE_FIELD, OP_GTE_FIELD
+    OP_LT_FIELD, OP_GT_FIELD, OP_LTE_FIELD, OP_GTE_FIELD,
+    /* POSIX extended regex on varchar fields. regcomp at compile-criteria
+       time, regexec per record. Always full-scan — no btree shortcut. */
+    OP_REGEX, OP_NOT_REGEX
 };
 
 typedef struct {

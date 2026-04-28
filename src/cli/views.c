@@ -999,6 +999,8 @@ static const char *const OPS_ALL[] = {
     "ilike","not_ilike","icontains","not_icontains","istarts","iends",
     /* Field-vs-field: value side names a sibling field on the same record. */
     "eq_field","neq_field","lt_field","gt_field","lte_field","gte_field",
+    /* POSIX extended regex on varchar; full scan only. */
+    "regex","not_regex",
     NULL
 };
 
