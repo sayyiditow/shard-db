@@ -111,6 +111,12 @@ jobs:
       - name: Aggregate NEQ algebraic shortcut (test-agg-neq-shortcut)
         run: ./tests/test-agg-neq-shortcut.sh
 
+      - name: Concurrent stress, no-hang (test-stress-no-hang)
+        # Default 16 workers × 15s — ~75k ops, 0 hangs. Catches concurrency
+        # races that single-client tests miss (the original write-side
+        # ftruncate-during-read race lived for months before this caught it).
+        run: ./tests/test-stress-no-hang.sh
+
       - name: Package binary
         # Tag artifact uploads by arch so both binaries can coexist.
         run: |
