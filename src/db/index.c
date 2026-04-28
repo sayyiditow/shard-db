@@ -1390,9 +1390,6 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
         return 1;
     }
 
-    FILE *devnull = fopen("/dev/null", "w");
-    FILE *saved_out = g_out;
-
     uint64_t t0 = now_ms_coarse();
     int objects_rebuilt = 0;
     int objects_skipped = 0;
@@ -1420,46 +1417,21 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
         char eff_root[PATH_MAX];
         snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
-        char icpath[PATH_MAX];
-        snprintf(icpath, sizeof(icpath), "%s/%s/indexes/index.conf", eff_root, obj);
-        FILE *ic = fopen(icpath, "r");
-        if (!ic) { objects_skipped++; continue; }
-
-        /* Build a JSON fields array from index.conf lines. */
-        char fields_json[8192];
-        int pos = snprintf(fields_json, sizeof(fields_json), "[");
-        int nf = 0;
-        char fline[512];
-        while (fgets(fline, sizeof(fline), ic)) {
-            fline[strcspn(fline, "\n")] = '\0';
-            if (!fline[0]) continue;
-            int avail = (int)sizeof(fields_json) - pos - 8;
-            if (avail <= 0) break;
-            pos += snprintf(fields_json + pos, avail,
-                            "%s\"%s\"", nf ? "," : "", fline);
-            nf++;
+        /* reindex_object handles everything: reads index.conf, wipes any
+           stale on-disk artefacts (including high-numbered idx shards left
+           behind by a vacuum --splits=N where the new index_splits is
+           smaller than the old one — the very situation that bit users
+           on the splits=64 → splits=32 path), and rebuilds via
+           cmd_add_indexes(force=1). */
+        int n = reindex_object(eff_root, obj);
+        if (n > 0) {
+            objects_rebuilt++;
+            indexes_rebuilt += n;
+        } else {
+            objects_skipped++;
         }
-        fclose(ic);
-        snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
-
-        if (nf == 0) { objects_skipped++; continue; }
-
-        /* Sweep any pre-2026.05.1 single-file <field>.idx leftovers before
-           the rebuild — force=1 drops only the new per-shard layout, not
-           the legacy files. */
-        reindex_clean_legacy(eff_root, obj);
-
-        /* force=1 drops existing per-shard .idx files first, then rebuilds. */
-        g_out = devnull ? devnull : saved_out;
-        cmd_add_indexes(eff_root, obj, fields_json, 1);
-        g_out = saved_out;
-
-        objects_rebuilt++;
-        indexes_rebuilt += nf;
-        log_msg(3, "REINDEX %s/%s: rebuilt %d indexes", dir, obj, nf);
     }
     fclose(sf);
-    if (devnull) fclose(devnull);
 
     uint64_t t1 = now_ms_coarse();
     OUT("{\"status\":\"reindexed\",\"objects\":%d,\"skipped\":%d,\"indexes\":%d,\"duration_ms\":%llu}\n",
