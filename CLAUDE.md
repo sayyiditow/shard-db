@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-shard-db is a file-based database in C with a key/value foundation plus full query features (find, count, aggregate, joins, CAS). Inspired by chronicle-db. xxh128 hashing, mmap for reads and writes, typed binary records via fields.conf, linear probing, per-shard rwlock, multi-threaded TCP server, async logging, 17 search operators.
+shard-db is a file-based database in C with a key/value foundation plus full query features (find, count, aggregate, joins, CAS). Inspired by chronicle-db. xxh128 hashing, mmap for reads and writes, typed binary records via fields.conf, linear probing, per-shard rwlock, multi-threaded TCP server, async logging, 24 search operators.
 
 ## Build & Test
 
@@ -39,7 +39,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-bulk-upsert.sh               # bulk-insert as true upsert + idx drift (15)
 ./tests/test-bulk-update-json.sh          # bulk-update JSON per-key partial update (24)
 ./tests/test-agg-neq-shortcut.sh          # aggregate NEQ algebraic shortcut       (21)
-# Total: 742 tests
+./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
+# Total: 765 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -126,7 +127,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 - **B+ tree** with prefix-compressed leaves (anchors every K=16 entries, two-stage bsearch)
 - Single field: `indexes:["name"]`
 - Composite: `indexes:["country+zip"]` (concatenated field values)
-- **All 17 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists
+- **All 24 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists, len_eq, len_neq, len_lt, len_gt, len_lte, len_gte, len_between (length ops on varchar — answered from btree leaf entry's vlen, no record fetch)
 
 ## Commands
 

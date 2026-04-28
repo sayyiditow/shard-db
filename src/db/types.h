@@ -151,7 +151,14 @@ enum SearchOp {
     OP_STARTS_WITH, OP_ENDS_WITH,
     OP_IN, OP_NOT_IN,
     OP_BETWEEN,
-    OP_EXISTS, OP_NOT_EXISTS
+    OP_EXISTS, OP_NOT_EXISTS,
+    /* Length ops on varchar — compare the uint16 length-prefix value, not
+       the bytes. Indexed varchar uses btree-walk-without-fetch (vlen is
+       carried in every leaf entry); non-indexed full scans. Always 0 on
+       non-varchar fields. */
+    OP_LEN_EQ, OP_LEN_NEQ,
+    OP_LEN_LESS, OP_LEN_GREATER, OP_LEN_LESS_EQ, OP_LEN_GREATER_EQ,
+    OP_LEN_BETWEEN
 };
 
 typedef struct {

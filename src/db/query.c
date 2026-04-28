@@ -4092,6 +4092,31 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             for (int i = 0; i < c->in_count; i++)
                 if (strcmp(val_str, c->in_values[i]) == 0) return 0;
             return 1;
+        case OP_LEN_EQ:
+        case OP_LEN_NEQ:
+        case OP_LEN_LESS:
+        case OP_LEN_GREATER:
+        case OP_LEN_LESS_EQ:
+        case OP_LEN_GREATER_EQ:
+        case OP_LEN_BETWEEN: {
+            /* Legacy/composite path: strlen reads the user-visible length.
+               Embedded NULs in varchar (rare) under-report here; the typed
+               fast path uses the precise length-prefix and is the canonical
+               implementation. */
+            int64_t L = (int64_t)strlen(val_str);
+            int64_t q1 = (int64_t)strtoll(c->value, NULL, 10);
+            int64_t q2 = (int64_t)strtoll(c->value2, NULL, 10);
+            switch (c->op) {
+                case OP_LEN_EQ:         return L == q1;
+                case OP_LEN_NEQ:        return L != q1;
+                case OP_LEN_LESS:       return L <  q1;
+                case OP_LEN_GREATER:    return L >  q1;
+                case OP_LEN_LESS_EQ:    return L <= q1;
+                case OP_LEN_GREATER_EQ: return L >= q1;
+                case OP_LEN_BETWEEN:    return L >= q1 && L <= q2;
+                default:                return 0;
+            }
+        }
     }
     return 0;
 }
@@ -4217,6 +4242,17 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
     cc->s2_len = strlen(c->value2);
     cc->s2 = malloc(cc->s2_len + 1);
     memcpy(cc->s2, c->value2, cc->s2_len + 1);
+
+    /* Length ops parse value/value2 as integers regardless of the field's
+       native type. Compile time, so the hot path skips strtoll per record. */
+    if (cc->op == OP_LEN_EQ || cc->op == OP_LEN_NEQ ||
+        cc->op == OP_LEN_LESS || cc->op == OP_LEN_GREATER ||
+        cc->op == OP_LEN_LESS_EQ || cc->op == OP_LEN_GREATER_EQ ||
+        cc->op == OP_LEN_BETWEEN) {
+        cc->i1 = (int64_t)strtoll(c->value, NULL, 10);
+        cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
+        return;
+    }
 
     /* Type-specific parsing of scalar rvalue */
     switch (cc->ftype) {
@@ -4439,6 +4475,13 @@ static int match_typed_varchar(const uint8_t *p, int size,
             if (elen == (int)vl && memcmp(hay, c->in_values[i], vl) == 0) return 0;
         }
         return 1;
+    case OP_LEN_EQ:         return elen == (int)cc->i1;
+    case OP_LEN_NEQ:        return elen != (int)cc->i1;
+    case OP_LEN_LESS:       return elen <  (int)cc->i1;
+    case OP_LEN_GREATER:    return elen >  (int)cc->i1;
+    case OP_LEN_LESS_EQ:    return elen <= (int)cc->i1;
+    case OP_LEN_GREATER_EQ: return elen >= (int)cc->i1;
+    case OP_LEN_BETWEEN:    return elen >= (int)cc->i1 && elen <= (int)cc->i2;
     }
     return 0;
 }
@@ -5108,12 +5151,21 @@ typedef struct {
     int budget_exceeded; /* set when collected bytes would exceed QUERY_BUFFER_MB */
 } CollectCtx;
 
+/* Forward decls — defined alongside btree_dispatch below; declared here so
+   collect_hash_cb can route LEN_* ops through the vlen-only fast path. */
+static int op_is_length(enum SearchOp op);
+static int match_length_vlen(size_t vlen, const SearchCriterion *c);
+
 static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     CollectCtx *cc = (CollectCtx *)ctx;
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return -1;
 
-    /* For CONTAINS/LIKE/ENDS: filter on B+ tree value before collecting */
-    if (cc->check_primary && cc->primary_crit) {
+    /* Length ops: filter from btree entry vlen, no record fetch. Same
+       fast path as idx_count_cb above. */
+    if (cc->primary_crit && op_is_length(cc->primary_crit->op)) {
+        if (!match_length_vlen(vlen, cc->primary_crit)) return 0;
+    } else if (cc->check_primary && cc->primary_crit) {
+        /* For CONTAINS/LIKE/ENDS: filter on B+ tree value before collecting */
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
@@ -5188,6 +5240,34 @@ static enum SearchOp op_invert(enum SearchOp op) {
 
 static int op_needs_check_primary(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH;
+}
+
+/* True if the op is a length comparator answerable from (val, vlen) alone —
+   no record fetch needed, just inspect the btree leaf entry's vlen. */
+static int op_is_length(enum SearchOp op) {
+    return op == OP_LEN_EQ || op == OP_LEN_NEQ ||
+           op == OP_LEN_LESS || op == OP_LEN_GREATER ||
+           op == OP_LEN_LESS_EQ || op == OP_LEN_GREATER_EQ ||
+           op == OP_LEN_BETWEEN;
+}
+
+/* Length match against the btree entry's vlen — exact even when the value
+   contains embedded NULs (which strlen would under-report). Bypasses the
+   tmp-string roundtrip in match_criterion for hot-path callbacks. */
+static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
+    int64_t L = (int64_t)vlen;
+    int64_t q1 = (int64_t)strtoll(c->value, NULL, 10);
+    int64_t q2 = (int64_t)strtoll(c->value2, NULL, 10);
+    switch (c->op) {
+        case OP_LEN_EQ:         return L == q1;
+        case OP_LEN_NEQ:        return L != q1;
+        case OP_LEN_LESS:       return L <  q1;
+        case OP_LEN_GREATER:    return L >  q1;
+        case OP_LEN_LESS_EQ:    return L <= q1;
+        case OP_LEN_GREATER_EQ: return L >= q1;
+        case OP_LEN_BETWEEN:    return L >= q1 && L <= q2;
+        default:                return 0;
+    }
 }
 
 /* Dispatch B+ tree query based on search operator. Used by find, count, aggregate.
@@ -5302,7 +5382,12 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
     (void)hash16;
     IdxCountCtx *ic = (IdxCountCtx *)ctx;
     if (query_deadline_tick(ic->deadline, &ic->dl_counter)) return -1;  /* stop btree walk */
-    if (ic->check_primary) {
+    /* Length ops can be answered from the btree entry's vlen — exact even
+       when value contains embedded NULs. Drives the no-record-fetch fast
+       path for `count len_*` on indexed varchar. */
+    if (ic->primary_crit && op_is_length(ic->primary_crit->op)) {
+        if (!match_length_vlen(vlen, ic->primary_crit)) return 0;
+    } else if (ic->check_primary) {
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
@@ -5721,6 +5806,13 @@ enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "between") == 0) return OP_BETWEEN;
     if (strcmp(s, "exists") == 0) return OP_EXISTS;
     if (strcmp(s, "nexists") == 0 || strcmp(s, "not_exists") == 0) return OP_NOT_EXISTS;
+    if (strcmp(s, "len_eq") == 0) return OP_LEN_EQ;
+    if (strcmp(s, "len_neq") == 0) return OP_LEN_NEQ;
+    if (strcmp(s, "len_lt") == 0) return OP_LEN_LESS;
+    if (strcmp(s, "len_gt") == 0) return OP_LEN_GREATER;
+    if (strcmp(s, "len_lte") == 0) return OP_LEN_LESS_EQ;
+    if (strcmp(s, "len_gte") == 0) return OP_LEN_GREATER_EQ;
+    if (strcmp(s, "len_between") == 0) return OP_LEN_BETWEEN;
     return OP_EQUAL;
 }
 
