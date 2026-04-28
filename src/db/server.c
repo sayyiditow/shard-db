@@ -1468,6 +1468,14 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (filename) cmd_delete_file(db_root, object, filename);
         else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
+    } else if (strcmp(mode, "list-files") == 0) {
+        char *prefix = json_obj_strdup(&req, "prefix");
+        char *off_s = json_obj_strdup(&req, "offset");
+        char *lim_s = json_obj_strdup(&req, "limit");
+        int off = off_s ? atoi(off_s) : 0;
+        int lim = lim_s ? atoi(lim_s) : 0;
+        cmd_list_files(db_root, object, prefix, off, lim);
+        free(prefix); free(off_s); free(lim_s);
     } else if (strcmp(mode, "aggregate") == 0) {
         char *crit = json_obj_strdup_raw(&req, "criteria");
         char *grp = json_obj_strdup_raw(&req, "group_by");

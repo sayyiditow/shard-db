@@ -2476,22 +2476,58 @@ static void files_delete(CliConn *c) {
     }
 }
 
+static void files_list(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[3] = {0};
+    fs[0].label = "prefix (optional)"; fs[0].kind = FF_TEXT;
+    fs[1].label = "offset"; fs[1].kind = FF_NUMBER;
+    snprintf(fs[1].value, sizeof(fs[1].value), "0");
+    fs[2].label = "limit (0 = GLOBAL_LIMIT)"; fs[2].kind = FF_NUMBER;
+    snprintf(fs[2].value, sizeof(fs[2].value), "0");
+    for (;;) {
+        if (tui_form("list-files", fs, 3) != 0) return;
+        int off = atoi(fs[1].value);
+        int lim = atoi(fs[2].value);
+        char req[1024];
+        if (fs[0].value[0]) {
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"list-files\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"prefix\":\"%s\",\"offset\":%d,\"limit\":%d}",
+                oi.dir, oi.object, fs[0].value, off, lim);
+        } else {
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"list-files\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"offset\":%d,\"limit\":%d}",
+                oi.dir, oi.object, off, lim);
+        }
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "list-files failed"); continue;
+        }
+        show_response("list-files", resp);
+        free(resp);
+    }
+}
+
 static void menu_files(void) {
     CliConn *c = get_conn();
     if (!c) return;
     int sel = 0;
     for (;;) {
         MenuItem items[] = {
+            { "list-files",  "browse stored files (prefix filter + pagination)" },
             { "put-file",    "upload a local file to <dir>/<obj>/files/" },
             { "get-file",    "download a stored file to a local path" },
             { "delete-file", "remove a stored file by name (confirms)" },
         };
-        int choice = tui_menu_at("Files", items, 3, &sel);
+        int choice = tui_menu_at("Files", items, 4, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0: files_put(c);    break;
-            case 1: files_get(c);    break;
-            case 2: files_delete(c); break;
+            case 0: files_list(c);   break;
+            case 1: files_put(c);    break;
+            case 2: files_get(c);    break;
+            case 3: files_delete(c); break;
         }
     }
 }

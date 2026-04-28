@@ -682,6 +682,11 @@ int cmd_put_file_b64(const char *db_root, const char *object,
                      int if_not_exists);
 int cmd_get_file_b64(const char *db_root, const char *object, const char *filename);
 int cmd_delete_file(const char *db_root, const char *object, const char *filename);
+/* List files under $DB_ROOT/<dir>/<object>/files/XX/XX/, optional prefix
+   filter, alphabetical pagination. limit ≤ 0 → g_global_limit. Returns
+   {"files":[...],"total":N,"offset":N,"limit":N}. */
+int cmd_list_files(const char *db_root, const char *object,
+                   const char *prefix, int offset, int limit);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists);

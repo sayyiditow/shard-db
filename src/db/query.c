@@ -8684,6 +8684,92 @@ int cmd_delete_file(const char *db_root, const char *object, const char *filenam
     return 0;
 }
 
+/* ========== LIST FILES ==========
+   Walks <db_root>/<object>/files/XX/XX/, optionally filters by filename
+   prefix, and returns a sorted page. Files live in a 2-level bucket tree
+   (XX/XX) so we descend two levels into entries that look like 2-hex
+   names; anything else is skipped (defensive against stray content).
+   Pagination is offset/limit on a stable alphabetical sort. */
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int hex2(const char *s) {
+    if (strlen(s) != 2) return 0;
+    return ((s[0] >= '0' && s[0] <= '9') || (s[0] >= 'a' && s[0] <= 'f')) &&
+           ((s[1] >= '0' && s[1] <= '9') || (s[1] >= 'a' && s[1] <= 'f'));
+}
+
+int cmd_list_files(const char *db_root, const char *object,
+                   const char *prefix, int offset, int limit) {
+    if (limit <= 0) limit = g_global_limit;
+    if (offset < 0) offset = 0;
+
+    char files_dir[PATH_MAX];
+    snprintf(files_dir, sizeof(files_dir), "%s/%s/files", db_root, object);
+
+    DIR *d1 = opendir(files_dir);
+    if (!d1) {
+        /* No files dir = no files. Not an error. */
+        OUT("{\"files\":[],\"total\":0,\"offset\":%d,\"limit\":%d}\n", offset, limit);
+        return 0;
+    }
+
+    /* Collect all matching filenames into a heap-grown array, then sort. */
+    char **names = NULL;
+    size_t cap = 256, count = 0;
+    names = malloc(cap * sizeof(char *));
+
+    size_t prefix_len = prefix ? strlen(prefix) : 0;
+
+    struct dirent *e1;
+    while ((e1 = readdir(d1))) {
+        if (!hex2(e1->d_name)) continue;
+        char sub1[PATH_MAX];
+        snprintf(sub1, sizeof(sub1), "%s/%s", files_dir, e1->d_name);
+        DIR *d2 = opendir(sub1);
+        if (!d2) continue;
+        struct dirent *e2;
+        while ((e2 = readdir(d2))) {
+            if (!hex2(e2->d_name)) continue;
+            char sub2[PATH_MAX];
+            snprintf(sub2, sizeof(sub2), "%s/%s", sub1, e2->d_name);
+            DIR *d3 = opendir(sub2);
+            if (!d3) continue;
+            struct dirent *e3;
+            while ((e3 = readdir(d3))) {
+                if (e3->d_name[0] == '.') continue;
+                if (prefix_len > 0 && strncmp(e3->d_name, prefix, prefix_len) != 0) continue;
+                if (count >= cap) {
+                    cap *= 2;
+                    names = realloc(names, cap * sizeof(char *));
+                }
+                names[count++] = strdup(e3->d_name);
+            }
+            closedir(d3);
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+
+    qsort(names, count, sizeof(char *), cmp_str);
+
+    /* Emit page [offset, offset+limit) plus the unfiltered total. */
+    OUT("{\"files\":[");
+    int emitted = 0;
+    for (size_t i = (size_t)offset; i < count && emitted < limit; i++) {
+        if (emitted) OUT(",");
+        OUT("\"%s\"", names[i]);
+        emitted++;
+    }
+    OUT("],\"total\":%zu,\"offset\":%d,\"limit\":%d}\n", count, offset, limit);
+
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    return 0;
+}
+
 /* ========== CREATE OBJECT ========== */
 
 /* Validate a field type spec like "name:varchar:30" or "age:int".

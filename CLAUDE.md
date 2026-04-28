@@ -41,7 +41,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-agg-neq-shortcut.sh          # aggregate NEQ algebraic shortcut       (21)
 ./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
 ./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
-# Total: 806 tests
+./tests/test-list-files.sh                # list-files mode + prefix + pagination (27)
+# Total: 833 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -417,6 +418,7 @@ Remote-safe (base64 in JSON):
 - `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
 - `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
 - `{"mode":"delete-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"deleted","filename":"..."}` or `{"error":"file not found","filename":"..."}`.
+- `{"mode":"list-files","dir":"...","object":"...","prefix":"opt","offset":0,"limit":100}` — alphabetical paginated listing. `prefix` filters by filename prefix; `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Walks the `XX/XX` bucket tree; cost is O(file count) — not optimized for filestores beyond ~1M files.
 
 Server-local zero-copy (same-host callers only — admin fast path):
 - `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.
