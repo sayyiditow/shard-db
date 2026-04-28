@@ -997,6 +997,8 @@ static const char *const OPS_ALL[] = {
     "len_eq","len_neq","len_lt","len_gt","len_lte","len_gte","len_between",
     /* Case-insensitive substring/prefix/suffix/pattern variants. */
     "ilike","not_ilike","icontains","not_icontains","istarts","iends",
+    /* Field-vs-field: value side names a sibling field on the same record. */
+    "eq_field","neq_field","lt_field","gt_field","lte_field","gte_field",
     NULL
 };
 

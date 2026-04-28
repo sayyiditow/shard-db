@@ -192,6 +192,7 @@ enum LikeKind { LK_EXACT, LK_PREFIX, LK_CONTAINS };
 
 struct CompiledCriterion {
     const TypedField *tf;       /* resolved; NULL iff composite or unknown */
+    const TypedField *rhs_tf;   /* RHS for field-vs-field ops; NULL otherwise */
     enum SearchOp op;
     enum FieldType ftype;       /* cached when tf != NULL */
     int composite;              /* 1 if field name contains '+' */
@@ -4150,6 +4151,12 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
                 default:                return 0;
             }
         }
+        /* Field-vs-field: only reachable through the typed fast path
+           (match_typed); legacy/composite path returns no match. */
+        case OP_EQ_FIELD: case OP_NEQ_FIELD:
+        case OP_LT_FIELD: case OP_GT_FIELD:
+        case OP_LTE_FIELD: case OP_GTE_FIELD:
+            return 0;
     }
     return 0;
 }
@@ -4284,6 +4291,22 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->op == OP_LEN_BETWEEN) {
         cc->i1 = (int64_t)strtoll(c->value, NULL, 10);
         cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
+        return;
+    }
+
+    /* Field-vs-field ops: c->value names the RHS sibling field. Resolve to
+       a TypedField pointer and require type match — mismatched types yield
+       cc->rhs_tf=NULL, which match_typed treats as "no match" for every
+       record (graceful degradation; planner sees the leaf as non-indexable). */
+    if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
+        cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
+        cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
+        int rhs_idx = ts ? typed_field_index(ts, c->value) : -1;
+        if (rhs_idx >= 0) {
+            const TypedField *rhs = &ts->fields[rhs_idx];
+            if (rhs->type == cc->ftype) cc->rhs_tf = rhs;
+            /* else: leave rhs_tf NULL; match returns 0 every time. */
+        }
         return;
     }
 
@@ -4558,6 +4581,12 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_LEN_LESS_EQ:    return elen <= (int)cc->i1;
     case OP_LEN_GREATER_EQ: return elen >= (int)cc->i1;
     case OP_LEN_BETWEEN:    return elen >= (int)cc->i1 && elen <= (int)cc->i2;
+    /* Field-vs-field is intercepted in match_typed before per-type dispatch;
+       these labels exist only to keep the switch exhaustive (silences -Wswitch). */
+    case OP_EQ_FIELD: case OP_NEQ_FIELD:
+    case OP_LT_FIELD: case OP_GT_FIELD:
+    case OP_LTE_FIELD: case OP_GTE_FIELD:
+        return 0;
     }
     return 0;
 }
@@ -4609,6 +4638,56 @@ static inline int cmp_op_f64(double v, double q1, double q2,
     }
 }
 
+/* Generic 3-way comparator for a typed field given two pointers into the
+   same record. Returns negative / 0 / positive. Both pointers must reference
+   the same TypedField type — compile_one enforces this for field-vs-field
+   ops by setting rhs_tf only when types match. */
+static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
+                                const TypedField *f) {
+    switch (f->type) {
+    case FT_VARCHAR: {
+        int la = varchar_eff_len(a, f->size);
+        int lb = varchar_eff_len(b, f->size);
+        size_t n = la < lb ? (size_t)la : (size_t)lb;
+        int r = memcmp(a + 2, b + 2, n);
+        if (r != 0) return r;
+        return la - lb;
+    }
+    case FT_LONG:    { int64_t va = ld_be_i64(a), vb = ld_be_i64(b);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_INT:     { int32_t va = ld_be_i32(a), vb = ld_be_i32(b);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_SHORT:   { int16_t va = ld_be_i16(a), vb = ld_be_i16(b);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_NUMERIC: { int64_t va = ld_be_i64(a), vb = ld_be_i64(b);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_DOUBLE:  { double va, vb; memcpy(&va, a, 8); memcpy(&vb, b, 8);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_BOOL:
+    case FT_BYTE:    return (int)a[0] - (int)b[0];
+    case FT_DATE:    { int32_t va = ld_be_i32(a), vb = ld_be_i32(b);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_DATETIME: {
+        int64_t va = (int64_t)ld_be_i32(a) * 100000LL + ld_be_u16(a + 4);
+        int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u16(b + 4);
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    default: return 0;
+    }
+}
+
+static int field_vs_field_match(int cmp, enum SearchOp op) {
+    switch (op) {
+    case OP_EQ_FIELD:  return cmp == 0;
+    case OP_NEQ_FIELD: return cmp != 0;
+    case OP_LT_FIELD:  return cmp <  0;
+    case OP_GT_FIELD:  return cmp >  0;
+    case OP_LTE_FIELD: return cmp <= 0;
+    case OP_GTE_FIELD: return cmp >= 0;
+    default: return 0;
+    }
+}
+
 /* Hot-path match: typed binary compare against pre-compiled criterion.
    `rec` points at the raw value region of the record (hdr->key_len offset
    into block). Returns 1 on match, 0 otherwise.
@@ -4619,6 +4698,18 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         int r = match_criterion(attr, cc->raw);
         free(attr);
         return r;
+    }
+
+    /* Field-vs-field: compare LHS bytes against the sibling RHS field on
+       the same record. cc->rhs_tf is NULL when types didn't match at
+       compile time — every record fails (caller's fault). */
+    if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
+        cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
+        cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
+        if (!cc->rhs_tf) return 0;
+        int r = cmp_typed_field_pair(rec + cc->tf->offset,
+                                     rec + cc->rhs_tf->offset, cc->tf);
+        return field_vs_field_match(r, cc->op);
     }
 
     const TypedField *f = cc->tf;
@@ -5944,6 +6035,12 @@ enum SearchOp parse_op(const char *s) {
         strcmp(s, "not_icontains") == 0) return OP_INOT_CONTAINS;
     if (strcmp(s, "istarts") == 0 || strcmp(s, "istarts_with") == 0) return OP_ISTARTS_WITH;
     if (strcmp(s, "iends") == 0 || strcmp(s, "iends_with") == 0) return OP_IENDS_WITH;
+    if (strcmp(s, "eq_field") == 0) return OP_EQ_FIELD;
+    if (strcmp(s, "neq_field") == 0) return OP_NEQ_FIELD;
+    if (strcmp(s, "lt_field") == 0) return OP_LT_FIELD;
+    if (strcmp(s, "gt_field") == 0) return OP_GT_FIELD;
+    if (strcmp(s, "lte_field") == 0) return OP_LTE_FIELD;
+    if (strcmp(s, "gte_field") == 0) return OP_GTE_FIELD;
     return OP_EQUAL;
 }
 
@@ -6371,6 +6468,12 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
                            const char *object, char *out_idx_path, size_t out_sz) {
     if (!c || !c->field[0]) return 0;
     if (c->op == OP_NOT_EXISTS) return 0;  /* missing field → not in index */
+    /* Field-vs-field ops can't use a btree on the LHS alone — the RHS is
+       per-record, so even a perfect btree walk still pays record fetches.
+       Force full-scan to keep the planner honest. */
+    if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
+        c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
+        c->op == OP_LTE_FIELD || c->op == OP_GTE_FIELD) return 0;
     char p[PATH_MAX];
     snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->field);
     struct stat st;

@@ -165,7 +165,13 @@ enum SearchOp {
        range shortcut without a folded secondary index). */
     OP_ILIKE, OP_INOT_LIKE,
     OP_ICONTAINS, OP_INOT_CONTAINS,
-    OP_ISTARTS_WITH, OP_IENDS_WITH
+    OP_ISTARTS_WITH, OP_IENDS_WITH,
+    /* Field-vs-field comparison: the criterion's value is the NAME of a
+       sibling field on the same record. Both sides must be the same
+       typed field type (varchar↔varchar, int↔int, …). Always full-scan;
+       no clean indexed shortcut because the RHS is per-record. */
+    OP_EQ_FIELD, OP_NEQ_FIELD,
+    OP_LT_FIELD, OP_GT_FIELD, OP_LTE_FIELD, OP_GTE_FIELD
 };
 
 typedef struct {
