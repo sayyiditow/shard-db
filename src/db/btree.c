@@ -1712,43 +1712,39 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
 static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
     *out_count = 0;
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
+    /* Use the unified btree open path — same rdlock that every other
+       reader takes, so a concurrent btree_insert blocks briefly on the
+       per-file wrlock rather than racing this MAP_PRIVATE view. The
+       caller (btree_bulk_merge) holds the per-path bulk-merge mutex and
+       runs under objlock, but going through bt_acquire keeps the access
+       pattern uniform with the rest of the read path. */
+    BtFile bt;
+    if (bt_acquire(&bt, path, 0) != 0) return NULL;
+    if (bt.map_size < (size_t)bt_page_size * 2) { bt_release(&bt); return NULL; }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size < (off_t)bt_page_size * 2) {
-        close(fd); return NULL;
-    }
-
-    size_t map_size = (size_t)st.st_size;
-    uint8_t *map = mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    madvise(map, map_size, MADV_SEQUENTIAL);
-
-    BtFileHeader *fh = (BtFileHeader *)map;
+    BtFileHeader *fh = (BtFileHeader *)bt.map;
     if (fh->magic != BT_MAGIC || fh->entry_count == 0) {
-        munmap(map, map_size); return NULL;
+        bt_release(&bt); return NULL;
     }
 
     size_t cap = (size_t)fh->entry_count + 64;
     BtEntry *entries = malloc(cap * sizeof(BtEntry));
-    if (!entries) { munmap(map, map_size); return NULL; }
+    if (!entries) { bt_release(&bt); return NULL; }
     size_t count = 0;
 
     /* Walk down to leftmost leaf via next_leaf (= leftmost child for internal) */
     uint32_t page_id = fh->root_page;
     while (1) {
-        if ((size_t)page_id * bt_page_size + bt_page_size > map_size) break;
-        uint8_t *pg = map + (size_t)page_id * bt_page_size;
+        if ((size_t)page_id * bt_page_size + bt_page_size > bt.map_size) break;
+        uint8_t *pg = bt.map + (size_t)page_id * bt_page_size;
         BtPageHeader *ph = (BtPageHeader *)pg;
         if (ph->page_type == 1) break;
         page_id = ph->next_leaf;
     }
 
     /* Scan leaf chain — sequential decode via LeafIter */
-    while (page_id != 0 && (size_t)page_id * bt_page_size + bt_page_size <= map_size) {
-        uint8_t *pg = map + (size_t)page_id * bt_page_size;
+    while (page_id != 0 && (size_t)page_id * bt_page_size + bt_page_size <= bt.map_size) {
+        uint8_t *pg = bt.map + (size_t)page_id * bt_page_size;
         BtPageHeader *ph = (BtPageHeader *)pg;
         if (ph->page_type != 1) break;
 
@@ -1774,7 +1770,7 @@ static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
     }
 
 extract_done:
-    munmap(map, map_size);
+    bt_release(&bt);
     *out_count = count;
     return entries;
 }

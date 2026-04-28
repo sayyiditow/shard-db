@@ -3377,24 +3377,25 @@ int rebuild_object(const char *db_root, const char *object,
     rmrf(new_data_dir);
     mkdirp(new_data_dir);
 
-    /* Iterate current shards, copy live records into data.new/. */
+    /* Iterate current shards, copy live records into data.new/. Use the
+       persistent ucache for the read side — vacuum holds objlock_wrlock on
+       this object so no concurrent ops are racing, but the consistent
+       cache path keeps memory footprint shared with whatever ucache
+       entries already existed and avoids a second kernel mmap region per
+       shard during the rebuild. */
     int live_count = 0;
     for (int olds = 0; olds < old_splits; olds++) {
         char old_path[PATH_MAX];
         build_shard_filename(old_path, sizeof(old_path), data_dir, olds);
-        int ofd = open(old_path, O_RDONLY);
-        if (ofd < 0) continue;
-        struct stat st;
-        if (fstat(ofd, &st) < 0 || st.st_size == 0) { close(ofd); continue; }
-        uint8_t *omap = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, ofd, 0);
-        close(ofd);
-        if (omap == MAP_FAILED) continue;
-
-        if ((size_t)st.st_size < SHARD_HDR_SIZE) { munmap(omap, st.st_size); continue; }
+        FcacheRead ofc = fcache_get_read(old_path);
+        if (!ofc.map) continue;
+        uint8_t *omap = ofc.map;
         ShardHeader *oshdr = (ShardHeader *)omap;
-        if (oshdr->magic != SHARD_MAGIC || oshdr->slots_per_shard == 0) { munmap(omap, st.st_size); continue; }
+        if (oshdr->magic != SHARD_MAGIC || oshdr->slots_per_shard == 0) {
+            fcache_release(ofc); continue;
+        }
         uint32_t old_slots = oshdr->slots_per_shard;
-        if ((size_t)st.st_size < shard_zoneA_end(old_slots)) { munmap(omap, st.st_size); continue; }
+        if (ofc.size < shard_zoneA_end(old_slots)) { fcache_release(ofc); continue; }
         for (uint32_t s = 0; s < old_slots; s++) {
             SlotHeader *h = (SlotHeader *)(omap + zoneA_off(s));
             if (h->flag != 1) continue;  /* skip empty and tombstoned */
@@ -3475,7 +3476,7 @@ int rebuild_object(const char *db_root, const char *object,
             ucache_write_release(wh);
             live_count++;
         }
-        munmap(omap, st.st_size);
+        fcache_release(ofc);
     }
 
     /* Stage fields.conf.new if compacting (drop tombstoned lines). */
@@ -8529,24 +8530,18 @@ typedef struct {
 static void *recount_worker(void *arg) {
     RecountWorkerArg *w = (RecountWorkerArg *)arg;
     int local = 0;
-    /* Bypass ucache — MADV_RANDOM would kill readahead for a sequential
-       scan. Open direct + MADV_SEQUENTIAL + MADV_DONTNEED after so recount
-       doesn't evict hot random-lookup pages. */
-    int fd = open(w->path, O_RDONLY);
-    if (fd < 0) return NULL;
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return NULL; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    madvise(map, st.st_size, MADV_SEQUENTIAL);
-
-    size_t file_size = st.st_size;
-    if (file_size < SHARD_HDR_SIZE) { munmap(map, file_size); return NULL; }
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, file_size); return NULL; }
-    uint32_t shard_slots = sh->slots_per_shard;
-    if (file_size < shard_zoneA_end(shard_slots)) { munmap(map, file_size); return NULL; }
+    /* Use the persistent ucache so recount sees a consistent snapshot — a
+       concurrent insert/delete takes the per-shard wrlock and blocks
+       briefly per shard rather than racing against this MAP_PRIVATE view.
+       The MADV_DONTNEED-after-scan trick is gone with the cache: ucache
+       pins the mapping, the page-cache LRU naturally evicts cold pages
+       after the scan is over, and the OS's implicit readahead handles
+       sequential access without an explicit MADV_SEQUENTIAL hint. */
+    FcacheRead fc = fcache_get_read(w->path);
+    if (!fc.map) return NULL;
+    uint8_t *map = fc.map;
+    uint32_t shard_slots = fc.slots_per_shard;
+    if (fc.size < shard_zoneA_end(shard_slots)) { fcache_release(fc); return NULL; }
     size_t scan_end = shard_slots;
     while (scan_end > 0) {
         const SlotHeader *h = (const SlotHeader *)(map + zoneA_off(scan_end - 1));
@@ -8557,8 +8552,7 @@ static void *recount_worker(void *arg) {
         const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(s));
         if (hdr->flag == 1) local++;
     }
-    madvise(map, file_size, MADV_DONTNEED);
-    munmap(map, file_size);
+    fcache_release(fc);
     __sync_fetch_and_add(w->counter, local);
     return NULL;
 }
