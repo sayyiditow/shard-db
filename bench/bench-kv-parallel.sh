@@ -128,7 +128,7 @@ echo "--- SHARD STATS ---"
 $BIN query "{\"mode\":\"shard-stats\",\"dir\":\"default\",\"object\":\"$OBJ\"}" | python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read())
-print(f\"splits={d['splits']} shards={d['shards']} total_records={d['total_records']} total_bytes={d['total_bytes']:,} max_grows={d['max_grows']}\")
+print(f\"splits={d['splits']} shards_on_disk={d['shards_on_disk']} total_records={d['total_records']} total_bytes={d['total_bytes']:,} max_grows={d['max_grows']}\")
 loads = [s['load'] for s in d['shard_list']]
 recs = [s['records'] for s in d['shard_list']]
 if loads:
