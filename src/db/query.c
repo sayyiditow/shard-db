@@ -11,24 +11,21 @@ volatile int g_scan_stop = 0; /* shared stop flag for parallel scan */
 
 void scan_one_shard(const char *binpath, int slot_size,
                            scan_callback cb, void *ctx) {
-    /* Full-shard scans bypass the ucache (MADV_RANDOM hint is wrong for linear
-       scans). Open direct with MADV_SEQUENTIAL for kernel readahead. */
-    int fd = open(binpath, O_RDONLY);
-    if (fd < 0) return;
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return;
-    madvise(map, st.st_size, MADV_SEQUENTIAL);
-    size_t file_size = st.st_size;
-
-    /* Read ShardHeader to learn this shard's slots_per_shard. */
-    if (file_size < SHARD_HDR_SIZE) { munmap(map, file_size); return; }
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, file_size); return; }
-    uint32_t shard_slots = sh->slots_per_shard;
-    if (file_size < shard_zoneA_end(shard_slots)) { munmap(map, file_size); return; }
+    /* Use the persistent shard mmap cache. Earlier versions opened the file
+       fresh with MADV_SEQUENTIAL on the theory that ucache's MADV_RANDOM
+       hint would hurt linear scans, but in practice repeated bench runs
+       (and the bench harness in particular) hit the same shards back-to-
+       back — ucache keeps the pages hot across queries, which dwarfs the
+       readahead benefit on a one-shot scan. */
+    FcacheRead fc = fcache_get_read(binpath);
+    if (!fc.map) return;
+    uint8_t *map = fc.map;
+    size_t file_size = fc.size;
+    uint32_t shard_slots = fc.slots_per_shard;
+    if (shard_slots == 0 || file_size < shard_zoneA_end(shard_slots)) {
+        fcache_release(fc);
+        return;
+    }
 
     /* Find last used Zone A slot (metadata-only tail trim — tiny region). */
     size_t scan_end = shard_slots;
@@ -53,7 +50,7 @@ void scan_one_shard(const char *binpath, int slot_size,
             if (stop) { g_scan_stop = 1; break; }
         }
     }
-    munmap(map, file_size);
+    fcache_release(fc);
 }
 
 typedef struct {
