@@ -3552,11 +3552,24 @@ int rebuild_object(const char *db_root, const char *object,
     rmrf(data_old);
     if (fields_changed) unlink(fpath_old);
 
-    log_msg(3, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d",
+    /* Per-shard idx layout uses index_splits = splits/4. Changing splits
+       changes the idx-shard count, so the on-disk idx files no longer match
+       the routing math: writes go to the new shard count, reads fan out
+       across the new count, and any old high-numbered shard files are
+       both unreachable AND poisonous (the old layout stored all entries
+       across the wider hash range, so dropping them leaves stale rows
+       indexed and missing rows unindexed). Rebuild every index from the
+       data shards atomically with the splits change. Compact-only changes
+       slot_size but not the hash routing, so idx layout stays valid. */
+    int idx_rebuilt = 0;
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+
+    log_msg(3, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_splits, new_splits,
-            old_sch.slot_size, new_sch.slot_size, drop_tombstoned);
-    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s}\n",
-        live_count, new_splits, new_sch.slot_size, drop_tombstoned ? "true" : "false");
+            old_sch.slot_size, new_sch.slot_size, drop_tombstoned, idx_rebuilt);
+    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
+        live_count, new_splits, new_sch.slot_size, drop_tombstoned ? "true" : "false",
+        idx_rebuilt);
     return 0;
 }
 

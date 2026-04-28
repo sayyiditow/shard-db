@@ -698,6 +698,13 @@ int  btree_idx_exists(const char *db_root, const char *object,
    every object under <dir>; object form rebuilds one. Writes a single
    summary JSON to OUT; per-object progress goes to the info log. */
 int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter);
+
+/* Rebuild every index for one object from the data shards. Used by
+   cmd_reindex's per-object pass and by rebuild_object after a
+   vacuum --splits / --compact (the per-shard idx layout depends on
+   `splits`, so a splits change requires a fresh idx build).
+   Returns the number of indexes rebuilt; 0 if no index.conf. */
+int reindex_object(const char *eff_root, const char *object);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 

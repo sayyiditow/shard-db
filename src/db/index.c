@@ -1261,10 +1261,100 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
    gets the indexes/ directory into the new <field>/<NNN>.idx shape with
    no orphans on disk. */
 
-/* Sweep stale <field>.idx files left behind by the pre-2026.05.1 single-file
-   layout. With the per-shard layout, each indexed field lives in its own
-   sub-directory under indexes/ — any sibling *.idx file is from before the
-   migration. Idempotent; harmless to run when there's nothing to clean. */
+/* Wipe every per-field idx directory + legacy <field>.idx file under
+   indexes/, preserving index.conf. Used by reindex_object before a force=1
+   rebuild so the new layout starts from a clean slate (vacuum --splits=N
+   in particular needs this — the old layout's idx_splits = old_splits/4
+   doesn't match the new splits, and btree_idx_unlink_all only walks the
+   new shard count, leaving high-index orphans behind). */
+static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
+    char idx_dir[PATH_MAX];
+    snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
+    DIR *d = opendir(idx_dir);
+    if (!d) return;
+
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (strcmp(e->d_name, "index.conf") == 0) continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            /* Per-shard layout: indexes/<field>/<NNN>.idx. Drop every
+               cached btree mapping under this directory before rmrf so
+               ucache doesn't keep stale fds alive. */
+            DIR *sub = opendir(path);
+            if (sub) {
+                struct dirent *se;
+                while ((se = readdir(sub))) {
+                    if (se->d_name[0] == '.') continue;
+                    char sp[PATH_MAX];
+                    snprintf(sp, sizeof(sp), "%s/%s", path, se->d_name);
+                    btree_cache_invalidate(sp);
+                }
+                closedir(sub);
+            }
+            rmrf(path);
+        } else if (S_ISREG(st.st_mode)) {
+            /* Legacy single-file <field>.idx artefact. */
+            btree_cache_invalidate(path);
+            unlink(path);
+        }
+    }
+    closedir(d);
+}
+
+/* Rebuild every index for one object: read index.conf for the field list,
+   wipe stale on-disk idx files (any layout), then cmd_add_indexes(force=1).
+   Used by both cmd_reindex (multi-object walk) and rebuild_object (after a
+   vacuum --splits or --compact that may have changed the layout under our
+   feet). Returns the number of indexes rebuilt; 0 if the object has no
+   index.conf or it's empty. */
+int reindex_object(const char *eff_root, const char *object) {
+    char ic_path[PATH_MAX];
+    snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
+             eff_root, object);
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) return 0;
+
+    char fields_json[8192];
+    int pos = snprintf(fields_json, sizeof(fields_json), "[");
+    int nf = 0;
+    char fline[512];
+    while (fgets(fline, sizeof(fline), ic)) {
+        fline[strcspn(fline, "\n")] = '\0';
+        if (!fline[0]) continue;
+        int avail = (int)sizeof(fields_json) - pos - 8;
+        if (avail <= 0) break;
+        pos += snprintf(fields_json + pos, avail,
+                        "%s\"%s\"", nf ? "," : "", fline);
+        nf++;
+    }
+    fclose(ic);
+    snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
+    if (nf == 0) return 0;
+
+    reindex_wipe_idx_dirs(eff_root, object);
+
+    /* cmd_add_indexes emits its own JSON to OUT; redirect to /dev/null so
+       reindex_object stays silent (callers wrap their own response). */
+    FILE *saved_out = g_out;
+    FILE *devnull = fopen("/dev/null", "w");
+    g_out = devnull ? devnull : saved_out;
+    cmd_add_indexes(eff_root, object, fields_json, 1);
+    g_out = saved_out;
+    if (devnull) fclose(devnull);
+
+    log_msg(3, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
+    return nf;
+}
+
+/* Legacy single-file sweep — kept for cmd_reindex's per-object loop where
+   reindex_wipe_idx_dirs would already handle it, but documented separately
+   so the upgrade path stays clear. */
 static void reindex_clean_legacy(const char *eff_root, const char *object) {
     char idx_dir[PATH_MAX];
     snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
