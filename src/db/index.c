@@ -96,54 +96,47 @@ void btree_idx_range_ex(const char *db_root, const char *object,
     }
 }
 
-/* ----- Globally-ordered walk (for cursor pagination) ----- */
+/* ----- Globally-ordered walk (for cursor pagination) =====
+   K-way merge across all idx shards. Each shard runs a streaming
+   BtRangeIter; a min-heap (ASC) or max-heap (DESC) of (current entry,
+   shard_id) picks the next globally-ordered entry. O(splits/4) memory —
+   one entry materialised per shard at a time, regardless of total range
+   cardinality. */
 
 typedef struct {
-    uint8_t *value;
-    size_t   vlen;
-    uint8_t  hash[BT_HASH_SIZE];
-} OrderedEntry;
+    BtRangeIter *iter;
+    /* Currently-buffered head entry — copied out of the iterator since the
+       iterator's internal buffer gets overwritten on next(). */
+    char    value[BT_MAX_VAL_LEN];
+    size_t  vlen;
+    uint8_t hash[BT_HASH_SIZE];
+    int     has_entry;       /* 1 if value/hash hold a valid head, 0 if drained */
+    int     shard_id;        /* tie-break ordering when (value,hash) collide */
+} ShardCursor;
 
-typedef struct {
-    OrderedEntry *entries;
-    size_t        count;
-    size_t        cap;
-    int           oom;
-} OrderedCollect;
-
-static int ordered_collect_cb(const char *value, size_t vlen,
-                              const uint8_t *hash16, void *ctx) {
-    OrderedCollect *oc = (OrderedCollect *)ctx;
-    if (oc->oom) return -1;
-    if (oc->count >= oc->cap) {
-        size_t ncap = oc->cap ? oc->cap * 2 : 4096;
-        OrderedEntry *ne = realloc(oc->entries, ncap * sizeof(OrderedEntry));
-        if (!ne) { oc->oom = 1; return -1; }
-        oc->entries = ne;
-        oc->cap = ncap;
-    }
-    OrderedEntry *e = &oc->entries[oc->count++];
-    e->value = malloc(vlen);
-    if (!e->value) { oc->oom = 1; oc->count--; return -1; }
-    memcpy(e->value, value, vlen);
-    e->vlen = vlen;
-    memcpy(e->hash, hash16, BT_HASH_SIZE);
-    return 0;
-}
-
-static int ordered_cmp_asc(const void *a, const void *b) {
-    const OrderedEntry *ea = (const OrderedEntry *)a;
-    const OrderedEntry *eb = (const OrderedEntry *)b;
-    size_t m = ea->vlen < eb->vlen ? ea->vlen : eb->vlen;
-    int r = memcmp(ea->value, eb->value, m);
+static int sc_cmp_asc(const ShardCursor *a, const ShardCursor *b) {
+    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
+    int r = memcmp(a->value, b->value, m);
     if (r != 0) return r;
-    if (ea->vlen != eb->vlen) return ea->vlen < eb->vlen ? -1 : 1;
-    /* Tie-break on hash16 for stable ordering across pagination. */
-    return memcmp(ea->hash, eb->hash, BT_HASH_SIZE);
+    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
+    r = memcmp(a->hash, b->hash, BT_HASH_SIZE);
+    if (r != 0) return r;
+    return a->shard_id - b->shard_id;
 }
 
-static int ordered_cmp_desc(const void *a, const void *b) {
-    return -ordered_cmp_asc(a, b);
+/* Refill the head entry of cursor c by pulling one from its iterator. */
+static void sc_pull(ShardCursor *c) {
+    const char *v;
+    size_t vl;
+    const uint8_t *h;
+    if (btree_range_iter_next(c->iter, &v, &vl, &h)) {
+        c->vlen = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
+        memcpy(c->value, v, c->vlen);
+        memcpy(c->hash, h, BT_HASH_SIZE);
+        c->has_entry = 1;
+    } else {
+        c->has_entry = 0;
+    }
 }
 
 void btree_idx_walk_ordered(const char *db_root, const char *object,
@@ -152,36 +145,46 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *max_val, size_t max_len, int max_exclusive,
                             int desc, bt_result_cb cb, void *ctx) {
     int n = index_splits_for(splits);
-    OrderedCollect oc = {0};
+    ShardCursor *cursors = calloc((size_t)n, sizeof(ShardCursor));
+    if (!cursors) return;
 
+    /* Open one streaming iterator per shard and prime its head entry. Shards
+       whose iterator fails to open (missing file, etc.) drop out — they
+       contribute nothing and don't block the merge. */
     for (int s = 0; s < n; s++) {
         char idx_path[PATH_MAX];
         build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        if (desc) {
-            btree_range_desc_ex(idx_path,
-                                min_val, min_len, min_exclusive,
-                                max_val, max_len, max_exclusive,
-                                ordered_collect_cb, &oc);
-        } else {
-            btree_range_ex(idx_path,
-                           min_val, min_len, min_exclusive,
-                           max_val, max_len, max_exclusive,
-                           ordered_collect_cb, &oc);
-        }
-        if (oc.oom) break;
+        cursors[s].shard_id = s;
+        cursors[s].iter = btree_range_iter_open(idx_path,
+                                                min_val, min_len, min_exclusive,
+                                                max_val, max_len, max_exclusive,
+                                                desc);
+        if (cursors[s].iter) sc_pull(&cursors[s]);
     }
 
-    if (!oc.oom && oc.count > 0) {
-        qsort(oc.entries, oc.count, sizeof(OrderedEntry),
-              desc ? ordered_cmp_desc : ordered_cmp_asc);
-        for (size_t i = 0; i < oc.count; i++) {
-            if (cb((const char *)oc.entries[i].value, oc.entries[i].vlen,
-                   oc.entries[i].hash, ctx) < 0) break;
+    /* Linear-scan-pick-best is fine at this scale — splits/4 ≤ 1024 and the
+       per-iteration callback cost (record fetch + criteria_match_tree)
+       dwarfs the O(N) selection. Heap would shave µs at high splits but
+       complicates code without changing the dominant cost. */
+    while (1) {
+        int best = -1;
+        for (int s = 0; s < n; s++) {
+            if (!cursors[s].has_entry) continue;
+            if (best < 0) { best = s; continue; }
+            int cmp = sc_cmp_asc(&cursors[s], &cursors[best]);
+            if (desc ? cmp > 0 : cmp < 0) best = s;
         }
+        if (best < 0) break;  /* every iterator drained */
+
+        ShardCursor *bc = &cursors[best];
+        if (cb(bc->value, bc->vlen, bc->hash, ctx) < 0) break;
+        sc_pull(bc);
     }
 
-    for (size_t i = 0; i < oc.count; i++) free(oc.entries[i].value);
-    free(oc.entries);
+    for (int s = 0; s < n; s++) {
+        if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
+    }
+    free(cursors);
 }
 
 void btree_idx_unlink_all(const char *db_root, const char *object,
@@ -1205,7 +1208,42 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
    rebuilds every index listed in that object's indexes/index.conf via
    cmd_add_indexes(..., force=1). cmd_add_indexes's per-call OUT is redirected
    to /dev/null during the loop so reindex emits a single summary document.
-   Per-object progress is logged at info level only. */
+   Per-object progress is logged at info level only.
+
+   Also cleans up any legacy single-file <field>.idx artefacts left over
+   from the pre-2026.05.1 layout — one ./shard-db reindex after upgrade
+   gets the indexes/ directory into the new <field>/<NNN>.idx shape with
+   no orphans on disk. */
+
+/* Sweep stale <field>.idx files left behind by the pre-2026.05.1 single-file
+   layout. With the per-shard layout, each indexed field lives in its own
+   sub-directory under indexes/ — any sibling *.idx file is from before the
+   migration. Idempotent; harmless to run when there's nothing to clean. */
+static void reindex_clean_legacy(const char *eff_root, const char *object) {
+    char idx_dir[PATH_MAX];
+    snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
+    DIR *d = opendir(idx_dir);
+    if (!d) return;
+
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        size_t nlen = strlen(e->d_name);
+        if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".idx") != 0) continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+        btree_cache_invalidate(path);
+        if (unlink(path) == 0) {
+            log_msg(3, "REINDEX %s/%s: cleaned legacy single-file index %s",
+                    eff_root, object, e->d_name);
+        }
+    }
+    closedir(d);
+}
 
 int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter) {
     char scpath[PATH_MAX];
@@ -1270,7 +1308,12 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
 
         if (nf == 0) { objects_skipped++; continue; }
 
-        /* force=1 drops existing .idx files first, then rebuilds. */
+        /* Sweep any pre-2026.05.1 single-file <field>.idx leftovers before
+           the rebuild — force=1 drops only the new per-shard layout, not
+           the legacy files. */
+        reindex_clean_legacy(eff_root, obj);
+
+        /* force=1 drops existing per-shard .idx files first, then rebuilds. */
         g_out = devnull ? devnull : saved_out;
         cmd_add_indexes(eff_root, obj, fields_json, 1);
         g_out = saved_out;

@@ -1302,6 +1302,261 @@ void btree_range_desc_ex(const char *path,
     bt_release(&bt);
 }
 
+/* ========== Streaming range iterator ==========
+   Pulls one entry at a time so a caller can drive a k-way merge across
+   multiple btrees (cursor pagination over per-shard indexes) without
+   collecting every entry into a per-shard buffer. Holds the btree's rdlock
+   for its lifetime. */
+
+struct BtRangeIter {
+    BtFile bt;
+    int    valid;            /* 0 once finished — bt has been released */
+    int    desc;
+    /* Bounds */
+    char   min_val[BT_MAX_VAL_LEN];
+    size_t min_len;
+    int    min_exclusive;
+    char   max_val[BT_MAX_VAL_LEN];
+    size_t max_len;
+    int    max_exclusive;
+    /* Last-yielded snapshot — pointers returned to caller stay valid until
+       the next iter_next call. */
+    char    yield_value[BT_MAX_VAL_LEN];
+    size_t  yield_vlen;
+    uint8_t yield_hash[BT_HASH_SIZE];
+    /* ASC state — straight forward leaf-chain walk. */
+    uint32_t fwd_page_id;    /* current leaf page (0 = exhausted) */
+    LeafIter fwd_leaf;       /* prefix-decode state for the current page */
+    int      fwd_pending;    /* leaf_iter is positioned AT a valid entry — yield
+                                without advancing (set by initial seek and by
+                                advancing into a fresh leaf). */
+    /* DESC state — pre-collected leaf list, walked right-to-left, and a
+       per-leaf decoded snapshot consumed back-to-front. */
+    uint32_t      *desc_leaves;
+    size_t         desc_leaf_count;
+    int            desc_li;       /* index into desc_leaves[] */
+    DescEntrySnap *desc_snaps;
+    int            desc_snap_n;
+    int            desc_snap_i;   /* index walking right-to-left */
+};
+
+/* Walk to the leaf containing min_val and position fwd_leaf at the first
+   slot >= min_val. The leaf-iter prefix-decode state must be primed by
+   walking from the nearest anchor — leaf_iter_seek does that for us. Sets
+   fwd_page_id = 0 if no such leaf exists. */
+static void iter_seek_fwd(BtRangeIter *it) {
+    BtFileHeader *fh = (BtFileHeader *)it->bt.map;
+    uint32_t page_id = fh->root_page;
+    while (1) {
+        uint8_t *page = bt_page(&it->bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->page_type == 1) break;
+        int pos = page_bsearch(page, it->min_val, it->min_len);
+        if (pos == 0) page_id = ph->next_leaf;
+        else page_id = entry_child(page_entry(page, pos - 1));
+    }
+    /* Walk forward across leaves until we find one with an in-range slot. */
+    while (page_id != 0) {
+        uint8_t *page = bt_page(&it->bt, page_id);
+        int start = page_bsearch(page, it->min_val, it->min_len);
+        leaf_iter_init(&it->fwd_leaf, page);
+        if (leaf_iter_seek(&it->fwd_leaf, start)) {
+            it->fwd_page_id = page_id;
+            it->fwd_pending = 1;  /* yield this entry without advancing */
+            return;
+        }
+        /* Empty leaf or all entries past max — try next. */
+        BtPageHeader *ph = (BtPageHeader *)page;
+        page_id = ph->next_leaf;
+    }
+    it->fwd_page_id = 0;
+}
+
+/* Walk forward leaf chain until a slot is in-range, copy into yield_*, and
+   return 1. Returns 0 when exhausted. */
+static int iter_next_fwd(BtRangeIter *it) {
+    while (it->fwd_page_id != 0) {
+        if (it->fwd_pending) {
+            /* Initial-seek state or fresh-leaf state — fwd_leaf is already
+               positioned on a valid entry; yield without advancing. */
+            it->fwd_pending = 0;
+        } else if (!leaf_iter_next(&it->fwd_leaf)) {
+            /* Page exhausted — advance to next leaf and retry. */
+            BtPageHeader *ph = (BtPageHeader *)bt_page(&it->bt, it->fwd_page_id);
+            uint32_t next = ph->next_leaf;
+            if (next == 0) { it->fwd_page_id = 0; return 0; }
+            it->fwd_page_id = next;
+            leaf_iter_init(&it->fwd_leaf, bt_page(&it->bt, next));
+            /* Slot 0 of every leaf is an anchor (full-key suffix), so the
+               first leaf_iter_next decodes correctly without seek. */
+            continue;
+        }
+
+        int cmp_max = val_cmp(it->fwd_leaf.key_buf, it->fwd_leaf.key_len,
+                              it->max_val, it->max_len);
+        if (cmp_max > 0) { it->fwd_page_id = 0; return 0; }
+        if (it->max_exclusive && cmp_max == 0) { it->fwd_page_id = 0; return 0; }
+        if (it->min_exclusive &&
+            val_cmp(it->fwd_leaf.key_buf, it->fwd_leaf.key_len,
+                    it->min_val, it->min_len) == 0) continue;
+
+        it->yield_vlen = it->fwd_leaf.key_len;
+        if (it->yield_vlen > BT_MAX_VAL_LEN) it->yield_vlen = BT_MAX_VAL_LEN;
+        memcpy(it->yield_value, it->fwd_leaf.key_buf, it->yield_vlen);
+        memcpy(it->yield_hash, it->fwd_leaf.hash, BT_HASH_SIZE);
+        return 1;
+    }
+    return 0;
+}
+
+static int iter_load_desc_snap(BtRangeIter *it);
+
+/* Pre-collect the leaf-chain page IDs for DESC walks. Mirrors the prologue
+   of btree_range_desc_ex. */
+static int iter_init_desc_leaves(BtRangeIter *it) {
+    BtFileHeader *fh = (BtFileHeader *)it->bt.map;
+    uint32_t page_id = fh->root_page;
+    while (1) {
+        uint8_t *page = bt_page(&it->bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->page_type == 1) break;
+        page_id = ph->next_leaf;
+    }
+    size_t cap = 0;
+    while (page_id != 0) {
+        if (it->desc_leaf_count >= cap) {
+            cap = cap ? cap * 2 : 1024;
+            uint32_t *nl = realloc(it->desc_leaves, cap * sizeof(uint32_t));
+            if (!nl) return -1;
+            it->desc_leaves = nl;
+        }
+        it->desc_leaves[it->desc_leaf_count++] = page_id;
+        BtPageHeader *ph = (BtPageHeader *)bt_page(&it->bt, page_id);
+        page_id = ph->next_leaf;
+    }
+    /* Pre-load the rightmost leaf's snapshot so the first iter_next_desc call
+       has a valid in-leaf cursor; subsequent calls advance leftward. If the
+       rightmost leaf is empty / beyond max, iter_load_desc_snap walks left
+       internally until it finds a usable one or the iterator drains. */
+    it->desc_li = (int)it->desc_leaf_count - 1;
+    it->desc_snap_i = -1;
+    if (it->desc_li >= 0) iter_load_desc_snap(it);
+    return 0;
+}
+
+/* Decode the current desc_li leaf into desc_snaps and reset desc_snap_i to
+   the rightmost entry. Returns 0 if there's no more snapshot data possible. */
+static int iter_load_desc_snap(BtRangeIter *it) {
+    while (it->desc_li >= 0) {
+        uint8_t *page = bt_page(&it->bt, it->desc_leaves[it->desc_li]);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->count == 0) { it->desc_li--; continue; }
+
+        /* Cheap left-bound check: anchor at slot 0 carries the leaf's first
+           full key. If first_key > max_val every entry here is past max — skip. */
+        LeafIter peek;
+        leaf_iter_init(&peek, page);
+        if (!leaf_iter_next(&peek)) { it->desc_li--; continue; }
+        int peek_vs_max = val_cmp(peek.key_buf, peek.key_len, it->max_val, it->max_len);
+        if (peek_vs_max > 0) { it->desc_li--; continue; }
+        if (it->max_exclusive && peek_vs_max == 0 && ph->count == 1) { it->desc_li--; continue; }
+
+        free(it->desc_snaps);
+        it->desc_snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
+        if (!it->desc_snaps) return 0;
+        it->desc_snap_n = 0;
+
+        LeafIter lit;
+        leaf_iter_init(&lit, page);
+        while (leaf_iter_next(&lit) && it->desc_snap_n < (int)ph->count) {
+            size_t kl = lit.key_len;
+            if (kl > BT_MAX_VAL_LEN) kl = BT_MAX_VAL_LEN;
+            memcpy(it->desc_snaps[it->desc_snap_n].key, lit.key_buf, kl);
+            it->desc_snaps[it->desc_snap_n].key_len = kl;
+            memcpy(it->desc_snaps[it->desc_snap_n].hash, lit.hash, BT_HASH_SIZE);
+            it->desc_snap_n++;
+        }
+        it->desc_snap_i = it->desc_snap_n - 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Backward walk: pop snaps right-to-left, advance to previous leaf when a
+   leaf is drained, applying [min, max] bounds. Returns 1 on yield, 0 when
+   exhausted. */
+static int iter_next_desc(BtRangeIter *it) {
+    if (!it->desc_leaves) {
+        if (iter_init_desc_leaves(it) < 0) return 0;
+    }
+
+    while (1) {
+        if (it->desc_snap_i < 0) {
+            it->desc_li--;
+            if (it->desc_li < 0) return 0;
+            if (!iter_load_desc_snap(it)) return 0;
+            continue;
+        }
+        DescEntrySnap *s = &it->desc_snaps[it->desc_snap_i--];
+
+        int cmp_max = val_cmp(s->key, s->key_len, it->max_val, it->max_len);
+        if (cmp_max > 0) continue;
+        if (it->max_exclusive && cmp_max == 0) continue;
+
+        int cmp_min = val_cmp(s->key, s->key_len, it->min_val, it->min_len);
+        if (cmp_min < 0) return 0;  /* below min — every leftward entry is smaller */
+        if (it->min_exclusive && cmp_min == 0) continue;
+
+        it->yield_vlen = s->key_len;
+        memcpy(it->yield_value, s->key, it->yield_vlen);
+        memcpy(it->yield_hash, s->hash, BT_HASH_SIZE);
+        return 1;
+    }
+}
+
+BtRangeIter *btree_range_iter_open(const char *path,
+                                   const char *min_val, size_t min_len, int min_exclusive,
+                                   const char *max_val, size_t max_len, int max_exclusive,
+                                   int desc) {
+    BtRangeIter *it = calloc(1, sizeof(*it));
+    if (!it) return NULL;
+    if (bt_acquire(&it->bt, path, 0) != 0) { free(it); return NULL; }
+    it->valid = 1;
+    it->desc = desc;
+    if (min_len > BT_MAX_VAL_LEN) min_len = BT_MAX_VAL_LEN;
+    if (max_len > BT_MAX_VAL_LEN) max_len = BT_MAX_VAL_LEN;
+    memcpy(it->min_val, min_val, min_len); it->min_len = min_len;
+    memcpy(it->max_val, max_val, max_len); it->max_len = max_len;
+    it->min_exclusive = min_exclusive;
+    it->max_exclusive = max_exclusive;
+
+    if (!desc) iter_seek_fwd(it);
+    /* DESC defers the leaf-list collection to the first next() call so that
+       trees the caller never reads from skip the up-front cost. */
+    return it;
+}
+
+int btree_range_iter_next(BtRangeIter *it,
+                          const char **value, size_t *vlen,
+                          const uint8_t **hash16) {
+    if (!it || !it->valid) return 0;
+    int got = it->desc ? iter_next_desc(it) : iter_next_fwd(it);
+    if (got) {
+        *value  = it->yield_value;
+        *vlen   = it->yield_vlen;
+        *hash16 = it->yield_hash;
+    }
+    return got;
+}
+
+void btree_range_iter_close(BtRangeIter *it) {
+    if (!it) return;
+    if (it->valid) bt_release(&it->bt);
+    free(it->desc_leaves);
+    free(it->desc_snaps);
+    free(it);
+}
+
 void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     /* Drop the cached fd/mapping before unlink — otherwise the cache holds
        the orphaned inode alive and the next acquire opens the new file via

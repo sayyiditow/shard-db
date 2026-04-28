@@ -1991,6 +1991,12 @@ int cmd_server(const char *db_root, int daemonize) {
         }
     }
 
+    /* Bootstrap DB_ROOT on first start. The release tarball ships only the
+       binary; the data directory comes from the user's db.env setting and
+       is created here on demand so a fresh deploy doesn't require a manual
+       mkdir. Idempotent — existing dirs are left untouched. */
+    mkdirp(db_root);
+
     /* Single-instance guard. flock on a per-DB_ROOT lock file prevents a
        second shard-db process from attaching to the same data directory
        (which would corrupt shared mmap state — the per-object rwlocks in

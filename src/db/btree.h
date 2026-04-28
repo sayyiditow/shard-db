@@ -127,6 +127,27 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count);
    Use for bulk insert operations instead of btree_insert_batch. */
 void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count);
 
+/* Streaming range iterator. Pulls one entry at a time so callers can drive a
+   k-way merge across multiple btree files without buffering everything per
+   file. desc=1 walks DESC, otherwise ASC. Bounds match btree_range_ex /
+   btree_range_desc_ex semantics (NULL bounds disallowed; pass "" / 0 + the
+   sentinel "\xff\xff\xff\xff" for open ends, same as those callers).
+
+   Holds the underlying btree's rdlock for the iterator's lifetime — callers
+   must call btree_range_iter_close to release. Returned (value, vlen, hash)
+   pointers are valid until the next btree_range_iter_next call on the same
+   iterator. */
+typedef struct BtRangeIter BtRangeIter;
+
+BtRangeIter *btree_range_iter_open(const char *path,
+                                   const char *min_val, size_t min_len, int min_exclusive,
+                                   const char *max_val, size_t max_len, int max_exclusive,
+                                   int desc);
+int  btree_range_iter_next(BtRangeIter *it,
+                           const char **value, size_t *vlen,
+                           const uint8_t **hash16);
+void btree_range_iter_close(BtRangeIter *it);
+
 /* Read-only cache of mmap'd B+ tree files. Capacity from db.env BT_CACHE_MAX. */
 void bt_cache_init(int cap);
 void bt_cache_shutdown(void);

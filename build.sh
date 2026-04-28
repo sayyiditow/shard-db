@@ -37,12 +37,13 @@ strip shard-db
 gcc -O2 -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS -lncursesw -lssl -lcrypto
 strip shard-cli
 
-mkdir -p build/bin build/db
+mkdir -p build/bin
 
 cp shard-db shard-cli build/bin/
-cp start.sh stop.sh status.sh build/bin/ 2>/dev/null || true
 
-cat > build/bin/db.env << 'EOF'
+# Ship as db.env.example — operator copies to db.env on first deploy. Avoids
+# overwriting the existing config when an upgrade tarball lands on top.
+cat > build/bin/db.env.example << 'EOF'
 export DB_ROOT="../db"
 export PORT=9199
 export TIMEOUT=0
@@ -72,10 +73,6 @@ export TLS_CA=""
 export TLS_SKIP_VERIFY=0
 EOF
 
-cat > build/db/schema.conf << 'EOF'
-# Format: dir:object:splits:max_key:max_value
-# Auto-managed by create-object — do not edit manually
-EOF
-
 echo "Built: build/"
 echo "Deploy: copy build/ to server, cd build/bin, ./shard-db start"
+echo "Note: \$DB_ROOT is created lazily on first start; existing data dirs are not touched."

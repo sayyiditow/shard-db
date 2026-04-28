@@ -23,14 +23,12 @@ Output lives under `build/`:
 ```
 build/
   bin/
-    shard-db        # the binary
-    start.sh stop.sh status.sh
-    db.env          # default config
-  db/
-    schema.conf     # empty schema
+    shard-db        # daemon binary
+    shard-cli       # ncurses TUI client
+    db.env.example  # template config — copy to db.env on first deploy
 ```
 
-The helper scripts (`start.sh`, `stop.sh`, `status.sh`) just invoke `./shard-db start|stop|status` in the `build/bin` directory.
+`build/bin/` is the only artefact. `$DB_ROOT` (from your `db.env`) is created lazily on first `./shard-db start`; an existing data directory is never touched, so dropping a fresh build/ tree onto an upgraded host is non-destructive.
 
 ### Manual compile
 
