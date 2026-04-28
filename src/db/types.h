@@ -158,7 +158,14 @@ enum SearchOp {
        non-varchar fields. */
     OP_LEN_EQ, OP_LEN_NEQ,
     OP_LEN_LESS, OP_LEN_GREATER, OP_LEN_LESS_EQ, OP_LEN_GREATER_EQ,
-    OP_LEN_BETWEEN
+    OP_LEN_BETWEEN,
+    /* Case-insensitive variants of like/contains/starts_with/ends_with.
+       Substring/prefix/suffix/exact-pattern matching with ASCII tolower.
+       Always full-scan in the indexed path (btree is byte-sorted, no CI
+       range shortcut without a folded secondary index). */
+    OP_ILIKE, OP_INOT_LIKE,
+    OP_ICONTAINS, OP_INOT_CONTAINS,
+    OP_ISTARTS_WITH, OP_IENDS_WITH
 };
 
 typedef struct {

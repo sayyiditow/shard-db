@@ -4053,8 +4053,41 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             }
             return strcmp(val_str, c->value) >= 0 && strcmp(val_str, c->value2) <= 0;
         case OP_LIKE: {
-            /* Simple LIKE: % = any, _ = single char */
-            /* Convert to basic substring check for %val% pattern */
+            /* SQL-style LIKE with `%` wildcard (no `_`). Case-sensitive —
+               use `ilike` for case-insensitive. */
+            const char *pat = c->value;
+            if (pat[0] == '%' && pat[strlen(pat)-1] == '%') {
+                char sub[MAX_LINE];
+                snprintf(sub, sizeof(sub), "%s", pat + 1);
+                sub[strlen(sub)-1] = '\0';
+                return strstr(val_str, sub) != NULL;
+            }
+            if (pat[0] == '%') return strstr(val_str, pat + 1) != NULL;
+            if (pat[strlen(pat)-1] == '%') {
+                return strncmp(val_str, pat, strlen(pat)-1) == 0;
+            }
+            return strcmp(val_str, pat) == 0;
+        }
+        case OP_NOT_LIKE: {
+            SearchCriterion tmp = *c;
+            tmp.op = OP_LIKE;
+            return !match_criterion(val_str, &tmp);
+        }
+        case OP_CONTAINS:
+            return strstr(val_str, c->value) != NULL;
+        case OP_NOT_CONTAINS:
+            return strstr(val_str, c->value) == NULL;
+        case OP_STARTS_WITH:
+            return strncmp(val_str, c->value, strlen(c->value)) == 0;
+        case OP_ENDS_WITH: {
+            size_t vl = strlen(val_str), cl = strlen(c->value);
+            if (vl < cl) return 0;
+            return strcmp(val_str + vl - cl, c->value) == 0;
+        }
+        /* Case-insensitive variants (ASCII tolower). Indexed paths fall
+           through to the default full-scan branch in btree_dispatch and
+           filter per entry in the callbacks below. */
+        case OP_ILIKE: {
             const char *pat = c->value;
             if (pat[0] == '%' && pat[strlen(pat)-1] == '%') {
                 char sub[MAX_LINE];
@@ -4068,18 +4101,18 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             }
             return strcasecmp(val_str, pat) == 0;
         }
-        case OP_NOT_LIKE: {
+        case OP_INOT_LIKE: {
             SearchCriterion tmp = *c;
-            tmp.op = OP_LIKE;
+            tmp.op = OP_ILIKE;
             return !match_criterion(val_str, &tmp);
         }
-        case OP_CONTAINS:
+        case OP_ICONTAINS:
             return strcasestr(val_str, c->value) != NULL;
-        case OP_NOT_CONTAINS:
+        case OP_INOT_CONTAINS:
             return strcasestr(val_str, c->value) == NULL;
-        case OP_STARTS_WITH:
+        case OP_ISTARTS_WITH:
             return strncasecmp(val_str, c->value, strlen(c->value)) == 0;
-        case OP_ENDS_WITH: {
+        case OP_IENDS_WITH: {
             size_t vl = strlen(val_str), cl = strlen(c->value);
             if (vl < cl) return 0;
             return strcasecmp(val_str + vl - cl, c->value) == 0;
@@ -4291,38 +4324,51 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         break;
     }
 
-    /* LIKE pattern classification for varchar ops */
-    if (cc->ftype == FT_VARCHAR &&
-        (cc->op == OP_LIKE || cc->op == OP_NOT_LIKE ||
-         cc->op == OP_CONTAINS || cc->op == OP_NOT_CONTAINS ||
-         cc->op == OP_STARTS_WITH || cc->op == OP_ENDS_WITH ||
-         cc->op == OP_EQUAL || cc->op == OP_NOT_EQUAL)) {
+    /* LIKE/CONTAINS/STARTS/ENDS needle prep for varchar ops.
+       Stores the needle pre-stripped (LIKE strips `%`) in cc->needle_lc.
+       CS family (LIKE/NOT_LIKE/CONTAINS/NOT_CONTAINS/STARTS_WITH/ENDS_WITH):
+         needle stored raw — matchers use memcmp/memmem.
+       CI family (ILIKE/INOT_LIKE/ICONTAINS/INOT_CONTAINS/ISTARTS_WITH/IENDS_WITH):
+         needle stored ASCII-lowered — matchers tolower the haystack per char.
+       The field name `needle_lc` is now misleading; kept for diff continuity. */
+    int is_like_op = (cc->op == OP_LIKE || cc->op == OP_NOT_LIKE ||
+                      cc->op == OP_ILIKE || cc->op == OP_INOT_LIKE);
+    int is_substr_op = (cc->op == OP_CONTAINS || cc->op == OP_NOT_CONTAINS ||
+                        cc->op == OP_ICONTAINS || cc->op == OP_INOT_CONTAINS ||
+                        cc->op == OP_STARTS_WITH || cc->op == OP_ENDS_WITH ||
+                        cc->op == OP_ISTARTS_WITH || cc->op == OP_IENDS_WITH);
+    int is_ci_op = (cc->op == OP_ILIKE || cc->op == OP_INOT_LIKE ||
+                    cc->op == OP_ICONTAINS || cc->op == OP_INOT_CONTAINS ||
+                    cc->op == OP_ISTARTS_WITH || cc->op == OP_IENDS_WITH);
+
+    if (cc->ftype == FT_VARCHAR && (is_like_op || is_substr_op)) {
         const char *pat = c->value;
         size_t pl = cc->s1_len;
-        /* LIKE unpacks the %; other ops use literal value */
-        if (cc->op == OP_LIKE || cc->op == OP_NOT_LIKE) {
+        const char *needle_start = pat;
+        size_t needle_len = pl;
+        cc->like_kind = LK_EXACT;
+
+        if (is_like_op) {
             if (pl >= 2 && pat[0] == '%' && pat[pl-1] == '%') {
                 cc->like_kind = LK_CONTAINS;
-                cc->needle_lc = strdup_lower(pat + 1, pl - 2);
-                cc->needle_len = pl - 2;
+                needle_start = pat + 1;
+                needle_len = pl - 2;
             } else if (pl >= 1 && pat[0] == '%') {
-                /* Preserves current match_criterion behavior: %foo → substring */
                 cc->like_kind = LK_CONTAINS;
-                cc->needle_lc = strdup_lower(pat + 1, pl - 1);
-                cc->needle_len = pl - 1;
+                needle_start = pat + 1;
+                needle_len = pl - 1;
             } else if (pl >= 1 && pat[pl-1] == '%') {
                 cc->like_kind = LK_PREFIX;
-                cc->needle_lc = strdup_lower(pat, pl - 1);
-                cc->needle_len = pl - 1;
-            } else {
-                cc->like_kind = LK_EXACT;
-                cc->needle_lc = strdup_lower(pat, pl);
-                cc->needle_len = pl;
+                needle_len = pl - 1;
             }
+        }
+
+        cc->needle_len = needle_len;
+        if (is_ci_op) {
+            cc->needle_lc = strdup_lower(needle_start, needle_len);
         } else {
-            /* CONTAINS/STARTS_WITH/ENDS_WITH use c->value as-is (case-insensitive) */
-            cc->needle_lc = strdup_lower(pat, pl);
-            cc->needle_len = pl;
+            cc->needle_lc = malloc(needle_len > 0 ? needle_len : 1);
+            if (needle_len > 0) memcpy(cc->needle_lc, needle_start, needle_len);
         }
     }
 
@@ -4413,7 +4459,37 @@ static int match_typed_varchar(const uint8_t *p, int size,
         if (r2 == 0) r2 = (elen < (int)cc->s2_len) ? -1 : (elen > (int)cc->s2_len ? 1 : 0);
         return r2 <= 0;
     }
+    /* CS string ops — needle stored raw in cc->needle_lc (despite the
+       legacy field name; compile_one only lowers for CI variants below). */
     case OP_LIKE:
+        switch (cc->like_kind) {
+        case LK_EXACT:
+            return elen == (int)cc->needle_len &&
+                   memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
+        case LK_PREFIX:
+            return elen >= (int)cc->needle_len &&
+                   memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
+        case LK_CONTAINS:
+            return memmem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
+        }
+        return 0;
+    case OP_NOT_LIKE: {
+        CompiledCriterion tmp = *cc; tmp.op = OP_LIKE;
+        return !match_typed_varchar(p, size, &tmp);
+    }
+    case OP_CONTAINS:
+        return memmem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
+    case OP_NOT_CONTAINS:
+        return memmem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
+    case OP_STARTS_WITH:
+        return elen >= (int)cc->needle_len &&
+               memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
+    case OP_ENDS_WITH:
+        return elen >= (int)cc->needle_len &&
+               memcmp(hay + elen - cc->needle_len, cc->needle_lc, cc->needle_len) == 0;
+    /* CI variants — needle is pre-lowered in compile_one; haystack is
+       lowered per char on the hot path. memcasemem fuses both. */
+    case OP_ILIKE:
         switch (cc->like_kind) {
         case LK_EXACT: {
             if (elen != (int)cc->needle_len) return 0;
@@ -4436,15 +4512,15 @@ static int match_typed_varchar(const uint8_t *p, int size,
             return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
         }
         return 0;
-    case OP_NOT_LIKE: {
-        CompiledCriterion tmp = *cc; tmp.op = OP_LIKE;
+    case OP_INOT_LIKE: {
+        CompiledCriterion tmp = *cc; tmp.op = OP_ILIKE;
         return !match_typed_varchar(p, size, &tmp);
     }
-    case OP_CONTAINS:
+    case OP_ICONTAINS:
         return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
-    case OP_NOT_CONTAINS:
+    case OP_INOT_CONTAINS:
         return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
-    case OP_STARTS_WITH: {
+    case OP_ISTARTS_WITH: {
         if (elen < (int)cc->needle_len) return 0;
         for (size_t i = 0; i < cc->needle_len; i++) {
             char a = hay[i], b = cc->needle_lc[i];
@@ -4453,7 +4529,7 @@ static int match_typed_varchar(const uint8_t *p, int size,
         }
         return 1;
     }
-    case OP_ENDS_WITH: {
+    case OP_IENDS_WITH: {
         if (elen < (int)cc->needle_len) return 0;
         const char *tail = hay + elen - cc->needle_len;
         for (size_t i = 0; i < cc->needle_len; i++) {
@@ -5238,8 +5314,17 @@ static enum SearchOp op_invert(enum SearchOp op) {
     }
 }
 
+/* Ops where btree_dispatch falls through to the default full-leaf scan
+   (no precise range), so the callback must validate per entry against
+   the criterion. The CI variants (ILIKE/ICONTAINS/...) join because the
+   btree is byte-sorted and case-folding isn't byte-monotonic — there's
+   no range shortcut. Length ops are handled separately via op_is_length. */
 static int op_needs_check_primary(enum SearchOp op) {
-    return op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH;
+    return op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
+           op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN ||
+           op == OP_ILIKE || op == OP_ICONTAINS ||
+           op == OP_ISTARTS_WITH || op == OP_IENDS_WITH ||
+           op == OP_INOT_LIKE || op == OP_INOT_CONTAINS;
 }
 
 /* True if the op is a length comparator answerable from (val, vlen) alone —
@@ -5813,6 +5898,14 @@ enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "len_lte") == 0) return OP_LEN_LESS_EQ;
     if (strcmp(s, "len_gte") == 0) return OP_LEN_GREATER_EQ;
     if (strcmp(s, "len_between") == 0) return OP_LEN_BETWEEN;
+    if (strcmp(s, "ilike") == 0) return OP_ILIKE;
+    if (strcmp(s, "inlike") == 0 || strcmp(s, "inot_like") == 0 ||
+        strcmp(s, "not_ilike") == 0) return OP_INOT_LIKE;
+    if (strcmp(s, "icontains") == 0) return OP_ICONTAINS;
+    if (strcmp(s, "incontains") == 0 || strcmp(s, "inot_contains") == 0 ||
+        strcmp(s, "not_icontains") == 0) return OP_INOT_CONTAINS;
+    if (strcmp(s, "istarts") == 0 || strcmp(s, "istarts_with") == 0) return OP_ISTARTS_WITH;
+    if (strcmp(s, "iends") == 0 || strcmp(s, "iends_with") == 0) return OP_IENDS_WITH;
     return OP_EQUAL;
 }
 
@@ -7182,8 +7275,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     if (plan.kind == PRIMARY_LEAF) {
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
-        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
-                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
+        int check_primary = op_needs_check_primary(op);
 
         /* Single-leaf tree → inline btree count, no record fetch. */
         int is_single_leaf =
@@ -7969,8 +8061,7 @@ int cmd_find(const char *db_root, const char *object,
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
-        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
-                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
+        int check_primary = op_needs_check_primary(op);
         int rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
@@ -9714,8 +9805,7 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     if (plan.kind == PRIMARY_LEAF) {
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
-        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
-                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
+        int check_primary = op_needs_check_primary(op);
         CollectCtx cc;
         memset(&cc, 0, sizeof(cc));
         cc.cap = 4096;
