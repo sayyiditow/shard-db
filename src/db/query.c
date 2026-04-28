@@ -5422,32 +5422,49 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
 /* ========== Indexed Find: Collect ALL → Batch Process in Parallel ========== */
 
 /* Collecting callback for find — gathers hashes, applies primary filter.
-   Thread-safe via the embedded mutex: the btree_idx_* wrappers fan out
-   per shard with parallel_for so collect_hash_cb is invoked concurrently
-   from multiple worker threads. The btree walk + per-entry filter run
-   under that parallelism; only the append + grow happen under the lock. */
+   Lock-free: the entries buffer is a single mmap MAP_ANONYMOUS|MAP_NORESERVE
+   reservation up to QUERY_BUFFER_MB. Workers claim slot indices via
+   atomic_fetch_add; the kernel lazy-commits pages on first write, so a
+   query that only collects 100 hashes pays for ~1 page (4 KB) of physical
+   RAM despite the large virtual reservation. No realloc → no pointer
+   migration → no need for a lock around appends. The btree_idx_* wrappers
+   fan out per shard with parallel_for so this callback is invoked from
+   multiple worker threads simultaneously. */
 typedef struct {
-    CollectedHash *entries;
-    size_t count;
-    size_t cap;
+    CollectedHash *entries;     /* mmap'd region; pointer is stable */
+    size_t reservation_bytes;   /* total mmap size for munmap */
+    size_t count;               /* updated via __atomic_fetch_add */
+    size_t cap;                 /* entries-capacity (immutable after init) */
     int splits;
-    int collect_cap;
+    int collect_cap;            /* caller-supplied early-stop limit (0 = none) */
     SearchCriterion *primary_crit;
     int check_primary;
     QueryDeadline *deadline;
     int dl_counter;
-    int budget_exceeded;
-    pthread_mutex_t mu;          /* must be pthread_mutex_init'd by caller */
+    int budget_exceeded;        /* updated via __atomic_store_n */
 } CollectCtx;
 
-/* Init/destroy helpers — keep all CollectCtx setup/teardown in one place
-   so the mutex always has a paired init/destroy. */
+/* Init/destroy helpers. The mmap is kernel-side cheap (lazy commit) — the
+   reservation only consumes virtual address space until pages are touched.
+   Caller still doesn't need to set cc.cap / cc.entries; collect_ctx_init
+   sizes the buffer to the per-query buffer cap. */
 static inline void collect_ctx_init(CollectCtx *cc) {
     memset(cc, 0, sizeof(*cc));
-    pthread_mutex_init(&cc->mu, NULL);
+    cc->reservation_bytes = g_query_buffer_max_bytes;
+    cc->entries = mmap(NULL, cc->reservation_bytes,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (cc->entries == MAP_FAILED) {
+        cc->entries = NULL;
+        cc->cap = 0;
+    } else {
+        cc->cap = cc->reservation_bytes / sizeof(CollectedHash);
+    }
 }
+
 static inline void collect_ctx_destroy(CollectCtx *cc) {
-    pthread_mutex_destroy(&cc->mu);
+    if (cc->entries) munmap(cc->entries, cc->reservation_bytes);
+    cc->entries = NULL;
 }
 
 /* Forward decls — defined alongside btree_dispatch below; declared here so
@@ -5459,8 +5476,7 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     CollectCtx *cc = (CollectCtx *)ctx;
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return -1;
 
-    /* Per-entry filter happens OUTSIDE the lock — the btree walk + cheap
-       filter are the parallel-friendly part; only the append serializes. */
+    /* Per-entry filter — fully lock-free, parallel-safe. */
     if (cc->primary_crit && op_is_length(cc->primary_crit->op)) {
         if (!match_length_vlen(vlen, cc->primary_crit)) return 0;
     } else if (cc->check_primary && cc->primary_crit) {
@@ -5470,26 +5486,19 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
         if (!match_criterion(tmp, cc->primary_crit)) return 0;
     }
 
-    pthread_mutex_lock(&cc->mu);
+    /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
+       limit → bail; the buffer is mmap'd up to the per-query cap so the
+       former realloc-with-mutex path is gone. */
+    size_t idx = __atomic_fetch_add(&cc->count, 1, __ATOMIC_RELAXED);
+    if (cc->collect_cap > 0 && idx >= (size_t)cc->collect_cap) return -1;
+    if (idx >= cc->cap) {
+        __atomic_store_n(&cc->budget_exceeded, 1, __ATOMIC_RELAXED);
+        return -1;
+    }
 
-    if (cc->collect_cap > 0 && (int)cc->count >= cc->collect_cap) {
-        pthread_mutex_unlock(&cc->mu);
-        return -1;
-    }
-    if ((cc->count + 1) * sizeof(CollectedHash) > g_query_buffer_max_bytes) {
-        cc->budget_exceeded = 1;
-        pthread_mutex_unlock(&cc->mu);
-        return -1;
-    }
-    if (cc->count >= cc->cap) {
-        cc->cap *= 2;
-        cc->entries = realloc(cc->entries, cc->cap * sizeof(CollectedHash));
-    }
-    CollectedHash *e = &cc->entries[cc->count++];
+    CollectedHash *e = &cc->entries[idx];
     memcpy(e->hash, hash16, 16);
     addr_from_hash(hash16, cc->splits, &e->shard_id, &e->start_slot);
-
-    pthread_mutex_unlock(&cc->mu);
     return 0;
 }
 
@@ -6129,8 +6138,6 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     int collect_target = (limit > 0 && all_left_or_none) ? offset + limit : 0;
     CollectCtx cc;
     collect_ctx_init(&cc);
-    cc.cap = (collect_target > 0 && collect_target < 4096) ? collect_target : 4096;
-    cc.entries = malloc(cc.cap * sizeof(CollectedHash));
     cc.splits = sch->splits;
     cc.collect_cap = collect_target;
     cc.primary_crit = primary_crit;
@@ -6143,8 +6150,8 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
                    resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
                    collect_hash_cb, &cc);
 
-    if (cc.budget_exceeded) { free(cc.entries); collect_ctx_destroy(&cc); return -2; }
-    if (cc.count == 0) { free(cc.entries); collect_ctx_destroy(&cc); return 0; }
+    if (cc.budget_exceeded) { collect_ctx_destroy(&cc); return -2; }
+    if (cc.count == 0)      { collect_ctx_destroy(&cc); return 0; }
 
     int count = 0, printed = 0;
     process_batch(cc.entries, cc.count, db_root, object, sch,
@@ -6152,7 +6159,6 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
                  proj_fields, proj_count, fs, offset, limit, &count, &printed,
                  rows_fmt, csv_delim, joins, njoins, dl);
 
-    free(cc.entries);
     collect_ctx_destroy(&cc);
     return printed;
 }
@@ -7638,8 +7644,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         } else {
             CollectCtx cc;
             collect_ctx_init(&cc);
-            cc.cap = 4096;
-            cc.entries = malloc(cc.cap * sizeof(CollectedHash));
             cc.splits = sch.splits;
             cc.primary_crit = pc;
             cc.check_primary = check_primary;
@@ -7649,7 +7653,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 
             if (cc.budget_exceeded) {
                 OUT(QUERY_BUFFER_ERR);
-                free(cc.entries); collect_ctx_destroy(&cc); free_criteria_tree(tree);
+                collect_ctx_destroy(&cc); free_criteria_tree(tree);
                 return -1;
             }
             size_t count = parallel_indexed_count(db_root, object, &sch,
@@ -7657,7 +7661,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                   tree, &fs, &dl);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("{\"count\":%zu}\n", count);
-            free(cc.entries);
             collect_ctx_destroy(&cc);
         }
     } else if (plan.kind == PRIMARY_INTERSECT) {
@@ -10227,8 +10230,6 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         int check_primary = op_needs_check_primary(op);
         CollectCtx cc;
         collect_ctx_init(&cc);
-        cc.cap = 4096;
-        cc.entries = malloc(cc.cap * sizeof(CollectedHash));
         cc.splits = sch->splits;
         cc.primary_crit = pc;
         cc.check_primary = check_primary;
@@ -10239,7 +10240,6 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
                        collect_hash_cb, &cc);
         if (cc.budget_exceeded) ctx->budget_exceeded = 1;
         else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
-        free(cc.entries);
         collect_ctx_destroy(&cc);
     } else if (plan.kind == PRIMARY_INTERSECT) {
         CriteriaNode *saved = ctx->tree;
