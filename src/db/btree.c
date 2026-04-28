@@ -494,12 +494,18 @@ static int bt_open(BtFile *bt, const char *path, int create) {
 
 static void bt_close(BtFile *bt) {
     if (bt->map && bt->map != MAP_FAILED) {
-        /* Trim file to actual page count (remove pre-allocated slack) */
+        /* No close-time ftruncate. A previous version trimmed slack here
+           (file size → actual page count × page size), but that races
+           with cached readers: bt_open_cached MAP_PRIVATEs the same file,
+           and a shrink past the reader's last accessed page faults them
+           with SIGBUS/SEGV (stress test exposed this with 16 concurrent
+           clients running mixed insert/find workloads). The growth in
+           bt_alloc_page already extends in 1 MB chunks so per-file slack
+           is small; reclaim properly via vacuum/reindex when the object
+           is quiesced. flock release stays — needed to let other writers
+           proceed. */
         int flags = fcntl(bt->fd, F_GETFL);
         if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY) {
-            BtFileHeader *fh = (BtFileHeader *)bt->map;
-            size_t actual = (size_t)fh->page_count * bt_page_size;
-            if (actual < bt->map_size) ftruncate(bt->fd, actual);
             flock(bt->fd, LOCK_UN);
         }
         munmap(bt->map, bt->map_size);
