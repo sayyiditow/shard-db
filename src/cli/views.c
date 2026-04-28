@@ -992,7 +992,12 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
 static const char *const OPS_ALL[] = {
     "eq","neq","lt","gt","lte","gte","between","in","not_in",
     "like","not_like","contains","not_contains","starts","ends",
-    "exists","not_exists", NULL
+    "exists","not_exists",
+    /* Length filters on varchar (compare uint16 length-prefix). */
+    "len_eq","len_neq","len_lt","len_gt","len_lte","len_gte","len_between",
+    /* Case-insensitive substring/prefix/suffix/pattern variants. */
+    "ilike","not_ilike","icontains","not_icontains","istarts","iends",
+    NULL
 };
 
 /* Open a single-criterion form. *out is in/out: pre-filled values turn this
@@ -1048,15 +1053,15 @@ static char *pack_criteria(const CritRow *rows, int n) {
         }
         if (i) off += snprintf(out + off, cap - off, ",");
 
-        if (strcmp(op, "between") == 0) {
+        if (strcmp(op, "between") == 0 || strcmp(op, "len_between") == 0) {
             char vbuf[1024];
             snprintf(vbuf, sizeof(vbuf), "%s", val);
             char *comma = strchr(vbuf, ',');
             const char *lo = vbuf, *hi = "";
             if (comma) { *comma = '\0'; hi = comma + 1; }
             off += snprintf(out + off, cap - off,
-                "{\"field\":\"%s\",\"op\":\"between\",\"value\":\"%s\",\"value2\":\"%s\"}",
-                fld, lo, hi);
+                "{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\",\"value2\":\"%s\"}",
+                fld, op, lo, hi);
         } else if (strcmp(op, "exists") == 0 || strcmp(op, "not_exists") == 0) {
             off += snprintf(out + off, cap - off,
                 "{\"field\":\"%s\",\"op\":\"%s\"}", fld, op);
