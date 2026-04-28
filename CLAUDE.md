@@ -38,7 +38,8 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-stats-prom.sh                # Prometheus text-format exposition     (57)
 ./tests/test-bulk-upsert.sh               # bulk-insert as true upsert + idx drift (15)
 ./tests/test-bulk-update-json.sh          # bulk-update JSON per-key partial update (24)
-# Total: 721 tests
+./tests/test-agg-neq-shortcut.sh          # aggregate NEQ algebraic shortcut       (21)
+# Total: 742 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users

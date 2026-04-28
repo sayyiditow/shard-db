@@ -9603,6 +9603,82 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
     return 0;
 }
 
+/* Run the plan dispatcher into `ctx` for the given criteria tree.
+   ctx must be already initialized (specs, group setup, deadline,
+   shared_buffer_bytes). Mutates ctx.tree. Returns 0 on success,
+   -1 if the deadline tripped or the buffer budget was exceeded.
+   Extracted so the NEQ algebraic shortcut can call it twice with
+   different trees (eq-set, full-set) and subtract scalars. */
+static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
+                        const char *db_root, const char *object,
+                        const Schema *sch) {
+    ctx->tree = tree;
+
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
+
+    QueryPlan plan = choose_primary_source(tree, db_root, object);
+
+    if (plan.kind == PRIMARY_LEAF) {
+        SearchCriterion *pc = plan.primary_leaf;
+        enum SearchOp op = pc->op;
+        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
+                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
+        CollectCtx cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.cap = 4096;
+        cc.entries = malloc(cc.cap * sizeof(CollectedHash));
+        cc.splits = sch->splits;
+        cc.primary_crit = pc;
+        cc.check_primary = check_primary;
+        cc.deadline = ctx->deadline;
+        btree_dispatch(plan.primary_idx_path, pc,
+                       resolve_idx_field(ctx->fs->ts, pc->field),
+                       collect_hash_cb, &cc);
+        if (cc.budget_exceeded) ctx->budget_exceeded = 1;
+        else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
+        free(cc.entries);
+    } else if (plan.kind == PRIMARY_INTERSECT) {
+        CriteriaNode *saved = ctx->tree;
+        ctx->tree = NULL;
+        keyset_agg_from_intersect(db_root, object, sch, ctx, &plan,
+                                  saved, &ctx->tree, ctx->deadline);
+        ctx->tree = saved;
+    } else if (plan.kind == PRIMARY_KEYSET) {
+        int budget_exceeded = 0;
+        keyset_agg_from_or(db_root, object, sch, ctx, plan.or_node,
+                           ctx->deadline, &budget_exceeded);
+        if (budget_exceeded) ctx->budget_exceeded = 1;
+    } else {
+        scan_shards(data_dir, sch->slot_size, agg_scan_cb, ctx);
+    }
+
+    if (ctx->deadline->timed_out) return -1;
+    if (ctx->budget_exceeded) return -1;
+    return 0;
+}
+
+/* Free buckets owned by a cloned/local AggCtx. Counterpart to agg_free
+   that omits `free(ctx->specs)` and `pthread_mutex_destroy()` because
+   those resources are owned by the cloning origin. */
+static void agg_ctx_free_local(AggCtx *ctx) {
+    for (int i = 0; i < AGG_HT_SIZE; i++) {
+        AggBucket *b = ctx->ht[i];
+        while (b) {
+            AggBucket *next = b->next;
+            free(b->group_key);
+            for (int j = 0; j < ctx->ngroups; j++) free(b->group_vals[j]);
+            if (ctx->ngroups == 0 && b->group_vals) free(b->group_vals[0]);
+            free(b->group_vals);
+            free(b->accums);
+            free(b);
+            b = next;
+        }
+        ctx->ht[i] = NULL;
+    }
+    ctx->total_buckets = 0;
+}
+
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
@@ -9686,65 +9762,125 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
-
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-
-    if (plan.kind == PRIMARY_LEAF) {
-        /* Indexed aggregate: collect hashes → group by shard → batch process */
-        SearchCriterion *pc = plan.primary_leaf;
-        enum SearchOp op = pc->op;
-        int check_primary = (op == OP_CONTAINS || op == OP_LIKE || op == OP_ENDS_WITH ||
-                             op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN);
-
-        CollectCtx cc;
-        memset(&cc, 0, sizeof(cc));
-        cc.cap = 4096;
-        cc.entries = malloc(cc.cap * sizeof(CollectedHash));
-        cc.splits = sch.splits;
-        cc.primary_crit = pc;
-        cc.check_primary = check_primary;
-        cc.deadline = &dl;
-
-        btree_dispatch(plan.primary_idx_path, pc,
-                       resolve_idx_field(fs.ts, pc->field),
-                       collect_hash_cb, &cc);
-
-        if (cc.budget_exceeded) ctx.budget_exceeded = 1;
-        else parallel_indexed_agg(&ctx, db_root, object, &sch, cc.entries, (int)cc.count);
-
-        free(cc.entries);
-    } else if (plan.kind == PRIMARY_INTERSECT) {
-        /* AND of indexed leaves on rangeable ops — build intersection KeySet,
-           walk, aggregate. Nullify ctx.tree so agg_scan_cb skips the redundant
-           criteria_match_tree call (intersection already exact); the small-
-           primary fallback path inside keyset_agg_from_intersect restores tree
-           when needed for post-filtering. */
-        CriteriaNode *saved_tree = ctx.tree;
-        ctx.tree = NULL;
-        keyset_agg_from_intersect(db_root, object, &sch, &ctx, &plan,
-                                  saved_tree, &ctx.tree, &dl);
-        ctx.tree = saved_tree;
-    } else if (plan.kind == PRIMARY_KEYSET) {
-        /* Shape C / hybrid: build KeySet from OR index-union, feed each keyed
-           record through agg_scan_cb (which re-checks the full tree). */
-        int budget_exceeded = 0;
-        keyset_agg_from_or(db_root, object, &sch, &ctx, plan.or_node, &dl, &budget_exceeded);
-        if (budget_exceeded) ctx.budget_exceeded = 1;
-    } else {
-        /* Full scan fallback */
-        scan_shards(data_dir, sch.slot_size, agg_scan_cb, &ctx);
+    /* ===== NEQ algebraic shortcut =====
+       Narrow eligibility: criteria is exactly one NEQ leaf on an indexed
+       field, no group_by, no having, every spec is COUNT/SUM/AVG (algebraic
+       under subtraction; MIN/MAX excluded — no closed form for the
+       complement). Substitution: agg(neq X) = agg(*) − agg(eq X). Wins
+       because the existing NEQ-on-indexed path collects ~all hashes and
+       fetches every record, while this path runs one full scan plus a
+       (typically tiny) indexed eq scan. */
+    int neq_eligible = 0;
+    if (no_group && (!having_json || having_json[0] == '\0') &&
+        tree && tree->kind == CNODE_LEAF &&
+        tree->leaf.op == OP_NOT_EQUAL) {
+        int algebraic = 1;
+        for (int i = 0; i < nspecs; i++) {
+            if (specs[i].fn != AGG_COUNT && specs[i].fn != AGG_SUM && specs[i].fn != AGG_AVG) {
+                algebraic = 0; break;
+            }
+        }
+        if (algebraic) {
+            char idx_path[PATH_MAX];
+            snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx",
+                     db_root, object, tree->leaf.field);
+            struct stat st;
+            if (stat(idx_path, &st) == 0) neq_eligible = 1;
+        }
     }
 
-    if (dl.timed_out) {
-        OUT("{\"error\":\"query_timeout\"}\n");
+    if (neq_eligible) {
+        /* Two side-aggregations: eq(X) on the original ctx (its setup is
+           already correct), and full(*) on a clone that shares specs/fs/
+           buffer-budget read-only. */
+        SearchCriterion *leaf = &tree->leaf;
+        enum SearchOp saved_op = leaf->op;
+        leaf->op = OP_EQUAL;
+        compile_criteria_tree(tree, fs.ts);
+        int rc_eq = agg_run_plan(&ctx, tree, db_root, object, &sch);
+        leaf->op = saved_op;
+        compile_criteria_tree(tree, fs.ts);
+
+        AggCtx ctx_full;
+        agg_ctx_clone_shared(&ctx_full, &ctx);
+        int rc_full = (rc_eq == 0) ? agg_run_plan(&ctx_full, NULL, db_root, object, &sch) : -1;
+
+        if (dl.timed_out) {
+            OUT("{\"error\":\"query_timeout\"}\n");
+            agg_ctx_free_local(&ctx_full);
+            free_criteria_tree(tree);
+            agg_free(&ctx);
+            return -1;
+        }
+        if (ctx.budget_exceeded || ctx_full.budget_exceeded) {
+            OUT(QUERY_BUFFER_ERR);
+            agg_ctx_free_local(&ctx_full);
+            free_criteria_tree(tree);
+            agg_free(&ctx);
+            return -1;
+        }
+
+        /* Pull the single bucket from each side. Either may be empty:
+           agg_eq is empty when no record matches (NEQ matches everything),
+           agg_full is empty only on an empty table. */
+        int n_eq = 0, n_full = 0;
+        AggBucket **bs_eq = agg_collect(&ctx, &n_eq);
+        AggBucket **bs_full = agg_collect(&ctx_full, &n_full);
+        AggAccum *acc_eq = (n_eq > 0) ? bs_eq[0]->accums : NULL;
+        AggAccum *acc_full = (n_full > 0) ? bs_full[0]->accums : NULL;
+
+        /* Emit single-bucket no-group output, subtracting per spec. */
+        if (csv_delim) {
+            for (int i = 0; i < nspecs; i++) {
+                if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+                csv_emit_cell(specs[i].alias, csv_delim);
+            }
+            OUT("\n");
+            for (int i = 0; i < nspecs; i++) {
+                if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
+                int64_t cnt = (acc_full ? acc_full[i].count : 0) - (acc_eq ? acc_eq[i].count : 0);
+                double sum = (acc_full ? acc_full[i].sum : 0.0) - (acc_eq ? acc_eq[i].sum : 0.0);
+                char vbuf[64];
+                switch (specs[i].fn) {
+                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", (long)cnt); break;
+                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), sum); break;
+                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf), cnt > 0 ? sum / (double)cnt : 0.0); break;
+                    default:        vbuf[0] = '\0'; break;
+                }
+                csv_emit_cell(vbuf, csv_delim);
+            }
+            OUT("\n");
+        } else {
+            OUT("{");
+            for (int i = 0; i < nspecs; i++) {
+                if (i > 0) OUT(",");
+                int64_t cnt = (acc_full ? acc_full[i].count : 0) - (acc_eq ? acc_eq[i].count : 0);
+                double sum = (acc_full ? acc_full[i].sum : 0.0) - (acc_eq ? acc_eq[i].sum : 0.0);
+                char vbuf[64];
+                switch (specs[i].fn) {
+                    case AGG_COUNT: OUT("\"%s\":%ld", specs[i].alias, (long)cnt); break;
+                    case AGG_SUM:
+                        fmt_double(vbuf, sizeof(vbuf), sum);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    case AGG_AVG:
+                        fmt_double(vbuf, sizeof(vbuf), cnt > 0 ? sum / (double)cnt : 0.0);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    default: break;
+                }
+            }
+            OUT("}\n");
+        }
+
+        free(bs_eq); free(bs_full);
+        agg_ctx_free_local(&ctx_full);
         free_criteria_tree(tree);
         agg_free(&ctx);
-        return -1;
+        return 0;
     }
-    if (ctx.budget_exceeded) {
-        OUT(QUERY_BUFFER_ERR);
+
+    if (agg_run_plan(&ctx, tree, db_root, object, &sch) != 0) {
+        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+        else if (ctx.budget_exceeded) OUT(QUERY_BUFFER_ERR);
         free_criteria_tree(tree);
         agg_free(&ctx);
         return -1;
