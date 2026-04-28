@@ -1317,18 +1317,37 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(file);
         }
     } else if (strcmp(mode, "bulk-update") == 0) {
+        /* Three shapes share this mode:
+             criteria + value             → criteria-driven mass update
+             records:[{id,data},...]      → JSON per-key partial update (inline)
+             file:"path/to/array.json"    → JSON per-key partial update (file)
+           Dispatch by which field is present; criteria wins if both happen
+           to be set so existing callers keep working. */
         char *crit_json = json_obj_strdup_raw(&req, "criteria");
-        char *value = json_obj_strdup_raw(&req, "value");
-        char *lim_s = json_obj_strdup(&req, "limit");
-        char *dry_s = json_obj_strdup(&req, "dry_run");
-        char *if_json = json_obj_strdup_raw(&req, "if");
-        int lim = lim_s ? atoi(lim_s) : 0;
-        int dry = (dry_s && strcmp(dry_s, "true") == 0);
-        if (crit_json && value)
-            cmd_bulk_update(db_root, object, crit_json, value, if_json, lim, dry);
-        else
-            OUT("{\"error\":\"Missing criteria or value\"}\n");
-        free(crit_json); free(value); free(lim_s); free(dry_s); free(if_json);
+        if (crit_json) {
+            char *value = json_obj_strdup_raw(&req, "value");
+            char *lim_s = json_obj_strdup(&req, "limit");
+            char *dry_s = json_obj_strdup(&req, "dry_run");
+            char *if_json = json_obj_strdup_raw(&req, "if");
+            int lim = lim_s ? atoi(lim_s) : 0;
+            int dry = (dry_s && strcmp(dry_s, "true") == 0);
+            if (value)
+                cmd_bulk_update(db_root, object, crit_json, value, if_json, lim, dry);
+            else
+                OUT("{\"error\":\"Missing value\"}\n");
+            free(value); free(lim_s); free(dry_s); free(if_json);
+        } else {
+            char *records = json_obj_strdup_raw(&req, "records");
+            char *file = json_obj_strdup(&req, "file");
+            if (records)
+                cmd_bulk_update_json_string(db_root, object, records);
+            else if (file)
+                cmd_bulk_update_json(db_root, object, file);
+            else
+                OUT("{\"error\":\"bulk-update requires criteria+value, records, or file\"}\n");
+            free(records); free(file);
+        }
+        free(crit_json);
     } else if (strcmp(mode, "bulk-update-delimited") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");

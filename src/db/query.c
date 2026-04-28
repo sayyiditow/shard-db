@@ -693,6 +693,27 @@ static void *bulk_insert_shard_worker(void *arg) {
             i++;
             continue;
         }
+        /* Capture old index keys BEFORE the slot rewrite. Without this,
+           overwriting an existing key leaves stale (old-value, key-hash)
+           pairs in every index — symptoms: idx_count_cb over-counts (no
+           record fetch to filter the stale hit), find pays an extra
+           record fetch per stale entry, index files grow per overwrite.
+           Mirrors what cmd_update does for single-record overwrites. */
+        uint8_t *old_idx_bufs[MAX_FIELDS];
+        size_t   old_idx_lens[MAX_FIELDS];
+        int      old_idx_have[MAX_FIELDS];
+        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+        memset(old_idx_lens, 0, sizeof(old_idx_lens));
+        memset(old_idx_have, 0, sizeof(old_idx_have));
+        if (is_update && sw->nidx > 0) {
+            uint8_t *old_value_ptr = map + zoneB_off(slot, slots, sw->sch->slot_size) +
+                                     existing->key_len;
+            for (int fi = 0; fi < sw->nidx; fi++) {
+                old_idx_have[fi] = build_index_key_from_record(
+                    sw->ts, old_value_ptr, sw->idx_fields[fi],
+                    &old_idx_bufs[fi], &old_idx_lens[fi]);
+            }
+        }
         SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
         memset(hdr, 0, HEADER_SIZE);
         memcpy(hdr->hash, r->hash, 16);
@@ -749,7 +770,29 @@ static void *bulk_insert_shard_worker(void *arg) {
                 }
             }
 
-            if (key_buf && key_len > 0) {
+            int have_new = (key_buf != NULL && key_len > 0);
+            int unchanged = old_idx_have[fi] && have_new &&
+                            key_len == old_idx_lens[fi] &&
+                            memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
+
+            /* Drop stale btree entry on overwrite. Skip the drop iff old==new
+               because re-adding via btree_bulk_merge would duplicate (the
+               bulk path does not dedup on (value, hash) pairs the way
+               btree_insert does). */
+            if (old_idx_have[fi] && !unchanged) {
+                delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
+                                   old_idx_bufs[fi], old_idx_lens[fi], r->hash);
+            }
+            if (old_idx_have[fi]) free(old_idx_bufs[fi]);
+
+            if (unchanged) {
+                /* No-op: old btree entry still points at this hash with the
+                   same value bytes. Don't queue a new entry — would duplicate. */
+                free(key_buf);
+                continue;
+            }
+
+            if (have_new) {
                 if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
                     sw->idx_pair_caps[fi] = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
                     sw->idx_pairs[fi] = realloc(sw->idx_pairs[fi],
@@ -2559,6 +2602,393 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
             object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
     return 0;
+}
+
+/* ===== bulk-update JSON form =====
+   Shape: [{"id":"k","data":{...}}, ...]
+   Semantics: update-only, key must exist; only fields present in `data`
+   are overwritten, fields absent from `data` keep their existing value.
+   Same shard-grouped parallel pattern as bulk-update-delimited; the worker
+   patches each touched field in place at its known offset and applies the
+   drop-old/insert-new index delta only where the indexed value changed. */
+
+typedef struct {
+    char        *key;            /* heap-owned, null-terminated */
+    size_t       klen;
+    uint8_t      hash[16];
+    int          start_slot;
+    int          shard_id;
+    /* Field deltas: aligned arrays of (typed-field index, owned-string value).
+       Only fields present in `data` populate these — missing fields are
+       left alone in the worker. */
+    int          n_fields;
+    int         *field_indices;  /* heap-owned, length n_fields */
+    char       **field_values;   /* heap-owned strings, length n_fields */
+} BulkUpdJsonRec;
+
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const Schema     *sch;
+    TypedSchema      *ts;
+    const char      (*idx_fields)[256];
+    int               nidx;
+    int               shard_id;
+    BulkUpdJsonRec   *recs;
+    int               count;
+    /* Results */
+    int               updated;
+    int               skipped;
+} BulkUpdJsonShardWork;
+
+static void *bulk_upd_json_shard_worker(void *arg) {
+    BulkUpdJsonShardWork *w = (BulkUpdJsonShardWork *)arg;
+    if (w->count == 0) return NULL;
+
+    char shard[PATH_MAX];
+    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
+    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    if (!wh.map) { w->skipped += w->count; return NULL; }
+    uint8_t *map = wh.map;
+    uint32_t slots = wh.slots_per_shard;
+    uint32_t mask = slots - 1;
+
+    for (int ki = 0; ki < w->count; ki++) {
+        BulkUpdJsonRec *rec = &w->recs[ki];
+
+        /* Probe — must already exist (update-only semantics) */
+        int slot = -1;
+        for (uint32_t si = 0; si < slots; si++) {
+            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
+            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            if (h->flag == 0 && h->key_len == 0) break;
+            if (h->flag == 2) continue;
+            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
+                h->key_len == rec->klen &&
+                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
+                slot = (int)s; break;
+            }
+        }
+        if (slot < 0) { w->skipped++; continue; }
+
+        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
+        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
+
+        /* Capture old index keys before patching. */
+        uint8_t *old_idx_bufs[MAX_FIELDS];
+        size_t   old_idx_lens[MAX_FIELDS];
+        int      old_idx_have[MAX_FIELDS];
+        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+        memset(old_idx_lens, 0, sizeof(old_idx_lens));
+        memset(old_idx_have, 0, sizeof(old_idx_have));
+        for (int fi = 0; fi < w->nidx; fi++) {
+            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
+                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
+        }
+
+        /* Patch each touched field at its fixed offset. Tombstoned fields
+           are silently skipped — the touched-list was filtered in phase 1. */
+        for (int i = 0; i < rec->n_fields; i++) {
+            int tidx = rec->field_indices[i];
+            if (tidx < 0 || tidx >= w->ts->nfields) continue;
+            if (w->ts->fields[tidx].removed) continue;
+            encode_field(&w->ts->fields[tidx], rec->field_values[i],
+                         value_ptr + w->ts->fields[tidx].offset);
+        }
+
+        /* auto_update fields — refresh timestamp on every successful update */
+        for (int fi = 0; fi < w->ts->nfields; fi++) {
+            if (w->ts->fields[fi].removed) continue;
+            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+                char tbuf[20];
+                time_t now = time(NULL);
+                struct tm tm;
+                localtime_r(&now, &tm);
+                if (w->ts->fields[fi].type == FT_DATE)
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                else
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                             tm.tm_hour, tm.tm_min, tm.tm_sec);
+                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
+            }
+        }
+
+        /* Drop-old / insert-new btree entries where the indexed value moved. */
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *new_buf = NULL; size_t new_len = 0;
+            int have_new = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
+                                                      &new_buf, &new_len);
+            int changed = 0;
+            if (have_new && !old_idx_have[fi]) changed = 1;
+            else if (!have_new && old_idx_have[fi]) changed = 1;
+            else if (have_new && old_idx_have[fi]) {
+                if (new_len != old_idx_lens[fi] ||
+                    memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
+            }
+            if (changed) {
+                if (old_idx_have[fi])
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                      new_buf, new_len, rec->hash);
+            }
+            if (old_idx_have[fi]) free(old_idx_bufs[fi]);
+            free(new_buf);
+        }
+
+        w->updated++;
+    }
+
+    ucache_write_release(wh);
+    return NULL;
+}
+
+/* Internal helper: read input (file path or in-memory string) into a heap buffer.
+   `input_is_file` is 1 for file path, 0 for in-memory string passed verbatim. */
+static int bulk_upd_json_run(const char *db_root, const char *object,
+                              const char *input, int input_is_file) {
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"bulk-update-json requires typed fields (fields.conf)\"}\n");
+        return 1;
+    }
+    Schema sch = load_schema(db_root, object);
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+
+    char *json = NULL;
+    size_t len = 0;
+    int json_mmaped = 0;
+    int ifd = -1;
+    if (input_is_file) {
+        ifd = open(input, O_RDONLY);
+        if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
+        struct stat st; fstat(ifd, &st);
+        if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
+        len = st.st_size;
+        json = mmap(NULL, len, PROT_READ, MAP_SHARED, ifd, 0);
+        if (json == MAP_FAILED) {
+            json = malloc(len + 1);
+            lseek(ifd, 0, SEEK_SET);
+            size_t rd = 0;
+            while (rd < len) {
+                ssize_t n = read(ifd, json + rd, len - rd);
+                if (n <= 0) break;
+                rd += n;
+            }
+            json[rd] = '\0';
+        } else {
+            madvise((void *)json, len, MADV_SEQUENTIAL);
+            json_mmaped = 1;
+        }
+        close(ifd);
+    } else {
+        json = (char *)input;
+        len = strlen(input);
+    }
+
+    /* Phase 1: parse the array, extract per-record (key, touched fields, hash, shard). */
+    BulkUpdJsonRec *records = NULL;
+    size_t rec_cap = 1024, rec_count = 0;
+    records = malloc(rec_cap * sizeof(BulkUpdJsonRec));
+
+    int matched = 0, skipped = 0;
+
+    const char *p = json_skip(json);
+    if (*p != '[') {
+        OUT("{\"error\":\"bulk-update JSON must be a top-level array\"}\n");
+        if (json_mmaped) munmap((void *)json, len);
+        else if (input_is_file) free(json);
+        free(records);
+        return 1;
+    }
+    p++;
+
+    /* Pre-name the typed fields once so we can reuse the names array per
+       record without rebuilding it. */
+    const char *field_names[MAX_FIELDS];
+    for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
+
+    while (*p) {
+        p = json_skip(p);
+        if (*p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') { p++; continue; }
+
+        const char *obj_start = p;
+        const char *obj_end = json_skip_value(p);
+        size_t obj_len = obj_end - obj_start;
+
+        char obj_buf[8192];
+        char *obj_str;
+        int obj_heap = 0;
+        if (obj_len < sizeof(obj_buf)) {
+            memcpy(obj_buf, obj_start, obj_len);
+            obj_buf[obj_len] = '\0';
+            obj_str = obj_buf;
+        } else {
+            obj_str = malloc(obj_len + 1);
+            memcpy(obj_str, obj_start, obj_len);
+            obj_str[obj_len] = '\0';
+            obj_heap = 1;
+        }
+
+        JsonObj rec;
+        json_parse_object(obj_str, obj_len, &rec);
+
+        char *key = NULL; size_t klen = 0;
+        const char *iv; size_t ivl;
+        if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
+            key = malloc(ivl + 1);
+            memcpy(key, iv, ivl);
+            key[ivl] = '\0';
+            klen = ivl;
+        }
+
+        const char *dv; size_t dl;
+        const char *data_str = NULL;
+        if (json_obj_get(&rec, "data", &dv, &dl)) {
+            data_str = dv;
+            (void)dl;
+        }
+
+        if (!key || !data_str) {
+            skipped++;
+            free(key);
+            if (obj_heap) free(obj_str);
+            p = obj_end;
+            continue;
+        }
+        if ((int)klen > sch.max_key) {
+            skipped++;
+            free(key);
+            if (obj_heap) free(obj_str);
+            p = obj_end;
+            continue;
+        }
+
+        /* Pull out every typed-field name from `data`. Fields not present in
+           `data` come back NULL → not touched. */
+        char *vals_buf[MAX_FIELDS];
+        json_get_fields(data_str, field_names, ts->nfields, vals_buf);
+
+        int n_touched = 0;
+        for (int i = 0; i < ts->nfields; i++) if (vals_buf[i]) n_touched++;
+
+        BulkUpdJsonRec *r;
+        if (rec_count >= rec_cap) {
+            rec_cap *= 2;
+            records = realloc(records, rec_cap * sizeof(BulkUpdJsonRec));
+        }
+        r = &records[rec_count++];
+        r->key = key;
+        r->klen = klen;
+        compute_addr(key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+        if (n_touched > 0) {
+            r->n_fields = n_touched;
+            r->field_indices = malloc(n_touched * sizeof(int));
+            r->field_values = malloc(n_touched * sizeof(char *));
+            int j = 0;
+            for (int i = 0; i < ts->nfields; i++) {
+                if (vals_buf[i]) {
+                    r->field_indices[j] = i;
+                    r->field_values[j] = vals_buf[i];   /* take ownership */
+                    j++;
+                }
+            }
+        } else {
+            r->n_fields = 0;
+            r->field_indices = NULL;
+            r->field_values = NULL;
+        }
+        matched++;
+
+        if (obj_heap) free(obj_str);
+        p = obj_end;
+    }
+
+    if (rec_count == 0) {
+        OUT("{\"matched\":0,\"updated\":0,\"skipped\":%d}\n", skipped);
+        if (json_mmaped) munmap((void *)json, len);
+        else if (input_is_file) free(json);
+        free(records);
+        return 0;
+    }
+
+    /* Bucket per shard — same pattern as bulk-update-delimited / bulk-delete. */
+    int *shard_counts = calloc(sch.splits, sizeof(int));
+    for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
+
+    int nshard_groups = 0;
+    for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
+
+    BulkUpdJsonShardWork *workers = calloc(nshard_groups, sizeof(BulkUpdJsonShardWork));
+    int wi = 0;
+    for (int s = 0; s < sch.splits; s++) {
+        if (shard_counts[s] > 0) {
+            workers[wi].db_root = db_root;
+            workers[wi].object = object;
+            workers[wi].sch = &sch;
+            workers[wi].ts = ts;
+            workers[wi].idx_fields = idx_fields;
+            workers[wi].nidx = nidx;
+            workers[wi].shard_id = s;
+            workers[wi].recs = malloc(shard_counts[s] * sizeof(BulkUpdJsonRec));
+            workers[wi].count = 0;
+            workers[wi].updated = 0;
+            workers[wi].skipped = 0;
+            wi++;
+        }
+    }
+
+    for (size_t i = 0; i < rec_count; i++) {
+        for (int gi = 0; gi < nshard_groups; gi++) {
+            if (workers[gi].shard_id == records[i].shard_id) {
+                workers[gi].recs[workers[gi].count++] = records[i];
+                break;
+            }
+        }
+    }
+    free(shard_counts);
+
+    /* Phase 2: parallel shard workers. */
+    parallel_for(bulk_upd_json_shard_worker, workers, nshard_groups,
+                 sizeof(BulkUpdJsonShardWork));
+
+    int updated = 0;
+    for (int gi = 0; gi < nshard_groups; gi++) {
+        updated += workers[gi].updated;
+        skipped += workers[gi].skipped;
+        for (int i = 0; i < workers[gi].count; i++) {
+            BulkUpdJsonRec *r = &workers[gi].recs[i];
+            free(r->key);
+            for (int j = 0; j < r->n_fields; j++) free(r->field_values[j]);
+            free(r->field_values);
+            free(r->field_indices);
+        }
+        free(workers[gi].recs);
+    }
+    free(workers);
+    free(records);
+
+    if (json_mmaped) munmap((void *)json, len);
+    else if (input_is_file) free(json);
+
+    log_msg(3, "BULK-UPDATE-JSON %s matched=%d updated=%d skipped=%d",
+            object, matched, updated, skipped);
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
+    return 0;
+}
+
+int cmd_bulk_update_json(const char *db_root, const char *object, const char *input) {
+    return bulk_upd_json_run(db_root, object, input, 1);
+}
+
+int cmd_bulk_update_json_string(const char *db_root, const char *object, char *json_str) {
+    return bulk_upd_json_run(db_root, object, json_str, 0);
 }
 
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,

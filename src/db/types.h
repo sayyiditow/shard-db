@@ -634,6 +634,15 @@ int cmd_bulk_update(const char *db_root, const char *object,
    non-blank cell = overwrite. */
 int cmd_bulk_update_delimited(const char *db_root, const char *object,
                                const char *filepath, char delimiter);
+/* Per-key partial update from a JSON array. Shape: [{"id":"k","data":{...}}, ...].
+   Semantics: update-only, key must exist; only fields present in `data` are
+   overwritten, fields absent from `data` keep their existing value.
+   `input` is a file path; `cmd_bulk_update_json_string` accepts an in-memory
+   JSON string (used by the server.c dispatcher when records arrive inline). */
+int cmd_bulk_update_json(const char *db_root, const char *object,
+                          const char *input);
+int cmd_bulk_update_json_string(const char *db_root, const char *object,
+                                 char *json_str);
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              const char *criteria_json, const char *if_json,
                              int limit, int dry_run);

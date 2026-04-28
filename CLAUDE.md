@@ -36,7 +36,9 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-bulk-cas.sh                  # CAS on bulk-insert / bulk-update / bulk-delete (58)
 ./tests/test-schema-export.sh             # export-schema / import-schema CLI argv form (40)
 ./tests/test-stats-prom.sh                # Prometheus text-format exposition     (57)
-# Total: 682 tests
+./tests/test-bulk-upsert.sh               # bulk-insert as true upsert + idx drift (15)
+./tests/test-bulk-update-json.sh          # bulk-update JSON per-key partial update (24)
+# Total: 721 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -149,6 +151,8 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 
 # Bulk
 ./shard-db bulk-insert <dir> <obj> [file]         # JSON: [{"id":"k","data":{...}},...]
+                                                  # Acts as upsert — overwriting an existing
+                                                  # key drops stale index entries before writing.
 ./shard-db bulk-delete <dir> <obj> [file]
 
 # Files (base64-in-JSON over TCP — remote-safe)
@@ -398,6 +402,7 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 - `{"mode":"update", ..., "if":{"status":"pending"}}` — update only if condition matches
 - `{"mode":"delete", ..., "if":{"version":42}}` — delete only if condition matches
 - `{"mode":"bulk-update", "criteria":[...], "value":{...}, "limit":N, "dry_run":true}` — conditional mass update
+- `{"mode":"bulk-update", "records":[{"id":"k","data":{...}}, ...]}` — JSON per-key partial update (only fields present in `data` overwrite; absent fields kept). `file:"path.json"` reads the array from disk. Mode dispatches by content: `criteria` → mass update, `records`/`file` → per-key update.
 - `{"mode":"bulk-delete", "criteria":[...], "limit":N, "dry_run":true}` — mass delete by criteria
 
 ### File storage

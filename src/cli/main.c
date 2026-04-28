@@ -2006,6 +2006,7 @@ static void menu_migrate(void) {
    bulk-insert (JSON file): server reads a JSON array of {"id":"k","data":{...}}
    bulk-insert-delimited:    server reads a CSV file with header row
    bulk-update (criteria):   updates fields on every record matching criteria
+   bulk-update (JSON file):  per-key partial update; only fields present in `data` overwrite
    bulk-update-delimited:    CSV with key + per-field overrides
    bulk-delete (criteria):   deletes every matching record (with limit/dry_run)
 
@@ -2182,6 +2183,29 @@ static void bulk_update_criteria(CliConn *c) {
     }
 }
 
+static void bulk_update_json(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    FormField fs[1] = {0};
+    fs[0].label = "JSON file path"; fs[0].kind = FF_TEXT;
+    for (;;) {
+        if (tui_form("bulk-update from JSON file (per-key partial)", fs, 1) != 0) return;
+        if (!fs[0].value[0]) { tui_alert("bulk-update", "path required"); continue; }
+        char req[2048];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-update\",\"dir\":\"%s\",\"object\":\"%s\",\"file\":\"%s\"}",
+            oi.dir, oi.object, fs[0].value);
+        int act = tui_preview_json("bulk-update (JSON) — query JSON", req);
+        if (act != 1) continue;
+        char *resp = NULL; size_t rlen = 0;
+        if (cli_query(c, req, &resp, &rlen) != 0) {
+            tui_alert("error", "bulk-update failed"); continue;
+        }
+        show_response("bulk-update result", resp);
+        free(resp);
+    }
+}
+
 static void bulk_update_csv(CliConn *c) {
     ObjectInfo oi;
     if (pick_object(c, &oi) != 0) return;
@@ -2294,17 +2318,19 @@ static void menu_bulk(void) {
             { "bulk-insert (JSON file)",     "import a JSON array of {id, data} entries" },
             { "bulk-insert (CSV file)",      "import a delimited file with header row" },
             { "bulk-update (criteria)",      "change fields on every record matching" },
+            { "bulk-update (JSON file)",     "JSON per-key partial update (only fields in `data` overwrite)" },
             { "bulk-update (CSV file)",      "CSV per-key overrides (key + new field values)" },
             { "bulk-delete (criteria)",      "delete every matching record (dry_run by default)" },
         };
-        int choice = tui_menu_at("Bulk", items, 5, &sel);
+        int choice = tui_menu_at("Bulk", items, 6, &sel);
         if (choice < 0) return;
         switch (choice) {
             case 0: bulk_insert_json(c);     break;
             case 1: bulk_insert_csv(c);      break;
             case 2: bulk_update_criteria(c); break;
-            case 3: bulk_update_csv(c);      break;
-            case 4: bulk_delete_criteria(c); break;
+            case 3: bulk_update_json(c);     break;
+            case 4: bulk_update_csv(c);      break;
+            case 5: bulk_delete_criteria(c); break;
         }
     }
 }
