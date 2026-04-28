@@ -37,7 +37,7 @@ sleep 0.5
 $BIN query '{"mode":"truncate","dir":"default","object":"leads"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/leads"
 sed -i '/^default:leads:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
-$BIN query '{"mode":"create-object","dir":"default","object":"leads","splits":8,"max_key":32,"fields":["fullName:varchar:32","email:varchar:40","age:int"],"indexes":["email","age","fullName+age"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"leads","splits":16,"max_key":32,"fields":["fullName:varchar:32","email:varchar:40","age:int"],"indexes":["email","age","fullName+age"]}' > /dev/null
 
 # Seed data so indexes exist with entries
 $BIN insert default leads k1 '{"fullName":"Alice","email":"a@x.com","age":30}' > /dev/null

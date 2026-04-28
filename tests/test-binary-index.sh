@@ -44,7 +44,7 @@ $BIN start > /dev/null
 sleep 0.5
 
 echo "=== SIGNED INT RANGE ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_int","splits":2,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_int","splits":16,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
 for n in -2147483647 -1000000 -1 0 1 1000000 2147483647; do
     $BIN insert default bi_int "k_$n" "{\"n\":$n}" > /dev/null
 done
@@ -53,7 +53,7 @@ done
 # the single-record path (storage.c) and the bulk path (query.c).
 rm -rf "$DB_ROOT/default/bi_int_bulk"
 sed -i "/^default:bi_int_bulk:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_int_bulk","splits":2,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_int_bulk","splits":16,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
 BULK=$(mktemp)
 cat > "$BULK" <<'EOF'
 [{"id":"b_min","data":{"n":-2147483647}},{"id":"b_-1m","data":{"n":-1000000}},{"id":"b_-1","data":{"n":-1}},{"id":"b_0","data":{"n":0}},{"id":"b_1","data":{"n":1}},{"id":"b_1m","data":{"n":1000000}},{"id":"b_max","data":{"n":2147483647}}]
@@ -81,7 +81,7 @@ R=$($BIN query '{"mode":"count","dir":"default","object":"bi_int","criteria":[{"
 assert_eq "gt -2 = 4 (-1, 0, 1, 1M, MAX)" '"count":5' "$R"
 
 echo "=== NUMERIC (fixed-point) RANGE ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_num","splits":2,"max_key":16,"fields":["amt:numeric:10,2"],"indexes":["amt"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_num","splits":16,"max_key":16,"fields":["amt:numeric:10,2"],"indexes":["amt"]}' > /dev/null
 for v in -999.99 -0.01 0 0.01 999.99; do
     $BIN insert default bi_num "n_$v" "{\"amt\":$v}" > /dev/null
 done
@@ -91,7 +91,7 @@ R=$($BIN query '{"mode":"count","dir":"default","object":"bi_num","criteria":[{"
 assert_eq "numeric between -1 and 1 = 3" '"count":3' "$R"
 
 echo "=== DATE RANGE ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_date","splits":2,"max_key":16,"fields":["d:date"],"indexes":["d"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_date","splits":16,"max_key":16,"fields":["d:date"],"indexes":["d"]}' > /dev/null
 for d in 20200101 20250601 20300101; do
     $BIN insert default bi_date "d_$d" "{\"d\":\"$d\"}" > /dev/null
 done
@@ -101,7 +101,7 @@ R=$($BIN query '{"mode":"count","dir":"default","object":"bi_date","criteria":[{
 assert_eq "date gte 2026 = 1" '"count":1' "$R"
 
 echo "=== VARCHAR EQ / PREFIX ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_varchar","splits":2,"max_key":16,"fields":["s:varchar:32"],"indexes":["s"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_varchar","splits":16,"max_key":16,"fields":["s:varchar:32"],"indexes":["s"]}' > /dev/null
 for v in alpha alpine beta gamma; do
     $BIN insert default bi_varchar "v_$v" "{\"s\":\"$v\"}" > /dev/null
 done
@@ -111,7 +111,7 @@ R=$($BIN query '{"mode":"count","dir":"default","object":"bi_varchar","criteria"
 assert_eq "varchar starts alp = 2" '"count":2' "$R"
 
 echo "=== COMPOSITE INDEX (ASCII path regression) ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"bi_comp","splits":2,"max_key":16,"fields":["status:varchar:16","region:varchar:16"],"indexes":["status+region"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"bi_comp","splits":16,"max_key":16,"fields":["status:varchar:16","region:varchar:16"],"indexes":["status+region"]}' > /dev/null
 $BIN insert default bi_comp "c1" '{"status":"paid","region":"us"}' > /dev/null
 $BIN insert default bi_comp "c2" '{"status":"paid","region":"eu"}' > /dev/null
 $BIN insert default bi_comp "c3" '{"status":"pending","region":"us"}' > /dev/null

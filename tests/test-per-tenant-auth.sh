@@ -64,8 +64,8 @@ echo "$GLOBAL_TOKEN" > "$DB_ROOT/tokens.conf"
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_b\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_b\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
 $BIN query "{\"mode\":\"insert\",\"dir\":\"tenant_a\",\"object\":\"users\",\"key\":\"a1\",\"value\":{\"name\":\"Alice\"},\"auth\":\"$GLOBAL_TOKEN\"}" > /dev/null
 $BIN query "{\"mode\":\"insert\",\"dir\":\"tenant_b\",\"object\":\"users\",\"key\":\"b1\",\"value\":{\"name\":\"Bob\"},\"auth\":\"$GLOBAL_TOKEN\"}" > /dev/null
 
@@ -129,7 +129,7 @@ GOT=$($BIN query "{\"mode\":\"stats\",\"auth\":\"$TENANT_A_TOKEN\"}")
 assert_contains "tenant token rejected on stats"        '"error":"auth failed"' "$GOT"
 GOT=$($BIN query "{\"mode\":\"db-dirs\",\"auth\":\"$TENANT_A_TOKEN\"}")
 assert_contains "tenant token rejected on db-dirs"      '"error":"auth failed"' "$GOT"
-GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"x\",\"auth\":\"$TENANT_A_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"n:int\"]}")
+GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"x\",\"auth\":\"$TENANT_A_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}")
 assert_contains "tenant token rejected on create-object" '"error":"auth failed"' "$GOT"
 GOT=$($BIN query "{\"mode\":\"add-token\",\"auth\":\"$TENANT_A_TOKEN\",\"token\":\"new\"}")
 # Note: add-token has its own early auth gate that treats it as admin-only;

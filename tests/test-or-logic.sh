@@ -47,7 +47,7 @@ $BIN start > /dev/null
 sleep 0.5
 
 # status + region are indexed; amount + notes are NOT indexed.
-$BIN query '{"mode":"create-object","dir":"default","object":"or_orders","splits":2,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16","notes:varchar:64"],"indexes":["status","region"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"or_orders","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16","notes:varchar:64"],"indexes":["status","region"]}' > /dev/null
 
 $BIN insert default or_orders o1 '{"status":"paid","amount":100,"region":"us","notes":"vip"}'          > /dev/null
 $BIN insert default or_orders o2 '{"status":"paid","amount":50,"region":"eu","notes":"standard"}'      > /dev/null

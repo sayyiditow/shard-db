@@ -37,7 +37,7 @@ sleep 0.5
 $BIN query '{"mode":"truncate","dir":"default","object":"leads"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/leads"
 sed -i '/^default:leads:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
-$BIN query '{"mode":"create-object","dir":"default","object":"leads","splits":8,"max_key":32,"fields":["fullName:varchar:32","email:varchar:40","age:int","score:int"],"indexes":["email","age","fullName+age"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"leads","splits":16,"max_key":32,"fields":["fullName:varchar:32","email:varchar:40","age:int","score:int"],"indexes":["email","age","fullName+age"]}' > /dev/null
 
 $BIN insert default leads k1 '{"fullName":"Alice","email":"a@x.com","age":30,"score":100}' > /dev/null
 $BIN insert default leads k2 '{"fullName":"Bob","email":"b@x.com","age":25,"score":90}' > /dev/null
@@ -124,7 +124,7 @@ echo "=== CSV bulk insert uses ACTIVE field count ==="
 $BIN query '{"mode":"truncate","dir":"default","object":"csvtest"}' 2>/dev/null || true
 rm -rf "$DB_ROOT/default/csvtest"
 sed -i '/^default:csvtest:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
-$BIN query '{"mode":"create-object","dir":"default","object":"csvtest","splits":4,"max_key":16,"fields":["a:varchar:8","b:varchar:8","c:varchar:8"],"indexes":[]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"csvtest","splits":16,"max_key":16,"fields":["a:varchar:8","b:varchar:8","c:varchar:8"],"indexes":[]}' > /dev/null
 
 # Remove middle field 'b' — CSV should now be key|a|c (3 columns)
 $BIN query '{"mode":"remove-field","dir":"default","object":"csvtest","fields":["b"]}' > /dev/null

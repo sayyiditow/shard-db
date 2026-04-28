@@ -42,7 +42,7 @@ sleep 0.5
 
 # `name` is indexed (drives btree-walk path). `tag` is non-indexed
 # (drives full-scan typed match). Both should agree on results.
-$BIN query '{"mode":"create-object","dir":"default","object":"cit","fields":["name:varchar:32","tag:varchar:32"],"indexes":["name"],"splits":2}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"cit","fields":["name:varchar:32","tag:varchar:32"],"indexes":["name"],"splits":16}' > /dev/null
 
 echo "=== seed (mixed case) ==="
 $BIN query '{"mode":"bulk-insert","dir":"default","object":"cit","records":[{"id":"k1","data":{"name":"Alice","tag":"VIP"}},{"id":"k2","data":{"name":"alice","tag":"vip"}},{"id":"k3","data":{"name":"BOB","tag":"vip"}},{"id":"k4","data":{"name":"bob","tag":"VIP"}},{"id":"k5","data":{"name":"Carol","tag":"std"}}]}' > /dev/null

@@ -64,9 +64,9 @@ echo "$GLOBAL_TOKEN" > "$DB_ROOT/tokens.conf"
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"status:varchar:16\",\"amount:int\"]}" > /dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_beta\",\"object\":\"orders\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"status:varchar:16\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"status:varchar:16\",\"amount:int\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"users\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_beta\",\"object\":\"orders\",\"auth\":\"$GLOBAL_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"status:varchar:16\"]}" > /dev/null
 $BIN query "{\"mode\":\"insert\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"key\":\"o1\",\"value\":{\"status\":\"paid\",\"amount\":100},\"auth\":\"$GLOBAL_TOKEN\"}" > /dev/null
 $BIN query "{\"mode\":\"insert\",\"dir\":\"tp_acme\",\"object\":\"users\",\"key\":\"u1\",\"value\":{\"name\":\"Alice\"},\"auth\":\"$GLOBAL_TOKEN\"}" > /dev/null
 $BIN query "{\"mode\":\"insert\",\"dir\":\"tp_beta\",\"object\":\"orders\",\"key\":\"b1\",\"value\":{\"status\":\"paid\"},\"auth\":\"$GLOBAL_TOKEN\"}" > /dev/null
@@ -93,7 +93,7 @@ assert_contains "perm=rw insert ok"                         '"status":"inserted"
 GOT=$($BIN query "{\"mode\":\"delete\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"key\":\"o2\",\"auth\":\"$RW_TOKEN\"}")
 assert_contains "perm=rw delete ok"                         '"status":"deleted"'    "$GOT"
 # Admin ops rejected on rw token
-GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"newthing\",\"auth\":\"$RW_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"n:int\"]}")
+GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"newthing\",\"auth\":\"$RW_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}")
 assert_contains "perm=rw create-object rejected"            '"error":"auth failed"' "$GOT"
 GOT=$($BIN query "{\"mode\":\"add-field\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"fields\":[\"note:varchar:32\"],\"auth\":\"$RW_TOKEN\"}")
 assert_contains "perm=rw add-field rejected"                '"error":"auth failed"' "$GOT"
@@ -103,7 +103,7 @@ echo "=== perm=rwx at tenant scope : data + dir/object admin, not server admin =
 TADMIN_TOKEN="sdb_tp_tadmin_$(date +%s)"
 $BIN query "{\"mode\":\"add-token\",\"auth\":\"$GLOBAL_TOKEN\",\"token\":\"$TADMIN_TOKEN\",\"dir\":\"tp_acme\",\"perm\":\"rwx\"}" > /dev/null
 # tenant-scope admin: can create-object within its dir
-GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"widgets\",\"auth\":\"$TADMIN_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"n:int\"]}")
+GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"widgets\",\"auth\":\"$TADMIN_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}")
 assert_contains "tenant-rwx create-object on own dir"       '"status":"created"'    "$GOT"
 # object-scope admin: can add-field on own dir
 GOT=$($BIN query "{\"mode\":\"add-field\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"fields\":[\"note:varchar:32\"],\"auth\":\"$TADMIN_TOKEN\"}")
@@ -117,7 +117,7 @@ assert_contains "tenant-rwx db-dirs rejected"               '"error":"auth faile
 GOT=$($BIN query "{\"mode\":\"add-token\",\"auth\":\"$TADMIN_TOKEN\",\"token\":\"foo\",\"dir\":\"tp_acme\"}")
 assert_contains "tenant-rwx cannot add-token (ever)"        '"error":"unauthorized"' "$GOT"
 # Cross-dir rejected
-GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_beta\",\"object\":\"x\",\"auth\":\"$TADMIN_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"n:int\"]}")
+GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_beta\",\"object\":\"x\",\"auth\":\"$TADMIN_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}")
 assert_contains "tenant-rwx rejected on other dir"          '"error":"auth failed"' "$GOT"
 
 echo ""
@@ -159,7 +159,7 @@ $BIN query "{\"mode\":\"add-token\",\"auth\":\"$GLOBAL_TOKEN\",\"token\":\"$OBJX
 GOT=$($BIN query "{\"mode\":\"add-index\",\"dir\":\"tp_acme\",\"object\":\"orders\",\"field\":\"status\",\"auth\":\"$OBJX_TOKEN\"}")
 assert_contains "object-rwx add-index on target"            '"status":'             "$GOT"
 # But NOT create-object (tenant-scope admin, object-rwx is too narrow)
-GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"something_new\",\"auth\":\"$OBJX_TOKEN\",\"splits\":2,\"max_key\":16,\"fields\":[\"n:int\"]}")
+GOT=$($BIN query "{\"mode\":\"create-object\",\"dir\":\"tp_acme\",\"object\":\"something_new\",\"auth\":\"$OBJX_TOKEN\",\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}")
 assert_contains "object-rwx cannot create-object (tenant-scope)" '"error":"auth failed"' "$GOT"
 
 echo ""

@@ -47,7 +47,7 @@ sleep 0.5
 #   amount: indexed int (50–349 across 4 patterns)
 #   region: indexed varchar (us, eu rotating)
 #   notes : NON-indexed varchar (used for fallback tests)
-$BIN query '{"mode":"create-object","dir":"default","object":"ix_orders","splits":4,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16","notes:varchar:64"],"indexes":["status","amount","region"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"ix_orders","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16","notes:varchar:64"],"indexes":["status","amount","region"]}' > /dev/null
 
 # 200 records using the same i%4 pattern verified against in earlier hand-tests:
 #   i%4==0 → paid+us, amount=100+i  (50 records)

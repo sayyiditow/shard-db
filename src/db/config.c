@@ -10,8 +10,10 @@ int g_pool_chunk = 0;   /* 0 = auto (cores) — parallel_for() submit batch */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
-int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via FCACHE_MAX */
-int g_btcache_cap = 256;        /* B+ tree mmap cache capacity, configurable via BT_CACHE_MAX */
+int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via FCACHE_MAX
+                                   to one of {4096, 8192, 12288, 16384} */
+int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 4
+                                   (derived, not separately configurable) */
 size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024; /* 500 MB per-query intermediate cap, configurable via QUERY_BUFFER_MB */
 int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
@@ -259,11 +261,25 @@ int load_db_root(char *out, size_t outlen) {
             int sz = atoi(p + 17);
             if (sz >= 1024) g_max_request_size = sz;
         } else if (strncmp(p, "FCACHE_MAX=", 11) == 0) {
+            /* Strict allow-list: FCACHE_MAX ∈ {4096, 8192, 12288, 16384}
+               (4096 × N for N=1..4). BT_CACHE_MAX is derived (FCACHE_MAX/4),
+               so a single config value tunes both caches consistently. */
             int n = atoi(p + 11);
-            if (n >= 16 && n <= 1048576) g_fcache_cap = n;
+            if (n == 4096 || n == 8192 || n == 12288 || n == 16384) {
+                g_fcache_cap = n;
+            } else {
+                fprintf(stderr,
+                    "config: FCACHE_MAX=%d is not in {4096, 8192, 12288, 16384}; "
+                    "falling back to default 4096.\n", n);
+                g_fcache_cap = 4096;
+            }
+            g_btcache_cap = g_fcache_cap / 4;
         } else if (strncmp(p, "BT_CACHE_MAX=", 13) == 0) {
-            int n = atoi(p + 13);
-            if (n >= 16 && n <= 1048576) g_btcache_cap = n;
+            /* Ignored as of 2026.05.1 — BT_CACHE_MAX is derived from
+               FCACHE_MAX/4. Warn so users notice the change. */
+            fprintf(stderr,
+                "config: BT_CACHE_MAX is no longer configurable as of 2026.05.1 — "
+                "it is derived as FCACHE_MAX/4. Setting ignored.\n");
         } else if (strncmp(p, "QUERY_BUFFER_MB=", 16) == 0) {
             long mb = atol(p + 16);
             if (mb >= 1 && mb <= 1048576)  /* 1 MB floor, 1 TB ceiling */

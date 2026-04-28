@@ -41,7 +41,7 @@ sed -i "/^default:$OBJ:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start
 sleep 0.5
 
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:40\",\"age:int\",\"status:varchar:12\",\"city:varchar:40\"],\"indexes\":[\"name\",\"status\",\"city\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:40\",\"age:int\",\"status:varchar:12\",\"city:varchar:40\"],\"indexes\":[\"name\",\"status\",\"city\"]}" > /dev/null
 pass "object created with 3 indexes (name, status, city)"
 
 # Seed 5 records via a JSON file

@@ -41,7 +41,7 @@ sleep 0.5
 
 # Object with `status` indexed (drives the shortcut), `region` NOT indexed
 # (fall-through), `amount` numeric (for sum/avg).
-$BIN query '{"mode":"create-object","dir":"default","object":"neq_t","fields":["status:varchar:16","region:varchar:8","amount:int"],"indexes":["status"],"splits":4}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"neq_t","fields":["status:varchar:16","region:varchar:8","amount:int"],"indexes":["status"],"splits":16}' > /dev/null
 
 echo "=== seed: 100 rows, status: 1/5 paid, 4/5 pending ==="
 # Build a JSON array of 100 records: i=1..100, status=paid iff i%5==0,

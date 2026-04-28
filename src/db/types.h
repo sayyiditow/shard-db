@@ -34,9 +34,31 @@
 #define HEADER_SIZE 24               /* Zone A entry size */
 #define SHARD_HDR_SIZE   32          /* ShardHeader at file offset 0 */
 #define INITIAL_SLOTS    256         /* starting slots_per_shard for new shards */
-#define MIN_SPLITS       4
+/* As of 2026.05.1 the valid splits set is restricted to powers of 2 from
+   16 to 4096. The restriction supports the per-shard index layout where
+   index_splits = splits / 4 — keeping splits a power of 2 keeps the
+   shard math (and the routing of records → index shards) regular. */
+#define MIN_SPLITS       16
 #define DEFAULT_SPLITS   16          /* used by create-object when splits is omitted/0 */
 #define MAX_SPLITS       4096
+
+/* True iff n ∈ {16, 32, 64, 128, 256, 512, 1024, 2048, 4096}. */
+static inline int is_valid_splits(int n) {
+    if (n < MIN_SPLITS || n > MAX_SPLITS) return 0;
+    return (n & (n - 1)) == 0;   /* power of two */
+}
+
+/* Index shard count for a given data splits — always splits/4. Floor of 4
+   guaranteed by is_valid_splits (16/4 = 4). */
+static inline int index_splits_for(int splits) {
+    return splits / 4;
+}
+
+/* Index shard id for a record given its data shard id. Contiguous mapping:
+   data shards [0..3] → idx 0, [4..7] → idx 1, etc. Keeps locality. */
+static inline int idx_shard_for_data_shard(int data_shard) {
+    return data_shard / 4;
+}
 #define MAX_KEY_CEILING  1024        /* hard upper bound on per-object max_key
                                         (uint16 allows 65535, but keys near that
                                         size bloat slot_size; 1024 is plenty —

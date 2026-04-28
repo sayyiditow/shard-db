@@ -54,7 +54,7 @@ sleep 0.5
 
 # --- 1. Basic ASC/DESC pagination ---
 
-$BIN query '{"mode":"create-object","dir":"default","object":"curs_int","splits":2,"max_key":16,"fields":["n:int","tag:varchar:16"],"indexes":["n"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"curs_int","splits":16,"max_key":16,"fields":["n:int","tag:varchar:16"],"indexes":["n"]}' > /dev/null
 for i in 1 2 3 4 5 6 7 8 9 10; do
     $BIN insert default curs_int "k$i" "{\"n\":$((i*10)),\"tag\":\"paid\"}" > /dev/null
 done
@@ -116,7 +116,7 @@ assert_contains "reject cursor missing value for order_by" "missing order_by fie
 
 # --- 2. Tie-breaking on equal order_by values ---
 
-$BIN query '{"mode":"create-object","dir":"default","object":"curs_tie","splits":2,"max_key":16,"fields":["grp:int"],"indexes":["grp"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"curs_tie","splits":16,"max_key":16,"fields":["grp:int"],"indexes":["grp"]}' > /dev/null
 # Insert 10 records all with grp=5 (should still paginate deterministically)
 for i in 1 2 3 4 5 6 7 8 9 10; do
     $BIN insert default curs_tie "t$i" "{\"grp\":5}" > /dev/null
@@ -147,7 +147,7 @@ fi
 
 # --- 3. Cursor with criteria filter ---
 
-$BIN query '{"mode":"create-object","dir":"default","object":"curs_crit","splits":2,"max_key":16,"fields":["n:int","flag:bool"],"indexes":["n"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"curs_crit","splits":16,"max_key":16,"fields":["n:int","flag:bool"],"indexes":["n"]}' > /dev/null
 for i in 1 2 3 4 5 6 7 8 9 10; do
     FLAG=$(( i % 2 == 0 ? 1 : 0 ))
     FLAG_S=$([ "$FLAG" = "1" ] && echo "true" || echo "false")

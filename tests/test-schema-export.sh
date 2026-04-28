@@ -50,9 +50,9 @@ sleep 0.5
 # Build three test objects across two tenants. Mix typed shapes so the
 # round-trip exercises varchar (length translation), int, numeric (scale
 # preserved), bool, datetime, and composite indexes.
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_users\",\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:40\",\"age:int\",\"active:bool\",\"created_at:datetime\"],\"indexes\":[\"age\",\"name\"]}" > /dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_orders\",\"splits\":4,\"max_key\":16,\"fields\":[\"status:varchar:16\",\"amount:numeric:18,2\",\"region:varchar:16\"],\"indexes\":[\"status\",\"status+region\"]}" > /dev/null
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"migtest\",\"object\":\"mig_events\",\"splits\":4,\"max_key\":24,\"fields\":[\"kind:varchar:24\",\"ts:datetime\"],\"indexes\":[]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_users\",\"splits\":16,\"max_key\":32,\"fields\":[\"name:varchar:40\",\"age:int\",\"active:bool\",\"created_at:datetime\"],\"indexes\":[\"age\",\"name\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_orders\",\"splits\":16,\"max_key\":16,\"fields\":[\"status:varchar:16\",\"amount:numeric:18,2\",\"region:varchar:16\"],\"indexes\":[\"status\",\"status+region\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"migtest\",\"object\":\"mig_events\",\"splits\":16,\"max_key\":24,\"fields\":[\"kind:varchar:24\",\"ts:datetime\"],\"indexes\":[]}" > /dev/null
 pass "3 objects created across 2 tenants"
 
 # Insert one record into each, just to confirm import is data-free.
@@ -90,7 +90,7 @@ assert_contains "datetime simple"                '"created_at:datetime"' "$MANIF
 assert_contains "composite index exported"       '"status+region"'       "$MANIFEST"
 
 # splits / max_key preserved
-assert_contains "mig_users splits=8"            '"splits":8'  "$MANIFEST"
+assert_contains "mig_users splits=16"            '"splits":16'  "$MANIFEST"
 assert_contains "mig_users max_key=32"          '"max_key":32' "$MANIFEST"
 
 # Manifest must NOT contain data, tokens, or record_count
@@ -130,7 +130,7 @@ assert_contains "import announced failed=0"                      'failed=0'  "$I
 
 # Verify schemas reconstructed via describe-object
 DESC1=$($BIN query "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"mig_users\"}")
-assert_contains "mig_users splits restored"     '"splits":8'           "$DESC1"
+assert_contains "mig_users splits restored"     '"splits":16'           "$DESC1"
 assert_contains "mig_users name field restored" '"name":"name"'        "$DESC1"
 assert_contains "mig_users age index restored"  '"age"'                "$DESC1"
 # describe-object reports varchar on-disk size (= content + 2)

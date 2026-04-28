@@ -43,9 +43,9 @@ $BIN start > /dev/null
 sleep 0.5
 
 # Create three objects with varying shapes.
-$BIN query '{"mode":"create-object","dir":"default","object":"dsc_users","splits":8,"max_key":40,"fields":["name:varchar:64","age:int","email:varchar:80","active:bool"],"indexes":["age","email"]}' > /dev/null
-$BIN query '{"mode":"create-object","dir":"default","object":"dsc_orders","splits":4,"max_key":32,"fields":["amount:numeric:10,2","total:long","placed:datetime","sku:varchar:24"],"indexes":["sku","amount","sku+placed"]}' > /dev/null
-$BIN query '{"mode":"create-object","dir":"default","object":"dsc_empty","splits":2,"max_key":16,"fields":["k:varchar:8"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"dsc_users","splits":16,"max_key":40,"fields":["name:varchar:64","age:int","email:varchar:80","active:bool"],"indexes":["age","email"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"dsc_orders","splits":16,"max_key":32,"fields":["amount:numeric:10,2","total:long","placed:datetime","sku:varchar:24"],"indexes":["sku","amount","sku+placed"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"dsc_empty","splits":16,"max_key":16,"fields":["k:varchar:8"]}' > /dev/null
 
 # Populate dsc_users with 3 records to verify record_count.
 $BIN insert default dsc_users k1 '{"name":"alice","age":30,"email":"a@x","active":true}' > /dev/null
@@ -71,7 +71,7 @@ echo "=== describe-object: basic shape ==="
 out=$($BIN query '{"mode":"describe-object","dir":"default","object":"dsc_users"}')
 assert_contains "describe has dir" '"dir":"default"' "$out"
 assert_contains "describe has object name" '"object":"dsc_users"' "$out"
-assert_contains "describe has splits=8" '"splits":8' "$out"
+assert_contains "describe has splits=16" '"splits":16' "$out"
 assert_contains "describe has max_key=40" '"max_key":40' "$out"
 assert_contains "describe has slot_size" '"slot_size":' "$out"
 assert_contains "describe has record_count=3" '"record_count":3' "$out"

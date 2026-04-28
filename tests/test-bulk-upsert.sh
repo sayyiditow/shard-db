@@ -42,7 +42,7 @@ sed -i "/^default:upsert_t:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query '{"mode":"create-object","dir":"default","object":"upsert_t","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":4}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"upsert_t","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":16}' > /dev/null
 
 echo "=== seed: bulk-insert 3 records ==="
 $BIN query '{"mode":"bulk-insert","dir":"default","object":"upsert_t","records":[{"id":"k1","data":{"status":"paid","amount":100,"note":"v"}},{"id":"k2","data":{"status":"paid","amount":200,"note":"v"}},{"id":"k3","data":{"status":"pending","amount":50,"note":"v"}}]}' > /dev/null

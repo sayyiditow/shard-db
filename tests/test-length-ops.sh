@@ -41,7 +41,7 @@ sleep 0.5
 
 # `name` is indexed (drives btree-walk path), `bio` is unindexed (drives
 # full-scan path). Both paths must agree on the answer.
-$BIN query '{"mode":"create-object","dir":"default","object":"lent","fields":["name:varchar:64","bio:varchar:200"],"indexes":["name"],"splits":4}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"lent","fields":["name:varchar:64","bio:varchar:200"],"indexes":["name"],"splits":16}' > /dev/null
 
 echo "=== seed ==="
 # names: a(1), bob(3), alice(5), carol(5), elizabeth(9), longusername123(15)

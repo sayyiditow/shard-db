@@ -47,7 +47,7 @@ sed -i '/^default:csv_rt:/d' "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query '{"mode":"create-object","dir":"default","object":"csv_orders","splits":2,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:64"],"indexes":["status"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"csv_orders","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:64"],"indexes":["status"]}' > /dev/null
 
 $BIN insert default csv_orders o1 '{"status":"paid","amount":100,"note":"vip"}'               > /dev/null
 $BIN insert default csv_orders o2 '{"status":"paid","amount":50,"note":"a,comma,here"}'       > /dev/null
@@ -179,7 +179,7 @@ assert_contains "exists-multi o3 true"         'o3,true'          "$GOT"
 
 echo ""
 echo "=== round-trip: find CSV → bulk-insert-delimited → count equality ==="
-$BIN query '{"mode":"create-object","dir":"default","object":"csv_rt","splits":2,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:64"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"csv_rt","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:64"]}' > /dev/null
 # Export simple rows (no quotes, no newlines) from csv_orders filtered to paid → csv_rt
 # Manually build a pipe-delimited file we control, import, and verify counts.
 TMP_EXPORT=$(mktemp)

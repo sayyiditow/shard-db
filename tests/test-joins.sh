@@ -19,8 +19,8 @@ $BIN start >/dev/null
 sleep 1
 
 # Clean + create
-$BIN query '{"mode":"create-object","dir":"default","object":"j_cust","splits":2,"max_key":16,"fields":["name:varchar:32","city:varchar:32"]}' >/dev/null
-$BIN query '{"mode":"create-object","dir":"default","object":"j_orders","splits":2,"max_key":16,"fields":["amount:numeric:10,2","status:varchar:20","cust_id:varchar:16","ref_code:varchar:32"],"indexes":["status","cust_id","ref_code"]}' >/dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"j_cust","splits":16,"max_key":16,"fields":["name:varchar:32","city:varchar:32"]}' >/dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"j_orders","splits":16,"max_key":16,"fields":["amount:numeric:10,2","status:varchar:20","cust_id:varchar:16","ref_code:varchar:32"],"indexes":["status","cust_id","ref_code"]}' >/dev/null
 
 # Add customers (primary keys = their IDs)
 $BIN query '{"mode":"insert","dir":"default","object":"j_cust","key":"c1","value":{"name":"Alice","city":"NYC"}}' >/dev/null

@@ -44,7 +44,7 @@ make_fresh() {
 echo ""
 echo "=== TASK #5: vacuum without flags (fast in-place, unchanged) ==="
 make_fresh vac1
-$BIN query '{"mode":"create-object","dir":"default","object":"vac1","splits":8,"max_key":32,"fields":["name:varchar:32","age:int"],"indexes":[]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"vac1","splits":16,"max_key":32,"fields":["name:varchar:32","age:int"],"indexes":[]}' > /dev/null
 
 for i in 1 2 3 4 5; do $BIN insert default vac1 k$i "{\"name\":\"n$i\",\"age\":$i}" > /dev/null; done
 $BIN delete default vac1 k1 > /dev/null
@@ -62,7 +62,7 @@ GOT=$($BIN get default vac1 k4); assert_contains "vac1: k4 still there" '"name":
 echo ""
 echo "=== TASK #5: vacuum --compact drops tombstoned fields + shrinks layout ==="
 make_fresh vac2
-$BIN query '{"mode":"create-object","dir":"default","object":"vac2","splits":8,"max_key":32,"fields":["name:varchar:32","email:varchar:40","age:int","score:int"],"indexes":[]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"vac2","splits":16,"max_key":32,"fields":["name:varchar:32","email:varchar:40","age:int","score:int"],"indexes":[]}' > /dev/null
 
 for i in 1 2 3; do
     $BIN insert default vac2 k$i "{\"name\":\"n$i\",\"email\":\"e$i@x.com\",\"age\":$((20+i)),\"score\":$((100-i))}" > /dev/null
@@ -101,22 +101,22 @@ assert_absent "fields.conf.old gone" "$DB_ROOT/default/vac2/fields.conf.old"
 echo ""
 echo "=== TASK #5: vacuum --splits N reshards ==="
 make_fresh vac3
-$BIN query '{"mode":"create-object","dir":"default","object":"vac3","splits":4,"max_key":32,"fields":["name:varchar:16"],"indexes":["name"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"vac3","splits":16,"max_key":32,"fields":["name:varchar:16"],"indexes":["name"]}' > /dev/null
 
 for i in $(seq 1 50); do $BIN insert default vac3 k$i "{\"name\":\"n$i\"}" > /dev/null; done
 
-# Before: splits=4
+# Before: splits=16 (created with that)
 SPLITS_BEFORE=$(grep "^default:vac3:" "$DB_ROOT/schema.conf" | head -1)
-assert_contains "vac3 schema: splits=4" "default:vac3:4:" "$SPLITS_BEFORE"
+assert_contains "vac3 schema: splits=16" "default:vac3:16:" "$SPLITS_BEFORE"
 
-# Reshard to 16
-GOT=$($BIN query '{"mode":"vacuum","dir":"default","object":"vac3","splits":16}')
+# Reshard to 32 (next valid power of 2)
+GOT=$($BIN query '{"mode":"vacuum","dir":"default","object":"vac3","splits":32}')
 assert_contains "reshard status"  '"status":"rebuilt"' "$GOT"
-assert_contains "reshard splits"  '"splits":16'        "$GOT"
+assert_contains "reshard splits"  '"splits":32'        "$GOT"
 assert_contains "reshard live=50" '"live":50'          "$GOT"
 
 SPLITS_AFTER=$(grep "^default:vac3:" "$DB_ROOT/schema.conf" | head -1)
-assert_contains "vac3 schema: splits=16" "default:vac3:16:" "$SPLITS_AFTER"
+assert_contains "vac3 schema: splits=32" "default:vac3:32:" "$SPLITS_AFTER"
 
 # All records still retrievable via GET (uses hash → new shard routing)
 FOUND=0
@@ -134,7 +134,7 @@ assert_contains "indexed search post-reshard" '"key":"k25"' "$GOT"
 echo ""
 echo "=== TASK #6: add-field appends new fields ==="
 make_fresh add1
-$BIN query '{"mode":"create-object","dir":"default","object":"add1","splits":8,"max_key":32,"fields":["name:varchar:16"],"indexes":[]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"add1","splits":16,"max_key":32,"fields":["name:varchar:16"],"indexes":[]}' > /dev/null
 $BIN insert default add1 k1 '{"name":"alice"}' > /dev/null
 $BIN insert default add1 k2 '{"name":"bob"}'   > /dev/null
 
@@ -184,7 +184,7 @@ assert_contains "duplicate-in-request rejected" '"error"' "$GOT"
 echo ""
 echo "=== INTEGRATION: remove-field + vacuum --compact + add-field ==="
 make_fresh integ
-$BIN query '{"mode":"create-object","dir":"default","object":"integ","splits":4,"max_key":32,"fields":["a:varchar:16","b:varchar:16","c:int"],"indexes":[]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"integ","splits":16,"max_key":32,"fields":["a:varchar:16","b:varchar:16","c:int"],"indexes":[]}' > /dev/null
 $BIN insert default integ k1 '{"a":"aa","b":"bb","c":42}' > /dev/null
 $BIN insert default integ k2 '{"a":"aaa","b":"bbb","c":43}' > /dev/null
 

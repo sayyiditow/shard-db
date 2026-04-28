@@ -85,7 +85,7 @@ echo "=== counters move under traffic ==="
 hits_before=$(grep '^shard_db_ucache_hits_total ' <<<"$out" | awk '{print $2}')
 miss_before=$(grep '^shard_db_ucache_misses_total ' <<<"$out" | awk '{print $2}')
 
-$BIN query '{"mode":"create-object","dir":"default","object":"prom_test","fields":["name:varchar:32"],"splits":4}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"prom_test","fields":["name:varchar:32"],"splits":16}' > /dev/null
 $BIN insert default prom_test k1 '{"name":"alice"}' > /dev/null
 for i in 1 2 3 4 5; do $BIN get default prom_test k1 > /dev/null; done
 

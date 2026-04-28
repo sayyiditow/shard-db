@@ -58,7 +58,7 @@ sed -i "/^default:$OBJ:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start
 sleep 0.5
 
-$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:40\",\"status:varchar:16\",\"attempt:int\"],\"indexes\":[\"name\",\"status\"]}" > /dev/null
+$BIN query "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"$OBJ\",\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:40\",\"status:varchar:16\",\"attempt:int\"],\"indexes\":[\"name\",\"status\"]}" > /dev/null
 pass "object created (name, status indexed; attempt scalar)"
 
 # ----------------------------------------------------------------------

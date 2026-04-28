@@ -44,7 +44,7 @@ sed -i "/^default:budj_t:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query '{"mode":"create-object","dir":"default","object":"budj_t","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":4}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"budj_t","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":16}' > /dev/null
 
 echo "=== seed ==="
 $BIN query '{"mode":"bulk-insert","dir":"default","object":"budj_t","records":[{"id":"k1","data":{"status":"paid","amount":100,"note":"vip"}},{"id":"k2","data":{"status":"paid","amount":200,"note":"vip"}},{"id":"k3","data":{"status":"pending","amount":50,"note":""}}]}' > /dev/null

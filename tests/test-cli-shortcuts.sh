@@ -47,8 +47,8 @@ sed -i '/^default:cli_files:/d'  "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start > /dev/null
 sleep 0.5
 
-$BIN query '{"mode":"create-object","dir":"default","object":"cli_orders","splits":2,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16"]}' > /dev/null
-$BIN query '{"mode":"create-object","dir":"default","object":"cli_files","splits":2,"max_key":32,"fields":["name:varchar:32"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"cli_orders","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","region:varchar:16"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"cli_files","splits":16,"max_key":32,"fields":["name:varchar:32"]}' > /dev/null
 
 $BIN insert default cli_orders o1 '{"status":"paid","amount":100,"region":"us"}'    > /dev/null
 $BIN insert default cli_orders o2 '{"status":"paid","amount":250,"region":"us"}'    > /dev/null

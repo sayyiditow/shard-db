@@ -50,7 +50,7 @@ sleep 0.5
 # scans in the 50-100 ms range and set timeout_ms=10 to get a reliable trip
 # without needing millisecond precision. Sized for ~16-way parallel scan —
 # smaller counts complete in <10 ms on multicore and mask the deadline.
-$BIN query '{"mode":"create-object","dir":"default","object":"rt_big","splits":8,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:32"]}' > /dev/null
+$BIN query '{"mode":"create-object","dir":"default","object":"rt_big","splits":16,"max_key":16,"fields":["status:varchar:16","amount:int","note:varchar:32"]}' > /dev/null
 
 # Bulk-insert 1.5M records — scan of this on a full filter reliably takes
 # ~100 ms under full shard-scan parallelism.

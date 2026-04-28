@@ -3240,8 +3240,11 @@ int rebuild_object(const char *db_root, const char *object,
 
     int old_splits = old_sch.splits;
     int new_splits = new_splits_arg > 0 ? new_splits_arg : old_splits;
-    if (new_splits < MIN_SPLITS) new_splits = MIN_SPLITS;
-    if (new_splits > MAX_SPLITS) new_splits = MAX_SPLITS;
+    if (!is_valid_splits(new_splits)) {
+        OUT("{\"error\":\"splits=%d invalid; must be a power of 2 in {16, 32, 64, 128, 256, 512, 1024, 2048, 4096}\"}\n",
+            new_splits);
+        return 1;
+    }
     int splits_changed = (new_splits != old_splits);
 
     /* Build new TypedSchema:
@@ -9063,10 +9066,15 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* Defaults */
+    /* Defaults + strict validation. As of 2026.05.1, splits must be a
+       power of 2 in [16, 4096]. The per-shard index layout (index_splits
+       = splits / 4) relies on this regularity. */
     if (splits <= 0) splits = DEFAULT_SPLITS;
-    if (splits < MIN_SPLITS) splits = MIN_SPLITS;
-    if (splits > MAX_SPLITS) splits = MAX_SPLITS;
+    if (!is_valid_splits(splits)) {
+        OUT("{\"error\":\"splits=%d invalid; must be a power of 2 in {16, 32, 64, 128, 256, 512, 1024, 2048, 4096}\"}\n",
+            splits);
+        return 1;
+    }
     if (max_key <= 0) max_key = 64;
     if (max_key > MAX_KEY_CEILING) {
         OUT("{\"error\":\"max_key %d exceeds ceiling %d — keys larger than this bloat slot_size; use a shorter key (UUIDs are 36B)\"}\n",
