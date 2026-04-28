@@ -22,6 +22,11 @@ extern uint64_t g_bt_cache_misses;
 #include <pthread.h>
 #include <limits.h>
 
+/* Defined in util.c — forward-declared here to avoid pulling all of types.h
+   (types.h carries heavy server/storage deps that btree.c doesn't need). */
+extern void  mkdirp(const char *path);
+extern char *dirname_of(const char *path);
+
 /* ========== Page helpers ========== */
 
 /* Slot directory starts right after page header */
@@ -225,32 +230,36 @@ static int page_bsearch(uint8_t *page, const char *target, size_t target_len) {
     return page_bsearch_internal(page, target, target_len);
 }
 
-/* ========== File management ========== */
-
-typedef struct {
-    int fd;
-    uint8_t *map;
-    size_t map_size;
-    int cache_slot;  /* -1 = uncached (overflow or write-mode), else hashmap slot */
-} BtFile;
-
-/* ========== Read-only B+ tree mmap cache ==========
-   Open-addressing hashmap keyed by path. Single mutex, atomic lookup-or-insert.
-   No LRU: entries only leave on btree_cache_invalidate (write) or shutdown.
-   On overflow, serves uncached (cache_slot=-1) and the caller munmaps directly. */
+/* ========== File management ==========
+   Unified ucache-style btree cache: one MAP_SHARED mapping per file,
+   per-entry pthread_rwlock_t (readers share, writers exclusive). One open
+   path for both modes — no MAP_PRIVATE snapshot, no separate writer flock,
+   no refcount-based invalidation dance. Mirrors storage.c's UCacheEntry
+   model for shard files. */
 
 typedef struct {
     char     path[PATH_MAX];
+    int      fd;
     uint8_t *map;
     size_t   map_size;
-    int      refcount;
-    int      stale;
+    pthread_rwlock_t rwlock;
+    int      used;
+    uint64_t last_access;
 } BtCacheEntry;
+
+typedef struct {
+    int      slot;       /* cache slot index, or -1 if uncached fallback */
+    int      writer;     /* 1 if held wrlock, 0 if rdlock (only when slot >= 0) */
+    int      fd;         /* mirror of cache entry fd; used for grow remap */
+    uint8_t *map;
+    size_t   map_size;
+} BtFile;
 
 static BtCacheEntry    *bt_cache = NULL;
 static int              bt_cache_slots = 0;  /* power of 2 */
 static int              bt_cache_count = 0;
 static pthread_mutex_t  bt_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t bt_cache_clock = 0;  /* monotonic LRU counter */
 
 static int bt_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
@@ -260,14 +269,23 @@ void bt_cache_init(int cap) {
     bt_cache_slots = bt_next_pow2(cap * 2);
     bt_cache = calloc(bt_cache_slots, sizeof(BtCacheEntry));
     bt_cache_count = 0;
+    for (int i = 0; i < bt_cache_slots; i++) {
+        pthread_rwlock_init(&bt_cache[i].rwlock, NULL);
+        bt_cache[i].fd = -1;
+    }
 }
 
 void bt_cache_shutdown(void) {
     pthread_mutex_lock(&bt_cache_lock);
     if (bt_cache) {
         for (int i = 0; i < bt_cache_slots; i++) {
-            if (bt_cache[i].path[0] && bt_cache[i].map)
-                munmap(bt_cache[i].map, bt_cache[i].map_size);
+            BtCacheEntry *e = &bt_cache[i];
+            if (!e->used) continue;
+            if (e->map && e->map_size > 0)
+                msync(e->map, e->map_size, MS_SYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            pthread_rwlock_destroy(&e->rwlock);
         }
         free(bt_cache);
         bt_cache = NULL;
@@ -284,128 +302,227 @@ static uint32_t bt_path_hash(const char *s) {
     return h;
 }
 
+/* Linear probe. Returns slot index of match (out_found=1) or first empty slot
+   for insertion (out_found=0). Returns -1 only if the table is completely full. */
 static int bt_cache_probe(const char *path, int *out_found) {
     uint32_t h = bt_path_hash(path);
     int mask = bt_cache_slots - 1;
     int idx = h & mask;
+    int first_empty = -1;
     for (int i = 0; i < bt_cache_slots; i++) {
         int s = (idx + i) & mask;
-        if (bt_cache[s].path[0] == '\0') { *out_found = 0; return s; }
-        if (!bt_cache[s].stale && strcmp(bt_cache[s].path, path) == 0) {
-            *out_found = 1; return s;
+        if (!bt_cache[s].used) {
+            *out_found = 0;
+            return first_empty >= 0 ? first_empty : s;
+        }
+        if (strcmp(bt_cache[s].path, path) == 0) {
+            *out_found = 1;
+            return s;
         }
     }
     *out_found = 0;
-    return -1;
+    return first_empty;
 }
 
+/* Tear down a cache slot. Caller holds bt_cache_lock and ensures no holder
+   of the rwlock. Mirrors storage.c's LRU eviction — does not check the
+   rwlock and does not compact the probe chain. The dropped slot leaves a
+   probe-chain gap; a subsequent probe for a path that hashed past this
+   slot may install a duplicate at the gap. Both copies are MAP_SHARED of
+   the same file (coherent via the kernel page cache); the orphaned copy
+   gets LRU-evicted eventually. Bounded by working-set sizing
+   (BT_CACHE_MAX = FCACHE_MAX/4). */
 static void bt_cache_drop_slot(int slot) {
     BtCacheEntry *e = &bt_cache[slot];
+    if (!e->used) return;
+    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
     if (e->map) munmap(e->map, e->map_size);
-    memset(e, 0, sizeof(*e));
+    if (e->fd >= 0) close(e->fd);
+    e->map = NULL;
+    e->fd = -1;
+    e->map_size = 0;
+    e->used = 0;
+    e->path[0] = '\0';
     bt_cache_count--;
-    int mask = bt_cache_slots - 1;
-    int i = (slot + 1) & mask;
-    while (bt_cache[i].path[0]) {
-        uint32_t h = bt_path_hash(bt_cache[i].path);
-        int ideal = h & mask;
-        int hole_dist = (i - slot) & mask;
-        int entry_dist = (i - ideal) & mask;
-        if (entry_dist >= hole_dist) {
-            bt_cache[slot] = bt_cache[i];
-            memset(&bt_cache[i], 0, sizeof(BtCacheEntry));
-            slot = i;
-        }
-        i = (i + 1) & mask;
-    }
 }
 
-static int bt_open_cached(BtFile *bt, const char *path) {
-    pthread_mutex_lock(&bt_cache_lock);
-    if (bt_cache) {
-        int found = 0;
-        int slot = bt_cache_probe(path, &found);
-        if (found) {
-            __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
-            bt_cache[slot].refcount++;
-            bt->fd = -1;
-            bt->map = bt_cache[slot].map;
-            bt->map_size = bt_cache[slot].map_size;
-            bt->cache_slot = slot;
-            pthread_mutex_unlock(&bt_cache_lock);
-            return 0;
-        }
-        __atomic_add_fetch(&g_bt_cache_misses, 1, __ATOMIC_RELAXED);
-        /* Miss — open under the lock so no two threads cold-open the same file. */
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) { pthread_mutex_unlock(&bt_cache_lock); return -1; }
-        struct stat st;
-        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); pthread_mutex_unlock(&bt_cache_lock); return -1; }
-        uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) { pthread_mutex_unlock(&bt_cache_lock); return -1; }
-        madvise(map, st.st_size, MADV_RANDOM);
+/* Initialise a fresh btree file at `map` of `bt_page_size * 2` bytes. */
+static void bt_init_file(uint8_t *map) {
+    BtFileHeader *fh = (BtFileHeader *)map;
+    fh->magic = BT_MAGIC;
+    fh->root_page = 1;
+    fh->page_count = 2;
+    fh->height = 1;
+    fh->entry_count = 0;
+    fh->key_type = 0;
+    fh->key_signed = 0;
+    uint8_t *leaf = map + bt_page_size;
+    memset(leaf, 0, bt_page_size);
+    BtPageHeader *lh = (BtPageHeader *)leaf;
+    lh->page_type = 1;
+    lh->count = 0;
+    lh->next_leaf = 0;
+    lh->data_end = bt_page_size;
+}
 
-        if (slot >= 0 && bt_cache_count < bt_cache_slots / 2) {
-            BtCacheEntry *e = &bt_cache[slot];
-            strncpy(e->path, path, PATH_MAX - 1);
-            e->path[PATH_MAX - 1] = '\0';
-            e->map = map;
-            e->map_size = st.st_size;
-            e->refcount = 1;
-            e->stale = 0;
-            bt_cache_count++;
-            bt->fd = -1;
-            bt->map = map;
-            bt->map_size = st.st_size;
-            bt->cache_slot = slot;
-            pthread_mutex_unlock(&bt_cache_lock);
-            return 0;
-        }
-        /* Overflow — uncached */
-        pthread_mutex_unlock(&bt_cache_lock);
-        bt->fd = -1;
-        bt->map = map;
-        bt->map_size = st.st_size;
-        bt->cache_slot = -1;
-        return 0;
+/* Open the file (creating with a fresh header on writer=1 if absent) and
+   mmap MAP_SHARED. Returns 0 on success and fills *out_fd, *out_map,
+   *out_size; -1 on failure. */
+static int bt_open_file(const char *path, int writer,
+                        int *out_fd, uint8_t **out_map, size_t *out_size) {
+    int fd;
+    if (writer) {
+        /* dirname_of returns a static-buffer pointer — do not free. */
+        mkdirp(dirname_of(path));
+        fd = open(path, O_RDWR | O_CREAT, 0644);
+    } else {
+        fd = open(path, O_RDWR);
     }
-    pthread_mutex_unlock(&bt_cache_lock);
-
-    /* Not initialized — direct mmap, cache_slot=-1 */
-    int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
+
     struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return -1; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return -1;
-    madvise(map, st.st_size, MADV_RANDOM);
-    bt->fd = -1;
-    bt->map = map;
-    bt->map_size = st.st_size;
-    bt->cache_slot = -1;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    int fresh = 0;
+    size_t sz;
+    if (st.st_size == 0) {
+        if (!writer) { close(fd); return -1; }
+        size_t init_size = (size_t)bt_page_size * 2;
+        if (ftruncate(fd, init_size) < 0) { close(fd); return -1; }
+        sz = init_size;
+        fresh = 1;
+    } else {
+        sz = (size_t)st.st_size;
+    }
+
+    uint8_t *map = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { close(fd); return -1; }
+    madvise(map, sz, MADV_RANDOM);
+
+    if (fresh) bt_init_file(map);
+
+    *out_fd = fd;
+    *out_map = map;
+    *out_size = sz;
     return 0;
 }
 
-static void bt_close_cached(BtFile *bt) {
-    if (!bt->map) return;
-    if (bt->cache_slot < 0) {
-        /* Uncached — munmap directly */
-        munmap(bt->map, bt->map_size);
-        bt->map = NULL;
-        return;
+/* Acquire a btree handle. writer=0 takes rdlock, writer=1 takes wrlock and
+   creates the file (with a fresh header) if missing. On cache pressure we
+   evict the least-recently-used slot; if the cache isn't initialised or
+   eviction can't free a slot, we fall back to an uncached mapping (slot=-1,
+   no rwlock) — same hazard tradeoff as storage.c's ucache. */
+static int bt_acquire(BtFile *bt, const char *path, int writer) {
+    bt->slot = -1;
+    bt->writer = writer;
+    bt->fd = -1;
+    bt->map = NULL;
+    bt->map_size = 0;
+
+    if (!bt_cache) {
+        /* Cache not initialised — direct mmap, no locking. */
+        return bt_open_file(path, writer, &bt->fd, &bt->map, &bt->map_size);
     }
+
     pthread_mutex_lock(&bt_cache_lock);
-    if (bt_cache && bt->cache_slot < bt_cache_slots &&
-        bt_cache[bt->cache_slot].map == bt->map) {
-        bt_cache[bt->cache_slot].refcount--;
-        if (bt_cache[bt->cache_slot].stale && bt_cache[bt->cache_slot].refcount == 0) {
-            bt_cache_drop_slot(bt->cache_slot);
+
+    int found = 0;
+    int slot = bt_cache_probe(path, &found);
+
+    if (found) {
+        __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
+        bt_cache[slot].last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &bt_cache[slot].rwlock;
+        pthread_mutex_unlock(&bt_cache_lock);
+
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+
+        BtCacheEntry *e = &bt_cache[slot];
+        bt->slot = slot;
+        bt->fd = e->fd;
+        bt->map = e->map;
+        bt->map_size = e->map_size;
+        return 0;
+    }
+
+    __atomic_add_fetch(&g_bt_cache_misses, 1, __ATOMIC_RELAXED);
+
+    int fd;
+    uint8_t *map;
+    size_t sz;
+    if (bt_open_file(path, writer, &fd, &map, &sz) < 0) {
+        pthread_mutex_unlock(&bt_cache_lock);
+        return -1;
+    }
+
+    /* Evict LRU when over half-full or the probe couldn't find an empty slot. */
+    if (slot < 0 || bt_cache_count >= bt_cache_slots / 2) {
+        int lru = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < bt_cache_slots; i++) {
+            if (bt_cache[i].used && bt_cache[i].last_access < oldest) {
+                oldest = bt_cache[i].last_access;
+                lru = i;
+            }
+        }
+        if (lru >= 0) {
+            bt_cache_drop_slot(lru);
+            slot = lru;
         }
     }
+
+    if (slot < 0) {
+        /* Cache truly full — serve uncached. */
+        pthread_mutex_unlock(&bt_cache_lock);
+        bt->slot = -1;
+        bt->fd = fd;
+        bt->map = map;
+        bt->map_size = sz;
+        return 0;
+    }
+
+    BtCacheEntry *e = &bt_cache[slot];
+    strncpy(e->path, path, PATH_MAX - 1);
+    e->path[PATH_MAX - 1] = '\0';
+    e->fd = fd;
+    e->map = map;
+    e->map_size = sz;
+    e->used = 1;
+    e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
+    bt_cache_count++;
+
+    pthread_rwlock_t *lock = &e->rwlock;
     pthread_mutex_unlock(&bt_cache_lock);
+
+    if (writer) pthread_rwlock_wrlock(lock);
+    else        pthread_rwlock_rdlock(lock);
+
+    bt->slot = slot;
+    bt->fd = fd;
+    bt->map = map;
+    bt->map_size = sz;
+    return 0;
+}
+
+static void bt_release(BtFile *bt) {
+    if (bt->slot >= 0) {
+        if (bt->writer) {
+            /* Propagate any grow-time remap back into the cache entry so the
+               next reader picks up the new mapping. Safe: we hold wrlock. */
+            BtCacheEntry *e = &bt_cache[bt->slot];
+            e->map = bt->map;
+            e->map_size = bt->map_size;
+        }
+        pthread_rwlock_unlock(&bt_cache[bt->slot].rwlock);
+    } else {
+        /* Uncached fallback — manage manually. */
+        if (bt->map && bt->map != MAP_FAILED) munmap(bt->map, bt->map_size);
+        if (bt->fd >= 0) close(bt->fd);
+    }
     bt->map = NULL;
+    bt->fd = -1;
+    bt->slot = -1;
 }
 
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes) {
@@ -414,7 +531,7 @@ int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes) {
     pthread_mutex_lock(&bt_cache_lock);
     if (bt_cache) {
         for (int i = 0; i < bt_cache_slots; i++) {
-            if (bt_cache[i].path[0] && bt_cache[i].map) {
+            if (bt_cache[i].used && bt_cache[i].map) {
                 used++;
                 bytes += bt_cache[i].map_size;
             }
@@ -427,94 +544,22 @@ int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes) {
     return 0;
 }
 
-/* Mark cache entry as stale — evicted when refcount drops to 0 */
+/* Drop any cache entry for `path`. Used by remove-index before unlink so the
+   next acquirer reopens. With the unified MAP_SHARED + rwlock model this is
+   no longer needed for write/read coherence (writers and readers share one
+   live mapping); invalidate is only required for filesystem operations like
+   unlink that need the cached fd/mmap released. Same hazard tradeoff as
+   bt_cache_drop_slot: admin paths (remove-index) are already serialized via
+   the per-object rwlock so concurrent traffic to this index doesn't happen
+   in practice. */
 void btree_cache_invalidate(const char *path) {
     pthread_mutex_lock(&bt_cache_lock);
     if (bt_cache) {
         int found = 0;
         int slot = bt_cache_probe(path, &found);
-        if (found) {
-            if (bt_cache[slot].refcount == 0) {
-                bt_cache_drop_slot(slot);
-            } else {
-                bt_cache[slot].stale = 1;
-            }
-        }
+        if (found) bt_cache_drop_slot(slot);
     }
     pthread_mutex_unlock(&bt_cache_lock);
-}
-
-/* mode: 0=read-only (MAP_PRIVATE, no lock), 1=create/write (MAP_SHARED, LOCK_EX) */
-static int bt_open(BtFile *bt, const char *path, int create) {
-    int readonly = !create;
-    int flags = readonly ? O_RDONLY : (O_RDWR | O_CREAT);
-    bt->fd = open(path, flags, 0644);
-    if (bt->fd < 0) return -1;
-
-    if (!readonly) flock(bt->fd, LOCK_EX);
-
-    struct stat st;
-    fstat(bt->fd, &st);
-
-    if (st.st_size == 0 && create) {
-        size_t init_size = 2 * bt_page_size;
-        ftruncate(bt->fd, init_size);
-        bt->map = mmap(NULL, init_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
-        if (bt->map == MAP_FAILED) { flock(bt->fd, LOCK_UN); close(bt->fd); return -1; }
-        bt->map_size = init_size;
-
-        BtFileHeader *fh = (BtFileHeader *)bt->map;
-        fh->magic = BT_MAGIC;
-        fh->root_page = 1;
-        fh->page_count = 2;
-        fh->height = 1;
-        fh->entry_count = 0;
-        fh->key_type = 0;   /* FT_NONE — populated by typed bulk_build / caller */
-        fh->key_signed = 0;
-
-        uint8_t *leaf = bt->map + bt_page_size;
-        memset(leaf, 0, bt_page_size);
-        BtPageHeader *lh = (BtPageHeader *)leaf;
-        lh->page_type = 1;
-        lh->count = 0;
-        lh->next_leaf = 0;
-        lh->data_end = bt_page_size;
-    } else {
-        bt->map_size = st.st_size;
-        int prot = readonly ? PROT_READ : (PROT_READ | PROT_WRITE);
-        int mflags = readonly ? MAP_PRIVATE : MAP_SHARED;
-        bt->map = mmap(NULL, bt->map_size, prot, mflags, bt->fd, 0);
-        if (bt->map == MAP_FAILED) {
-            if (!readonly) flock(bt->fd, LOCK_UN);
-            close(bt->fd); return -1;
-        }
-    }
-    return 0;
-}
-
-static void bt_close(BtFile *bt) {
-    if (bt->map && bt->map != MAP_FAILED) {
-        /* No close-time ftruncate. A previous version trimmed slack here
-           (file size → actual page count × page size), but that races
-           with cached readers: bt_open_cached MAP_PRIVATEs the same file,
-           and a shrink past the reader's last accessed page faults them
-           with SIGBUS/SEGV (stress test exposed this with 16 concurrent
-           clients running mixed insert/find workloads). The growth in
-           bt_alloc_page already extends in 1 MB chunks so per-file slack
-           is small; reclaim properly via vacuum/reindex when the object
-           is quiesced. flock release stays — needed to let other writers
-           proceed. */
-        int flags = fcntl(bt->fd, F_GETFL);
-        if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY) {
-            flock(bt->fd, LOCK_UN);
-        }
-        munmap(bt->map, bt->map_size);
-    } else {
-        int flags = fcntl(bt->fd, F_GETFL);
-        if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY)
-            flock(bt->fd, LOCK_UN);
-    }
-    close(bt->fd);
 }
 
 /* Get page pointer */
@@ -522,7 +567,11 @@ static inline uint8_t *bt_page(BtFile *bt, uint32_t page_id) {
     return bt->map + (size_t)page_id * bt_page_size;
 }
 
-/* Allocate a new page. Returns page_id. Grows file in chunks to avoid per-page remap. */
+/* Allocate a new page. Returns page_id. Grows file in chunks to avoid per-page remap.
+   When the file grows we munmap+remap; the caller holds wrlock on the cache slot
+   so no concurrent reader is dereferencing the old map, and we update the cache
+   entry's map/map_size in place so the next acquirer (waiting on the rwlock)
+   picks up the new mapping. */
 static uint32_t bt_alloc_page(BtFile *bt) {
     BtFileHeader *fh = (BtFileHeader *)bt->map;
     uint32_t new_id = fh->page_count;
@@ -539,6 +588,11 @@ static uint32_t bt_alloc_page(BtFile *bt) {
         bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
         bt->map_size = new_size;
         fh = (BtFileHeader *)bt->map;
+        if (bt->slot >= 0) {
+            BtCacheEntry *e = &bt_cache[bt->slot];
+            e->map = bt->map;
+            e->map_size = bt->map_size;
+        }
     }
 
     fh->page_count = new_id + 1;
@@ -938,10 +992,9 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
 void btree_insert(const char *path, const char *value, size_t vlen,
                   const uint8_t hash[BT_HASH_SIZE]) {
     if (vlen > BT_MAX_VAL_LEN) return;
-    btree_cache_invalidate(path);
 
     BtFile bt;
-    if (bt_open(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return;
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
     char promote_val[BT_MAX_VAL_LEN];
@@ -975,17 +1028,16 @@ void btree_insert(const char *path, const char *value, size_t vlen,
 
     fh = (BtFileHeader *)bt.map;
     fh->entry_count++;
-    bt_close(&bt);
+    bt_release(&bt);
 }
 
 /* Batch insert — opens file once, inserts all entries, closes once.
    Much faster and safer than calling btree_insert N times. */
 void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
     if (count == 0) return;
-    btree_cache_invalidate(path);
 
     BtFile bt;
-    if (bt_open(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return;
 
     for (size_t i = 0; i < count; i++) {
         if (entries[i].vlen > BT_MAX_VAL_LEN) continue;
@@ -1015,14 +1067,13 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
         fh->entry_count++;
     }
 
-    bt_close(&bt);
+    bt_release(&bt);
 }
 
 void btree_delete(const char *path, const char *value, size_t vlen,
                   const uint8_t hash[BT_HASH_SIZE]) {
-    btree_cache_invalidate(path);
     BtFile bt;
-    if (bt_open(&bt, path, 1) != 0) return; /* write mode — needs to modify pages */
+    if (bt_acquire(&bt, path, 1) != 0) return; /* write mode — needs to modify pages */
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
@@ -1054,13 +1105,13 @@ void btree_delete(const char *path, const char *value, size_t vlen,
         } while (leaf_iter_next(&it));
     }
 
-    bt_close(&bt);
+    bt_release(&bt);
 }
 
 void btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_open_cached(&bt, path) != 0) return;
+    if (bt_acquire(&bt, path, 0) != 0) return;
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
@@ -1092,7 +1143,7 @@ void btree_search(const char *path, const char *value, size_t vlen,
         page_id = ph->next_leaf;
     }
 done:
-    bt_close_cached(&bt);
+    bt_release(&bt);
 }
 
 void btree_range_ex(const char *path,
@@ -1100,7 +1151,7 @@ void btree_range_ex(const char *path,
                     const char *max_val, size_t max_len, int max_exclusive,
                     bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_open_cached(&bt, path) != 0) return;
+    if (bt_acquire(&bt, path, 0) != 0) return;
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
@@ -1136,7 +1187,7 @@ void btree_range_ex(const char *path,
         page_id = ph->next_leaf;
     }
 range_done:
-    bt_close_cached(&bt);
+    bt_release(&bt);
 }
 
 void btree_range(const char *path,
@@ -1158,7 +1209,7 @@ void btree_range_desc_ex(const char *path,
                          const char *max_val, size_t max_len, int max_exclusive,
                          bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_open_cached(&bt, path) != 0) return;
+    if (bt_acquire(&bt, path, 0) != 0) return;
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Step 1: descend to leftmost leaf, then walk next_leaf chain to collect
@@ -1179,7 +1230,7 @@ void btree_range_desc_ex(const char *path,
         if (leaf_count >= leaf_cap) {
             leaf_cap = leaf_cap ? leaf_cap * 2 : 1024;
             uint32_t *nl = realloc(leaves, leaf_cap * sizeof(uint32_t));
-            if (!nl) { free(leaves); bt_close_cached(&bt); return; }
+            if (!nl) { free(leaves); bt_release(&bt); return; }
             leaves = nl;
         }
         leaves[leaf_count++] = page_id;
@@ -1248,17 +1299,19 @@ void btree_range_desc_ex(const char *path,
     }
 
     free(leaves);
-    bt_close_cached(&bt);
+    bt_release(&bt);
 }
 
 void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
+    /* Drop the cached fd/mapping before unlink — otherwise the cache holds
+       the orphaned inode alive and the next acquire opens the new file via
+       a fresh fd while old writers still see the deleted one. */
     btree_cache_invalidate(path);
-    /* Delete existing file */
     unlink(path);
     if (count == 0) return;
 
     BtFile bt;
-    if (bt_open(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return;
 
     /* Fill leaf pages left to right */
     uint32_t *leaf_ids = NULL;
@@ -1393,7 +1446,7 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
 
     if (child_ids != leaf_ids) free(child_ids);
     free(leaf_ids);
-    bt_close(&bt);
+    bt_release(&bt);
 }
 
 /* ========== Merge-rebuild: extract existing + merge + bulk_build ========== */
