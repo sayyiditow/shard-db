@@ -103,6 +103,7 @@ Top-level menus: **Server** (start/stop/status), **Browse** (db-dirs → list-ob
 - **All I/O via mmap**: MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup
 - **Concurrency**: per-ucache-entry rwlock (shared for read, exclusive for write); per-object rwlock for schema mutations
+- **Index layout**: Each indexed field is sharded into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx` (3-hex, matches data shard naming). Writes route by xxh128 to one shard; reads fan out across all shards in parallel; cursor pagination uses a streaming k-way merge across per-shard `BtRangeIter`s for global ordering. The btree cache mirrors ucache (per-file pthread_rwlock_t, persistent MAP_SHARED, LRU eviction at `BT_CACHE_MAX = FCACHE_MAX/4`).
 - **Multi-tenancy**: `dir` parameter in every data query, validated against dirs.conf
 - **Logging**: Async ring buffer, separate info/error files by date, auto-retention
 
@@ -130,8 +131,10 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ### Indexes
 
 - **B+ tree** with prefix-compressed leaves (anchors every K=16 entries, two-stage bsearch)
+- **Per-shard layout**: every indexed field is split into `splits/4` btree files (`indexes/<field>/<NNN>.idx`). `splits` is locked to powers of 2 in [16, 4096]; `index_splits_for(splits) = splits/4` is derived at runtime — no separate config knob. Path constructor: `build_idx_path(buf, db_root, object, field, idx_shard_id)`. Hash routing: `idx_shard_for_hash(hash16, splits)` and the data-shard variant `idx_shard_for_data_shard(data_shard) = data_shard / 4` (contiguous coverage so idx-shard X covers data-shards X*4..X*4+3).
+- **Wrapper API** (`index.c`, declared in `types.h`): `btree_idx_insert/delete` (route to one shard), `btree_idx_search/range/range_ex` (fan out across all shards, callback fires in arbitrary inter-shard order), `btree_idx_walk_ordered` (k-way streaming merge for cursor pagination), `btree_idx_unlink_all/exists` (admin ops on the per-shard directory). Reindex sweeps any pre-2026.05.1 single-file `<field>.idx` artefacts (`reindex_clean_legacy`).
 - Single field: `indexes:["name"]`
-- Composite: `indexes:["country+zip"]` (concatenated field values)
+- Composite: `indexes:["country+zip"]` (concatenated field values; the literal `+`-joined name becomes the directory name on disk)
 - **All 38 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists, len_eq, len_neq, len_lt, len_gt, len_lte, len_gte, len_between (length ops on varchar — answered from btree leaf entry's vlen, no record fetch), ilike, not_ilike, icontains, not_icontains, istarts, iends (case-insensitive variants — full leaf scan with per-entry tolower compare), eq_field, neq_field, lt_field, gt_field, lte_field, gte_field (field-vs-field on the same record — full scan only; RHS is per-record so no btree shortcut), regex, not_regex (POSIX extended regex on varchar — compiled once at criteria time, REG_STARTEND on the hot path; full scan only).
 - **Case-sensitivity**: `eq, neq, like, not_like, contains, not_contains, starts, ends` are byte-exact (case-SENSITIVE). `ilike, not_ilike, icontains, not_icontains, istarts, iends` are case-INSENSITIVE (ASCII tolower).
 
@@ -451,7 +454,11 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 - `parallel_indexed_count` / `parallel_indexed_agg`: orchestrators for indexed multi-criteria
 - `QueryDeadline` + `query_deadline_tick()`: statement-timeout enforcement (coarse clock, every 1024 iterations)
 - `idx_count_cb`: single-criterion inline count (no record fetch, O(1) per btree hit)
-- `btree_insert/search/range/bulk_build/bulk_merge`: B+ tree ops with prefix-compressed leaves
+- `btree_insert/search/range/bulk_build/bulk_merge`: B+ tree ops with prefix-compressed leaves (path-based — single-file API, used by per-shard wrappers and the legacy reindex extract path)
+- `bt_acquire/bt_release` (btree.c): unified ucache-style open path. One `BtCacheEntry` table with per-entry pthread_rwlock_t, persistent MAP_SHARED, LRU eviction. `bt_alloc_page` propagates grow remaps back to the cache entry under wrlock so subsequent acquirers see the new mapping.
+- `BtRangeIter` (btree.c): streaming range iterator. `btree_range_iter_open/next/close` — pull one entry at a time. Holds rdlock for iter lifetime. ASC: `iter_seek_fwd` uses `leaf_iter_seek` to prime the prefix-decoded key_buf, `fwd_pending` flag yields the seeked entry once before advancing. DESC: pre-collects leaves[] list, walks right-to-left with per-leaf snapshot — `iter_init_desc_leaves` pre-loads the rightmost leaf so the first `iter_next_desc` doesn't skip it.
+- `btree_idx_*` wrappers (index.c): per-shard btree dispatch. Reads fan out across `splits/4` shards; writes route by hash16 to one shard. `btree_idx_walk_ordered` runs N=splits/4 streaming iterators and picks the next globally-ordered head via linear-scan-pick-best (cb cost dominates over O(N) selection at splits ≤ 4096). `partition_pairs_by_idx_shard` (index.c, query.c) bucket-sorts collected `BtEntry[]` for parallel per-(field, shard) bulk-build during add-index / cmd_bulk_insert.
+- `reindex_clean_legacy` (index.c): per-object sweep of pre-2026.05.1 single-file `<field>.idx` artefacts. Runs inside `cmd_reindex` before each `cmd_add_indexes(force=1)` rebuild.
 - `ucache`: unified shard mmap cache (FCACHE_MAX entries, per-entry rwlock, LRU eviction)
 - `typed_encode/decode/typed_get_field_str`: typed binary encode/decode with length-prefix varchar
 - `encode_field_len` (config.c): length-based encoder used by the CSV bulk-insert path to parse directly against an mmap'd page cache with (ptr, len) spans — no per-line memcpy. `encode_field()` is a thin `encode_field_len(f, val, strlen(val), out)` wrapper for null-terminated callers (JSON bulk-insert, typed_encode, cmd_update, etc.)
@@ -460,6 +467,7 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 - `cmd_put_file_tcp`/`cmd_get_file_tcp` (server.c): client-side helpers invoked by CLI; `query_collect` accumulates a full response buffer before parsing
 - `compute_addr` / `addr_from_hash`: xxh128 hash → shard_id/slot
 - `build_shard_filename(dir, shard_id)`: canonical `NNN.bin` formatter (3 hex, MAX_SPLITS=4096)
+- `build_idx_path(buf, db_root, object, field, idx_shard_id)` (storage.c): canonical `<obj>/indexes/<field>/<NNN>.idx` formatter. `index_splits_for(splits) = splits/4`, `idx_shard_for_hash(hash16, splits)`, `idx_shard_for_data_shard(s) = s/4` are the routing helpers (types.h)
 - `g_schema_cache` / `g_idx_cache` / `g_typed_cache`: in-memory caches for config files
 - `is_valid_dir()`: tenant directory whitelist enforcement
 

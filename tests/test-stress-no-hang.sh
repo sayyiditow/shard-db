@@ -51,9 +51,12 @@ sed -i "/^default:stress:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN start > /dev/null
 sleep 0.5
 
-# 64 splits to spread the lock contention across shards. Indexed `status`
-# so writes also exercise the index drop+insert path.
-$BIN query '{"mode":"create-object","dir":"default","object":"stress","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status"],"splits":64}' > /dev/null
+# 256 data splits → 64 idx-shards per indexed field (splits/4) so the
+# per-shard btree cache + write-routing + read-fan-out paths get
+# exercised concurrently. Two indexes — `status` (low-cardinality eq) and
+# `amount` (high-cardinality range) — drive both KEYSET and INTERSECT
+# planner branches under load.
+$BIN query '{"mode":"create-object","dir":"default","object":"stress","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":256}' > /dev/null
 
 WORK_DIR=$(mktemp -d /tmp/shard-stress.XXXXXX)
 STOP_FLAG="$WORK_DIR/stop"
@@ -70,18 +73,28 @@ worker() {
         local roll=$((RANDOM % 100))
         local key="w${id}_${op_count}"
         local rc=0
-        if [ $roll -lt 60 ]; then
-            # 60% inserts (the hot write path)
+        if [ $roll -lt 50 ]; then
+            # 50% inserts (the hot write path; routes one entry per index per
+            # record into a single per-shard btree under wrlock)
             local status; if [ $((op_count % 3)) -eq 0 ]; then status="paid"; else status="pending"; fi
             $BIN query "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"stress\",\"key\":\"$key\",\"value\":{\"status\":\"$status\",\"amount\":$op_count,\"note\":\"x\"}}" > /dev/null 2>&1 || rc=1
-        elif [ $roll -lt 80 ]; then
-            # 20% indexed counts
+        elif [ $roll -lt 65 ]; then
+            # 15% indexed counts (single-leaf btree fan-out across all shards)
             $BIN query '{"mode":"count","dir":"default","object":"stress","criteria":[{"field":"status","op":"eq","value":"paid"}]}' > /dev/null 2>&1 || rc=1
-        elif [ $roll -lt 95 ]; then
-            # 15% finds (small page)
+        elif [ $roll -lt 78 ]; then
+            # 13% finds (small page; eq + range mix to hit both planner paths)
             $BIN query '{"mode":"find","dir":"default","object":"stress","criteria":[{"field":"status","op":"eq","value":"pending"}],"limit":5}' > /dev/null 2>&1 || rc=1
+        elif [ $roll -lt 88 ]; then
+            # 10% AND-intersection across two indexes (drives PRIMARY_INTERSECT
+            # planner — KeySet probes per-shard btree concurrently with writers)
+            $BIN query '{"mode":"count","dir":"default","object":"stress","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"amount","op":"gte","value":"100"}]}' > /dev/null 2>&1 || rc=1
+        elif [ $roll -lt 95 ]; then
+            # 7% cursor pagination on indexed amount (drives k-way merge across
+            # all per-shard btrees under load)
+            $BIN query '{"mode":"find","dir":"default","object":"stress","criteria":[],"order_by":"amount","order":"asc","limit":10,"cursor":null}' > /dev/null 2>&1 || rc=1
         else
-            # 5% updates of recently-inserted records (drives index drop+insert)
+            # 5% updates of recently-inserted records (drives index drop+insert
+            # across multiple per-shard btrees in one operation)
             local target_id=$((id))
             local target_op=$((op_count - 1))
             [ $target_op -lt 0 ] && target_op=0

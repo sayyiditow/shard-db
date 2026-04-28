@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml)
 [![Docs](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sayyiditow/shard-db/badge)](https://scorecard.dev/viewer/?uri=github.com/sayyiditow/shard-db)
 
 A file-based sharded database written in C. Started as a key/value store; now a full small-scale DB with typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server. Single static binary, no external dependencies.
 
@@ -1204,7 +1205,7 @@ Composite indexes use `+` to join fields: `"city+country"` indexes the concatena
 {"mode":"remove-index","dir":"<dir>","object":"<obj>","fields":["email","city+country"]}
 ```
 
-Drops the index by exact name match (pass composite names the same way you registered them, e.g. `"city+country"`). Unlinks the `.idx` file, removes the line from `index.conf`, and invalidates caches. Returns `{"status":"not_indexed",...}` (not an error) when the field wasn't indexed — safe to call idempotently. Queries against that field fall back to full-shard scan afterwards.
+Drops the index by exact name match (pass composite names the same way you registered them, e.g. `"city+country"`). Removes every per-shard `.idx` file under `indexes/<field>/`, drops the (now-empty) directory, removes the line from `index.conf`, and invalidates caches. Returns `{"status":"not_indexed",...}` (not an error) when the field wasn't indexed — safe to call idempotently. Queries against that field fall back to full-shard scan afterwards.
 
 ### Schema Management
 
@@ -1630,11 +1631,15 @@ $DB_ROOT/
       data/
         NNN.bin                    # Shard files (e.g. 000.bin..0ff.bin for 256 splits; max 4096 shards)
       indexes/
-        index.conf                 # List of indexed fields
-        <field>.idx                # B+ tree index file
-        <field1>+<field2>.idx      # Composite index
+        index.conf                          # List of indexed fields
+        <field>/                            # Per-field directory (per-shard btree layout)
+          NNN.idx                           #   Sharded B+ tree files, splits/4 of them
+        <field1>+<field2>/                  # Composite index — '+' joined name
+          NNN.idx
       files/                       # Stored files (put-file)
 ```
+
+Each indexed field is split into `splits/4` btree files (e.g. `splits=64` → 16 idx shards under `indexes/<field>/000.idx`..`00f.idx`). Writes route by record hash to a single shard; reads fan out across all shards in parallel — for ordered queries (cursor pagination), a streaming k-way merge across the per-shard iterators reconstructs global order without materialising every match. The 1:N data-shard-to-idx-shard ratio caps per-query parallelism at a useful level across the whole 16..4096 splits range. **Upgrading from pre-2026.05.1**: one `./shard-db reindex` after upgrade rebuilds every index into the new layout and sweeps any leftover single-file `<field>.idx` artefacts.
 
 ### Shard File Format
 
