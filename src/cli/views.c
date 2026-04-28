@@ -324,6 +324,13 @@ typedef struct {
     char *cells[MAX_ROWS][MAX_COLS];  /* malloc'd */
     int   nrows;
     int   widths[MAX_COLS];
+    /* Per-row drill-down JSON. Populated only by Shape 6 when a value is a
+       JSON array/object — the cell text is replaced with "[N items, → drill]"
+       and Enter/→ on that row recurses into tui_show_table with the raw
+       JSON, giving operators a way to inspect long nested results
+       (shard_list, joined records, etc) that would otherwise be truncated.
+       NULL on rows whose values were scalars. malloc'd; freed by table_free. */
+    char *drilldown[MAX_ROWS];
 } Table;
 
 static int table_col_index(Table *t, const char *name, size_t len) {
@@ -430,9 +437,11 @@ static int row_collect_cb(const char *elem, size_t len, void *ctx) {
 }
 
 static void table_free(Table *t) {
-    for (int r = 0; r < t->nrows; r++)
+    for (int r = 0; r < t->nrows; r++) {
         for (int c = 0; c < t->ncols; c++)
             free(t->cells[r][c]);
+        free(t->drilldown[r]);
+    }
 }
 
 /* Callback: row entry is a single scalar (string/number/bool). Used by
@@ -598,12 +607,42 @@ int tui_show_table(const char *title, const char *json) {
                 t.cells[row][0][klen] = '\0';
                 if ((int)klen > t.widths[0]) t.widths[0] = klen > 32 ? 32 : (int)klen;
 
-                t.cells[row][1] = malloc(vlen + 1);
-                if (vlen > 0 && vs[0] == '"') {
-                    json_string_into(vs, vlen, t.cells[row][1], vlen + 1);
+                /* If the value is a nested array or object, store the raw
+                   JSON in drilldown[row] so Enter/→ can recurse to view
+                   it as a sub-table. The visible cell becomes a hint. */
+                int is_array  = (vlen > 0 && vs[0] == '[');
+                int is_object = (vlen > 0 && vs[0] == '{');
+                if (is_array || is_object) {
+                    t.drilldown[row] = malloc(vlen + 1);
+                    memcpy(t.drilldown[row], vs, vlen);
+                    t.drilldown[row][vlen] = '\0';
+                    /* Cheap item count for the placeholder — counts top-level
+                       commas at depth 0. Good enough for a UI hint. */
+                    int depth = 0, items = (vlen > 2) ? 1 : 0;
+                    for (size_t i = 1; i + 1 < vlen; i++) {
+                        char c = vs[i];
+                        if (c == '"') {
+                            i++;
+                            while (i + 1 < vlen && vs[i] != '"') {
+                                if (vs[i] == '\\' && i + 2 < vlen) i++;
+                                i++;
+                            }
+                        } else if (c == '[' || c == '{') depth++;
+                        else if (c == ']' || c == '}') depth--;
+                        else if (c == ',' && depth == 0) items++;
+                    }
+                    char hint[64];
+                    snprintf(hint, sizeof(hint), "[%d %s, %s drill]",
+                             items, is_array ? "items" : "fields", "→");
+                    t.cells[row][1] = strdup(hint);
                 } else {
-                    memcpy(t.cells[row][1], vs, vlen);
-                    t.cells[row][1][vlen] = '\0';
+                    t.cells[row][1] = malloc(vlen + 1);
+                    if (vlen > 0 && vs[0] == '"') {
+                        json_string_into(vs, vlen, t.cells[row][1], vlen + 1);
+                    } else {
+                        memcpy(t.cells[row][1], vs, vlen);
+                        t.cells[row][1][vlen] = '\0';
+                    }
                 }
                 int w = (int)strlen(t.cells[row][1]);
                 if (w > t.widths[1]) t.widths[1] = (w > 64 ? 64 : w);
@@ -677,10 +716,20 @@ int tui_show_table(const char *title, const char *json) {
             }
         }
 
+        /* Drill hint: only show when the current row has a nested value the
+           user can drill into. Keeps the status line uncluttered for the
+           common scalar-only case. */
+        int can_drill = (top < t.nrows && t.drilldown[top] != NULL);
         attron(COLOR_PAIR(3));
-        mvprintw(rows - 2, 4,
-                 "↑↓/jk row  ←→/hl scroll-x  e export-csv  q/ESC close   row %d/%d",
-                 top + 1, t.nrows);
+        if (can_drill) {
+            mvprintw(rows - 2, 4,
+                     "↑↓/jk row  ←→/hl scroll-x  ENTER drill  e export-csv  q/ESC close   row %d/%d",
+                     top + 1, t.nrows);
+        } else {
+            mvprintw(rows - 2, 4,
+                     "↑↓/jk row  ←→/hl scroll-x  e export-csv  q/ESC close   row %d/%d",
+                     top + 1, t.nrows);
+        }
         attroff(COLOR_PAIR(3));
         refresh();
 
@@ -694,6 +743,20 @@ int tui_show_table(const char *title, const char *json) {
             case 'g': case KEY_HOME:  top = 0; break;
             case 'G': case KEY_END:   top = t.nrows - 1; break;
             case KEY_LEFT: case 'h':  hscroll -= 8; if (hscroll < 0) hscroll = 0; break;
+            /* Enter on a drillable row recurses into a sub-table view of the
+               nested JSON. Right-arrow stays bound to horizontal scroll for
+               wide tables; explicit ENTER avoids stealing the scroll key. */
+            case '\n':
+            case KEY_ENTER:
+                if (can_drill) {
+                    char sub_title[160];
+                    snprintf(sub_title, sizeof(sub_title), "%s → %s",
+                             title ? title : "drill", t.cells[top][0]);
+                    /* Discard return code — sub-view's `e` shouldn't bubble
+                       up as an export of the parent. */
+                    (void)tui_show_table(sub_title, t.drilldown[top]);
+                }
+                break;
             case KEY_RIGHT: case 'l': hscroll += 8; break;
             case 'e':                 table_free(&t); return 1;
             case 'q': case 27:        table_free(&t); return 0;

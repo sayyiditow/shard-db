@@ -8667,9 +8667,12 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     }
 
     if (as_table) {
-        OUT("splits=%d shards=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
+        OUT("splits=%d shards_on_disk=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
             sch.splits, nrows, (unsigned long)total_records, (unsigned long)total_bytes,
             (unsigned long)rps, grows, avg_load);
+        if (nrows != sch.splits)
+            OUT("warn: shards_on_disk (%d) ≠ splits (%d) — partial vacuum/reshard or missing shard files?\n",
+                nrows, sch.splits);
         OUT("  %-8s %-10s %-10s %-8s %-14s\n", "shard", "slots", "records", "load", "bytes");
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
@@ -8679,7 +8682,12 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         }
         if (hint) OUT("hint: %s\n", hint);
     } else {
-        OUT("{\"splits\":%d,\"shards\":%d,\"total_records\":%lu,\"total_bytes\":%lu,\"shard_list\":[",
+        /* JSON: keep `splits` as the configured count from schema.conf and
+           rename the on-disk count to `shards_on_disk` so the two are
+           clearly distinct sources rather than identical-looking duplicates.
+           Drift between them signals a partial vacuum/reshard or missing
+           shard files — operators should investigate. */
+        OUT("{\"splits\":%d,\"shards_on_disk\":%d,\"total_records\":%lu,\"total_bytes\":%lu,\"shard_list\":[",
             sch.splits, nrows, (unsigned long)total_records, (unsigned long)total_bytes);
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
