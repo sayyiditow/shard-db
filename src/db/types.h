@@ -1,7 +1,9 @@
 #ifndef TYPES_H
 #define TYPES_H
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -624,12 +626,72 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
    string + its strlen; single-field indexes pass encoded bytes + their true
    length. vlen may be 0 (empty key sorts before all others). */
 void write_index_entry(const char *db_root, const char *object, const char *field,
+                       int splits,
                        const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
 void delete_index_entry(const char *db_root, const char *object, const char *field,
+                        int splits,
                         const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
-void index_parallel(const char *db_root, const char *object, const char *value, const uint8_t hash16[16], char fields[][256], int nfields);
+void index_parallel(const char *db_root, const char *object, int splits,
+                    const char *value, const uint8_t hash16[16],
+                    char fields[][256], int nfields);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
+
+/* ========== Per-shard btree index wrappers ==========
+   Each indexed field lives at $DB_ROOT/<obj>/indexes/<field>/<NNN>.idx,
+   sharded into index_splits_for(splits) = splits/4 files. Writes route by
+   hash16 to a single shard; reads fan out across all shards.
+
+   For point-search and range scans, results from different shards arrive
+   in arbitrary interleaving (per-shard order is preserved within a shard
+   but not globally). Use btree_idx_walk_ordered for cursor pagination
+   where global ordering matters. */
+#include "btree.h"  /* bt_result_cb, BT_HASH_SIZE */
+
+void btree_idx_insert(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      const uint8_t hash[BT_HASH_SIZE]);
+
+void btree_idx_delete(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      const uint8_t hash[BT_HASH_SIZE]);
+
+void btree_idx_search(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      bt_result_cb cb, void *ctx);
+
+void btree_idx_range(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *min_val, size_t min_len,
+                     const char *max_val, size_t max_len,
+                     bt_result_cb cb, void *ctx);
+
+void btree_idx_range_ex(const char *db_root, const char *object,
+                        const char *field, int splits,
+                        const char *min_val, size_t min_len, int min_exclusive,
+                        const char *max_val, size_t max_len, int max_exclusive,
+                        bt_result_cb cb, void *ctx);
+
+/* Globally-ordered range walk across all shards. desc=1 reverses direction.
+   Implementation: collect all matches into a buffer, qsort by (value, hash16)
+   tie-break, replay through `cb` in order. Used by cursor pagination —
+   k-way streaming merge is a perf-only follow-up. */
+void btree_idx_walk_ordered(const char *db_root, const char *object,
+                            const char *field, int splits,
+                            const char *min_val, size_t min_len, int min_exclusive,
+                            const char *max_val, size_t max_len, int max_exclusive,
+                            int desc, bt_result_cb cb, void *ctx);
+
+/* Drop every shard file for an index and the parent directory. */
+void btree_idx_unlink_all(const char *db_root, const char *object,
+                          const char *field, int splits);
+
+/* Returns 1 if any shard file exists with non-zero size. */
+int  btree_idx_exists(const char *db_root, const char *object,
+                      const char *field, int splits);
 
 /* Rebuild every index for matching objects. NULL filters match all. The
    no-filter form walks every (dir, object) in schema.conf; tenant form walks

@@ -1774,31 +1774,42 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
     char idx_dir[PATH_MAX];
     snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", db_root, object);
 
+    /* Each indexed field lives in its own sub-directory (per-shard layout):
+       indexes/<field>/<NNN>.idx. Rename the directory and invalidate every
+       shard's cache entry so the next acquirer reopens at the new path. */
+    Schema sch = load_schema(db_root, object);
+    int idx_n = index_splits_for(sch.splits);
+
     DIR *d = opendir(idx_dir);
     if (!d) return 0;
 
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        size_t nlen = strlen(e->d_name);
-        if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".idx") != 0) continue;
+        if (strcmp(e->d_name, "index.conf") == 0) continue;
 
-        /* Strip .idx, replace tokens, re-append .idx */
-        char base[512];
-        if (nlen - 4 >= sizeof(base)) continue;
-        memcpy(base, e->d_name, nlen - 4);
-        base[nlen - 4] = '\0';
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
 
         char newbase[512];
-        int chg = replace_tokens(base, old_name, new_name, newbase, sizeof(newbase));
+        int chg = replace_tokens(e->d_name, old_name, new_name, newbase, sizeof(newbase));
         if (chg != 1) continue;
 
-        char oldpath[PATH_MAX], newpath[PATH_MAX];
-        snprintf(oldpath, sizeof(oldpath), "%s/%s", idx_dir, e->d_name);
-        snprintf(newpath, sizeof(newpath), "%s/%s.idx", idx_dir, newbase);
-        if (rename(oldpath, newpath) != 0) {
+        /* Drop cached fd/mappings for every shard before the rename so the
+           next acquirer picks up the new path. */
+        for (int s = 0; s < idx_n; s++) {
+            char p[PATH_MAX];
+            build_idx_path(p, sizeof(p), db_root, object, e->d_name, s);
+            btree_cache_invalidate(p);
+        }
+
+        char newpath[PATH_MAX];
+        snprintf(newpath, sizeof(newpath), "%s/%s", idx_dir, newbase);
+        if (rename(path, newpath) != 0) {
             log_msg(1, "rename-field: failed to rename %s -> %s: %s",
-                    oldpath, newpath, strerror(errno));
+                    path, newpath, strerror(errno));
         }
     }
     closedir(d);
@@ -1927,21 +1938,23 @@ static int drop_indexes_for_fields(const char *db_root, const char *object,
     DIR *d = opendir(idx_dir);
     if (!d) return 0;
 
+    Schema sch = load_schema(db_root, object);
     int dropped = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        size_t nlen = strlen(e->d_name);
-        if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".idx") != 0) continue;
+        if (strcmp(e->d_name, "index.conf") == 0) continue;
 
-        /* Split basename on '+', drop if any token is in removed_names. */
-        char base[512];
-        if (nlen - 4 >= sizeof(base)) continue;
-        memcpy(base, e->d_name, nlen - 4);
-        base[nlen - 4] = '\0';
+        /* Per-shard layout: indexes/<field>/<NNN>.idx — each indexed field
+           lives in its own sub-directory. */
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
 
+        /* Split field name on '+', drop if any token is in removed_names. */
         int affected = 0;
-        const char *p = base;
+        const char *p = e->d_name;
         while (*p) {
             const char *sep = strchr(p, '+');
             size_t toklen = sep ? (size_t)(sep - p) : strlen(p);
@@ -1953,9 +1966,8 @@ static int drop_indexes_for_fields(const char *db_root, const char *object,
         }
         if (!affected) continue;
 
-        char idx_path[PATH_MAX];
-        snprintf(idx_path, sizeof(idx_path), "%s/%s", idx_dir, e->d_name);
-        if (unlink(idx_path) == 0) dropped++;
+        btree_idx_unlink_all(db_root, object, e->d_name, sch.splits);
+        dropped++;
     }
     closedir(d);
 

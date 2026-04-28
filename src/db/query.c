@@ -500,6 +500,57 @@ static void *idx_build_worker(void *arg) {
     return NULL;
 }
 
+/* Partition `pairs` (of total `count`) by idx_shard and append per-shard
+   IdxBuildArg slices to `out_args` (which must have room for at least
+   index_splits_for(splits) entries). Returns the number of non-empty
+   shard buckets appended. The pairs array is reordered in place; on
+   return pairs[offset .. offset+counts[s]] holds shard s's entries. The
+   caller still owns the BtEntry value strings (one allocation per pair,
+   freed exactly once after the build). */
+static int partition_pairs_by_idx_shard(BtEntry *pairs, size_t count,
+                                        const char *db_root, const char *object,
+                                        const char *field, int splits,
+                                        IdxBuildArg *out_args) {
+    int n = index_splits_for(splits);
+    /* First pass: tally per-shard sizes. */
+    size_t *counts = calloc((size_t)n, sizeof(size_t));
+    if (!counts) return 0;
+    for (size_t i = 0; i < count; i++) {
+        int s = idx_shard_for_hash(pairs[i].hash, splits);
+        counts[s]++;
+    }
+    /* Compute prefix-sum offsets. */
+    size_t *offsets = calloc((size_t)n, sizeof(size_t));
+    if (!offsets) { free(counts); return 0; }
+    size_t acc = 0;
+    for (int s = 0; s < n; s++) { offsets[s] = acc; acc += counts[s]; }
+    /* Second pass: scatter pairs into a temporary array. */
+    BtEntry *tmp = malloc(count * sizeof(BtEntry));
+    if (!tmp) { free(counts); free(offsets); return 0; }
+    size_t *cursor = calloc((size_t)n, sizeof(size_t));
+    if (!cursor) { free(counts); free(offsets); free(tmp); return 0; }
+    for (size_t i = 0; i < count; i++) {
+        int s = idx_shard_for_hash(pairs[i].hash, splits);
+        tmp[offsets[s] + cursor[s]++] = pairs[i];
+    }
+    memcpy(pairs, tmp, count * sizeof(BtEntry));
+    free(tmp);
+    free(cursor);
+
+    int out_count = 0;
+    for (int s = 0; s < n; s++) {
+        if (counts[s] == 0) continue;
+        build_idx_path(out_args[out_count].ipath, sizeof(out_args[out_count].ipath),
+                       db_root, object, field, s);
+        out_args[out_count].pairs = pairs + offsets[s];
+        out_args[out_count].pair_count = counts[s];
+        out_count++;
+    }
+    free(counts);
+    free(offsets);
+    return out_count;
+}
+
 /* ---- Fast bulk insert using mmap ---- */
 
 /* Bump/arena allocator for phase-1 record buffers. Replaces 2 mallocs per
@@ -788,6 +839,7 @@ static void *bulk_insert_shard_worker(void *arg) {
                btree_insert does). */
             if (old_idx_have[fi] && !unchanged) {
                 delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
+                                   sw->sch->splits,
                                    old_idx_bufs[fi], old_idx_lens[fi], r->hash);
             }
             if (old_idx_have[fi]) free(old_idx_bufs[fi]);
@@ -1181,28 +1233,29 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
     else free(json);
 
-    /* Bulk write indexes — parallel across index fields */
+    /* Bulk write indexes — partition each field's pairs by idx_shard, then
+       fan out one bulk-merge worker per (field, shard) pair. */
     if (nfields > 0) {
-        IdxBuildArg *ib_args = malloc(nfields * sizeof(IdxBuildArg));
+        int idx_n = index_splits_for(sc.splits);
+        IdxBuildArg *ib_args = malloc((size_t)nfields * idx_n * sizeof(IdxBuildArg));
         int ib_count = 0;
         for (int fi = 0; fi < nfields; fi++) {
-            if (idx_pair_counts[fi] == 0) { free(idx_pairs[fi]); continue; }
-            snprintf(ib_args[ib_count].ipath, sizeof(ib_args[ib_count].ipath),
-                     "%s/%s/indexes/%s.idx", db_root, object, idx_fields[fi]);
-            mkdirp(dirname_of(ib_args[ib_count].ipath));
-            ib_args[ib_count].pairs = idx_pairs[fi];
-            ib_args[ib_count].pair_count = idx_pair_counts[fi];
-            ib_count++;
+            if (idx_pair_counts[fi] == 0) continue;
+            ib_count += partition_pairs_by_idx_shard(idx_pairs[fi], idx_pair_counts[fi],
+                                                    db_root, object, idx_fields[fi],
+                                                    sc.splits, ib_args + ib_count);
         }
 
         parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
 
-        for (int i = 0; i < ib_count; i++) {
-            for (size_t ei = 0; ei < ib_args[i].pair_count; ei++)
-                free((char *)ib_args[i].pairs[ei].value);
-            free(ib_args[i].pairs);
-        }
         free(ib_args);
+        /* Free the value strings (one allocation per pair, partitioning only
+           reorders pointers — no copies — so each value is owned exactly once). */
+        for (int fi = 0; fi < nfields; fi++) {
+            for (size_t ei = 0; ei < idx_pair_counts[fi]; ei++)
+                free((char *)idx_pairs[fi][ei].value);
+            free(idx_pairs[fi]);
+        }
     }
     free(idx_pairs);
     free(idx_pair_counts);
@@ -1567,24 +1620,28 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     if (data_mmaped) munmap((void *)data, st.st_size);
     else free((void *)data);
 
-    /* Parallel index builds — uses file-scope idx_build_worker */
+    /* Parallel index builds — partition each field's pairs by idx_shard and
+       dispatch one bulk-merge worker per (field, shard) pair. */
     if (nidx > 0) {
-        IdxBuildArg *ib_args = malloc(nidx * sizeof(IdxBuildArg));
+        int idx_n = index_splits_for(sc.splits);
+        IdxBuildArg *ib_args = malloc((size_t)nidx * idx_n * sizeof(IdxBuildArg));
         int ib_count = 0;
         for (int fi = 0; fi < nidx; fi++) {
-            if (idx_pair_counts[fi] == 0) { free(idx_pairs[fi]); continue; }
-            snprintf(ib_args[ib_count].ipath, PATH_MAX, "%s/%s/indexes/%s.idx", db_root, object, idx_fields[fi]);
-            mkdirp(dirname_of(ib_args[ib_count].ipath));
-            ib_args[ib_count].pairs = idx_pairs[fi];
-            ib_args[ib_count].pair_count = idx_pair_counts[fi];
-            ib_count++;
+            if (idx_pair_counts[fi] == 0) continue;
+            ib_count += partition_pairs_by_idx_shard(idx_pairs[fi], idx_pair_counts[fi],
+                                                    db_root, object, idx_fields[fi],
+                                                    sc.splits, ib_args + ib_count);
         }
         parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
-        for (int i = 0; i < ib_count; i++) {
-            for (size_t ei = 0; ei < ib_args[i].pair_count; ei++) free((char *)ib_args[i].pairs[ei].value);
-            free(ib_args[i].pairs);
-        }
         free(ib_args);
+        /* Each value string is referenced by exactly one ib_args slice (the
+           partition reorders pointers in place), so iterate idx_pairs[fi]
+           directly and free each value once. */
+        for (int fi = 0; fi < nidx; fi++) {
+            for (size_t ei = 0; ei < idx_pair_counts[fi]; ei++)
+                free((char *)idx_pairs[fi][ei].value);
+            free(idx_pairs[fi]);
+        }
     }
     free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
 
@@ -1703,6 +1760,7 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *field;
+    int splits;
     uint8_t **vals;
     size_t   *vlens;
     uint8_t (*hashes)[16];
@@ -1713,7 +1771,7 @@ static void *bulk_del_idx_worker(void *arg) {
     BulkDelIdxWork *iw = (BulkDelIdxWork *)arg;
     for (int i = 0; i < iw->count; i++) {
         if (iw->vals[i] && iw->vlens[i] > 0)
-            delete_index_entry(iw->db_root, iw->object, iw->field,
+            delete_index_entry(iw->db_root, iw->object, iw->field, iw->splits,
                                iw->vals[i], iw->vlens[i], iw->hashes[i]);
     }
     return NULL;
@@ -1861,6 +1919,7 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
             idx_workers[fi].db_root = db_root;
             idx_workers[fi].object = object;
             idx_workers[fi].field = idx_fields[fi];
+            idx_workers[fi].splits = sch.splits;
             idx_workers[fi].vals = malloc(key_count * sizeof(uint8_t *));
             idx_workers[fi].vlens = malloc(key_count * sizeof(size_t));
             idx_workers[fi].hashes = malloc(key_count * sizeof(uint8_t[16]));
@@ -2111,9 +2170,11 @@ static void *bulk_upd_shard_worker(void *arg) {
                 if (changed) {
                     if (old_idx_have[fi])
                         delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                           w->sch->splits,
                                            old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
                     if (have_new)
                         write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                          w->sch->splits,
                                           new_buf, new_len, rec->hash);
                 }
                 free(old_idx_bufs[fi]);
@@ -2436,9 +2497,11 @@ static void *bulk_upd_delim_shard_worker(void *arg) {
             if (changed) {
                 if (old_idx_have[fi])
                     delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits,
                                        old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
                 if (have_new)
                     write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                      w->sch->splits,
                                       new_buf, new_len, rec->hash);
             }
             free(old_idx_bufs[fi]);
@@ -2737,9 +2800,11 @@ static void *bulk_upd_json_shard_worker(void *arg) {
             if (changed) {
                 if (old_idx_have[fi])
                     delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits,
                                        old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
                 if (have_new)
                     write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                      w->sch->splits,
                                       new_buf, new_len, rec->hash);
             }
             if (old_idx_have[fi]) free(old_idx_bufs[fi]);
@@ -3132,7 +3197,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         /* Index cleanup */
         for (int fi = 0; fi < nidx; fi++) {
             if (idx_have[fi])
-                delete_index_entry(db_root, object, idx_fields[fi],
+                delete_index_entry(db_root, object, idx_fields[fi], sch.splits,
                                    idx_bufs[fi], idx_lens[fi], hash);
             free(idx_bufs[fi]);
         }
@@ -4971,10 +5036,7 @@ static int resolve_joins(JoinSpec *joins, int n, const char *db_root,
             j->remote_is_key = 1;
         } else {
             j->remote_is_key = 0;
-            snprintf(j->remote_idx_path, sizeof(j->remote_idx_path),
-                     "%s/%s/indexes/%s.idx", db_root, j->object, j->remote_field);
-            struct stat ist;
-            if (stat(j->remote_idx_path, &ist) != 0 || ist.st_size == 0) {
+            if (!btree_idx_exists(db_root, j->object, j->remote_field, j->remote_sch.splits)) {
                 OUT("{\"error\":\"join remote field [%s.%s] must be 'key' or indexed\"}\n",
                     j->object, j->remote_field);
                 return -1;
@@ -5088,10 +5150,12 @@ static int lookup_remote(const JoinSpec *j, const char *db_root,
         size_t keylen;
         if (rem_tf) {
             encode_field_for_index(rem_tf, local_key, local_len, keybuf, &keylen);
-            btree_search(j->remote_idx_path, (const char *)keybuf, keylen, join_bt_first_cb, &hit);
+            btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
+                             (const char *)keybuf, keylen, join_bt_first_cb, &hit);
         } else {
             /* Composite remote field or untyped — raw passthrough. */
-            btree_search(j->remote_idx_path, local_key, local_len, join_bt_first_cb, &hit);
+            btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
+                             local_key, local_len, join_bt_first_cb, &hit);
         }
         if (!hit.found) return 0;
         memcpy(hash, hit.hash, 16);
@@ -5502,9 +5566,11 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
 /* Dispatch B+ tree query based on search operator. Used by find, count, aggregate.
    tf is the TypedField for pc->field (NULL for composite indexes or
    untyped objects — in that case values are passed as raw bytes, matching
-   the legacy ASCII storage of composite indexes). */
-static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
-                           const TypedField *tf,
+   the legacy ASCII storage of composite indexes). With the per-shard index
+   layout each call fans out across splits/4 shard files internally. */
+static void btree_dispatch(const char *db_root, const char *object,
+                           const char *field, int splits,
+                           SearchCriterion *pc, const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
     /* Stack buffers for encoded key bytes. Max fixed-type output is 8 B;
        varchar caps at f->size - 2 ≤ 65533 — BT_MAX_VAL_LEN = 512 in practice.
@@ -5515,39 +5581,45 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
     switch (pc->op) {
         case OP_EQUAL:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
+            btree_idx_search(db_root, object, field, splits,
+                             (const char *)buf1, len1, cb, ctx);
             break;
         case OP_GREATER_EQ:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_range(idx_path, (const char *)buf1, len1,
-                       "\xff\xff\xff\xff", 4, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            (const char *)buf1, len1,
+                            "\xff\xff\xff\xff", 4, cb, ctx);
             break;
         case OP_GREATER:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_range_ex(idx_path, (const char *)buf1, len1, 1,
-                          "\xff\xff\xff\xff", 4, 0, cb, ctx);
+            btree_idx_range_ex(db_root, object, field, splits,
+                               (const char *)buf1, len1, 1,
+                               "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         case OP_LESS_EQ:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_range(idx_path, "", 0,
-                       (const char *)buf1, len1, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            "", 0, (const char *)buf1, len1, cb, ctx);
             break;
         case OP_LESS:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_range_ex(idx_path, "", 0, 0,
-                          (const char *)buf1, len1, 1, cb, ctx);
+            btree_idx_range_ex(db_root, object, field, splits,
+                               "", 0, 0,
+                               (const char *)buf1, len1, 1, cb, ctx);
             break;
         case OP_BETWEEN:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             encode_criterion_value(tf, pc->value2, strlen(pc->value2), buf2, &len2);
-            btree_range(idx_path, (const char *)buf1, len1,
-                       (const char *)buf2, len2, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            (const char *)buf1, len1,
+                            (const char *)buf2, len2, cb, ctx);
             break;
         case OP_IN:
             for (int iv = 0; iv < pc->in_count; iv++) {
                 encode_criterion_value(tf, pc->in_values[iv],
                                        strlen(pc->in_values[iv]), buf1, &len1);
-                btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
+                btree_idx_search(db_root, object, field, splits,
+                                 (const char *)buf1, len1, cb, ctx);
             }
             break;
         case OP_STARTS_WITH: {
@@ -5564,8 +5636,9 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
             }
             memcpy(buf2, buf1, plen);
             memset(buf2 + plen, 0xff, 4);
-            btree_range(idx_path, (const char *)buf1, plen,
-                        (const char *)buf2, plen + 4, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            (const char *)buf1, plen,
+                            (const char *)buf2, plen + 4, cb, ctx);
             break;
         }
         case OP_LIKE: {
@@ -5588,7 +5661,8 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
             if (!lead && !trail && raw_prefix) {
                 /* Exact byte match — point lookup. */
                 encode_criterion_value(tf, pat, pl, buf1, &len1);
-                btree_search(idx_path, (const char *)buf1, len1, cb, ctx);
+                btree_idx_search(db_root, object, field, splits,
+                                 (const char *)buf1, len1, cb, ctx);
                 break;
             }
             if (!lead && trail && raw_prefix) {
@@ -5597,13 +5671,15 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
                 memcpy(buf1, pat, needle_len);
                 memcpy(buf2, buf1, needle_len);
                 memset(buf2 + needle_len, 0xff, 4);
-                btree_range(idx_path, (const char *)buf1, needle_len,
-                            (const char *)buf2, needle_len + 4, cb, ctx);
+                btree_idx_range(db_root, object, field, splits,
+                                (const char *)buf1, needle_len,
+                                (const char *)buf2, needle_len + 4, cb, ctx);
                 break;
             }
             /* Substring / suffix / non-varchar → full leaf scan; per-entry
                filter via check_primary in the callback handles correctness. */
-            btree_range(idx_path, "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
             break;
         }
         case OP_NOT_EQUAL:
@@ -5616,19 +5692,23 @@ static void btree_dispatch(const char *idx_path, SearchCriterion *pc,
                 int is_true = (pc->value[0] == 't' || pc->value[0] == 'T' ||
                                pc->value[0] == '1');
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
-                btree_search(idx_path, (const char *)inv, 1, cb, ctx);
+                btree_idx_search(db_root, object, field, splits,
+                                 (const char *)inv, 1, cb, ctx);
                 break;
             }
             /* General case: two exclusive ranges covering everything except X. */
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            btree_range_ex(idx_path, "", 0, 0,
-                          (const char *)buf1, len1, 1, cb, ctx);
-            btree_range_ex(idx_path, (const char *)buf1, len1, 1,
-                          "\xff\xff\xff\xff", 4, 0, cb, ctx);
+            btree_idx_range_ex(db_root, object, field, splits,
+                               "", 0, 0,
+                               (const char *)buf1, len1, 1, cb, ctx);
+            btree_idx_range_ex(db_root, object, field, splits,
+                               (const char *)buf1, len1, 1,
+                               "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         default:
             /* Full index scan: contains, like, ends_with, not_like, not_contains, not_in, exists */
-            btree_range(idx_path, "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            btree_idx_range(db_root, object, field, splits,
+                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
             break;
     }
 }
@@ -6038,7 +6118,9 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     cc.check_primary = check_primary;
     cc.deadline = dl;
 
-    btree_dispatch(primary_idx_path, primary_crit,
+    (void)primary_idx_path; /* path now derived per-shard inside btree_idx_*; arg kept for API stability */
+    btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+                   primary_crit,
                    resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
                    collect_hash_cb, &cc);
 
@@ -6759,15 +6841,24 @@ static int intersect_probe_cb(const char *val, size_t vlen,
     return 0;
 }
 
-/* Estimate KeySet capacity from index file size. anchor count ≈ size / page,
-   ~16 leaf entries per anchor block. Generous oversize is fine — KeySet is
-   open-addressed and tolerates load factor up to 0.5 by construction. */
-static size_t leaf_capacity_hint(const char *idx_path) {
-    struct stat st;
-    if (stat(idx_path, &st) != 0 || st.st_size == 0) return 256;
-    size_t hint = (size_t)(st.st_size / 4096) * 16;
+/* Estimate KeySet capacity from index file sizes (summed across all shards).
+   anchor count ≈ size / page, ~16 leaf entries per anchor block. Generous
+   oversize is fine — KeySet is open-addressed and tolerates load factor
+   up to 0.5 by construction. */
+static size_t leaf_capacity_hint(const char *db_root, const char *object,
+                                 const char *field, int splits) {
+    int n = index_splits_for(splits);
+    size_t total = 0;
+    for (int s = 0; s < n; s++) {
+        char p[PATH_MAX];
+        build_idx_path(p, sizeof(p), db_root, object, field, s);
+        struct stat st;
+        if (stat(p, &st) == 0) total += (size_t)st.st_size;
+    }
+    if (total == 0) return 256;
+    size_t hint = (total / 4096) * 16;
     if (hint < 256) hint = 256;
-    if (hint > 10000000) hint = 10000000; /* cap at 10M to avoid runaway alloc */
+    if (hint > 10000000) hint = 10000000;
     return hint;
 }
 
@@ -6789,13 +6880,15 @@ static int intersect_collect_cb(const char *val, size_t vlen,
 
 /* Walk the first leaf's btree into a fresh KeySet. */
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
-                                      SearchCriterion *leaf, const char *idx_path,
+                                      int splits,
+                                      SearchCriterion *leaf,
                                       QueryDeadline *dl) {
-    KeySet *ks = keyset_new(leaf_capacity_hint(idx_path));
+    KeySet *ks = keyset_new(leaf_capacity_hint(db_root, object, leaf->field, splits));
     if (!ks) return NULL;
     TypedSchema *ts = load_typed_schema(db_root, object);
     IntersectCollectCtx c = { ks, dl, 0 };
-    btree_dispatch((char *)idx_path, leaf, resolve_idx_field(ts, leaf->field),
+    btree_dispatch(db_root, object, leaf->field, splits,
+                   leaf, resolve_idx_field(ts, leaf->field),
                    intersect_collect_cb, &c);
     if (dl->timed_out) { keyset_free(ks); return NULL; }
     return ks;
@@ -6822,13 +6915,13 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
 
    Caller frees the returned KeySet. */
 static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
-                                        SearchCriterion **leaves,
-                                        char paths[][PATH_MAX], int n,
+                                        int splits,
+                                        SearchCriterion **leaves, int n,
                                         QueryDeadline *dl,
                                         int *out_small_primary) {
     *out_small_primary = 0;
     if (n < 2) return NULL;
-    KeySet *running = build_keyset_from_leaf(db_root, object, leaves[0], paths[0], dl);
+    KeySet *running = build_keyset_from_leaf(db_root, object, splits, leaves[0], dl);
     if (!running || dl->timed_out) { keyset_free(running); return NULL; }
 
     /* Small-primary heuristic: skip the second-leaf btree walk; let the
@@ -6848,8 +6941,8 @@ static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
         if (!next) { keyset_free(running); return NULL; }
 
         IntersectProbeCtx p = { running, next, dl, 0 };
-        btree_dispatch(paths[i], leaves[i],
-                       resolve_idx_field(ts, leaves[i]->field),
+        btree_dispatch(db_root, object, leaves[i]->field, splits,
+                       leaves[i], resolve_idx_field(ts, leaves[i]->field),
                        intersect_probe_cb, &p);
 
         keyset_free(running);
@@ -6899,9 +6992,8 @@ static size_t keyset_count_from_intersect(const char *db_root, const char *objec
                                           CriteriaNode *tree, FieldSchema *fs,
                                           QueryDeadline *dl) {
     int small_primary = 0;
-    KeySet *result = intersect_indexed_leaves(db_root, object,
+    KeySet *result = intersect_indexed_leaves(db_root, object, sch->splits,
                                               plan->intersect_leaves,
-                                              plan->intersect_paths,
                                               plan->intersect_count, dl,
                                               &small_primary);
     if (!result) return 0;
@@ -6930,8 +7022,8 @@ static size_t keyset_count_from_intersect(const char *db_root, const char *objec
 typedef struct {
     const char *db_root;
     const char *object;
+    int splits;
     const SearchCriterion *leaf;
-    const char *idx_path;
     KeySet *ks;
     QueryDeadline *deadline;
     int dl_counter;
@@ -6949,7 +7041,8 @@ static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, vo
 static void *or_child_worker(void *arg) {
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)arg;
     TypedSchema *ts = load_typed_schema(w->db_root, w->object);
-    btree_dispatch(w->idx_path, (SearchCriterion *)w->leaf,
+    btree_dispatch(w->db_root, w->object, w->leaf->field, w->splits,
+                   (SearchCriterion *)w->leaf,
                    resolve_idx_field(ts, w->leaf->field),
                    or_collect_cb, w);
     return NULL;
@@ -6960,22 +7053,25 @@ static void *or_child_worker(void *arg) {
    Caller owns the returned KeySet and must keyset_free() it.
    If the OR's estimated capacity would exceed the per-query buffer cap, returns
    NULL and sets *out_budget_exceeded = 1 when the pointer is non-NULL. */
-static KeySet *build_or_keyset(const char *db_root, const char *object,
+static KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
                                const CriteriaNode *or_node, QueryDeadline *dl,
                                int *out_budget_exceeded) {
     int n = or_node->n_children;
     if (n <= 0) return NULL;
 
-    /* Estimate total candidate size from index file sizes (very rough: 1 entry
-       per 64 bytes of leaf storage). Floor at 1024, cap at 1M to keep memory
-       bounded for a single query. */
+    /* Estimate total candidate size by summing every shard file's size for
+       each child's index field (very rough: 1 entry per 64 bytes of leaf
+       storage). Floor at 1024, cap at 1M to keep memory bounded. */
+    int idx_n = index_splits_for(splits);
     size_t est_total = 0;
     for (int i = 0; i < n; i++) {
         CriteriaNode *c = or_node->children[i];
-        char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s/%s/indexes/%s.idx", db_root, object, c->leaf.field);
-        struct stat st;
-        if (stat(p, &st) == 0) est_total += (size_t)st.st_size / 64;
+        for (int s = 0; s < idx_n; s++) {
+            char p[PATH_MAX];
+            build_idx_path(p, sizeof(p), db_root, object, c->leaf.field, s);
+            struct stat st;
+            if (stat(p, &st) == 0) est_total += (size_t)st.st_size / 64;
+        }
     }
     if (est_total < 1024) est_total = 1024;
     if (est_total > 1000000) est_total = 1000000;
@@ -6993,15 +7089,12 @@ static KeySet *build_or_keyset(const char *db_root, const char *object,
     if (!ks) return NULL;
 
     OrChildWorkerCtx *ctxs = calloc(n, sizeof(OrChildWorkerCtx));
-    char (*idx_paths)[PATH_MAX] = calloc(n, sizeof(*idx_paths));
     for (int i = 0; i < n; i++) {
         CriteriaNode *c = or_node->children[i];
-        snprintf(idx_paths[i], PATH_MAX, "%s/%s/indexes/%s.idx",
-                 db_root, object, c->leaf.field);
         ctxs[i].db_root = db_root;
         ctxs[i].object = object;
+        ctxs[i].splits = splits;
         ctxs[i].leaf = &c->leaf;
-        ctxs[i].idx_path = idx_paths[i];
         ctxs[i].ks = ks;
         ctxs[i].deadline = dl;
     }
@@ -7009,7 +7102,6 @@ static KeySet *build_or_keyset(const char *db_root, const char *object,
     parallel_for(or_child_worker, ctxs, n, sizeof(OrChildWorkerCtx));
 
     free(ctxs);
-    free(idx_paths);
     return ks;
 }
 
@@ -7255,7 +7347,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                FieldSchema *fs, int rows_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
                                QueryDeadline *dl, int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
@@ -7284,9 +7376,8 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       FieldSchema *fs, int rows_fmt, char csv_delim,
                                       JoinSpec *joins, int njoins, QueryDeadline *dl) {
     int small_primary = 0;
-    KeySet *ks = intersect_indexed_leaves(db_root, object,
+    KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
                                           plan->intersect_leaves,
-                                          plan->intersect_paths,
                                           plan->intersect_count, dl,
                                           &small_primary);
     if (!ks) return 0;
@@ -7351,7 +7442,7 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
                                const Schema *sch, void *agg_ctx,
                                CriteriaNode *or_node, QueryDeadline *dl,
                                int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
     if (!ks) return;
     if (dl->timed_out) { keyset_free(ks); return; }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -7370,9 +7461,8 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                      CriteriaNode **agg_ctx_tree_field,
                                      QueryDeadline *dl) {
     int small_primary = 0;
-    KeySet *ks = intersect_indexed_leaves(db_root, object,
+    KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
                                           plan->intersect_leaves,
-                                          plan->intersect_paths,
                                           plan->intersect_count, dl,
                                           &small_primary);
     if (!ks) return 0;
@@ -7395,7 +7485,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
                                    const Schema *sch, CriteriaNode *tree,
                                    CriteriaNode *or_node, FieldSchema *fs,
                                    QueryDeadline *dl, int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, or_node, dl, out_budget_exceeded);
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
@@ -7495,7 +7585,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             pos.op = op_invert(op);
             int pos_cp = op_needs_check_primary(pos.op);
             IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
-            btree_dispatch(plan.primary_idx_path, &pos, pc_tf, idx_count_cb, &ic);
+            btree_dispatch(db_root, object, pc->field, sch.splits,
+                           &pos, pc_tf, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else {
                 int total = get_live_count(db_root, object);
@@ -7504,7 +7595,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             }
         } else if (is_single_leaf) {
             IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
-            btree_dispatch(plan.primary_idx_path, pc, pc_tf, idx_count_cb, &ic);
+            btree_dispatch(db_root, object, pc->field, sch.splits,
+                           pc, pc_tf, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("{\"count\":%zu}\n", ic.count);
         } else {
@@ -7516,7 +7608,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             cc.primary_crit = pc;
             cc.check_primary = check_primary;
             cc.deadline = &dl;
-            btree_dispatch(plan.primary_idx_path, pc, pc_tf, collect_hash_cb, &cc);
+            btree_dispatch(db_root, object, pc->field, sch.splits,
+                           pc, pc_tf, collect_hash_cb, &cc);
 
             if (cc.budget_exceeded) {
                 OUT(QUERY_BUFFER_ERR);
@@ -8001,11 +8094,7 @@ int cmd_find(const char *db_root, const char *object,
         }
 
         /* order_by must be indexed (hard requirement for cursor). */
-        char idx_path[PATH_MAX];
-        snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx",
-                 db_root, object, order_by);
-        struct stat idx_st;
-        if (stat(idx_path, &idx_st) != 0 || idx_st.st_size == 0) {
+        if (!btree_idx_exists(db_root, object, order_by, sch.splits)) {
             OUT("{\"error\":\"cursor requires order_by field to be indexed\",\"field\":\"%s\"}\n",
                 order_by);
             free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
@@ -8081,20 +8170,20 @@ int cmd_find(const char *db_root, const char *object,
             const char *max_val_bytes = has_cur_bytes
                 ? (const char *)cur_value_buf : "\xff\xff\xff\xff";
             size_t max_val_len = has_cur_bytes ? cur_value_len : 4;
-            btree_range_desc_ex(idx_path,
-                                "", 0, 0,
-                                max_val_bytes, max_val_len, 0,
-                                cursor_find_cb, &cc);
+            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+                                   "", 0, 0,
+                                   max_val_bytes, max_val_len, 0,
+                                   1, cursor_find_cb, &cc);
         } else {
             /* ASC: walk forward. Lower bound = cursor value (inclusive),
                upper bound = "\xff\xff\xff\xff". Ties handled in callback. */
             const char *min_val_bytes = has_cur_bytes
                 ? (const char *)cur_value_buf : "";
             size_t min_val_len = has_cur_bytes ? cur_value_len : 0;
-            btree_range_ex(idx_path,
-                           min_val_bytes, min_val_len, 0,
-                           "\xff\xff\xff\xff", 4, 0,
-                           cursor_find_cb, &cc);
+            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+                                   min_val_bytes, min_val_len, 0,
+                                   "\xff\xff\xff\xff", 4, 0,
+                                   0, cursor_find_cb, &cc);
         }
         OUT("]");
 
@@ -10107,7 +10196,8 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         cc.primary_crit = pc;
         cc.check_primary = check_primary;
         cc.deadline = ctx->deadline;
-        btree_dispatch(plan.primary_idx_path, pc,
+        btree_dispatch(db_root, object, pc->field, sch->splits,
+                       pc,
                        resolve_idx_field(ctx->fs->ts, pc->field),
                        collect_hash_cb, &cc);
         if (cc.budget_exceeded) ctx->budget_exceeded = 1;

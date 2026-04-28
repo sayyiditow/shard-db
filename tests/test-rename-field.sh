@@ -44,16 +44,16 @@ $BIN insert default leads k1 '{"fullName":"Alice","email":"a@x.com","age":30}' >
 $BIN insert default leads k2 '{"fullName":"Bob","email":"b@x.com","age":25}' > /dev/null
 
 OBJ="$DB_ROOT/default/leads"
-assert_present "email index exists"          "$OBJ/indexes/email.idx"
-assert_present "age index exists"            "$OBJ/indexes/age.idx"
-assert_present "composite index exists"      "$OBJ/indexes/fullName+age.idx"
+assert_present "email index exists"          "$OBJ/indexes/email"
+assert_present "age index exists"            "$OBJ/indexes/age"
+assert_present "composite index exists"      "$OBJ/indexes/fullName+age"
 
 echo ""
 echo "=== HAPPY PATH: rename 'email' -> 'contact' ==="
 GOT=$($BIN query '{"mode":"rename-field","dir":"default","object":"leads","old":"email","new":"contact"}')
 assert_contains "rename-field status" '"status":"renamed"' "$GOT"
-assert_present  "new index file"            "$OBJ/indexes/contact.idx"
-assert_absent   "old index file gone"       "$OBJ/indexes/email.idx"
+assert_present  "new index file"            "$OBJ/indexes/contact"
+assert_absent   "old index file gone"       "$OBJ/indexes/email"
 assert_contains "fields.conf has new name"  "contact:varchar:40" "$(cat $OBJ/fields.conf)"
 assert_not_contains "fields.conf old name gone" "^email:"       "$(cat $OBJ/fields.conf)"
 assert_contains "index.conf has new name"   "contact"           "$(cat $OBJ/indexes/index.conf)"
@@ -76,8 +76,8 @@ echo ""
 echo "=== COMPOSITE INDEX: rename 'fullName' -> 'fn' ==="
 GOT=$($BIN query '{"mode":"rename-field","dir":"default","object":"leads","old":"fullName","new":"fn"}')
 assert_contains "composite rename status" '"status":"renamed"' "$GOT"
-assert_present  "composite index renamed"  "$OBJ/indexes/fn+age.idx"
-assert_absent   "old composite index gone" "$OBJ/indexes/fullName+age.idx"
+assert_present  "composite index renamed"  "$OBJ/indexes/fn+age"
+assert_absent   "old composite index gone" "$OBJ/indexes/fullName+age"
 assert_contains "fields.conf has 'fn'"     "fn:varchar:32"     "$(cat $OBJ/fields.conf)"
 
 GOT=$($BIN get default leads k1)

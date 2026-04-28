@@ -975,13 +975,13 @@ int cmd_insert(const char *db_root, const char *object,
                 if (new_len != old_len || memcmp(new_key, old_key, new_len) != 0) changed = 1;
             }
             if (changed) {
-                if (have_old) delete_index_entry(db_root, object, fields[i], old_key, old_len, hash);
-                if (have_new) write_index_entry(db_root, object, fields[i], new_key, new_len, hash);
+                if (have_old) delete_index_entry(db_root, object, fields[i], sc.splits, old_key, old_len, hash);
+                if (have_new) write_index_entry(db_root, object, fields[i], sc.splits, new_key, new_len, hash);
             }
             free(new_key); free(old_key);
         }
     } else {
-        index_parallel(db_root, object, value, hash, fields, nfields);
+        index_parallel(db_root, object, sc.splits, value, hash, fields, nfields);
     }
     free(old_value);
 
@@ -1133,10 +1133,10 @@ int cmd_update(const char *db_root, const char *object,
                 }
                 if (changed) {
                     if (old_idx_have[i])
-                        delete_index_entry(db_root, object, idx_fields[i],
+                        delete_index_entry(db_root, object, idx_fields[i], sc.splits,
                                            old_idx_bufs[i], old_idx_lens[i], hash);
                     if (have_new)
-                        write_index_entry(db_root, object, idx_fields[i],
+                        write_index_entry(db_root, object, idx_fields[i], sc.splits,
                                           new_buf, new_len, hash);
                 }
                 free(old_idx_bufs[i]);
@@ -1156,13 +1156,15 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *field;
+    int splits;
     const uint8_t *val;
     size_t vlen;
     const uint8_t *hash;
 } DelIdxArg;
 static void *del_idx_fn(void *arg) {
     DelIdxArg *a = (DelIdxArg *)arg;
-    delete_index_entry(a->db_root, a->object, a->field, a->val, a->vlen, a->hash);
+    delete_index_entry(a->db_root, a->object, a->field, a->splits,
+                       a->val, a->vlen, a->hash);
     return NULL;
 }
 
@@ -1254,7 +1256,7 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
             int dic = 0;
             for (int i = 0; i < nidx; i++) {
                 if (idx_have[i]) {
-                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i],
+                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i], sc.splits,
                                               idx_bufs[i], idx_lens[i], hash };
                 }
             }

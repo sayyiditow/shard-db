@@ -43,9 +43,9 @@ $BIN insert default leads k1 '{"fullName":"Alice","email":"a@x.com","age":30,"sc
 $BIN insert default leads k2 '{"fullName":"Bob","email":"b@x.com","age":25,"score":90}' > /dev/null
 
 OBJ="$DB_ROOT/default/leads"
-assert_present "email.idx exists"      "$OBJ/indexes/email.idx"
-assert_present "age.idx exists"        "$OBJ/indexes/age.idx"
-assert_present "fullName+age.idx exists" "$OBJ/indexes/fullName+age.idx"
+assert_present "email/ exists"      "$OBJ/indexes/email"
+assert_present "age/ exists"        "$OBJ/indexes/age"
+assert_present "fullName+age/ exists" "$OBJ/indexes/fullName+age"
 
 echo ""
 echo "=== REMOVE single field: 'email' ==="
@@ -55,9 +55,9 @@ assert_contains "remove fields count"  '"fields":1'          "$GOT"
 assert_contains "remove indexes count" '"indexes_dropped":1' "$GOT"
 
 assert_contains "fields.conf has email:removed" "email:varchar:40:removed" "$(cat $OBJ/fields.conf)"
-assert_absent   "email.idx dropped"    "$OBJ/indexes/email.idx"
-assert_present  "age.idx still exists" "$OBJ/indexes/age.idx"
-assert_present  "fullName+age.idx still exists" "$OBJ/indexes/fullName+age.idx"
+assert_absent   "email/ dropped"    "$OBJ/indexes/email"
+assert_present  "age/ still exists" "$OBJ/indexes/age"
+assert_present  "fullName+age/ still exists" "$OBJ/indexes/fullName+age"
 assert_not_contains "index.conf no email" "^email$" "$(cat $OBJ/indexes/index.conf)"
 
 echo ""
@@ -93,9 +93,9 @@ echo "=== REMOVE multiple fields at once ==="
 GOT=$($BIN query '{"mode":"remove-field","dir":"default","object":"leads","fields":["age","score"]}')
 assert_contains "multi-remove status"  '"status":"removed"' "$GOT"
 assert_contains "multi-remove count 2" '"fields":2'         "$GOT"
-# age.idx + fullName+age.idx should both be dropped
-assert_absent   "age.idx dropped"      "$OBJ/indexes/age.idx"
-assert_absent   "fullName+age.idx dropped (composite with removed)" "$OBJ/indexes/fullName+age.idx"
+# age/ + fullName+age/ should both be dropped
+assert_absent   "age/ dropped"      "$OBJ/indexes/age"
+assert_absent   "fullName+age/ dropped (composite with removed)" "$OBJ/indexes/fullName+age"
 
 GOT=$($BIN get default leads k1)
 assert_not_contains "GET no 'age'"    '"age"'   "$GOT"

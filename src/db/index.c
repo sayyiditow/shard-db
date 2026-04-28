@@ -1,13 +1,7 @@
 #include "types.h"
 
-/* File-scope worker for parallel index builds in cmd_add_indexes */
-typedef struct { char ipath[PATH_MAX]; BtEntry *pairs; size_t pair_count; } IdxBuildArgIdx;
-static void *idx_build_worker_idx(void *arg) {
-    IdxBuildArgIdx *ib = (IdxBuildArgIdx *)arg;
-    qsort(ib->pairs, ib->pair_count, sizeof(BtEntry), cmp_btentry_fn);
-    btree_bulk_build(ib->ipath, ib->pairs, ib->pair_count);
-    return NULL;
-}
+/* Per-shard build worker shared by cmd_add_index and cmd_add_indexes; defined
+   below alongside the partition_by_shard helper. */
 
 /* ========== Binary Sorted Index (B-tree style) ========== */
 
@@ -36,25 +30,204 @@ static void *idx_build_worker_idx(void *arg) {
  */
 
 
+/* ========== Per-shard btree index wrappers ==========
+   See types.h for the contract. Layout: <db_root>/<obj>/indexes/<field>/<NNN>.idx
+   with index_splits_for(splits) = splits/4 shards. Writes route by hash16
+   to a single shard (idx_shard_for_hash); reads fan out across all shards. */
+
+void btree_idx_insert(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      const uint8_t hash[BT_HASH_SIZE]) {
+    int idx_shard = idx_shard_for_hash(hash, splits);
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
+    btree_insert(idx_path, value, vlen, hash);
+}
+
+void btree_idx_delete(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      const uint8_t hash[BT_HASH_SIZE]) {
+    int idx_shard = idx_shard_for_hash(hash, splits);
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
+    btree_delete(idx_path, value, vlen, hash);
+}
+
+void btree_idx_search(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const char *value, size_t vlen,
+                      bt_result_cb cb, void *ctx) {
+    int n = index_splits_for(splits);
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        btree_search(idx_path, value, vlen, cb, ctx);
+    }
+}
+
+void btree_idx_range(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *min_val, size_t min_len,
+                     const char *max_val, size_t max_len,
+                     bt_result_cb cb, void *ctx) {
+    int n = index_splits_for(splits);
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        btree_range(idx_path, min_val, min_len, max_val, max_len, cb, ctx);
+    }
+}
+
+void btree_idx_range_ex(const char *db_root, const char *object,
+                        const char *field, int splits,
+                        const char *min_val, size_t min_len, int min_exclusive,
+                        const char *max_val, size_t max_len, int max_exclusive,
+                        bt_result_cb cb, void *ctx) {
+    int n = index_splits_for(splits);
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        btree_range_ex(idx_path,
+                       min_val, min_len, min_exclusive,
+                       max_val, max_len, max_exclusive,
+                       cb, ctx);
+    }
+}
+
+/* ----- Globally-ordered walk (for cursor pagination) ----- */
+
+typedef struct {
+    uint8_t *value;
+    size_t   vlen;
+    uint8_t  hash[BT_HASH_SIZE];
+} OrderedEntry;
+
+typedef struct {
+    OrderedEntry *entries;
+    size_t        count;
+    size_t        cap;
+    int           oom;
+} OrderedCollect;
+
+static int ordered_collect_cb(const char *value, size_t vlen,
+                              const uint8_t *hash16, void *ctx) {
+    OrderedCollect *oc = (OrderedCollect *)ctx;
+    if (oc->oom) return -1;
+    if (oc->count >= oc->cap) {
+        size_t ncap = oc->cap ? oc->cap * 2 : 4096;
+        OrderedEntry *ne = realloc(oc->entries, ncap * sizeof(OrderedEntry));
+        if (!ne) { oc->oom = 1; return -1; }
+        oc->entries = ne;
+        oc->cap = ncap;
+    }
+    OrderedEntry *e = &oc->entries[oc->count++];
+    e->value = malloc(vlen);
+    if (!e->value) { oc->oom = 1; oc->count--; return -1; }
+    memcpy(e->value, value, vlen);
+    e->vlen = vlen;
+    memcpy(e->hash, hash16, BT_HASH_SIZE);
+    return 0;
+}
+
+static int ordered_cmp_asc(const void *a, const void *b) {
+    const OrderedEntry *ea = (const OrderedEntry *)a;
+    const OrderedEntry *eb = (const OrderedEntry *)b;
+    size_t m = ea->vlen < eb->vlen ? ea->vlen : eb->vlen;
+    int r = memcmp(ea->value, eb->value, m);
+    if (r != 0) return r;
+    if (ea->vlen != eb->vlen) return ea->vlen < eb->vlen ? -1 : 1;
+    /* Tie-break on hash16 for stable ordering across pagination. */
+    return memcmp(ea->hash, eb->hash, BT_HASH_SIZE);
+}
+
+static int ordered_cmp_desc(const void *a, const void *b) {
+    return -ordered_cmp_asc(a, b);
+}
+
+void btree_idx_walk_ordered(const char *db_root, const char *object,
+                            const char *field, int splits,
+                            const char *min_val, size_t min_len, int min_exclusive,
+                            const char *max_val, size_t max_len, int max_exclusive,
+                            int desc, bt_result_cb cb, void *ctx) {
+    int n = index_splits_for(splits);
+    OrderedCollect oc = {0};
+
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        if (desc) {
+            btree_range_desc_ex(idx_path,
+                                min_val, min_len, min_exclusive,
+                                max_val, max_len, max_exclusive,
+                                ordered_collect_cb, &oc);
+        } else {
+            btree_range_ex(idx_path,
+                           min_val, min_len, min_exclusive,
+                           max_val, max_len, max_exclusive,
+                           ordered_collect_cb, &oc);
+        }
+        if (oc.oom) break;
+    }
+
+    if (!oc.oom && oc.count > 0) {
+        qsort(oc.entries, oc.count, sizeof(OrderedEntry),
+              desc ? ordered_cmp_desc : ordered_cmp_asc);
+        for (size_t i = 0; i < oc.count; i++) {
+            if (cb((const char *)oc.entries[i].value, oc.entries[i].vlen,
+                   oc.entries[i].hash, ctx) < 0) break;
+        }
+    }
+
+    for (size_t i = 0; i < oc.count; i++) free(oc.entries[i].value);
+    free(oc.entries);
+}
+
+void btree_idx_unlink_all(const char *db_root, const char *object,
+                          const char *field, int splits) {
+    int n = index_splits_for(splits);
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        btree_cache_invalidate(idx_path);
+        unlink(idx_path);
+    }
+    /* Drop the (now-empty) field directory. */
+    char dir_path[PATH_MAX];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s/indexes/%s",
+             db_root, object, field);
+    rmdir(dir_path);
+}
+
+int btree_idx_exists(const char *db_root, const char *object,
+                     const char *field, int splits) {
+    int n = index_splits_for(splits);
+    for (int s = 0; s < n; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        struct stat st;
+        if (stat(idx_path, &st) == 0 && st.st_size > 0) return 1;
+    }
+    return 0;
+}
+
 /* Wrapper for insert-time indexing — uses B+ tree */
 void write_index_entry(const char *db_root, const char *object,
-                              const char *field,
+                              const char *field, int splits,
                               const uint8_t *val, size_t vlen,
                               const uint8_t hash16[16]) {
-    char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
-    mkdirp(dirname_of(idx_path));
-    btree_insert(idx_path, (const char *)val, vlen, hash16);
+    btree_idx_insert(db_root, object, field, splits,
+                     (const char *)val, vlen, hash16);
 }
 
 /* Delete from index — uses B+ tree */
 void delete_index_entry(const char *db_root, const char *object,
-                               const char *field,
+                               const char *field, int splits,
                                const uint8_t *val, size_t vlen,
                                const uint8_t hash16[16]) {
-    char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
-    btree_delete(idx_path, (const char *)val, vlen, hash16);
+    btree_idx_delete(db_root, object, field, splits,
+                     (const char *)val, vlen, hash16);
 }
 
 /* ========== Parallel indexing ========== */
@@ -63,6 +236,7 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *field;
+    int splits;
     uint8_t *val;               /* heap-owned bytes (index-key encoding); freed by caller */
     size_t vlen;
     const uint8_t *hash16;
@@ -70,7 +244,8 @@ typedef struct {
 
 void *index_thread_fn(void *arg) {
     IndexThreadArg *a = (IndexThreadArg *)arg;
-    write_index_entry(a->db_root, a->object, a->field, a->val, a->vlen, a->hash16);
+    write_index_entry(a->db_root, a->object, a->field, a->splits,
+                      a->val, a->vlen, a->hash16);
     return NULL;
 }
 
@@ -135,7 +310,7 @@ char *build_composite_value(const char *field_name, const char *json_value) {
     return all_present ? strdup(result) : NULL;
 }
 
-void index_parallel(const char *db_root, const char *object,
+void index_parallel(const char *db_root, const char *object, int splits,
                            const char *value, const uint8_t hash16[16],
                            char fields[][256], int nfields) {
     if (nfields <= 0) return;
@@ -243,6 +418,7 @@ void index_parallel(const char *db_root, const char *object,
         args[tcount].db_root = db_root;
         args[tcount].object = object;
         args[tcount].field = fields[i];
+        args[tcount].splits = splits;
         args[tcount].val = key_buf;
         args[tcount].vlen = key_len;
         args[tcount].hash16 = hash16;
@@ -518,12 +694,64 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     return 0;
 }
 
+/* Per-field-shard build worker — qsorts its slice and bulk-builds one shard. */
+typedef struct {
+    char  ipath[PATH_MAX];
+    BtEntry *pairs;     /* slice — does NOT own backing memory; freed by caller */
+    size_t  pair_count;
+} ShardBuildArg;
+
+static void *shard_build_worker(void *arg) {
+    ShardBuildArg *sb = (ShardBuildArg *)arg;
+    qsort(sb->pairs, sb->pair_count, sizeof(BtEntry), cmp_btentry_fn);
+    btree_bulk_build(sb->ipath, sb->pairs, sb->pair_count);
+    return NULL;
+}
+
+/* Bucket-sort `pairs` (of total `count`) into `nshards` partitions by
+   idx_shard_for_hash(pair.hash, splits). Returns a malloc'd contiguous
+   BtEntry array of length `count` (caller frees) plus per-shard offset/length
+   arrays (out_offsets[i] and out_counts[i]). The original `pairs` array is
+   consumed (no copies of the variable-length value strings — pointers are
+   moved). */
+static BtEntry *partition_by_shard(BtEntry *pairs, size_t count, int splits,
+                                   int nshards,
+                                   size_t **out_offsets, size_t **out_counts) {
+    size_t *counts = calloc((size_t)nshards, sizeof(size_t));
+    size_t *offsets = calloc((size_t)nshards, sizeof(size_t));
+    BtEntry *out = malloc(count * sizeof(BtEntry));
+    if (!counts || !offsets || !out) {
+        free(counts); free(offsets); free(out);
+        *out_offsets = NULL; *out_counts = NULL;
+        return NULL;
+    }
+    /* First pass: tally per-shard sizes. */
+    for (size_t i = 0; i < count; i++) {
+        int s = idx_shard_for_hash(pairs[i].hash, splits);
+        counts[s]++;
+    }
+    /* Compute prefix-sum offsets. */
+    size_t acc = 0;
+    for (int s = 0; s < nshards; s++) { offsets[s] = acc; acc += counts[s]; }
+    /* Second pass: scatter into out[] using a per-shard write cursor. */
+    size_t *cursor = calloc((size_t)nshards, sizeof(size_t));
+    if (!cursor) { free(counts); free(offsets); free(out); return NULL; }
+    for (size_t i = 0; i < count; i++) {
+        int s = idx_shard_for_hash(pairs[i].hash, splits);
+        out[offsets[s] + cursor[s]++] = pairs[i];
+    }
+    free(cursor);
+    *out_offsets = offsets;
+    *out_counts = counts;
+    return out;
+}
+
 int cmd_add_index(const char *db_root, const char *object,
                          const char *field, int force) {
     Schema sch = load_schema(db_root, object);
-    char conf_path[PATH_MAX], idx_path[PATH_MAX];
+    int idx_n = index_splits_for(sch.splits);
+    char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
-    snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
 
     if (!force) {
         FILE *cf = fopen(conf_path, "r");
@@ -539,7 +767,7 @@ int cmd_add_index(const char *db_root, const char *object,
             fclose(cf);
         }
     }
-    if (force) unlink(idx_path);
+    if (force) btree_idx_unlink_all(db_root, object, field, sch.splits);
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
@@ -567,12 +795,32 @@ int cmd_add_index(const char *db_root, const char *object,
     /* Parallel shard scan — collects all (value, hash) pairs */
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    mkdirp(dirname_of(idx_path));
     scan_shards(data_dir, sch.slot_size, index_scan_cb, &ic);
 
-    /* Sort and bulk build B+ tree */
-    qsort(ic.pairs, ic.pair_count, sizeof(BtEntry), cmp_btentry_fn);
-    btree_bulk_build(idx_path, ic.pairs, ic.pair_count);
+    /* Partition by idx_shard, then sort+build per shard in parallel. */
+    if (ic.pair_count > 0) {
+        size_t *offsets = NULL, *counts = NULL;
+        BtEntry *parted = partition_by_shard(ic.pairs, ic.pair_count,
+                                             sch.splits, idx_n,
+                                             &offsets, &counts);
+        if (parted) {
+            ShardBuildArg *sb = malloc((size_t)idx_n * sizeof(ShardBuildArg));
+            int sb_count = 0;
+            for (int s = 0; s < idx_n; s++) {
+                if (counts[s] == 0) continue;
+                build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
+                               db_root, object, field, s);
+                sb[sb_count].pairs = parted + offsets[s];
+                sb[sb_count].pair_count = counts[s];
+                sb_count++;
+            }
+            parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
+            free(sb);
+            free(parted);
+            free(offsets);
+            free(counts);
+        }
+    }
 
     for (size_t i = 0; i < ic.pair_count; i++) free((char *)ic.pairs[i].value);
     free(ic.pairs);
@@ -703,12 +951,10 @@ int cmd_add_indexes(const char *db_root, const char *object,
     char actual_fields[MAX_FIELDS][256];
     int actual_count = 0;
     for (int i = 0; i < nfields; i++) {
-        char idx_path[PATH_MAX];
-        snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, fields[i]);
-        if (force) { unlink(idx_path); }
-        else {
-            struct stat ist;
-            if (stat(idx_path, &ist) == 0 && ist.st_size > 0) continue; /* skip existing */
+        if (force) {
+            btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
+        } else if (btree_idx_exists(db_root, object, fields[i], sch.splits)) {
+            continue; /* skip existing */
         }
         memcpy(actual_fields[actual_count], fields[i], 256);
         actual_count++;
@@ -748,25 +994,54 @@ int cmd_add_indexes(const char *db_root, const char *object,
     scan_shards(data_dir, sch.slot_size, multi_index_scan_cb, &mc);
     for (int fi = 0; fi < actual_count; fi++) pthread_mutex_destroy(&mc.lock[fi]);
 
-    /* Parallel sort + build — one thread per index */
-    IdxBuildArgIdx *ib_args = malloc(actual_count * sizeof(IdxBuildArgIdx));
-    int ib_count = 0;
+    /* Parallel sort + build — partition each field's pairs by idx_shard,
+       then dispatch one worker per (field, shard) pair. Workers across
+       different fields share the thread pool. */
+    int idx_n = index_splits_for(sch.splits);
+    /* Worst case: every field × every shard. */
+    ShardBuildArg *sb = malloc((size_t)actual_count * idx_n * sizeof(ShardBuildArg));
+    int sb_count = 0;
+    /* parted_per_field[i] holds the partitioned BtEntry array; freed after build. */
+    BtEntry **parted_per_field = calloc((size_t)actual_count, sizeof(BtEntry *));
+    size_t  **offsets_per_field = calloc((size_t)actual_count, sizeof(size_t *));
+    size_t  **counts_per_field  = calloc((size_t)actual_count, sizeof(size_t *));
+
     for (int fi = 0; fi < actual_count; fi++) {
         if (mc.pair_count[fi] == 0) { free(mc.pairs[fi]); continue; }
-        snprintf(ib_args[ib_count].ipath, PATH_MAX, "%s/%s/indexes/%s.idx", db_root, object, mc.fields[fi]);
-        mkdirp(dirname_of(ib_args[ib_count].ipath));
-        ib_args[ib_count].pairs = mc.pairs[fi];
-        ib_args[ib_count].pair_count = mc.pair_count[fi];
-        ib_count++;
+        size_t *offsets = NULL, *counts = NULL;
+        BtEntry *parted = partition_by_shard(mc.pairs[fi], mc.pair_count[fi],
+                                             sch.splits, idx_n,
+                                             &offsets, &counts);
+        if (!parted) { free(mc.pairs[fi]); continue; }
+        parted_per_field[fi] = parted;
+        offsets_per_field[fi] = offsets;
+        counts_per_field[fi] = counts;
+        for (int s = 0; s < idx_n; s++) {
+            if (counts[s] == 0) continue;
+            build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
+                           db_root, object, mc.fields[fi], s);
+            sb[sb_count].pairs = parted + offsets[s];
+            sb[sb_count].pair_count = counts[s];
+            sb_count++;
+        }
     }
 
-    parallel_for(idx_build_worker_idx, ib_args, ib_count, sizeof(IdxBuildArgIdx));
+    parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
+    free(sb);
 
-    for (int i = 0; i < ib_count; i++) {
-        for (size_t ei = 0; ei < ib_args[i].pair_count; ei++) free((char *)ib_args[i].pairs[ei].value);
-        free(ib_args[i].pairs);
+    /* Free pair value strings (originally allocated in multi_index_scan_cb)
+       and the partition + scan arrays. */
+    for (int fi = 0; fi < actual_count; fi++) {
+        for (size_t ei = 0; ei < mc.pair_count[fi]; ei++)
+            free((char *)mc.pairs[fi][ei].value);
+        free(mc.pairs[fi]);
+        free(parted_per_field[fi]);
+        free(offsets_per_field[fi]);
+        free(counts_per_field[fi]);
     }
-    free(ib_args);
+    free(parted_per_field);
+    free(offsets_per_field);
+    free(counts_per_field);
 
     /* Add to index.conf */
     mkdirp(dirname_of(conf_path));
@@ -803,9 +1078,9 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
         return 1;
     }
 
-    char conf_path[PATH_MAX], idx_path[PATH_MAX];
+    Schema sch = load_schema(db_root, object);
+    char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
-    snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, field);
 
     /* Rewrite index.conf without the target line. */
     int found = 0;
@@ -839,8 +1114,7 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
         return 0;
     }
 
-    btree_cache_invalidate(idx_path);
-    unlink(idx_path);
+    btree_idx_unlink_all(db_root, object, field, sch.splits);
     invalidate_idx_cache(object);
 
     log_msg(3, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
@@ -882,11 +1156,11 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
         return 1;
     }
 
+    Schema sch = load_schema(db_root, object);
     int removed = 0, missing = 0;
     for (int i = 0; i < nfields; i++) {
-        char conf_path[PATH_MAX], idx_path[PATH_MAX];
+        char conf_path[PATH_MAX];
         snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
-        snprintf(idx_path, sizeof(idx_path), "%s/%s/indexes/%s.idx", db_root, object, fields[i]);
 
         int found = 0;
         FILE *cf = fopen(conf_path, "r");
@@ -910,8 +1184,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
         }
 
         if (found) {
-            btree_cache_invalidate(idx_path);
-            unlink(idx_path);
+            btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
             removed++;
         } else {
             missing++;
