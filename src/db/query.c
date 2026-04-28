@@ -5937,17 +5937,13 @@ static void *shard_count_worker(void *arg) {
     int sid = sc->entries[0].shard_id;
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), sc->db_root, sc->object, sid);
-    int fd = open(shard, O_RDONLY);
-    if (fd < 0) return NULL;
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { close(fd); return NULL; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    if ((size_t)st.st_size < SHARD_HDR_SIZE) { munmap(map, st.st_size); return NULL; }
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, st.st_size); return NULL; }
-    uint32_t slots = sh->slots_per_shard;
+
+    /* Use the persistent shard mmap cache — same path as shard_find_worker.
+       Direct mmap+munmap per query was paying ~100µs of page-fault + TLB
+       work per shard, swamping the actual count work for selective queries. */
+    FcacheRead fc = fcache_get_read(shard);
+    if (!fc.map) return NULL;
+    uint32_t slots = fc.slots_per_shard;
     uint32_t mask = slots - 1;
 
     size_t local = 0;
@@ -5956,17 +5952,17 @@ static void *shard_count_worker(void *arg) {
         CollectedHash *e = &sc->entries[ei];
         for (uint32_t p = 0; p < slots; p++) {
             uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag != 1) continue;
             if (memcmp(h->hash, e->hash, 16) != 0) continue;
 
-            const uint8_t *raw = map + zoneB_off(s, slots, sc->sch->slot_size) + h->key_len;
+            const uint8_t *raw = fc.map + zoneB_off(s, slots, sc->sch->slot_size) + h->key_len;
             if (criteria_match_tree(raw, sc->tree, sc->fs)) local++;
             break;
         }
     }
-    munmap(map, st.st_size);
+    fcache_release(fc);
     sc->count = local;
     return NULL;
 }
@@ -10044,17 +10040,13 @@ static void *shard_agg_worker(void *arg) {
     int sid = sa->entries[0].shard_id;
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), sa->db_root, sa->object, sid);
-    int fd = open(shard, O_RDONLY);
-    if (fd < 0) return NULL;
-    struct stat st; fstat(fd, &st);
-    if (st.st_size == 0) { close(fd); return NULL; }
-    uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return NULL;
-    if ((size_t)st.st_size < SHARD_HDR_SIZE) { munmap(map, st.st_size); return NULL; }
-    const ShardHeader *sh = (const ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC || sh->slots_per_shard == 0) { munmap(map, st.st_size); return NULL; }
-    uint32_t slots = sh->slots_per_shard;
+
+    /* Use the persistent shard mmap cache. Per-call mmap+munmap was paying
+       page-fault + TLB-flush per shard per query — visible as a 4-5x agg
+       slowdown vs README baseline before this fix. */
+    FcacheRead fc = fcache_get_read(shard);
+    if (!fc.map) return NULL;
+    uint32_t slots = fc.slots_per_shard;
     uint32_t mask = slots - 1;
 
     for (int ei = 0; ei < sa->entry_count; ei++) {
@@ -10062,16 +10054,16 @@ static void *shard_agg_worker(void *arg) {
         CollectedHash *e = &sa->entries[ei];
         for (uint32_t p = 0; p < slots; p++) {
             uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
+            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag != 1) continue;
             if (memcmp(h->hash, e->hash, 16) != 0) continue;
-            const uint8_t *block = map + zoneB_off(s, slots, sa->sch->slot_size);
+            const uint8_t *block = fc.map + zoneB_off(s, slots, sa->sch->slot_size);
             agg_scan_cb(h, block, &sa->local);
             break;
         }
     }
-    munmap(map, st.st_size);
+    fcache_release(fc);
     return NULL;
 }
 
