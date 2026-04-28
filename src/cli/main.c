@@ -1426,6 +1426,51 @@ static void simple_op(CliConn *c, const char *mode, const char *title, int confi
     else { show_response(title, resp); free(resp); }
 }
 
+/* Form-driven vacuum — exposes the optional `compact` and `splits` flags so
+   operators can drop tombstoned fields and/or reshard from inside the TUI.
+   Empty splits = no reshard; empty compact = vacuum without dropping
+   removed fields' bytes. */
+static void maintenance_vacuum(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+
+    static const char *YESNO[] = { "no", "yes", NULL };
+    FormField fs[2] = {0};
+    fs[0].label = "compact";  fs[0].kind = FF_CHOICE; fs[0].choices = YESNO;
+    fs[1].label = "splits";   fs[1].kind = FF_NUMBER;
+    /* Pre-fill splits with current value as a reminder of the starting point. */
+    snprintf(fs[1].value, sizeof(fs[1].value), "%d", oi.splits);
+    if (tui_form("vacuum — compact tombstones / reshard", fs, 2) != 0) return;
+
+    int compact = (fs[0].value[0] == 'y' || fs[0].value[0] == 'Y' || fs[0].value[0] == '1');
+    int new_splits = atoi(fs[1].value);
+    if (new_splits == oi.splits) new_splits = 0; /* no reshard */
+
+    /* Build optional flag fragments — server treats omitted fields as defaults. */
+    char compact_frag[32] = "";
+    char splits_frag[32]  = "";
+    if (compact)         snprintf(compact_frag, sizeof(compact_frag), ",\"compact\":true");
+    if (new_splits > 0)  snprintf(splits_frag, sizeof(splits_frag),  ",\"splits\":%d", new_splits);
+
+    if (compact || new_splits > 0) {
+        char p[160];
+        snprintf(p, sizeof(p), "vacuum %s/%s — compact=%s splits=%s — proceed?",
+                 oi.dir, oi.object,
+                 compact ? "yes" : "no",
+                 new_splits > 0 ? fs[1].value : "(no reshard)");
+        if (!tui_confirm(p)) return;
+    }
+
+    char req[512];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"vacuum\",\"dir\":\"%s\",\"object\":\"%s\"%s%s}",
+        oi.dir, oi.object, compact_frag, splits_frag);
+
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "vacuum");
+    else { show_response("vacuum", resp); free(resp); }
+}
+
 static void menu_maintenance(void) {
     CliConn *c = get_conn();
     if (!c) return;
@@ -1440,7 +1485,7 @@ static void menu_maintenance(void) {
         int choice = tui_menu_at("Maintenance", items, 4, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0: simple_op(c, "vacuum",   "vacuum",   0); break;
+            case 0: maintenance_vacuum(c); break;
             case 1: simple_op(c, "recount",  "recount",  0); break;
             case 2: simple_op(c, "truncate", "truncate", 1); break;
             case 3: simple_op(c, "backup",   "backup",   0); break;
