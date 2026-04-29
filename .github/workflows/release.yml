@@ -1,0 +1,172 @@
+name: Release
+
+# Builds, signs, and publishes release artifacts on every tag push.
+# Per-tag GitHub Release contains:
+#   - shard-db-<tag>-source.tar.gz       (architecture-independent;
+#                                          users build from source)
+#   - shard-db-<tag>-linux-x86_64.tar.gz  (compiled binaries)
+#   - <each-of-above>.sig                 (cosign keyless signature)
+#   - multiple.intoto.jsonl               (SLSA L3 provenance covering
+#                                          every artifact in the release)
+#
+# Verification by end-users:
+#   cosign verify-blob \
+#     --certificate-identity-regexp 'github\.com/sayyiditow/shard-db' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --signature shard-db-<tag>-linux-x86_64.tar.gz.sig \
+#     shard-db-<tag>-linux-x86_64.tar.gz
+#
+# To extend to more targets (linux-arm64, darwin-x86_64, darwin-arm64),
+# uncomment the matrix rows in `binary-build` and the runner labels.
+# No other changes are needed — the combine-hashes / provenance /
+# sign-and-attach jobs all walk every uploaded tarball.
+
+on:
+  push:
+    tags: ['*']
+
+permissions: read-all
+
+jobs:
+  # ----- 1. Source tarball (architecture-independent) -----------------
+  source-tarball:
+    name: Source tarball
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0   # git archive needs full history for the tag
+
+      - name: Build source tarball
+        run: |
+          tarball="shard-db-${{ github.ref_name }}-source.tar.gz"
+          git archive --format=tar.gz \
+            --prefix="shard-db-${{ github.ref_name }}/" \
+            -o "$tarball" HEAD
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: artifact-source
+          path: shard-db-*-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----- 2. Compiled binary tarballs (matrix per OS+arch) -------------
+  binary-build:
+    name: Build ${{ matrix.target.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: linux-x86_64, runner: ubuntu-latest }
+          # Uncomment when ARM64 port lands (post-2026.05.x):
+          # - { name: linux-arm64, runner: ubuntu-22.04-arm }
+          # Uncomment when macOS port lands (2026.05.2):
+          # - { name: darwin-x86_64, runner: macos-13 }
+          # - { name: darwin-arm64,  runner: macos-latest }
+    runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build deps (Linux)
+        if: startsWith(matrix.target.name, 'linux-')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev libncursesw5-dev
+
+      - name: Install build deps (macOS)
+        if: startsWith(matrix.target.name, 'darwin-')
+        run: brew install openssl@3 ncurses
+
+      - name: Build daemon + cli
+        run: ./build.sh
+
+      - name: Package binary tarball
+        run: |
+          tarball="shard-db-${{ github.ref_name }}-${{ matrix.target.name }}.tar.gz"
+          tar -czf "$tarball" -C build bin db.env.example
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: artifact-${{ matrix.target.name }}
+          path: shard-db-*-${{ matrix.target.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----- 3. Combine all artifact hashes for SLSA provenance -----------
+  combine-hashes:
+    name: Combine artifact hashes
+    needs: [source-tarball, binary-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.combine.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifact-*
+          merge-multiple: true
+
+      - id: combine
+        name: Hash every tarball, base64-encode for SLSA generator
+        run: |
+          ls -la *.tar.gz
+          hashes=$(sha256sum shard-db-*.tar.gz | base64 -w0)
+          echo "hashes=$hashes" >> "$GITHUB_OUTPUT"
+
+  # ----- 4. SLSA L3 provenance + GitHub Release creation --------------
+  # The generator builds an .intoto.jsonl provenance attestation listing
+  # every base64-encoded artifact hash. With upload-assets: true it also
+  # creates the GitHub Release for the tag and uploads the attestation.
+  # Reusable workflows must be referenced by tag (semver), not commit
+  # SHA — Scorecard accepts this exception for slsa-github-generator.
+  provenance:
+    needs: combine-hashes
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.combine-hashes.outputs.hashes }}
+      upload-assets: true
+
+  # ----- 5. Cosign keyless signing + attach tarballs to release -------
+  sign-and-attach:
+    name: Sign tarballs + upload to release
+    needs: provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # softprops/action-gh-release writes assets
+      id-token: write     # cosign keyless OIDC
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifact-*
+          merge-multiple: true
+
+      - uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign each tarball with cosign keyless
+        run: |
+          for f in shard-db-*.tar.gz; do
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              "$f"
+          done
+          ls -la
+
+      - name: Upload signed tarballs to release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            shard-db-*.tar.gz
+            shard-db-*.tar.gz.sig
+          fail_on_unmatched_files: true
