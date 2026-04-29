@@ -19,6 +19,10 @@ on:
   schedule:
     - cron: '33 2 * * 6'
 
+# Top-level read-only default; the analyze job overrides with the
+# specific writes it needs (security-events). Matches scorecard.yml.
+permissions: read-all
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
