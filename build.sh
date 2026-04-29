@@ -69,7 +69,13 @@ case "$BUILD_MODE" in
         # gcov-style line/branch coverage. Each compiled .o gets a sibling
         # .gcno (control-flow graph); each test run produces .gcda counters.
         # Codecov collects both via lcov.
-        MODE_CFLAGS="-O0 -g --coverage -fprofile-arcs -ftest-coverage $WARN_CFLAGS"
+        #
+        # -fprofile-update=atomic is required because the daemon spawns
+        # parallel-for worker threads that hit the same .gcda counters
+        # concurrently. Without atomics, racing increments produce
+        # impossible negative deltas and gcov refuses to read the data
+        # ("Unexpected negative count for branch ..." in lcov).
+        MODE_CFLAGS="-O0 -g --coverage -fprofile-arcs -ftest-coverage -fprofile-update=atomic $WARN_CFLAGS"
         MODE_LDFLAGS="--coverage"
         DO_STRIP=0
         ;;
