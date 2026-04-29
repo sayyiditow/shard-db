@@ -6,6 +6,9 @@ shardkv
 *.o
 *.a
 
+# Release artefacts (built tarballs sit at the repo root for upload)
+shard-db-*.tar.gz
+
 # ASan / sanitizer builds
 *_asan
 *_asan.log
