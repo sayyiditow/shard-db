@@ -102,6 +102,6 @@ Initial v1 release.
 
 Core storage, query engine, indexes, CAS, schema mutations, multi-tenancy, auth, async logging, stats, 167 tests across 6 scripts. See the repo `CHANGELOG.md` for the full v1 feature inventory.
 
-## Where to see what's next
+## Versioning
 
-[Roadmap (v2)](../v2/roadmap.md) — native TLS, replication, paid tier features, streaming-binary file protocol for very-large uploads.
+Releases follow `yyyy.mm.N` — year-month plus a counter within that month. There is no separate "v1" / "v2" track; new features ship in the next monthly release. Anything not yet shipped lives as an open issue on the [GitHub repo](https://github.com/sayyiditow/shard-db/issues), not a roadmap doc.

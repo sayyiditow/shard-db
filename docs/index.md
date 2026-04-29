@@ -54,4 +54,4 @@ Dive deeper in the [Quick start](getting-started/quickstart.md).
 | Look up a JSON query | [Query protocol](query-protocol/overview.md) |
 | Deploy to production | [Operations → Deployment](operations/deployment.md) · [Tuning](operations/tuning.md) |
 | Find a limit or error | [Reference → Limits](reference/limits.md) · [Error codes](reference/error-codes.md) |
-| See what's coming | [Roadmap (v2)](v2/roadmap.md) |
+| See what shipped | [Changelog](reference/changelog.md) |

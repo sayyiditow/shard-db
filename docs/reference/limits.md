@@ -74,9 +74,8 @@ Changing these requires recompiling. Most don't need to change.
 - **Right / full outer joins.** Left and inner only.
 - **Nested aggregates, window functions.** Post-process in the app.
 - **Native replication.** Use block-level (DRBD) or filesystem-level (ZFS send/recv).
-- **TLS (native).** Terminate at a reverse proxy — see [Deployment](../operations/deployment.md).
-- **Platforms other than Linux.** Uses `epoll`; not portable without code changes.
+- **Platforms other than Linux.** Uses `epoll`; macOS port is on the near-term backlog (2026.05.2). Containers cover the cross-platform case meanwhile.
 
-## Roadmap
+## What's already shipped
 
-Several of these ("unlimited fields", native TLS, native replication) are on the [v2 roadmap](../v2/roadmap.md).
+Native TLS 1.3, OR criteria, per-tenant + per-object tokens, cursor pagination, AND index intersection, `delete-file` / `list-files`, AND `MAX_FIELDS` bumped to 256 — all landed in 2026.05+. See the [changelog](changelog.md) for the full list.
