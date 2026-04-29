@@ -1,0 +1,40 @@
+version: 2
+
+# Dependabot keeps our pinned dependencies current. Without it, the SHA-
+# pinned GitHub Actions and the ==-pinned pip packages would drift away
+# from upstream releases — security patches included. Closes Scorecard's
+# "Dependency-Update-Tool" check.
+#
+# Schedule is weekly (Monday) for both ecosystems to avoid PR noise.
+# open-pull-requests-limit caps queue depth so a busy upstream week
+# doesn't bury the inbox.
+
+updates:
+  # GitHub Actions used by .github/workflows/*.yml. Bumps SHA pins to the
+  # newest stable tag's commit. Each PR shows the upstream release notes
+  # so the reviewer can decide whether to merge.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+
+  # Python packages used by the docs build (mkdocs-material today; any
+  # future tooling we add to requirements.txt comes along for free).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "docs"
