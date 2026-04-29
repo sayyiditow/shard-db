@@ -56,8 +56,16 @@ case "$BUILD_MODE" in
         MODE_LDFLAGS=""
         DO_STRIP=0
         ;;
+    coverage)
+        # gcov-style line/branch coverage. Each compiled .o gets a sibling
+        # .gcno (control-flow graph); each test run produces .gcda counters.
+        # Codecov collects both via lcov.
+        MODE_CFLAGS="-O0 -g --coverage -fprofile-arcs -ftest-coverage"
+        MODE_LDFLAGS="--coverage"
+        DO_STRIP=0
+        ;;
     *)
-        echo "build.sh: unknown BUILD_MODE=$BUILD_MODE (release|asan|tsan|debug)" >&2
+        echo "build.sh: unknown BUILD_MODE=$BUILD_MODE (release|asan|tsan|debug|coverage)" >&2
         exit 1
         ;;
 esac

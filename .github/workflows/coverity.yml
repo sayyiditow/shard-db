@@ -1,0 +1,75 @@
+name: Coverity Scan
+
+# Uploads a build of the daemon to Coverity Scan, which finds different
+# bugs than CodeQL/cppcheck/scan-build. Free for OSS projects.
+#
+# REQUIRES SECRETS to be configured before this workflow does anything
+# useful (it skips silently otherwise — see the `if:` gate):
+#
+#   COVERITY_SCAN_TOKEN  - project token from scan.coverity.com
+#   COVERITY_SCAN_EMAIL  - the email registered with that project
+#
+# Setup steps in .github/SCANNER-SIGNUPS.md.
+#
+# Schedule: weekly + on-demand. Coverity Scan rate-limits public-repo
+# uploads (~1 build per day, ~3 per week), so don't trigger this on
+# every push.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  coverity:
+    name: Coverity Scan upload
+    runs-on: ubuntu-latest
+    if: ${{ secrets.COVERITY_SCAN_TOKEN != '' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev libncursesw5-dev curl
+
+      - name: Download Coverity Build Tool
+        run: |
+          curl -fsSL --form "token=${{ secrets.COVERITY_SCAN_TOKEN }}" \
+                     --form "project=sayyiditow/shard-db" \
+                     -o cov-analysis-linux64.tar.gz \
+                     https://scan.coverity.com/download/linux64
+          mkdir -p cov-analysis-linux64
+          tar -xzf cov-analysis-linux64.tar.gz \
+            --strip-components=1 -C cov-analysis-linux64
+          echo "$(pwd)/cov-analysis-linux64/bin" >> $GITHUB_PATH
+
+      - name: Build under cov-build
+        run: |
+          # cov-build wraps the compiler and emits intermediate analysis
+          # artifacts to cov-int/. Skip strip; symbols help Coverity attribute
+          # findings to source lines.
+          cov-build --dir cov-int gcc -O2 -g \
+            src/db/util.c src/db/config.c src/db/storage.c src/db/index.c \
+            src/db/query.c src/db/server.c src/db/main.c src/db/btree.c \
+            src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c \
+            -Isrc/db -lpthread -lssl -lcrypto -o /dev/null
+
+      - name: Tar + upload
+        run: |
+          tar -czf shard-db-cov.tgz cov-int
+          curl -fsSL --form "token=${{ secrets.COVERITY_SCAN_TOKEN }}" \
+                     --form "email=${{ secrets.COVERITY_SCAN_EMAIL }}" \
+                     --form "file=@shard-db-cov.tgz" \
+                     --form "version=$(git rev-parse --short HEAD)" \
+                     --form "description=Automated upload from $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                     https://scan.coverity.com/builds?project=sayyiditow/shard-db

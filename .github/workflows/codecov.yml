@@ -1,0 +1,72 @@
+name: Coverage (Codecov)
+
+# Builds with gcov line+branch coverage, runs the tests, uploads the
+# .gcov data to Codecov. Surfaces which code paths the test suite
+# never exercises — useful for "we have great test coverage" claims to
+# match reality.
+#
+# Public repos use Codecov's tokenless OIDC upload; no secret required.
+# (For private repos, CODECOV_TOKEN must be configured in repo secrets.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BUILD_MODE: coverage
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build deps + lcov
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev libncursesw5-dev lcov
+
+      - name: Build (BUILD_MODE=coverage)
+        # The flags add ~3× to compile time but the test suite still
+        # finishes well under timeout. -O0 keeps line attribution
+        # accurate.
+        run: ./build.sh && cp build/bin/shard-db ./shard-db
+
+      - name: Run test suite
+        # Run the same test set as the main CI, in series (gcov counters
+        # aren't thread-safe across processes; serialised tests keep
+        # the .gcda files coherent).
+        run: |
+          for t in tests/test-*.sh; do
+            echo "=== $t ==="
+            "$t" || exit 1
+          done
+
+      - name: Collect coverage
+        run: |
+          # lcov reads the .gcno (graph) and .gcda (counters) sibling files
+          # next to each .o. Then strip system headers and tests/ dir.
+          lcov --capture --directory . --output-file coverage.info \
+               --rc lcov_branch_coverage=1
+          lcov --remove coverage.info \
+               '/usr/*' '*/tests/*' '*/fuzz/*' \
+               --output-file coverage.info \
+               --rc lcov_branch_coverage=1
+          lcov --list coverage.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5.5.4
+        with:
+          files: ./coverage.info
+          flags: c-suite
+          fail_ci_if_error: false      # don't gate the workflow on Codecov outage
