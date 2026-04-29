@@ -802,12 +802,17 @@ static void query_aggregate(CliConn *c) {
     for (int i = 0; i < oi.nfields; i++) fld_choices[i] = oi.fields[i].name;
     fld_choices[oi.nfields] = NULL;
 
-    /* Sticky criteria + agg-spec + having rows across re-runs. */
-    CritRow crit_rows[MAX_CRIT_ROWS];
+    /* Sticky criteria + agg-spec + having rows across re-runs.
+       Zero-initialised so the row-count counters and the underlying field
+       buffers start in a known state — cppcheck flags reads of agg_rows[i]
+       before the user has filled row i, even though the loop only iterates
+       up to *_n which starts at 0. Defensive zero-init removes the
+       warning and costs nothing in practice. */
+    CritRow crit_rows[MAX_CRIT_ROWS] = {0};
     int crit_n = 0;
-    AggRow agg_rows[MAX_AGG_ROWS];
+    AggRow agg_rows[MAX_AGG_ROWS] = {0};
     int agg_n = 0;
-    CritRow having_rows[MAX_CRIT_ROWS];
+    CritRow having_rows[MAX_CRIT_ROWS] = {0};
     int having_n = 0;
 
     /* Sticky form fields for limit / order_by / order — kept outside all
