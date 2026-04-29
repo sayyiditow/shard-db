@@ -45,3 +45,14 @@ Thumbs.db
 # Temp benchmark artifacts
 /tmp/shard-db_*
 /tmp/shardkv_*
+
+# Fuzzer build artifacts, mutation cache, and crash corpora.
+# Auto-discovered corpus entries (sha-named) get cached in fuzz/.cache/
+# to speed up subsequent local fuzz runs — fast to regenerate, not
+# worth committing 22 MB of binary blobs. The committed fuzz/corpora/
+# directory holds only the hand-written human-named seed inputs.
+fuzz/build/
+fuzz/.cache/
+crash-*
+leak-*
+timeout-*

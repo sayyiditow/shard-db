@@ -1,0 +1,1 @@
+[{"field":"name","op":"regex","value":"^foo[0-9]+$"}]

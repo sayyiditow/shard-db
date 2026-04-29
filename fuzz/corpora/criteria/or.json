@@ -1,0 +1,1 @@
+[{"or":[{"field":"a","op":"eq","value":"1"},{"field":"b","op":"eq","value":"2"}]}]

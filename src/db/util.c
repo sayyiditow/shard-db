@@ -48,12 +48,18 @@ const char *json_skip_value(const char *p) {
         if (*p == '"') p++;
         return p;
     }
+    /* The inner string-skip (the `"` branch inside) walks until the closing
+       quote OR end-of-buffer. If it ran out at end-of-buffer without finding
+       a close, we MUST NOT then `p++` past the NUL terminator — that's a
+       heap-buffer-overflow on the next loop check. The `if (!*p) break;`
+       guard covers that. Found by libFuzzer; see fuzz/fuzz_json.c. */
     if (*p == '{') {
         int depth = 1; p++;
         while (*p && depth > 0) {
             if (*p == '{') depth++;
             else if (*p == '}') depth--;
             else if (*p == '"') { p++; while (*p && !(*p == '"' && *(p-1) != '\\')) p++; }
+            if (!*p) break;
             p++;
         }
         return p;
@@ -64,6 +70,7 @@ const char *json_skip_value(const char *p) {
             if (*p == '[') depth++;
             else if (*p == ']') depth--;
             else if (*p == '"') { p++; while (*p && !(*p == '"' && *(p-1) != '\\')) p++; }
+            if (!*p) break;
             p++;
         }
         return p;

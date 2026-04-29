@@ -1,0 +1,1 @@
+[{"and":[{"field":"a","op":"gt","value":"1"},{"or":[{"field":"b","op":"eq","value":"x"},{"field":"c","op":"in","value":["a","b","c"]}]}]}]

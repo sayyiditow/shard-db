@@ -1,0 +1,70 @@
+name: libFuzzer (wire-format parsers)
+
+# Build the libFuzzer harnesses with ASan + UBSan and run a short
+# coverage-driven fuzz pass on each. Catches the bug class that none of
+# our static analyzers can: malformed-input parsing crashes (heap OOB,
+# leaks, infinite loops in the JSON / base64 / criteria-tree parsers).
+#
+# First three runs of these harnesses found two real heap-buffer-overflows
+# in the wire path — both reachable from any unauthenticated TCP byte
+# before auth. Those are now fixed; this workflow keeps regressions out.
+#
+# CI budget per harness is intentionally short (60s of fuzzing per parser
+# = 3 minutes total). For deeper continuous fuzzing, register with
+# OSS-Fuzz — the harnesses live in fuzz/ ready to be picked up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: libFuzzer (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FUZZ_TIME: 60          # seconds per harness on PRs
+      ASAN_OPTIONS: "halt_on_error=1:abort_on_error=0:print_stacktrace=1"
+      UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install clang + libatomic + ssl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang libssl-dev libatomic1
+          clang --version | head -1
+
+      - name: Build fuzzers
+        run: ./fuzz/build.sh
+
+      - name: Fuzz json_parse_object (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_json -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/json/
+
+      - name: Fuzz b64_decode (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_b64 -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/b64/
+
+      - name: Fuzz parse_criteria_tree (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_criteria -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/criteria/
+
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+          retention-days: 14

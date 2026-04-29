@@ -6318,6 +6318,14 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                 ap++;
                 while (*ap) {
                     while (*ap == ' ' || *ap == ',') ap++;
+                    /* The skip-ws/comma loop can advance ap to the NUL
+                       terminator if the input ends with a trailing comma
+                       and no closing ']' (the upstream json_skip_value
+                       can be tricked into truncating the span at an
+                       embedded NUL — see fuzzer-found bug). Without this
+                       guard, the else `ap++` below walks past NUL → OOB
+                       read on next iteration. */
+                    if (!*ap) break;
                     if (*ap == ']') break;
                     if (*ap == '"') {
                         ap++;
