@@ -315,6 +315,28 @@ extern int g_log_level;
    Defaults to stdout for CLI mode. All command output uses OUT() instead of printf(). */
 extern __thread FILE *g_out;
 #define OUT(...) fprintf(g_out ? g_out : stdout, __VA_ARGS__)
+
+/* SB_APPEND(buf, off, cap, fmt, ...) — safe StringBuilder-style append.
+   Replaces the unsafe `off += snprintf(buf + off, cap - off, ...)` idiom
+   that CodeQL flags as "potentially overflowing snprintf": snprintf
+   returns the *would-have-written* count, so on truncation `off`
+   advances past `cap` and subsequent writes hit out-of-bounds memory.
+   This macro:
+     - Computes remaining safely (no underflow if off ever exceeded cap).
+     - Only advances `off` when the write fully fit.
+     - On truncation or write error, leaves `off` at the last valid
+       written position (cap - 1 max) so the buffer stays NUL-terminated
+       and no further writes overflow.
+   Pre-grow checks at growable-buffer call sites are still the primary
+   line of defence; this macro is the safety net CodeQL recognises.       */
+#define SB_APPEND(buf, off, cap, ...) do {                                \
+    size_t _rem = (cap) > (off) ? (cap) - (off) : 0;                      \
+    if (_rem == 0) break;                                                 \
+    int _n = snprintf((buf) + (off), _rem, __VA_ARGS__);                  \
+    if (_n < 0) { (off) = (cap) - 1; break; }                             \
+    (off) += ((size_t)_n < _rem) ? (size_t)_n : (_rem - 1);               \
+} while (0)
+
 extern int g_log_retain_days;
 
 /* Native TLS — when g_tls_enable=1, server requires TLS on PORT and CLI

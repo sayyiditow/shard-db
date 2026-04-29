@@ -1616,11 +1616,14 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
     if (!ts || !ts->typed) return NULL;
-    /* Estimate output: {"field":"value",...} */
+    /* Estimate output: {"field":"value",...}. 300/field is generous for the
+       common case (short field names, typed-binary values that fit in a
+       512-byte vbuf), and SB_APPEND clamps if a pathological schema with
+       very long field names ever undershoots. */
     size_t est = ts->nfields * 300 + 16;
     char *buf = malloc(est);
     size_t pos = 0;
-    buf[pos++] = '{';
+    if (est > 0) buf[pos++] = '{';
     int first = 1;
 
     for (int i = 0; i < ts->nfields; i++) {
@@ -1632,11 +1635,11 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
         int vlen = decode_field_to_buf(f, data + f->offset, vbuf, sizeof(vbuf));
         if (vlen <= 0) continue; /* skip empty/zero fields */
 
-        if (!first) buf[pos++] = ',';
-        pos += snprintf(buf + pos, est - pos, "\"%s\":%s", f->name, vbuf);
+        if (!first && pos + 1 < est) buf[pos++] = ',';
+        SB_APPEND(buf, pos, est, "\"%s\":%s", f->name, vbuf);
         first = 0;
     }
-    buf[pos++] = '}';
+    if (pos + 1 < est) buf[pos++] = '}';
     buf[pos] = '\0';
     return buf;
 }

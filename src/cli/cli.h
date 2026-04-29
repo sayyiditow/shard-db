@@ -7,6 +7,27 @@
 #include <stdint.h>
 #include <ncurses.h>
 
+/* SB_APPEND(buf, off, cap, fmt, ...) — safe StringBuilder-style append.
+   Replaces the unsafe `off += snprintf(buf + off, cap - off, ...)` idiom
+   that CodeQL flags as "potentially overflowing snprintf": snprintf
+   returns the *would-have-written* count, so on truncation `off`
+   advances past `cap` and subsequent writes hit out-of-bounds memory.
+   This macro:
+     - Computes remaining safely (no underflow if off ever exceeded cap).
+     - Only advances `off` when the write fully fit.
+     - On truncation or write error, leaves `off` at the last valid
+       written position so the buffer stays NUL-terminated and no further
+       writes overflow.
+   Pre-grow checks at growable-buffer call sites are still the primary
+   line of defence; this macro is the safety net CodeQL recognises.       */
+#define SB_APPEND(buf, off, cap, ...) do {                                \
+    size_t _rem = (cap) > (off) ? (cap) - (off) : 0;                      \
+    if (_rem == 0) break;                                                 \
+    int _n = snprintf((buf) + (off), _rem, __VA_ARGS__);                  \
+    if (_n < 0) { (off) = (cap) - 1; break; }                             \
+    (off) += ((size_t)_n < _rem) ? (size_t)_n : (_rem - 1);               \
+} while (0)
+
 /* ============================================================
    shard-cli — ncurses TUI client for shard-db.
 

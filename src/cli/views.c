@@ -1101,24 +1101,28 @@ static int prompt_one_criterion(const ObjectInfo *oi, CritRow *out) {
     return 0;
 }
 
-/* Pack accumulated rows into a JSON array string. Caller frees. */
+/* Pack accumulated rows into a JSON array string. Caller frees.
+   Pre-grow heuristic now sums every variable string (fld + op + val) so
+   the SB_APPEND that follows always has room — CodeQL flagged the prior
+   `off += snprintf(...)` advance as potentially overflowing.            */
 static char *pack_criteria(const CritRow *rows, int n) {
     size_t cap = 1024;
     char *out = malloc(cap);
     if (!out) return NULL;
     size_t off = 0;
-    off += snprintf(out + off, cap - off, "[");
+    SB_APPEND(out, off, cap, "[");
     for (int i = 0; i < n; i++) {
         const char *fld = rows[i].field;
         const char *op  = rows[i].op;
         const char *val = rows[i].value;
-        if (off + 512 + strlen(val) >= cap) {
-            cap *= 2;
+        size_t need = 64 + strlen(fld) + strlen(op) + strlen(val);
+        if (off + need >= cap) {
+            while (cap < off + need + 1) cap *= 2;
             char *nb = realloc(out, cap);
             if (!nb) { free(out); return NULL; }
             out = nb;
         }
-        if (i) off += snprintf(out + off, cap - off, ",");
+        if (i) SB_APPEND(out, off, cap, ",");
 
         if (strcmp(op, "between") == 0 || strcmp(op, "len_between") == 0) {
             char vbuf[1024];
@@ -1126,14 +1130,14 @@ static char *pack_criteria(const CritRow *rows, int n) {
             char *comma = strchr(vbuf, ',');
             const char *lo = vbuf, *hi = "";
             if (comma) { *comma = '\0'; hi = comma + 1; }
-            off += snprintf(out + off, cap - off,
+            SB_APPEND(out, off, cap,
                 "{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\",\"value2\":\"%s\"}",
                 fld, op, lo, hi);
         } else if (strcmp(op, "exists") == 0 || strcmp(op, "not_exists") == 0) {
-            off += snprintf(out + off, cap - off,
+            SB_APPEND(out, off, cap,
                 "{\"field\":\"%s\",\"op\":\"%s\"}", fld, op);
         } else if (strcmp(op, "in") == 0 || strcmp(op, "not_in") == 0) {
-            off += snprintf(out + off, cap - off,
+            SB_APPEND(out, off, cap,
                 "{\"field\":\"%s\",\"op\":\"%s\",\"value\":[", fld, op);
             const char *p = val;
             int first = 1;
@@ -1144,23 +1148,23 @@ static char *pack_criteria(const CritRow *rows, int n) {
                 while (*p && *p != ',') p++;
                 size_t L = (size_t)(p - s);
                 if (off + L + 8 >= cap) {
-                    cap *= 2;
+                    while (cap < off + L + 9) cap *= 2;
                     char *nb = realloc(out, cap);
                     if (!nb) { free(out); return NULL; }
                     out = nb;
                 }
-                off += snprintf(out + off, cap - off,
+                SB_APPEND(out, off, cap,
                     "%s\"%.*s\"", first ? "" : ",", (int)L, s);
                 first = 0;
             }
-            off += snprintf(out + off, cap - off, "]}");
+            SB_APPEND(out, off, cap, "]}");
         } else {
-            off += snprintf(out + off, cap - off,
+            SB_APPEND(out, off, cap,
                 "{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\"}",
                 fld, op, val);
         }
     }
-    off += snprintf(out + off, cap - off, "]");
+    SB_APPEND(out, off, cap, "]");
     return out;
 }
 

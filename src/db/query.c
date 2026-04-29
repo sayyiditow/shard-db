@@ -5948,18 +5948,32 @@ static void *shard_find_worker(void *arg) {
                                                    mr->json + pos, bsz - pos);
                         snprintf(mr->json + pos, bsz - pos, "]");
                     } else if (sw->proj_count > 0) {
-                        size_t bsz = 256 + sw->proj_count * 256;
+                        /* Sum the actual sizes per field — the prior 256-byte-per-
+                           field heuristic underestimated when long varchars were
+                           projected. CodeQL flagged the unchecked snprintf advance. */
+                        size_t bsz = 256;
+                        char **decoded = calloc(sw->proj_count, sizeof(char *));
+                        for (int fi = 0; fi < sw->proj_count; fi++) {
+                            decoded[fi] = decode_field(raw, raw_len,
+                                                       sw->proj_fields[fi], sw->fs);
+                            if (decoded[fi])
+                                bsz += strlen(sw->proj_fields[fi]) +
+                                       strlen(decoded[fi]) + 16;
+                        }
                         mr->json = malloc(bsz);
-                        int pos = snprintf(mr->json, bsz, "{");
+                        size_t pos = 0;
+                        SB_APPEND(mr->json, pos, bsz, "{");
                         int first = 1;
                         for (int fi = 0; fi < sw->proj_count; fi++) {
-                            char *pv = decode_field(raw, raw_len, sw->proj_fields[fi], sw->fs);
-                            if (!pv) continue;
-                            pos += snprintf(mr->json + pos, bsz - pos, "%s\"%s\":\"%s\"",
-                                           first ? "" : ",", sw->proj_fields[fi], pv);
-                            first = 0; free(pv);
+                            if (!decoded[fi]) continue;
+                            SB_APPEND(mr->json, pos, bsz, "%s\"%s\":\"%s\"",
+                                      first ? "" : ",",
+                                      sw->proj_fields[fi], decoded[fi]);
+                            first = 0;
+                            free(decoded[fi]);
                         }
-                        snprintf(mr->json + pos, bsz - pos, "}");
+                        free(decoded);
+                        SB_APPEND(mr->json, pos, bsz, "}");
                     } else {
                         mr->json = decode_value(raw, raw_len, sw->fs);
                     }
@@ -7347,13 +7361,21 @@ static int keyset_emit_find(const char *db_root, const char *object,
                 count++;
                 if (count > offset && (limit <= 0 || printed < limit)) {
                     if (njoins > 0) {
-                        /* Tabular row for joins */
+                        /* Tabular row for joins. SB_APPEND keeps `pos` clamped
+                           inside the 16K buffer if the row is unusually wide;
+                           buf_driver_values / buf_join_values already cap their
+                           own writes, so a clamp here is the safety net for the
+                           literal-string segments. */
                         char buf[16384];
-                        int pos = snprintf(buf, sizeof(buf), "[\"%s\"", keybuf);
-                        pos += buf_driver_values(raw, fs,
-                                                 proj_count > 0 ? proj_fields : NULL,
-                                                 proj_count,
-                                                 buf + pos, sizeof(buf) - pos);
+                        size_t pos = 0;
+                        SB_APPEND(buf, pos, sizeof(buf), "[\"%s\"", keybuf);
+                        size_t wrote = buf_driver_values(
+                                            raw, fs,
+                                            proj_count > 0 ? proj_fields : NULL,
+                                            proj_count,
+                                            buf + pos, sizeof(buf) - pos);
+                        pos += wrote;
+                        if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
                         for (int i = 0; i < njoins; i++) {
                             if (!jraws[i]) {
                                 int ncols = joins[i].proj_count > 0
@@ -7362,13 +7384,15 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                                ? joins[i].remote_fs.ts->nfields : 0);
                                 if (joins[i].include_remote_key) ncols++;
                                 for (int k = 0; k < ncols; k++)
-                                    pos += snprintf(buf + pos, sizeof(buf) - pos, ",null");
+                                    SB_APPEND(buf, pos, sizeof(buf), ",null");
                             } else {
-                                pos += buf_join_values(&joins[i], jraws[i],
-                                                       buf + pos, sizeof(buf) - pos);
+                                wrote = buf_join_values(&joins[i], jraws[i],
+                                                        buf + pos, sizeof(buf) - pos);
+                                pos += wrote;
+                                if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
                             }
                         }
-                        snprintf(buf + pos, sizeof(buf) - pos, "]");
+                        SB_APPEND(buf, pos, sizeof(buf), "]");
                         OUT("%s%s", printed ? "," : "", buf);
                     } else if (csv_delim) {
                         csv_emit_row(keybuf, raw, h->value_len,

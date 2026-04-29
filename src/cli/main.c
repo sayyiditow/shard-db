@@ -355,23 +355,24 @@ static void query_insert(CliConn *c) {
         if (!fs[0].value[0]) { tui_alert("insert", "key required"); continue; }
 
         size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
-        off += snprintf(req + off, cap - off,
+        SB_APPEND(req, off, cap,
             "{\"mode\":\"insert\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"data\":{",
             oi.dir, oi.object, fs[0].value);
         int emitted = 0;
         for (int i = 0; i < oi.nfields; i++) {
             if (!fs[1 + i].value[0]) continue;  /* skip empty — defaults apply */
-            if (off + 256 + strlen(fs[1 + i].value) >= cap) {
-                cap *= 2;
+            size_t need = 64 + strlen(oi.fields[i].name) + strlen(fs[1 + i].value);
+            if (off + need >= cap) {
+                while (cap < off + need + 1) cap *= 2;
                 req = realloc(req, cap);
             }
-            off += snprintf(req + off, cap - off,
+            SB_APPEND(req, off, cap,
                 "%s\"%s\":\"%s\"",
                 emitted ? "," : "",
                 oi.fields[i].name, fs[1 + i].value);
             emitted++;
         }
-        off += snprintf(req + off, cap - off, "}}");
+        SB_APPEND(req, off, cap, "}}");
 
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "insert failed");
@@ -434,11 +435,11 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
         /* Build keys JSON array from the accumulated list. */
         char keys_json[8192];
         size_t off = 0;
-        off += snprintf(keys_json + off, sizeof(keys_json) - off, "[");
+        SB_APPEND(keys_json, off, sizeof(keys_json), "[");
         for (int i = 0; i < n_keys; i++) {
             /* Basic JSON-string escape for embedded quotes/backslashes. */
             const char *s = keys[i];
-            off += snprintf(keys_json + off, sizeof(keys_json) - off,
+            SB_APPEND(keys_json, off, sizeof(keys_json),
                 "%s\"", i ? "," : "");
             for (; *s && off + 6 < sizeof(keys_json); s++) {
                 if (*s == '"' || *s == '\\') {
@@ -523,19 +524,23 @@ static void query_update(CliConn *c) {
         if (!fs[0].value[0]) { tui_alert("update", "key required"); continue; }
 
         size_t cap = 4096; char *req = malloc(cap); size_t off = 0;
-        off += snprintf(req + off, cap - off,
+        SB_APPEND(req, off, cap,
             "{\"mode\":\"update\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"value\":{",
             oi.dir, oi.object, fs[0].value);
         int emitted = 0;
         for (int i = 0; i < oi.nfields; i++) {
             if (!fs[1 + i].value[0]) continue;
-            if (off + 256 + strlen(fs[1 + i].value) >= cap) { cap *= 2; req = realloc(req, cap); }
-            off += snprintf(req + off, cap - off,
+            size_t need = 64 + strlen(oi.fields[i].name) + strlen(fs[1 + i].value);
+            if (off + need >= cap) {
+                while (cap < off + need + 1) cap *= 2;
+                req = realloc(req, cap);
+            }
+            SB_APPEND(req, off, cap,
                 "%s\"%s\":\"%s\"",
                 emitted ? "," : "", oi.fields[i].name, fs[1 + i].value);
             emitted++;
         }
-        off += snprintf(req + off, cap - off, "}}");
+        SB_APPEND(req, off, cap, "}}");
 
         char *resp = NULL; size_t rlen = 0;
         if (cli_query(c, req, &resp, &rlen) != 0) tui_alert("error", "update failed");
@@ -594,15 +599,15 @@ static void query_fetch(CliConn *c) {
         for (int i = 0; i < oi.nfields; i++) if (fld_sel[i]) picked++;
         if (picked > 0 && picked < oi.nfields) {
             size_t off = 0;
-            off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
+            SB_APPEND(fields_json, off, sizeof(fields_json), "[");
             int first = 1;
             for (int i = 0; i < oi.nfields; i++) {
                 if (!fld_sel[i]) continue;
-                off += snprintf(fields_json + off, sizeof(fields_json) - off,
+                SB_APPEND(fields_json, off, sizeof(fields_json),
                     "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
                 first = 0;
             }
-            snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+            SB_APPEND(fields_json, off, sizeof(fields_json), "]");
         }
 
         char req[2048];
@@ -887,15 +892,15 @@ static void query_aggregate(CliConn *c) {
                     for (int i = 0; i < oi.nfields; i++) if (grp_sel[i]) grp_picked++;
                     if (grp_picked > 0) {
                         size_t off = 0;
-                        off += snprintf(grp_json + off, sizeof(grp_json) - off, "[");
+                        SB_APPEND(grp_json, off, sizeof(grp_json), "[");
                         int first = 1;
                         for (int i = 0; i < oi.nfields; i++) {
                             if (!grp_sel[i]) continue;
-                            off += snprintf(grp_json + off, sizeof(grp_json) - off,
+                            SB_APPEND(grp_json, off, sizeof(grp_json),
                                 "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
                             first = 0;
                         }
-                        snprintf(grp_json + off, sizeof(grp_json) - off, "]");
+                        SB_APPEND(grp_json, off, sizeof(grp_json), "]");
                     }
 
                     int limv = atoi(fs[0].value);
@@ -1040,15 +1045,15 @@ static void query_find(CliConn *c) {
             for (int i = 0; i < oi.nfields; i++) if (fld_sel[i]) picked++;
             if (picked > 0 && picked < oi.nfields) {
                 size_t off = 0;
-                off += snprintf(fields_json + off, sizeof(fields_json) - off, "[");
+                SB_APPEND(fields_json, off, sizeof(fields_json), "[");
                 int first = 1;
                 for (int i = 0; i < oi.nfields; i++) {
                     if (!fld_sel[i]) continue;
-                    off += snprintf(fields_json + off, sizeof(fields_json) - off,
+                    SB_APPEND(fields_json, off, sizeof(fields_json),
                         "%s\"%s\"", first ? "" : ",", oi.fields[i].name);
                     first = 0;
                 }
-                snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+                SB_APPEND(fields_json, off, sizeof(fields_json), "]");
             }
 
             int offv = atoi(fs[0].value);
@@ -1178,11 +1183,11 @@ static void schema_create_object(CliConn *c) {
             const char *s = p;
             while (*p && *p != ',') p++;
             size_t L = (size_t)(p - s);
-            off += snprintf(fields_json + off, sizeof(fields_json) - off,
+            SB_APPEND(fields_json, off, sizeof(fields_json),
                 "%s\"%.*s\"", first ? "" : ",", (int)L, s);
             first = 0;
         }
-        snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+        SB_APPEND(fields_json, off, sizeof(fields_json), "]");
     }
     {
         size_t off = 1;
@@ -1193,11 +1198,11 @@ static void schema_create_object(CliConn *c) {
             const char *s = p;
             while (*p && *p != ',') p++;
             size_t L = (size_t)(p - s);
-            off += snprintf(indexes_json + off, sizeof(indexes_json) - off,
+            SB_APPEND(indexes_json, off, sizeof(indexes_json),
                 "%s\"%.*s\"", first ? "" : ",", (int)L, s);
             first = 0;
         }
-        snprintf(indexes_json + off, sizeof(indexes_json) - off, "]");
+        SB_APPEND(indexes_json, off, sizeof(indexes_json), "]");
     }
 
     char req[8192];
@@ -1243,11 +1248,11 @@ static void schema_add_field(CliConn *c) {
         const char *s = p;
         while (*p && *p != ',') p++;
         size_t L = (size_t)(p - s);
-        off += snprintf(fields_json + off, sizeof(fields_json) - off,
+        SB_APPEND(fields_json, off, sizeof(fields_json),
             "%s\"%.*s\"", first ? "" : ",", (int)L, s);
         first = 0;
     }
-    snprintf(fields_json + off, sizeof(fields_json) - off, "]");
+    SB_APPEND(fields_json, off, sizeof(fields_json), "]");
 
     char req[3072];
     snprintf(req, sizeof(req),
@@ -2179,12 +2184,12 @@ static void bulk_update_criteria(CliConn *c) {
             int emitted = 0;
             for (int i = 0; i < nf; i++) {
                 if (!value_fs[i].value[0]) continue;
-                off += snprintf(value_json + off, sizeof(value_json) - off,
+                SB_APPEND(value_json, off, sizeof(value_json),
                     "%s\"%s\":\"%s\"",
                     emitted ? "," : "", oi.fields[i].name, value_fs[i].value);
                 emitted++;
             }
-            snprintf(value_json + off, sizeof(value_json) - off, "}");
+            SB_APPEND(value_json, off, sizeof(value_json), "}");
 
             int dry = strcmp(extra_fs[1].value, "yes") == 0;
             int limv = atoi(extra_fs[0].value);

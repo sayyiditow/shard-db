@@ -2340,13 +2340,18 @@ int cmd_query(int port, int argc, char **argv) {
 
     /* Protocol: all args separated by Unit Separator (0x1F) */
     char buf[MAX_LINE * 2];
-    int pos = 0;
+    size_t pos = 0;
     for (int i = 0; i < argc; i++) {
-        if (i > 0) buf[pos++] = '\x1F';
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", argv[i]);
+        if (i > 0 && pos + 2 < sizeof(buf)) buf[pos++] = '\x1F';
+        SB_APPEND(buf, pos, sizeof(buf), "%s", argv[i]);
+    }
+    if (pos + 1 >= sizeof(buf)) {
+        fprintf(stderr, "Error: arg vector exceeds %zu bytes\n", sizeof(buf));
+        client_close(&cc);
+        return 1;
     }
     buf[pos++] = '\n';
-    if (client_send_all(&cc, buf, (size_t)pos) != 0) { client_close(&cc); return 1; }
+    if (client_send_all(&cc, buf, pos) != 0) { client_close(&cc); return 1; }
 
     char rbuf[8192];
     ssize_t n;
