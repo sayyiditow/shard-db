@@ -5,6 +5,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sayyiditow/shard-db/badge)](https://scorecard.dev/viewer/?uri=github.com/sayyiditow/shard-db)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12704/badge)](https://www.bestpractices.dev/projects/12704)
 [![Coverity Scan](https://scan.coverity.com/projects/33072/badge.svg)](https://scan.coverity.com/projects/sayyiditow-shard-db)
+[![codecov](https://codecov.io/gh/sayyiditow/shard-db/branch/main/graph/badge.svg)](https://codecov.io/gh/sayyiditow/shard-db)
 
 A high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3. ~2.7M K/V ops/sec single-thread; 38 search operators with index intersection planner; multi-tenant with scoped auth.
 
