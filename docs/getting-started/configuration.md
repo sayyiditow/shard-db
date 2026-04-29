@@ -15,13 +15,21 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `LOG_LEVEL` | `3` | `0`=off · `1`=errors · `2`=warnings · `3`=info · `4`=debug. |
 | `LOG_RETAIN_DAYS` | `7` | Auto-prune logs older than N days. `0` = keep forever. |
 | `INDEX_PAGE_SIZE` | `4096` | B+ tree page size in bytes (power of 2, 1024–65536). |
-| `THREADS` | `0` (auto) | Parallel scan thread count. `0` = number of online CPUs. |
-| `WORKERS` | `0` (auto) | Server worker thread pool. `0` = auto (CPU count, minimum 4). |
+| `THREADS` | `0` (auto) | Parallel-for worker pool — drives every parallel hot path (shard scans, indexed find/count/aggregate fan-out, parallel index builds, bulk-insert phase 2). `0` = `4 × nproc`, minimum 4. |
+| `WORKERS` | `0` (auto) | Server-worker pool that accepts connections + dispatches request handlers. `0` = auto (CPU count, minimum 4). |
+| `POOL_CHUNK` | `0` (auto) | parallel_for submission chunk size. `0` = `nproc`. Tasks are enqueued in chunks of this many; larger chunks reduce queue-lock contention but serialise concurrent submitters. Rarely needs tuning. |
 | `GLOBAL_LIMIT` | `100000` | Soft cap on result rows per query — use per-query `limit` for tighter bounds. |
-| `MAX_REQUEST_SIZE` | `33554432` (32 MB) | Maximum JSON request size per line. Oversized requests get `{"error":"Request too large (max N bytes)"}`. Every connection allocates a read buffer of this size. |
-| `FCACHE_MAX` | `4096` | Unified shard-mmap cache capacity (entries). See [Tuning](../operations/tuning.md). |
-| `BT_CACHE_MAX` | `256` | B+ tree mmap cache capacity (entries). |
+| `MAX_REQUEST_SIZE` | `33554432` (32 MB) | Maximum JSON request size per line. Oversized requests get `{"error":"Request too large (max N bytes)"}`. Every connection allocates a read buffer of this size, so total per-conn memory = N × `MAX_REQUEST_SIZE`. |
+| `FCACHE_MAX` | `4096` | Unified shard-mmap cache capacity (entries). **Strict allow-list:** `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning. See [Tuning](../operations/tuning.md). |
+| `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
+| `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap. Protects the daemon from one bad query monopolising RAM. The collect-hash buffer is a single mmap MAP_NORESERVE reservation up to this cap; pages lazy-commit on write. |
+| `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
+| `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
 | `SLOW_QUERY_MS` | `500` | Log queries slower than N ms to `slow-*.log` and the in-memory ring (`stats` endpoint). `0` = disable. Minimum 100 ms. |
+| `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. See [Operations → Deployment → Native TLS](../operations/deployment.md). |
+| `TLS_CERT` / `TLS_KEY` | (empty) | Server cert + private key paths (PEM). Required when `TLS_ENABLE=1`. |
+| `TLS_CA` | (empty) | Client-side CA bundle for verifying the server (defaults to OS trust store). |
+| `TLS_SKIP_VERIFY` | `0` | Client-side: `1` skips server cert verify (dev only — emits stderr warning). |
 
 Example:
 
@@ -39,8 +47,18 @@ export WORKERS=0
 export GLOBAL_LIMIT=100000
 export MAX_REQUEST_SIZE=33554432
 export FCACHE_MAX=4096
-export BT_CACHE_MAX=256
+# BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
+export QUERY_BUFFER_MB=500
+export TOKEN_CAP=1024
+export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500
+
+# Native TLS — leave TLS_ENABLE=0 unless terminating TLS in-process
+export TLS_ENABLE=0
+export TLS_CERT=""
+export TLS_KEY=""
+export TLS_CA=""
+export TLS_SKIP_VERIFY=0
 ```
 
 Every variable is optional; defaults apply when the file or a specific export is missing. Changes require a server restart.
@@ -120,9 +138,11 @@ $DB_ROOT/
       data/
         NNN.bin                    # Shard files (3 hex digits, max 0fff)
       indexes/
-        index.conf                 # List of indexed fields
-        <field>.idx                # B+ tree index file
-        <a>+<b>.idx                # Composite index
+        index.conf                          # List of indexed fields
+        <field>/                            # Per-field directory (per-shard btree layout)
+          NNN.idx                           #   Sharded B+ tree files, splits/4 of them
+        <a>+<b>/                            # Composite index — '+' joined name
+          NNN.idx
       files/                       # Stored files (put-file)
         XX/XX/<filename>           # Hash-bucketed by filename
   logs/
@@ -130,6 +150,8 @@ $DB_ROOT/
     error-YYYY-MM-DD.log
     slow-YYYY-MM-DD.log
 ```
+
+Each indexed field is split into `splits/4` btree files (e.g., `splits=64` → 16 idx-shards under `indexes/<field>/000.idx`..`00f.idx`). Writes route by record hash to a single shard; reads fan out across all shards in parallel.
 
 ## Next
 

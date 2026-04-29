@@ -1,6 +1,6 @@
 # Indexes
 
-shard-db indexes are **B+ trees with prefix-compressed leaves**, stored per-object under `<object>/indexes/`. Every one of the 17 search operators uses an index when one is available.
+shard-db indexes are **B+ trees with prefix-compressed leaves**, stored per-object under `<object>/indexes/<field>/<NNN>.idx` — each field's btree is split into `splits/4` shards (the **per-shard btree layout**, 2026.05.1+). Reads fan out across all shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every one of the 38 search operators uses an index when one is available (with a few intentional full-scan exceptions noted in [find → Operators](../query-protocol/find.md#operators)).
 
 ## When to add an index
 
@@ -19,7 +19,7 @@ Don't bother for tiny objects or fields with very low cardinality (`bool`, `acti
 {"mode":"add-index","dir":"acme","object":"invoices","field":"customer"}
 ```
 
-File created: `<obj>/indexes/customer.idx`.
+Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`splits/4` shards). For `splits=64`, that's 16 idx-shard files; for `splits=128`, 32 files; etc.
 
 ### Composite
 
@@ -29,7 +29,7 @@ Concatenate fields with `+`:
 {"mode":"add-index","dir":"acme","object":"invoices","field":"status+created"}
 ```
 
-File created: `<obj>/indexes/status+created.idx`.
+Directory created: `<obj>/indexes/status+created/<NNN>.idx`. The composite name (with `+`) becomes the directory; per-shard files inside.
 
 Composite indexes store the **concatenation** of the listed field values as the key. They accelerate queries that filter on the **leading prefix** of the composite — e.g., `status+created` helps `WHERE status=? AND created>?`, but not `WHERE created>?` alone.
 
@@ -107,5 +107,15 @@ After `remove-field`, any index referencing the tombstoned field is **automatica
 ## Inspecting indexes
 
 - `<obj>/indexes/index.conf` — authoritative list of registered indexes.
-- `<obj>/indexes/*.idx` — the B+ tree files themselves.
-- `stats` output includes B+ tree cache hit rate — low hit rate on a read-heavy workload suggests raising `BT_CACHE_MAX`.
+- `<obj>/indexes/<field>/<NNN>.idx` — per-shard B+ tree files (one directory per indexed field, `splits/4` files inside).
+- `stats` output includes B+ tree cache hit rate — low hit rate on a read-heavy workload suggests raising `FCACHE_MAX` (which derives `BT_CACHE_MAX = FCACHE_MAX/4` automatically as of 2026.05.1).
+
+## Why per-shard?
+
+Pre-2026.05.1 each field was one big `<field>.idx` file. The 2026.05.1 redesign sharded that into `splits/4` files because:
+
+1. **Concurrency hazard.** A writer doing `bulk_build` truncates and rewrites the file; a reader holding a private mmap saw inconsistent intermediate state. Per-file `pthread_rwlock_t` (one per shard) gives readers and writers proper isolation.
+2. **Read parallelism.** `find` / `count` / `aggregate` fan out across all shards via `parallel_for`; with 16 idx shards on a 16-core box, indexed lookups parallelise N-way for free.
+3. **Smaller per-file working set.** A 100M-row index that was 3 GB single-file becomes ~12 MB per shard at `splits=4096`. Easier on the page cache.
+
+The trade is more on-disk space (~20-25 % bloat from reduced prefix-compression effectiveness with smaller per-leaf working sets, plus 1.8 MB of empty-tree headers for the typical 14-index schema) and a structural cost on bulk-insert into pre-existing-indexed objects (each merge call hits 16 files instead of 1). For static schemas, **load-then-index** is now preferred over insert-with-pre-existing-indexes.

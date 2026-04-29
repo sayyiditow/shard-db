@@ -241,11 +241,13 @@ No DB migration step — schemas are per-object and live in `fields.conf`; the b
 
 Rough rules:
 
-| Workload | `WORKERS` | `FCACHE_MAX` | `BT_CACHE_MAX` | `MAX_REQUEST_SIZE` |
-|---|---|---|---|---|
-| Small (< 1 M records, internal tool) | auto | 4096 (default) | 256 (default) | 32 MB (default) |
-| Medium (1–10 M records, mixed read/write) | 16 | 8192 | 512 | 64 MB |
-| Large (10 M+, read-heavy) | 32 | 16384 | 2048 | 128 MB |
-| File-heavy (large uploads) | — | — | — | 128–256 MB |
+| Workload | `WORKERS` | `FCACHE_MAX` | `MAX_REQUEST_SIZE` |
+|---|---|---|---|
+| Small (< 1 M records, internal tool) | auto | 4096 (default) | 32 MB (default) |
+| Medium (1–10 M records, mixed read/write) | 16 | 8192 | 64 MB |
+| Large (10 M+, read-heavy) | 32 | 16384 | 128 MB |
+| File-heavy (large uploads) | — | — | 128–256 MB |
+
+`BT_CACHE_MAX` is **derived** as `FCACHE_MAX / 4` since 2026.05.1 — no separate knob. `FCACHE_MAX` accepts the strict allow-list `{4096, 8192, 12288, 16384}`.
 
 See [Operations → Tuning](tuning.md) for detail.

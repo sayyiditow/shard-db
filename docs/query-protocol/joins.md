@@ -68,7 +68,7 @@ Always tabular:
 - Left-join no-match emits `null` for all the join's columns.
 - `key` is always included for the driver; joined objects only emit the fields you list (or all if `fields` is omitted).
 
-The `format` parameter is **ignored** when `join` is present — always tabular.
+The `format` parameter is **ignored** for the JSON shape (always tabular). `format:"csv"` with `join` is **rejected** with `format=csv is not supported with join` — joins always emit the JSON `{columns, rows}` envelope. `cursor` pagination is also not supported with `join`; use `offset`/`limit`.
 
 ## Chaining
 

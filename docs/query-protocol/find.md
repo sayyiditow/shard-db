@@ -112,16 +112,22 @@ The planner selects automatically:
 
 | Shape | Example | Strategy |
 |---|---|---|
-| Pure AND | `[A, B]` | Primary-indexed-leaf scan (today's path). |
-| AND + OR, AND sibling indexed | `[{a*=x}, {or:[{b},{c}]}]` | AND leaf drives candidates; OR sub-tree evaluated per record. OR children don't need indexes. |
-| Pure OR, every child indexed | `[{or:[{a*=x},{b*=y}]}]` | Per-child B+ tree lookups unioned into a concurrent `KeySet` (xxh128 hashes, lock-free CAS inserts). Sublinear — no shard scan. |
-| OR with any non-indexed child | `[{or:[{a*=x},{b=y}]}]` | Full parallel shard scan + tree match. |
+| Single indexed leaf | `[A]` where A is indexed | Primary-indexed-leaf scan. |
+| **Pure AND, 2+ indexed leaves on rangeable ops** | `[{a=x}, {b>10}]` | **PRIMARY_INTERSECT** — walk each leaf's btree into a `KeySet`, intersect candidate hash sets, skip per-record fetch for `count`. Walks most-selective-first. Eligible ops: eq, lt, gt, lte, gte, between, in, starts. Caps at `MAX_INTERSECT_LEAVES=8`. |
+| Pure AND, mixed | `[{a=x}, {bio contains x}]` | Primary-indexed-leaf for the indexed sibling; the rest post-filter via `criteria_match_tree`. |
+| AND + OR, AND sibling indexed | `[{a=x}, {or:[{b},{c}]}]` | AND leaf drives candidates; OR sub-tree evaluated per record. OR children don't need indexes. |
+| Pure OR, every child indexed | `[{or:[{a=x},{b=y}]}]` | Per-child B+ tree lookups unioned into a lock-free `KeySet`. Sublinear — no shard scan. Pure-OR `count` returns `\|KeySet\|` directly. |
+| OR with any non-indexed child | `[{or:[{a=x},{b=y}]}]` (b not indexed) | Full parallel shard scan + tree match. |
 
 Hybrid (non-indexed AND + fully-indexed OR sub-tree) uses the KeySet as primary-candidate source and applies the AND siblings as a post-filter.
 
+Per-shard btree layout: each indexed field is sharded into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Reads fan out across all shards via the parallel-for pool; writes route by record hash to one shard.
+
 ## Operators
 
-Seventeen operators. Every one uses an index when the field is indexed.
+**38 operators.** Every operator uses an index when the field is indexed (with the exceptions noted below for full-scan ops). Composite indexes (`field1+field2`) only assist `eq`, `starts`, and `between`-via-prefix; substring/range ops on composites fall back to leaf scan.
+
+### Equality, range, set membership
 
 | Operator | Description | Applies to | Example |
 |---|---|---|---|
@@ -131,17 +137,53 @@ Seventeen operators. Every one uses an index when the field is indexed.
 | `gt` / `greater` | Strictly greater than | numeric, date, datetime | `{"field":"age","op":"gt","value":"18"}` |
 | `lte` / `less_eq` | `<=` | numeric, date, datetime | `{"field":"score","op":"lte","value":"999"}` |
 | `gte` / `greater_eq` | `>=` | numeric, date, datetime | `{"field":"score","op":"gte","value":"100"}` |
-| `between` | Inclusive range | numeric, date, datetime | `{"field":"age","op":"between","value":"18","value2":"65"}` |
+| `between` | Inclusive range | numeric, date, datetime, varchar (lexicographic) | `{"field":"age","op":"between","value":"18","value2":"65"}` |
 | `in` | Value in CSV set | all | `{"field":"status","op":"in","value":"active,pending"}` |
 | `nin` / `not_in` | Value not in set | all | `{"field":"role","op":"nin","value":"bot,test"}` |
-| `like` | Wildcard — `%` or `*` | varchar | `{"field":"name","op":"like","value":"Ali%"}` |
-| `nlike` / `not_like` | Wildcard negated | varchar | `{"field":"email","op":"nlike","value":"*@test.com"}` |
-| `contains` | Substring match | varchar | `{"field":"bio","op":"contains","value":"engineer"}` |
-| `ncontains` / `not_contains` | Not substring | varchar | `{"field":"bio","op":"ncontains","value":"spam"}` |
-| `starts` / `starts_with` | Prefix match | varchar | `{"field":"email","op":"starts","value":"admin"}` |
-| `ends` / `ends_with` | Suffix match | varchar | `{"field":"email","op":"ends","value":".org"}` |
 | `exists` | Field present / non-empty | all | `{"field":"phone","op":"exists"}` |
-| `nexists` / `not_exists` | Field missing / empty | all | `{"field":"deleted_at","op":"nexists"}` |
+| `nexists` / `not_exists` | Field missing / empty | all | `{"field":"deleted_at","op":"nexists"}` (forces full scan — missing fields aren't in the index) |
+
+### Varchar matching — case-sensitive (default)
+
+| Operator | Description | Notes |
+|---|---|---|
+| `like` | Wildcard — `%` or `*` | Indexed shortcut: `"foo"` (no `%`) → point lookup; `"foo%"` → prefix range; `"%foo"` / `"%foo%"` → leaf scan |
+| `nlike` / `not_like` | Wildcard negated | Leaf scan |
+| `contains` | Substring match | Leaf scan with per-entry filter |
+| `ncontains` / `not_contains` | Not substring | Leaf scan |
+| `starts` / `starts_with` | Prefix match | Indexed prefix range scan |
+| `ends` / `ends_with` | Suffix match | Leaf scan |
+
+### Varchar matching — case-insensitive (ASCII tolower)
+
+`ilike`, `not_ilike`, `icontains`, `not_icontains`, `istarts`, `iends` — same semantics as their case-sensitive counterparts but `tolower` per byte before compare. Always leaf scan (no prefix shortcut).
+
+### Length filters (varchar only — answered from btree leaf entry's vlen, no record fetch)
+
+| Operator | Example |
+|---|---|
+| `len_eq` | `{"field":"name","op":"len_eq","value":"5"}` |
+| `len_neq` | `{"field":"name","op":"len_neq","value":"5"}` |
+| `len_lt`, `len_gt`, `len_lte`, `len_gte` | `{"field":"bio","op":"len_lt","value":"10"}` |
+| `len_between` | `{"field":"name","op":"len_between","value":"3","value2":"8"}` |
+
+### Field-vs-field (compare two fields on the same record — full scan only)
+
+| Operator | Example |
+|---|---|
+| `eq_field`, `neq_field` | `{"field":"createdAt","op":"eq_field","value":"updatedAt"}` |
+| `lt_field`, `gt_field`, `lte_field`, `gte_field` | `{"field":"used","op":"gt_field","value":"limit"}` |
+
+The RHS is per-record so no btree shortcut is possible — these always full-scan.
+
+### Regex (POSIX extended regex on varchar — full scan only)
+
+| Operator | Example |
+|---|---|
+| `regex` | `{"field":"sku","op":"regex","value":"^[A-Z]{2}-[0-9]{4}$"}` |
+| `not_regex` | `{"field":"phone","op":"not_regex","value":"^\\+1"}` |
+
+Compiled once at criteria-parse time; matched per record with `REG_STARTEND` on the hot path. Indexed fields could in theory walk leaves only, but the per-entry `regexec` cost dominates the saving from skipping record fetch — kept on the full-scan path.
 
 ### Value formatting
 
@@ -165,6 +207,34 @@ Types are enforced: passing a non-numeric string to `gt` on an `int` field retur
 - Not compatible with `join` — tabular join output doesn't sort.
 
 For streaming through large results in an arbitrary order, use `fetch` with keyset `cursor` pagination instead.
+
+## Cursor pagination (keyset)
+
+For deep pagination on large result sets, offset-based paging pays `O(matches)` per page (the buffer-sort path above). A cursor driven off an indexed `order_by` field is **`O(limit)` regardless of page depth**.
+
+```json
+// Page 1 — signal cursor pagination with cursor:null (or cursor:{})
+{"mode":"find","dir":"t","object":"orders",
+ "criteria":[{"field":"status","op":"eq","value":"paid"}],
+ "order_by":"amount","order":"asc","limit":100,"cursor":null}
+
+// Response wraps rows and emits the next-page cursor
+{"rows":[...], "cursor":{"amount":"500.00","key":"ord_4912"}}
+
+// Page N+1 — hand back the previous page's cursor verbatim
+{"mode":"find", ..., "order_by":"amount","limit":100,
+ "cursor":{"amount":"500.00","key":"ord_4912"}}
+
+// Last page returns "cursor":null
+```
+
+Rules:
+- `order_by` field **must be indexed** — cursor queries reject otherwise with a clear error.
+- Cursor tie-breaks on `hash16(primary_key)` when multiple rows share the same `order_by` value, so pagination is stable across ties.
+- `cursor:null` or `cursor:{}` in the request opts into cursor mode (page 1, walks from start/end).
+- Omitting `cursor` entirely keeps backward-compat behaviour (unwrapped array, buffer-sort for `order_by`).
+- `format:"csv"` and `join` are not supported with cursor — use the non-cursor `find` path for those.
+- ASC + DESC both supported; the server-side k-way merge across per-shard btree iterators reconstructs global order.
 
 ## Projection
 

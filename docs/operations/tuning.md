@@ -6,15 +6,16 @@ What to change in `db.env` and when. Pair with [`stats`](../query-protocol/diagn
 
 ```bash
 # db.env
-export THREADS=0            # auto = online CPU count
+export THREADS=0            # auto = 4 × nproc, min 4
 export WORKERS=0            # auto = max(CPU count, 4)
-export FCACHE_MAX=4096      # raise if shard-mmap cache hit rate < 90%
-export BT_CACHE_MAX=256     # raise if B+ tree cache hit rate < 90%
+export FCACHE_MAX=4096      # raise if shard-mmap cache hit rate < 90%; allow-list {4096, 8192, 12288, 16384}
+# BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX/4 (2026.05.1+)
 export MAX_REQUEST_SIZE=33554432   # 32 MB; per-connection read buffer (memory planning!)
+export QUERY_BUFFER_MB=500         # per-query intermediate buffer cap (collect-hash, KeySet, etc.)
 export GLOBAL_LIMIT=100000         # soft result-set cap
-export SLOW_QUERY_MS=500           # slow query threshold
-export TIMEOUT=0                   # statement timeout (seconds, 0=off)
-export INDEX_PAGE_SIZE=4096        # B+ tree page size (power-of-2)
+export SLOW_QUERY_MS=500           # slow query threshold (floor 100 ms)
+export TIMEOUT=0                   # statement timeout (seconds, 0=off; per-request `timeout_ms` overrides)
+export INDEX_PAGE_SIZE=4096        # B+ tree page size (power-of-2, 1024–65536)
 ```
 
 Only change what the data says to change.
@@ -39,26 +40,22 @@ Number of threads servicing incoming connections.
 
 When to care: `stats` shows `active_threads` consistently at the cap. Usually not the bottleneck — threads are cheap; memory and disk are the limits.
 
-## FCACHE_MAX — unified shard mmap cache
+## FCACHE_MAX — unified shard mmap cache (drives `BT_CACHE_MAX` too)
 
-Capacity (in entries, not bytes) of the shared shard mmap cache (`ucache`). Every entry is one shard's mmap region.
+Capacity (in entries, not bytes) of the shared shard mmap cache (`ucache`). Every entry is one shard's mmap region. Since 2026.05.1, `BT_CACHE_MAX` is **derived** from this as `FCACHE_MAX / 4` and is no longer configurable on its own.
 
-- **Default 4096**.
-- Each object has `splits` shards; cache needs at least the working set.
-- Raise if `ucache.hits / (hits + misses) < 90%` for read-heavy workloads.
-- Lower if memory is tight — LRU evicts on demand.
+- **Default 4096** (so `bt_cache` capacity = 1024).
+- Strict allow-list: `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning.
+- Each object has `splits` shards in `ucache`, plus `splits/4` per-field idx files in `bt_cache` (per-shard btree layout).
+- Raise if either `ucache.hits / (hits + misses) < 90%` (read-heavy) **or** `bt_cache.hits / (hits + misses) < 90%` (indexed-query heavy).
+- Lower not possible — `4096` is the floor of the allow-list.
 
-When to care: you have many objects × many splits, and query latency is higher than expected. Sum `objects × avg(splits)` across all dirs to size.
+When to care:
+- Many objects × many splits, with query latency higher than expected.
+- Sum `objects × avg(splits)` for ucache sizing; `objects × avg(indexes) × avg(splits/4)` for bt_cache sizing.
+- Bumping `FCACHE_MAX` from 4096 → 8192 doubles both caches. With 100 objects × 64 splits × 14 indexes, the per-shard layout creates 100 × 64 + 100 × 14 × 16 = 28 800 mmap entries — comfortably above 4096; bump to 16384 for full residency.
 
-## BT_CACHE_MAX — B+ tree mmap cache
-
-Capacity of the per-index B+ tree mmap cache. Separate from `ucache` because indexes have different access patterns.
-
-- **Default 256**.
-- Each entry is one `.idx` file's mmap.
-- Raise if `bt_cache.hits / (hits + misses) < 90%` and you have many indexed queries.
-
-When to care: you have many objects × many indexes. With 10 objects × 5 indexes each = 50 index files, the default 256 is fine. At 1000+ index files, raise.
+`BT_CACHE_MAX` set in db.env is **ignored** with a stderr warning.
 
 ## MAX_REQUEST_SIZE — per-request ceiling
 
@@ -103,9 +100,20 @@ Seconds before a long-running query is cancelled cooperatively. Checked every 10
 
 - **Default 0** = disabled.
 - Recommended: set to a protective upper bound (e.g., 30 seconds) to prevent stuck queries blocking worker threads.
-- Does not apply to writes — only to scans.
+- Per-request `"timeout_ms":N` overrides for `find` / `count` / `aggregate` / `bulk-delete` / `bulk-update`. Use a tight `timeout_ms` for interactive callers without lowering the global default.
+- Applies to scans + bulk-update/delete; does not apply to single-record writes.
 
-Response on timeout: `{"error":"Query deadline exceeded"}`.
+Response on timeout: `{"error":"query_timeout"}`.
+
+## QUERY_BUFFER_MB — per-query memory cap
+
+Upper bound on intermediate buffers any single query can hold — collect-hash arrays, KeySets (OR union, AND intersection), aggregate hash tables, ordered-find sort buffers, bulk-delete/update key lists.
+
+- **Default 500 MB**.
+- Checked at every collection site. Exceeding triggers `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
+- Peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10–15% higher from malloc overhead).
+
+When to care: heavy ad-hoc analytics that legitimately need bigger working sets. Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, `ulimit -v`) as a backstop.
 
 ## INDEX_PAGE_SIZE — B+ tree page size
 

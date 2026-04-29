@@ -7,6 +7,7 @@ shard-db is multi-threaded: a worker thread pool services TCP connections, scan 
 | Scope | Lock type | Purpose |
 |---|---|---|
 | Per ucache entry (one shard mmap) | rwlock | Readers share; a writer takes exclusive. |
+| Per bt_cache entry (one btree mmap) | rwlock | Same model, separate cache. One entry per per-shard idx file. |
 | Per object (logical) | rwlock ("objlock") | Normal ops take read; schema mutations take write. |
 | Global maps (schemas, indexes, dirs) | mutex | Short-held, protects cache-lookup structures. |
 | Process wide | atomic counters | `in_flight_writes`, `active_threads` — no locks, just atomics. |
@@ -19,6 +20,12 @@ Every mmapped shard file has its own rwlock. This is the hot path for both reads
 - **Writes** (`insert`, `update`, `delete`, index updates) take **exclusive** (write) on the shard they're modifying. A writer blocks readers only on that one shard.
 
 Because records route by `hash[0..1] % splits`, an insert/update/delete touches exactly one shard. Other shards remain fully concurrent. Full scans parallelize across shards — one thread per shard group — and each thread locks only the shard it's reading.
+
+## Per-bt_cache-entry rwlock (per-shard btree, 2026.05.1+)
+
+Each indexed field is sharded into `splits/4` btree files (`<obj>/indexes/<field>/<NNN>.idx`). Every btree file has its own rwlock — same model as ucache, separate cache (`BT_CACHE_MAX = FCACHE_MAX/4`, derived). Writes route by record hash to a single idx-shard; reads fan out across all shards in parallel via the `parallel_for` worker pool.
+
+This was the central reason for the per-shard layout. Pre-2026.05.1, a single `<field>.idx` file meant `bulk_build` (which truncates and rewrites the whole file) raced against in-flight readers holding an mmap of intermediate state. Per-file rwlocks give writers and readers proper isolation, and the parallel fan-out turns indexed lookups into N-way concurrent btree probes for free.
 
 ## Per-object rwlock ("objlock")
 
@@ -60,11 +67,15 @@ For indexed multi-criteria, `parallel_indexed_count` / `parallel_indexed_agg` wa
 
 ## Parallel index build
 
-`cmd_add_indexes` with multiple fields does a **single** shard scan and emits tuples to per-field sort buffers in parallel. Then builds all B+ trees in parallel (one pthread per index).
+`cmd_add_indexes` with multiple fields does a **single** shard scan and emits tuples to per-field sort buffers in parallel. Then runs **one worker per indexed field** (`idx_build_field_worker`) — each worker buckets entries by idx-shard locally and merges them sequentially. Replaces the pre-2026.05.1 dispatch shape (14 fields × 16 idx-shards = 224 tasks) with a flat 14-task fan-out — fewer queue contention points, same total work.
 
 ## Statement timeout
 
-Set `TIMEOUT=<seconds>` in db.env. Every scan loop calls `query_deadline_tick()` every 1024 iterations — a coarse monotonic-clock check. When exceeded, the query returns `{"error":"Query deadline exceeded"}`. Precision is milliseconds-accurate for long scans, but the check granularity means a query finishes its current 1024-record chunk before actually stopping.
+Set `TIMEOUT=<seconds>` in db.env for a global default, or pass `"timeout_ms":N` per request to override. Every scan loop calls `query_deadline_tick()` every 1024 iterations — coarse monotonic-clock check. When exceeded, the query returns `{"error":"query_timeout"}`. Precision is millisecond-accurate for long scans; the check granularity means a query finishes its current 1024-record chunk before actually stopping.
+
+## Per-query memory cap
+
+`QUERY_BUFFER_MB` (default 500) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`. Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
 
 ## Crash consistency
 

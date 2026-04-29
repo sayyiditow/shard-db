@@ -5,7 +5,7 @@ A conceptual walkthrough of what lives on disk when you insert a record. For the
 ## Objects, shards, slots
 
 - An **object** is shard-db's table. Every object has a typed schema (`fields.conf`), one or more shard files, optional indexes, and a directory for stored files.
-- A **shard** is one `.bin` file under `<object>/data/`. Objects start with `splits` shards (4 by default, 4096 maximum — the 3-hex-digit filename `NNN.bin` caps this at `MAX_SPLITS`).
+- A **shard** is one `.bin` file under `<object>/data/`. `splits` is configured per-object and locked to a power of 2 in `{16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` (`MAX_SPLITS`); default is 16 when `create-object` doesn't pass `splits`. The 3-hex-digit filename (`NNN.bin`) caps the count at 4096.
 - A **slot** is a single record position within a shard. Shards start at 256 slots each and grow dynamically.
 
 ### Record routing
@@ -109,7 +109,7 @@ See [Concepts → Concurrency](concurrency.md) for the full locking model.
 
 ## Indexes (separate from the shard file)
 
-Indexes live in `<object>/indexes/<field>.idx` as B+ trees with prefix-compressed leaves. When a query can use an index, the server reads **only** the index + the matching slots' headers, never scanning unmatched shards. Full detail: [Concepts → Indexes](indexes.md).
+Indexes live in `<object>/indexes/<field>/<NNN>.idx` as B+ trees with prefix-compressed leaves — each indexed field is **sharded into `splits/4` files** (per-shard btree layout, 2026.05.1+) so reads fan out across all shards via the parallel-for pool. When a query can use an index, the server reads only the relevant idx-shards' leaves + the matching slots' headers, never scanning unmatched data shards. Full detail: [Concepts → Indexes](indexes.md).
 
 ## Files (stored blobs, not records)
 

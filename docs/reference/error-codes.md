@@ -19,7 +19,8 @@ Clients should match on the `error` string, not on the full message.
 | `Cannot connect to port N` | Server not running or wrong port. | Check `./shard-db status`, verify `PORT` in `db.env`. |
 | `Server shutting down` | Sent during graceful stop while draining. | Retry against the new instance or wait for restart. |
 | `Request too large (max N bytes)` | JSON request exceeded `MAX_REQUEST_SIZE`. | Split into smaller requests, or raise `MAX_REQUEST_SIZE`. |
-| `Query deadline exceeded` | Query took longer than `TIMEOUT` (when set). | Add filters, add an index, raise `TIMEOUT`. |
+| `query_timeout` | Query exceeded `TIMEOUT` (db.env) or per-request `timeout_ms`. | Add filters, add an index, raise the timeout. |
+| `query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor` | Query intermediate buffers crossed `QUERY_BUFFER_MB`. | Narrow `criteria`, add `limit`, or stream via `fetch` + cursor. |
 
 ### Validation
 
@@ -79,8 +80,12 @@ The `remove-index` response `{"status":"not_indexed","field":"x"}` is **not an e
 
 | `error` | Cause | Recovery |
 |---|---|---|
-| `Unauthorized` | Non-allowlisted IP without a valid token. | Add token or IP allowlist entry. |
-| `Invalid token` | Token not in `tokens.conf`. | Rotate or re-add. |
+| `auth failed` | No matching token, IP not allowlisted, or token's scope/perm doesn't cover the request. | Check token scope (`global`/tenant/object), permission (`r`/`rw`/`rwx`), and the request's `dir`/`object`. |
+| `object scope requires dir` | `add-token` with `object` but no `dir`. | Provide both. |
+| `invalid perm: must be r, rw, or rwx` | `add-token` with an unrecognized perm. | Use `r`, `rw`, or `rwx`. |
+| `object not found: <dir>/<obj>` | `add-token` referencing a non-existent object. | Create the object first. |
+| `invalid dir name (no /,\\,..,control chars; max 64 bytes)` | `add-dir` with an unsafe name. | Use `[a-zA-Z0-9_-]`, ≤ 64 bytes. |
+| `dir is not empty — drop objects first or pass check_empty:false` | `remove-dir` while objects still live under the tenant. | Truncate/remove objects, or pass `check_empty:false`. |
 
 ## Non-error status values
 

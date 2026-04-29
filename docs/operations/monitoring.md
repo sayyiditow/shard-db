@@ -35,7 +35,7 @@ Key metrics to scrape:
 | `connections.active` | Near `WORKERS` cap for extended periods. |
 | `in_flight_writes` | Stays elevated (> 0) when traffic is idle — indicates stuck writes. |
 | `ucache.hits / (hits + misses)` | Drops below 90% on a read-heavy workload — raise `FCACHE_MAX`. |
-| `bt_cache.hits / (hits + misses)` | Drops below 90% on indexed queries — raise `BT_CACHE_MAX`. |
+| `bt_cache.hits / (hits + misses)` | Drops below 90% on indexed queries — raise `FCACHE_MAX` (bt_cache is derived as `FCACHE_MAX/4` since 2026.05.1; not separately configurable). |
 | `slow_queries[].duration_ms` | Any cross their SLO. |
 
 ### 2. Slow query log
@@ -77,33 +77,40 @@ Set `LOG_RETAIN_DAYS=0` to disable auto-prune and use logrotate instead (see [De
 
 ## Scraping into Prometheus
 
-shard-db doesn't speak Prometheus natively. Two options:
+shard-db speaks Prometheus text-format natively via `stats-prom`. Two integration shapes:
 
-### A. Textfile exporter
-
-Scrape `stats` periodically and write it as a Prometheus textfile:
+### A. Native `stats-prom` → textfile exporter
 
 ```bash
 # /usr/local/bin/shard-db-metrics.sh
 #!/bin/bash
-STATS=$(echo '{"mode":"stats"}' | nc -q1 localhost 9199)
-cat <<EOF > /var/lib/node_exporter/textfile/shard_db.prom.$$
-shard_db_uptime_ms $(echo "$STATS" | jq .uptime_ms)
-shard_db_connections_active $(echo "$STATS" | jq .connections.active)
-shard_db_in_flight_writes $(echo "$STATS" | jq .in_flight_writes)
-shard_db_ucache_hits $(echo "$STATS" | jq .ucache.hits)
-shard_db_ucache_misses $(echo "$STATS" | jq .ucache.misses)
-shard_db_bt_cache_hits $(echo "$STATS" | jq .bt_cache.hits)
-shard_db_bt_cache_misses $(echo "$STATS" | jq .bt_cache.misses)
-EOF
-mv /var/lib/node_exporter/textfile/shard_db.prom.$$ /var/lib/node_exporter/textfile/shard_db.prom
+TMP=/var/lib/node_exporter/textfile/shard_db.prom.$$
+echo '{"mode":"stats-prom"}' | nc -q1 localhost 9199 \
+  | sed -e 's/\x00//g' > "$TMP"
+mv "$TMP" /var/lib/node_exporter/textfile/shard_db.prom
 ```
 
-Run via cron or systemd timer (every 30 s is ample). Node exporter with `--collector.textfile` picks it up.
+Run via cron or systemd timer (every 30 s is ample). Node exporter with `--collector.textfile` picks it up. The output is already in Prometheus exposition format — no jq, no per-metric assembly.
+
+CLI shortcut:
+
+```bash
+./shard-db stats-prom > /var/lib/node_exporter/textfile/shard_db.prom
+```
 
 ### B. Dedicated exporter
 
-Write a small Python / Go daemon that opens a long-lived connection, polls `stats`, and exposes `/metrics`. Slightly more work, cleaner.
+Tiny Python / Go daemon that opens a long-lived connection, runs `stats-prom` on each scrape, and exposes `/metrics` directly. Saves the textfile dance and keeps the connection warm.
+
+### Metrics emitted
+
+`stats-prom` exposes:
+- `shard_db_uptime_seconds`, `shard_db_active_threads`, `shard_db_in_flight_writes`
+- `shard_db_ucache_used` / `_capacity` / `_bytes` / `_hits_total` / `_misses_total`
+- `shard_db_bt_cache_used` / `_capacity` / `_bytes` / `_hits_total` / `_misses_total`
+- `shard_db_slow_query_threshold_milliseconds`, `shard_db_slow_query_total`
+
+All counters use the `_total` convention; gauges have the unit in the name where applicable.
 
 ## Alerting rules (starter set)
 

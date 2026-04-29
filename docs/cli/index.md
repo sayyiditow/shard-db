@@ -4,6 +4,8 @@ Every `./shard-db <cmd>` subcommand in one place. Shortcuts for the common opera
 
 All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk to the running server over TCP at `$PORT`. Start the server first.
 
+> **Looking for a TUI?** [`shard-cli`](shard-cli.md) is a separate ncurses binary built alongside `shard-db` — full menu-driven access to every JSON mode (browse / query / schema / maintenance / auth / stats), no JSON typing required.
+
 ## Lifecycle
 
 | Command | Args | Description |
@@ -71,9 +73,11 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | Command | Args | Description |
 |---|---|---|
 | `stats` | — | Global snapshot: uptime, active connections, in-flight writes, cache hit rates, recent slow queries. Prints as table. |
+| `stats-prom` | — | Same counters as `stats`, rendered as Prometheus text-format exposition. Wire to your scrape pipeline. |
 | `shard-stats` | `[dir] [obj]` | Per-shard load table. Without args, shows all objects; with one arg, all objects in that dir; with both, just that object. |
 | `db-dirs` | — | List registered tenant directories (from `dirs.conf`). |
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
+| `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `splits/4` shard count. No args = all tenants. |
 
 ## JSON query mode
 

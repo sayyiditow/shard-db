@@ -102,9 +102,17 @@ On success the server bumps `version` via the sequence, and `updated` via `auto_
 
 Multiple workers racing to claim: exactly one wins.
 
+## CAS on bulk operations
+
+`bulk-insert`, `bulk-update`, and `bulk-delete` all carry CAS semantics in addition to the per-record forms:
+
+- `bulk-insert` with `if_not_exists:true` — existing keys are skipped (response gets `"skipped":N`), not overwritten. Pure-idempotent bulk load.
+- `bulk-update` with `criteria` + `if` per record — see [Bulk → bulk-update](bulk.md#bulk-update). Combine with `dry_run:true` to preview.
+- `bulk-delete` with `if` per record — see [Bulk → bulk-delete](bulk.md#bulk-delete).
+
 ## Dry-run
 
-Only `bulk-update` and `bulk-delete` support `dry_run:true`. Single-record CAS writes always execute — the check is the atomic part, not a preview.
+Only `bulk-update` and `bulk-delete` (criteria form) support `dry_run:true`. Single-record CAS writes always execute — the check is the atomic part, not a preview.
 
 ## `condition_not_met` response
 

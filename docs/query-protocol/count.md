@@ -17,8 +17,10 @@ Returns the number of records matching the criteria, without materializing any r
 ## Cost
 
 - **Single-criterion indexed path** — uses `idx_count_cb`, the inline index-walk counter. Zero record fetches — O(1) per B+ tree hit. Fastest path.
-- **Multi-criterion indexed** — primary index picks candidates, other criteria filter via the criteria tree (`criteria_match_tree`). Still fast because Zone B is read only for candidates that survive the primary index.
-- **Pure-OR (all children indexed)** — B+ tree lookups unioned into a `KeySet`; count = `|KeySet|`. **No record fetch, no per-record match.** Fastest multi-condition path.
+- **`neq` algebraic shortcut** — `count(neq X)` rewrites to `count(*) - count(eq X)`: two cheap counts instead of a near-everything scan. Same trick applies inside `aggregate`.
+- **AND of indexed leaves** — `PRIMARY_INTERSECT` planner branch (2026.05+). Each leaf's btree walks into a `KeySet` (xxh128 hashes, lock-free CAS inserts), sets intersect, and the count is just `|result|` — **no per-record fetch**. Big win when the intersection is small. See [find → AND index intersection](find.md#and-index-intersection).
+- **Mixed AND (indexed + non-indexed)** — primary index picks candidates, other criteria filter via the criteria tree (`criteria_match_tree`). Still fast because Zone B is read only for candidates that survive the primary index.
+- **Pure-OR (all children indexed)** — B+ tree lookups unioned into a `KeySet`; count = `|KeySet|`. **No record fetch, no per-record match.**
 - **Full scan** — parallel per-shard Zone A walk. 2–3 ms on 1 M records.
 
 See [find → OR criteria](find.md) for the full planner table.

@@ -31,10 +31,19 @@ File content is the same JSON array (not NDJSON — one big array).
 - `"id"` — the record key.
 - `"data"` — an object whose fields match the typed schema.
 
+### Upsert semantics
+
+`bulk-insert` is a **true upsert**: if a key already exists, its record is overwritten and any stale index entries pointing at the old value are dropped before the new entry is written. Pass `"if_not_exists": true` to make it idempotent (existing keys are skipped, response includes `"skipped":N`).
+
 ### Response
 
 ```json
 {"count": 10000}
+```
+
+With `if_not_exists` and pre-existing keys:
+```json
+{"count": 9997, "skipped": 3}
 ```
 
 If any records were rejected (type mismatch, missing required field, etc.):
@@ -44,8 +53,9 @@ If any records were rejected (type mismatch, missing required field, etc.):
 
 ### Performance
 
-- **Single-request bulk loads** — ~130 k inserts/sec on a typical laptop for 1 M records (see the README performance table).
-- **Parallel index build** — one pthread per indexed field, sharing a single shard scan. Much faster than adding indexes after bulk-insert.
+- **Single-request bulk loads** — ~117 k records/sec single-thread on the invoice schema (1 M records, 14 indexes, splits=64). Add-indexes-from-scratch ≈ 350 k records/sec equivalent. See the README performance tables for the full set.
+- **Parallel index build** — one worker per indexed field, each streaming the per-shard merges sequentially within the worker (per-shard btree layout, 2026.05.1+). 14 fields × `splits/4` shards run as 14 dispatched tasks.
+- **Indexed bulk-insert chunk-size guidance** — for parallel inserts into a pre-existing-indexed object, prefer **fewer, larger** bulk-insert calls. Each call triggers a sequential `bulk_merge` per (field, shard); cumulative work scales `O(R²)` in request count `R`. At 1 M records, **5 connections × 200 K each** is the sweet spot. Bigger chunks always win on the indexed path.
 
 ### Pattern: load + index in one go
 

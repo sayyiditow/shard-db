@@ -195,13 +195,18 @@ Scripts self-resolve to the repo root regardless of CWD and start/stop the serve
 ./build.sh
 ```
 
-Or manually:
+Builds two binaries into `build/bin/`:
+
+- **`shard-db`** — the daemon (~324 K stripped). The TCP server, the CLI, everything you actually need to run a database.
+- **`shard-cli`** — a separate ncurses TUI (~60 K stripped) that connects to the daemon over the same TCP+TLS wire as the CLI. Menu-driven access to every JSON mode (Server / Browse / Query / Schema / Maintenance / Auth / Stats) — no hand-typing JSON. Sources `db.env` for `HOST` / `PORT` / `TLS_*` / `TOKEN`.
+
+The build also drops `db.env.example` (rename to `db.env` and edit before first start; `db.env` is never overwritten).
+
+Manual build:
 
 ```bash
-gcc -O2 -o shard-db src/*.c -Isrc -lpthread
+gcc -O2 -o shard-db src/db/*.c -Isrc/db -lpthread
 ```
-
-Output goes to `build/` with a default `db.env` and `schema.conf`.
 
 ## Configuration (db.env)
 

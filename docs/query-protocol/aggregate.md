@@ -108,7 +108,9 @@ Multiple `having` clauses are AND-combined.
 
 - **Whole-table, no criteria** — O(N) scan of every record. Parallelized across shards.
 - **With criteria** — same as [`find`](find.md): indexed candidate scan + per-record typed comparison.
-- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit.
+- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit. Per-worker hash tables fold into a global table at the end (lock-free hot path).
+- **AND of indexed leaves** — uses the same `PRIMARY_INTERSECT` planner branch as `find`/`count`: each leaf's btree walks into a `KeySet`, the sets intersect, and aggregation streams the survivors only. Order-of-magnitude wins when the intersection is far smaller than any single leaf's candidate set. See [find → AND index intersection](find.md#and-index-intersection).
+- **NEQ algebraic shortcut** — `count(neq X)` is rewritten internally as `count(*) - count(eq X)`, turning a near-everything scan into two cheap counts. Applies inside `aggregate` too when the only criterion on an indexed field is `neq`.
 
 Typical latency on 1 M records: 1–3 ms for indexed, 2–10 ms for full scans with aggregation.
 

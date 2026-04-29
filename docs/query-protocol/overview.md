@@ -47,7 +47,21 @@ From trusted IPs (`allowed_ips.conf` + default localhost), no credential is requ
 {"mode":"get","dir":"default","object":"users","key":"u1","auth":"<token>"}
 ```
 
-Tokens are stored in `$DB_ROOT/tokens.conf`. See [Getting started → Configuration](../getting-started/configuration.md).
+Tokens carry both **scope** (global / per-tenant / per-object) and **permission** (`r` / `rw` / `rwx`). See [Concepts → Multi-tenancy](../concepts/multi-tenancy.md) for the full model and [Getting started → Configuration](../getting-started/configuration.md) for file layout.
+
+## Native TLS
+
+Set `TLS_ENABLE=1` (plus `TLS_CERT` / `TLS_KEY`) in db.env to require TLS 1.3 on `PORT`. Plaintext clients are rejected at handshake. Reverse-proxy termination (nginx `stream`, HAProxy, stunnel) remains supported as the alternative. Details: [Operations → Deployment](../operations/deployment.md).
+
+## Per-request timeout
+
+Any query can override the global `TIMEOUT` (db.env) for itself:
+
+```json
+{"mode":"find", ..., "timeout_ms": 200}
+```
+
+Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or absent → falls back to the global. Use it to give specific callers tighter deadlines without reconfiguring the server.
 
 ## Modes at a glance
 
@@ -72,16 +86,16 @@ Tokens are stored in `$DB_ROOT/tokens.conf`. See [Getting started → Configurat
 - [`add-index`](index-management.md), [`remove-index`](index-management.md)
 
 ### Files
-- [`put-file`](files.md), [`get-file`](files.md), `get-file-path`
+- [`put-file`](files.md), [`get-file`](files.md), `get-file-path`, `delete-file`, [`list-files`](diagnostics.md#list-files)
 
 ### Sequences (monotonic counters)
 - `sequence` — `action: init | next | current | reset`; optional `batch` for bulk allocation
 
 ### Diagnostics
-- [`stats`](diagnostics.md), `shard-stats`, `db-dirs`, `vacuum-check`
+- [`stats`](diagnostics.md#stats), [`stats-prom`](diagnostics.md#stats-prom), [`shard-stats`](diagnostics.md#shard-stats), [`db-dirs`](diagnostics.md#db-dirs), [`vacuum-check`](diagnostics.md#vacuum-check), [`list-objects`](diagnostics.md#list-objects), [`describe-object`](diagnostics.md#describe-object)
 
-### Auth admin (trusted-IP only)
-- `add-token`, `remove-token`, `list-tokens`, `add-ip`, `remove-ip`, `list-ips`
+### Auth admin (server scope: trusted-IP or global rwx token)
+- `add-token`, `remove-token`, `list-tokens`, `add-ip`, `remove-ip`, `list-ips`, `add-dir`, `remove-dir`
 
 ## `get` — the simplest round-trip
 
@@ -194,7 +208,7 @@ echo '{"mode":"get","dir":"default","object":"users","key":"u1"}' | nc -q1 local
 
 ## Where to go
 
-- [`find`](find.md) — the most-used query mode; all 17 operators, joins, sorting, projection.
+- [`find`](find.md) — the most-used query mode; all 38 operators, joins, sorting, projection, cursor pagination.
 - [`aggregate`](aggregate.md) — group-by + having.
 - [CAS](cas.md) — conditional writes.
 - [Bulk](bulk.md) — bulk-insert, bulk-update, bulk-delete.

@@ -159,6 +159,39 @@ Same filename rules as `put-file` / `get-file` — `{"error":"invalid filename"}
 ./shard-db delete-file <dir> <obj> <filename>
 ```
 
+## list-files
+
+Paginated, alphabetical inventory of stored files for one object. Optional `prefix` filter, returns total + page.
+
+### Shape
+
+```json
+{
+  "mode":"list-files",
+  "dir":"<dir>",
+  "object":"<obj>",
+  "prefix":"2026-",
+  "offset":0,
+  "limit":100
+}
+```
+
+- `prefix` — optional. Filters by filename prefix (byte-exact).
+- `offset` / `limit` — standard pagination. `limit` defaults to `GLOBAL_LIMIT` when absent or 0.
+
+### Response
+
+```json
+{
+  "files": ["2026-01-summary.pdf","2026-02-summary.pdf", ...],
+  "total": 245,
+  "offset": 0,
+  "limit": 100
+}
+```
+
+`total` is the unpaginated match count (after `prefix` filtering, before pagination). Walking the `XX/XX` bucket tree is O(file count) — fine for filestores up to ~1M files. Beyond that, maintain your own index in a regular object.
+
 ## Filename rules
 
 Enforced by `valid_filename()`:
@@ -212,6 +245,5 @@ md5sum /home/me/Invoice-001.pdf /tmp/invoice.pdf
 
 ## Limitations
 
-- No listing API for files — you fetch by known filename. Maintain a record in a regular object with the filenames you stored.
-- File content isn't indexed or queryable — it's opaque storage.
+- File content isn't indexed or queryable — it's opaque storage. Use [`list-files`](#list-files) for inventory by filename prefix.
 - No ranged reads — every `get-file` returns the whole file.

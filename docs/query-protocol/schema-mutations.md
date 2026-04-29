@@ -81,8 +81,8 @@ Metadata-only; no data rewrite.
 ### What happens
 
 1. Rewrites `fields.conf` with the new name.
-2. Rewrites `indexes/index.conf` + renames `<old>.idx` → `<new>.idx`.
-3. For composite indexes, rewrites parts that reference the old name.
+2. Rewrites `indexes/index.conf` and renames `indexes/<old>/` → `indexes/<new>/` (per-shard directory rename — all `NNN.idx` files travel with the rename, no rebuild required).
+3. For composite indexes, rewrites parts that reference the old name and renames the composite directory accordingly.
 4. Invalidates caches.
 
 ### Constraints
@@ -134,8 +134,18 @@ Maintenance — reclaim deleted-record slots, drop tombstoned fields, or reshard
 |---|---|
 | `{"mode":"vacuum",...}` | Fast in-place tombstone reclaim. Rewrites slots with `flag=2` (deleted) back to `flag=0` (empty). No schema change. |
 | `{"mode":"vacuum","compact":true}` | Full rebuild. Drops tombstoned fields, shrinks `slot_size`. Indexes preserved. |
-| `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes; hash routing identity is preserved. Indexes preserved. |
+| `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes data; hash routing identity is preserved. **Triggers a full reindex** — see below. |
 | `{"mode":"vacuum","compact":true,"splits":N}` | Both — compact schema and reshard in one pass. |
+
+### Why `splits` triggers reindex (2026.05.1+)
+
+Each indexed field is now sharded into `splits/4` btree files (`<obj>/indexes/<field>/<NNN>.idx`). Changing `splits` changes the per-field shard count, so the on-disk `NNN.idx` files for the old layout become unreachable orphans. `vacuum --splits` calls `reindex_object()` after the data rebuild, which:
+
+1. Wipes every per-field idx directory (`indexes/<field>/`).
+2. Rebuilds each indexed field at the new `splits/4` shard count.
+3. Preserves the index list (`index.conf`) — same indexes, fresh layout.
+
+Plain `vacuum --compact` (no `splits`) leaves indexes alone — the per-field shard count doesn't change.
 
 ### What triggers the need
 

@@ -34,7 +34,8 @@ Stores the concatenation of `country` + `zip` as the index key. Accelerates quer
 ### Behavior
 
 - If the index already exists and `force:true` is not set: `{"status":"exists","field":"..."}`.
-- Builds with parallel shard scans (one pthread per index field when multiple are requested).
+- Builds via a single shard scan that fans out to per-field workers — each indexed field becomes one task in the parallel-for pool. The worker buckets entries by idx-shard and merges them sequentially per shard (per-shard btree layout, 2026.05.1+).
+- Creates `<obj>/indexes/<field>/<NNN>.idx` — `splits/4` files per indexed field.
 - Updates `<obj>/indexes/index.conf`.
 - Invalidates `g_idx_cache` for the object.
 
@@ -57,9 +58,9 @@ Response (multi): `{"status":"indexed","count":3}`.
 
 ### Behavior
 
-- Unlinks the `.idx` file.
+- Unlinks every `<NNN>.idx` file under `indexes/<field>/` and removes the directory.
 - Rewrites `index.conf` without the removed entry.
-- Invalidates `g_idx_cache` and the B+ tree mmap cache for that file.
+- Invalidates `g_idx_cache` and the B+ tree mmap cache for those files.
 - Safe on non-existent index: returns `{"status":"not_indexed","field":"..."}` — not an error. Idempotent.
 
 Response (single): `{"status":"removed","field":"email"}` or `{"status":"not_indexed","field":"..."}`.
@@ -76,11 +77,12 @@ Queries referencing the dropped field fall back to full-shard scan. Re-add the i
 - Up to 16 fields per composite.
 - Don't use `+` in regular field names.
 
-## What `add-field` / `remove-field` do to indexes
+## What `add-field` / `remove-field` / `vacuum --splits` do to indexes
 
 - `remove-field` **automatically drops** any index referencing the removed field (including composites). You don't need to call `remove-index` separately.
 - `add-field` doesn't create indexes for the new field. Call `add-index` if you want one.
-- `rename-field` renames the `.idx` file and updates composite references.
+- `rename-field` renames the `indexes/<field>/` directory (all `NNN.idx` files travel with the rename) and updates composite references.
+- `vacuum --splits` triggers a **full reindex** because the per-field idx-shard count is `splits/4` — changing splits changes the layout. See [Schema mutations → vacuum](schema-mutations.md#vacuum).
 
 ## CLI shortcuts
 
@@ -94,11 +96,14 @@ For batch adds/removes, use the JSON mode above.
 ## Inspection
 
 ```bash
-cat $DB_ROOT/<dir>/<obj>/indexes/index.conf
-ls  $DB_ROOT/<dir>/<obj>/indexes/
+cat $DB_ROOT/<dir>/<obj>/indexes/index.conf      # registered indexes (one per line)
+ls  $DB_ROOT/<dir>/<obj>/indexes/                # one directory per indexed field
+ls  $DB_ROOT/<dir>/<obj>/indexes/<field>/        # per-shard NNN.idx files (splits/4 of them)
 ```
 
-Index file format is binary (B+ tree with prefix-compressed leaves). Use [`stats`](diagnostics.md) to see the B+ tree mmap cache hit rate.
+Index file format is binary (B+ tree with prefix-compressed leaves, page size = `INDEX_PAGE_SIZE`). Use [`stats`](diagnostics.md) to see the B+ tree mmap cache hit rate (`bt_cache.hits / misses`).
+
+Stale orphan files from a previous, higher `splits` value would survive `add-index` (it only writes `0..splits/4-1`); use `./shard-db reindex <dir> <obj>` to wipe and rebuild every per-field idx directory cleanly.
 
 ## When to force-rebuild
 

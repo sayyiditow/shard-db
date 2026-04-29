@@ -4,6 +4,64 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.1 — 2026-05-01
+
+The per-shard btree release.
+
+### Changed
+
+- **Indexes are now per-shard.** Each indexed field stores its B+ tree as `splits/4` files under `<obj>/indexes/<field>/<NNN>.idx`. Reads fan out across all shards in parallel via the worker pool; writes route by record hash to a single shard. Per-file `pthread_rwlock_t` gives readers and writers proper isolation (the pre-2026.05.1 single-file layout had a race window where `bulk_build`'s truncate could be observed by an in-flight reader's mmap).
+- **`BT_CACHE_MAX` is no longer configurable** — derived as `FCACHE_MAX / 4`. Setting it in db.env emits a stderr warning and is ignored. `FCACHE_MAX` accepts a strict allow-list of `{4096, 8192, 12288, 16384}`.
+- **`vacuum --splits` triggers a full reindex** because the per-field shard count depends on `splits`. The data rebuild is followed by `reindex_object()`, which wipes and rebuilds every per-field idx directory at the new shard count.
+- **`bulk-insert` is a true upsert** — overwriting an existing key drops its stale index entries before writing the new value. Pass `if_not_exists:true` to keep the old idempotent behaviour.
+
+### Performance
+
+- Bulk loads ~117 k records/sec single-thread on the 14-index invoice schema (1 M records, splits=64). Add-indexes-from-scratch ≈ 350 k records/sec equivalent.
+- For parallel inserts into a pre-existing-indexed object, prefer **fewer, larger** `bulk-insert` calls. Each call triggers a sequential `bulk_merge` per (field, shard); cumulative work scales O(R²) in request count. Sweet spot at 1 M records is **5 connections × 200 K records each**.
+
+### Trade
+
+- Disk footprint up ~25 % (smaller per-leaf working sets reduce prefix-compression effectiveness; ~1.8 MB of empty-tree headers for a typical 14-index schema).
+- Insert-with-pre-existing-indexes hits N×16 file ops per merge call instead of N×1. **Load-then-index** is now the recommended pattern for static schemas.
+
+### Documentation
+
+- New [`shard-cli`](../cli/shard-cli.md) page — full reference for the ncurses TUI binary built alongside `shard-db`.
+- All docs updated for the per-shard layout, 38 search operators, native TLS, per-tenant + per-object tokens, AND index intersection, cursor pagination.
+
+## 2026.05 — 2026-04-29
+
+Major feature drop.
+
+### Added
+
+- **38 search operators** — original 17 plus length operators (`len_eq/neq/lt/gt/lte/gte/between` on varchar, answered from btree leaf vlen with no record fetch), case-insensitive variants (`ilike`, `icontains`, `istarts`, `iends`, `not_ilike`, `not_icontains`), field-vs-field on the same record (`eq_field`, `neq_field`, `lt_field`, `gt_field`, `lte_field`, `gte_field`), and POSIX extended regex (`regex`, `not_regex`, compiled once at criteria-compile time).
+- **Native TLS 1.3** via OpenSSL — opt in with `TLS_ENABLE=1` in db.env. Single-port (TLS-only when enabled). Reverse-proxy termination remains supported as the alternative.
+- **Per-tenant and per-object tokens** with `r` / `rw` / `rwx` permissions. Tokens live in `<dir>/tokens.conf` or `<dir>/<obj>/tokens.conf`. Token management is always server-admin scope.
+- **Cursor pagination on `find`** — keyset cursor on any indexed `order_by` field. O(limit) per page regardless of depth. Pass `cursor:null` to opt in; `cursor:null` in the response signals last page.
+- **AND index intersection** — `PRIMARY_INTERSECT` planner branch for pure AND of 2+ indexed leaves on rangeable operators. Walks each leaf's btree into a `KeySet`, intersects the sets, and skips per-record fetch entirely for `count`. Big speedups when intersection is much smaller than any single leaf.
+- **OR criteria** in `find` / `count` / `aggregate` / `bulk-update` / `bulk-delete`. Five planner paths, including pure-indexed-OR via lock-free `KeySet` union (no record fetch for count).
+- **CSV / delimited export** on `find`, `fetch`, `aggregate`, `get` (multi-key), `keys`, `exists` (multi-key) via `format:"csv"` (+ optional `delimiter`). RFC 4180-style quoting.
+- **Per-request `timeout_ms`** override for `find` / `count` / `aggregate` / `bulk-delete` / `bulk-update`.
+- **Per-query memory cap** via `QUERY_BUFFER_MB` (default 500) at every collection site.
+- **`shard-cli`** — separate ncurses TUI binary built alongside `shard-db`. Top-level menus: Server, Browse, Query, Schema, Maintenance, Auth, Stats. See [CLI → shard-cli](../cli/shard-cli.md).
+- **`stats-prom`** — Prometheus text-format exposition of the same counters as `stats`.
+- **`list-objects`** + **`describe-object`** — schema/catalog discovery used by shard-cli; useful for any tooling.
+- **`list-files`** — paginated, alphabetical inventory of stored files for an object, with optional `prefix`.
+- **`add-dir` / `remove-dir`** — runtime tenant-directory management; `remove-dir` defaults to refusing non-empty trees.
+- **`delete-file`** — JSON mode + CLI shortcut.
+- **Bulk update by JSON list** — `{"mode":"bulk-update","records":[{"id":"k","data":{...}}]}` for per-key partial updates (alternative to the criteria form).
+- **`bulk-insert-delimited`** — CSV-style flat file loader, parses directly against the page cache with no per-line memcpy.
+- **Aggregate NEQ algebraic shortcut** — `count(neq X)` rewrites to `count(*) - count(eq X)`.
+- **Single-instance guard** — `flock` on `$DB_ROOT/.shard-db.lock` prevents two daemons from sharing a data root.
+
+### Changed
+
+- Server can now `mkdirp(db_root)` on first start — no need to pre-create the data root.
+- Build directory ships `bin/db.env.example` (won't overwrite an existing `db.env`).
+- Removed `start.sh` / `stop.sh` / `status.sh` wrapper scripts (the binary's lifecycle commands are sufficient).
+
 ## 2026.04.3 — 2026-04-18
 
 ### Added
