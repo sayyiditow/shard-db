@@ -74,6 +74,7 @@ nav:
       - Install: getting-started/install.md
       - Quick start: getting-started/quickstart.md
       - Configuration: getting-started/configuration.md
+      - Client examples: getting-started/clients.md
   - Concepts:
       - Storage model: concepts/storage-model.md
       - Typed records: concepts/typed-records.md
@@ -94,11 +95,13 @@ nav:
       - Index management: query-protocol/index-management.md
       - File storage: query-protocol/files.md
       - Diagnostics: query-protocol/diagnostics.md
+      - Recipes: query-protocol/recipes.md
   - Operations:
       - Deployment: operations/deployment.md
       - Tuning: operations/tuning.md
       - Backup: operations/backup.md
       - Monitoring: operations/monitoring.md
+      - Benchmarks: operations/benchmarks.md
   - Reference:
       - Limits: reference/limits.md
       - Error codes: reference/error-codes.md
