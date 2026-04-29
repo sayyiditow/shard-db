@@ -8554,6 +8554,61 @@ int cmd_sequence(const char *db_root, const char *object,
 
 /* ========== BACKUP ========== */
 
+/* Copy one regular file. Preserves mode bits. Returns 0 on success. */
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) return -1;
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 0777);
+    if (dfd < 0) { close(sfd); return -1; }
+    char buf[64 * 1024];
+    ssize_t n;
+    int rc = 0;
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(dfd, buf + off, n - off);
+            if (w < 0) { rc = -1; goto done; }
+            off += w;
+        }
+    }
+    if (n < 0) rc = -1;
+done:
+    close(sfd);
+    close(dfd);
+    return rc;
+}
+
+/* Recursively copy a directory tree. No shell, no path interpolation —
+   every path is built component-wise, so the source-object name (which
+   originates from a JSON request) cannot inject shell metacharacters.
+   Replaces the previous `system("cp -r ...")` invocations that CodeQL
+   flagged as "uncontrolled data used in OS command". */
+static void cprf(const char *src, const char *dst) {
+    struct stat st;
+    if (lstat(src, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        mkdirp(dst);
+        DIR *d = opendir(src);
+        if (!d) return;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.' &&
+                (e->d_name[1] == '\0' ||
+                 (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+                continue;
+            char child_src[PATH_MAX], child_dst[PATH_MAX];
+            snprintf(child_src, sizeof(child_src), "%s/%s", src, e->d_name);
+            snprintf(child_dst, sizeof(child_dst), "%s/%s", dst, e->d_name);
+            cprf(child_src, child_dst);
+        }
+        closedir(d);
+    } else if (S_ISREG(st.st_mode)) {
+        copy_file(src, dst, st.st_mode);
+    }
+    /* Symlinks, fifos, devices etc. are ignored — backup targets are
+       always shard-db's own regular files / directories. */
+}
+
 int cmd_backup(const char *db_root, const char *object) {
     char src_dir[PATH_MAX], bak_dir[PATH_MAX];
     snprintf(src_dir, sizeof(src_dir), "%s/%s", db_root, object);
@@ -8571,14 +8626,15 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
     mkdirp(bak_dir);
 
-    /* Copy data directory */
-    char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "cp -r '%s/data' '%s/data' 2>/dev/null", src_dir, bak_dir);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd), "cp -r '%s/indexes' '%s/indexes' 2>/dev/null", src_dir, bak_dir);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd), "cp -r '%s/metadata' '%s/metadata' 2>/dev/null", src_dir, bak_dir);
-    system(cmd);
+    /* Recursively copy data/, indexes/, and metadata/ via in-process
+       directory walk — no shell. */
+    char src_sub[PATH_MAX], dst_sub[PATH_MAX];
+    const char *subs[] = { "data", "indexes", "metadata" };
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
+        snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
+        cprf(src_sub, dst_sub);
+    }
 
     OUT("{\"status\":\"backed_up\",\"path\":\"%s\"}\n", bak_dir);
     return 0;
