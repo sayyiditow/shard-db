@@ -1839,24 +1839,28 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
         close(hfd);
     }
 
-    /* Adaptive strategy threshold. Empirical finding (bench-incremental.sh):
-       point-insert wins only when existing >> new batch, crossover around 100:1.
-       At 90:1 the point path is already 10x slower than rebuild — B+tree
-       random access + per-insert cache invalidation dominates. Default is
-       conservative (prefer rebuild); tunable via SHARDKV_BULK_RATIO. */
-    int ratio = 100;
+    /* Adaptive strategy threshold. The pre-2026.05.1 measurement set this
+       at 100:1 and noted point-insert was 10x slower than rebuild at 90:1
+       because every btree_insert call did its own
+       cache-invalidate + open + lock cycle. Per-call overhead is now ~1µs
+       (single bt_acquire wrlock; ucache keeps the file mapped) so the
+       crossover moved much closer to the algorithmic prediction:
+       insert wins when K * log(N) < N + K  →  K < N / log(N).
+       For N=62K (per-shard tree size in the invoice bench),
+       log(N)≈16, so insert wins for K < ~3.9K per shard. Lowered default
+       ratio to 16; tunable via SHARDKV_BULK_RATIO. */
+    int ratio = 16;
     const char *env = getenv("SHARDKV_BULK_RATIO");
     if (env) ratio = atoi(env);
 
     if (ratio > 0 && existing_count > 1000 &&
         existing_count > new_count * (size_t)ratio) {
-        /* Small batch into a large tree — point-insert each entry. Avoids
-           reading+rewriting the whole tree. btree_insert handles its own
-           file locking; our per-path mutex above already serializes callers. */
-        for (size_t i = 0; i < new_count; i++) {
-            btree_insert(path, new_entries[i].value,
-                         new_entries[i].vlen, new_entries[i].hash);
-        }
+        /* Small batch into a large tree — splice via btree_insert_batch.
+           Single bt_acquire(write) for the whole batch, no per-entry
+           wrlock cycle. The per-path mutex above serialises bulk_merge
+           callers; btree_insert_batch's own bt_acquire serialises against
+           any concurrent btree_insert / btree_delete on the same path. */
+        btree_insert_batch(path, new_entries, new_count);
         if (m) pthread_mutex_unlock(m);
         return;
     }
