@@ -441,18 +441,22 @@ static void query_keys_op(CliConn *c, const char *mode, const char *result_title
             const char *s = keys[i];
             SB_APPEND(keys_json, off, sizeof(keys_json),
                 "%s\"", i ? "," : "");
-            for (; *s && off + 6 < sizeof(keys_json); s++) {
+            /* Reserve 3 bytes for the trailing `"]\0` so the byte-by-byte
+               escape loop never fills the buffer all the way to the end. */
+            for (; *s && off + 3 < sizeof(keys_json); s++) {
                 if (*s == '"' || *s == '\\') {
-                    keys_json[off++] = '\\';
-                    keys_json[off++] = *s;
+                    if (off + 4 < sizeof(keys_json)) {
+                        keys_json[off++] = '\\';
+                        keys_json[off++] = *s;
+                    }
                 } else {
                     keys_json[off++] = *s;
                 }
             }
-            keys_json[off++] = '"';
+            if (off + 2 < sizeof(keys_json)) keys_json[off++] = '"';
         }
-        keys_json[off++] = ']';
-        keys_json[off]   = '\0';
+        if (off + 1 < sizeof(keys_json)) keys_json[off++] = ']';
+        keys_json[off < sizeof(keys_json) ? off : sizeof(keys_json) - 1] = '\0';
 
         char req[16384];
         snprintf(req, sizeof(req),

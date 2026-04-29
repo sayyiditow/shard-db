@@ -6674,6 +6674,14 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         p++;
         while (*p) {
             p = json_skip(p);
+            /* Guard: json_skip may have walked p to the NUL terminator
+               on a buffer that has trailing whitespace (or never had a
+               closing `}`). Without this break, the unrecognised-char
+               fall-through (`if (*p != '"') { p++; continue; }`) below
+               advances past the NUL → heap-OOB read on the next loop
+               iteration. Found by libFuzzer; same fix pattern as the
+               json_skip_value and parse_one_criterion bugs. */
+            if (!*p) break;
             if (*p == '}') break;
             if (*p == ',') { p++; continue; }
             if (*p != '"') { p++; continue; }

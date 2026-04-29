@@ -57,19 +57,23 @@ jobs:
           # lcov reads the .gcno (graph) and .gcda (counters) sibling files
           # next to each .o. Then strip system headers and tests/ dir.
           #
-          # --ignore-errors negative is a safety net: -fprofile-update=atomic
-          # in build.sh should prevent the racing-counter "negative branch
-          # count" lcov error in the first place, but if a stray uncovered
-          # path slips through we'd rather upload partial coverage than fail
-          # the workflow.
+          # --ignore-errors flags:
+          #   negative — racing counter (false positive after our atomic flag)
+          #   unused   — lcov 2.x errors on exclude patterns that don't match;
+          #              tests/ and fuzz/ are bash/external so they have no
+          #              .gcda files in the captured tree, but we still pass
+          #              the patterns defensively in case a future contributor
+          #              adds C tests.
+          #   gcov     — geninfo warns about "unexecuted block on non-branch
+          #              line" for some inlined functions; informational only.
           lcov --capture --directory . --output-file coverage.info \
                --rc branch_coverage=1 \
-               --ignore-errors negative,negative
+               --ignore-errors negative,negative,gcov
           lcov --remove coverage.info \
                '/usr/*' '*/tests/*' '*/fuzz/*' \
                --output-file coverage.info \
                --rc branch_coverage=1 \
-               --ignore-errors negative,negative
+               --ignore-errors negative,negative,unused
           lcov --list coverage.info
 
       - name: Upload to Codecov
