@@ -76,39 +76,61 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **118.6 k/sec** (8.43 s) |
-| Bulk insert (with 14 indexes) | **83.3 k/sec** (12.00 s) — 30 % index overhead |
-| Add 14 indexes post-insert | **3.85 s** (single-pass, all 14 concurrent; scan-path is lock-free + binary index keys skip ASCII render) |
-| GET ×1000 (pipelined) | **40 k ops/sec** (25 ms) |
-| EXISTS ×1000 (pipelined) | **55.6 k ops/sec** (18 ms) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **4 ms** |
-| Indexed `contains` via leaf scan | 3–25 ms |
+| Bulk insert (no indexes) | **117 k/sec** (8.55 s) |
+| Bulk insert (with 14 indexes) | **90 k/sec** (11.13 s) — 23 % index overhead |
+| Add 14 indexes post-insert | **2.85 s** (per-shard parallel build — 14 × splits/4 workers) |
+| GET ×1000 (pipelined) | **42 k ops/sec** (24 ms) |
+| EXISTS ×1000 (pipelined) | **48 k ops/sec** (21 ms) |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **5 ms** |
+| Indexed `contains` via leaf scan | 5–15 ms |
 | Indexed IN (2 values) | 5 ms |
-| Composite index eq / starts | 3–4 ms |
-| Indexed `range` | 3–4 ms |
+| Composite index eq / starts | 4–5 ms |
+| Indexed `range` | 3 ms |
 | Fetch page of 100 @ offset 5000 | 5 ms |
-| Keys (first 100) | 3 ms |
-| Single DELETE ×1000 (with 14 indexes) | **2.83 k/sec** (353 ms) |
-| Bulk DELETE ×1000 | **4.74 k/sec** (211 ms) |
-| VACUUM | 5 ms |
-| Disk footprint | 1.3 GB |
+| Keys (first 100) | 4 ms |
+| **Single DELETE ×1000 (with 14 indexes)** | **7.8 k/sec** (129 ms) — 2.7× faster vs pre-2026.05.1 |
+| **Bulk DELETE ×1000** | **77 k/sec** (13 ms) — 16× faster vs pre-2026.05.1 |
+| VACUUM | 8 ms |
+| Disk footprint | 1.6 GB |
 
-### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 100000 10`, `SPLITS=64`)
+The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths now going through the unified shard cache (`ucache_get_write` per shard). Pre-2026.05.1 they did per-call `open + flock + mmap MAP_SHARED + munmap`, paying full page-fault tax per request.
 
-Same schema, 10 connections × 100 k records each.
+### 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes (`bench-parallel.sh 1000000 200000 5`, `SPLITS=64`)
+
+Same schema, **5 connections × 200 k records each** — the sweet spot for indexed bulk inserts at this scale (see tuning note below).
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 7.97 s | **125 k/sec** |
-| Single CSV, 1M, no indexes | 4.09 s | **245 k/sec** |
-| **Parallel JSON, 10 conns, no indexes** | **3.66 s** | **273 k/sec** (2.18× single-JSON) |
-| Parallel JSON, 10 conns, pre-existing 14 indexes | 5.57 s | **180 k/sec** |
-| **Parallel CSV, 10 conns, no indexes** | **3.34 s** | **300 k/sec** (1.23× single-CSV) |
-| Parallel CSV, 10 conns, pre-existing 14 indexes | 5.10 s | **196 k/sec** |
-| Add 14 indexes after parallel bulk insert | ~3.7–3.9 s | (concurrent build across all 14) |
-| Disk footprint (with 14 indexes) | 1.3 GB |
+| Single JSON, 1M, no indexes | 8.20 s | **122 k/sec** |
+| Single CSV, 1M, no indexes | 4.20 s | **238 k/sec** |
+| **Parallel JSON, 5 conns, no indexes** | **3.91 s** | **256 k/sec** |
+| Parallel JSON, 5 conns, pre-existing 14 indexes | 6.21 s | **161 k/sec** |
+| **Parallel CSV, 5 conns, no indexes** | **3.62 s** | **276 k/sec** |
+| Parallel CSV, 5 conns, pre-existing 14 indexes | 5.66 s | **177 k/sec** |
+| Add 14 indexes after parallel bulk insert | ~2.85 s | (per-shard parallel build) |
+| Disk footprint (with 14 indexes) | 1.7 GB |
 
-**Insert WITH indexes still beats load-then-index, margin is back.** At 1M × 14 indexes: load CSV (3.34 s) + add-indexes (3.72 s) = 7.06 s → 142 k/sec; insert CSV with pre-existing indexes: 5.10 s → **196 k/sec**. Post-hoc rebuild is fast (scan-path lock-free + binary index keys) so load-then-index stays viable for evolving schemas, but for static schemas pre-existing indexes win by ~40 %. **Recommended: create indexes up front when schema is stable; load-then-index when it isn't.**
+**Indexed bulk-insert chunk-size tuning.** The per-shard btree layout (2026.05.1+) makes indexed bulk-insert sensitive to the *number* of bulk-insert REQUESTS, because each request triggers a sequential `bulk_merge` cycle per (field, shard). Cumulative extract work scales `O(R²)` where R is request count. Measured on this 1M dataset:
+
+| Shape | Requests | TEST 3 (JSON+idx) | TEST 5 (CSV+idx) |
+|---|---|---|---|
+| 10 conn × 100 k | 10 | 7.34 s | 7.04 s |
+| **5 conn × 200 k** | **5** | **6.21 s** | **5.66 s** |
+| 5 conn × 100 k (queued) | 10 | 8.35 s | 6.42 s |
+| 1 × 1 M (single call) | 1 | 11.13 s (single-thread) | — |
+
+**Bigger chunks = fewer merge cycles. 5 connections × 200 k each is the sweet spot for 1M records.** Connection count above 5 doesn't speed up phase-2 data writes meaningfully (16-core box doesn't saturate at 5 writers), and pushing chunk count up linearly hurts phase-4 merge cost. Recommended for indexed bulk-insert: **`requests ≈ N / 200_000` rounded down, with `5 ≤ connections ≤ requests`**.
+
+**Load-then-index now wins for static schemas.** With the per-shard layout, post-hoc add-indexes parallelises 14× wider (14 fields × splits/4 shards = 14 × 16 = 224 workers from a single-pass scan), making it 25-30 % faster than pre-2026.05.1. At 1M × 14 indexes: load CSV (3.62 s) + add-indexes (2.85 s) = **6.47 s** → 155 k/sec. Insert CSV with pre-existing indexes: 5.66 s → 177 k/sec. Pre-existing-indexes still wins on absolute throughput by ~14 %, but the gap shrunk; **load-then-index is preferred when feasible** because the merge-into-existing path scales worse with parallelism. **Recommended: load-then-index for static schemas at 1M+ records; pre-existing indexes for streaming workloads.**
+
+### Disk footprint
+
+Per-shard btree layout adds ~25 % to indexed-object disk usage vs pre-2026.05.1 (1.3 → 1.6-1.7 GB on the invoice schema). Sources:
+1. Each btree starts at `2 × bt_page_size = 8 KB`. With 14 indexes × 16 idx shards = 224 trees minimum, that's ~1.8 MB of header overhead before any data (vs 14 × 8 KB = 112 KB for the old single-tree layout).
+2. Reduced prefix-compression effectiveness: each leaf page has 1/16 the entries to share prefixes with, so per-entry compression savings drop ~15-25 %.
+3. Page-allocation rounding: each btree's pages are 4 KB; trailing slack accumulates across 16× more trees.
+
+Real space cost on production datasets typically lands at +20-30 % vs the legacy layout.
 
 ### Notes
 

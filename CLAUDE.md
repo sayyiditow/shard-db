@@ -164,6 +164,12 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db bulk-insert <dir> <obj> [file]         # JSON: [{"id":"k","data":{...}},...]
                                                   # Acts as upsert — overwriting an existing
                                                   # key drops stale index entries before writing.
+                                                  # For indexed bulk-insert at scale: prefer
+                                                  # FEWER, LARGER calls — each request triggers
+                                                  # a sequential bulk_merge per (field, shard),
+                                                  # so cumulative merge work scales O(R²) where
+                                                  # R = request count. Sweet spot at 1M records
+                                                  # is ~5 conns × 200K records per request.
 ./shard-db bulk-delete <dir> <obj> [file]
 
 # Files (base64-in-JSON over TCP — remote-safe)
