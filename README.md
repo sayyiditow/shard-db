@@ -5,7 +5,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sayyiditow/shard-db/badge)](https://scorecard.dev/viewer/?uri=github.com/sayyiditow/shard-db)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12704/badge)](https://www.bestpractices.dev/projects/12704)
 
-A file-based sharded database written in C. Started as a key/value store; now a full small-scale DB with typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server. Single static binary, no external dependencies.
+A high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3. ~2.7M K/V ops/sec single-thread; 38 search operators with index intersection planner; multi-tenant with scoped auth.
 
 **Platform:** Linux x86_64 / ARM64 (uses `epoll`, `mmap`, POSIX pthreads). Not portable to macOS or Windows without source changes. License: MIT.
 
