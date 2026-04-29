@@ -1,0 +1,77 @@
+name: scan-build (Clang Static Analyzer)
+
+# Path-sensitive bug detector that comes with Clang. Different signal
+# from CodeQL and cppcheck — particularly good at:
+#   - Use-of-uninitialized-value through control flow
+#   - Memory leaks across early-return paths
+#   - Null pointer derefs reachable through specific call sequences
+#   - Logic errors (always-false branches, dead code)
+#
+# Runs scan-build over the same source list build.sh uses. Fails the
+# job on any reported issue; emit HTML reports as an artifact for
+# inspection when something fires.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install clang-tools + libssl-dev
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang clang-tools libssl-dev libncursesw5-dev
+          scan-build --help | head -1
+
+      - name: scan-build the daemon
+        run: |
+          mkdir -p scan-reports
+          # --status-bugs makes the exit code non-zero when any bug is
+          # found; -o places the HTML report so we can upload it as an
+          # artifact for inspection.
+          scan-build \
+            --status-bugs \
+            -o scan-reports \
+            -analyze-headers \
+            --use-cc=clang \
+            gcc -O0 -g -c \
+              src/db/util.c src/db/config.c src/db/storage.c \
+              src/db/index.c src/db/query.c src/db/server.c \
+              src/db/main.c src/db/btree.c src/db/objlock.c \
+              src/db/keyset.c src/db/parallel.c src/db/tls.c \
+              -Isrc/db -lpthread -lssl -lcrypto
+
+      - name: scan-build the CLI (shard-cli)
+        run: |
+          scan-build \
+            --status-bugs \
+            -o scan-reports \
+            -analyze-headers \
+            --use-cc=clang \
+            gcc -O0 -g -c \
+              src/cli/main.c src/cli/widgets.c \
+              src/cli/views.c src/cli/conn.c \
+              -Isrc/cli -lncursesw -lssl -lcrypto
+
+      - name: Upload HTML reports (only if findings)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scan-build-reports
+          path: scan-reports/
+          retention-days: 14

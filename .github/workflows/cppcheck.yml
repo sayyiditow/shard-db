@@ -1,0 +1,58 @@
+name: cppcheck
+
+# Fast static analysis. Different bug detector than CodeQL — catches some
+# things CodeQL misses (typically: dead stores, narrow integer conversions,
+# null-deref via pointer aliasing) and produces fewer false positives on
+# C-only codebases.
+#
+# Tuning notes:
+#   - `--enable=warning,performance,portability` — skip the `style` group
+#     (noisy on otherwise-fine code) and `information` (only useful with
+#     full configuration).
+#   - `--suppress=missingIncludeSystem` — we don't want it to chase libc
+#     headers; we trust libc.
+#   - `--inline-suppr` lets us mark per-line false positives in source
+#     with `// cppcheck-suppress <id>`.
+#   - `--check-level=exhaustive` enables deeper inter-procedural checks
+#     at the cost of ~2x runtime; still finishes well under a minute on
+#     this codebase.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cppcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --version
+
+      - name: Run cppcheck on src/
+        run: |
+          cppcheck \
+            --error-exitcode=1 \
+            --enable=warning,performance,portability \
+            --check-level=exhaustive \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --inline-suppr \
+            --quiet \
+            -j "$(nproc)" \
+            -Isrc/db -Isrc/cli \
+            src/db/ src/cli/

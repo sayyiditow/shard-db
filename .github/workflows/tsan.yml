@@ -1,0 +1,74 @@
+name: TSan (ThreadSanitizer)
+
+# ThreadSanitizer build of the daemon, run against tests that exercise
+# the per-shard rwlock and parallel-for worker pool. Catches data races
+# (one thread reading, another writing, no synchronization) and lock-
+# ordering deadlocks.
+#
+# Why we DON'T run test-stress-no-hang here:
+#   TSan's shadow-memory bookkeeping slows the daemon ~10× to ~15×.
+#   The 16-worker, 15-second stress floods the daemon faster than it
+#   can process queries, the watchdog probes time out, and the test
+#   wall-clock blows past CI budget. Race-detection happens via TSan
+#   instrumentation regardless of throughput — the parallel-index-
+#   integrity test fires concurrent bulk-inserts that exercise the
+#   exact same lock paths under a manageable load.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tsan:
+    name: TSan (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUILD_MODE: tsan
+      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build (BUILD_MODE=tsan)
+        run: ./build.sh && cp build/bin/shard-db ./shard-db
+
+      # Tests chosen because they exercise multi-thread paths inside the
+      # daemon (parallel-for fan-out, per-shard rwlock acquisition, btree
+      # cache concurrency) without saturating the daemon under TSan
+      # instrumentation.
+
+      - name: AND index intersection (test-and-intersection)
+        run: ./tests/test-and-intersection.sh
+
+      - name: OR criteria — KeySet concurrency (test-or-logic)
+        run: ./tests/test-or-logic.sh
+
+      - name: Concurrent bulk-insert integrity (test-parallel-index-integrity)
+        # The single best test for per-shard concurrency: 100K records
+        # across multiple parallel writers, then full-table verification
+        # via every indexed path. Hits btree-cache rwlock, ucache
+        # rwlock, and parallel-for pool simultaneously.
+        run: ./tests/test-parallel-index-integrity.sh
+
+      - name: Keyset cursor pagination (test-find-cursor)
+        # Cursor walks the per-shard btree iterators concurrently —
+        # exercises the streaming k-way merge across shards.
+        run: ./tests/test-find-cursor.sh
+
+      - name: Fail if any TSan findings escaped
+        run: |
+          if grep -Erq "ThreadSanitizer|WARNING:|data race|deadlock" logs/ 2>/dev/null; then
+            echo "::error::TSan findings detected in daemon logs"
+            grep -Er "ThreadSanitizer|WARNING:|data race|deadlock" logs/ | head -50
+            exit 1
+          fi
+          echo "No TSan findings."

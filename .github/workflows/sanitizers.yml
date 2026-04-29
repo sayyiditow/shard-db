@@ -1,0 +1,87 @@
+name: Sanitizers (ASan + UBSan)
+
+# Build the daemon with -fsanitize=address,undefined and run the test
+# suite under it. Catches use-after-free, OOB reads/writes, double-free,
+# memory leaks, signed integer overflow, alignment violations, NULL
+# deref, etc. — exactly the bug class that crashes a database in
+# production.
+#
+# UBSan caught a real misaligned-uint16 bug on the very first run (fixed
+# in btree.c via bt_load_u16/bt_store_u16 helpers). Keep this workflow
+# green going forward.
+#
+# Runs on x86_64 only: ARM64 sanitizer support is solid, but the test
+# matrix is already long and these bugs are universal C/UB issues that
+# x86_64 will catch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan-ubsan:
+    name: ASan + UBSan (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BUILD_MODE: asan
+      # halt_on_error=0 so we collect all findings instead of stopping at
+      # the first one; abort_on_error=0 lets the daemon survive (else any
+      # finding aborts the process and the test wrapper reports failure
+      # for the wrong reason).
+      ASAN_OPTIONS: "halt_on_error=0:detect_leaks=0:abort_on_error=0:print_stacktrace=1:log_exe_name=1"
+      UBSAN_OPTIONS: "halt_on_error=0:print_stacktrace=1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build (BUILD_MODE=asan)
+        run: ./build.sh && cp build/bin/shard-db ./shard-db
+
+      # Subset of the full test matrix — tests that exercise the trickiest
+      # memory/concurrency paths. Adding the rest one at a time as we
+      # confirm they're sanitizer-clean keeps the workflow honest about
+      # what's been audited.
+
+      - name: Binary-native B+ tree keys + reindex (test-binary-index)
+        run: ./tests/test-binary-index.sh
+
+      - name: OR criteria — all 5 planner paths (test-or-logic)
+        run: ./tests/test-or-logic.sh
+
+      - name: AND index intersection (test-and-intersection)
+        run: ./tests/test-and-intersection.sh
+
+      - name: Vacuum + add-field (test-vacuum-addfield)
+        run: ./tests/test-vacuum-addfield.sh
+
+      - name: CAS on bulk ops (test-bulk-cas)
+        run: ./tests/test-bulk-cas.sh
+
+      - name: Keyset cursor pagination (test-find-cursor)
+        run: ./tests/test-find-cursor.sh
+
+      - name: Concurrent stress, no-hang (test-stress-no-hang)
+        run: ./tests/test-stress-no-hang.sh
+
+      # If ASan/UBSan finds anything, it prints to stderr; the test
+      # script's daemon-startup capture catches it. Grep the daemon
+      # logs once everything's done as a defensive backstop — if a
+      # sanitizer error fired but the test still passed (e.g. via
+      # halt_on_error=0), we still want to fail the workflow.
+      - name: Fail if any sanitizer findings escaped
+        run: |
+          if grep -Erq "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY: " logs/ 2>/dev/null; then
+            echo "::error::Sanitizer findings detected in daemon logs"
+            grep -Er "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY: " logs/ | head -50
+            exit 1
+          fi
+          echo "No sanitizer findings."

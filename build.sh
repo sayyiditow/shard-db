@@ -26,16 +26,53 @@ case "$(uname)" in
         ;;
 esac
 
+# BUILD_MODE selects compilation flavour. Default `release` is what ships;
+# the others are for CI sanitizer runs and never produce a stripped binary.
+#   release - -O2 -flto, stripped (default; what users get)
+#   asan    - -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+#   tsan    - -O1 -g -fsanitize=thread        -fno-omit-frame-pointer
+#   debug   - -O0 -g (no sanitizers; just for stepping in gdb)
+# The sanitizer modes use -O1 (not -O2) because aggressive optimisation
+# sometimes hides the very bugs the sanitizer is meant to find.
+BUILD_MODE="${BUILD_MODE:-release}"
+case "$BUILD_MODE" in
+    release)
+        MODE_CFLAGS="-O2 -flto"
+        MODE_LDFLAGS=""
+        DO_STRIP=1
+        ;;
+    asan)
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+        MODE_LDFLAGS="-fsanitize=address,undefined"
+        DO_STRIP=0
+        ;;
+    tsan)
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread"
+        MODE_LDFLAGS="-fsanitize=thread"
+        DO_STRIP=0
+        ;;
+    debug)
+        MODE_CFLAGS="-O0 -g"
+        MODE_LDFLAGS=""
+        DO_STRIP=0
+        ;;
+    *)
+        echo "build.sh: unknown BUILD_MODE=$BUILD_MODE (release|asan|tsan|debug)" >&2
+        exit 1
+        ;;
+esac
+
 # -flto: link-time optimization (cross-TU inlining; usually helps perf, definitely
 #        shrinks the binary by eliminating dead code visible only across files).
-# strip: remove symbol/debug tables from the shipped binary (~25K cut).
-gcc -O2 -flto -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/db/index.c src/db/query.c src/db/server.c src/db/main.c src/db/btree.c src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS -lpthread -lssl -lcrypto
-strip shard-db
+# strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
+#        for sanitizer/debug builds — symbols are needed for readable stack traces.
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/db/index.c src/db/query.c src/db/server.c src/db/main.c src/db/btree.c src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+[ "$DO_STRIP" = 1 ] && strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
 # pthread/daemon code. Self-contained connection helper in src/cli/conn.c.
-gcc -O2 -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS -lncursesw -lssl -lcrypto
-strip shard-cli
+gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lncursesw -lssl -lcrypto
+[ "$DO_STRIP" = 1 ] && strip shard-cli
 
 mkdir -p build/bin
 

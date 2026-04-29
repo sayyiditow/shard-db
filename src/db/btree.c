@@ -29,7 +29,27 @@ extern char *dirname_of(const char *path);
 
 /* ========== Page helpers ========== */
 
-/* Slot directory starts right after page header */
+/* Misalignment-safe uint16 read/write. Entry pointers within a btree
+   page land at arbitrary offsets — entries pack from the page end
+   inward and have variable widths (1 prefix byte + suffix + 16 hash),
+   so the leading uint16_t length field is not guaranteed to be 2-byte
+   aligned. UBSan flagged the `*(uint16_t *)entry` casts as undefined
+   behaviour even though x86_64 silently handles unaligned access; on
+   strict-alignment architectures (some ARM configs, RISC-V) the prior
+   code would SIGBUS. memcpy is the portable spelling and modern
+   compilers collapse it to a single mov on x86. */
+static inline uint16_t bt_load_u16(const uint8_t *p) {
+    uint16_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline void bt_store_u16(uint8_t *p, uint16_t v) {
+    memcpy(p, &v, sizeof(v));
+}
+
+/* Slot directory starts right after page header. Offset 20 (sizeof
+   BtPageHeader) is 2-byte aligned, so the slots array IS aligned and
+   doesn't need the helpers above. */
 static inline uint16_t *page_slots(uint8_t *page) {
     return (uint16_t *)(page + sizeof(BtPageHeader));
 }
@@ -46,15 +66,15 @@ static inline uint8_t *page_entry(uint8_t *page, int slot_idx) {
  *             Every BT_LEAF_RESTART_K-th slot is an anchor (prefix_len=0). */
 /* Entry data_len. High bit is the leaf-tombstone flag; mask it out for size. */
 static inline uint16_t entry_data_len(uint8_t *entry) {
-    return *(uint16_t *)entry & 0x7FFF;
+    return bt_load_u16(entry) & 0x7FFF;
 }
 
 /* Leaf-only: tombstone flag (high bit of the uint16_t data_len field). */
 static inline int leaf_entry_is_tomb(uint8_t *entry) {
-    return (*(uint16_t *)entry & 0x8000) != 0;
+    return (bt_load_u16(entry) & 0x8000) != 0;
 }
 static inline void leaf_entry_set_tomb(uint8_t *entry) {
-    *(uint16_t *)entry |= 0x8000;
+    bt_store_u16(entry, bt_load_u16(entry) | 0x8000);
 }
 
 /* Internal-page entry helpers (flat format) */
@@ -656,7 +676,7 @@ static int leaf_rebuild(uint8_t *page, LeafRec *recs, int count) {
         ph->data_end -= entry_bytes;
         uint8_t *e = page + ph->data_end;
         uint16_t dlen = (uint16_t)(1 + suffix_len + BT_HASH_SIZE);
-        *(uint16_t *)e = dlen;
+        bt_store_u16(e, dlen);
         e[2] = prefix_len;
         memcpy(e + 3, suffix, suffix_len);
         memcpy(e + 3 + suffix_len, recs[i].hash, BT_HASH_SIZE);
@@ -689,7 +709,7 @@ static int leaf_append(uint8_t *page, const char *value, size_t vlen,
     ph->data_end -= entry_bytes;
     uint8_t *e = page + ph->data_end;
     uint16_t dlen = (uint16_t)(1 + suffix_len + BT_HASH_SIZE);
-    *(uint16_t *)e = dlen;
+    bt_store_u16(e, dlen);
     e[2] = prefix_len;
     memcpy(e + 3, suffix, suffix_len);
     memcpy(e + 3 + suffix_len, hash, BT_HASH_SIZE);
@@ -765,7 +785,7 @@ static int page_insert_at(uint8_t *page, int pos, const char *value, size_t vlen
 
     ph->data_end -= entry_bytes;
     uint8_t *entry = page + ph->data_end;
-    *(uint16_t *)entry = data_len;
+    bt_store_u16(entry, data_len);
     memcpy(entry + 2, value, vlen);
     memcpy(entry + 2 + vlen, suffix, suffix_len);
 
