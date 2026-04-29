@@ -1623,7 +1623,9 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
             cur_leaf = new_leaf;
             if (leaf_count >= leaf_cap) {
                 leaf_cap *= 2;
-                leaf_ids = realloc(leaf_ids, leaf_cap * sizeof(uint32_t));
+                uint32_t *t = realloc(leaf_ids, leaf_cap * sizeof(uint32_t));
+                if (!t) { free(leaf_ids); leaf_ids = NULL; goto leaf_oom; }
+                leaf_ids = t;
             }
             leaf_ids[leaf_count++] = cur_leaf;
 
@@ -1721,6 +1723,13 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
 
     if (child_ids != leaf_ids) free(child_ids);
     free(leaf_ids);
+    bt_release(&bt);
+    return;
+
+leaf_oom:
+    /* Out of memory while growing leaf_ids — release the file lock and
+       bail out. The on-disk tree is partial but consistent up to the
+       last successfully written leaf; readers won't crash. */
     bt_release(&bt);
 }
 

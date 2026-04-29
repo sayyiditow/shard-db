@@ -316,6 +316,22 @@ extern int g_log_level;
 extern __thread FILE *g_out;
 #define OUT(...) fprintf(g_out ? g_out : stdout, __VA_ARGS__)
 
+/* xrealloc_or_free — safe wrapper around realloc that avoids the
+   memleak-on-OOM pattern cppcheck flags. Standard `x = realloc(x, sz)`
+   leaks the original `x` if realloc returns NULL. This helper does
+   the same in the success case (returns the new pointer) and frees
+   the original on failure (returns NULL). Caller must always check
+   the return and handle NULL.
+   Usage:
+     void *t = xrealloc_or_free(x, new_sz);
+     if (!t) { error("oom"); break; }
+     x = t;                                                          */
+static inline void *xrealloc_or_free(void *p, size_t new_sz) {
+    void *t = realloc(p, new_sz);
+    if (!t) free(p);
+    return t;
+}
+
 /* SB_APPEND(buf, off, cap, fmt, ...) — safe StringBuilder-style append.
    Replaces the unsafe `off += snprintf(buf + off, cap - off, ...)` idiom
    that CodeQL flags as "potentially overflowing snprintf": snprintf

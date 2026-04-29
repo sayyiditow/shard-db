@@ -192,7 +192,12 @@ static int collect_string_array(const char *resp, const char *key,
         const char *s = p;
         while (*p && *p != '"') p++;
         size_t L = p - s;
-        if (n >= cap) { cap *= 2; out = realloc(out, cap * sizeof(char *)); }
+        if (n >= cap) {
+            cap *= 2;
+            char **t = xrealloc_or_free(out, (size_t)cap * sizeof(char *));
+            if (!t) { *out_arr = NULL; *out_n = 0; return -1; }
+            out = t;
+        }
         out[n] = malloc(L + 1);
         memcpy(out[n], s, L);
         out[n][L] = '\0';
@@ -359,12 +364,15 @@ static void query_insert(CliConn *c) {
             "{\"mode\":\"insert\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"data\":{",
             oi.dir, oi.object, fs[0].value);
         int emitted = 0;
+        int oom = 0;
         for (int i = 0; i < oi.nfields; i++) {
             if (!fs[1 + i].value[0]) continue;  /* skip empty — defaults apply */
             size_t need = 64 + strlen(oi.fields[i].name) + strlen(fs[1 + i].value);
             if (off + need >= cap) {
                 while (cap < off + need + 1) cap *= 2;
-                req = realloc(req, cap);
+                char *t = xrealloc_or_free(req, cap);
+                if (!t) { req = NULL; oom = 1; break; }
+                req = t;
             }
             SB_APPEND(req, off, cap,
                 "%s\"%s\":\"%s\"",
@@ -372,6 +380,7 @@ static void query_insert(CliConn *c) {
                 oi.fields[i].name, fs[1 + i].value);
             emitted++;
         }
+        if (oom) { tui_alert("error", "out of memory"); continue; }
         SB_APPEND(req, off, cap, "}}");
 
         char *resp = NULL; size_t rlen = 0;
@@ -532,18 +541,22 @@ static void query_update(CliConn *c) {
             "{\"mode\":\"update\",\"dir\":\"%s\",\"object\":\"%s\",\"key\":\"%s\",\"value\":{",
             oi.dir, oi.object, fs[0].value);
         int emitted = 0;
+        int oom = 0;
         for (int i = 0; i < oi.nfields; i++) {
             if (!fs[1 + i].value[0]) continue;
             size_t need = 64 + strlen(oi.fields[i].name) + strlen(fs[1 + i].value);
             if (off + need >= cap) {
                 while (cap < off + need + 1) cap *= 2;
-                req = realloc(req, cap);
+                char *t = xrealloc_or_free(req, cap);
+                if (!t) { req = NULL; oom = 1; break; }
+                req = t;
             }
             SB_APPEND(req, off, cap,
                 "%s\"%s\":\"%s\"",
                 emitted ? "," : "", oi.fields[i].name, fs[1 + i].value);
             emitted++;
         }
+        if (oom) { tui_alert("error", "out of memory"); continue; }
         SB_APPEND(req, off, cap, "}}");
 
         char *resp = NULL; size_t rlen = 0;
@@ -679,7 +692,12 @@ static char *pack_aggs(const AggRow *rows, int n) {
     size_t off = 0;
     off += snprintf(out + off, cap - off, "[");
     for (int i = 0; i < n; i++) {
-        if (off + 256 >= cap) { cap *= 2; out = realloc(out, cap); }
+        if (off + 256 >= cap) {
+            cap *= 2;
+            char *t = xrealloc_or_free(out, cap);
+            if (!t) return NULL;
+            out = t;
+        }
         if (strcmp(rows[i].field, "(none)") == 0 || rows[i].field[0] == '\0') {
             off += snprintf(out + off, cap - off,
                 "%s{\"fn\":\"%s\",\"alias\":\"%s\"}",
@@ -781,7 +799,12 @@ static int extract_agg_aliases(const char *specs, char ***out) {
         const char *s = q;
         while (*q && *q != '"') q++;
         size_t L = (size_t)(q - s);
-        if (n >= cap) { cap *= 2; arr = realloc(arr, cap * sizeof(char *)); }
+        if (n >= cap) {
+            cap *= 2;
+            char **t = xrealloc_or_free(arr, (size_t)cap * sizeof(char *));
+            if (!t) { *out = NULL; return 0; }
+            arr = t;
+        }
         arr[n] = malloc(L + 1);
         memcpy(arr[n], s, L);
         arr[n][L] = '\0';

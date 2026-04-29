@@ -635,12 +635,17 @@ void sort_dedup_file(const char *path) {
     while (fgets(buf, sizeof(buf), f)) {
         buf[strcspn(buf, "\n")] = '\0';
         if (buf[0] == '\0') continue;
-        if (count >= cap) { cap *= 2; lines = realloc(lines, cap * sizeof(char *)); }
+        if (count >= cap) {
+            cap *= 2;
+            char **t = xrealloc_or_free(lines, cap * sizeof(char *));
+            if (!t) { lines = NULL; break; }
+            lines = t;
+        }
         lines[count++] = strdup(buf);
     }
     fclose(f);
 
-    if (count == 0) { free(lines); return; }
+    if (!lines || count == 0) { free(lines); return; }
 
     /* Sort */
     qsort(lines, count, sizeof(char *), cmp_str);
@@ -735,8 +740,18 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
     if (key_buf && key_len > 0) {
         pthread_mutex_lock(&ic->lock);
         if (ic->pair_count >= ic->pair_cap) {
-            ic->pair_cap *= 2;
-            ic->pairs = realloc(ic->pairs, ic->pair_cap * sizeof(BtEntry));
+            size_t new_cap = ic->pair_cap * 2;
+            BtEntry *t = xrealloc_or_free(ic->pairs, new_cap * sizeof(BtEntry));
+            if (!t) {
+                ic->pairs = NULL;
+                ic->pair_count = 0;
+                ic->pair_cap = 0;
+                pthread_mutex_unlock(&ic->lock);
+                free(key_buf);
+                return 0;
+            }
+            ic->pairs = t;
+            ic->pair_cap = new_cap;
         }
         ic->pairs[ic->pair_count].value = (const char *)key_buf;
         ic->pairs[ic->pair_count].vlen = key_len;
@@ -956,8 +971,18 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
         if (key_buf && key_len > 0) {
             pthread_mutex_lock(&mc->lock[fi]);
             if (mc->pair_count[fi] >= mc->pair_cap[fi]) {
-                mc->pair_cap[fi] *= 2;
-                mc->pairs[fi] = realloc(mc->pairs[fi], mc->pair_cap[fi] * sizeof(BtEntry));
+                size_t new_cap = mc->pair_cap[fi] * 2;
+                BtEntry *t = xrealloc_or_free(mc->pairs[fi], new_cap * sizeof(BtEntry));
+                if (!t) {
+                    mc->pairs[fi] = NULL;
+                    mc->pair_count[fi] = 0;
+                    mc->pair_cap[fi] = 0;
+                    pthread_mutex_unlock(&mc->lock[fi]);
+                    free(key_buf);
+                    continue;
+                }
+                mc->pairs[fi] = t;
+                mc->pair_cap[fi] = new_cap;
             }
             mc->pairs[fi][mc->pair_count[fi]].value = (const char *)key_buf;
             mc->pairs[fi][mc->pair_count[fi]].vlen = key_len;

@@ -1350,7 +1350,12 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             while (*p && *p != '"') p++;
             size_t klen = p - start;
             if (*p == '"') p++;
-            if (key_count >= key_cap) { key_cap *= 2; entries = realloc(entries, key_cap * sizeof(MultiExistsEntry)); }
+            if (key_count >= key_cap) {
+                key_cap *= 2;
+                MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
+                if (!t) { entries = NULL; break; }
+                entries = t;
+            }
             MultiExistsEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
@@ -1440,7 +1445,12 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             while (*p && *p != '"') p++;
             size_t klen = p - start;
             if (*p == '"') p++;
-            if (key_count >= key_cap) { key_cap *= 2; entries = realloc(entries, key_cap * sizeof(MultiExistsEntry)); }
+            if (key_count >= key_cap) {
+                key_cap *= 2;
+                MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
+                if (!t) { entries = NULL; break; }
+                entries = t;
+            }
             MultiExistsEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
@@ -1582,7 +1592,12 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
             size_t klen = p - start;
             if (*p == '"') p++;
-            if (key_count >= key_cap) { key_cap *= 2; entries = realloc(entries, key_cap * sizeof(MultiGetEntry)); }
+            if (key_count >= key_cap) {
+                key_cap *= 2;
+                MultiGetEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
+                if (!t) { entries = NULL; break; }
+                entries = t;
+            }
             MultiGetEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);

@@ -243,7 +243,11 @@ int cli_query(CliConn *c, const char *request_json,
                 }
                 memcpy(buf + len, rbuf, j);
                 len += j;
-                if (len + 1 >= cap) buf = realloc(buf, len + 1);
+                if (len + 1 >= cap) {
+                    char *nb = xrealloc_or_free(buf, len + 1);
+                    if (!nb) return -1;
+                    buf = nb;
+                }
                 buf[len] = '\0';
                 *out_resp = buf; *out_len = len;
                 return 0;
@@ -258,7 +262,11 @@ int cli_query(CliConn *c, const char *request_json,
         memcpy(buf + len, rbuf, n);
         len += (size_t)n;
     }
-    if (len + 1 > cap) buf = realloc(buf, len + 1);
+    if (len + 1 > cap) {
+        char *nb = xrealloc_or_free(buf, len + 1);
+        if (!nb) return -1;
+        buf = nb;
+    }
     buf[len] = '\0';
     *out_resp = buf; *out_len = len;
     return 0;

@@ -85,7 +85,9 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
         if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
         if (path_count >= path_cap) {
             path_cap *= 2;
-            paths = realloc(paths, path_cap * sizeof(char *));
+            char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
+            if (!t) { paths = NULL; break; }
+            paths = t;
         }
         char binpath[PATH_MAX];
         snprintf(binpath, sizeof(binpath), "%s/%s", data_dir, e1->d_name);
@@ -93,7 +95,7 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
     }
     closedir(d1);
 
-    if (path_count == 0) { free(paths); return; }
+    if (!paths || path_count == 0) { free(paths); return; }
 
     ScanWorkerArg *args = malloc(path_count * sizeof(ScanWorkerArg));
     for (int i = 0; i < path_count; i++) {
@@ -313,8 +315,11 @@ static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16
     SearchCollectCtx *sc = (SearchCollectCtx *)ctx;
     if (sc->limit > 0 && sc->count >= sc->limit) return 1; /* stop */
     if (sc->count >= sc->cap) {
-        sc->cap *= 2;
-        sc->entries = realloc(sc->entries, sc->cap * sizeof(CollectedHash));
+        size_t new_cap = sc->cap * 2;
+        CollectedHash *t = xrealloc_or_free(sc->entries, new_cap * sizeof(CollectedHash));
+        if (!t) { sc->entries = NULL; sc->count = 0; return 1; /* abort scan on OOM */ }
+        sc->entries = t;
+        sc->cap = new_cap;
     }
     CollectedHash *e = &sc->entries[sc->count++];
     memcpy(e->hash, hash16, 16);
@@ -918,9 +923,19 @@ static void *bulk_insert_shard_worker(void *arg) {
 
             if (have_new) {
                 if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
-                    sw->idx_pair_caps[fi] = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
-                    sw->idx_pairs[fi] = realloc(sw->idx_pairs[fi],
-                                                sw->idx_pair_caps[fi] * sizeof(BtEntry));
+                    size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
+                    BtEntry *t = xrealloc_or_free(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
+                    if (!t) {
+                        log_msg(1, "INDEX_OOM shard=%d field=%s (dropped index pair on realloc; rerun reindex)",
+                                sw->shard_id, sw->idx_fields[fi]);
+                        sw->idx_pairs[fi] = NULL;
+                        sw->idx_pair_counts[fi] = 0;
+                        sw->idx_pair_caps[fi] = 0;
+                        free(key_buf);
+                        continue;
+                    }
+                    sw->idx_pairs[fi] = t;
+                    sw->idx_pair_caps[fi] = new_cap;
                 }
                 BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
                 bp->value = (const char *)key_buf;
@@ -991,9 +1006,15 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         json = malloc(cap);
         int c;
         while ((c = fgetc(stdin)) != EOF) {
-            if (pos >= cap - 1) { cap *= 2; json = realloc(json, cap); }
+            if (pos >= cap - 1) {
+                cap *= 2;
+                char *t = xrealloc_or_free(json, cap);
+                if (!t) { json = NULL; break; }
+                json = t;
+            }
             json[pos++] = c;
         }
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
         json[pos] = '\0'; len = pos;
     }
     if (!json) { fprintf(stderr, "Error: Cannot read input\n"); return 1; }
@@ -1151,7 +1172,9 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
                 if (rec_count >= rec_cap) {
                     rec_cap *= 2;
-                    records = realloc(records, rec_cap * sizeof(BulkInsRecord));
+                    BulkInsRecord *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
+                    if (!t) { records = NULL; break; }
+                    records = t;
                 }
                 BulkInsRecord *r = &records[rec_count++];
                 r->id = id;
@@ -1252,8 +1275,22 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             size_t add = ws->idx_pair_counts[fi];
             if (add == 0) { free(ws->idx_pairs[fi]); continue; }
             if (idx_pair_counts[fi] + add > idx_pair_caps[fi]) {
-                while (idx_pair_counts[fi] + add > idx_pair_caps[fi]) idx_pair_caps[fi] *= 2;
-                idx_pairs[fi] = realloc(idx_pairs[fi], idx_pair_caps[fi] * sizeof(BtEntry));
+                size_t new_cap = idx_pair_caps[fi];
+                while (idx_pair_counts[fi] + add > new_cap) new_cap *= 2;
+                BtEntry *t = xrealloc_or_free(idx_pairs[fi], new_cap * sizeof(BtEntry));
+                if (!t) {
+                    log_msg(1, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
+                            fi, idx_pair_counts[fi] + add);
+                    idx_pairs[fi] = NULL;
+                    idx_pair_counts[fi] = 0;
+                    idx_pair_caps[fi] = 0;
+                    /* free the per-worker key_bufs we'd have copied in */
+                    for (size_t k = 0; k < add; k++) free((void *)ws->idx_pairs[fi][k].value);
+                    free(ws->idx_pairs[fi]);
+                    continue;
+                }
+                idx_pairs[fi] = t;
+                idx_pair_caps[fi] = new_cap;
             }
             memcpy(idx_pairs[fi] + idx_pair_counts[fi],
                    ws->idx_pairs[fi], add * sizeof(BtEntry));
@@ -1563,7 +1600,9 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
 
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
-            records = realloc(records, rec_cap * sizeof(BulkInsRecord));
+            BulkInsRecord *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
+            if (!t) { records = NULL; break; }
+            records = t;
         }
         BulkInsRecord *r = &records[rec_count++];
         r->id = id;
@@ -1642,8 +1681,21 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             size_t add = ws->idx_pair_counts[fi];
             if (add == 0) { free(ws->idx_pairs[fi]); continue; }
             if (idx_pair_counts[fi] + add > idx_pair_caps[fi]) {
-                while (idx_pair_counts[fi] + add > idx_pair_caps[fi]) idx_pair_caps[fi] *= 2;
-                idx_pairs[fi] = realloc(idx_pairs[fi], idx_pair_caps[fi] * sizeof(BtEntry));
+                size_t new_cap = idx_pair_caps[fi];
+                while (idx_pair_counts[fi] + add > new_cap) new_cap *= 2;
+                BtEntry *t = xrealloc_or_free(idx_pairs[fi], new_cap * sizeof(BtEntry));
+                if (!t) {
+                    log_msg(1, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
+                            fi, idx_pair_counts[fi] + add);
+                    idx_pairs[fi] = NULL;
+                    idx_pair_counts[fi] = 0;
+                    idx_pair_caps[fi] = 0;
+                    for (size_t k = 0; k < add; k++) free((void *)ws->idx_pairs[fi][k].value);
+                    free(ws->idx_pairs[fi]);
+                    continue;
+                }
+                idx_pairs[fi] = t;
+                idx_pair_caps[fi] = new_cap;
             }
             memcpy(idx_pairs[fi] + idx_pair_counts[fi],
                    ws->idx_pairs[fi], add * sizeof(BtEntry));
@@ -1849,9 +1901,15 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
         raw = malloc(cap);
         int c;
         while ((c = fgetc(stdin)) != EOF) {
-            if (pos >= cap - 1) { cap *= 2; raw = realloc(raw, cap); }
+            if (pos >= cap - 1) {
+                cap *= 2;
+                char *t = xrealloc_or_free(raw, cap);
+                if (!t) { raw = NULL; break; }
+                raw = t;
+            }
             raw[pos++] = c;
         }
+        if (!raw) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
         raw[pos] = '\0'; len = pos;
     }
     if (!raw) { fprintf(stderr, "Error: Cannot read input\n"); return 1; }
@@ -1873,7 +1931,12 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
                 const char *start = p;
                 while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
                 size_t klen = p - start;
-                if (key_count >= key_cap) { key_cap *= 2; keys = realloc(keys, key_cap * sizeof(char *)); }
+                if (key_count >= key_cap) {
+                    key_cap *= 2;
+                    char **t = xrealloc_or_free(keys, key_cap * sizeof(char *));
+                    if (!t) { keys = NULL; break; }
+                    keys = t;
+                }
                 keys[key_count] = malloc(klen + 1);
                 memcpy(keys[key_count], start, klen);
                 keys[key_count][klen] = '\0';
@@ -1885,7 +1948,12 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
         char *_line_save = NULL; char *line = strtok_r(raw, "\n", &_line_save);
         while (line) {
             if (line[0] != '\0') {
-                if (key_count >= key_cap) { key_cap *= 2; keys = realloc(keys, key_cap * sizeof(char *)); }
+                if (key_count >= key_cap) {
+                    key_cap *= 2;
+                    char **t = xrealloc_or_free(keys, key_cap * sizeof(char *));
+                    if (!t) { keys = NULL; break; }
+                    keys = t;
+                }
                 keys[key_count++] = strdup(line);
             }
             line = strtok_r(NULL, "\n", &_line_save);
@@ -2085,8 +2153,19 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
     }
     bc->buffer_bytes += key_bytes;
     if (bc->count >= bc->cap) {
-        bc->cap = bc->cap ? bc->cap * 2 : 1024;
-        bc->keys = realloc(bc->keys, bc->cap * sizeof(char *));
+        int new_cap = bc->cap ? bc->cap * 2 : 1024;
+        char **t = xrealloc_or_free(bc->keys, (size_t)new_cap * sizeof(char *));
+        if (!t) {
+            bc->keys = NULL;
+            bc->count = 0;
+            bc->cap = 0;
+            bc->budget_exceeded = 1;
+            pthread_mutex_unlock(&bc->lock);
+            free(key);
+            return 1;
+        }
+        bc->keys = t;
+        bc->cap = new_cap;
     }
     bc->keys[bc->count++] = key;
     pthread_mutex_unlock(&bc->lock);
@@ -2657,7 +2736,9 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
-            records = realloc(records, rec_cap * sizeof(BulkUpdDelimRec));
+            BulkUpdDelimRec *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
+            if (!t) { records = NULL; break; }
+            records = t;
         }
         BulkUpdDelimRec *r = &records[rec_count++];
         r->key = malloc(klen + 1);
@@ -3015,7 +3096,9 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         BulkUpdJsonRec *r;
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
-            records = realloc(records, rec_cap * sizeof(BulkUpdJsonRec));
+            BulkUpdJsonRec *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
+            if (!t) { records = NULL; break; }
+            records = t;
         }
         r = &records[rec_count++];
         r->key = key;
@@ -3690,7 +3773,9 @@ int cmd_vacuum(const char *db_root, const char *object,
         if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
         if (shard_count >= shard_cap) {
             shard_cap *= 2;
-            shards = realloc(shards, shard_cap * sizeof(VacuumWork));
+            VacuumWork *t = xrealloc_or_free(shards, shard_cap * sizeof(*t));
+            if (!t) { shards = NULL; break; }
+            shards = t;
         }
         snprintf(shards[shard_count].path, PATH_MAX, "%s/%s", data_dir, e1->d_name);
         shards[shard_count].slot_size = sch.slot_size;
@@ -4034,7 +4119,12 @@ int cmd_fetch(const char *db_root, const char *object,
             if (e1->d_name[0] == '.') continue;
             size_t nlen = strlen(e1->d_name);
             if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
-            if (path_count >= path_cap) { path_cap *= 2; paths = realloc(paths, path_cap * sizeof(char *)); }
+            if (path_count >= path_cap) {
+                path_cap *= 2;
+                char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
+                if (!t) { paths = NULL; break; }
+                paths = t;
+            }
             char bp[PATH_MAX];
             snprintf(bp, sizeof(bp), "%s/%s", data_dir, e1->d_name);
             paths[path_count++] = strdup(bp);
@@ -4124,7 +4214,12 @@ ExcludedKeys parse_excluded_keys(const char *csv) {
     ex.keys = malloc(cap * sizeof(char *));
     char *_tok_save = NULL; char *tok = strtok_r(copy, ",", &_tok_save);
     while (tok) {
-        if (ex.count >= cap) { cap *= 2; ex.keys = realloc(ex.keys, cap * sizeof(char *)); }
+        if (ex.count >= cap) {
+            cap *= 2;
+            char **t = realloc(ex.keys, (size_t)cap * sizeof(char *));
+            if (!t) break; /* keep what we already collected */
+            ex.keys = t;
+        }
         ex.keys[ex.count++] = strdup(tok);
         tok = strtok_r(NULL, ",", &_tok_save);
     }
@@ -5050,7 +5145,9 @@ int parse_joins_json(const char *json, JoinSpec **out, int *count) {
 
         if (n >= cap) {
             cap *= 2;
-            arr = realloc(arr, cap * sizeof(JoinSpec));
+            JoinSpec *t = xrealloc_or_free(arr, cap * sizeof(*t));
+            if (!t) { arr = NULL; break; }
+            arr = t;
             memset(&arr[n], 0, (cap - n) * sizeof(JoinSpec));
         }
 
@@ -5937,8 +6034,23 @@ static void *shard_find_worker(void *arg) {
 
                 if (!dropped) {
                     if (sw->result_count >= sw->result_cap) {
-                        sw->result_cap = sw->result_cap ? sw->result_cap * 2 : 64;
-                        sw->results = realloc(sw->results, sw->result_cap * sizeof(MatchResult));
+                        size_t new_cap = sw->result_cap ? sw->result_cap * 2 : 64;
+                        MatchResult *t = xrealloc_or_free(sw->results, new_cap * sizeof(MatchResult));
+                        if (!t) {
+                            sw->results = NULL;
+                            sw->result_count = 0;
+                            sw->result_cap = 0;
+                            free(key);
+                            if (sw->njoins > 0) {
+                                for (int i = 0; i < sw->njoins; i++)
+                                    if (jhs[i].map) fcache_release(jhs[i]);
+                                free(jhs); free(jraws);
+                            }
+                            fcache_release(fc);
+                            return NULL;
+                        }
+                        sw->results = t;
+                        sw->result_cap = new_cap;
                     }
                     MatchResult *mr = &sw->results[sw->result_count++];
                     mr->key = key;
@@ -6341,8 +6453,11 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         while (*ap && *ap != '"') ap++;
                         size_t len = ap - start;
                         if (c->in_count >= c->in_cap) {
-                            c->in_cap *= 2;
-                            c->in_values = realloc(c->in_values, c->in_cap * sizeof(char *));
+                            int new_cap = c->in_cap * 2;
+                            char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
+                            if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+                            c->in_values = t;
+                            c->in_cap = new_cap;
                         }
                         char *val = malloc(len + 1);
                         memcpy(val, start, len); val[len] = '\0';
@@ -6355,8 +6470,11 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                 char *_tok_save = NULL; char *tok = strtok_r(iv, ",", &_tok_save);
                 while (tok) {
                     if (c->in_count >= c->in_cap) {
-                        c->in_cap *= 2;
-                        c->in_values = realloc(c->in_values, c->in_cap * sizeof(char *));
+                        int new_cap = c->in_cap * 2;
+                        char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
+                        if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+                        c->in_values = t;
+                        c->in_cap = new_cap;
                     }
                     c->in_values[c->in_count++] = strdup(tok);
                     tok = strtok_r(NULL, ",", &_tok_save);
@@ -7846,8 +7964,19 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     }
     oc->buffer_bytes += row_bytes;
     if (oc->count >= oc->cap) {
-        oc->cap = oc->cap ? oc->cap * 2 : 256;
-        oc->rows = realloc(oc->rows, oc->cap * sizeof(OrderedRow));
+        int new_cap = oc->cap ? oc->cap * 2 : 256;
+        OrderedRow *t = xrealloc_or_free(oc->rows, (size_t)new_cap * sizeof(OrderedRow));
+        if (!t) {
+            oc->rows = NULL;
+            oc->count = 0;
+            oc->cap = 0;
+            oc->budget_exceeded = 1;
+            pthread_mutex_unlock(&oc->lock);
+            free(sv);
+            return 1;
+        }
+        oc->rows = t;
+        oc->cap = new_cap;
     }
     OrderedRow *r = &oc->rows[oc->count++];
     r->key_len = hdr->key_len;
@@ -8762,7 +8891,12 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         close(fd);
         if (hdr.magic != SHARD_MAGIC) continue;
         int sid = (int)strtol(e1->d_name, NULL, 16);
-        if (nrows >= cap) { cap *= 2; rows = realloc(rows, cap * sizeof(Row)); }
+        if (nrows >= cap) {
+            cap *= 2;
+            Row *t = xrealloc_or_free(rows, cap * sizeof(*t));
+            if (!t) { rows = NULL; break; }
+            rows = t;
+        }
         rows[nrows++] = (Row){ sid, hdr.slots_per_shard, hdr.record_count, (uint64_t)st.st_size };
     }
     closedir(d1);
@@ -8864,7 +8998,9 @@ int cmd_recount(const char *db_root, const char *object) {
         if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
         if (path_count >= path_cap) {
             path_cap *= 2;
-            paths = realloc(paths, path_cap * sizeof(char *));
+            char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
+            if (!t) { paths = NULL; break; }
+            paths = t;
         }
         char bp[PATH_MAX];
         snprintf(bp, sizeof(bp), "%s/%s", data_dir, e1->d_name);
@@ -9192,7 +9328,9 @@ int cmd_list_files(const char *db_root, const char *object,
                 if (prefix_len > 0 && strncmp(e3->d_name, prefix, prefix_len) != 0) continue;
                 if (count >= cap) {
                     cap *= 2;
-                    names = realloc(names, cap * sizeof(char *));
+                    char **t = xrealloc_or_free(names, cap * sizeof(char *));
+                    if (!t) { names = NULL; break; }
+                    names = t;
                 }
                 names[count++] = strdup(e3->d_name);
             }
@@ -10042,7 +10180,12 @@ static int parse_agg_specs(const char *json, AggSpec **out) {
         if (len >= (int)sizeof(buf)) { p = end + 1; continue; }
         memcpy(buf, obj, len); buf[len] = '\0';
 
-        if (n >= cap) { cap *= 2; specs = realloc(specs, cap * sizeof(AggSpec)); }
+        if (n >= cap) {
+            cap *= 2;
+            AggSpec *t = xrealloc_or_free(specs, cap * sizeof(*t));
+            if (!t) { specs = NULL; break; }
+            specs = t;
+        }
         AggSpec *s = &specs[n];
         memset(s, 0, sizeof(*s));
 

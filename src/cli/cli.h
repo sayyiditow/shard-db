@@ -7,6 +7,15 @@
 #include <stdint.h>
 #include <ncurses.h>
 
+/* xrealloc_or_free — safe wrapper around realloc that avoids the
+   memleak-on-OOM pattern. Same as the daemon-side helper in types.h
+   (CLI is intentionally decoupled from types.h). */
+static inline void *xrealloc_or_free(void *p, size_t new_sz) {
+    void *t = realloc(p, new_sz);
+    if (!t) free(p);
+    return t;
+}
+
 /* SB_APPEND(buf, off, cap, fmt, ...) — safe StringBuilder-style append.
    Replaces the unsafe `off += snprintf(buf + off, cap - off, ...)` idiom
    that CodeQL flags as "potentially overflowing snprintf": snprintf
