@@ -582,20 +582,25 @@ void ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb) {
 static void grow_recovery_dir(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return;
+    int dfd = dirfd(d);
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
         struct stat st;
-        if (lstat(p, &st) != 0) continue;
+        /* fstatat against the open dirfd: kernel resolves the entry against
+           that exact inode, so a swap between stat and unlink can't change
+           which file we touch (TOCTOU-safe). */
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
             grow_recovery_dir(p);
         } else if (S_ISREG(st.st_mode)) {
             size_t nl = strlen(e->d_name);
             if (nl >= 4 && strcmp(e->d_name + nl - 4, ".new") == 0) {
-                unlink(p);
-                log_msg(2, "grow_recovery: unlinked stale %s", p);
+                if (unlinkat(dfd, e->d_name, 0) == 0)
+                    log_msg(2, "grow_recovery: unlinked stale %s/%s",
+                            dir, e->d_name);
             }
         }
     }

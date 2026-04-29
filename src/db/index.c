@@ -660,21 +660,28 @@ void sort_dedup_file(const char *path) {
     free(lines);
 }
 
-/* Recursively remove a directory (replaces system("rm -rf")). */
+/* Recursively remove a directory (replaces system("rm -rf")).
+   Uses fstatat / unlinkat against the open dirfd so the type check and
+   the unlink target the same inode — CodeQL "time-of-check time-of-use
+   filesystem race" pattern, even though we own the directory we're
+   walking. */
 void rmrf(const char *path) {
     DIR *d = opendir(path);
     if (!d) { unlink(path); return; }
+    int dfd = dirfd(d);
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.' && (e->d_name[1] == '\0' ||
             (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
-        char child[PATH_MAX];
-        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
         struct stat st;
-        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode))
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
             rmrf(child);
-        else
-            unlink(child);
+        } else {
+            unlinkat(dfd, e->d_name, 0);
+        }
     }
     closedir(d);
     rmdir(path);
@@ -1272,16 +1279,21 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
     snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
     DIR *d = opendir(idx_dir);
     if (!d) return;
+    int dfd = dirfd(d);
 
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         if (strcmp(e->d_name, "index.conf") == 0) continue;
 
+        struct stat st;
+        /* fstatat against the open dirfd ties the metadata check to the
+           same inode that unlinkat/rmrf will operate on: TOCTOU-safe. */
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
-        struct stat st;
-        if (stat(path, &st) != 0) continue;
+
         if (S_ISDIR(st.st_mode)) {
             /* Per-shard layout: indexes/<field>/<NNN>.idx. Drop every
                cached btree mapping under this directory before rmrf so
@@ -1301,7 +1313,7 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
         } else if (S_ISREG(st.st_mode)) {
             /* Legacy single-file <field>.idx artefact. */
             btree_cache_invalidate(path);
-            unlink(path);
+            unlinkat(dfd, e->d_name, 0);
         }
     }
     closedir(d);
@@ -1360,6 +1372,7 @@ static void reindex_clean_legacy(const char *eff_root, const char *object) {
     snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
     DIR *d = opendir(idx_dir);
     if (!d) return;
+    int dfd = dirfd(d);
 
     struct dirent *e;
     while ((e = readdir(d))) {
@@ -1367,13 +1380,15 @@ static void reindex_clean_legacy(const char *eff_root, const char *object) {
         size_t nlen = strlen(e->d_name);
         if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".idx") != 0) continue;
 
+        struct stat st;
+        /* fstatat + unlinkat against the open dirfd: TOCTOU-safe. */
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(st.st_mode)) continue;
+
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
-        struct stat st;
-        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-
         btree_cache_invalidate(path);
-        if (unlink(path) == 0) {
+        if (unlinkat(dfd, e->d_name, 0) == 0) {
             log_msg(3, "REINDEX %s/%s: cleaned legacy single-file index %s",
                     eff_root, object, e->d_name);
         }

@@ -2821,15 +2821,22 @@ int cmd_import_schema(int port, const char *in_path, int if_not_exists) {
 /* CLI: read local file, base64-encode, send put-file JSON, print server response. */
 int cmd_put_file_tcp(int port, const char *dir, const char *object,
                      const char *local_path, int if_not_exists) {
-    struct stat st;
-    if (stat(local_path, &st) != 0) {
+    /* Open first, then fstat the fd — CodeQL flagged the prior
+       stat()-then-open() as a TOCTOU race. The fd we use to read is the
+       fd we measured; nobody can swap the file underneath us. */
+    int fd = open(local_path, O_RDONLY);
+    if (fd < 0) {
         fprintf(stderr, "{\"error\":\"source file not found: %s\"}\n", local_path);
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        fprintf(stderr, "{\"error\":\"%s is not a regular file\"}\n", local_path);
         return 1;
     }
     size_t raw_len = (size_t)st.st_size;
 
-    int fd = open(local_path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "{\"error\":\"cannot open %s\"}\n", local_path); return 1; }
     uint8_t *raw = malloc(raw_len ? raw_len : 1);
     if (!raw) { close(fd); fprintf(stderr, "{\"error\":\"out of memory\"}\n"); return 1; }
     size_t r = 0;

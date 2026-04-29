@@ -8890,11 +8890,23 @@ int cmd_truncate(const char *db_root, const char *object) {
 /* ========== PUT-FILE / GET-FILE-PATH ========== */
 
 int cmd_put_file(const char *db_root, const char *object, const char *src) {
-    struct stat st;
-    if (stat(src, &st) != 0) {
+    /* Open the source first, then fstat the fd. CodeQL flagged the prior
+       stat()-then-open() as a TOCTOU race: an attacker controlling the
+       directory containing `src` could swap the file between the two
+       syscalls. The fd binds us to a specific inode for the rest of the
+       function. */
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) {
         fprintf(stderr, "Error: Source file %s not found\n", src);
         return 1;
     }
+    struct stat st;
+    if (fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(sfd);
+        fprintf(stderr, "Error: %s is not a regular file\n", src);
+        return 1;
+    }
+
     const char *filename = strrchr(src, '/');
     filename = filename ? filename + 1 : src;
     char key[PATH_MAX];
@@ -8911,8 +8923,6 @@ int cmd_put_file(const char *db_root, const char *object, const char *src) {
     snprintf(dest, sizeof(dest), "%s/%s", dest_dir, filename);
     mkdirp(dest_dir);
 
-    int sfd = open(src, O_RDONLY);
-    if (sfd < 0) { fprintf(stderr, "Error: Cannot read %s\n", src); return 1; }
     int dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dfd < 0) { close(sfd); fprintf(stderr, "Error: Cannot create %s\n", dest); return 1; }
     char buf[65536]; ssize_t n;

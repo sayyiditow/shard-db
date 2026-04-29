@@ -130,16 +130,17 @@ void purge_old_logs(void) {
     time_t cutoff = time(NULL) - g_log_retain_days * 86400;
     DIR *d = opendir(g_log_dir);
     if (!d) return;
+    int dfd = dirfd(d);
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t nlen = strlen(e->d_name);
         if (nlen < 4 || strcmp(e->d_name + nlen - 4, ".log") != 0)
             continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", g_log_dir, e->d_name);
         struct stat st;
-        if (stat(path, &st) == 0 && st.st_mtime < cutoff)
-            unlink(path);
+        /* fstatat + unlinkat against the open dirfd: TOCTOU-safe. */
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(st.st_mode) && st.st_mtime < cutoff)
+            unlinkat(dfd, e->d_name, 0);
     }
     closedir(d);
 }
@@ -1782,16 +1783,19 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
 
     DIR *d = opendir(idx_dir);
     if (!d) return 0;
+    int dfd = dirfd(d);
 
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         if (strcmp(e->d_name, "index.conf") == 0) continue;
 
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
         struct stat st;
-        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        /* fstatat against the open dirfd: TOCTOU-safe — the rename below
+           uses the same dirfd so the entry we measured is the entry we
+           rename. */
+        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(st.st_mode)) continue;
 
         char newbase[512];
         int chg = replace_tokens(e->d_name, old_name, new_name, newbase, sizeof(newbase));
@@ -1805,11 +1809,9 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
             btree_cache_invalidate(p);
         }
 
-        char newpath[PATH_MAX];
-        snprintf(newpath, sizeof(newpath), "%s/%s", idx_dir, newbase);
-        if (rename(path, newpath) != 0) {
-            log_msg(1, "rename-field: failed to rename %s -> %s: %s",
-                    path, newpath, strerror(errno));
+        if (renameat(dfd, e->d_name, dfd, newbase) != 0) {
+            log_msg(1, "rename-field: failed to rename %s/%s -> %s: %s",
+                    idx_dir, e->d_name, newbase, strerror(errno));
         }
     }
     closedir(d);
