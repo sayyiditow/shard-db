@@ -205,7 +205,9 @@ Output goes to `build/` with a default `db.env` and `schema.conf`.
 
 ## Configuration (db.env)
 
-Place `db.env` in the working directory where you run shard-db.
+Place `db.env` in the working directory where you run shard-db. The release tarball ships `db.env.example` — copy to `db.env` and edit before first start. Anything unset uses the default below.
+
+### Core
 
 | Variable | Default | Description |
 |---|---|---|
@@ -216,16 +218,48 @@ Place `db.env` in the working directory where you run shard-db.
 | `LOG_LEVEL` | `3` | 0=off, 1=error, 2=warn, 3=info, 4=debug |
 | `LOG_RETAIN_DAYS` | `7` | Auto-delete logs older than N days |
 | `INDEX_PAGE_SIZE` | `4096` | B+ tree page size (1024-65536) |
-| `THREADS` | `0` | Parallel scan threads (0 = auto nproc) |
-| `WORKERS` | `0` | Worker thread pool (0 = auto, min 4) |
+
+### Concurrency
+
+| Variable | Default | Description |
+|---|---|---|
+| `THREADS` | `0` | Parallel-pool worker count (0 = `4 × nproc`, min 4). One pool drives every parallel hot path: shard scans, parallel index builds, indexed find/count/aggregate fan-out, bulk-insert phase 2 |
+| `WORKERS` | `0` | TCP server thread pool — accepts connections + dispatches request handlers (0 = auto, min 4) |
+| `POOL_CHUNK` | `0` | parallel_for submission chunk size (0 = `nproc`). Tasks are enqueued in chunks of this size to interleave with concurrent submitters; larger values reduce queue-lock contention but serialise submitters more. Rarely needs tuning |
+
+### Memory & I/O budgets
+
+| Variable | Default | Description |
+|---|---|---|
 | `GLOBAL_LIMIT` | `100000` | Max records returned per query |
-| `MAX_REQUEST_SIZE` | `33554432` | Max request size in bytes (32 MB) |
-| `FCACHE_MAX` | `4096` | Shard mmap cache capacity |
-| `BT_CACHE_MAX` | `256` | B+ tree index cache capacity |
-| `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap in MB — protects against one bad query monopolising RAM |
+| `MAX_REQUEST_SIZE` | `33554432` | Max inbound request size in bytes (32 MB). Per-connection read-buffer allocation, so memory cost = max-concurrent-conns × this |
+| `FCACHE_MAX` | `4096` | Shard mmap cache capacity. Strict allow-list: `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning |
+| `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1** — derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored |
+| `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap in MB — protects against one bad query monopolising RAM. Checked at every collection site (collect_hash buffer is mmap MAP_NORESERVE up to this cap; pages lazy-commit on write) |
+
+### Auth
+
+| Variable | Default | Description |
+|---|---|---|
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypass auth (assumes trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host) |
 | `TOKEN_CAP` | `1024` | Open-addressed hash-table bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes |
-| `SLOW_QUERY_MS` | `500` | Slow query log threshold in ms |
+
+### Observability
+
+| Variable | Default | Description |
+|---|---|---|
+| `SLOW_QUERY_MS` | `500` | Slow query log threshold in ms (floor 100; 0 = off). Queries exceeding the threshold get a per-day file under `LOG_DIR/slow-YYYY-MM-DD.log` |
+
+### TLS (full details in [Native TLS](#native-tls-13))
+
+| Variable | Default | Description |
+|---|---|---|
+| `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. `0` = plaintext TCP |
+| `TLS_CERT` | (empty) | Server cert path (PEM, chain ok) — required when `TLS_ENABLE=1` |
+| `TLS_KEY` | (empty) | Server private key path (PEM) — required when `TLS_ENABLE=1` |
+| `TLS_CA` | (empty) | Client-side CA bundle to verify the server (defaults to OS trust store) |
+| `TLS_SKIP_VERIFY` | `0` | Client-side: skip server cert verify (dev only — emits stderr warning) |
+| `TLS_SERVER_NAME` | `localhost` | Client SNI / verify-name override (env var, not db.env). Only matters when connecting to a server whose cert isn't issued for `localhost` |
 
 ## Quick Start
 
