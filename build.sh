@@ -34,25 +34,34 @@ esac
 #   debug   - -O0 -g (no sanitizers; just for stepping in gdb)
 # The sanitizer modes use -O1 (not -O2) because aggressive optimisation
 # sometimes hides the very bugs the sanitizer is meant to find.
+# Common warning flags: -Wall -Wextra catch a wide net of real bugs (typos
+# in conditionals, sign-mixing in arithmetic, dead stores). We disable
+# -Wformat-truncation because GCC fires it conservatively on every
+# `snprintf(buf[PATH_MAX], "%s/x", path)` even though snprintf truncates
+# safely and we never act on the truncated result. The CodeQL +
+# scan-build + cppcheck CI workflows catch real format-string issues
+# more reliably than -Wformat-truncation does.
+WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter"
+
 BUILD_MODE="${BUILD_MODE:-release}"
 case "$BUILD_MODE" in
     release)
-        MODE_CFLAGS="-O2 -flto"
+        MODE_CFLAGS="-O2 -flto $WARN_CFLAGS"
         MODE_LDFLAGS=""
         DO_STRIP=1
         ;;
     asan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined $WARN_CFLAGS"
         MODE_LDFLAGS="-fsanitize=address,undefined"
         DO_STRIP=0
         ;;
     tsan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread $WARN_CFLAGS"
         MODE_LDFLAGS="-fsanitize=thread"
         DO_STRIP=0
         ;;
     debug)
-        MODE_CFLAGS="-O0 -g"
+        MODE_CFLAGS="-O0 -g $WARN_CFLAGS"
         MODE_LDFLAGS=""
         DO_STRIP=0
         ;;
@@ -60,7 +69,7 @@ case "$BUILD_MODE" in
         # gcov-style line/branch coverage. Each compiled .o gets a sibling
         # .gcno (control-flow graph); each test run produces .gcda counters.
         # Codecov collects both via lcov.
-        MODE_CFLAGS="-O0 -g --coverage -fprofile-arcs -ftest-coverage"
+        MODE_CFLAGS="-O0 -g --coverage -fprofile-arcs -ftest-coverage $WARN_CFLAGS"
         MODE_LDFLAGS="--coverage"
         DO_STRIP=0
         ;;

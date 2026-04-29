@@ -179,14 +179,6 @@ static void token_set_add_full(const char *token,
     }
 }
 
-/* Legacy convenience: plain-string add always means global admin (rwx). */
-static void token_set_add(const char *token) {
-    token_set_add_full(token, NULL, NULL, PERM_RWX);
-}
-static void token_set_add_scoped(const char *token, const char *dir_scope) {
-    token_set_add_full(token, dir_scope, NULL, PERM_RWX);
-}
-
 static int token_set_remove(const char *token) {
     uint32_t idx = str_hash(token) % g_token_cap;
     for (int i = 0; i < g_token_cap; i++) {
@@ -464,14 +456,6 @@ static void save_tokens_conf_full(const char *db_root,
         save_token_line(f, i);
     }
     fclose(f);
-}
-
-/* Legacy wrappers used elsewhere in this file. */
-static void save_tokens_conf_scoped(const char *db_root, const char *dir_scope) {
-    save_tokens_conf_full(db_root, dir_scope, NULL);
-}
-static void save_tokens_conf(const char *db_root) {
-    save_tokens_conf_full(db_root, NULL, NULL);
 }
 
 /* ========== JSON QUERY DISPATCH ========== */

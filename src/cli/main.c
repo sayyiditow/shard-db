@@ -1146,7 +1146,14 @@ static char *pick_tenant(CliConn *c) {
     collect_string_array(resp, NULL, &dirs, &n);
     free(resp);
     if (n == 0) { tui_alert("(none)", "no tenants in dirs.conf"); return NULL; }
-    const char **vd = malloc(n * sizeof(*vd));
+    /* calloc (vs malloc) is just to keep -Wmaybe-uninitialized happy
+       under -O2 + LTO; the loop below would populate every slot anyway. */
+    const char **vd = calloc((size_t)n, sizeof(*vd));
+    if (!vd) {
+        for (int i = 0; i < n; i++) free(dirs[i]);
+        free(dirs);
+        return NULL;
+    }
     for (int i = 0; i < n; i++) vd[i] = dirs[i];
     const char *picked = tui_pick("pick tenant", vd, n);
     free(vd);

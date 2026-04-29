@@ -308,6 +308,7 @@ typedef struct {
     size_t limit;   /* max results to collect, 0 = unlimited */
 } SearchCollectCtx;
 
+static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) __attribute__((unused));
 static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     SearchCollectCtx *sc = (SearchCollectCtx *)ctx;
     if (sc->limit > 0 && sc->count >= sc->limit) return 1; /* stop */
@@ -384,6 +385,9 @@ static void *search_shard_worker(void *arg) {
 }
 
 /* Parallel fetch: collect hashes, group by shard, parallel shard reads, output */
+static int parallel_fetch_and_print(const char *db_root, const char *object,
+                                    const Schema *sch, CollectedHash *entries, size_t count,
+                                    FieldSchema *fs, int mode) __attribute__((unused));
 static int parallel_fetch_and_print(const char *db_root, const char *object,
                                     const Schema *sch, CollectedHash *entries, size_t count,
                                     FieldSchema *fs, int mode) {
@@ -488,6 +492,7 @@ static void *activate_worker(void *arg) {
 }
 
 typedef struct { char ipath[PATH_MAX]; BtEntry *pairs; size_t pair_count; } IdxBuildArg;
+static void *idx_build_worker(void *arg) __attribute__((unused));
 static void *idx_build_worker(void *arg) {
     IdxBuildArg *ib = (IdxBuildArg *)arg;
     /* Merge-rebuild: sort new entries, merge with existing tree, rebuild from scratch.
@@ -563,6 +568,10 @@ static void *idx_build_field_worker(void *arg) {
    return pairs[offset .. offset+counts[s]] holds shard s's entries. The
    caller still owns the BtEntry value strings (one allocation per pair,
    freed exactly once after the build). */
+static int partition_pairs_by_idx_shard(BtEntry *pairs, size_t count,
+                                        const char *db_root, const char *object,
+                                        const char *field, int splits,
+                                        IdxBuildArg *out_args) __attribute__((unused));
 static int partition_pairs_by_idx_shard(BtEntry *pairs, size_t count,
                                         const char *db_root, const char *object,
                                         const char *field, int splits,
@@ -993,8 +1002,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     Schema sc = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-    const char *field_ptrs[MAX_FIELDS];
-    for (int i = 0; i < nfields; i++) field_ptrs[i] = idx_fields[i];
+    (void)nfields; /* indexes are walked per-shard later via load_index_fields */
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
@@ -1741,8 +1749,8 @@ static void *bulk_del_shard_worker(void *arg) {
     BulkDelShardWork *sw = (BulkDelShardWork *)arg;
     if (sw->key_count == 0) return NULL;
 
-    int sid = sw->shard_slots[0]; /* all keys in this worker share shard_id */
-    /* Actually shard_slots stores start_slot, we need shard_id from first key's hash */
+    /* shard_slots stores start_slot per key; for the per-shard file we
+       need shard_id derived from the first key's hash. */
     int shard_id, dummy;
     addr_from_hash(sw->hashes[0], sw->sch->splits, &shard_id, &dummy);
 
@@ -10314,6 +10322,7 @@ typedef struct {
     int check_primary;
 } IdxAggCtx;
 
+static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw) __attribute__((unused));
 static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw) {
     IdxAggCtx *ia = (IdxAggCtx *)raw;
     if (ia->check_primary && ia->primary_crit) {
@@ -10541,7 +10550,7 @@ int cmd_aggregate(const char *db_root, const char *object,
 
         AggCtx ctx_full;
         agg_ctx_clone_shared(&ctx_full, &ctx);
-        int rc_full = (rc_eq == 0) ? agg_run_plan(&ctx_full, NULL, db_root, object, &sch) : -1;
+        if (rc_eq == 0) (void)agg_run_plan(&ctx_full, NULL, db_root, object, &sch);
 
         if (dl.timed_out) {
             OUT("{\"error\":\"query_timeout\"}\n");

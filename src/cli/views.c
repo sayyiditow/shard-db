@@ -738,8 +738,7 @@ int tui_show_table(const char *title, const char *json) {
             case KEY_UP: case 'k':    if (top > 0) top--; break;
             case KEY_DOWN: case 'j':  if (top < t.nrows - 1) top++; break;
             case KEY_PPAGE: case 'b': top -= view; if (top < 0) top = 0; break;
-            case KEY_NPAGE: case ' ': top += view;
-                                       if (top > t.nrows - 1) top = t.nrows - 1; break;
+            case KEY_NPAGE: case ' ': top += view; if (top > t.nrows - 1) top = t.nrows - 1; break;
             case 'g': case KEY_HOME:  top = 0; break;
             case 'G': case KEY_END:   top = t.nrows - 1; break;
             case KEY_LEFT: case 'h':  hscroll -= 8; if (hscroll < 0) hscroll = 0; break;

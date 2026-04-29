@@ -705,7 +705,6 @@ typedef struct {
 static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     IndexScanCtx *ic = (IndexScanCtx *)ctx;
     const char *raw = (const char *)(block + hdr->key_len);
-    size_t raw_len = hdr->value_len;
     uint8_t *key_buf = NULL;
     size_t key_len = 0;
 
@@ -925,7 +924,6 @@ typedef struct {
 static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     MultiIndexCtx *mc = (MultiIndexCtx *)ctx;
     const char *raw = (const char *)(block + hdr->key_len);
-    size_t raw_len = hdr->value_len;
 
     for (int fi = 0; fi < mc->nfields; fi++) {
         uint8_t *key_buf = NULL;
@@ -1367,6 +1365,7 @@ int reindex_object(const char *eff_root, const char *object) {
 /* Legacy single-file sweep — kept for cmd_reindex's per-object loop where
    reindex_wipe_idx_dirs would already handle it, but documented separately
    so the upgrade path stays clear. */
+static void reindex_clean_legacy(const char *eff_root, const char *object) __attribute__((unused));
 static void reindex_clean_legacy(const char *eff_root, const char *object) {
     char idx_dir[PATH_MAX];
     snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
