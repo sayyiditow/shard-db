@@ -35,7 +35,10 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install MkDocs + Material
-        run: pip install -r requirements.txt
+        # --require-hashes makes pip refuse to install if any package's
+        # downloaded artifact doesn't match the SHA256 in requirements.txt.
+        # Closes Scorecard's Pinned-Dependencies check at the strict tier.
+        run: pip install --require-hashes -r requirements.txt
 
       - name: Build site
         run: mkdocs build --strict
