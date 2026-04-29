@@ -69,7 +69,37 @@ static int ensure_ssl_ctx(void) {
     return 0;
 }
 
+/* Conservative loopback check: host strings that are unambiguously the
+   local machine. Used to gate plaintext-token sends. We deliberately
+   only allowlist literal forms (no DNS lookup): a remote that resolves
+   to 127.0.0.1 via /etc/hosts is still treated as remote so the token
+   can't leak via misconfigured DNS. */
+static int is_loopback_host(const char *host) {
+    if (!host || !*host) return 0;
+    return strcmp(host, "127.0.0.1") == 0 ||
+           strcmp(host, "::1")       == 0 ||
+           strcmp(host, "localhost") == 0;
+}
+
 CliConn *cli_connect(const char *host, int port) {
+    /* Refuse to send a bearer token over plaintext to a non-loopback peer.
+       The token would otherwise traverse the network in clear text — any
+       on-path observer (a forwarding proxy, an intermediate router with
+       traffic capture, an attacker on the same Wi-Fi) would see it.
+       Either flip TLS_ENABLE=1 + provide TLS_CA, or accept the loopback
+       restriction. CodeQL flags the env-var-token → write() dataflow as
+       "system data exposure" — this guard makes that dataflow safe by
+       construction for the only environment where plaintext is sane. */
+    if (g_cli_token[0] != '\0' &&
+        !g_cli_tls_enable &&
+        !is_loopback_host(host)) {
+        fprintf(stderr,
+                "shard-cli: refusing to send TOKEN to %s without TLS — "
+                "set TLS_ENABLE=1 (and TLS_CA) or connect to localhost\n",
+                host);
+        return NULL;
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
 

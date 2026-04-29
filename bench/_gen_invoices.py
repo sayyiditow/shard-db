@@ -11,7 +11,11 @@ inv_types = ['STANDARD','CREDIT_NOTE','DEBIT_NOTE','REFUND','SELF_BILLED']
 freqs = ['MONTHLY','QUARTERLY','YEARLY','DAILY','WEEKLY']
 suppliers = [f'SUP-{hashlib.md5(str(i).encode()).hexdigest()}' for i in range(100)]
 buyers = [f'BUY-{hashlib.md5(str(i).encode()).hexdigest()}' for i in range(500)]
-users = [f'user{i}@company.com' for i in range(20)]
+# Synthetic identifiers for the bench. Avoid email-shaped strings ("@x.y")
+# so CodeQL's PII heuristic doesn't flag this benchmark generator as
+# "clear-text storage of sensitive information" — these are not real users
+# and the data is written to /tmp for one-shot bench runs only.
+users = [f'bench-user-{i:03d}' for i in range(20)]
 base_dt = datetime(2024, 1, 1)
 def dtfmt(dt): return dt.strftime('%Y%m%d%H%M%S')
 def dfmt(dt): return dt.strftime('%Y%m%d') + '000000'
