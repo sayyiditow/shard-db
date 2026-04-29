@@ -44,11 +44,15 @@ Line + branch coverage. Surfaces test-suite blind spots.
 
 ### Steps
 
-1. Sign in at <https://about.codecov.io/sign-up/> via GitHub OAuth.
-2. From the dashboard, click **"Add new repository"** and pick `sayyiditow/shard-db`. The repo gets enabled immediately for public repos.
-3. **No secret needed** — Codecov supports tokenless OIDC upload from GitHub Actions for public repos. The existing `.github/workflows/codecov.yml` already uses it.
-4. Trigger the workflow: it runs on every push to main + PR. Either wait for the next push or trigger manually via Actions → "Coverage (Codecov)" → Run workflow.
-5. After the first successful upload, your repo page on codecov.io shows the coverage % and per-file heatmap.
+1. Sign in at <https://app.codecov.io/login/gh> via GitHub OAuth.
+2. From the dashboard, pick `sayyiditow/shard-db` from your repo list. Codecov walks you through "Coverage Analytics" setup; pick **Using GitHub Actions** as the setup option.
+3. **Step 2 of Codecov's UI** — pick **Repository token** as the upload-token type.
+4. **Step 3 of Codecov's UI** shows a UUID-shaped repository token. **Important:** if that token has been visible in chat / logs / a screenshot, click the **Regenerate token** button first and use the new one. Tokens cannot be revoked retroactively, only rotated.
+5. Copy the token. In GitHub: **Settings → Secrets and variables → Actions → New repository secret**:
+   - Name: `CODECOV_TOKEN`
+   - Value: the token from Codecov
+6. Steps 4-5 of Codecov's UI walk through editing the workflow YAML. **Skip this** — the workflow is already in place at `.github/workflows/codecov.yml` and references `secrets.CODECOV_TOKEN`.
+7. Push to main (or trigger manually via Actions → "Coverage (Codecov)" → Run workflow). After the first successful upload, your repo page on codecov.io shows the coverage % and per-file heatmap.
 
 ### Badge
 
