@@ -497,6 +497,65 @@ static void *idx_build_worker(void *arg) {
     return NULL;
 }
 
+/* Per-field bulk-merge that runs all idx_n shards' merges serially inside one
+   worker. Trades shard-level parallelism for thread-pool dispatch efficiency:
+   the prior layout dispatched nfields × idx_n tiny tasks (e.g. 14 × 16 = 224)
+   into the 16-thread pool, paying full task-dispatch + parallel_for queue
+   overhead per shard. The bench showed insert-with-pre-existing-indexes
+   ~30 % slower than the pre-2026.05.1 single-file layout for that reason —
+   bulk_merge's actual work-per-call is tiny (a few ms once warm), so the
+   per-task overhead dominates. With nfields workers (≤16 in practice) the
+   pool dispatches in one wave; each worker streams the 16 per-shard merges
+   sequentially using its own thread, which the kernel page-cache handles
+   well because consecutive shards of the same field share access patterns. */
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const char *field;
+    int splits;
+    BtEntry *new_entries;     /* not owned; values freed by caller */
+    size_t   new_count;
+} IdxFieldArg;
+
+static void *idx_build_field_worker(void *arg) {
+    IdxFieldArg *fa = (IdxFieldArg *)arg;
+    if (fa->new_count == 0) return NULL;
+    int idx_n = index_splits_for(fa->splits);
+
+    /* Bucket-sort new_entries by idx_shard. */
+    size_t *counts  = calloc((size_t)idx_n, sizeof(size_t));
+    size_t *offsets = calloc((size_t)idx_n, sizeof(size_t));
+    BtEntry *parted = malloc(fa->new_count * sizeof(BtEntry));
+    if (!counts || !offsets || !parted) {
+        free(counts); free(offsets); free(parted);
+        return NULL;
+    }
+    for (size_t i = 0; i < fa->new_count; i++)
+        counts[idx_shard_for_hash(fa->new_entries[i].hash, fa->splits)]++;
+    size_t acc = 0;
+    for (int s = 0; s < idx_n; s++) { offsets[s] = acc; acc += counts[s]; }
+    size_t *cursor = calloc((size_t)idx_n, sizeof(size_t));
+    if (!cursor) { free(counts); free(offsets); free(parted); return NULL; }
+    for (size_t i = 0; i < fa->new_count; i++) {
+        int s = idx_shard_for_hash(fa->new_entries[i].hash, fa->splits);
+        parted[offsets[s] + cursor[s]++] = fa->new_entries[i];
+    }
+    free(cursor);
+
+    /* Serial per-shard bulk_merge — same ops as before, just in one thread. */
+    for (int s = 0; s < idx_n; s++) {
+        if (counts[s] == 0) continue;
+        char path[PATH_MAX];
+        build_idx_path(path, sizeof(path), fa->db_root, fa->object, fa->field, s);
+        btree_bulk_merge(path, parted + offsets[s], counts[s]);
+    }
+
+    free(parted);
+    free(counts);
+    free(offsets);
+    return NULL;
+}
+
 /* Partition `pairs` (of total `count`) by idx_shard and append per-shard
    IdxBuildArg slices to `out_args` (which must have room for at least
    index_splits_for(splits) entries). Returns the number of non-empty
@@ -1230,24 +1289,24 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
     else free(json);
 
-    /* Bulk write indexes — partition each field's pairs by idx_shard, then
-       fan out one bulk-merge worker per (field, shard) pair. */
+    /* Bulk write indexes — one worker per field; the worker streams the per-
+       shard merges sequentially. Halves dispatch overhead vs the old
+       per-(field, shard) layout that flooded the 16-thread pool with
+       nfields × idx_n tiny tasks. */
     if (nfields > 0) {
-        int idx_n = index_splits_for(sc.splits);
-        IdxBuildArg *ib_args = malloc((size_t)nfields * idx_n * sizeof(IdxBuildArg));
-        int ib_count = 0;
+        IdxFieldArg *fa = malloc((size_t)nfields * sizeof(IdxFieldArg));
+        int fa_count = 0;
         for (int fi = 0; fi < nfields; fi++) {
             if (idx_pair_counts[fi] == 0) continue;
-            ib_count += partition_pairs_by_idx_shard(idx_pairs[fi], idx_pair_counts[fi],
-                                                    db_root, object, idx_fields[fi],
-                                                    sc.splits, ib_args + ib_count);
+            fa[fa_count++] = (IdxFieldArg){
+                .db_root = db_root, .object = object, .field = idx_fields[fi],
+                .splits = sc.splits,
+                .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
+            };
         }
-
-        parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
-
-        free(ib_args);
-        /* Free the value strings (one allocation per pair, partitioning only
-           reorders pointers — no copies — so each value is owned exactly once). */
+        parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
+        free(fa);
+        /* Free the value strings — owned by idx_pairs[fi]. */
         for (int fi = 0; fi < nfields; fi++) {
             for (size_t ei = 0; ei < idx_pair_counts[fi]; ei++)
                 free((char *)idx_pairs[fi][ei].value);
@@ -1617,23 +1676,22 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     if (data_mmaped) munmap((void *)data, st.st_size);
     else free((void *)data);
 
-    /* Parallel index builds — partition each field's pairs by idx_shard and
-       dispatch one bulk-merge worker per (field, shard) pair. */
+    /* Parallel index builds — one worker per field; the worker streams the
+       per-shard merges sequentially. See cmd_bulk_insert (JSON path) above
+       for why we no longer fan out per (field, shard). */
     if (nidx > 0) {
-        int idx_n = index_splits_for(sc.splits);
-        IdxBuildArg *ib_args = malloc((size_t)nidx * idx_n * sizeof(IdxBuildArg));
-        int ib_count = 0;
+        IdxFieldArg *fa = malloc((size_t)nidx * sizeof(IdxFieldArg));
+        int fa_count = 0;
         for (int fi = 0; fi < nidx; fi++) {
             if (idx_pair_counts[fi] == 0) continue;
-            ib_count += partition_pairs_by_idx_shard(idx_pairs[fi], idx_pair_counts[fi],
-                                                    db_root, object, idx_fields[fi],
-                                                    sc.splits, ib_args + ib_count);
+            fa[fa_count++] = (IdxFieldArg){
+                .db_root = db_root, .object = object, .field = idx_fields[fi],
+                .splits = sc.splits,
+                .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
+            };
         }
-        parallel_for(idx_build_worker, ib_args, ib_count, sizeof(IdxBuildArg));
-        free(ib_args);
-        /* Each value string is referenced by exactly one ib_args slice (the
-           partition reorders pointers in place), so iterate idx_pairs[fi]
-           directly and free each value once. */
+        parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
+        free(fa);
         for (int fi = 0; fi < nidx; fi++) {
             for (size_t ei = 0; ei < idx_pair_counts[fi]; ei++)
                 free((char *)idx_pairs[fi][ei].value);
