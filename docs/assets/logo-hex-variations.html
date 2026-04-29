@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>shard-db — hex shards refinement</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0d1117; color: #c9d1d9; max-width: 980px; margin: 2em auto; padding: 0 1em; }
+  .variation { display: grid; grid-template-columns: 200px 1fr; gap: 2em; padding: 2em 0; border-bottom: 1px solid #30363d; }
+  .swatch { background: #161b22; border-radius: 8px; padding: 1em; display: flex; align-items: center; justify-content: center; min-height: 180px; }
+  h2 { margin-top: 0; }
+  .row { display: flex; gap: 2em; align-items: center; flex-wrap: wrap; margin-top: 1em; }
+  .small { font-size: 11px; color: #8b949e; }
+  .pill { display: inline-block; background: #21262d; border-radius: 999px; padding: 2px 10px; font-size: 11px; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Hex shards — refinement variations</h1>
+<p class="small">All variations on concept #1. Pick a single one or a hybrid.</p>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch">
+    <svg width="160" height="160" viewBox="0 0 120 120">
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff" opacity="0.95"/>
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="none" stroke="#1f6feb" stroke-width="2"/>
+      <polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.6"/>
+      <polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.4"/>
+    </svg>
+  </div>
+  <div>
+    <h2>A. Original</h2>
+    <p>Three overlapping hex tiles, lead one bright. Where we started.</p>
+    <p class="small"><span class="pill">primary #58a6ff</span><span class="pill">accent #1f6feb</span></p>
+    <p class="small">Honest assessment: a competent first cut. Pretty close to generic blockchain/Web3 aesthetic though — could look like any-other-distributed-tech logo.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="none" stroke="#1f6feb" stroke-width="2"/><polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.6"/><polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.4"/></svg>
+      <span class="small">favicon</span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch">
+    <svg width="160" height="160" viewBox="0 0 120 120">
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/>
+      <polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.65"/>
+      <polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.45"/>
+      <!-- Data dots inside the lead hex -->
+      <circle cx="50" cy="45" r="3" fill="#fff"/>
+      <circle cx="65" cy="38" r="2" fill="#fff" opacity="0.7"/>
+      <circle cx="72" cy="55" r="2.5" fill="#fff" opacity="0.85"/>
+      <circle cx="55" cy="60" r="2" fill="#fff" opacity="0.6"/>
+      <circle cx="48" cy="55" r="1.5" fill="#fff" opacity="0.5"/>
+    </svg>
+  </div>
+  <div>
+    <h2>B. With data inside</h2>
+    <p>Same hex layout but the lead tile contains scattered "records" (white dots). Resolves the "could be any distributed tech" critique by literally showing data inside the shard.</p>
+    <p class="small">Communicates: this isn't crypto/Web3 — it's a database, and each shard contains records.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/><polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.65"/><polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.45"/><circle cx="50" cy="45" r="4" fill="#fff"/><circle cx="68" cy="42" r="3" fill="#fff" opacity="0.7"/><circle cx="60" cy="60" r="3" fill="#fff" opacity="0.85"/></svg>
+      <span class="small">favicon (dots reduced for legibility)</span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch">
+    <svg width="160" height="160" viewBox="0 0 120 120">
+      <!-- Just two hexes — cleaner -->
+      <polygon points="50,15 80,32 80,68 50,85 20,68 20,32" fill="#58a6ff"/>
+      <polygon points="80,15 110,32 110,68 80,85 50,68 50,32" fill="#1f6feb" opacity="0.7"/>
+    </svg>
+  </div>
+  <div>
+    <h2>C. Two hexes (minimalist)</h2>
+    <p>Drop one. Two interlocking hexes is a cleaner, more sophisticated mark. Subtraction makes it feel more designed and less generic.</p>
+    <p class="small">Still reads as "more than one shard" — the differentiator is preserved.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="50,15 80,32 80,68 50,85 20,68 20,32" fill="#58a6ff"/><polygon points="80,15 110,32 110,68 80,85 50,68 50,32" fill="#1f6feb" opacity="0.7"/></svg>
+      <span class="small">favicon</span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch">
+    <svg width="160" height="160" viewBox="0 0 120 120">
+      <!-- Warm palette — Rust / Postgres feel -->
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#f78166" opacity="0.95"/>
+      <polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#bf4220" opacity="0.7"/>
+      <polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#bf4220" opacity="0.4"/>
+    </svg>
+  </div>
+  <div>
+    <h2>D. Warm palette</h2>
+    <p>Same shape as A but in Rust/Postgres-adjacent oranges. Warmer, less "cloud-tech blue". Stands out next to the blue CI/Scorecard badges.</p>
+    <p class="small"><span class="pill">primary #f78166</span><span class="pill">accent #bf4220</span></p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#f78166"/><polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#bf4220" opacity="0.7"/><polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#bf4220" opacity="0.4"/></svg>
+      <span class="small">favicon</span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch">
+    <svg width="160" height="160" viewBox="0 0 120 120">
+      <!-- Single hex, no shadow — confident minimalism -->
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/>
+      <!-- Internal facets -->
+      <line x1="60" y1="10" x2="60" y2="90" stroke="#1f6feb" stroke-width="2" opacity="0.5"/>
+      <line x1="25" y1="30" x2="95" y2="70" stroke="#1f6feb" stroke-width="2" opacity="0.5"/>
+      <line x1="95" y1="30" x2="25" y2="70" stroke="#1f6feb" stroke-width="2" opacity="0.5"/>
+    </svg>
+  </div>
+  <div>
+    <h2>E. Single hex with internal facets</h2>
+    <p>One hex, with three lines through it splitting the interior into 6 wedges. The "shards" are inside the cell, not separate cells. More confident and less crowded.</p>
+    <p class="small">Conceptually closer to "this thing is one database that's internally sharded" — which is exactly what shard-db is.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/><line x1="60" y1="10" x2="60" y2="90" stroke="#1f6feb" stroke-width="3" opacity="0.6"/><line x1="25" y1="30" x2="95" y2="70" stroke="#1f6feb" stroke-width="3" opacity="0.6"/><line x1="95" y1="30" x2="25" y2="70" stroke="#1f6feb" stroke-width="3" opacity="0.6"/></svg>
+      <span class="small">favicon</span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="variation">
+  <div class="swatch" style="display: flex; flex-direction: column; gap: 1em;">
+    <svg width="280" height="80" viewBox="0 0 280 80">
+      <!-- Logo + wordmark lockup -->
+      <polygon points="40,15 70,32 70,58 40,75 10,58 10,32" fill="#58a6ff"/>
+      <line x1="40" y1="15" x2="40" y2="75" stroke="#1f6feb" stroke-width="2" opacity="0.6"/>
+      <line x1="10" y1="32" x2="70" y2="58" stroke="#1f6feb" stroke-width="2" opacity="0.6"/>
+      <line x1="70" y1="32" x2="10" y2="58" stroke="#1f6feb" stroke-width="2" opacity="0.6"/>
+      <text x="90" y="55" font-family="ui-monospace, 'SF Mono', monospace" font-size="32" font-weight="700" fill="#c9d1d9">shard-db</text>
+    </svg>
+  </div>
+  <div>
+    <h2>F. Lockup (E + wordmark)</h2>
+    <p>Variation E paired with the project name in monospace. This is what would go in the docs header / social card / GitHub repo banner.</p>
+    <p class="small">The mark + wordmark together — best of both worlds.</p>
+  </div>
+</div>
+
+<hr>
+<h3>My take</h3>
+<p>Of these, <strong>E (single hex with internal facets)</strong> is the strongest:</p>
+<ul>
+  <li>Cleanest favicon — reads at 16px</li>
+  <li>The "internal sharding" reading is conceptually accurate (one DB, internally partitioned)</li>
+  <li>Hardest to confuse with a blockchain/distributed-thing logo because there's only one hex, not many</li>
+  <li>Pairs naturally with a wordmark (variation F)</li>
+</ul>
+<p>If you want the "multiple shards" reading more explicit, <strong>C (two hexes)</strong> is the next strongest. <strong>B (with data dots)</strong> is the most explicit but risks looking busy.</p>
+<p>Tell me which to pursue and I'll generate clean SVG files at multiple sizes.</p>
+
+</body>
+</html>

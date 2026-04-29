@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  shard-db logo (concept E — single hex with internal facets).
+  One hex partitioned by three internal lines into 6 wedges:
+  conceptually "one database, internally sharded" — exactly what
+  shard-db is. Vector source; scales cleanly to any size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 128 128"
+     shape-rendering="geometricPrecision">
+  <!-- Hex body -->
+  <polygon
+    points="64,12 100,32 100,72 64,92 28,72 28,32"
+    fill="#58a6ff"/>
+  <!-- Internal facets — partition into 6 wedges -->
+  <g stroke="#1f6feb" stroke-width="2.5" stroke-linecap="round" opacity="0.6">
+    <line x1="64"  y1="12" x2="64"  y2="92"/>
+    <line x1="28"  y1="32" x2="100" y2="72"/>
+    <line x1="100" y1="32" x2="28"  y2="72"/>
+  </g>
+</svg>

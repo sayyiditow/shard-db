@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>shard-db logo concepts</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0d1117; color: #c9d1d9; max-width: 920px; margin: 2em auto; padding: 0 1em; }
+  .concept { display: grid; grid-template-columns: 200px 1fr; gap: 2em; padding: 2em 0; border-bottom: 1px solid #30363d; }
+  .swatch { background: #161b22; border-radius: 8px; padding: 1em; display: flex; align-items: center; justify-content: center; min-height: 140px; }
+  h2 { margin-top: 0; }
+  pre { background: #161b22; padding: 1em; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .row { display: flex; gap: 2em; align-items: center; flex-wrap: wrap; }
+  .small { font-size: 11px; color: #8b949e; }
+</style>
+</head>
+<body>
+
+<h1>shard-db logo concepts</h1>
+<p class="small">Each concept shown at full size, 32px favicon, and monochrome. Pick a direction; I can refine.</p>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="120" height="120" viewBox="0 0 120 120">
+      <!-- Three offset hex shards, primary lit -->
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff" opacity="0.95"/>
+      <polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="none" stroke="#1f6feb" stroke-width="2"/>
+      <polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.6"/>
+      <polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.4"/>
+    </svg>
+  </div>
+  <div>
+    <h2>1. Hex shards</h2>
+    <p>Three overlapping hex tiles, lead one bright. Reads as "sharded storage" without saying database. Hex shape is unusual enough to stand out from cylinder-clichés.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#58a6ff"/><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="none" stroke="#1f6feb" stroke-width="2"/><polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#1f6feb" opacity="0.6"/><polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#1f6feb" opacity="0.4"/></svg>
+      <span class="small">favicon (32px)</span>
+      <svg width="80" height="80" viewBox="0 0 120 120"><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="#fff"/><polygon points="60,10 95,30 95,70 60,90 25,70 25,30" fill="none" stroke="#000" stroke-width="2"/><polygon points="40,5 70,22 70,58 40,75 10,58 10,22" fill="#999"/><polygon points="80,5 110,22 110,58 80,75 50,58 50,22" fill="#666"/></svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> recognisable shape, scales to favicon. <strong>Weak:</strong> hex tiles are also blockchain trope; we'd want to differentiate.</p>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="120" height="120" viewBox="0 0 120 120">
+      <!-- Stacked offset cylinders — riff on the DB cliché but multi-shard -->
+      <ellipse cx="50" cy="35" rx="28" ry="9" fill="#3fb950"/>
+      <rect x="22" y="35" width="56" height="40" fill="#3fb950"/>
+      <ellipse cx="50" cy="75" rx="28" ry="9" fill="#2ea043"/>
+      <ellipse cx="78" cy="50" rx="28" ry="9" fill="#1f6feb" opacity="0.85"/>
+      <rect x="50" y="50" width="56" height="40" fill="#1f6feb" opacity="0.85"/>
+      <ellipse cx="78" cy="90" rx="28" ry="9" fill="#1158c7"/>
+    </svg>
+  </div>
+  <div>
+    <h2>2. Offset cylinders</h2>
+    <p>Two database-cylinders staggered, suggesting sharded storage. Picks up the classic DB icon language but says "more than one" — the distinguishing feature.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><ellipse cx="50" cy="35" rx="28" ry="9" fill="#3fb950"/><rect x="22" y="35" width="56" height="40" fill="#3fb950"/><ellipse cx="50" cy="75" rx="28" ry="9" fill="#2ea043"/><ellipse cx="78" cy="50" rx="28" ry="9" fill="#1f6feb" opacity="0.85"/><rect x="50" y="50" width="56" height="40" fill="#1f6feb" opacity="0.85"/><ellipse cx="78" cy="90" rx="28" ry="9" fill="#1158c7"/></svg>
+      <span class="small">favicon (32px)</span>
+      <svg width="80" height="80" viewBox="0 0 120 120"><ellipse cx="50" cy="35" rx="28" ry="9" fill="#fff"/><rect x="22" y="35" width="56" height="40" fill="#fff"/><ellipse cx="50" cy="75" rx="28" ry="9" fill="#ccc"/><ellipse cx="78" cy="50" rx="28" ry="9" fill="#999"/><rect x="50" y="50" width="56" height="40" fill="#999"/><ellipse cx="78" cy="90" rx="28" ry="9" fill="#666"/></svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> instantly readable as "database, but sharded." <strong>Weak:</strong> cylinder-DB icon is everywhere; risk of looking generic.</p>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="280" height="120" viewBox="0 0 280 120">
+      <!-- Wordmark with shard accent -->
+      <text x="20" y="80" font-family="ui-monospace, 'SF Mono', monospace" font-size="56" font-weight="700" fill="#c9d1d9">shard</text>
+      <rect x="180" y="55" width="6" height="20" fill="#58a6ff"/>
+      <text x="200" y="80" font-family="ui-monospace, 'SF Mono', monospace" font-size="56" font-weight="700" fill="#58a6ff">db</text>
+    </svg>
+  </div>
+  <div>
+    <h2>3. Wordmark with chevron</h2>
+    <p>"shard" in monospace + a vertical-bar separator + "db" in accent colour. No icon — pure typography. Reads as code-adjacent, fits a C project.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 60 60">
+        <text x="6" y="42" font-family="ui-monospace, monospace" font-size="40" font-weight="700" fill="#58a6ff">s/</text>
+      </svg>
+      <span class="small">favicon: "s/"</span>
+      <svg width="160" height="40" viewBox="0 0 280 120">
+        <text x="20" y="80" font-family="ui-monospace, monospace" font-size="56" font-weight="700" fill="#000">shard</text>
+        <rect x="180" y="55" width="6" height="20" fill="#000"/>
+        <text x="200" y="80" font-family="ui-monospace, monospace" font-size="56" font-weight="700" fill="#000">db</text>
+      </svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> distinctive, scales beautifully, hard to confuse with competitors. <strong>Weak:</strong> no icon = harder to make a recognisable favicon. The "s/" works but isn't iconic.</p>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="120" height="120" viewBox="0 0 120 120">
+      <!-- 4x4 grid of squares, one accent -->
+      <g fill="#30363d">
+        <rect x="10" y="10" width="22" height="22" rx="3"/>
+        <rect x="34" y="10" width="22" height="22" rx="3"/>
+        <rect x="58" y="10" width="22" height="22" rx="3"/>
+        <rect x="82" y="10" width="22" height="22" rx="3"/>
+        <rect x="10" y="34" width="22" height="22" rx="3"/>
+        <rect x="58" y="34" width="22" height="22" rx="3"/>
+        <rect x="82" y="34" width="22" height="22" rx="3"/>
+        <rect x="10" y="58" width="22" height="22" rx="3"/>
+        <rect x="34" y="58" width="22" height="22" rx="3"/>
+        <rect x="58" y="58" width="22" height="22" rx="3"/>
+        <rect x="34" y="82" width="22" height="22" rx="3"/>
+        <rect x="58" y="82" width="22" height="22" rx="3"/>
+        <rect x="82" y="82" width="22" height="22" rx="3"/>
+      </g>
+      <rect x="34" y="34" width="22" height="22" rx="3" fill="#58a6ff"/>
+      <rect x="82" y="58" width="22" height="22" rx="3" fill="#3fb950"/>
+      <rect x="10" y="82" width="22" height="22" rx="3" fill="#f78166"/>
+    </svg>
+  </div>
+  <div>
+    <h2>4. Hash-bucket grid</h2>
+    <p>4×4 grid (echoes our 16 splits default), three cells lit in different colours. Visualises hash bucketing literally — shards as discrete cells with data scattered across.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><g fill="#30363d"><rect x="10" y="10" width="22" height="22" rx="3"/><rect x="34" y="10" width="22" height="22" rx="3"/><rect x="58" y="10" width="22" height="22" rx="3"/><rect x="82" y="10" width="22" height="22" rx="3"/><rect x="10" y="34" width="22" height="22" rx="3"/><rect x="58" y="34" width="22" height="22" rx="3"/><rect x="82" y="34" width="22" height="22" rx="3"/><rect x="10" y="58" width="22" height="22" rx="3"/><rect x="34" y="58" width="22" height="22" rx="3"/><rect x="58" y="58" width="22" height="22" rx="3"/><rect x="34" y="82" width="22" height="22" rx="3"/><rect x="58" y="82" width="22" height="22" rx="3"/><rect x="82" y="82" width="22" height="22" rx="3"/></g><rect x="34" y="34" width="22" height="22" rx="3" fill="#58a6ff"/><rect x="82" y="58" width="22" height="22" rx="3" fill="#3fb950"/><rect x="10" y="82" width="22" height="22" rx="3" fill="#f78166"/></svg>
+      <span class="small">favicon (32px)</span>
+      <svg width="80" height="80" viewBox="0 0 120 120"><g fill="#ddd"><rect x="10" y="10" width="22" height="22" rx="3"/><rect x="34" y="10" width="22" height="22" rx="3"/><rect x="58" y="10" width="22" height="22" rx="3"/><rect x="82" y="10" width="22" height="22" rx="3"/><rect x="10" y="34" width="22" height="22" rx="3"/><rect x="58" y="34" width="22" height="22" rx="3"/><rect x="82" y="34" width="22" height="22" rx="3"/><rect x="10" y="58" width="22" height="22" rx="3"/><rect x="34" y="58" width="22" height="22" rx="3"/><rect x="58" y="58" width="22" height="22" rx="3"/><rect x="34" y="82" width="22" height="22" rx="3"/><rect x="58" y="82" width="22" height="22" rx="3"/><rect x="82" y="82" width="22" height="22" rx="3"/></g><rect x="34" y="34" width="22" height="22" rx="3" fill="#000"/><rect x="82" y="58" width="22" height="22" rx="3" fill="#666"/><rect x="10" y="82" width="22" height="22" rx="3" fill="#333"/></svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> on-message (literally shows hash-bucketing), distinctive, plays well with multi-colour CI badge bar. <strong>Weak:</strong> can look like a code-blocks/JIRA roadmap icon. Needs to be clearly grid-not-table.</p>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="120" height="120" viewBox="0 0 120 120">
+      <!-- Crystal / prism shard fragment -->
+      <polygon points="60,15 95,40 80,90 40,90 25,40" fill="#58a6ff" opacity="0.9"/>
+      <polygon points="60,15 95,40 60,55" fill="#1f6feb"/>
+      <polygon points="60,15 25,40 60,55" fill="#388bfd"/>
+      <polygon points="25,40 40,90 60,55" fill="#1158c7" opacity="0.7"/>
+      <polygon points="95,40 80,90 60,55" fill="#0d419d" opacity="0.8"/>
+      <line x1="60" y1="15" x2="60" y2="55" stroke="#fff" stroke-width="1" opacity="0.3"/>
+    </svg>
+  </div>
+  <div>
+    <h2>5. Crystal shard (single)</h2>
+    <p>Faceted gem-like polygon. The "shard" name made literal — a single crystal fragment with multiple faces catching light. Reads as quality / precision.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><polygon points="60,15 95,40 80,90 40,90 25,40" fill="#58a6ff" opacity="0.9"/><polygon points="60,15 95,40 60,55" fill="#1f6feb"/><polygon points="60,15 25,40 60,55" fill="#388bfd"/><polygon points="25,40 40,90 60,55" fill="#1158c7" opacity="0.7"/><polygon points="95,40 80,90 60,55" fill="#0d419d" opacity="0.8"/></svg>
+      <span class="small">favicon (32px)</span>
+      <svg width="80" height="80" viewBox="0 0 120 120"><polygon points="60,15 95,40 80,90 40,90 25,40" fill="#ddd"/><polygon points="60,15 95,40 60,55" fill="#888"/><polygon points="60,15 25,40 60,55" fill="#aaa"/><polygon points="25,40 40,90 60,55" fill="#444"/><polygon points="95,40 80,90 60,55" fill="#666"/></svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> beautiful, distinctive, premium feel. Plays the "shard" name straight. <strong>Weak:</strong> says "crystal" not "database"; risk of reading as a gem/jewelry brand.</p>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<div class="concept">
+  <div class="swatch">
+    <svg width="120" height="120" viewBox="0 0 120 120">
+      <!-- Stacked angular bands, like split data -->
+      <path d="M 20,30 L 100,30 L 80,55 L 100,80 L 20,80 L 40,55 Z" fill="#58a6ff" opacity="0.9"/>
+      <line x1="20" y1="30" x2="100" y2="30" stroke="#fff" stroke-width="2"/>
+      <line x1="40" y1="55" x2="80" y2="55" stroke="#fff" stroke-width="2"/>
+      <line x1="20" y1="80" x2="100" y2="80" stroke="#fff" stroke-width="2"/>
+    </svg>
+  </div>
+  <div>
+    <h2>6. Split bands (chevron-S)</h2>
+    <p>Stylised "S" formed by horizontal bands offset by chevrons — implies sharding visually with the letterform of "shard". Most abstract option.</p>
+    <div class="row">
+      <svg width="32" height="32" viewBox="0 0 120 120"><path d="M 20,30 L 100,30 L 80,55 L 100,80 L 20,80 L 40,55 Z" fill="#58a6ff" opacity="0.9"/><line x1="20" y1="30" x2="100" y2="30" stroke="#fff" stroke-width="2"/><line x1="40" y1="55" x2="80" y2="55" stroke="#fff" stroke-width="2"/><line x1="20" y1="80" x2="100" y2="80" stroke="#fff" stroke-width="2"/></svg>
+      <span class="small">favicon (32px)</span>
+      <svg width="80" height="80" viewBox="0 0 120 120"><path d="M 20,30 L 100,30 L 80,55 L 100,80 L 20,80 L 40,55 Z" fill="#000"/><line x1="20" y1="30" x2="100" y2="30" stroke="#fff" stroke-width="2"/><line x1="40" y1="55" x2="80" y2="55" stroke="#fff" stroke-width="2"/><line x1="20" y1="80" x2="100" y2="80" stroke="#fff" stroke-width="2"/></svg>
+      <span class="small">monochrome</span>
+    </div>
+    <p class="small"><strong>Strong:</strong> unique mark, scales well, faintly suggests "S" without spelling it. <strong>Weak:</strong> abstract enough that the "shard" reading is non-obvious; needs the wordmark next to it for context.</p>
+  </div>
+</div>
+
+<hr>
+<h3>Pick a direction</h3>
+<p>Tell me which concept you want to refine and I'll iterate. Variations to try once we pick:</p>
+<ul>
+  <li>Different colour palettes (the GitHub-blue I used is the obvious choice; could also try a green-on-black "fast/efficient" feel, or a warm orange like Rust/Postgres)</li>
+  <li>Wordmark + icon combinations</li>
+  <li>Square vs landscape lockups for social cards</li>
+</ul>
+<p>Once we lock the design, real polish should happen in <strong>Inkscape</strong> (free, FLOSS — fits the project) or <strong>Figma</strong> (free tier). For brand-quality output, an AI image gen like <strong>Recraft</strong> or <strong>Midjourney</strong> can generate variants you'd then trace to clean SVG.</p>
+
+</body>
+</html>

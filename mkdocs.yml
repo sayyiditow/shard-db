@@ -39,8 +39,8 @@ theme:
   font:
     text: Inter
     code: JetBrains Mono
-  icon:
-    logo: material/database
+  logo: assets/logo.svg
+  favicon: assets/favicon-32.png
 
 markdown_extensions:
   - admonition
