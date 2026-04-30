@@ -44,7 +44,12 @@
    a tighter sizing option for sub-1M-row objects (8/4 = 2 index shards
    still preserves k-way merge parallelism on indexed reads). */
 #define MIN_SPLITS       8
-#define DEFAULT_SPLITS   16          /* used by create-object when splits is omitted/0 */
+#define DEFAULT_SPLITS   8           /* used by create-object when splits is omitted/0.
+                                        Tuned for the ~70% of objects that never grow past
+                                        ~1M rows (test/demo/prototype/small-app). Larger
+                                        workloads should set splits explicitly via
+                                        create-object's splits param; shard-stats nags
+                                        once records-per-shard crosses 500K. */
 #define MAX_SPLITS       4096
 
 /* True iff n ∈ {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}. */

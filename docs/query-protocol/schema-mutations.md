@@ -27,7 +27,7 @@ Create a new typed object. See [Quick start](../getting-started/quickstart.md) f
 |---|---|---|---|
 | `dir` | yes | — | Tenant dir. Auto-registered if new. |
 | `object` | yes | — | Object name. |
-| `splits` | no | `16` (`DEFAULT_SPLITS`) | Initial shard count. Must be a power of 2 in `[8, 4096]` (`MIN_SPLITS`–`MAX_SPLITS`). |
+| `splits` | no | `8` (`DEFAULT_SPLITS`) | Initial shard count. Must be a power of 2 in `[8, 4096]` (`MIN_SPLITS`–`MAX_SPLITS`). The default is tuned for sub-1M-row objects; pass `splits` explicitly for larger workloads. |
 | `max_key` | no | `64` | Max key length in bytes. Hard ceiling 1024 (`MAX_KEY_CEILING`). |
 | `fields` | yes | — | Array of typed field specs. See [Concepts → Typed records](../concepts/typed-records.md). |
 

@@ -480,7 +480,7 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 ## Limits / constants
 
 - `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`)
-- `DEFAULT_SPLITS = 16` — used by `create-object` when `splits` is omitted/0. Floor is `MIN_SPLITS = 8`. Sweet spot = 78K–200K records/shard; see README / `docs/operations/tuning.md` for the full row-count → splits sizing table.
+- `DEFAULT_SPLITS = 8` — used by `create-object` when `splits` is omitted/0. Tuned for the common sub-1M-row case (~70% of objects); larger workloads should pass `splits` explicitly. Floor is `MIN_SPLITS = 8`. Sweet spot = 78K–200K records/shard; see README / `docs/operations/tuning.md` for the full row-count → splits sizing table.
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`; uint16 `SlotHeader.key_len` allows 65535 but every slot reserves `max_key` bytes, so large caps bloat `slot_size`. Keys are stored raw in Zone B, length lives in Zone A header (no in-payload prefix).
 - `varchar` max content = **65535 bytes** (uint16 length prefix)
 - `MAX_FIELDS = 256` fields per schema (bumped from 64 in 2026.04.2)

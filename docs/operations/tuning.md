@@ -151,7 +151,7 @@ Don't use network filesystems (NFS, CIFS) for `$DB_ROOT` unless you deeply trust
 | 500M–1B       | 2048                 | ~488K                |
 | 1B–2B+        | 4096 (MAX_SPLITS)    | ~488K and up         |
 
-Defaults: `create-object` with no `splits` gives **16** (fine for objects up to ~4M rows). For sub-1M-row test objects on small servers (2–4 cores), set `splits=8` explicitly — halves memory overhead vs the default and still preserves indexed-read parallelism (8/4 = 2 index shards). For bigger loads, set it explicitly up front — or re-split later with `vacuum --splits=N`.
+Defaults: `create-object` with no `splits` gives **8** (fine for sub-1M-row objects — test/demo/prototype/small-app, the ~70% case). For 1M+ rows set `splits` explicitly per the table above; otherwise re-split later with `vacuum --splits=N`. The shard-stats nag fires at 500K records/shard, so on the default 8 splits you get ~4M rows of headroom before the daemon tells you to re-split.
 
 > **The daemon will tell you when to re-split.** Run `./shard-db shard-stats <dir> <object>` periodically. When `avg_rec_per_shard` crosses **500K**, the output emits `hint: records-per-shard approaching upper band (>500K) — consider vacuum --splits=N`. Past **1M** it escalates to `hint: re-split with vacuum --splits=N`. Past 1M and already at `MAX_SPLITS=4096`, the hint switches to `partition by object` — at that scale you want multiple B+ trees, not a larger one. Tier transitions in the table above land before the 500K nag, so following the table keeps you out of the warning zone.
 
