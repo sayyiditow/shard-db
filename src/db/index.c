@@ -594,12 +594,12 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         return 1;
     }
 
-    /* Untyped — passthrough raw bytes. */
-    size_t sl = strlen(txt);
-    *out_val = malloc(sl);
-    memcpy(*out_val, txt, sl);
-    *out_len = sl;
-    free(txt);
+    /* Untyped — passthrough raw bytes. txt was just malloc'd by
+       json_obj_strdup; hand ownership to the caller instead of
+       malloc+memcpy+free. The output contract is (bytes, length),
+       not a C-string, so the missing null terminator is intentional. */
+    *out_len = strlen(txt);
+    *out_val = (uint8_t *)txt;
     return 1;
 }
 

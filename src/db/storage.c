@@ -135,18 +135,21 @@ void fcache_shutdown(void) {
     g_ucache_count = 0;
 }
 
-/* Probe hash table for path. Returns slot index.
-   Caller must hold the appropriate stripe lock. */
+/* Probe hash table for path. Returns slot index, or -1 if the table is
+   completely full (every slot used, no path match). Caller must hold the
+   appropriate stripe lock.
+
+   No tombstones — deletions clear `used` to 0 outright, so a probe that
+   reaches an empty slot means "path is not in the table". */
 static int ucache_probe(const char *path, int *out_found) {
     uint32_t h = path_hash(path);
     int mask = g_ucache_slots - 1;
     int idx = h & mask;
-    int first_empty = -1;
     for (int i = 0; i < g_ucache_slots; i++) {
         int s = (idx + i) & mask;
         if (!g_ucache[s].used) {
             *out_found = 0;
-            return first_empty >= 0 ? first_empty : s;
+            return s;
         }
         if (strcmp(g_ucache[s].path, path) == 0) {
             *out_found = 1;
@@ -154,7 +157,7 @@ static int ucache_probe(const char *path, int *out_found) {
         }
     }
     *out_found = 0;
-    return first_empty;
+    return -1;
 }
 
 /* Read ShardHeader from an open fd. On a fresh/empty file, writes a new
@@ -236,7 +239,8 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
         if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         slots_per_shard = shard_init_or_read_header(fd, slot_size_for_create, prealloc_mb);
         if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
-        struct stat st; fstat(fd, &st);
+        struct stat st;
+        if (fstat(fd, &st) < 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         sz = st.st_size;
     }
 
@@ -492,9 +496,9 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         ng_threads = (nproc > 1) ? (int)nproc : 1;
         if (ng_threads > 8) ng_threads = 8;
-        /* Don't spawn more threads than source chunks of 2048+ slots. */
+        /* Don't spawn more threads than source chunks of 2048+ slots.
+           old_slots >= 10000 here, so max_useful >= 4 — no zero-guard needed. */
         uint32_t max_useful = old_slots / 2048;
-        if (max_useful == 0) max_useful = 1;
         if ((uint32_t)ng_threads > max_useful) ng_threads = (int)max_useful;
     }
 
@@ -682,7 +686,9 @@ static void counts_read_locked(const char *cpath, int *live, int *del) {
     *live = 0; *del = 0;
     FILE *f = fopen(cpath, "r");
     if (!f) return;
-    fscanf(f, "%d %d", live, del);
+    /* Short read or parse failure → leave both as 0 (the function's
+       expected default for missing/empty/corrupt counts files). */
+    if (fscanf(f, "%d %d", live, del) != 2) { *live = 0; *del = 0; }
     fclose(f);
 }
 
@@ -698,6 +704,7 @@ static void update_counts(const char *db_root, const char *object, int live_delt
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) { log_msg(1, "update_counts: open(%s) failed: %s", lpath, strerror(errno)); return; }
     flock(lockfd, LOCK_EX);
     int live, del;
     counts_read_locked(cpath, &live, &del);
@@ -720,6 +727,7 @@ void set_count(const char *db_root, const char *object, int count) {
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) { log_msg(1, "set_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
     flock(lockfd, LOCK_EX);
     int live, del;
     counts_read_locked(cpath, &live, &del);
@@ -732,6 +740,7 @@ void reset_deleted_count(const char *db_root, const char *object) {
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) { log_msg(1, "reset_deleted_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
     flock(lockfd, LOCK_EX);
     int live, del;
     counts_read_locked(cpath, &live, &del);

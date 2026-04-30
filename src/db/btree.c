@@ -323,17 +323,18 @@ static uint32_t bt_path_hash(const char *s) {
 }
 
 /* Linear probe. Returns slot index of match (out_found=1) or first empty slot
-   for insertion (out_found=0). Returns -1 only if the table is completely full. */
+   for insertion (out_found=0). Returns -1 only if the table is completely
+   full and no path match was found. No tombstones — deletions clear `used`
+   to 0 outright, so reaching an empty slot means "path is not in the table". */
 static int bt_cache_probe(const char *path, int *out_found) {
     uint32_t h = bt_path_hash(path);
     int mask = bt_cache_slots - 1;
     int idx = h & mask;
-    int first_empty = -1;
     for (int i = 0; i < bt_cache_slots; i++) {
         int s = (idx + i) & mask;
         if (!bt_cache[s].used) {
             *out_found = 0;
-            return first_empty >= 0 ? first_empty : s;
+            return s;
         }
         if (strcmp(bt_cache[s].path, path) == 0) {
             *out_found = 1;
@@ -341,7 +342,7 @@ static int bt_cache_probe(const char *path, int *out_found) {
         }
     }
     *out_found = 0;
-    return first_empty;
+    return -1;
 }
 
 /* Tear down a cache slot. Caller holds bt_cache_lock and ensures no holder
@@ -444,13 +445,24 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
         return bt_open_file(path, writer, &bt->fd, &bt->map, &bt->map_size);
     }
 
-    pthread_mutex_lock(&bt_cache_lock);
-
+    /* Verify-and-retry on cache hit: between dropping bt_cache_lock and
+       acquiring the per-entry rwlock, another thread can call
+       bt_cache_drop_slot (under bt_cache_lock) to evict our slot and
+       reuse it for a different path. We'd then lock the rwlock for the
+       right slot but read the wrong file's fd/map. Re-check `used` and
+       `path` under the rwlock; if mismatched, release and re-probe.
+       Bounded retry so a pathologically thrashing cache can't loop forever —
+       past the cap we fall through to the cache-miss path which serves the
+       request via a fresh mapping (correctness preserved; the duplicate
+       MAP_SHARED is coherent and the orphan eventually LRU-evicts). */
+    int retries = 0;
     int found = 0;
-    int slot = bt_cache_probe(path, &found);
+    int slot = -1;
+    pthread_mutex_lock(&bt_cache_lock);
+    while (1) {
+        slot = bt_cache_probe(path, &found);
+        if (!found) break;
 
-    if (found) {
-        __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
         bt_cache[slot].last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &bt_cache[slot].rwlock;
         pthread_mutex_unlock(&bt_cache_lock);
@@ -459,11 +471,26 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
         else        pthread_rwlock_rdlock(lock);
 
         BtCacheEntry *e = &bt_cache[slot];
-        bt->slot = slot;
-        bt->fd = e->fd;
-        bt->map = e->map;
-        bt->map_size = e->map_size;
-        return 0;
+        if (e->used && strcmp(e->path, path) == 0) {
+            /* Confirmed cache hit. */
+            __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
+            bt->slot = slot;
+            bt->fd = e->fd;
+            bt->map = e->map;
+            bt->map_size = e->map_size;
+            return 0;
+        }
+
+        /* Slot was evicted+reused while we were blocked on the rwlock. */
+        pthread_rwlock_unlock(lock);
+        if (++retries >= 4) {
+            /* Fall through to cache-miss path with the table lock re-acquired. */
+            slot = -1;
+            found = 0;
+            pthread_mutex_lock(&bt_cache_lock);
+            break;
+        }
+        pthread_mutex_lock(&bt_cache_lock);
     }
 
     __atomic_add_fetch(&g_bt_cache_misses, 1, __ATOMIC_RELAXED);
@@ -512,11 +539,14 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
 
+    /* Take the per-entry rwlock before releasing the table mutex — closes
+       the same evict-after-install race the hit path's verify-retry handles.
+       This is the freshly-installed slot, no one else holds the rwlock yet,
+       so neither rdlock nor wrlock can block. */
     pthread_rwlock_t *lock = &e->rwlock;
-    pthread_mutex_unlock(&bt_cache_lock);
-
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
+    pthread_mutex_unlock(&bt_cache_lock);
 
     bt->slot = slot;
     bt->fd = fd;
@@ -768,17 +798,16 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
     return rc;
 }
 
-/* Insert entry into a page at position pos. Returns 0 on success, -1 if no space.
-   For leaves: suffix is 16-byte hash (suffix_len must be BT_HASH_SIZE).
-   For internals: suffix is child_page_id (suffix_len must be 4). */
-static int page_insert_at(uint8_t *page, int pos, const char *value, size_t vlen,
-                          const void *suffix, size_t suffix_len) {
+/* Insert entry into an INTERNAL page at position pos. Returns 0 on success,
+   -1 if no space. The 4-byte child_id is appended after `value` in the entry
+   payload, matching the internal-page layout. Leaves take a different path —
+   call page_insert_at_leaf directly. The two functions used to share a
+   polymorphic suffix dispatch; splitting them removes the buffer-size
+   ambiguity that Coverity OVERRUN heuristics flagged on the internal path. */
+static int page_insert_at_internal(uint8_t *page, int pos, const char *value,
+                                   size_t vlen, uint32_t child_id) {
     BtPageHeader *ph = (BtPageHeader *)page;
-    if (ph->page_type == 1) {
-        return page_insert_at_leaf(page, pos, value, vlen, (const uint8_t *)suffix);
-    }
-    /* Internal — flat layout */
-    uint16_t data_len = (uint16_t)(vlen + suffix_len);
+    uint16_t data_len = (uint16_t)(vlen + 4);
     size_t entry_bytes = 2 + data_len;
     size_t needed = entry_bytes + sizeof(uint16_t);
     if (page_free_space(page) < needed) return -1;
@@ -787,7 +816,7 @@ static int page_insert_at(uint8_t *page, int pos, const char *value, size_t vlen
     uint8_t *entry = page + ph->data_end;
     bt_store_u16(entry, data_len);
     memcpy(entry + 2, value, vlen);
-    memcpy(entry + 2 + vlen, suffix, suffix_len);
+    memcpy(entry + 2 + vlen, &child_id, 4);
 
     uint16_t *slots = page_slots(page);
     if (pos < (int)ph->count)
@@ -902,7 +931,7 @@ static uint32_t bt_split_internal(BtFile *bt, uint32_t page_id,
         uint8_t *e = page_entry(old_pg, i);
         size_t vlen = int_entry_vlen(e);
         uint32_t child = entry_child(e);
-        page_insert_at(new_pg, new_h->count, int_entry_value(e), vlen, &child, 4);
+        page_insert_at_internal(new_pg, new_h->count, int_entry_value(e), vlen, child);
     }
 
     old_h = (BtPageHeader *)bt_page(bt, page_id);
@@ -935,7 +964,7 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         }
 
         /* Try to insert */
-        if (page_insert_at(page, pos, value, vlen, hash, BT_HASH_SIZE) == 0) {
+        if (page_insert_at_leaf(page, pos, value, vlen, hash) == 0) {
             return -1; /* success, no split */
         }
 
@@ -950,10 +979,10 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         if (memcmp(value, promote_val, vlen < *promote_vlen ? vlen : *promote_vlen) >= 0 ||
             (vlen >= *promote_vlen && memcmp(value, promote_val, *promote_vlen) >= 0)) {
             pos = page_bsearch(new_pg, value, vlen);
-            page_insert_at(new_pg, pos, value, vlen, hash, BT_HASH_SIZE);
+            page_insert_at_leaf(new_pg, pos, value, vlen, hash);
         } else {
             pos = page_bsearch(page, value, vlen);
-            page_insert_at(page, pos, value, vlen, hash, BT_HASH_SIZE);
+            page_insert_at_leaf(page, pos, value, vlen, hash);
         }
 
         return 0; /* split happened */
@@ -984,8 +1013,8 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         ph = (BtPageHeader *)page;
         int ipos = page_bsearch(page, sub_promote, sub_promote_len);
 
-        if (page_insert_at(page, ipos, sub_promote, sub_promote_len,
-                          &sub_new_child, 4) == 0) {
+        if (page_insert_at_internal(page, ipos, sub_promote, sub_promote_len,
+                                    sub_new_child) == 0) {
             return -1; /* inserted into this page, no further split */
         }
 
@@ -997,10 +1026,10 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         if (memcmp(sub_promote, promote_val,
                    sub_promote_len < *promote_vlen ? sub_promote_len : *promote_vlen) >= 0) {
             ipos = page_bsearch(new_pg, sub_promote, sub_promote_len);
-            page_insert_at(new_pg, ipos, sub_promote, sub_promote_len, &sub_new_child, 4);
+            page_insert_at_internal(new_pg, ipos, sub_promote, sub_promote_len, sub_new_child);
         } else {
             ipos = page_bsearch(page, sub_promote, sub_promote_len);
-            page_insert_at(page, ipos, sub_promote, sub_promote_len, &sub_new_child, 4);
+            page_insert_at_internal(page, ipos, sub_promote, sub_promote_len, sub_new_child);
         }
 
         return 0; /* split propagated */
@@ -1040,7 +1069,7 @@ void btree_insert(const char *path, const char *value, size_t vlen,
         /* old_root is leftmost child (in next_leaf), promote key points to new_child */
         uint32_t old_root = fh->root_page;
         rh->next_leaf = old_root; /* leftmost child pointer */
-        page_insert_at(root_pg, 0, promote_val, promote_vlen, &new_child, 4);
+        page_insert_at_internal(root_pg, 0, promote_val, promote_vlen, new_child);
 
         fh->root_page = new_root;
         fh->height++;
@@ -1079,7 +1108,7 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
             rh->count = 0;
             rh->next_leaf = fh->root_page;
             rh->data_end = bt_page_size;
-            page_insert_at(root_pg, 0, promote_val, promote_vlen, &new_child, 4);
+            page_insert_at_internal(root_pg, 0, promote_val, promote_vlen, new_child);
             fh->root_page = new_root;
             fh->height++;
         }
@@ -1446,7 +1475,14 @@ static int iter_init_desc_leaves(BtRangeIter *it) {
     while (page_id != 0) {
         if (it->desc_leaf_count >= cap) {
             cap = cap ? cap * 2 : 1024;
-            uint32_t *nl = realloc(it->desc_leaves, cap * sizeof(uint32_t));
+            /* Explicit malloc-on-first / realloc-on-grow: realloc(NULL, sz) is
+               equivalent to malloc(sz) per the C standard, but Coverity's
+               flow analysis treats the NULL→realloc transition as a deref of
+               null. Splitting the cases keeps the static analyzer happy
+               without changing semantics. */
+            uint32_t *nl = it->desc_leaves
+                ? realloc(it->desc_leaves, cap * sizeof(uint32_t))
+                : malloc(cap * sizeof(uint32_t));
             if (!nl) return -1;
             it->desc_leaves = nl;
         }
@@ -1685,9 +1721,9 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
             ppg = bt_page(&bt, cur_parent);
             pph = (BtPageHeader *)ppg;
 
-            if (page_insert_at(ppg, pph->count,
-                              key_buf, kvlen,
-                              &child_ids[i], 4) == -1) {
+            if (page_insert_at_internal(ppg, pph->count,
+                                        key_buf, kvlen,
+                                        child_ids[i]) == -1) {
                 /* Parent full — new parent */
                 cur_parent = bt_alloc_page(&bt);
                 ppg = bt_page(&bt, cur_parent);

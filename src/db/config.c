@@ -432,10 +432,12 @@ int dirs_add(const char *db_root, const char *dir) {
     FILE *f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", dir); fclose(f); }
 
-    /* Create on-disk tenant dir so create-object has a place to land. */
+    /* Create on-disk tenant dir so create-object has a place to land.
+       EEXIST is benign — admin re-add of an existing tenant. */
     char dir_path[PATH_MAX];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dir);
-    mkdir(dir_path, 0755);
+    if (mkdir(dir_path, 0755) != 0 && errno != EEXIST)
+        log_msg(1, "add_dir: mkdir(%s): %s", dir_path, strerror(errno));
 
     pthread_mutex_unlock(&g_dirs_lock);
     return 0;
@@ -495,7 +497,10 @@ int dirs_remove(const char *db_root, const char *dir, int check_empty) {
             fputs(line, out);
         }
         fclose(in); fclose(out);
-        rename(tmp, path);
+        if (rename(tmp, path) != 0) {
+            log_msg(1, "remove_dir: rename(%s → %s): %s", tmp, path, strerror(errno));
+            unlink(tmp);
+        }
     } else {
         if (in)  fclose(in);
         if (out) fclose(out);
@@ -688,8 +693,10 @@ int load_index_fields(const char *db_root, const char *object,
         if (!g_idx_cache[slot].used) break;
         if (strcmp(g_idx_cache[slot].name, object) == 0) {
             int n = g_idx_cache[slot].nfields;
-            for (int j = 0; j < n && j < max_fields; j++)
+            for (int j = 0; j < n && j < max_fields; j++) {
                 memcpy(fields[j], g_idx_cache[slot].fields[j], 256);
+                fields[j][255] = '\0';
+            }
             pthread_mutex_unlock(&g_idx_lock);
             return n < max_fields ? n : max_fields;
         }
@@ -940,28 +947,31 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     fclose(f);
     ts.total_size = offset;
 
-    /* Store in cache */
+    /* Store in cache, capture the slot we wrote to so we can return the
+       pointer without doing a second (lock-free) linear-probe lookup. */
     pthread_mutex_lock(&g_typed_lock);
     uint32_t sidx = str_hash(cache_key) % TYPED_BUCKETS;
+    int written_slot = -1;
     for (int i = 0; i < TYPED_BUCKETS; i++) {
         int slot = (sidx + i) % TYPED_BUCKETS;
         if (!g_typed_cache[slot].used) {
             strncpy(g_typed_cache[slot].name, cache_key, 511);
             g_typed_cache[slot].schema = ts;
             g_typed_cache[slot].used = 1;
+            written_slot = slot;
             break;
         }
     }
+    /* Snapshot the return pointer while still holding the lock. The cache
+       slots are persistent (TYPED_BUCKETS fixed at compile time, never
+       freed individually) so the pointer stays valid after unlock — same
+       contract as the cache-hit return at line 833. */
+    TypedSchema *result = (written_slot >= 0 &&
+                           g_typed_cache[written_slot].schema.typed)
+        ? &g_typed_cache[written_slot].schema
+        : NULL;
     pthread_mutex_unlock(&g_typed_lock);
-
-    /* Return pointer to cached entry */
-    idx = str_hash(cache_key) % TYPED_BUCKETS;
-    for (int i = 0; i < TYPED_BUCKETS; i++) {
-        int slot = (idx + i) % TYPED_BUCKETS;
-        if (g_typed_cache[slot].used && strcmp(g_typed_cache[slot].name, cache_key) == 0)
-            return g_typed_cache[slot].schema.typed ? &g_typed_cache[slot].schema : NULL;
-    }
-    return NULL;
+    return result;
 }
 
 /* Find field index by name. Tombstoned fields are invisible to lookups. */
@@ -1427,7 +1437,7 @@ static long long seq_next_val(const char *db_root, const char *object, const cha
 
     long long val = 0;
     FILE *f = fopen(seq_path, "r");
-    if (f) { fscanf(f, "%lld", &val); fclose(f); }
+    if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
     val++;
     f = fopen(seq_path, "w");
     if (f) { fprintf(f, "%lld\n", val); fclose(f); }
@@ -1839,7 +1849,10 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
     }
     fclose(f);
     fclose(nf);
-    rename(newconf_path, conf_path);  /* atomic swap */
+    if (rename(newconf_path, conf_path) != 0) {  /* atomic swap */
+        log_msg(1, "rename_field: rename(%s → %s): %s", newconf_path, conf_path, strerror(errno));
+        unlink(newconf_path);
+    }
     return 0;
 }
 
@@ -2010,7 +2023,10 @@ static int drop_indexes_for_fields(const char *db_root, const char *object,
     }
     fclose(f);
     fclose(nf);
-    rename(tmp_path, conf_path);
+    if (rename(tmp_path, conf_path) != 0) {
+        log_msg(1, "remove_field: rename(%s → %s): %s", tmp_path, conf_path, strerror(errno));
+        unlink(tmp_path);
+    }
     return dropped;
 }
 
@@ -2037,7 +2053,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
 
     char lines[MAX_FIELDS][512];
     int nlines = 0;
-    while (fgets(lines[nlines], sizeof(lines[0]), f) && nlines < MAX_FIELDS) {
+    while (nlines < MAX_FIELDS && fgets(lines[nlines], sizeof(lines[0]), f)) {
         lines[nlines][strcspn(lines[nlines], "\n")] = '\0';
         nlines++;
     }
@@ -2130,7 +2146,7 @@ int cmd_rename_field(const char *db_root, const char *object,
     int nlines = 0;
     int found_old = 0;
     int new_conflict = 0;
-    while (fgets(lines[nlines], sizeof(lines[0]), f) && nlines < MAX_FIELDS) {
+    while (nlines < MAX_FIELDS && fgets(lines[nlines], sizeof(lines[0]), f)) {
         lines[nlines][strcspn(lines[nlines], "\n")] = '\0';
         const char *ln = lines[nlines];
         if (ln[0] && ln[0] != '#') {

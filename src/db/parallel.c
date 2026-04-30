@@ -55,7 +55,12 @@ static pthread_cond_t  g_q_not_full  = PTHREAD_COND_INITIALIZER;
 
 static pthread_t *g_pool_threads = NULL;
 static int        g_pool_nthreads = 0;
-static volatile int g_pool_running = 0;
+/* Read lock-free at parallel_pool_init/shutdown entry, parallel_pool_size,
+   and parallel_for; written under g_q_lock at parallel_pool_shutdown and
+   lock-free at parallel_pool_init. _Atomic gives correct cross-thread
+   visibility regardless of which writer-lock was held. (Was volatile —
+   volatile is for memory-mapped IO, not thread synchronization.) */
+static _Atomic int g_pool_running = 0;
 
 static void *pool_worker(void *arg) {
     (void)arg;

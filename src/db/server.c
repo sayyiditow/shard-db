@@ -746,13 +746,23 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
     }
 
-    /* db-dirs doesn't need dir or object */
+    /* db-dirs doesn't need dir or object. Take a quick snapshot under
+       g_dirs_lock so concurrent add-dir/remove-dir mutators can't tear
+       the read; iterate the copy outside the critical section. Same
+       pattern as objlock.c::dirs_copy at line 130. */
     if (mode && strcmp(mode, "db-dirs") == 0) {
+        char dirs_copy[DIRS_BUCKETS][256];
+        int  used_copy[DIRS_BUCKETS];
+        pthread_mutex_lock(&g_dirs_lock);
+        memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
+        memcpy(used_copy, g_dirs_used, sizeof(used_copy));
+        pthread_mutex_unlock(&g_dirs_lock);
+
         OUT("[");
         int printed = 0;
         for (int i = 0; i < DIRS_BUCKETS; i++) {
-            if (!g_dirs_used[i]) continue;
-            OUT("%s\"%s\"", printed ? "," : "", g_dirs[i]);
+            if (!used_copy[i]) continue;
+            OUT("%s\"%s\"", printed ? "," : "", dirs_copy[i]);
             printed++;
         }
         OUT("]\n");
@@ -1848,7 +1858,7 @@ void *worker_thread(void *arg) {
             out = cf;  /* same handle for both directions */
         } else {
             out_fd = dup(cfd);  /* separate fd for writing */
-            out = fdopen(out_fd, "w");
+            out = (out_fd >= 0) ? fdopen(out_fd, "w") : NULL;
             cf = fdopen(cfd, "r");
         }
         if (cf && out) {
@@ -2097,7 +2107,8 @@ int cmd_server(const char *db_root, int daemonize) {
     grow_recovery(db_root);
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (nthreads < 4) nthreads = 4; /* minimum pool size */
+    if (nthreads < 4) nthreads = 4;       /* minimum pool size */
+    if (nthreads > 1024) nthreads = 1024; /* sanity cap — no real CPU count exceeds this; protects nthreads*64 from int overflow on a typo'd WORKERS in db.env */
 
     /* Init work queue and thread pool */
     wq_init(&g_work_queue, nthreads * 64);
@@ -2139,9 +2150,11 @@ int cmd_server(const char *db_root, int daemonize) {
             int cfd = accept(sfd, (struct sockaddr *)&caddr, &clen);
             if (cfd < 0) continue;
 
-            /* TCP_NODELAY — reduce latency for small responses */
+            /* TCP_NODELAY — reduce latency for small responses. Best-effort:
+               failure means slightly higher latency under Nagle's, not a
+               correctness issue, so we don't propagate the error. */
             int flag = 1;
-            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+            (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
             wq_push(&g_work_queue, cfd);
         }
@@ -2181,8 +2194,12 @@ int cmd_stop(const char *db_root) {
     snprintf(pidpath, sizeof(pidpath), "%s/shard-db.pid", g_log_dir);
     FILE *f = fopen(pidpath, "r");
     if (!f) { fprintf(stderr, "Error: No running server (no pid file)\n"); return 1; }
-    int pid, port;
-    fscanf(f, "%d\n%d", &pid, &port);
+    int pid = 0, port = 0;
+    if (fscanf(f, "%d\n%d", &pid, &port) != 2) {
+        fclose(f);
+        fprintf(stderr, "Error: Corrupt pid file %s — remove it manually\n", pidpath);
+        return 1;
+    }
     fclose(f);
 
     if (kill(pid, 0) != 0) {
@@ -2218,8 +2235,12 @@ int cmd_status(const char *db_root) {
     snprintf(pidpath, sizeof(pidpath), "%s/shard-db.pid", g_log_dir);
     FILE *f = fopen(pidpath, "r");
     if (!f) { OUT("stopped\n"); return 1; }
-    int pid, port;
-    fscanf(f, "%d\n%d", &pid, &port);
+    int pid = 0, port = 0;
+    if (fscanf(f, "%d\n%d", &pid, &port) != 2) {
+        fclose(f);
+        OUT("stopped (corrupt pid file)\n");
+        return 1;
+    }
     fclose(f);
     if (kill(pid, 0) == 0) {
         OUT("running (pid %d, port %d)\n", pid, port);

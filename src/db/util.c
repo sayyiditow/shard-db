@@ -5,10 +5,21 @@
 void mkdirp(const char *path) {
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
+    /* mkdir() may fail with EEXIST on intermediate components or the leaf —
+       that's the expected case for any path where ancestors already exist.
+       Other failures (EACCES, ENOSPC, ENOTDIR) are treated as best-effort:
+       callers will hit them again on the open()/write() that follows and
+       report a precise error there. */
     for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+                log_msg(2, "mkdirp: %s: %s", tmp, strerror(errno));
+            *p = '/';
+        }
     }
-    mkdir(tmp, 0755);
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+        log_msg(2, "mkdirp: %s: %s", tmp, strerror(errno));
 }
 
 char *dirname_of(const char *path) {
@@ -22,14 +33,16 @@ char *dirname_of(const char *path) {
 char *read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
-    fread(buf, 1, len, f);
-    buf[len] = '\0';
+    if (len < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    buf[got] = '\0';
     fclose(f);
-    if (out_len) *out_len = len;
+    if (out_len) *out_len = got;
     return buf;
 }
 

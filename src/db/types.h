@@ -603,9 +603,18 @@ typedef struct UCacheEntry {
     int      fd;
     uint8_t *map;
     size_t   map_size;
-    uint32_t slots_per_shard;   /* current — updated by grow */
+    /* Lock-free readers (fcache_get_read at storage.c:304, observed_slots
+       at :437) snapshot this field without taking e->rwlock — the retired_map
+       mechanism keeps old mappings valid across grows. _Atomic gives those
+       readers a torn-read-free view against the writers at :275, :553, :653. */
+    _Atomic uint32_t slots_per_shard;
     pthread_rwlock_t rwlock;
-    int      used;
+    /* `used` straddles two locking layers: written under g_ucache_table_mutex
+       (allocation/eviction at storage.c:260,278) AND under e->rwlock
+       (fcache_invalidate at storage.c:656). Lock-free reads (lines 121, 249,
+       643) check it as a fast skip. _Atomic gives the readers correct
+       cross-thread visibility regardless of which writer-lock was held. */
+    _Atomic int used;
     uint8_t *slot_bits;
     int      max_dirty_slot;
     int      dirty;

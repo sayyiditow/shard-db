@@ -75,6 +75,7 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
     char **paths = NULL;
     int path_count = 0, path_cap = 256;
     paths = malloc(path_cap * sizeof(char *));
+    if (!paths) return;
 
     DIR *d1 = opendir(data_dir);
     if (!d1) { free(paths); return; }
@@ -85,8 +86,14 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
         if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
         if (path_count >= path_cap) {
             path_cap *= 2;
-            char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
-            if (!t) { paths = NULL; break; }
+            char **t = realloc(paths, path_cap * sizeof(char *));
+            if (!t) {
+                for (int k = 0; k < path_count; k++) free(paths[k]);
+                free(paths);
+                paths = NULL;
+                path_count = 0;
+                break;
+            }
             paths = t;
         }
         char binpath[PATH_MAX];
@@ -98,6 +105,11 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
     if (!paths || path_count == 0) { free(paths); return; }
 
     ScanWorkerArg *args = malloc(path_count * sizeof(ScanWorkerArg));
+    if (!args) {
+        for (int i = 0; i < path_count; i++) free(paths[i]);
+        free(paths);
+        return;
+    }
     for (int i = 0; i < path_count; i++) {
         args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, g_out };
     }
@@ -978,7 +990,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         int ifd = open(input, O_RDONLY);
         if (ifd < 0) { fprintf(stderr, "Error: Cannot open %s\n", input); return 1; }
         struct stat st;
-        fstat(ifd, &st);
+        if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
         len = st.st_size;
         if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
         json = mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0);
@@ -1173,7 +1185,13 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 if (rec_count >= rec_cap) {
                     rec_cap *= 2;
                     BulkInsRecord *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
-                    if (!t) { records = NULL; break; }
+                    if (!t) {
+                        /* Reset rec_count so phase 1.5 below sees an empty
+                           set instead of dereferencing NULL records. */
+                        records = NULL;
+                        rec_count = 0;
+                        break;
+                    }
                     records = t;
                 }
                 BulkInsRecord *r = &records[rec_count++];
@@ -1189,6 +1207,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
        writes and can hold the ucache wrlock once for the entire bucket. */
     int *shard_counts = calloc(sc.splits, sizeof(int));
+    if (!shard_counts) {
+        free(records);
+        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        return 1;
+    }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
     int nshard_groups = 0;
@@ -1197,6 +1220,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     BulkInsShardWork *workers = nshard_groups > 0
         ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
     int *shard_to_worker = malloc(sc.splits * sizeof(int));
+    if ((nshard_groups > 0 && !workers) || !shard_to_worker) {
+        free(workers); free(shard_to_worker); free(shard_counts); free(records);
+        OUT("{\"error\":\"oom: workers\"}\n");
+        return 1;
+    }
     {
         int g = 0;
         for (int s = 0; s < sc.splits; s++) {
@@ -1435,7 +1463,8 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     /* mmap the file */
     int ifd = open(filepath, O_RDONLY);
     if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
-    struct stat st; fstat(ifd, &st);
+    struct stat st;
+    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
     if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
     const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
     int data_mmaped = 1;
@@ -1601,7 +1630,14 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
             BulkInsRecord *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
-            if (!t) { records = NULL; break; }
+            if (!t) {
+                /* xrealloc_or_free already freed records; reset rec_count
+                   so phase 1.5 below sees an empty set and skips the
+                   shard-bucket loop instead of dereferencing NULL records. */
+                records = NULL;
+                rec_count = 0;
+                break;
+            }
             records = t;
         }
         BulkInsRecord *r = &records[rec_count++];
@@ -1611,8 +1647,15 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
     }
 
-    /* ===== Phase 1.5: bucket by shard — identical to the JSON path. */
+    /* ===== Phase 1.5: bucket by shard — identical to the JSON path.
+       OOM at any of the three allocs short-circuits with an error JSON;
+       Phase 2's parallel workers never see a partially-built work set. */
     int *shard_counts = calloc(sc.splits, sizeof(int));
+    if (!shard_counts) {
+        free(records);
+        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        return 1;
+    }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
     int nshard_groups = 0;
@@ -1621,6 +1664,14 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     BulkInsShardWork *workers = nshard_groups > 0
         ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
     int *shard_to_worker = malloc(sc.splits * sizeof(int));
+    if ((nshard_groups > 0 && !workers) || !shard_to_worker) {
+        free(workers);
+        free(shard_to_worker);
+        free(shard_counts);
+        free(records);
+        OUT("{\"error\":\"oom: workers\"}\n");
+        return 1;
+    }
     {
         int g = 0;
         for (int s = 0; s < sc.splits; s++) {
@@ -1933,8 +1984,15 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
                 size_t klen = p - start;
                 if (key_count >= key_cap) {
                     key_cap *= 2;
-                    char **t = xrealloc_or_free(keys, key_cap * sizeof(char *));
-                    if (!t) { keys = NULL; break; }
+                    /* Plain realloc + walk: keys[] holds heap-malloc'd entries. */
+                    char **t = realloc(keys, key_cap * sizeof(char *));
+                    if (!t) {
+                        for (int k = 0; k < key_count; k++) free(keys[k]);
+                        free(keys);
+                        keys = NULL;
+                        key_count = 0;
+                        break;
+                    }
                     keys = t;
                 }
                 keys[key_count] = malloc(klen + 1);
@@ -1950,8 +2008,15 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
             if (line[0] != '\0') {
                 if (key_count >= key_cap) {
                     key_cap *= 2;
-                    char **t = xrealloc_or_free(keys, key_cap * sizeof(char *));
-                    if (!t) { keys = NULL; break; }
+                    /* Plain realloc + walk: keys[] holds heap-malloc'd entries. */
+                    char **t = realloc(keys, key_cap * sizeof(char *));
+                    if (!t) {
+                        for (int k = 0; k < key_count; k++) free(keys[k]);
+                        free(keys);
+                        keys = NULL;
+                        key_count = 0;
+                        break;
+                    }
                     keys = t;
                 }
                 keys[key_count++] = strdup(line);
@@ -2111,13 +2176,18 @@ typedef struct {
     FieldSchema *fs;
     /* Collected keys */
     char **keys;
-    int count;
+    _Atomic int count;
     int cap;
     int limit;
     QueryDeadline *deadline;
     int dl_counter;
     size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
-    int budget_exceeded;
+    /* `count` and `budget_exceeded` are read lock-free in the per-record
+       callback as fast-skip checks (count >= limit / budget_exceeded != 0).
+       bc->lock only serializes the keys-array append, not the per-record
+       match. _Atomic gives the lock-free reader a torn-read-free view
+       against the writers under bc->lock. */
+    _Atomic int budget_exceeded;
     pthread_mutex_t lock;   /* serializes only the keys-array append,
                                not the per-record match */
 } BulkCriteriaCtx;
@@ -2672,7 +2742,8 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 
     int ifd = open(filepath, O_RDONLY);
     if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
-    struct stat st; fstat(ifd, &st);
+    struct stat st;
+    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
     if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
     const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
     int data_mmaped = 1;
@@ -2736,8 +2807,17 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
-            BulkUpdDelimRec *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
-            if (!t) { records = NULL; break; }
+            /* Plain realloc + nested cleanup (same pattern as the bulk-update-json
+               OOM fix): per-record `key` is heap-malloc'd, so xrealloc_or_free's
+               atomic-free leaves no chance to walk records[] for cleanup. */
+            BulkUpdDelimRec *t = realloc(records, rec_cap * sizeof(*t));
+            if (!t) {
+                for (size_t k = 0; k < rec_count; k++) free(records[k].key);
+                free(records);
+                records = NULL;
+                rec_count = 0;
+                break;
+            }
             records = t;
         }
         BulkUpdDelimRec *r = &records[rec_count++];
@@ -2751,6 +2831,12 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 
     /* ===== Phase 1.5: bucket by shard_id. */
     int *shard_counts = calloc(sch.splits, sizeof(int));
+    if (!shard_counts) {
+        for (size_t i = 0; i < rec_count; i++) free(records[i].key);
+        free(records);
+        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        return 1;
+    }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
     int nshard_groups = 0;
     for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
@@ -2758,6 +2844,13 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
     BulkUpdDelimShardWork *workers = nshard_groups > 0
         ? calloc(nshard_groups, sizeof(BulkUpdDelimShardWork)) : NULL;
     int *shard_to_worker = malloc(sch.splits * sizeof(int));
+    if ((nshard_groups > 0 && !workers) || !shard_to_worker) {
+        free(workers); free(shard_to_worker); free(shard_counts);
+        for (size_t i = 0; i < rec_count; i++) free(records[i].key);
+        free(records);
+        OUT("{\"error\":\"oom: workers\"}\n");
+        return 1;
+    }
     {
         int g = 0;
         for (int s = 0; s < sch.splits; s++) {
@@ -2981,7 +3074,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     if (input_is_file) {
         ifd = open(input, O_RDONLY);
         if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
-        struct stat st; fstat(ifd, &st);
+        struct stat st;
+        if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
         if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
         len = st.st_size;
         json = mmap(NULL, len, PROT_READ, MAP_SHARED, ifd, 0);
@@ -3096,8 +3190,32 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         BulkUpdJsonRec *r;
         if (rec_count >= rec_cap) {
             rec_cap *= 2;
-            BulkUpdJsonRec *t = xrealloc_or_free(records, rec_cap * sizeof(*t));
-            if (!t) { records = NULL; break; }
+            /* Plain realloc (not xrealloc_or_free) so we can walk records[]
+               for nested free() before releasing the array. xrealloc_or_free
+               frees atomically, leaving no window to clean up the per-record
+               heap-owned key / field_indices / field_values mallocs. */
+            BulkUpdJsonRec *t = realloc(records, rec_cap * sizeof(*t));
+            if (!t) {
+                /* OOM: free per-record nested allocations, then the array,
+                   then the current iteration's locals (whose ownership
+                   hadn't transferred to records[rec_count] yet). Reset
+                   rec_count so the downstream phase-2 loop sees an empty
+                   set and the rec_count==0 branch handles the response. */
+                for (size_t k = 0; k < rec_count; k++) {
+                    free(records[k].key);
+                    for (int j = 0; j < records[k].n_fields; j++)
+                        free(records[k].field_values[j]);
+                    free(records[k].field_values);
+                    free(records[k].field_indices);
+                }
+                free(records);
+                records = NULL;
+                rec_count = 0;
+                free(key);
+                for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
+                if (obj_heap) free(obj_str);
+                break;
+            }
             records = t;
         }
         r = &records[rec_count++];
@@ -3137,12 +3255,37 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     /* Bucket per shard — same pattern as bulk-update-delimited / bulk-delete. */
     int *shard_counts = calloc(sch.splits, sizeof(int));
+    if (!shard_counts) {
+        for (size_t i = 0; i < rec_count; i++) {
+            free(records[i].key);
+            for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
+            free(records[i].field_values);
+            free(records[i].field_indices);
+        }
+        free(records);
+        if (json_mmaped) munmap((void *)json, len); else if (input_is_file) free(json);
+        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        return 1;
+    }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
     int nshard_groups = 0;
     for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
 
     BulkUpdJsonShardWork *workers = calloc(nshard_groups, sizeof(BulkUpdJsonShardWork));
+    if (nshard_groups > 0 && !workers) {
+        free(shard_counts);
+        for (size_t i = 0; i < rec_count; i++) {
+            free(records[i].key);
+            for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
+            free(records[i].field_values);
+            free(records[i].field_indices);
+        }
+        free(records);
+        if (json_mmaped) munmap((void *)json, len); else if (input_is_file) free(json);
+        OUT("{\"error\":\"oom: workers\"}\n");
+        return 1;
+    }
     int wi = 0;
     for (int s = 0; s < sch.splits; s++) {
         if (shard_counts[s] > 0) {
@@ -3165,6 +3308,13 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         for (int gi = 0; gi < nshard_groups; gi++) {
             if (workers[gi].shard_id == records[i].shard_id) {
                 workers[gi].recs[workers[gi].count++] = records[i];
+                /* Ownership of the heap-owned key / field_values / field_indices
+                   pointers transfers to the worker copy. Null them in records[i]
+                   so the final free(records) doesn't appear to leak (Coverity
+                   can't see the aliased ownership transfer otherwise). */
+                records[i].key = NULL;
+                records[i].field_values = NULL;
+                records[i].field_indices = NULL;
                 break;
             }
         }
@@ -3677,15 +3827,27 @@ int rebuild_object(const char *db_root, const char *object,
         return 1;
     }
     if (rename(new_data_dir, data_dir) != 0) {
-        rename(data_old, data_dir); /* try to roll back */
+        /* Best-effort rollback — if this also fails the operator must
+           manually restore data_old → data_dir; either way we're already
+           returning an error so just log the secondary failure. */
+        if (rename(data_old, data_dir) != 0)
+            log_msg(1, "vacuum: rollback rename(%s → %s) failed: %s",
+                    data_old, data_dir, strerror(errno));
         if (fields_changed) unlink(fpath_new);
         OUT("{\"error\":\"Failed to rename data.new → data\"}\n");
         return 1;
     }
 
     if (fields_changed) {
-        rename(fpath, fpath_old);
-        rename(fpath_new, fpath);
+        if (rename(fpath, fpath_old) != 0)
+            log_msg(1, "vacuum: rename(%s → %s) failed: %s",
+                    fpath, fpath_old, strerror(errno));
+        if (rename(fpath_new, fpath) != 0) {
+            log_msg(1, "vacuum: rename(%s → %s) failed: %s — restoring old fields.conf",
+                    fpath_new, fpath, strerror(errno));
+            /* Best-effort restore of the previous fields.conf from .old. */
+            (void)rename(fpath_old, fpath);
+        }
     }
 
     if (splits_changed) {
@@ -3763,6 +3925,7 @@ int cmd_vacuum(const char *db_root, const char *object,
     VacuumWork *shards = NULL;
     int shard_count = 0, shard_cap = 256;
     shards = malloc(shard_cap * sizeof(VacuumWork));
+    if (!shards) { fprintf(stderr, "Error: oom\n"); return 1; }
 
     DIR *d1 = opendir(data_dir);
     if (!d1) { free(shards); fprintf(stderr, "Error: No data directory for [%s]\n", object); return 1; }
@@ -3774,7 +3937,13 @@ int cmd_vacuum(const char *db_root, const char *object,
         if (shard_count >= shard_cap) {
             shard_cap *= 2;
             VacuumWork *t = xrealloc_or_free(shards, shard_cap * sizeof(*t));
-            if (!t) { shards = NULL; break; }
+            if (!t) {
+                /* xrealloc_or_free already freed shards; reset count so the
+                   parallel_for + cleaned-sum below don't dereference NULL. */
+                shards = NULL;
+                shard_count = 0;
+                break;
+            }
             shards = t;
         }
         snprintf(shards[shard_count].path, PATH_MAX, "%s/%s", data_dir, e1->d_name);
@@ -4112,6 +4281,7 @@ int cmd_fetch(const char *db_root, const char *object,
     char **paths = NULL;
     int path_count = 0, path_cap = 256;
     paths = malloc(path_cap * sizeof(char *));
+    if (!paths) { OUT("{\"error\":\"oom\"}\n"); return 1; }
     DIR *d1 = opendir(data_dir);
     if (d1) {
         struct dirent *e1;
@@ -4121,8 +4291,19 @@ int cmd_fetch(const char *db_root, const char *object,
             if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
             if (path_count >= path_cap) {
                 path_cap *= 2;
-                char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
-                if (!t) { paths = NULL; break; }
+                /* Plain realloc (not xrealloc_or_free) so we can walk paths[]
+                   to free already-strdup'd entries before releasing the array. */
+                char **t = realloc(paths, path_cap * sizeof(char *));
+                if (!t) {
+                    /* OOM: free strdup'd entries + the array, zero path_count
+                       so downstream loops (the scan at line 4191 and the
+                       cleanup at 4235) skip without dereferencing NULL paths. */
+                    for (int k = 0; k < path_count; k++) free(paths[k]);
+                    free(paths);
+                    paths = NULL;
+                    path_count = 0;
+                    break;
+                }
                 paths = t;
             }
             char bp[PATH_MAX];
@@ -4245,8 +4426,12 @@ typedef struct {
     CriteriaNode *tree;
     int offset;
     int limit;
-    int count;
-    int printed;
+    /* `count` and `printed` are read lock-free in the per-record callback
+       (fast-skip when limit reached). The lock only serializes the emit +
+       counter section across parallel shard scans, so the read path doesn't
+       take it. _Atomic gives the lock-free reader a torn-read-free view. */
+    _Atomic int count;
+    _Atomic int printed;
     const char **proj_fields;
     int proj_count;
     ExcludedKeys excluded;
@@ -4559,7 +4744,9 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
     if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
         cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
         cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
-        int rhs_idx = ts ? typed_field_index(ts, c->value) : -1;
+        /* ts is non-NULL here — the early-return at the top of compile_one
+           (cc->tf = NULL on idx < 0) only proceeds when ts && idx >= 0. */
+        int rhs_idx = typed_field_index(ts, c->value);
         if (rhs_idx >= 0) {
             const TypedField *rhs = &ts->fields[rhs_idx];
             if (rhs->type == cc->ftype) cc->rhs_tf = rhs;
@@ -5223,6 +5410,7 @@ static int resolve_joins(JoinSpec *joins, int n, const char *db_root,
                     if (j->remote_fs.ts->fields[k].removed) continue;
                     strncpy(j->proj_fields[j->proj_count],
                             j->remote_fs.ts->fields[k].name, 255);
+                    j->proj_fields[j->proj_count][255] = '\0';
                     j->proj_tfs[j->proj_count] = &j->remote_fs.ts->fields[k];
                     j->proj_count++;
                 }
@@ -7925,7 +8113,11 @@ typedef struct {
     int dl_counter;
     int order_is_numeric;
     size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
-    int budget_exceeded;    /* set once we cross the cap — callback stops collecting */
+    /* Lock-free reads (line 7959 fast-skip in the per-record callback;
+       line 8553 post-scan check) intentionally don't take oc->lock — _Atomic
+       gives them a torn-read-free view against the writers at lines 7985, 7998
+       which set the flag under oc->lock. */
+    _Atomic int budget_exceeded;
     pthread_mutex_t lock;
 } OrderedCollectCtx;
 
@@ -8248,7 +8440,11 @@ static int cursor_find_cb(const char *val, size_t vlen,
        emitted — which is exactly what we send back. */
     free(c->last_value_str);
     free(c->last_key_str);
-    c->last_value_str = c->order_tf
+    /* When order_tf is non-NULL it was resolved from c->fs->ts, so both
+       pointers are non-NULL here in practice — the explicit checks mirror
+       the defensive pattern at the OrderedCollectCtx callback (line 8000)
+       and silence Coverity's flow-insensitive FORWARD_NULL on c->fs. */
+    c->last_value_str = (c->order_tf && c->fs && c->fs->ts)
         ? typed_get_field_str(c->fs->ts, raw, c->order_field_idx)
         : NULL;
     c->last_key_str = strndup(key_buf, klen);
@@ -8683,7 +8879,7 @@ int cmd_sequence(const char *db_root, const char *object,
     if (strcmp(action, "current") == 0) {
         long long val = 0;
         FILE *f = fopen(seq_path, "r");
-        if (f) { fscanf(f, "%lld", &val); fclose(f); }
+        if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
         OUT("{\"sequence\":\"%s\",\"value\":%lld}\n", seq_name, val);
         return 0;
     }
@@ -8697,15 +8893,24 @@ int cmd_sequence(const char *db_root, const char *object,
 
     if (strcmp(action, "next") == 0 || strcmp(action, "next-batch") == 0) {
         int lockfd = open(lock_path, O_RDWR | O_CREAT, 0644);
+        if (lockfd < 0) {
+            OUT("{\"error\":\"sequence: open(%s) failed: %s\"}\n", lock_path, strerror(errno));
+            return 1;
+        }
         flock(lockfd, LOCK_EX);
 
         long long val = 0;
         FILE *f = fopen(seq_path, "r");
-        if (f) { fscanf(f, "%lld", &val); fclose(f); }
+        if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
 
         if (batch_size <= 1) {
             val++;
             f = fopen(seq_path, "w");
+            if (!f) {
+                flock(lockfd, LOCK_UN); close(lockfd);
+                OUT("{\"error\":\"sequence: fopen(%s) failed: %s\"}\n", seq_path, strerror(errno));
+                return 1;
+            }
             fprintf(f, "%lld\n", val);
             fclose(f);
             flock(lockfd, LOCK_UN);
@@ -8715,6 +8920,11 @@ int cmd_sequence(const char *db_root, const char *object,
             long long start = val + 1;
             val += batch_size;
             f = fopen(seq_path, "w");
+            if (!f) {
+                flock(lockfd, LOCK_UN); close(lockfd);
+                OUT("{\"error\":\"sequence: fopen(%s) failed: %s\"}\n", seq_path, strerror(errno));
+                return 1;
+            }
             fprintf(f, "%lld\n", val);
             fclose(f);
             flock(lockfd, LOCK_UN);
@@ -8741,11 +8951,12 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
     ssize_t n;
     int rc = 0;
     while ((n = read(sfd, buf, sizeof(buf))) > 0) {
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(dfd, buf + off, n - off);
+        size_t total = (size_t)n;     /* n > 0 here; bounded by sizeof(buf) */
+        size_t off = 0;
+        while (off < total) {
+            ssize_t w = write(dfd, buf + off, total - off);
             if (w < 0) { rc = -1; goto done; }
-            off += w;
+            off += (size_t)w;
         }
     }
     if (n < 0) rc = -1;
@@ -8761,12 +8972,21 @@ done:
    Replaces the previous `system("cp -r ...")` invocations that CodeQL
    flagged as "uncontrolled data used in OS command". */
 static void cprf(const char *src, const char *dst) {
+    /* TOCTOU-safe: open by path once, then fstat the fd and fdopendir the
+       same fd. Avoids the classic lstat-then-opendir race where a symlink
+       swap between the two calls would steer the recursive copy at a
+       different filesystem object. O_NOFOLLOW rejects symlinks at the
+       open boundary, which is consistent with the existing "skip symlinks"
+       contract documented below. */
+    int fd = open(src, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return;
     struct stat st;
-    if (lstat(src, &st) != 0) return;
+    if (fstat(fd, &st) != 0) { close(fd); return; }
+
     if (S_ISDIR(st.st_mode)) {
         mkdirp(dst);
-        DIR *d = opendir(src);
-        if (!d) return;
+        DIR *d = fdopendir(fd);          /* takes ownership of fd */
+        if (!d) { close(fd); return; }
         struct dirent *e;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.' &&
@@ -8778,9 +8998,12 @@ static void cprf(const char *src, const char *dst) {
             snprintf(child_dst, sizeof(child_dst), "%s/%s", dst, e->d_name);
             cprf(child_src, child_dst);
         }
-        closedir(d);
+        closedir(d);                      /* closes the underlying fd */
     } else if (S_ISREG(st.st_mode)) {
+        close(fd);                        /* copy_file opens its own fd */
         copy_file(src, dst, st.st_mode);
+    } else {
+        close(fd);
     }
     /* Symlinks, fifos, devices etc. are ignored — backup targets are
        always shard-db's own regular files / directories. */
@@ -8872,6 +9095,7 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     typedef struct { int shard_id; uint32_t slots; uint32_t records; uint64_t file_bytes; } Row;
     int cap = sch.splits > 0 ? sch.splits : 16;
     Row *rows = calloc(cap, sizeof(Row));
+    if (!rows) { OUT("{\"error\":\"oom\"}\n"); return 1; }
     int nrows = 0;
 
     DIR *d1 = opendir(data_dir);
@@ -8894,7 +9118,7 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         if (nrows >= cap) {
             cap *= 2;
             Row *t = xrealloc_or_free(rows, cap * sizeof(*t));
-            if (!t) { rows = NULL; break; }
+            if (!t) { rows = NULL; nrows = 0; break; }
             rows = t;
         }
         rows[nrows++] = (Row){ sid, hdr.slots_per_shard, hdr.record_count, (uint64_t)st.st_size };
@@ -8988,6 +9212,7 @@ int cmd_recount(const char *db_root, const char *object) {
     char **paths = NULL;
     int path_count = 0, path_cap = 256;
     paths = malloc(path_cap * sizeof(char *));
+    if (!paths) { OUT("{\"error\":\"oom\"}\n"); return 1; }
 
     DIR *d1 = opendir(data_dir);
     if (!d1) { free(paths); OUT("{\"count\":0}\n"); set_count(db_root, object, 0); return 0; }
@@ -8998,8 +9223,16 @@ int cmd_recount(const char *db_root, const char *object) {
         if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
         if (path_count >= path_cap) {
             path_cap *= 2;
-            char **t = xrealloc_or_free(paths, path_cap * sizeof(char *));
-            if (!t) { paths = NULL; break; }
+            /* Plain realloc + walk: paths[] holds strdup'd entries that
+               xrealloc_or_free's atomic free would orphan. */
+            char **t = realloc(paths, path_cap * sizeof(char *));
+            if (!t) {
+                for (int k = 0; k < path_count; k++) free(paths[k]);
+                free(paths);
+                paths = NULL;
+                path_count = 0;
+                break;
+            }
             paths = t;
         }
         char bp[PATH_MAX];
@@ -9011,6 +9244,12 @@ int cmd_recount(const char *db_root, const char *object) {
     int total = 0;
     if (path_count > 0) {
         RecountWorkerArg *args = malloc(path_count * sizeof(RecountWorkerArg));
+        if (!args) {
+            for (int i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            OUT("{\"error\":\"oom\"}\n");
+            return 1;
+        }
         for (int i = 0; i < path_count; i++)
             args[i] = (RecountWorkerArg){ paths[i], sch.slot_size, &total };
         parallel_for(recount_worker, args, path_count, sizeof(RecountWorkerArg));
@@ -9305,6 +9544,7 @@ int cmd_list_files(const char *db_root, const char *object,
     char **names = NULL;
     size_t cap = 256, count = 0;
     names = malloc(cap * sizeof(char *));
+    if (!names) { closedir(d1); OUT("{\"error\":\"oom\"}\n"); return 1; }
 
     size_t prefix_len = prefix ? strlen(prefix) : 0;
 
@@ -9328,8 +9568,15 @@ int cmd_list_files(const char *db_root, const char *object,
                 if (prefix_len > 0 && strncmp(e3->d_name, prefix, prefix_len) != 0) continue;
                 if (count >= cap) {
                     cap *= 2;
-                    char **t = xrealloc_or_free(names, cap * sizeof(char *));
-                    if (!t) { names = NULL; break; }
+                    /* Plain realloc + walk: names[] holds strdup'd entries. */
+                    char **t = realloc(names, cap * sizeof(char *));
+                    if (!t) {
+                        for (size_t k = 0; k < count; k++) free(names[k]);
+                        free(names);
+                        names = NULL;
+                        count = 0;
+                        break;
+                    }
                     names = t;
                 }
                 names[count++] = strdup(e3->d_name);
@@ -9710,7 +9957,11 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
             }
             fclose(out);
             fclose(in);
-            rename(tmp_path, schema_path);
+            if (rename(tmp_path, schema_path) != 0) {
+                log_msg(1, "drop_object: rename(%s → %s): %s",
+                        tmp_path, schema_path, strerror(errno));
+                unlink(tmp_path);
+            }
         } else {
             fclose(in);
         }
