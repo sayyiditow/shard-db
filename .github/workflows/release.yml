@@ -5,15 +5,17 @@ name: Release
 #   - shard-db-<tag>-source.tar.gz       (architecture-independent;
 #                                          users build from source)
 #   - shard-db-<tag>-linux-x86_64.tar.gz  (compiled binaries)
-#   - <each-of-above>.sig                 (cosign keyless signature)
+#   - <each-of-above>.bundle              (cosign sigstore bundle —
+#                                          signature + cert + tlog entry
+#                                          in one file, new format)
 #   - multiple.intoto.jsonl               (SLSA L3 provenance covering
 #                                          every artifact in the release)
 #
-# Verification by end-users:
+# Verification by end-users (cosign 2.6+):
 #   cosign verify-blob \
 #     --certificate-identity-regexp 'github\.com/sayyiditow/shard-db' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-#     --signature shard-db-<tag>-linux-x86_64.tar.gz.sig \
+#     --bundle shard-db-<tag>-linux-x86_64.tar.gz.bundle \
 #     shard-db-<tag>-linux-x86_64.tar.gz
 #
 # To extend to more targets (linux-arm64, darwin-x86_64, darwin-arm64),
@@ -157,14 +159,12 @@ jobs:
 
       - name: Sign each tarball with cosign keyless
         run: |
-          # cosign 2.6+ defaults to --new-bundle-format which deprecates
-          # --output-signature and requires --bundle. We keep the legacy
-          # .sig file contract documented at the top of this workflow,
-          # so opt out of the new bundle format explicitly.
+          # cosign 2.6+ requires --bundle (new sigstore bundle format).
+          # The bundle contains signature + cert + transparency-log entry
+          # in one file. Verification uses --bundle <path>.
           for f in shard-db-*.tar.gz; do
             cosign sign-blob --yes \
-              --new-bundle-format=false \
-              --output-signature "${f}.sig" \
+              --bundle "${f}.bundle" \
               "$f"
           done
           ls -la
@@ -175,5 +175,5 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             shard-db-*.tar.gz
-            shard-db-*.tar.gz.sig
+            shard-db-*.tar.gz.bundle
           fail_on_unmatched_files: true
