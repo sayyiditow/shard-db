@@ -907,14 +907,24 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
-    /* vacuum-check scans all objects — no dir/object needed */
+    /* vacuum-check scans all objects — no dir/object needed. Snapshot
+       g_dirs/g_dirs_used under g_dirs_lock once, then iterate the copy
+       outside the critical section (admin command, rare; same pattern as
+       the db-dirs handler above and objlock.c::dirs_copy at line 130). */
     if (mode && strcmp(mode, "vacuum-check") == 0) {
+        char dirs_copy[DIRS_BUCKETS][256];
+        int  used_copy[DIRS_BUCKETS];
+        pthread_mutex_lock(&g_dirs_lock);
+        memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
+        memcpy(used_copy, g_dirs_used, sizeof(used_copy));
+        pthread_mutex_unlock(&g_dirs_lock);
+
         OUT("[");
         int printed = 0;
         for (int di = 0; di < DIRS_BUCKETS; di++) {
-            if (!g_dirs_used[di]) continue;
+            if (!used_copy[di]) continue;
             char dir_path[PATH_MAX];
-            snprintf(dir_path, sizeof(dir_path), "%s/%s", g_db_root, g_dirs[di]);
+            snprintf(dir_path, sizeof(dir_path), "%s/%s", g_db_root, dirs_copy[di]);
             DIR *dd = opendir(dir_path);
             if (!dd) continue;
             struct dirent *de;
@@ -926,7 +936,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 if (stat(obj_check, &ost) != 0) continue;
                 /* Build effective root for this dir */
                 char eff[PATH_MAX];
-                snprintf(eff, sizeof(eff), "%s/%s", g_db_root, g_dirs[di]);
+                snprintf(eff, sizeof(eff), "%s/%s", g_db_root, dirs_copy[di]);
                 /* Read counts (single file, single read) */
                 int count = get_live_count(eff, de->d_name);
                 int deleted = get_deleted_count(eff, de->d_name);
@@ -935,7 +945,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 int recommend = (deleted >= 1000 && total > 0 && deleted * 10 >= total);
                 if (deleted > 0) {
                     OUT("%s{\"dir\":\"%s\",\"object\":\"%s\",\"count\":%d,\"orphaned\":%d,\"vacuum\":%s}",
-                        printed ? "," : "", g_dirs[di], de->d_name, count, deleted,
+                        printed ? "," : "", dirs_copy[di], de->d_name, count, deleted,
                         recommend ? "true" : "false");
                     printed++;
                 }
@@ -2064,7 +2074,10 @@ int cmd_server(const char *db_root, int daemonize) {
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) { perror("socket"); return 1; }
     int opt = 1;
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    /* SO_REUSEADDR is a best-effort hint — if it fails (extremely rare),
+       the worst case is "Address already in use" on a quick restart while
+       a previous bind is in TIME_WAIT. Not a correctness issue. */
+    (void)setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in saddr;
     memset(&saddr, 0, sizeof(saddr));

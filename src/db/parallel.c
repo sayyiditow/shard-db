@@ -96,6 +96,11 @@ void parallel_pool_init(int nthreads) {
 }
 
 void parallel_pool_shutdown(void) {
+    /* coverity[lock_evasion] coverity[missing_lock] intentional lock-free
+       fast-skip — `_Atomic int` gives torn-read-free visibility; if a
+       concurrent init flipped the flag to 1 between this check and the
+       lock below, we'd just take the lock and do nothing. Idempotent
+       shutdown is correct either way. */
     if (!g_pool_running) return;
     pthread_mutex_lock(&g_q_lock);
     g_pool_running = 0;

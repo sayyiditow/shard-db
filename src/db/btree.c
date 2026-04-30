@@ -472,7 +472,21 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
 
         BtCacheEntry *e = &bt_cache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
-            /* Confirmed cache hit. */
+            /* Confirmed cache hit. Two things going on:
+               1. The per-entry rwlock stays held across this return by
+                  design — bt_release() is the matched unlock (see btree.c:559).
+                  bt_cache_lock was already released above, so the only
+                  outstanding lock is the rwlock, the caller's to drop.
+                  coverity[missing_unlock] rwlock handoff to caller is intentional
+               2. Coverity ATOMICITY worries that `slot` was chosen lock-free
+                  and another thread could re-target it. The verify-retry
+                  loop above already eliminates the evict-during-rwlock-wait
+                  window (e->used + e->path re-checked under rwlock); during
+                  the rwlock hold, bt_cache_drop_slot assumes no rwlock
+                  holder (its contract; LRU picks oldest last_access and we
+                  just bumped to current clock at line 466, so we won't be
+                  selected as victim).
+                  coverity[atomicity] slot stability guaranteed by rwlock + verify */
             __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
             bt->slot = slot;
             bt->fd = e->fd;
@@ -552,6 +566,9 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     bt->fd = fd;
     bt->map = map;
     bt->map_size = sz;
+    /* Same lock-handoff contract as the cache-hit return at btree.c:481 —
+       rwlock stays held; bt_release() is the matched unlock.
+       coverity[missing_unlock] rwlock handoff to caller is intentional */
     return 0;
 }
 
@@ -1543,6 +1560,9 @@ static int iter_load_desc_snap(BtRangeIter *it) {
    exhausted. */
 static int iter_next_desc(BtRangeIter *it) {
     if (!it->desc_leaves) {
+        /* coverity[forward_null] iter_init_desc_leaves handles a NULL
+           it->desc_leaves explicitly — see the malloc-on-first /
+           realloc-on-grow conditional at btree.c:1483. */
         if (iter_init_desc_leaves(it) < 0) return 0;
     }
 

@@ -1016,6 +1016,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     } else {
         size_t cap = 65536, pos = 0;
         json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
         int c;
         while ((c = fgetc(stdin)) != EOF) {
             if (pos >= cap - 1) {
@@ -1035,6 +1036,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     Schema sc = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nfields; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
     (void)nfields; /* indexes are walked per-shard later via load_index_fields */
 
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -1205,11 +1207,19 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     }
 
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
-       writes and can hold the ucache wrlock once for the entire bucket. */
+       writes and can hold the ucache wrlock once for the entire bucket.
+       OOM at any of the allocs below frees every prior allocation
+       (records, arena, idx_pairs[], idx_pair_*, json buffer) in reverse
+       order before bailing — same cleanup the success path runs at the
+       function tail, just earlier. */
     int *shard_counts = calloc(sc.splits, sizeof(int));
     if (!shard_counts) {
         free(records);
-        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        arena_free(arena);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        OUT("{\"error\":\"oom: bulk_insert shard_counts\"}\n");
         return 1;
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
@@ -1221,8 +1231,13 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
     int *shard_to_worker = malloc(sc.splits * sizeof(int));
     if ((nshard_groups > 0 && !workers) || !shard_to_worker) {
-        free(workers); free(shard_to_worker); free(shard_counts); free(records);
-        OUT("{\"error\":\"oom: workers\"}\n");
+        free(workers); free(shard_to_worker);
+        free(shard_counts); free(records);
+        arena_free(arena);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        OUT("{\"error\":\"oom: bulk_insert workers\"}\n");
         return 1;
     }
     {
@@ -1239,8 +1254,13 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             }
         }
     }
+    /* Invariant: rec_count > 0 ⇒ at least one shard has count > 0 ⇒
+       nshard_groups > 0 ⇒ workers != NULL (post-OOM-guard above).
+       Coverity can't trace the chain, so the loop body's workers[w]
+       deref is flagged FORWARD_NULL — annotate. */
     for (size_t i = 0; i < rec_count; i++) {
         int w = shard_to_worker[records[i].shard_id];
+        /* coverity[forward_null] workers is non-NULL when rec_count > 0 */
         workers[w].records[workers[w].count++] = records[i];  /* shallow copy, ownership transferred */
     }
     free(records);
@@ -1249,6 +1269,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     /* Wire read-only worker context + allocate per-worker idx-entry collectors. */
     for (int wi = 0; wi < nshard_groups; wi++) {
+        /* coverity[forward_null] same invariant — nshard_groups > 0 ⇒ workers non-NULL */
         BulkInsShardWork *ws = &workers[wi];
         ws->db_root = db_root;
         ws->object = object;
@@ -1459,6 +1480,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     Schema sc = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
     /* mmap the file */
     int ifd = open(filepath, O_RDONLY);
@@ -1648,12 +1670,16 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     }
 
     /* ===== Phase 1.5: bucket by shard — identical to the JSON path.
-       OOM at any of the three allocs short-circuits with an error JSON;
-       Phase 2's parallel workers never see a partially-built work set. */
+       OOM at any of the three allocs frees every prior allocation in
+       reverse order before bailing. */
     int *shard_counts = calloc(sc.splits, sizeof(int));
     if (!shard_counts) {
         free(records);
-        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        arena_free(arena);
+        for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"oom: bulk_insert shard_counts\"}\n");
         return 1;
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
@@ -1665,11 +1691,13 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         ? calloc(nshard_groups, sizeof(BulkInsShardWork)) : NULL;
     int *shard_to_worker = malloc(sc.splits * sizeof(int));
     if ((nshard_groups > 0 && !workers) || !shard_to_worker) {
-        free(workers);
-        free(shard_to_worker);
-        free(shard_counts);
-        free(records);
-        OUT("{\"error\":\"oom: workers\"}\n");
+        free(workers); free(shard_to_worker);
+        free(shard_counts); free(records);
+        arena_free(arena);
+        for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"oom: bulk_insert workers\"}\n");
         return 1;
     }
     {
@@ -1686,8 +1714,11 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             }
         }
     }
+    /* Same invariant as cmd_bulk_insert (JSON path): rec_count > 0 ⇒
+       nshard_groups > 0 ⇒ workers non-NULL post-OOM-guard. */
     for (size_t i = 0; i < rec_count; i++) {
         int w = shard_to_worker[records[i].shard_id];
+        /* coverity[forward_null] workers non-NULL when rec_count > 0 */
         workers[w].records[workers[w].count++] = records[i];
     }
     free(records);
@@ -2030,6 +2061,7 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
     Schema sch = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
     TypedSchema *ts = load_typed_schema(db_root, object);
 
     /* Compute hashes and group by shard */
@@ -2194,7 +2226,14 @@ typedef struct {
 
 static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     BulkCriteriaCtx *bc = (BulkCriteriaCtx *)ctx;
+    /* coverity[lock_evasion] coverity[missing_lock] intentional fast-skip in
+       the per-record hot path — `_Atomic int` gives torn-read-free visibility
+       against the writers under bc->lock; staleness here just costs one
+       extra iteration before the locked re-check at line 2232 catches the
+       budget overflow. Taking the mutex per record would gate every callback
+       through a kernel call. */
     if (bc->budget_exceeded) return 1;
+    /* coverity[lock_evasion] coverity[missing_lock] same rationale — count is _Atomic. */
     if (bc->limit > 0 && bc->count >= bc->limit) return 1;
     if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 1;
 
@@ -2470,6 +2509,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     TypedSchema *ts = load_typed_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
     int updated = 0, skipped = 0;
 
     /* Pre-compute each matched key's hash + shard placement so bucketing
@@ -2739,6 +2779,7 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
     Schema sch = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
     int ifd = open(filepath, O_RDONLY);
     if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
@@ -2829,12 +2870,14 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
         compute_addr(r->key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
     }
 
-    /* ===== Phase 1.5: bucket by shard_id. */
+    /* ===== Phase 1.5: bucket by shard_id.
+       OOM bails free the mmap/buf-backed `data` along with records[]. */
     int *shard_counts = calloc(sch.splits, sizeof(int));
     if (!shard_counts) {
         for (size_t i = 0; i < rec_count; i++) free(records[i].key);
         free(records);
-        OUT("{\"error\":\"oom: shard_counts\"}\n");
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"oom: bulk_update_delim shard_counts\"}\n");
         return 1;
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
@@ -2848,7 +2891,8 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
         free(workers); free(shard_to_worker); free(shard_counts);
         for (size_t i = 0; i < rec_count; i++) free(records[i].key);
         free(records);
-        OUT("{\"error\":\"oom: workers\"}\n");
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"oom: bulk_update_delim workers\"}\n");
         return 1;
     }
     {
@@ -3066,6 +3110,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     Schema sch = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
     char *json = NULL;
     size_t len = 0;
@@ -3471,6 +3516,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         /* Extract indexed field values (as index-key bytes) BEFORE tombstoning */
         char idx_fields[MAX_FIELDS][256];
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+        for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
         uint8_t *idx_bufs[MAX_FIELDS];
         size_t   idx_lens[MAX_FIELDS];
         int      idx_have[MAX_FIELDS];
@@ -4334,7 +4380,16 @@ int cmd_fetch(const char *db_root, const char *object,
     else
         OUT("{\"results\":[");
 
+    /* paths is NULL only when path_count was reset to 0 alongside it
+       (initial-malloc fail returns early; realloc fail also zeroes
+       path_count). The loop condition `pi < path_count` short-circuits
+       when path_count == 0, so paths[pi] is never reached with NULL paths.
+       Coverity can't trace the paired invariant — suppress.
+       UNINIT for the same reason: paths[pi] is only read when pi < path_count,
+       and path_count is incremented only after a successful strdup writes
+       paths[path_count]. So paths[0..path_count-1] are always initialized. */
     for (int pi = start_path; pi < path_count && printed < limit; pi++) {
+        /* coverity[forward_null] coverity[uninit_use_in_call] paths non-NULL and paths[pi] initialized when pi < path_count */
         FcacheRead fc = fcache_get_read(paths[pi]);
         if (!fc.map) continue;
         uint32_t shard_slots = fc.slots_per_shard;
@@ -5416,6 +5471,11 @@ static int resolve_joins(JoinSpec *joins, int n, const char *db_root,
                 }
             }
         } else {
+            /* Belt-and-suspenders re-term — proj_fields[] is null-terminated
+               at population (parse_one_join via memcpy + explicit '\0', and
+               the auto-fill above via strncpy + explicit '\0'), but Coverity
+               can't propagate the post-condition to consumers. */
+            for (int k = 0; k < j->proj_count; k++) j->proj_fields[k][255] = '\0';
             for (int k = 0; k < j->proj_count; k++) {
                 if (strchr(j->proj_fields[k], '+')) {
                     OUT("{\"error\":\"composite projection field [%s] not supported\"}\n",
@@ -5659,7 +5719,10 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                           void *ctx) {
     AdvSearchCtx *sc = (AdvSearchCtx *)ctx;
     /* Best-effort pre-checks (no lock). The emit section below re-checks
-       limit under the lock to ensure we never over-emit. */
+       limit under the lock to ensure we never over-emit.
+       coverity[lock_evasion] coverity[missing_lock] — `_Atomic int printed`
+       gives torn-read-free visibility; staleness costs at most one wasted
+       record-fetch before the locked re-check at line 5731 catches it. */
     if (sc->limit > 0 && sc->printed >= sc->limit) return 1;
     if (query_deadline_tick(sc->deadline, &sc->dl_counter)) return 1;
 
@@ -6123,7 +6186,7 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
     if (query_deadline_tick(ic->deadline, &ic->dl_counter)) return -1;
     if (ic->primary_crit && op_is_length(ic->primary_crit->op)) {
         if (!match_length_vlen(vlen, ic->primary_crit)) return 0;
-    } else if (ic->check_primary) {
+    } else if (ic->check_primary && ic->primary_crit) {
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
@@ -8123,6 +8186,11 @@ typedef struct {
 
 static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     OrderedCollectCtx *oc = (OrderedCollectCtx *)ctx;
+    /* coverity[lock_evasion] coverity[missing_lock] intentional fast-skip —
+       `_Atomic int` makes the read torn-read-free; if stale, the locked
+       re-check at line 7984 (`if (oc->buffer_bytes + row_bytes >
+       g_query_buffer_max_bytes)`) catches it. Per-callback mutex acquire
+       would gate every record. */
     if (oc->budget_exceeded) return 1;  /* stop scanning once cap hit */
     if (query_deadline_tick(oc->deadline, &oc->dl_counter)) return 1;
 
@@ -8954,6 +9022,13 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
         size_t total = (size_t)n;     /* n > 0 here; bounded by sizeof(buf) */
         size_t off = 0;
         while (off < total) {
+            /* Loop guard `off < total` (both size_t) makes total-off > 0
+               and well within size_t range — the only writer to off is
+               `off += (size_t)w` where w >= 0 (the w<0 path goto-dones).
+               Coverity's INTEGER_OVERFLOW heuristic chains taintedness
+               from read()'s ssize_t return, so it doesn't trust the
+               cast+invariant chain. The arithmetic is safe by construction.
+               coverity[overflow_sink] total - off is unsigned-positive */
             ssize_t w = write(dfd, buf + off, total - off);
             if (w < 0) { rc = -1; goto done; }
             off += (size_t)w;
@@ -9587,7 +9662,11 @@ int cmd_list_files(const char *db_root, const char *object,
     }
     closedir(d1);
 
-    qsort(names, count, sizeof(char *), cmp_str);
+    /* qsort(NULL, 0, ...) is well-defined as a no-op per POSIX, but Coverity
+       can't see that — explicit count guard keeps the static analyzer happy
+       and avoids dragging the names arg through a NULL-pointer code path
+       even when there are no entries to sort. */
+    if (count > 0) qsort(names, count, sizeof(char *), cmp_str);
 
     /* Emit page [offset, offset+limit) plus the unfiltered total. */
     OUT("{\"files\":[");

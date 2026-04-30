@@ -438,7 +438,14 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
     if (slot < 0) return -1;
 
     UCacheEntry *e = &g_ucache[slot];
-    uint32_t observed_slots = e->slots_per_shard;  /* snapshot before lock */
+    /* coverity[lock_evasion] coverity[missing_lock] deliberate lock-free
+       snapshot — `_Atomic uint32_t` gives torn-read-free visibility; the
+       value is only used to detect "did another writer grow this shard
+       before us" via the locked `old_slots != observed_slots` comparison
+       after the wrlock acquire. Stale value just means we proceed with the
+       locked check, which is authoritative. Snapshotting before the lock
+       avoids serialising every concurrent grow-detection through the wrlock. */
+    uint32_t observed_slots = e->slots_per_shard;
     pthread_rwlock_wrlock(&e->rwlock);
 
     ShardHeader *old_hdr = (ShardHeader *)e->map;
@@ -644,6 +651,12 @@ void fcache_invalidate(const char *path_prefix) {
     size_t plen = strlen(path_prefix);
     for (int i = 0; i < g_ucache_slots; i++) {
         UCacheEntry *e = &g_ucache[i];
+        /* coverity[lock_evasion] coverity[missing_lock] lock-free skip-empty —
+           `_Atomic int used` gives torn-read-free visibility. If a concurrent
+           ucache_ensure is in the middle of installing this slot we may miss
+           it on this pass; that's acceptable for an invalidate sweep (the
+           next sweep or the subsequent reads of the freshly-installed entry
+           will see the stale state and the reload-on-miss path handles it). */
         if (!e->used) continue;
         if (strncmp(e->path, path_prefix, plen) != 0) continue;
         /* Take write lock to ensure no readers */
@@ -976,6 +989,12 @@ int cmd_insert(const char *db_root, const char *object,
     /* Indexing — parallel per field, skip unchanged values */
     char fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    /* load_index_fields null-terminates each entry within 256 bytes
+       (config.c:698 cache-hit, :720 cache-miss). Re-asserting the term
+       in caller scope so Coverity STRING_NULL stops chaining through
+       every fields[i] consumer downstream. Cheap: one byte write per
+       index field on the schema-load path (once per query). */
+    for (int _i = 0; _i < nfields; _i++) fields[_i][255] = '\0';
     if (nfields > 0 && is_update && old_value) {
         TypedSchema *idx_ts = load_typed_schema(db_root, object);
         for (int i = 0; i < nfields; i++) {
@@ -1079,6 +1098,7 @@ int cmd_update(const char *db_root, const char *object,
     /* Index fields — collect old values before modifying */
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* see fields[] re-term comment above */
     uint8_t *old_idx_bufs[MAX_FIELDS];
     size_t  old_idx_lens[MAX_FIELDS];
     int     old_idx_have[MAX_FIELDS];
@@ -1242,6 +1262,7 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
         /* Extract indexed field values BEFORE tombstoning, for index cleanup */
         char idx_fields[MAX_FIELDS][256];
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+        for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* see fields[] re-term comment above */
         uint8_t *idx_bufs[MAX_FIELDS];
         size_t   idx_lens[MAX_FIELDS];
         int      idx_have[MAX_FIELDS];

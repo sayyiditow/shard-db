@@ -99,6 +99,15 @@ gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c s
 
 mkdir -p build/bin
 
+# Purge any dev-run artifacts so `./build.sh` always emits a clean tree.
+# When the daemon is exercised from build/bin during local testing it
+# creates build/db (DB_ROOT="../db") + build/logs (LOG_DIR="../logs") +
+# possibly a build/bin/db.env if the operator copied from the example.
+# Strip those here so `cp build/bin/ <prod>:/opt/shard-db/bin/` upgrades
+# don't accidentally drag dev state along.
+rm -rf build/db build/logs
+rm -f  build/bin/db.env
+
 cp shard-db shard-cli build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
@@ -133,6 +142,7 @@ export TLS_CA=""
 export TLS_SKIP_VERIFY=0
 EOF
 
-echo "Built: build/"
-echo "Deploy: copy build/ to server, cd build/bin, ./shard-db start"
-echo "Note: \$DB_ROOT is created lazily on first start; existing data dirs are not touched."
+echo "Built: build/bin/"
+echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
+echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
+echo "Upgrades: replace shard-db + shard-cli only — db.env / DB_ROOT / logs are untouched."
