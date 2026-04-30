@@ -9,17 +9,19 @@ void mkdirp(const char *path) {
        that's the expected case for any path where ancestors already exist.
        Other failures (EACCES, ENOSPC, ENOTDIR) are treated as best-effort:
        callers will hit them again on the open()/write() that follows and
-       report a precise error there. */
+       report a precise error there. Errors emitted to stderr (not log_msg)
+       to keep util.c self-contained for the fuzz harness, which links
+       util.c standalone without the daemon's logging facility. */
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
             if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
-                log_msg(2, "mkdirp: %s: %s", tmp, strerror(errno));
+                fprintf(stderr, "mkdirp: %s: %s\n", tmp, strerror(errno));
             *p = '/';
         }
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
-        log_msg(2, "mkdirp: %s: %s", tmp, strerror(errno));
+        fprintf(stderr, "mkdirp: %s: %s\n", tmp, strerror(errno));
 }
 
 char *dirname_of(const char *path) {
