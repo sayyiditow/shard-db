@@ -76,15 +76,15 @@ planned peak connections × MAX_REQUEST_SIZE < 50% of total RAM
 
 Leave room for the `ucache`, `bt_cache`, page cache, and working memory.
 
-## GLOBAL_LIMIT — soft result cap
+## GLOBAL_LIMIT — default result limit
 
-Default ceiling for query `limit` when no explicit `limit` is provided, and a hard safety cap for aggregate results.
+Default `limit` applied when a query omits one (or sets `limit ≤ 0`).
 
 - **Default 100 000**.
-- Prevents runaway queries from materializing millions of records.
-- Per-query `limit` always wins when smaller.
+- Pure fallback — there is **no server-side clamp**. A per-query `"limit": 500000` returns 500K records even with `GLOBAL_LIMIT=100000`.
+- Prevents runaway queries from accidentally materializing the whole object when a caller forgets `limit`.
 
-When to raise: you legitimately need larger result sets (e.g., data exports). Consider paginating instead.
+If you need a hard ceiling that cannot be overridden, that's not what `GLOBAL_LIMIT` is — enforce it in the application layer or behind a reverse proxy. Pair the limit-default with `QUERY_BUFFER_MB` (a real cap on intermediate-buffer memory; the query aborts if exceeded) for memory protection.
 
 ## SLOW_QUERY_MS — slow query threshold
 

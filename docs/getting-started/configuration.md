@@ -18,7 +18,7 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `THREADS` | `0` (auto) | Parallel-for worker pool — drives every parallel hot path (shard scans, indexed find/count/aggregate fan-out, parallel index builds, bulk-insert phase 2). `0` = `4 × nproc`, minimum 4. |
 | `WORKERS` | `0` (auto) | Server-worker pool that accepts connections + dispatches request handlers. `0` = auto (CPU count, minimum 4). |
 | `POOL_CHUNK` | `0` (auto) | parallel_for submission chunk size. `0` = `nproc`. Tasks are enqueued in chunks of this many; larger chunks reduce queue-lock contention but serialise concurrent submitters. Rarely needs tuning. |
-| `GLOBAL_LIMIT` | `100000` | Soft cap on result rows per query — use per-query `limit` for tighter bounds. |
+| `GLOBAL_LIMIT` | `100000` | Default `limit` applied when a query omits one. Per-query `limit` is **not clamped** — pass any value to override. |
 | `MAX_REQUEST_SIZE` | `33554432` (32 MB) | Maximum JSON request size per line. Oversized requests get `{"error":"Request too large (max N bytes)"}`. Every connection allocates a read buffer of this size, so total per-conn memory = N × `MAX_REQUEST_SIZE`. |
 | `FCACHE_MAX` | `4096` | Unified shard-mmap cache capacity (entries). **Strict allow-list:** `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning. See [Tuning](../operations/tuning.md). |
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |

@@ -191,7 +191,7 @@ The planner paths from [find](find.md#execution-paths) apply here too — when t
 ## Limitations
 
 - Max **32 aggregates per query** (`MAX_AGG_SPECS`).
-- Max `limit` capped by `GLOBAL_LIMIT` (default 100,000).
+- `limit` defaults to `GLOBAL_LIMIT` (default 100,000) when omitted, but is **not** clamped to it — pass any value to override.
 - No `DISTINCT` — emulate with `group_by` + `count`.
 - No window functions — aggregate against a query, keep state in the app.
 - No nested aggregates.

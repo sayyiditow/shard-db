@@ -36,7 +36,7 @@ Changing these requires recompiling. Most don't need to change.
 
 | Thing | Limit | Notes |
 |---|---|---|
-| `limit` per query | `GLOBAL_LIMIT` (default 100 000) | Soft cap. Per-query `limit` overrides. |
+| `limit` per query | `GLOBAL_LIMIT` (default 100 000) | Default applied when `limit` is omitted or ≤ 0. Per-query `limit` overrides without clamp — there is no server-side ceiling. |
 | Aggregates per query | 32 | `MAX_AGG_SPECS`. |
 | `criteria` length | bounded by `MAX_REQUEST_SIZE` | No hard count cap, just the request-size ceiling. |
 | AND/OR criteria depth | 16 | `MAX_CRITERIA_DEPTH`. Empty `or:[]` / `and:[]` rejected. |
@@ -46,7 +46,7 @@ Changing these requires recompiling. Most don't need to change.
 | Per-query intermediate buffers | `QUERY_BUFFER_MB` MB (default 500) | Enforced at every collection site (collect-hash, KeySet, aggregate buckets, sort buffers). Exceeded → `query memory buffer exceeded` error and the server keeps serving. |
 | Per-request statement timeout | global `TIMEOUT` (db.env, seconds) or per-request `timeout_ms` (override) | Disabled when both are 0. |
 | Request size (one JSON line) | `MAX_REQUEST_SIZE` (default 32 MB) | Configurable per install. |
-| Response size | no cap | Bounded by memory + `GLOBAL_LIMIT`. |
+| Response size | no cap | Bounded by `QUERY_BUFFER_MB` (intermediate buffers) + the caller-supplied `limit`. |
 
 ## File storage limits
 
