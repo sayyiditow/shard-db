@@ -1030,7 +1030,9 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
         json[pos] = '\0'; len = pos;
     }
-    if (!json) { fprintf(stderr, "Error: Cannot read input\n"); return 1; }
+    /* json is non-NULL on all paths reaching here: the file branch (988-1015)
+       returns early on every alloc failure; the stdin branch (1016-1032)
+       returns at the initial-malloc and post-realloc NULL guards. */
 
     /* Load config ONCE */
     Schema sc = load_schema(db_root, object);
@@ -3353,16 +3355,19 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         for (int gi = 0; gi < nshard_groups; gi++) {
             if (workers[gi].shard_id == records[i].shard_id) {
                 workers[gi].recs[workers[gi].count++] = records[i];
-                /* Ownership of the heap-owned key / field_values / field_indices
-                   pointers transfers to the worker copy. Null them in records[i]
-                   so the final free(records) doesn't appear to leak (Coverity
-                   can't see the aliased ownership transfer otherwise). */
-                records[i].key = NULL;
-                records[i].field_values = NULL;
-                records[i].field_indices = NULL;
                 break;
             }
         }
+        /* Null the heap-owned pointers in records[i] unconditionally — the
+           inner loop above ALWAYS finds a matching worker by construction
+           (every records[i].shard_id was used to compute shard_counts, and
+           every shard with count > 0 got a worker), but Coverity can't
+           trace the invariant. NULLing outside the if covers the
+           unreachable no-match case so free(records) below is leak-free
+           in the static analyzer's view too. */
+        records[i].key = NULL;
+        records[i].field_values = NULL;
+        records[i].field_indices = NULL;
     }
     free(shard_counts);
 
