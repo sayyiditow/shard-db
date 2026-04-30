@@ -6,10 +6,10 @@ Hard caps and practical bounds. Everything here is enforced at compile time unle
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `MIN_SPLITS` | 16 | Minimum shards per object at `create-object`. Per-shard btree layout (2026.05.1+) requires `splits ≥ 16` so that `splits/4 ≥ 4` per-field idx files. |
+| `MIN_SPLITS` | 8 | Minimum shards per object at `create-object`. At the floor, `splits/4 = 2` per-field idx shards — preserves k-way-merge parallelism on indexed reads while giving small-server (2–4 core) deployments a tighter sizing option for sub-1M-row objects. |
 | `DEFAULT_SPLITS` | 16 | Used by `create-object` when `splits` is omitted or 0. |
 | `MAX_SPLITS` | 4096 | Maximum shards per object. Filename is `NNN.bin` (3 hex digits), so this is structural — not a policy knob. |
-| Allowed `splits` set | `{16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` | `splits` must be a power of 2 in this set. Other values are rejected at `create-object` and `vacuum --splits`. |
+| Allowed `splits` set | `{8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` | `splits` must be a power of 2 in this set. Other values are rejected at `create-object` and `vacuum --splits`. |
 | `MAX_KEY_CEILING` | 1024 bytes | Hard upper limit on per-object `max_key`. Keys are stored raw in Zone B, so every slot reserves `max_key` bytes — larger caps bloat `slot_size`. |
 | `MAX_FIELDS` | 256 | Max fields per typed schema (bumped from 64 in 2026.04.2). |
 | `MAX_LINE` | 65 536 bytes | Internal buffer size for queries and intermediate strings. |

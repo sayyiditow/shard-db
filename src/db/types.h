@@ -37,21 +37,24 @@
 #define SHARD_HDR_SIZE   32          /* ShardHeader at file offset 0 */
 #define INITIAL_SLOTS    256         /* starting slots_per_shard for new shards */
 /* As of 2026.05.1 the valid splits set is restricted to powers of 2 from
-   16 to 4096. The restriction supports the per-shard index layout where
+   8 to 4096. The restriction supports the per-shard index layout where
    index_splits = splits / 4 — keeping splits a power of 2 keeps the
-   shard math (and the routing of records → index shards) regular. */
-#define MIN_SPLITS       16
+   shard math (and the routing of records → index shards) regular.
+   Floor lowered from 16 to 8 to give small-server (2-4 core) deployments
+   a tighter sizing option for sub-1M-row objects (8/4 = 2 index shards
+   still preserves k-way merge parallelism on indexed reads). */
+#define MIN_SPLITS       8
 #define DEFAULT_SPLITS   16          /* used by create-object when splits is omitted/0 */
 #define MAX_SPLITS       4096
 
-/* True iff n ∈ {16, 32, 64, 128, 256, 512, 1024, 2048, 4096}. */
+/* True iff n ∈ {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}. */
 static inline int is_valid_splits(int n) {
     if (n < MIN_SPLITS || n > MAX_SPLITS) return 0;
     return (n & (n - 1)) == 0;   /* power of two */
 }
 
-/* Index shard count for a given data splits — always splits/4. Floor of 4
-   guaranteed by is_valid_splits (16/4 = 4). */
+/* Index shard count for a given data splits — always splits/4. Floor of 2
+   guaranteed by is_valid_splits (8/4 = 2). */
 static inline int index_splits_for(int splits) {
     return splits / 4;
 }

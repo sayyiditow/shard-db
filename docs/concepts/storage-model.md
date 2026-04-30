@@ -5,7 +5,7 @@ A conceptual walkthrough of what lives on disk when you insert a record. For the
 ## Objects, shards, slots
 
 - An **object** is shard-db's table. Every object has a typed schema (`fields.conf`), one or more shard files, optional indexes, and a directory for stored files.
-- A **shard** is one `.bin` file under `<object>/data/`. `splits` is configured per-object and locked to a power of 2 in `{16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` (`MAX_SPLITS`); default is 16 when `create-object` doesn't pass `splits`. The 3-hex-digit filename (`NNN.bin`) caps the count at 4096.
+- A **shard** is one `.bin` file under `<object>/data/`. `splits` is configured per-object and locked to a power of 2 in `{8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` (`MIN_SPLITS`–`MAX_SPLITS`); default is 16 when `create-object` doesn't pass `splits`. The 3-hex-digit filename (`NNN.bin`) caps the count at 4096.
 - A **slot** is a single record position within a shard. Shards start at 256 slots each and grow dynamically.
 
 ### Record routing

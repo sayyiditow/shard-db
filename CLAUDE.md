@@ -131,7 +131,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ### Indexes
 
 - **B+ tree** with prefix-compressed leaves (anchors every K=16 entries, two-stage bsearch)
-- **Per-shard layout**: every indexed field is split into `splits/4` btree files (`indexes/<field>/<NNN>.idx`). `splits` is locked to powers of 2 in [16, 4096]; `index_splits_for(splits) = splits/4` is derived at runtime — no separate config knob. Path constructor: `build_idx_path(buf, db_root, object, field, idx_shard_id)`. Hash routing: `idx_shard_for_hash(hash16, splits)` and the data-shard variant `idx_shard_for_data_shard(data_shard) = data_shard / 4` (contiguous coverage so idx-shard X covers data-shards X*4..X*4+3).
+- **Per-shard layout**: every indexed field is split into `splits/4` btree files (`indexes/<field>/<NNN>.idx`). `splits` is locked to powers of 2 in [8, 4096]; `index_splits_for(splits) = splits/4` is derived at runtime — no separate config knob. Path constructor: `build_idx_path(buf, db_root, object, field, idx_shard_id)`. Hash routing: `idx_shard_for_hash(hash16, splits)` and the data-shard variant `idx_shard_for_data_shard(data_shard) = data_shard / 4` (contiguous coverage so idx-shard X covers data-shards X*4..X*4+3).
 - **Wrapper API** (`index.c`, declared in `types.h`): `btree_idx_insert/delete` (route to one shard), `btree_idx_search/range/range_ex` (fan out across all shards, callback fires in arbitrary inter-shard order), `btree_idx_walk_ordered` (k-way streaming merge for cursor pagination), `btree_idx_unlink_all/exists` (admin ops on the per-shard directory). Reindex sweeps any pre-2026.05.1 single-file `<field>.idx` artefacts (`reindex_clean_legacy`).
 - Single field: `indexes:["name"]`
 - Composite: `indexes:["country+zip"]` (concatenated field values; the literal `+`-joined name becomes the directory name on disk)
@@ -480,7 +480,7 @@ Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base
 ## Limits / constants
 
 - `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`)
-- `DEFAULT_SPLITS = 16` — used by `create-object` when `splits` is omitted/0. Floor is `MIN_SPLITS = 4`. Sweet spot = 78K–200K records/shard; see README / `docs/operations/tuning.md` for the full row-count → splits sizing table.
+- `DEFAULT_SPLITS = 16` — used by `create-object` when `splits` is omitted/0. Floor is `MIN_SPLITS = 8`. Sweet spot = 78K–200K records/shard; see README / `docs/operations/tuning.md` for the full row-count → splits sizing table.
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`; uint16 `SlotHeader.key_len` allows 65535 but every slot reserves `max_key` bytes, so large caps bloat `slot_size`. Keys are stored raw in Zone B, length lives in Zone A header (no in-payload prefix).
 - `varchar` max content = **65535 bytes** (uint16 length prefix)
 - `MAX_FIELDS = 256` fields per schema (bumped from 64 in 2026.04.2)

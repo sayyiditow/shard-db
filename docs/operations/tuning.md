@@ -138,33 +138,28 @@ Don't use network filesystems (NFS, CIFS) for `$DB_ROOT` unless you deeply trust
 
 **Sweet spot: 78K–200K records/shard.** Acceptable to ~500K; past ~1M you're saturating this design. (Validated on the parallel K/V bench: 10M rows at 128 splits = 78K rec/shard completed in 3.488s. 64 splits: 3.605s. 256 splits: 3.986s. 1024 splits: 5.454s — too many shards = too many small files = more syscalls per query.)
 
-| Expected rows | Recommended `splits` | Records/shard at target |
-|---------------|----------------------|-------------------------|
-| < 1M          | 8–32                 | up to ~125K             |
-| 1–10M         | 64                   | ~16K–156K               |
-| 10–25M        | 128                  | ~78K–195K (optimal band) |
-| 25–50M        | 256                  | ~98K–195K               |
-| 50–100M       | 512                  | ~98K–195K               |
-| 100–250M      | 512                  | ~200K–488K (acceptable) |
-| 250–500M      | 1024                 | ~244K–488K              |
-| 500M–1B       | 2048                 | ~244K–488K              |
-| 1–4B          | 4096 (MAX_SPLITS)    | ~244K–976K (at limit)   |
+| Expected rows | Recommended `splits` | Records/shard at cap |
+|---------------|----------------------|----------------------|
+| up to 1M      | 8                    | ~125K                |
+| 1–4M          | 16                   | ~250K                |
+| 4–10M         | 32                   | ~313K                |
+| 10–25M        | 64                   | ~391K                |
+| 25–60M        | 128                  | ~469K                |
+| 60–125M       | 256                  | ~488K                |
+| 125–250M      | 512                  | ~488K                |
+| 250–500M      | 1024                 | ~488K                |
+| 500M–1B       | 2048                 | ~488K                |
+| 1B–2B+        | 4096 (MAX_SPLITS)    | ~488K and up         |
 
-Defaults: `create-object` with no `splits` gives **16** (fine for test objects and anything under ~2M rows). For bigger loads, set it explicitly up front — or re-split later with `vacuum --splits=N`.
+Defaults: `create-object` with no `splits` gives **16** (fine for objects up to ~4M rows). For sub-1M-row test objects on small servers (2–4 cores), set `splits=8` explicitly — halves memory overhead vs the default and still preserves indexed-read parallelism (8/4 = 2 index shards). For bigger loads, set it explicitly up front — or re-split later with `vacuum --splits=N`.
 
-Past 4B rows you've hit `MAX_SPLITS=4096`. Partition across multiple objects or tenant dirs rather than trying to climb further — at that scale you want multiple B+ trees, not one larger one.
+> **The daemon will tell you when to re-split.** Run `./shard-db shard-stats <dir> <object>` periodically. When `avg_rec_per_shard` crosses **500K**, the output emits `hint: records-per-shard approaching upper band (>500K) — consider vacuum --splits=N`. Past **1M** it escalates to `hint: re-split with vacuum --splits=N`. Past 1M and already at `MAX_SPLITS=4096`, the hint switches to `partition by object` — at that scale you want multiple B+ trees, not a larger one. Tier transitions in the table above land before the 500K nag, so following the table keeps you out of the warning zone.
 
-### What `shard-stats` tells you
+### What else `shard-stats` flags
 
-```bash
-shard-db shard-stats <dir> <object>
-```
+Beyond the records-per-shard nags above, `shard-stats` also surfaces shard-load skew:
 
-Shows `avg_rec_per_shard` in the header. Compare it to the table above:
-
-- `avg_rec_per_shard > 1,000,000` → hint: `re-split with vacuum --splits=N` (or already at MAX_SPLITS: partition by object).
-- `avg_rec_per_shard > 500,000` with room to grow → hint: `consider vacuum --splits=N`.
-- `max_records > 4 × min_records` → hint: `shard load is skewed — check key distribution` (usually means non-random keys — prefix-heavy keys like `ord_0001`, `ord_0002` hash fine, but if you're slotting raw sequential integers, look at `cmd_shard_stats`).
+- `max_records > 4 × min_records` → hint: `shard load is skewed — check key distribution`. Usually means non-random keys — prefix-heavy keys like `ord_0001`, `ord_0002` hash fine, but raw sequential integers cluster badly. Inspect the per-shard table in the output.
 
 ## When to run `vacuum`
 
