@@ -261,8 +261,9 @@ For `bulk-update` and `bulk-delete` on criteria, **always** run `dry_run:true` f
 
 ## Crash safety
 
-- Bulk ops process records one at a time with per-record writes. A mid-batch crash leaves the already-written records committed — not all-or-nothing.
-- For **atomic** bulk operations across records, there's no option today. Stage intent in a control record and reconcile in the app.
+- Each record commits atomically — per-slot flag flip, same as a single `insert`/`update`/`delete`. A mid-batch crash leaves the records written up to that point in place; nothing is half-written.
+- The batch as a whole is **not** transactional — there's no all-or-nothing across records. `bulk-insert` dispatches records to per-shard workers in parallel; the per-shard btree merge runs once per `(field, shard)` at the end of the batch under the per-shard rwlock.
+- For atomicity across multiple records, stage intent in a control record and reconcile in the app.
 
 ## Performance tips
 
