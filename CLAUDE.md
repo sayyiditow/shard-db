@@ -165,7 +165,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 # Bulk
 ./shard-db bulk-insert <dir> <obj> [file]         # JSON, either shape:
                                                   #   {"k1":{...},"k2":{...}}                   (dict — round-trips with get-multi)
-                                                  #   [{"id":"k1","data":{...}}, ...]           (array — explicit id/data pairs)
+                                                  #   [{"key":"k1","value":{...}}, ...]         (array — explicit key/value pairs)
                                                   # Acts as upsert — overwriting an existing
                                                   # key drops stale index entries before writing.
                                                   # For indexed bulk-insert at scale: prefer
@@ -452,7 +452,7 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 - `{"mode":"bulk-update", "criteria":[...], "value":{...}, "limit":N, "dry_run":true}` — conditional mass update
 - `{"mode":"bulk-update", "records":<data>}` — JSON per-key partial update. Only fields present in each record overwrite; absent fields kept. `<data>` accepts either shape:
   - `{"k1":{...},"k2":{...}}` (dict — round-trips with get-multi)
-  - `[{"id":"k1","data":{...}}, ...]` (array of explicit id/data pairs)
+  - `[{"key":"k1","value":{...}}, ...]` (array of explicit key/value pairs)
   `file:"path.json"` reads `<data>` from disk (same two shapes). Mode dispatches by content: `criteria` → mass update, `records`/`file` → per-key update.
 - `{"mode":"bulk-delete", "criteria":[...], "limit":N, "dry_run":true}` — mass delete by criteria
 

@@ -51,7 +51,7 @@ for i in $(seq 1 100); do
     if [ $((i % 5)) -eq 0 ]; then s="paid"; else s="pending"; fi
     if [ $((i % 2)) -eq 1 ]; then r="us"; else r="eu"; fi
     [ "$recs" != "[" ] && recs="$recs,"
-    recs="$recs{\"id\":\"k$i\",\"data\":{\"status\":\"$s\",\"region\":\"$r\",\"amount\":$i}}"
+    recs="$recs{\"key\":\"k$i\",\"value\":{\"status\":\"$s\",\"region\":\"$r\",\"amount\":$i}}"
 done
 recs="$recs]"
 $BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"neq_t\",\"records\":$recs}" > /dev/null
@@ -138,7 +138,7 @@ assert_eq "count(neq nonexistent)=100" "100" "$(field "$out" n)"
 
 echo "=== NEQ on indexed field with single-value table — count=0 ==="
 # After overwriting all rows to status=paid, count(neq paid) should be 0.
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"neq_t","records":[{"id":"k1","data":{"status":"paid","region":"us","amount":1}},{"id":"k2","data":{"status":"paid","region":"us","amount":2}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"neq_t","records":[{"key":"k1","value":{"status":"paid","region":"us","amount":1}},{"key":"k2","value":{"status":"paid","region":"us","amount":2}}]}' > /dev/null
 # Just k1 and k2 changed; k3..k100 still mixed. Test the original distribution still works.
 out=$($BIN query '{"mode":"aggregate","dir":"default","object":"neq_t","aggregates":[{"fn":"count","alias":"n"}],"criteria":[{"field":"status","op":"neq","value":"paid"}]}')
 # Originally 80 pending; we just overwrote k1 (was pending) and k2 (was pending) to paid.

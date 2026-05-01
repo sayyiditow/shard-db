@@ -45,7 +45,7 @@ sleep 0.5
 $BIN query '{"mode":"create-object","dir":"default","object":"fft","fields":["received_at:int","scheduled_at:int","name:varchar:32","alias:varchar:32","amount:numeric:10,2","budget:numeric:10,2","day_a:date","day_b:date"],"indexes":["name"]}' > /dev/null
 
 echo "=== seed ==="
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"fft","records":[{"id":"k1","data":{"received_at":100,"scheduled_at":200,"name":"alice","alias":"alice","amount":"50.00","budget":"100.00","day_a":"20260101","day_b":"20260201"}},{"id":"k2","data":{"received_at":300,"scheduled_at":200,"name":"bob","alias":"BOB","amount":"100.00","budget":"100.00","day_a":"20260301","day_b":"20260301"}},{"id":"k3","data":{"received_at":150,"scheduled_at":150,"name":"carol","alias":"carol","amount":"75.00","budget":"50.00","day_a":"20260601","day_b":"20260101"}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"fft","records":[{"key":"k1","value":{"received_at":100,"scheduled_at":200,"name":"alice","alias":"alice","amount":"50.00","budget":"100.00","day_a":"20260101","day_b":"20260201"}},{"key":"k2","value":{"received_at":300,"scheduled_at":200,"name":"bob","alias":"BOB","amount":"100.00","budget":"100.00","day_a":"20260301","day_b":"20260301"}},{"key":"k3","value":{"received_at":150,"scheduled_at":150,"name":"carol","alias":"carol","amount":"75.00","budget":"50.00","day_a":"20260601","day_b":"20260101"}}]}' > /dev/null
 
 echo "=== int eq_field / neq_field / lt_field / gt_field ==="
 assert_eq "received_at eq_field scheduled_at → 1 (k3 150=150)" "1" \

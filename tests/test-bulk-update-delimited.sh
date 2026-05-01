@@ -47,11 +47,11 @@ pass "object created with 3 indexes (name, status, city)"
 # Seed 5 records via a JSON file
 cat > /tmp/shard-db_seed.json <<'EOF'
 [
-  {"id":"k1","data":{"name":"alice","age":"30","status":"active","city":"London"}},
-  {"id":"k2","data":{"name":"bob","age":"25","status":"active","city":"Paris"}},
-  {"id":"k3","data":{"name":"carol","age":"40","status":"inactive","city":"Berlin"}},
-  {"id":"k4","data":{"name":"dave","age":"35","status":"active","city":"Tokyo"}},
-  {"id":"k5","data":{"name":"eve","age":"28","status":"inactive","city":"Madrid"}}
+  {"key":"k1","value":{"name":"alice","age":"30","status":"active","city":"London"}},
+  {"key":"k2","value":{"name":"bob","age":"25","status":"active","city":"Paris"}},
+  {"key":"k3","value":{"name":"carol","age":"40","status":"inactive","city":"Berlin"}},
+  {"key":"k4","value":{"name":"dave","age":"35","status":"active","city":"Tokyo"}},
+  {"key":"k5","value":{"name":"eve","age":"28","status":"inactive","city":"Madrid"}}
 ]
 EOF
 $BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_seed.json\"}" > /dev/null

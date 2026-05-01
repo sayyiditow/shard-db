@@ -68,9 +68,9 @@ echo "=== bulk-insert (JSON) — back-compat shape on fresh keys ==="
 # Plain bulk-insert of 3 brand-new keys → existing semantics: {"count":3}
 cat > /tmp/shard-db_seed.json <<'EOF'
 [
-  {"id":"k1","data":{"name":"alice","status":"pending","attempt":"0"}},
-  {"id":"k2","data":{"name":"bob","status":"pending","attempt":"1"}},
-  {"id":"k3","data":{"name":"carol","status":"pending","attempt":"0"}}
+  {"key":"k1","value":{"name":"alice","status":"pending","attempt":"0"}},
+  {"key":"k2","value":{"name":"bob","status":"pending","attempt":"1"}},
+  {"key":"k3","value":{"name":"carol","status":"pending","attempt":"0"}}
 ]
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_seed.json\"}")
@@ -85,9 +85,9 @@ echo "=== bulk-insert (JSON) — if_not_exists ==="
 # Re-run WITH if_not_exists, but try to overwrite k1/k2/k3. All collide → skipped.
 cat > /tmp/shard-db_collide.json <<'EOF'
 [
-  {"id":"k1","data":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
-  {"id":"k2","data":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
-  {"id":"k3","data":{"name":"OVERWRITTEN","status":"x","attempt":"99"}}
+  {"key":"k1","value":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
+  {"key":"k2","value":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
+  {"key":"k3","value":{"name":"OVERWRITTEN","status":"x","attempt":"99"}}
 ]
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_collide.json\",\"if_not_exists\":true}")
@@ -101,10 +101,10 @@ assert_contains "k1 attempt still 0" '"attempt":0' "$K1"
 # Mixed run: 2 collide (k1, k3), 2 are new (k4, k5)
 cat > /tmp/shard-db_mixed.json <<'EOF'
 [
-  {"id":"k1","data":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
-  {"id":"k4","data":{"name":"dave","status":"pending","attempt":"0"}},
-  {"id":"k5","data":{"name":"eve","status":"pending","attempt":"2"}},
-  {"id":"k3","data":{"name":"OVERWRITTEN","status":"x","attempt":"99"}}
+  {"key":"k1","value":{"name":"OVERWRITTEN","status":"x","attempt":"99"}},
+  {"key":"k4","value":{"name":"dave","status":"pending","attempt":"0"}},
+  {"key":"k5","value":{"name":"eve","status":"pending","attempt":"2"}},
+  {"key":"k3","value":{"name":"OVERWRITTEN","status":"x","attempt":"99"}}
 ]
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_mixed.json\",\"if_not_exists\":true}")

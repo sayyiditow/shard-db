@@ -47,10 +47,10 @@ sleep 0.5
 $BIN query '{"mode":"create-object","dir":"default","object":"budj_t","fields":["status:varchar:16","amount:int","note:varchar:32"],"indexes":["status","amount"],"splits":16}' > /dev/null
 
 echo "=== seed ==="
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"budj_t","records":[{"id":"k1","data":{"status":"paid","amount":100,"note":"vip"}},{"id":"k2","data":{"status":"paid","amount":200,"note":"vip"}},{"id":"k3","data":{"status":"pending","amount":50,"note":""}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"budj_t","records":[{"key":"k1","value":{"status":"paid","amount":100,"note":"vip"}},{"key":"k2","value":{"status":"paid","amount":200,"note":"vip"}},{"key":"k3","value":{"status":"pending","amount":50,"note":""}}]}' > /dev/null
 
 echo "=== inline records: matched/updated/skipped accounting ==="
-out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","records":[{"id":"k1","data":{"status":"refunded"}},{"id":"k2","data":{"status":"refunded","amount":201}},{"id":"missing","data":{"status":"x"}}]}')
+out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","records":[{"key":"k1","value":{"status":"refunded"}},{"key":"k2","value":{"status":"refunded","amount":201}},{"key":"missing","value":{"status":"x"}}]}')
 assert_contains "matched=3" '"matched":3' "$out"
 assert_contains "updated=2" '"updated":2' "$out"
 assert_contains "skipped=1 (missing key)" '"skipped":1' "$out"
@@ -80,8 +80,8 @@ echo "=== file form: same shape, from a JSON file ==="
 TF=$(mktemp /tmp/budj_XXXX.json)
 cat > "$TF" <<'EOF'
 [
-  {"id":"k1","data":{"amount":111}},
-  {"id":"k3","data":{"status":"paid"}}
+  {"key":"k1","value":{"amount":111}},
+  {"key":"k3","value":{"status":"paid"}}
 ]
 EOF
 out=$($BIN query "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"budj_t\",\"file\":\"$TF\"}")

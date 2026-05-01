@@ -42,7 +42,7 @@ sleep 0.5
 $BIN query '{"mode":"create-object","dir":"default","object":"rxt","fields":["email:varchar:64","phone:varchar:32"]}' > /dev/null
 
 echo "=== seed ==="
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"rxt","records":[{"id":"k1","data":{"email":"alice@example.com","phone":"+15551234567"}},{"id":"k2","data":{"email":"bob@TEST.org","phone":"5555555"}},{"id":"k3","data":{"email":"not-an-email","phone":"+44 20 7946 0958"}},{"id":"k4","data":{"email":"carol@x.io","phone":"abc"}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"rxt","records":[{"key":"k1","value":{"email":"alice@example.com","phone":"+15551234567"}},{"key":"k2","value":{"email":"bob@TEST.org","phone":"5555555"}},{"key":"k3","value":{"email":"not-an-email","phone":"+44 20 7946 0958"}},{"key":"k4","value":{"email":"carol@x.io","phone":"abc"}}]}' > /dev/null
 
 echo "=== substring (no anchors) ==="
 assert_eq "regex 'org' → 1 (k2 bob@TEST.org)" "1" \

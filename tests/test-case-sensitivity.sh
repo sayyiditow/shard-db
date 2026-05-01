@@ -45,7 +45,7 @@ sleep 0.5
 $BIN query '{"mode":"create-object","dir":"default","object":"cit","fields":["name:varchar:32","tag:varchar:32"],"indexes":["name"],"splits":16}' > /dev/null
 
 echo "=== seed (mixed case) ==="
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"cit","records":[{"id":"k1","data":{"name":"Alice","tag":"VIP"}},{"id":"k2","data":{"name":"alice","tag":"vip"}},{"id":"k3","data":{"name":"BOB","tag":"vip"}},{"id":"k4","data":{"name":"bob","tag":"VIP"}},{"id":"k5","data":{"name":"Carol","tag":"std"}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"cit","records":[{"key":"k1","value":{"name":"Alice","tag":"VIP"}},{"key":"k2","value":{"name":"alice","tag":"vip"}},{"key":"k3","value":{"name":"BOB","tag":"vip"}},{"key":"k4","value":{"name":"bob","tag":"VIP"}},{"key":"k5","value":{"name":"Carol","tag":"std"}}]}' > /dev/null
 
 echo "=== CS contains: byte-exact (was CI before) ==="
 assert_eq "contains 'bob' (CS) → 1 (only bob)" "1" "$(run_count name contains bob)"

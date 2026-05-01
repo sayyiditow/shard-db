@@ -56,7 +56,7 @@ sed -i "/^default:bi_int_bulk:/d" "$DB_ROOT/schema.conf" 2>/dev/null || true
 $BIN query '{"mode":"create-object","dir":"default","object":"bi_int_bulk","splits":16,"max_key":16,"fields":["n:int"],"indexes":["n"]}' > /dev/null
 BULK=$(mktemp)
 cat > "$BULK" <<'EOF'
-[{"id":"b_min","data":{"n":-2147483647}},{"id":"b_-1m","data":{"n":-1000000}},{"id":"b_-1","data":{"n":-1}},{"id":"b_0","data":{"n":0}},{"id":"b_1","data":{"n":1}},{"id":"b_1m","data":{"n":1000000}},{"id":"b_max","data":{"n":2147483647}}]
+[{"key":"b_min","value":{"n":-2147483647}},{"key":"b_-1m","value":{"n":-1000000}},{"key":"b_-1","value":{"n":-1}},{"key":"b_0","value":{"n":0}},{"key":"b_1","value":{"n":1}},{"key":"b_1m","value":{"n":1000000}},{"key":"b_max","value":{"n":2147483647}}]
 EOF
 $BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bi_int_bulk\",\"file\":\"$BULK\"}" > /dev/null
 rm -f "$BULK"

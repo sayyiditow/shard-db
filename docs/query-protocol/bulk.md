@@ -6,14 +6,32 @@ Single round-trip operations for inserting, updating, or deleting many records a
 
 ### Shape
 
+`records` (or the file contents) accepts either of two shapes — pick whichever round-trips with the producer:
+
+**Dict form** (round-trips with `get-multi`):
+
+```json
+{
+  "mode": "bulk-insert",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "records": {
+    "<key1>": {...},
+    "<key2>": {...}
+  }
+}
+```
+
+**Array form** (one record per element):
+
 ```json
 {
   "mode": "bulk-insert",
   "dir": "<dir>",
   "object": "<obj>",
   "records": [
-    {"id":"<key>","data":{...}},
-    {"id":"<key>","data":{...}}
+    {"key":"<key>","value":{...}},
+    {"key":"<key>","value":{...}}
   ]
 }
 ```
@@ -24,12 +42,14 @@ Or from a file:
 {"mode":"bulk-insert","dir":"<dir>","object":"<obj>","file":"/path/to/data.json"}
 ```
 
-File content is the same JSON array (not NDJSON — one big array).
+File content is the same JSON (either shape — one big object or one big array, not NDJSON).
 
-### Record shape
+### Record shape (array form)
 
-- `"id"` — the record key.
-- `"data"` — an object whose fields match the typed schema.
+- `"key"` — the record key.
+- `"value"` — an object whose fields match the typed schema.
+
+> **Breaking change in 2026.05.1**: array-form record fields renamed from `"id"` / `"data"` to `"key"` / `"value"` for consistency with single-`insert` and the dict shape. Update existing payloads.
 
 ### Upsert semantics
 
@@ -162,6 +182,10 @@ Response (actual):
 
 ## bulk-update
 
+`bulk-update` has three sub-shapes — dispatched by which field is set in the request.
+
+### Criteria-driven mass update
+
 ```json
 {
   "mode": "bulk-update",
@@ -179,10 +203,49 @@ Response (actual):
 - `dry_run:true` returns the match count without writing.
 - `limit` caps the update.
 
-Response:
+Response: `{"matched":2450, "updated":2450, "skipped":0}`.
+
+### Per-key partial update — inline records
+
 ```json
-{"matched":2450, "updated":2450, "skipped":0}
+{
+  "mode": "bulk-update",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "records": {
+    "<key1>": {"<field>":"<new value>"},
+    "<key2>": {"<field>":"<new value>"}
+  }
+}
 ```
+
+Or the array form:
+
+```json
+{
+  "mode": "bulk-update",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "records": [
+    {"key":"<key1>","value":{"<field>":"<new value>"}},
+    {"key":"<key2>","value":{"<field>":"<new value>"}}
+  ]
+}
+```
+
+- Updates each named key by merging the inner object into the existing record. **Only fields present overwrite**; absent fields are kept as-is.
+- Missing keys count toward `skipped`, not `updated`.
+- Indexes stay in sync.
+
+### Per-key partial update — from a file
+
+```json
+{"mode":"bulk-update","dir":"<dir>","object":"<obj>","file":"/path/to/patches.json"}
+```
+
+File contents are the same shape (dict or array). Same semantics as the inline form.
+
+> **Breaking change in 2026.05.1**: the array form's record fields renamed from `"id"` / `"data"` to `"key"` / `"value"`. Match the single-`insert` and dict-shape conventions.
 
 ## Dry-run workflow
 

@@ -34,11 +34,11 @@ random.seed(42)
 for c in range(5):
     recs = []
     for i in range(c*20000, (c+1)*20000):
-        recs.append({'id': f'k{i}',
-                     'data': {'status': statuses[i%4],
-                              'region': regions[i%5],
-                              'tier':   tiers[i%3],
-                              'amount': i}})
+        recs.append({'key': f'k{i}',
+                     'value': {'status': statuses[i%4],
+                               'region': regions[i%5],
+                               'tier':   tiers[i%3],
+                               'amount': i}})
     with open(f'/tmp/idx_{c}.json','w') as f:
         json.dump(recs, f)
 PY

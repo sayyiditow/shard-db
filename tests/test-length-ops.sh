@@ -46,7 +46,7 @@ $BIN query '{"mode":"create-object","dir":"default","object":"lent","fields":["n
 echo "=== seed ==="
 # names: a(1), bob(3), alice(5), carol(5), elizabeth(9), longusername123(15)
 # bios:  "" (0), "x" (1), "vip" (3), "vip" (3), "lengthier note" (14), "..." (3)
-$BIN query '{"mode":"bulk-insert","dir":"default","object":"lent","records":[{"id":"k1","data":{"name":"a","bio":""}},{"id":"k2","data":{"name":"bob","bio":"x"}},{"id":"k3","data":{"name":"alice","bio":"vip"}},{"id":"k4","data":{"name":"carol","bio":"vip"}},{"id":"k5","data":{"name":"elizabeth","bio":"lengthier note"}},{"id":"k6","data":{"name":"longusername123","bio":"..."}}]}' > /dev/null
+$BIN query '{"mode":"bulk-insert","dir":"default","object":"lent","records":[{"key":"k1","value":{"name":"a","bio":""}},{"key":"k2","value":{"name":"bob","bio":"x"}},{"key":"k3","value":{"name":"alice","bio":"vip"}},{"key":"k4","value":{"name":"carol","bio":"vip"}},{"key":"k5","value":{"name":"elizabeth","bio":"lengthier note"}},{"key":"k6","value":{"name":"longusername123","bio":"..."}}]}' > /dev/null
 
 echo "=== indexed: name len_eq ==="
 assert_eq "len_eq 5 (alice, carol)" "2" \

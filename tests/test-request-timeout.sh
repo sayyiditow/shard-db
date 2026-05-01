@@ -59,7 +59,7 @@ SEED=$(mktemp)
   printf '['
   for i in $(seq 1 1500000); do
     if [ $i -gt 1 ]; then printf ','; fi
-    printf '{"id":"k%d","data":{"status":"paid","amount":%d,"note":"note_for_record_%d_padding_x"}}' "$i" $((i % 1000)) "$i"
+    printf '{"key":"k%d","value":{"status":"paid","amount":%d,"note":"note_for_record_%d_padding_x"}}' "$i" $((i % 1000)) "$i"
   done
   printf ']'
 } > "$SEED"

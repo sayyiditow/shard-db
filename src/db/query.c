@@ -1090,7 +1090,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     const char *p = json_skip(json);
     int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}} */
-    int is_array_format = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
+    int is_array_format = (*p == '[');  /* [{"key":"k1","value":{...}},...] */
 
     if (!is_object_format && !is_array_format) {
         fprintf(stderr, "Error: Expected JSON object or array\n");
@@ -1144,7 +1144,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             data_ptr = p;
             p = json_skip_value(p);
         } else {
-            /* Array format: {"id":"k1","data":{...}} */
+            /* Array format: {"key":"k1","value":{...}} */
             if (*p != '{') { p++; continue; }
             const char *obj_start = p;
             const char *obj_end = json_skip_value(p);
@@ -1164,12 +1164,12 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             JsonObj rec;
             json_parse_object(obj_str, obj_len, &rec);
             const char *iv; size_t ivl;
-            if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
+            if (json_obj_unquoted(&rec, "key", &iv, &ivl)) {
                 id = arena_strndup(&arena, iv, ivl);
                 klen = ivl;
             }
             const char *dv; size_t dl;
-            if (json_obj_get(&rec, "data", &dv, &dl)) {
+            if (json_obj_get(&rec, "value", &dv, &dl)) {
                 data_ptr = dv;  /* span into obj_str */
                 (void)dl;       /* encoder finds matching brace itself */
             }
@@ -2958,7 +2958,7 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
 }
 
 /* ===== bulk-update JSON form =====
-   Shape: [{"id":"k","data":{...}}, ...]
+   Shape: [{"key":"k","value":{...}}, ...]
    Semantics: update-only, key must exist; only fields present in `data`
    are overwritten, fields absent from `data` keep their existing value.
    Same shard-grouped parallel pattern as bulk-update-delimited; the worker
@@ -3156,7 +3156,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     const char *p = json_skip(json);
     int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}}    — round-trips with get-multi */
-    int is_array_format  = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
+    int is_array_format  = (*p == '[');  /* [{"key":"k1","value":{...}},...] */
     if (!is_object_format && !is_array_format) {
         OUT("{\"error\":\"bulk-update JSON must be a top-level object or array\"}\n");
         if (json_mmaped) munmap((void *)json, len);
@@ -3222,7 +3222,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             json_parse_object(obj_str, obj_len, &rec);
 
             const char *iv; size_t ivl;
-            if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
+            if (json_obj_unquoted(&rec, "key", &iv, &ivl)) {
                 key = malloc(ivl + 1);
                 memcpy(key, iv, ivl);
                 key[ivl] = '\0';
@@ -3230,7 +3230,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             }
 
             const char *dv; size_t dl;
-            if (json_obj_get(&rec, "data", &dv, &dl)) {
+            if (json_obj_get(&rec, "value", &dv, &dl)) {
                 data_str = dv;
                 (void)dl;
             }
