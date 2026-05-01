@@ -58,17 +58,17 @@ File content is the same JSON (either shape — one big object or one big array,
 ### Response
 
 ```json
-{"count": 10000}
+{"inserted": 10000}
 ```
 
 With `if_not_exists` and pre-existing keys:
 ```json
-{"count": 9997, "skipped": 3}
+{"inserted": 9997, "skipped": 3}
 ```
 
 If any records were rejected (type mismatch, missing required field, etc.):
 ```json
-{"count": 9997, "errors": 3, "error": "some_records_dropped"}
+{"inserted": 9997, "skipped": 0, "errors": 3, "error": "some_records_dropped"}
 ```
 
 ### Performance

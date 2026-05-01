@@ -1435,8 +1435,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     } else if (skipped_total > 0) {
         OUT("{\"inserted\":%d,\"skipped\":%d}\n", count, skipped_total);
     } else {
-        /* Backward-compat: no skipped column when caller didn't ask for CAS. */
-        OUT("{\"count\":%d}\n", count);
+        OUT("{\"inserted\":%d}\n", count);
     }
     return errors > 0 ? 1 : 0;
 }
@@ -1853,7 +1852,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     } else if (delim_skipped_total > 0) {
         OUT("{\"inserted\":%d,\"skipped\":%d}\n", count, delim_skipped_total);
     } else {
-        OUT("{\"count\":%d}\n", count);
+        OUT("{\"inserted\":%d}\n", count);
     }
     return errors > 0 ? 1 : 0;
 }

@@ -74,9 +74,8 @@ cat > /tmp/shard-db_seed.json <<'EOF'
 ]
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_seed.json\"}")
-assert_contains "fresh insert returns {count:3}" '3' "$RESP"
+assert_contains "fresh insert returns {inserted:3}" '"inserted":3' "$RESP"
 assert_not_contains "no skipped field on plain run" '"skipped"' "$RESP"
-assert_not_contains "no inserted field on plain run" '"inserted"' "$RESP"
 
 # ----------------------------------------------------------------------
 echo ""

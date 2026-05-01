@@ -58,6 +58,7 @@ Idempotent — re-running after a successful pass is a no-op. Linked into `build
 ### Changed
 
 - **Bulk array-form record fields renamed** — `bulk-insert` and `bulk-update`'s array form (`records:[...]` and file payloads) now expect `"key"` / `"value"` instead of `"id"` / `"data"`. Aligns with `insert` / `update` single-record requests and the new `get-multi` dict shape. The dict form (preferred) is unaffected. **Update existing payloads** — old field names are no longer accepted (the parser silently treats records without the new names as malformed and counts them as `skipped`).
+- **`bulk-insert` / `bulk-insert-delimited` clean-path response field renamed** — `{"count":N}` → `{"inserted":N}`. The CAS path always used `"inserted"`; this aligns the no-skips path so the field name is consistent across all three response shapes (clean, with skips, with errors).
 - **`bulk-insert-delimited` default delimiter is now `,`** (was `|`). Aligns with `bulk-update-delimited` and CSV format on `find`/`fetch`. Pass `delimiter:"|"` explicitly if you need pipes.
 - Documented that `bulk-insert` accepts both dict and array shapes (the parser already supported both — the doc was incomplete).
 
