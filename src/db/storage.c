@@ -820,7 +820,7 @@ int cmd_get(const char *db_root, const char *object, const char *key) {
 
     TypedSchema *ts = load_typed_schema(db_root, object);
     char *json = typed_decode(ts, (const uint8_t *)raw, hdr->value_len);
-    OUT("{\"key\":\"%s\",\"value\":%s}\n", key, json);
+    OUT("%s\n", json);
     free(json);
     fcache_release(fc);
     return 0;
