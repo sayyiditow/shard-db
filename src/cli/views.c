@@ -623,21 +623,52 @@ int tui_show_table(const char *title, const char *json) {
     memset(&t, 0, sizeof(t));
 
     /* tui_show_table is the single render path for every data-returning
-       JSON response. Seven shapes the daemon emits today, all handled here:
+       JSON response. Eight shapes the daemon emits today, all handled here:
 
          1. {"columns":[...],"rows":[[v1,v2],...]}     — find/fetch format=rows
          2. {"results":[{...}], "cursor":...}          — fetch default
          3. {"rows":[...]}                             — generic envelope
          4. [{...},{...}]                              — find default, agg group_by
          5. ["s1","s2"]                                — keys default
-         6. {"k1":"v1","k2":"v2"}                      — count, exists, agg scalar
+         6. {"k1":"v1","k2":"v2"}                      — find scalar agg, errors
          7. {"k1":{...},"k2":{...}}                    — get-multi dict-of-dicts
+         8. 42 / true / "x"                            — count / size / orphaned / exists (single)
 
        (1) drives column names + array rows. (2)/(3) just unwrap and recurse.
        (4) auto-detects columns from each object's keys (special-cases "value"
        to flatten a nested record). (5) becomes a single-column "value" table.
        (6) becomes a two-column "metric/value" table. (7) becomes a table with
-       "key" column + union of inner-object field columns. */
+       "key" column + union of inner-object field columns. (8) shows the bare
+       value via tui_alert (no table machinery for a single scalar). */
+
+    /* Shape 8 — bare scalar response. Catch before the {/[ checks: digit/-,
+       t/f/n for true/false/null, " for string. Show in a modal alert. */
+    {
+        const char *p = json;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p && *p != '{' && *p != '[') {
+            char body[256];
+            if (*p == '"') {
+                /* Strip surrounding quotes for cleaner display. */
+                const char *s = p + 1;
+                const char *e = s;
+                while (*e && *e != '"') e++;
+                size_t n = (size_t)(e - s);
+                if (n >= sizeof(body)) n = sizeof(body) - 1;
+                memcpy(body, s, n);
+                body[n] = '\0';
+            } else {
+                size_t n = strlen(p);
+                while (n > 0 && (p[n-1] == '\n' || p[n-1] == '\r' ||
+                                 p[n-1] == ' '  || p[n-1] == '\t')) n--;
+                if (n >= sizeof(body)) n = sizeof(body) - 1;
+                memcpy(body, p, n);
+                body[n] = '\0';
+            }
+            tui_alert(title, body);
+            return 0;
+        }
+    }
 
     const char *arr = json;
     int rendered = 0;

@@ -2671,7 +2671,24 @@ static void diag_size(CliConn *c) {
         tui_alert("error", "size failed"); return;
     }
     char title[128];
-    snprintf(title, sizeof(title), "size %s/%s", oi.dir, oi.object);
+    snprintf(title, sizeof(title), "size %s/%s (live)", oi.dir, oi.object);
+    show_response(title, resp);
+    free(resp);
+}
+
+static void diag_orphaned(CliConn *c) {
+    ObjectInfo oi;
+    if (pick_object(c, &oi) != 0) return;
+    char req[256];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"orphaned\",\"dir\":\"%s\",\"object\":\"%s\"}",
+        oi.dir, oi.object);
+    char *resp = NULL; size_t rlen = 0;
+    if (cli_query(c, req, &resp, &rlen) != 0) {
+        tui_alert("error", "orphaned failed"); return;
+    }
+    char title[128];
+    snprintf(title, sizeof(title), "orphaned %s/%s (tombstoned slots)", oi.dir, oi.object);
     show_response(title, resp);
     free(resp);
 }
@@ -2684,14 +2701,16 @@ static void menu_diagnostics(void) {
         MenuItem items[] = {
             { "shard-stats",  "per-shard load table for one object (find hot shards)" },
             { "vacuum-check", "objects with high tombstone ratios" },
-            { "size",         "quick record count for one object" },
+            { "size",         "live record count for one object (O(1) metadata read)" },
+            { "orphaned",     "tombstoned slot count for one object (vacuum reclaims these)" },
         };
-        int choice = tui_menu_at("Diagnostics", items, 3, &sel);
+        int choice = tui_menu_at("Diagnostics", items, 4, &sel);
         if (choice < 0) return;
         switch (choice) {
             case 0: diag_shard_stats(c);  break;
             case 1: diag_vacuum_check(c); break;
             case 2: diag_size(c);         break;
+            case 3: diag_orphaned(c);     break;
         }
     }
 }
