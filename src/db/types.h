@@ -855,7 +855,6 @@ int cmd_delete_file(const char *db_root, const char *object, const char *filenam
    into the flat <obj>/files/<filename> layout. Walks every (dir, object)
    in schema.conf. Idempotent — second run is a no-op. Emits one-line
    JSON summary. */
-int cmd_migrate_files(const char *db_root);
 /* List files under $DB_ROOT/<dir>/<object>/files/XX/XX/, optional pattern
    match (prefix|suffix|contains|glob — fnmatch(3) for glob), alphabetical
    pagination. NULL/empty pattern matches all. NULL/empty match defaults to

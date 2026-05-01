@@ -97,6 +97,11 @@ gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/
 gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lncursesw -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-cli
 
+# migrate — one-shot per-release upgrade runner. Pure FS ops + system()
+# calls to shard-db; no daemon code, no OpenSSL, no ncurses.
+gcc $MODE_CFLAGS -o migrate src/migrate/main.c src/migrate/migrate_files.c -Isrc/migrate $MODE_LDFLAGS
+[ "$DO_STRIP" = 1 ] && strip migrate
+
 mkdir -p build/bin
 
 # Purge any dev-run artifacts so `./build.sh` always emits a clean tree.
@@ -108,7 +113,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli build/bin/
+cp shard-db shard-cli migrate build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
 # overwriting the existing config when an upgrade tarball lands on top.
@@ -145,4 +150,4 @@ EOF
 echo "Built: build/bin/"
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
-echo "Upgrades: replace shard-db + shard-cli only — db.env / DB_ROOT / logs are untouched."
+echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli + migrate). Run ./migrate before starting the new daemon — db.env / DB_ROOT / logs are untouched."
