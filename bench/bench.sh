@@ -49,7 +49,7 @@ q '{"mode":"truncate","dir":"default","object":"bench"}' > /dev/null 2>&1
 echo "Generating $COUNT records..."
 python3 -c "
 import json
-records = [{'id': f'key_{i}', 'data': {
+records = [{'key': f'key_{i}', 'value': {
     'fullName': f'User_{i}',
     'email': f'user{i}@test.com',
     'location': ['London','Paris','Berlin','Tokyo','NYC'][i%5],

@@ -67,8 +67,8 @@ for i in range(count):
 
     key = hashlib.sha256(f'user-{i}'.encode()).hexdigest()[:32]
     records.append({
-        'id': key,
-        'data': {
+        'key': key,
+        'value': {
             'username': username,
             'email': email,
             'bio': bio,

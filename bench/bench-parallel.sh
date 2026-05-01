@@ -57,7 +57,7 @@ for c in range(0, total, chunk_size):
         dt = base_dt + timedelta(days=i)
         amt = round(random.uniform(100, 50000), 2)
         tax = round(amt * 0.06, 2)
-        records.append({'id': f'INV-{i:07d}', 'data': {
+        records.append({'key': f'INV-{i:07d}', 'value': {
             'buyerId': buyers[i%500], 'version': '1.0',
             'number': f'INV-2026-{i:07d}', 'originalReference': f'REF-2026-{i:07d}',
             'supplierId': suppliers[i%100], 'irbmIdentifier': f'IRBM-{i:012d}',
@@ -103,7 +103,7 @@ for c in range(0, total, chunk_size):
     # CSV version — key|fields in fields.conf order
     with open(f'/tmp/shard-db_par_{idx}.csv', 'w') as f:
         for r in records:
-            d = r['data']
+            d = r['value']
             vals = [d['buyerId'], d['version'], d['number'], d['originalReference'],
                     d['supplierId'], d['irbmIdentifier'], d['source'],
                     d['createdBy'], d['updatedBy'], d['irbmLongId'],
@@ -135,7 +135,7 @@ for c in range(0, total, chunk_size):
                     str(d['totalTourismTaxable']), str(d['totalTourismTaxAmount']),
                     str(d['totalHighValueTaxable']), str(d['totalHighValueTaxAmount']),
                     str(d['totalLowValueTaxable']), str(d['totalLowValueTaxAmount'])]
-            f.write(r['id'] + '|' + '|'.join(vals) + '\n')
+            f.write(r['key'] + '|' + '|'.join(vals) + '\n')
 
 # Also write combined single file
 with open('/tmp/shard-db_par_single.json', 'w') as out:

@@ -49,12 +49,12 @@ for c in range(0, total, chunk_size):
     for i in range(c, end):
         k = hashlib.sha256(str(i).encode()).hexdigest()[:16]
         v = ('val_' + str(i)).ljust(100, 'x')[:100]
-        recs.append({'id': k, 'data': {'v': v}})
+        recs.append({'key': k, 'value': {'v': v}})
     with open(f'/tmp/shard-db_kv_par_{idx}.json', 'w') as f:
         json.dump(recs, f, separators=(',', ':'))
     with open(f'/tmp/shard-db_kv_par_{idx}.csv', 'w') as f:
         for r in recs:
-            f.write(r['id'] + ',' + r['data']['v'] + '\n')
+            f.write(r['key'] + ',' + r['value']['v'] + '\n')
 
 # Combined single-file baseline
 with open('/tmp/shard-db_kv_par_single.json', 'w') as out:

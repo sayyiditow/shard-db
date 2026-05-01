@@ -46,15 +46,15 @@ recs = []
 for i in range($COUNT):
     k = hashlib.sha256(str(i).encode()).hexdigest()[:16]  # exactly 16 hex chars
     v = ('val_' + str(i)).ljust(100, 'x')[:100]
-    recs.append({'id': k, 'data': {'v': v}})
+    recs.append({'key': k, 'value': {'v': v}})
 with open('/tmp/shard-db_kv.json','w') as f:
     json.dump(recs, f)
 with open('/tmp/shard-db_kv.csv','w') as f:
     for r in recs:
-        f.write(r['id'] + ',' + r['data']['v'] + '\n')
+        f.write(r['key'] + ',' + r['value']['v'] + '\n')
 with open('/tmp/shard-db_kv_keys.txt','w') as f:
     for r in recs:
-        f.write(r['id'] + '\n')
+        f.write(r['key'] + '\n')
 print('done')
 "
 

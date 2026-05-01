@@ -24,7 +24,7 @@ gen_records() {
 import json
 recs = []
 for i in range($start, $end):
-    recs.append({'id': f'INV-{i:08d}', 'data': {
+    recs.append({'key': f'INV-{i:08d}', 'value': {
         'status': ['DRAFT','PENDING','APPROVED','REJECTED'][i%4],
         'region': ['EU','US','APAC','LATAM','ME'][i%5],
         'amount': i * 1.5,

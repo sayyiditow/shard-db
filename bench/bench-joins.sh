@@ -62,7 +62,7 @@ for i in range(count):
     minute = i % 60
     sec = (i * 13) % 60
     created_at = f'{year}{month:02d}{day:02d}{hour:02d}{minute:02d}{sec:02d}'
-    records.append({'id': order_key, 'data': {
+    records.append({'key': order_key, 'value': {
         'order_num': i + 1,
         'amount': str(amount),
         'status': status,
