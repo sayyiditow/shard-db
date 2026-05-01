@@ -122,12 +122,27 @@ got=$($BIN query '{"mode":"find","dir":"default","object":"shape_t","criteria":[
 [ "${got:0:1}" = "{" ] && pass "ordered dict opens with {" || fail "ordered dict: $got"
 
 echo ""
-echo "=== find format:dict + indexed criteria → REJECTED ==="
-# shape_t doesn't have indexes; use an indexed object to trigger PRIMARY_LEAF
-$BIN query '{"mode":"create-object","dir":"default","object":"shape_idx","fields":["status:varchar:16","amount:int"],"indexes":["status"]}' > /dev/null
-$BIN insert default shape_idx ki1 '{"status":"paid","amount":100}' > /dev/null
+echo "=== find format:dict on indexed paths (PRIMARY_LEAF / INTERSECT / KEYSET) ==="
+$BIN query '{"mode":"create-object","dir":"default","object":"shape_idx","fields":["status:varchar:16","region:varchar:8","amount:int"],"indexes":["status","region","amount"]}' > /dev/null
+$BIN insert default shape_idx ki1 '{"status":"paid","region":"us","amount":100}' > /dev/null
+$BIN insert default shape_idx ki2 '{"status":"paid","region":"eu","amount":250}' > /dev/null
+$BIN insert default shape_idx ki3 '{"status":"refunded","region":"us","amount":75}' > /dev/null
+
+# PRIMARY_LEAF: single indexed equality
 got=$($BIN query '{"mode":"find","dir":"default","object":"shape_idx","criteria":[{"field":"status","op":"eq","value":"paid"}],"format":"dict"}')
-echo "$got" | grep -q 'not yet supported' && pass "dict + indexed → clear error" || fail "dict + indexed should error: $got"
+[ "${got:0:1}" = "{" ] && pass "PRIMARY_LEAF dict opens with {" || fail "PRIMARY_LEAF dict header: $got"
+echo "$got" | grep -q '"ki1":' && echo "$got" | grep -q '"ki2":' && pass "PRIMARY_LEAF dict has both paid keys" || fail "PRIMARY_LEAF dict missing keys: $got"
+echo "$got" | grep -q '"ki3"' && fail "PRIMARY_LEAF dict leaked refunded key: $got" || pass "PRIMARY_LEAF dict excludes refunded"
+
+# PRIMARY_INTERSECT: AND of two indexed leaves on rangeable ops
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_idx","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}],"format":"dict"}')
+echo "$got" | grep -q '"ki1":' && pass "PRIMARY_INTERSECT dict has ki1 (paid+us)" || fail "INTERSECT dict missing ki1: $got"
+echo "$got" | grep -q '"ki2"' && fail "INTERSECT dict leaked ki2 (paid+eu): $got" || pass "INTERSECT dict excludes ki2"
+
+# PRIMARY_KEYSET: pure-OR over indexed leaves
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_idx","criteria":[{"or":[{"field":"status","op":"eq","value":"refunded"},{"field":"region","op":"eq","value":"eu"}]}],"format":"dict"}')
+echo "$got" | grep -q '"ki2":' && echo "$got" | grep -q '"ki3":' && pass "PRIMARY_KEYSET dict has ki2 (eu) + ki3 (refunded)" || fail "KEYSET dict: $got"
+
 $BIN query '{"mode":"drop-object","dir":"default","object":"shape_idx"}' > /dev/null
 
 echo ""

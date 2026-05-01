@@ -6544,7 +6544,7 @@ static int process_batch(CollectedHash *batch, int batch_count,
                          CriteriaNode *tree,
                          ExcludedKeys *excluded, const char **proj_fields, int proj_count,
                          FieldSchema *fs, int offset, int limit, int *count, int *printed,
-                         int rows_fmt, char csv_delim,
+                         int rows_fmt, int dict_fmt, char csv_delim,
                          JoinSpec *joins, int njoins, QueryDeadline *dl) {
 
     int group_starts[1024], group_sizes[1024]; /* max 1K shards in a batch */
@@ -6633,6 +6633,8 @@ static int process_batch(CollectedHash *batch, int batch_count,
                         }
                         OUT("]");
                     }
+                } else if (dict_fmt) {
+                    OUT("%s\"%s\":%s", *printed ? "," : "", mr->key, mr->json);
                 } else {
                     OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", mr->key, mr->json);
                 }
@@ -6659,7 +6661,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
                              SearchCriterion *primary_crit, int check_primary,
                              ExcludedKeys *excluded,
                              int offset, int limit, const char **proj_fields, int proj_count,
-                             FieldSchema *fs, int rows_fmt, char csv_delim,
+                             FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                              JoinSpec *joins, int njoins, QueryDeadline *dl) {
     /* Collection cap heuristic:
        - No joins, or all-LEFT joins: every collected hash emits at most one row,
@@ -6691,7 +6693,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     process_batch(cc.entries, cc.count, db_root, object, sch,
                  tree, excluded,
                  proj_fields, proj_count, fs, offset, limit, &count, &printed,
-                 rows_fmt, csv_delim, joins, njoins, dl);
+                 rows_fmt, dict_fmt, csv_delim, joins, njoins, dl);
 
     collect_ctx_destroy(&cc);
     return printed;
@@ -7763,7 +7765,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             CriteriaNode *tree_for_rematch,  /* NULL = skip */
                             ExcludedKeys *excluded, int offset, int limit,
                             const char **proj_fields, int proj_count,
-                            FieldSchema *fs, int rows_fmt, char csv_delim,
+                            FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                             JoinSpec *joins, int njoins, QueryDeadline *dl) {
     int need_rematch = (tree_for_rematch != NULL);
     CriteriaNode *tree = tree_for_rematch;
@@ -7896,6 +7898,25 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             }
                         }
                         OUT("]");
+                    } else if (dict_fmt) {
+                        OUT("%s\"%s\":", printed ? "," : "", keybuf);
+                        if (proj_count > 0) {
+                            OUT("{");
+                            int first = 1;
+                            for (int j = 0; j < proj_count; j++) {
+                                char *pv = decode_field((const char *)raw, h->value_len,
+                                                        proj_fields[j], fs);
+                                if (!pv) continue;
+                                OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                                first = 0;
+                                free(pv);
+                            }
+                            OUT("}");
+                        } else {
+                            char *v = decode_value((const char *)raw, h->value_len, fs);
+                            OUT("%s", v);
+                            free(v);
+                        }
                     } else if (proj_count > 0) {
                         OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
                         int first = 1;
@@ -7938,7 +7959,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                CriteriaNode *or_node,
                                ExcludedKeys *excluded, int offset, int limit,
                                const char **proj_fields, int proj_count,
-                               FieldSchema *fs, int rows_fmt, char csv_delim,
+                               FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
                                QueryDeadline *dl, int *out_budget_exceeded) {
     KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
@@ -7952,7 +7973,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               need_rematch ? tree : NULL,
                               excluded, offset, limit,
-                              proj_fields, proj_count, fs, rows_fmt, csv_delim,
+                              proj_fields, proj_count, fs, rows_fmt, dict_fmt, csv_delim,
                               joins, njoins, dl);
     keyset_free(ks);
     return rc;
@@ -7967,7 +7988,7 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       CriteriaNode *tree,
                                       ExcludedKeys *excluded, int offset, int limit,
                                       const char **proj_fields, int proj_count,
-                                      FieldSchema *fs, int rows_fmt, char csv_delim,
+                                      FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                                       JoinSpec *joins, int njoins, QueryDeadline *dl) {
     int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
@@ -7980,7 +8001,7 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               small_primary ? tree : NULL,
                               excluded, offset, limit,
-                              proj_fields, proj_count, fs, rows_fmt, csv_delim,
+                              proj_fields, proj_count, fs, rows_fmt, dict_fmt, csv_delim,
                               joins, njoins, dl);
     keyset_free(ks);
     return rc;
@@ -8856,23 +8877,6 @@ int cmd_find(const char *db_root, const char *object,
         return -1;
     }
 
-    /* dict_fmt threading is complete for full-scan + ordered + cursor; the
-       indexed planner paths (PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET)
-       still emit {key,value} records via process_batch and the keyset emit
-       helpers. Reject dict_fmt when those paths would fire so we never
-       produce malformed JSON. Tracked for follow-up; threading is mechanical
-       but touches several helpers. has_order && !has_joins → ordered path,
-       which is dict-aware. */
-    if (dict_fmt && !has_joins && !(order_by && order_by[0])) {
-        if (plan.kind == PRIMARY_LEAF || plan.kind == PRIMARY_INTERSECT ||
-            plan.kind == PRIMARY_KEYSET) {
-            OUT("{\"error\":\"format=dict with indexed criteria is not yet supported; use order_by, drop the criteria, or use default array format\"}\n");
-            free_joins(joins, njoins);
-            free_criteria_tree(tree);
-            free_excluded(&excluded);
-            return -1;
-        }
-    }
 
     if (has_joins) {
         /* Joined queries always emit tabular, ignoring `format` and `rows_fmt`. */
@@ -9023,7 +9027,7 @@ int cmd_find(const char *db_root, const char *object,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                                   rows_fmt, csv_delim, joins, njoins, &dl);
+                                   rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
     } else if (plan.kind == PRIMARY_LEAF) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         SearchCriterion *pc = plan.primary_leaf;
@@ -9033,7 +9037,7 @@ int cmd_find(const char *db_root, const char *object,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                         rows_fmt, csv_delim, joins, njoins, &dl);
+                         rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT("]}\n");
@@ -9049,7 +9053,7 @@ int cmd_find(const char *db_root, const char *object,
         keyset_find_from_or(db_root, object, &sch, tree, plan.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                            rows_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded);
+                            rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded);
         if (budget_exceeded) {
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
             if (csv_delim) { /* no envelope to close */ }
