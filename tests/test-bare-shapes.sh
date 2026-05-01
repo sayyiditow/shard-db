@@ -101,6 +101,41 @@ got=$($BIN query '{"mode":"orphaned","dir":"default","object":"shape_t"}')
 assert_eq "orphaned via JSON mode" '1' "$got"
 
 echo ""
+echo "=== fetch format:dict ==="
+got=$($BIN query '{"mode":"fetch","dir":"default","object":"shape_t","format":"dict","limit":10}')
+# fetch always wraps with {"results":...,"cursor":...} envelope
+echo "$got" | grep -q '"results":{' && pass "fetch dict: results is dict" || fail "fetch dict envelope: $got"
+echo "$got" | grep -q '"cursor":' && pass "fetch dict: cursor present" || fail "fetch dict cursor: $got"
+
+echo ""
+echo "=== find format:dict (full-scan, no criteria) ==="
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_t","criteria":[],"format":"dict","limit":10}')
+# find returns bare {} dict when no cursor active
+[ "${got:0:1}" = "{" ] || fail "find dict header: $got"
+[ "${got: -1}" = "$(printf '}')" ] && pass "find dict close" || fail "find dict close: $got"
+# k1 was deleted earlier; k3 should be present
+echo "$got" | grep -q '"k3":' && pass "find dict contains k3" || fail "find dict k3 missing: $got"
+
+echo ""
+echo "=== find format:dict + order_by allowed ==="
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_t","criteria":[],"format":"dict","order_by":"age","limit":10}')
+[ "${got:0:1}" = "{" ] && pass "ordered dict opens with {" || fail "ordered dict: $got"
+
+echo ""
+echo "=== find format:dict + indexed criteria → REJECTED ==="
+# shape_t doesn't have indexes; use an indexed object to trigger PRIMARY_LEAF
+$BIN query '{"mode":"create-object","dir":"default","object":"shape_idx","fields":["status:varchar:16","amount:int"],"indexes":["status"]}' > /dev/null
+$BIN insert default shape_idx ki1 '{"status":"paid","amount":100}' > /dev/null
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_idx","criteria":[{"field":"status","op":"eq","value":"paid"}],"format":"dict"}')
+echo "$got" | grep -q 'not yet supported' && pass "dict + indexed → clear error" || fail "dict + indexed should error: $got"
+$BIN query '{"mode":"drop-object","dir":"default","object":"shape_idx"}' > /dev/null
+
+echo ""
+echo "=== find format:dict + join → REJECTED ==="
+got=$($BIN query '{"mode":"find","dir":"default","object":"shape_t","criteria":[],"format":"dict","join":[{"object":"x","local":"name","remote":"key","as":"y"}]}' 2>&1)
+echo "$got" | grep -q 'dict.*not supported with join' && pass "dict + join → error" || fail "dict + join: $got"
+
+echo ""
 echo "=== TEARDOWN ==="
 $BIN stop > /dev/null
 rm -rf "$DB_ROOT/default/shape_t"

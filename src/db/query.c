@@ -8856,6 +8856,24 @@ int cmd_find(const char *db_root, const char *object,
         return -1;
     }
 
+    /* dict_fmt threading is complete for full-scan + ordered + cursor; the
+       indexed planner paths (PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET)
+       still emit {key,value} records via process_batch and the keyset emit
+       helpers. Reject dict_fmt when those paths would fire so we never
+       produce malformed JSON. Tracked for follow-up; threading is mechanical
+       but touches several helpers. has_order && !has_joins → ordered path,
+       which is dict-aware. */
+    if (dict_fmt && !has_joins && !(order_by && order_by[0])) {
+        if (plan.kind == PRIMARY_LEAF || plan.kind == PRIMARY_INTERSECT ||
+            plan.kind == PRIMARY_KEYSET) {
+            OUT("{\"error\":\"format=dict with indexed criteria is not yet supported; use order_by, drop the criteria, or use default array format\"}\n");
+            free_joins(joins, njoins);
+            free_criteria_tree(tree);
+            free_excluded(&excluded);
+            return -1;
+        }
+    }
+
     if (has_joins) {
         /* Joined queries always emit tabular, ignoring `format` and `rows_fmt`. */
         emit_joined_columns(object,
