@@ -161,7 +161,7 @@ Same filename rules as `put-file` / `get-file` — `{"error":"invalid filename"}
 
 ## list-files
 
-Paginated, alphabetical inventory of stored files for one object. Optional `prefix` filter, returns total + page.
+Paginated, alphabetical inventory of stored files for one object. Optional pattern match, returns total + page.
 
 ### Shape
 
@@ -170,14 +170,31 @@ Paginated, alphabetical inventory of stored files for one object. Optional `pref
   "mode":"list-files",
   "dir":"<dir>",
   "object":"<obj>",
-  "prefix":"2026-",
+  "pattern":"2026-",
+  "match":"prefix",
   "offset":0,
   "limit":100
 }
 ```
 
-- `prefix` — optional. Filters by filename prefix (byte-exact).
+- `pattern` — optional. Pattern to match filenames against (byte-exact for prefix/suffix/contains, glob syntax for `glob`). Missing or empty = match all.
+- `match` — optional, one of `prefix` (default), `suffix`, `contains`, `glob`. `glob` uses `fnmatch(3)` — supports `*`, `?`, `[abc]` character classes.
+- `prefix` — legacy field, still accepted; equivalent to `pattern:"..."` + `match:"prefix"`. Use `pattern` + `match` for new code.
 - `offset` / `limit` — standard pagination. `limit` defaults to `GLOBAL_LIMIT` when absent or 0.
+
+### Examples
+
+```json
+{"mode":"list-files","dir":"acme","object":"invoices","pattern":".pdf","match":"suffix"}
+{"mode":"list-files","dir":"acme","object":"invoices","pattern":"2026-Q4","match":"contains"}
+{"mode":"list-files","dir":"acme","object":"invoices","pattern":"INV-*.pdf","match":"glob"}
+```
+
+### CLI
+
+```bash
+./shard-db list-files <dir> <obj> [pattern] [offset] [limit] [--match=<mode>]
+```
 
 ### Response
 
@@ -190,7 +207,9 @@ Paginated, alphabetical inventory of stored files for one object. Optional `pref
 }
 ```
 
-`total` is the unpaginated match count (after `prefix` filtering, before pagination). Walking the `XX/XX` bucket tree is O(file count) — fine for filestores up to ~1M files. Beyond that, maintain your own index in a regular object.
+`total` is the unpaginated match count (after pattern filtering, before pagination). Walking the `XX/XX` bucket tree is O(file count) regardless of match mode — there's no filename index. Fine for filestores up to ~1M files. Beyond that, maintain your own index in a regular object.
+
+Invalid match mode returns `{"error":"invalid match mode (use prefix|suffix|contains|glob)"}`.
 
 ## Filename rules
 

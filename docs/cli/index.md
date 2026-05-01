@@ -49,6 +49,7 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 | `put-file` | `<dir> <obj> <local-path> [--if-not-exists]` | Upload local file to server (base64 over TCP). `--if-not-exists` refuses overwrite. |
 | `get-file` | `<dir> <obj> <filename> [<out-path>]` | Download by filename (base64 over TCP). Writes to `<out-path>` or stdout. |
 | `delete-file` | `<dir> <obj> <filename>` | Remove a stored file. Returns `{"status":"deleted",...}` or `{"error":"file not found",...}`. |
+| `list-files` | `<dir> <obj> [pattern] [offset] [limit] [--match=<mode>]` | Alphabetical paginated listing. `--match=prefix` (default), `suffix`, `contains`, or `glob` (`fnmatch(3)`: `*`, `?`, `[abc]`). Empty pattern matches all. `limit` defaults to `GLOBAL_LIMIT` when 0/omitted. Returns `{"files":[...],"total":N,"offset":N,"limit":N}`. |
 
 Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). For same-host admin tasks, [JSON mode `put-file` with `path`](../query-protocol/files.md) and `get-file-path` skip the base64 roundtrip.
 

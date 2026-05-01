@@ -1473,13 +1473,26 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
     } else if (strcmp(mode, "list-files") == 0) {
-        char *prefix = json_obj_strdup(&req, "prefix");
-        char *off_s = json_obj_strdup(&req, "offset");
-        char *lim_s = json_obj_strdup(&req, "limit");
+        char *pattern = json_obj_strdup(&req, "pattern");
+        char *prefix  = json_obj_strdup(&req, "prefix");
+        char *match   = json_obj_strdup(&req, "match");
+        char *off_s   = json_obj_strdup(&req, "offset");
+        char *lim_s   = json_obj_strdup(&req, "limit");
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
-        cmd_list_files(db_root, object, prefix, off, lim);
-        free(prefix); free(off_s); free(lim_s);
+        /* Backward compat: bare "prefix" without explicit "match" keeps
+           pre-2026.05 prefix semantics. New API is "pattern" + "match". */
+        const char *pat_use = pattern ? pattern : prefix;
+        const char *match_use = match ? match : "prefix";
+        if (*match_use && strcmp(match_use, "prefix") != 0 &&
+            strcmp(match_use, "suffix") != 0 &&
+            strcmp(match_use, "contains") != 0 &&
+            strcmp(match_use, "glob") != 0) {
+            OUT("{\"error\":\"invalid match mode (use prefix|suffix|contains|glob)\"}\n");
+        } else {
+            cmd_list_files(db_root, object, pat_use, match_use, off, lim);
+        }
+        free(pattern); free(prefix); free(match); free(off_s); free(lim_s);
     } else if (strcmp(mode, "aggregate") == 0) {
         char *crit = json_obj_strdup_raw(&req, "criteria");
         char *grp = json_obj_strdup_raw(&req, "group_by");

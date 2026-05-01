@@ -49,6 +49,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  get-file <dir> <object> <filename> [<out-path>]\n");
         fprintf(stderr, "                                       Download file (base64 over TCP)\n");
         fprintf(stderr, "  delete-file <dir> <object> <filename> Remove a stored file\n");
+        fprintf(stderr, "  list-files <dir> <object> [pattern] [offset] [limit] [--match=<mode>]\n");
+        fprintf(stderr, "                                       List stored files (alphabetical, paginated)\n");
+        fprintf(stderr, "                                       --match=prefix (default) | suffix | contains | glob\n");
         fprintf(stderr, "  get-file-path <object> <filename>    Get server-local file path\n");
         fprintf(stderr, "  export-schema [out_path]             Write JSON manifest of all schemas\n");
         fprintf(stderr, "  import-schema <in_path> [--if-not-exists]\n");
@@ -301,6 +304,32 @@ int main(int argc, char *argv[]) {
         snprintf(json, cap,
             "{\"mode\":\"delete-file\",\"dir\":\"%s\",\"object\":\"%s\",\"filename\":\"%s\"}",
             argv[2], argv[3], argv[4]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "list-files") == 0) {
+        if (argc < 4) {
+            fprintf(stderr,
+                "Usage: shard-db list-files <dir> <object> [pattern] [offset] [limit] "
+                "[--match=<prefix|suffix|contains|glob>]\n");
+            return 1;
+        }
+        const char *match = "prefix";
+        const char *pos[3] = {"", "0", "0"}; /* pattern, offset, limit */
+        int npos = 0;
+        for (int i = 4; i < argc; i++) {
+            if (strncmp(argv[i], "--match=", 8) == 0) match = argv[i] + 8;
+            else if (npos < 3) pos[npos++] = argv[i];
+        }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(pos[0])
+                   + strlen(match) + strlen(pos[1]) + strlen(pos[2]) + 192;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"list-files\",\"dir\":\"%s\",\"object\":\"%s\","
+            "\"pattern\":\"%s\",\"match\":\"%s\",\"offset\":%s,\"limit\":%s}",
+            argv[2], argv[3], pos[0], match, pos[1], pos[2]);
         int rc = cmd_query_json(port, json);
         free(json);
         return rc;

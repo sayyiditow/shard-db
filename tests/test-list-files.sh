@@ -102,6 +102,49 @@ out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","offset":1
 assert_contains "offset>total → empty page" '"files":[]' "$out"
 assert_eq "but total still reports the full set" "6" "$(total_of "$out")"
 
+echo "=== match=suffix ==="
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":".pdf","match":"suffix"}')
+assert_eq "suffix .pdf → total=4" "4" "$(total_of "$out")"
+assert_contains "suffix .pdf → alpha.pdf"  'alpha.pdf'  "$out"
+assert_contains "suffix .pdf → alpha2.pdf" 'alpha2.pdf' "$out"
+assert_contains "suffix .pdf → beta.pdf"   'beta.pdf'   "$out"
+assert_contains "suffix .pdf → delta.pdf"  'delta.pdf'  "$out"
+[[ "$out" == *'gamma.txt'* ]] && fail "suffix .pdf leaked gamma.txt" || pass "suffix .pdf rejects gamma.txt"
+[[ "$out" == *'zeta.png'*  ]] && fail "suffix .pdf leaked zeta.png"  || pass "suffix .pdf rejects zeta.png"
+
+echo "=== match=contains ==="
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"lpha","match":"contains"}')
+assert_eq "contains lpha → total=2" "2" "$(total_of "$out")"
+assert_contains "contains lpha → alpha.pdf"  'alpha.pdf'  "$out"
+assert_contains "contains lpha → alpha2.pdf" 'alpha2.pdf' "$out"
+
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"eta","match":"contains"}')
+assert_eq "contains eta → total=2" "2" "$(total_of "$out")"
+assert_contains "contains eta → beta.pdf"  'beta.pdf'  "$out"
+assert_contains "contains eta → zeta.png"  'zeta.png'  "$out"
+[[ "$out" == *'delta.pdf'* ]] && fail "contains eta wrongly matched delta.pdf" || pass "contains eta rejects delta.pdf"
+
+echo "=== match=glob ==="
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"*.pdf","match":"glob"}')
+assert_eq "glob *.pdf → total=4" "4" "$(total_of "$out")"
+
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"alpha?.pdf","match":"glob"}')
+assert_eq "glob alpha?.pdf → total=1 (alpha2.pdf)" "1" "$(total_of "$out")"
+assert_contains "glob alpha?.pdf → alpha2.pdf" 'alpha2.pdf' "$out"
+[[ "$out" == *'alpha.pdf"'* ]] && fail "glob alpha?.pdf wrongly matched alpha.pdf" || pass "glob alpha?.pdf rejects alpha.pdf"
+
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"[ab]*","match":"glob"}')
+assert_eq "glob [ab]* → total=3" "3" "$(total_of "$out")"
+
+echo "=== invalid match mode ==="
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","pattern":"foo","match":"regex"}')
+assert_contains "invalid match mode → error" 'invalid match mode' "$out"
+
+echo "=== back-compat: legacy prefix field still works ==="
+out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft","prefix":"alpha"}')
+assert_eq "legacy prefix → total=2" "2" "$(total_of "$out")"
+assert_contains "legacy prefix → alpha.pdf"  'alpha.pdf'  "$out"
+
 echo "=== files survive delete-file ==="
 $BIN query '{"mode":"delete-file","dir":"default","object":"lft","filename":"beta.pdf"}' > /dev/null
 out=$($BIN query '{"mode":"list-files","dir":"default","object":"lft"}')

@@ -41,11 +41,11 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-agg-neq-shortcut.sh          # aggregate NEQ algebraic shortcut       (21)
 ./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
 ./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
-./tests/test-list-files.sh                # list-files mode + prefix + pagination (27)
+./tests/test-list-files.sh                # list-files mode + match (prefix/suffix/contains/glob) (49)
 ./tests/test-field-vs-field.sh            # eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (24)
 ./tests/test-regex.sh                     # POSIX regex / not_regex on varchar    (23)
 ./tests/test-stress-no-hang.sh            # 16 concurrent clients × 15s mixed ops, watchdog probes (4)
-# Total: 884 tests
+# Total: 906 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -176,6 +176,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db put-file <dir> <obj> <local-path> [--if-not-exists]
 ./shard-db get-file <dir> <obj> <filename> [<out-path>]
 ./shard-db delete-file <dir> <obj> <filename>
+./shard-db list-files <dir> <obj> [pattern] [offset] [limit] [--match=<prefix|suffix|contains|glob>]
 
 # Maintenance
 ./shard-db size|recount|truncate|vacuum|backup <dir> <obj>
@@ -430,7 +431,7 @@ Remote-safe (base64 in JSON):
 - `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
 - `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
 - `{"mode":"delete-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"deleted","filename":"..."}` or `{"error":"file not found","filename":"..."}`.
-- `{"mode":"list-files","dir":"...","object":"...","prefix":"opt","offset":0,"limit":100}` — alphabetical paginated listing. `prefix` filters by filename prefix; `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Walks the `XX/XX` bucket tree; cost is O(file count) — not optimized for filestores beyond ~1M files.
+- `{"mode":"list-files","dir":"...","object":"...","pattern":"opt","match":"prefix|suffix|contains|glob","offset":0,"limit":100}` — alphabetical paginated listing. `match` defaults to `prefix`; `glob` uses `fnmatch(3)` (`*`, `?`, `[abc]`). Empty/missing pattern matches all. Legacy `prefix:"..."` field still accepted (implies `match:"prefix"`). `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Walks the `XX/XX` bucket tree; cost is O(file count) regardless of match mode (no filename index) — not optimized for filestores beyond ~1M files.
 
 Server-local zero-copy (same-host callers only — admin fast path):
 - `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.

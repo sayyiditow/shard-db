@@ -1,4 +1,5 @@
 #include "types.h"
+#include <fnmatch.h>
 
 /* ========== Probing helpers ========== */
 
@@ -9605,10 +9606,51 @@ static int hex2(const char *s) {
            ((s[1] >= '0' && s[1] <= '9') || (s[1] >= 'a' && s[1] <= 'f'));
 }
 
+/* Match modes for cmd_list_files. PREFIX preserves pre-2026.05 semantics
+   (the legacy `prefix` request field maps to this). */
+typedef enum {
+    LF_MATCH_PREFIX = 0,
+    LF_MATCH_SUFFIX,
+    LF_MATCH_CONTAINS,
+    LF_MATCH_GLOB
+} ListFilesMatch;
+
+static ListFilesMatch parse_list_files_match(const char *s) {
+    if (!s || !*s) return LF_MATCH_PREFIX;
+    if (strcmp(s, "prefix")   == 0) return LF_MATCH_PREFIX;
+    if (strcmp(s, "suffix")   == 0) return LF_MATCH_SUFFIX;
+    if (strcmp(s, "contains") == 0) return LF_MATCH_CONTAINS;
+    if (strcmp(s, "glob")     == 0) return LF_MATCH_GLOB;
+    return LF_MATCH_PREFIX;
+}
+
+static int filename_matches(const char *name, const char *pattern,
+                            size_t pattern_len, ListFilesMatch mode) {
+    if (pattern_len == 0) return 1;
+    switch (mode) {
+        case LF_MATCH_PREFIX:
+            return strncmp(name, pattern, pattern_len) == 0;
+        case LF_MATCH_SUFFIX: {
+            size_t name_len = strlen(name);
+            if (name_len < pattern_len) return 0;
+            return memcmp(name + name_len - pattern_len, pattern, pattern_len) == 0;
+        }
+        case LF_MATCH_CONTAINS:
+            return strstr(name, pattern) != NULL;
+        case LF_MATCH_GLOB:
+            return fnmatch(pattern, name, 0) == 0;
+    }
+    return 0;
+}
+
 int cmd_list_files(const char *db_root, const char *object,
-                   const char *prefix, int offset, int limit) {
+                   const char *pattern, const char *match,
+                   int offset, int limit) {
     if (limit <= 0) limit = g_global_limit;
     if (offset < 0) offset = 0;
+
+    ListFilesMatch mmode = parse_list_files_match(match);
+    size_t pattern_len = pattern ? strlen(pattern) : 0;
 
     char files_dir[PATH_MAX];
     snprintf(files_dir, sizeof(files_dir), "%s/%s/files", db_root, object);
@@ -9625,8 +9667,6 @@ int cmd_list_files(const char *db_root, const char *object,
     size_t cap = 256, count = 0;
     names = malloc(cap * sizeof(char *));
     if (!names) { closedir(d1); OUT("{\"error\":\"oom\"}\n"); return 1; }
-
-    size_t prefix_len = prefix ? strlen(prefix) : 0;
 
     struct dirent *e1;
     while ((e1 = readdir(d1))) {
@@ -9645,7 +9685,7 @@ int cmd_list_files(const char *db_root, const char *object,
             struct dirent *e3;
             while ((e3 = readdir(d3))) {
                 if (e3->d_name[0] == '.') continue;
-                if (prefix_len > 0 && strncmp(e3->d_name, prefix, prefix_len) != 0) continue;
+                if (!filename_matches(e3->d_name, pattern, pattern_len, mmode)) continue;
                 if (count >= cap) {
                     cap *= 2;
                     /* Plain realloc + walk: names[] holds strdup'd entries. */
