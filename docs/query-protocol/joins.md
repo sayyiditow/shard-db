@@ -68,7 +68,17 @@ Always tabular:
 - Left-join no-match emits `null` for all the join's columns.
 - `key` is always included for the driver; joined objects only emit the fields you list (or all if `fields` is omitted).
 
-The `format` parameter is **ignored** for the JSON shape (always tabular). `format:"csv"` with `join` is **rejected** with `format=csv is not supported with join` — joins always emit the JSON `{columns, rows}` envelope. `cursor` pagination is also not supported with `join`; use `offset`/`limit`.
+Joins always emit a tabular shape. By default that's the JSON `{"columns":[...],"rows":[...]}` envelope. `format:"csv"` (new in 2026.05.1) emits the same table as raw CSV — header row first, then one row per match, RFC 4180-style quoting via `csv_emit_cell`. Custom delimiter via `delimiter:"|"` etc.
+
+```
+j_orders.key,j_orders.amount,cust.name,cust.city
+ord_1,1500,Alice,Berlin
+ord_2,250,Bob,
+```
+
+Left-join no-match → empty cell in CSV (parallels the `null` you'd get in the JSON shape). Driver columns prefix with `<driver_object>.<field>`; each joined object's columns prefix with `<as>.<field>`.
+
+`format:"dict"` is **rejected** with `format=dict is not supported with join` — a join produces wide rows that can't sensibly key on the driver alone. `cursor` pagination is also not supported with `join`; use `offset`/`limit`.
 
 ## Chaining
 
@@ -144,4 +154,4 @@ Driver has `country_code` and `zip_code`; remote has a composite index on `"coun
 - Same-`dir` only. Cross-tenant joins are not supported.
 - No nested/subquery joins — join targets are base objects, not query results.
 - No right or full outer joins. Use left and reorder.
-- `format` forced to tabular — JSON-record form is not produced when `join` is present.
+- `format` forced to tabular — JSON-record / dict shapes are not produced when `join` is present. CSV is supported (2026.05.1+).

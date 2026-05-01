@@ -78,6 +78,32 @@ assert_contains "multi-join: cust.name column"          '"cust.name"'       "$GO
 assert_contains "multi-join: related.ref_code column"   '"related.ref_code"' "$GOT"
 
 echo ""
+echo "=== format:csv on joins (new in 2026.05.1) ==="
+GOT=$($BIN query '{"mode":"find","dir":"default","object":"j_orders","criteria":[{"field":"status","op":"eq","value":"paid"}],"join":[{"object":"j_cust","local":"cust_id","remote":"key","as":"cust","fields":["name","city"]}],"format":"csv"}')
+# Header line
+HEADER=$(echo "$GOT" | head -1)
+assert_contains "csv header has driver key column"   'j_orders.key'  "$HEADER"
+assert_contains "csv header has cust.name column"    'cust.name'     "$HEADER"
+assert_contains "csv header has cust.city column"    'cust.city'     "$HEADER"
+# Data rows
+ROWS=$(echo "$GOT" | tail -n +2 | wc -l)
+[[ "$ROWS" -ge 2 ]] && pass "csv: at least 2 data rows" || fail "csv: expected >=2 rows, got $ROWS"
+echo "$GOT" | tail -n +2 | grep -q 'Alice' && pass "csv: Alice cell present" || fail "csv: missing Alice"
+echo "$GOT" | tail -n +2 | grep -q 'Bob'   && pass "csv: Bob cell present"   || fail "csv: missing Bob"
+
+# Custom delimiter
+GOT=$($BIN query '{"mode":"find","dir":"default","object":"j_orders","criteria":[{"field":"status","op":"eq","value":"paid"}],"join":[{"object":"j_cust","local":"cust_id","remote":"key","as":"cust","fields":["name"]}],"format":"csv","delimiter":"|"}')
+HEADER=$(echo "$GOT" | head -1)
+assert_contains "pipe delimiter respected"           'j_orders.key|'  "$HEADER"
+
+# Left join CSV — missing match → empty cell, not "null"
+GOT=$($BIN query '{"mode":"find","dir":"default","object":"j_orders","join":[{"object":"j_cust","local":"cust_id","remote":"key","as":"cust","type":"left","fields":["name"]}],"format":"csv"}')
+echo "$GOT" | grep -q '^o4,' && pass "csv left-join: o4 row present" || fail "csv left-join: o4 missing in $GOT"
+# o4's cust_id has no match — its row should end with `,` (empty cust.name)
+ROW_O4=$(echo "$GOT" | grep '^o4,' | head -1)
+[[ "$ROW_O4" == *',' ]] && pass "csv left-join: empty trailing cell for missing match" || fail "csv left-join: expected trailing comma in $ROW_O4"
+
+echo ""
 echo "=== LIMIT with inner join drops applied ==="
 GOT=$($BIN query '{"mode":"find","dir":"default","object":"j_orders","criteria":[{"field":"status","op":"eq","value":"paid"}],"join":[{"object":"j_cust","local":"cust_id","remote":"key","as":"cust","fields":["name"]}],"limit":2}')
 # Count rows in the output — should be at most 2

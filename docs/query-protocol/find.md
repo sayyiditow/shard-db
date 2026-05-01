@@ -84,7 +84,7 @@ u1,Alice,a@x.com,30
 u2,Bob,b@x.com,22
 ```
 
-Plain text body — no JSON wrapping. Optional `"delimiter":"|"` picks a single-char separator (`\t` literal for tab; defaults to `,`). Values containing the delimiter or `"` are RFC-4180-quoted with internal `"` doubled; newlines inside values are replaced with a space so one physical line equals one logical row. Errors still come as JSON `{"error":"..."}`. Not compatible with `join` (returns `{"error":"format=csv is not supported with join"}`). Same shape works on [`fetch`](#fetch) and [`aggregate`](aggregate.md).
+Plain text body — no JSON wrapping. Optional `"delimiter":"|"` picks a single-char separator (`\t` literal for tab; defaults to `,`). Values containing the delimiter or `"` are RFC-4180-quoted with internal `"` doubled; newlines inside values are replaced with a space so one physical line equals one logical row. Errors still come as JSON `{"error":"..."}`. Combines with `join` (2026.05.1+) — emits the same column-prefixed tabular table as the JSON shape, just CSV-encoded. Same shape works on [`fetch`](#fetch) and [`aggregate`](aggregate.md).
 
 ## Criteria shape
 

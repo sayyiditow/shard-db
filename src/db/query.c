@@ -5760,6 +5760,121 @@ static int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
     return pos;
 }
 
+/* CSV-cell quoting to a buffer (mirrors csv_emit_cell but doesn't OUT —
+   safe for worker threads). Returns chars written (excluding NUL). */
+static size_t csv_cell_to_buf(const char *val, char delim, char *out, size_t out_sz) {
+    if (!out_sz) return 0;
+    if (!val || !val[0]) { out[0] = '\0'; return 0; }
+    size_t len = strlen(val);
+    int needs_quote = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = val[i];
+        if (c == delim || c == '"' || c == '\n' || c == '\r') { needs_quote = 1; break; }
+    }
+    size_t pos = 0;
+    if (!needs_quote) {
+        for (size_t i = 0; i < len && pos < out_sz - 1; i++) out[pos++] = val[i];
+    } else {
+        if (pos < out_sz - 1) out[pos++] = '"';
+        for (size_t i = 0; i < len && pos < out_sz - 1; i++) {
+            char c = val[i];
+            if (c == '\n' || c == '\r') c = ' ';
+            if (c == '"') {
+                if (pos + 1 < out_sz - 1) { out[pos++] = '"'; out[pos++] = '"'; }
+                else break;
+            } else out[pos++] = c;
+        }
+        if (pos < out_sz - 1) out[pos++] = '"';
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+/* Build one joined-query CSV row "<key><d>v1<d>v2<d>j1.a<d>...\n" into buf.
+   Joins with no remote match emit empty cells. Returns chars written. */
+static size_t build_joined_csv_row(const char *key,
+                                   const uint8_t *driver_raw, FieldSchema *driver_fs,
+                                   const char **proj_fields, int proj_count,
+                                   const JoinSpec *joins, int njoins,
+                                   const uint8_t **jraws,
+                                   char csv_delim,
+                                   char *buf, size_t bufsz) {
+    size_t pos = 0;
+    pos += csv_cell_to_buf(key, csv_delim, buf + pos, bufsz - pos);
+    char tmp[1024];
+
+    /* Driver fields */
+    if (proj_count > 0 && driver_fs && driver_fs->ts) {
+        for (int i = 0; i < proj_count; i++) {
+            if (pos < bufsz - 1) buf[pos++] = csv_delim;
+            int idx = typed_field_index(driver_fs->ts, proj_fields[i]);
+            char *v = (idx >= 0)
+                ? typed_get_field_str(driver_fs->ts, driver_raw, idx)
+                : NULL;
+            (void)tmp;
+            pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
+            free(v);
+        }
+    } else if (driver_fs && driver_fs->ts) {
+        for (int i = 0; i < driver_fs->ts->nfields; i++) {
+            if (driver_fs->ts->fields[i].removed) continue;
+            if (pos < bufsz - 1) buf[pos++] = csv_delim;
+            char *v = typed_get_field_str(driver_fs->ts, driver_raw, i);
+            pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
+            free(v);
+        }
+    }
+
+    /* Joined fields — one column per (join.proj_field), prefixed with as_name in the header. */
+    for (int i = 0; i < njoins; i++) {
+        const JoinSpec *j = &joins[i];
+        const uint8_t *rraw = jraws ? jraws[i] : NULL;
+        if (j->include_remote_key) {
+            if (pos < bufsz - 1) buf[pos++] = csv_delim;
+            /* Empty cell — local field carries the value (matches JSON's null). */
+        }
+        for (int k = 0; k < j->proj_count; k++) {
+            if (pos < bufsz - 1) buf[pos++] = csv_delim;
+            if (!rraw || !j->proj_tfs[k]) continue;
+            int n = typed_field_to_buf_raw(j->proj_tfs[k],
+                                           rraw + j->proj_tfs[k]->offset,
+                                           tmp, sizeof(tmp));
+            if (n > 0) pos += csv_cell_to_buf(tmp, csv_delim, buf + pos, bufsz - pos);
+        }
+    }
+
+    if (pos < bufsz - 1) buf[pos++] = '\n';
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* Emit the CSV header line for a joined query (driver + joins, prefixed columns). */
+static void emit_joined_csv_header(const char *driver_object,
+                                   FieldSchema *driver_fs,
+                                   const JoinSpec *joins, int njoins,
+                                   const char **driver_proj, int driver_proj_count,
+                                   char delim) {
+    OUT("%s.key", driver_object);
+    if (driver_proj_count > 0) {
+        for (int i = 0; i < driver_proj_count; i++) {
+            char d[2] = { delim, '\0' }; OUT("%s%s.%s", d, driver_object, driver_proj[i]);
+        }
+    } else if (driver_fs && driver_fs->ts) {
+        for (int i = 0; i < driver_fs->ts->nfields; i++) {
+            if (driver_fs->ts->fields[i].removed) continue;
+            char d[2] = { delim, '\0' }; OUT("%s%s.%s", d, driver_object, driver_fs->ts->fields[i].name);
+        }
+    }
+    for (int i = 0; i < njoins; i++) {
+        const JoinSpec *j = &joins[i];
+        if (j->include_remote_key) { char d[2] = { delim, '\0' }; OUT("%s%s.key", d, j->as_name); }
+        for (int k = 0; k < j->proj_count; k++) {
+            char d[2] = { delim, '\0' }; OUT("%s%s.%s", d, j->as_name, j->proj_fields[k]);
+        }
+    }
+    OUT("\n");
+}
+
 /* Emit the columns header for a joined query (main thread only). */
 static void emit_joined_columns(const char *driver_object,
                                 FieldSchema *driver_fs,
@@ -5844,8 +5959,17 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
             }
             sc->count++;
             if (sc->count > sc->offset) {
-                if (sc->njoins > 0) {
-                    /* Tabular row: [driver.key, driver fields..., join1 fields..., ...] */
+                if (sc->njoins > 0 && sc->csv_delim) {
+                    /* CSV joined row: <key><delim>v1<delim>...<delim>j1.a<delim>...\n */
+                    char row[16384];
+                    size_t n = build_joined_csv_row(
+                        key, (const uint8_t *)raw, sc->fs,
+                        sc->proj_count > 0 ? sc->proj_fields : NULL, sc->proj_count,
+                        sc->joins, sc->njoins, join_raws, sc->csv_delim,
+                        row, sizeof(row));
+                    OUT("%.*s", (int)n, row);
+                } else if (sc->njoins > 0) {
+                    /* Tabular JSON row: [driver.key, driver fields..., join1 fields..., ...] */
                     char row[16384];
                     int pos = snprintf(row, sizeof(row), "%s[\"%s\"",
                                        sc->printed ? "," : "", key);
@@ -6303,6 +6427,7 @@ typedef struct {
     /* Joins (tabular path when njoins > 0) */
     JoinSpec *joins;
     int njoins;
+    char csv_delim;                /* 0 = JSON tabular row, else CSV with this delimiter */
     QueryDeadline *deadline;
     int dl_counter;
     MatchResult *results;
@@ -6392,8 +6517,18 @@ static void *shard_find_worker(void *arg) {
                     }
                     MatchResult *mr = &sw->results[sw->result_count++];
                     mr->key = key;
-                    if (sw->njoins > 0) {
-                        /* Build tabular row string: [driver.key, driver fields..., join fields...] */
+                    if (sw->njoins > 0 && sw->csv_delim) {
+                        /* Pre-render CSV joined row "<key><d>v1<d>...\n" so the
+                           main thread's emit loop just streams it out. */
+                        size_t bsz = 16384;
+                        mr->json = malloc(bsz);
+                        build_joined_csv_row(
+                            key, (const uint8_t *)raw, sw->fs,
+                            sw->proj_count > 0 ? sw->proj_fields : NULL, sw->proj_count,
+                            sw->joins, sw->njoins, jraws, sw->csv_delim,
+                            mr->json, bsz);
+                    } else if (sw->njoins > 0) {
+                        /* Build tabular JSON row: [driver.key, driver fields..., join fields...] */
                         size_t bsz = 16384;
                         mr->json = malloc(bsz);
                         int pos = snprintf(mr->json, bsz, "[\"%s\"", key);
@@ -6565,6 +6700,7 @@ static int process_batch(CollectedHash *batch, int batch_count,
         workers[g].fs = fs;
         workers[g].joins = joins;
         workers[g].njoins = njoins;
+        workers[g].csv_delim = csv_delim;
         workers[g].deadline = dl;
     }
 
@@ -6585,8 +6721,11 @@ static int process_batch(CollectedHash *batch, int batch_count,
             batch_matches++;
             if (*count > offset) {
                 MatchResult *mr = &workers[g].results[r];
-                if (njoins > 0) {
-                    /* mr->json already holds the full tabular row "[...]"; just emit. */
+                if (njoins > 0 && csv_delim) {
+                    /* mr->json already holds the full CSV row ending in \n. */
+                    OUT("%s", mr->json);
+                } else if (njoins > 0) {
+                    /* mr->json already holds the JSON tabular row "[...]"; just emit. */
                     OUT("%s%s", *printed ? "," : "", mr->json);
                 } else if (csv_delim || rows_fmt) {
                     /* Projection emit — parse mr->json once per row rather than
@@ -7842,7 +7981,18 @@ static int keyset_emit_find(const char *db_root, const char *object,
             if (!dropped) {
                 count++;
                 if (count > offset && (limit <= 0 || printed < limit)) {
-                    if (njoins > 0) {
+                    if (njoins > 0 && csv_delim) {
+                        /* CSV joined row: pre-render the whole line into buf,
+                           OUT it under the lock so concurrent shards don't
+                           interleave half-rows. */
+                        char buf[16384];
+                        size_t n = build_joined_csv_row(
+                            keybuf, raw, fs,
+                            proj_count > 0 ? proj_fields : NULL, proj_count,
+                            joins, njoins, jraws, csv_delim,
+                            buf, sizeof(buf));
+                        OUT("%.*s", (int)n, buf);
+                    } else if (njoins > 0) {
                         /* Tabular row for joins. SB_APPEND keeps `pos` clamped
                            inside the 16K buffer if the row is unusually wide;
                            buf_driver_values / buf_join_values already cap their
@@ -8869,21 +9019,18 @@ int cmd_find(const char *db_root, const char *object,
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
-    if (csv_delim && has_joins) {
-        OUT("{\"error\":\"format=csv is not supported with join\"}\n");
-        free_joins(joins, njoins);
-        free_criteria_tree(tree);
-        free_excluded(&excluded);
-        return -1;
-    }
-
-
     if (has_joins) {
-        /* Joined queries always emit tabular, ignoring `format` and `rows_fmt`. */
-        emit_joined_columns(object,
-                            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                            joins, njoins,
-                            proj_count > 0 ? proj_fields : NULL, proj_count);
+        /* Joined queries are tabular by default (rows_fmt-style). format=csv
+           emits an equivalent CSV table with `<as>.<field>` column names. */
+        FieldSchema *fs_ptr = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        if (csv_delim) {
+            emit_joined_csv_header(object, fs_ptr, joins, njoins,
+                                   proj_count > 0 ? proj_fields : NULL, proj_count,
+                                   csv_delim);
+        } else {
+            emit_joined_columns(object, fs_ptr, joins, njoins,
+                                proj_count > 0 ? proj_fields : NULL, proj_count);
+        }
     } else if (csv_delim) {
         csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count,
                         (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
@@ -9077,10 +9224,10 @@ int cmd_find(const char *db_root, const char *object,
         pthread_mutex_destroy(&ctx.lock);
     }
 
-    if (has_joins)
+    if (csv_delim)
+        { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
+    else if (has_joins)
         OUT("]}\n");
-    else if (csv_delim)
-        { /* CSV body already ends with its own \n per row — nothing to close */ }
     else if (rows_fmt)
         OUT("]}\n");
     else if (dict_fmt)

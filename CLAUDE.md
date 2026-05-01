@@ -372,7 +372,7 @@ o2|paid|50|"a,comma,here"
 - Values containing the delimiter or `"` are wrapped in `"` with internal `"` doubled (RFC 4180 minus multiline).
 - NULL fields → empty cell.
 - Errors still come as JSON — content type is unified only on success.
-- `csv + join` is rejected (`format=csv is not supported with join`).
+- `csv + join` produces a tabular CSV with `<driver>.<field>` and `<as>.<field>` columns; left-join no-match → empty cell. `dict + join` is still rejected.
 
 ### OR criteria
 

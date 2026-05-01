@@ -99,9 +99,11 @@ GOT=$($BIN query '{"mode":"find","dir":"default","object":"nonexistent","criteri
 assert_contains "error is JSON"               '"error"'                 "$GOT"
 
 echo ""
-echo "=== find: csv + join rejected ==="
-GOT=$($BIN query '{"mode":"find","dir":"default","object":"csv_orders","criteria":[],"format":"csv","join":[{"object":"csv_orders","local":"status","remote":"status","as":"x"}]}')
-assert_contains "csv+join rejected"           'not supported with join' "$GOT"
+echo "=== find: csv + join produces tabular CSV (new in 2026.05.1) ==="
+GOT=$($BIN query '{"mode":"find","dir":"default","object":"csv_orders","criteria":[],"format":"csv","join":[{"object":"csv_orders","local":"status","remote":"status","as":"x","fields":["amount"]}]}')
+HEADER=$(echo "$GOT" | head -1)
+assert_contains "csv+join header has driver columns"  'csv_orders.key'   "$HEADER"
+assert_contains "csv+join header has joined column"   'x.amount'         "$HEADER"
 
 echo ""
 echo "=== fetch: CSV works ==="

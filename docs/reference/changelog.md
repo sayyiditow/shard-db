@@ -27,6 +27,10 @@ Errors continue to come back as `{"error":"..."}` so clients can branch on JSON 
 
 `format:"dict"` returns `{"k1":{...},"k2":{...}}` — O(1) lookup by primary key on the client side, round-trips with `bulk-insert`'s dict shape. Works on every find path including indexed planner branches (PRIMARY_LEAF, PRIMARY_INTERSECT, PRIMARY_KEYSET) and cursor pagination (envelope becomes `{"results":{...},"cursor":...}`). Rejected with `join` (joins force tabular). With `order_by`, dict iteration order is parser-dependent — use the default array or `format:"rows"` if strict iteration order matters.
 
+### Added — `format:"csv"` works with `join`
+
+Joined queries can now emit raw CSV instead of the default `{"columns":[...],"rows":[...]}` JSON envelope. Same column-naming convention (`<driver>.key`, `<driver>.<field>`, `<as>.<field>`); left-join no-match → empty cell. Custom delimiter via `delimiter:"|"`. Dict format is still rejected with joins (joined rows have no single primary key to dict-key on).
+
 ### Added — `bulk-update` accepts dict shape
 
 Both `records:` (inline) and `file:` payloads now accept either:
