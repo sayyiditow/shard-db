@@ -125,9 +125,9 @@ echo "=== Sample spot checks: random records findable via each index ==="
 # Pick 10 random records, verify each is returned by the composite search matching its exact values
 for i in 0 7777 15000 33333 49999 60000 77777 88888 95000 99999; do
     GOT=$($BIN get default idxtest k$i)
-    S=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['value']['status'])" 2>/dev/null || echo "")
-    R=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['value']['region'])" 2>/dev/null || echo "")
-    T=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['value']['tier'])" 2>/dev/null || echo "")
+    S=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['status'])" 2>/dev/null || echo "")
+    R=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['region'])" 2>/dev/null || echo "")
+    T=$(echo "$GOT" | python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print(r['tier'])" 2>/dev/null || echo "")
     [ -z "$S" ] && { fail "k$i not retrievable"; continue; }
     GOT2=$($BIN query "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"idxtest\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"$S\"},{\"field\":\"region\",\"op\":\"eq\",\"value\":\"$R\"},{\"field\":\"tier\",\"op\":\"eq\",\"value\":\"$T\"}],\"limit\":200000}")
     if echo "$GOT2" | grep -q "\"k$i\""; then pass "k$i findable via 3-way composite"; else fail "k$i NOT findable via 3-way composite (s=$S r=$R t=$T)"; fi
