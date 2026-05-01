@@ -67,13 +67,13 @@ done
 
 echo "=== COUNT 2-way EQ + EQ ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}]}')
-assert_eq "count(paid AND us)" '{"count":50}' "$out"
+assert_eq "count(paid AND us)" '50' "$out"
 
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"eu"}]}')
-assert_eq "count(paid AND eu)" '{"count":50}' "$out"
+assert_eq "count(paid AND eu)" '50' "$out"
 
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"pending"},{"field":"region","op":"eq","value":"us"}]}')
-assert_eq "count(pending AND us) — empty intersection" '{"count":0}' "$out"
+assert_eq "count(pending AND us) — empty intersection" '0' "$out"
 
 echo "=== COUNT 2-way EQ + range ==="
 # i%4==0 with i+100>150 means i>50 and i%4==0 → 38 records
@@ -82,35 +82,35 @@ out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria
 # i%4==0 ∧ amt>150: i>50, i%4==0 → 50 ≤ i ≤ 200, 38 vals
 # i%4==2 ∧ amt>150: amt=200+i, all > 150 → 50 vals
 # total 88
-assert_eq "count(paid AND amount>150)" '{"count":88}' "$out"
+assert_eq "count(paid AND amount>150)" '88' "$out"
 
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"amount","op":"between","value":"200","value2":"250"}]}')
 # i%4==0 ∧ 200≤amt≤250: 100+i in [200,250] → i in [100,150], i%4==0 → 100,104,...148 (13 vals)
 # i%4==2 ∧ 200≤amt≤250: 200+i in [200,250] → i in [0,50], i%4==2 ∩ ≥1 ≤ 200 → 2,6,10,...50 (13 vals)
 # total 26
-assert_eq "count(paid AND amount between 200..250)" '{"count":26}' "$out"
+assert_eq "count(paid AND amount between 200..250)" '26' "$out"
 
 echo "=== COUNT 3-way intersection ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"},{"field":"amount","op":"gt","value":"150"}]}')
 # paid+us = i%4==0 (50 records, amt=100+i for i=4,8,...,200)
 # amt>150 means i>50. i%4==0 ∧ i>50 ∧ i≤200 → 52,56,...,200 = 38 records
-assert_eq "count(paid AND us AND amount>150)" '{"count":38}' "$out"
+assert_eq "count(paid AND us AND amount>150)" '38' "$out"
 
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"eu"},{"field":"amount","op":"lte","value":"250"}]}')
 # paid+eu = i%4==2 (50 records, amt=200+i for i=2,6,...,198)
 # amt≤250 → i≤50 → i%4==2 ∧ 1≤i≤50 → 2,6,...,50 = 13 records
-assert_eq "count(paid AND eu AND amount<=250)" '{"count":13}' "$out"
+assert_eq "count(paid AND eu AND amount<=250)" '13' "$out"
 
 echo "=== COUNT EQ + IN ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"region","op":"eq","value":"us"},{"field":"status","op":"in","value":"paid,cancelled"}]}')
 # us = i%4 ∈ {0,3}; status in {paid,cancelled} = i%4 ∈ {0,2,3}
 # intersection = i%4 ∈ {0,3} = 100 records
-assert_eq "count(us AND status IN (paid,cancelled))" '{"count":100}' "$out"
+assert_eq "count(us AND status IN (paid,cancelled))" '100' "$out"
 
 echo "=== COUNT EQ + STARTS_WITH ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"region","op":"eq","value":"us"},{"field":"status","op":"starts","value":"pa"}]}')
 # us ∧ status starts pa = us ∧ paid = i%4==0 = 50 records
-assert_eq "count(us AND status starts 'pa')" '{"count":50}' "$out"
+assert_eq "count(us AND status starts 'pa')" '50' "$out"
 
 echo "=== FIND with limit applies to survivors (intersection fixes the limit-on-walk bug) ==="
 # 50 records match paid AND us; with limit=10 we should get exactly 10.
@@ -163,7 +163,7 @@ assert_contains "agg group_by region eu=50" '"region":"eu","n":50' "$out"
 
 echo "=== NEGATIVE: single leaf stays on PRIMARY_LEAF ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"pending"}]}')
-assert_eq "single leaf count(pending)" '{"count":50}' "$out"
+assert_eq "single leaf count(pending)" '50' "$out"
 
 echo "=== NEGATIVE: non-eligible op (LIKE) falls back to PRIMARY_LEAF ==="
 # `LIKE` is NOT intersection-eligible; whole tree should fall back to LEAF
@@ -174,28 +174,28 @@ out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria
 # i=4,40,...,48,40-49,140-149,40,42,44,...
 # Easier: just verify count > 0 and the query returns numeric.
 case "$out" in
-    '{"count":'*) pass "non-eligible LIKE falls back, returns numeric count" ;;
+    [0-9]*) pass "non-eligible LIKE falls back, returns numeric count" ;;
     *) fail "non-eligible LIKE got: $out" ;;
 esac
 
 echo "=== NEGATIVE: mixed indexed + non-indexed AND siblings ==="
 # notes is NOT indexed → mixed tree → falls back to PRIMARY_LEAF
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"notes","op":"eq","value":"order 4"}]}')
-assert_eq "mixed indexed+non-indexed AND falls back" '{"count":1}' "$out"
+assert_eq "mixed indexed+non-indexed AND falls back" '1' "$out"
 
 echo "=== NEGATIVE: pure OR doesn't trigger intersection ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"or":[{"field":"status","op":"eq","value":"pending"},{"field":"status","op":"eq","value":"cancelled"}]}]}')
-assert_eq "pure OR uses PRIMARY_KEYSET" '{"count":100}' "$out"
+assert_eq "pure OR uses PRIMARY_KEYSET" '100' "$out"
 
 echo "=== EDGE: 4-way intersection (all 4 indexed eq leaves) ==="
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"},{"field":"amount","op":"gte","value":"100"},{"field":"amount","op":"lte","value":"200"}]}')
 # paid+us = i%4==0, amt = 100+i. 100≤amt≤200 → 0≤i≤100. i%4==0, 1≤i≤200 → i ∈ {4,8,...,100} = 25 records
-assert_eq "count 4-way intersection" '{"count":25}' "$out"
+assert_eq "count 4-way intersection" '25' "$out"
 
 echo "=== EDGE: empty intersection found early (short-circuit) ==="
 # All paid with status=cancelled: contradiction. Same field intersected.
 out=$($BIN query '{"mode":"count","dir":"default","object":"ix_orders","criteria":[{"field":"status","op":"eq","value":"paid"},{"field":"status","op":"eq","value":"cancelled"}]}')
-assert_eq "contradiction yields 0" '{"count":0}' "$out"
+assert_eq "contradiction yields 0" '0' "$out"
 
 echo
 echo "=== TEARDOWN ==="

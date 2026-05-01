@@ -30,7 +30,7 @@ field() {
     echo "$1" | grep -oE "\"$2\":\"?[^,}\"]*\"?" | head -1 | sed -E "s/^\"$2\":\"?//; s/\"$//"
 }
 count() {
-    echo "$1" | grep -oE '"count":[0-9]+' | head -1 | sed 's/.*://'
+    echo "$1" | tr -dc "0-9"
 }
 
 echo "=== SETUP ==="

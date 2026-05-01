@@ -69,10 +69,10 @@ assert_contains "missing field rejected"       "leaf missing 'field'" "$GOT"
 echo ""
 echo "=== SHAPE A (AND only) — regression baseline ==="
 GOT=$($BIN count default or_orders '[{"field":"status","op":"eq","value":"paid"}]')
-assert_contains "count status=paid"            '"count":2'          "$GOT"
+assert_contains "count status=paid"            '2'          "$GOT"
 
 GOT=$($BIN count default or_orders '[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}]')
-assert_contains "count status=paid AND region=us" '"count":1'       "$GOT"
+assert_contains "count status=paid AND region=us" '1'       "$GOT"
 
 GOT=$($BIN find default or_orders '[{"field":"status","op":"eq","value":"paid"},{"field":"amount","op":"gte","value":"100"}]')
 assert_contains "find paid+amount>=100 includes o1" '"key":"o1"'    "$GOT"
@@ -81,7 +81,7 @@ assert_not_contains "find paid+amount>=100 excludes o2" '"key":"o2"' "$GOT"
 echo ""
 echo "=== SHAPE B (AND + OR, indexed AND sibling drives primary) ==="
 GOT=$($BIN count default or_orders '[{"field":"status","op":"eq","value":"paid"},{"or":[{"field":"region","op":"eq","value":"us"},{"field":"amount","op":"lt","value":"100"}]}]')
-assert_contains "Shape B: paid AND (region=us OR amount<100) = 2" '"count":2' "$GOT"
+assert_contains "Shape B: paid AND (region=us OR amount<100) = 2" '2' "$GOT"
 
 GOT=$($BIN find default or_orders '[{"field":"status","op":"eq","value":"paid"},{"or":[{"field":"region","op":"eq","value":"us"},{"field":"amount","op":"lt","value":"100"}]}]')
 assert_contains "Shape B: includes o1 (paid+us)"   '"key":"o1"' "$GOT"
@@ -92,7 +92,7 @@ echo ""
 echo "=== SHAPE C (pure OR, all children indexed → KeySet path) ==="
 GOT=$($BIN count default or_orders '[{"or":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}]}]')
 # o1 (paid,us), o2 (paid,eu), o3 (pending,us)
-assert_contains "Shape C: paid OR us = 3"         '"count":3' "$GOT"
+assert_contains "Shape C: paid OR us = 3"         '3' "$GOT"
 
 GOT=$($BIN find default or_orders '[{"or":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}]}]')
 assert_contains "Shape C find: o1 present"         '"key":"o1"' "$GOT"
@@ -104,13 +104,13 @@ assert_not_contains "Shape C find: o5 absent"      '"key":"o5"' "$GOT"
 # Three indexed OR children (status=paid OR status=pending OR region=asia)
 GOT=$($BIN count default or_orders '[{"or":[{"field":"status","op":"eq","value":"paid"},{"field":"status","op":"eq","value":"pending"},{"field":"region","op":"eq","value":"asia"}]}]')
 # o1, o2 (paid), o3 (pending), o4 (asia)
-assert_contains "Shape C: 3-child OR = 4"         '"count":4' "$GOT"
+assert_contains "Shape C: 3-child OR = 4"         '4' "$GOT"
 
 echo ""
 echo "=== SHAPE D (OR with non-indexed child → full scan) ==="
 GOT=$($BIN count default or_orders '[{"or":[{"field":"status","op":"eq","value":"paid"},{"field":"amount","op":"gte","value":"200"}]}]')
 # o1, o2 (paid), o3 (amount=200)
-assert_contains "Shape D: paid OR amount>=200 = 3" '"count":3' "$GOT"
+assert_contains "Shape D: paid OR amount>=200 = 3" '3' "$GOT"
 
 GOT=$($BIN find default or_orders '[{"or":[{"field":"notes","op":"eq","value":"vip"},{"field":"status","op":"eq","value":"cancelled"}]}]')
 # notes is non-indexed; o1 (vip), o3 (vip), o4 (cancelled)
@@ -123,7 +123,7 @@ echo "=== HYBRID (non-indexed AND + fully-indexed OR → KeySet primary) ==="
 # amount is non-indexed (AND sibling); OR children both indexed
 GOT=$($BIN count default or_orders '[{"field":"amount","op":"gt","value":"60"},{"or":[{"field":"status","op":"eq","value":"paid"},{"field":"region","op":"eq","value":"us"}]}]')
 # OR-union = {o1,o2,o3}. Of those amount>60: o1(100), o3(200). Not o2(50).
-assert_contains "Hybrid: amount>60 AND (paid OR us) = 2" '"count":2' "$GOT"
+assert_contains "Hybrid: amount>60 AND (paid OR us) = 2" '2' "$GOT"
 
 echo ""
 echo "=== limit / order_by across OR ==="
@@ -157,13 +157,13 @@ assert_contains "bulk-delete dry_run deleted=0"      '"deleted":0'   "$GOT"
 assert_contains "bulk-delete dry_run flag"           '"dry_run":true' "$GOT"
 
 GOT=$($BIN count default or_orders)
-assert_contains "count before actual delete = 5"      '"count":5'    "$GOT"
+assert_contains "count before actual delete = 5"      '5'    "$GOT"
 
 GOT=$($BIN query '{"mode":"bulk-delete","dir":"default","object":"or_orders","criteria":[{"or":[{"field":"status","op":"eq","value":"cancelled"},{"field":"status","op":"eq","value":"refunded"}]}]}')
 assert_contains "bulk-delete actual deleted=2"       '"deleted":2'   "$GOT"
 
 GOT=$($BIN count default or_orders)
-assert_contains "count after delete = 3"             '"count":3'     "$GOT"
+assert_contains "count after delete = 3"             '3'     "$GOT"
 
 echo ""
 echo "=== bulk-update with OR condition ==="
@@ -181,11 +181,11 @@ assert_contains "o3 updated"                          '"key":"o3"'    "$GOT"
 echo ""
 echo "=== Backward compatibility: flat array still means AND ==="
 GOT=$($BIN count default or_orders '[{"field":"status","op":"eq","value":"paid"}]')
-assert_contains "flat-array single leaf"              '"count":2' "$GOT"
+assert_contains "flat-array single leaf"              '2' "$GOT"
 
 GOT=$($BIN count default or_orders '{"status":"paid","region":"us"}')
 # Simple-equality form → AND
-assert_contains "simple-equality form still AND"      '"count":1' "$GOT"
+assert_contains "simple-equality form still AND"      '1' "$GOT"
 
 echo ""
 echo "=== nested OR-in-OR and AND-in-OR ==="
@@ -195,7 +195,7 @@ GOT=$($BIN count default or_orders '[{"or":[{"or":[{"field":"status","op":"eq","
 # nested OR children aren't LEAF directly → full scan. Still correct count.
 # After bulk-delete + bulk-update, remaining records: o1 (paid), o2 (paid), o3 (pending).
 # Only paid = 2 (o1, o2). o3 is still pending (not touched by the prior bulk ops).
-assert_contains "nested-OR single leaf count=2"        '"count":2'   "$GOT"
+assert_contains "nested-OR single leaf count=2"        '2'   "$GOT"
 
 echo ""
 echo "=== CLEANUP ==="

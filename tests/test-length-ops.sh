@@ -26,7 +26,7 @@ assert_contains() {
     if [[ "$hay" == *"$needle"* ]]; then pass "$desc"
     else fail "$desc: expected '$needle' in: $hay"; fi
 }
-count() { echo "$1" | grep -oE '"count":[0-9]+' | head -1 | sed 's/.*://'; }
+count() { echo "$1" | tr -dc "0-9"; }
 
 echo "=== SETUP ==="
 $BIN stop 2>/dev/null || true

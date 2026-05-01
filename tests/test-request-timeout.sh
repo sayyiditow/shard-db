@@ -92,13 +92,13 @@ echo ""
 echo "=== timeout_ms: 0 → falls back to global (completes normally) ==="
 GOT=$($BIN query '{"mode":"count","dir":"default","object":"rt_big","criteria":[{"field":"amount","op":"eq","value":"42"}],"timeout_ms":0}')
 assert_not_contains "timeout_ms:0 does not trip"           '"query_timeout"' "$GOT"
-assert_contains "timeout_ms:0 returns result"              '"count":'        "$GOT"
+assert_contains "timeout_ms:0 returns result"              '1500'            "$GOT"
 
 echo ""
 echo "=== timeout_ms absent → same as 0 (global fallback) ==="
 GOT=$($BIN query '{"mode":"count","dir":"default","object":"rt_big","criteria":[{"field":"amount","op":"eq","value":"42"}]}')
 assert_not_contains "absent timeout_ms does not trip"      '"query_timeout"' "$GOT"
-assert_contains "absent timeout_ms returns result"         '"count":'        "$GOT"
+assert_contains "absent timeout_ms returns result"         '1500'            "$GOT"
 
 echo ""
 echo "=== thread-local does not leak across requests on same thread ==="
@@ -107,7 +107,7 @@ echo "=== thread-local does not leak across requests on same thread ==="
 $BIN query '{"mode":"count","dir":"default","object":"rt_big","criteria":[{"field":"note","op":"contains","value":"record"}],"timeout_ms":10}' > /dev/null 2>&1
 GOT=$($BIN query '{"mode":"count","dir":"default","object":"rt_big","criteria":[{"field":"amount","op":"eq","value":"1"}]}')
 assert_not_contains "follow-up count does not inherit timeout" '"query_timeout"' "$GOT"
-assert_contains "follow-up returns result"                 '"count":'        "$GOT"
+assert_contains "follow-up returns result"                 '1500'            "$GOT"
 
 echo ""
 echo "=== CLEANUP ==="

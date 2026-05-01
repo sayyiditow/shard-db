@@ -187,7 +187,7 @@ printf 'r1|paid|100|simple\nr2|pending|50|plain\n' > "$TMP_EXPORT"
 $BIN query "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"csv_rt\",\"file\":\"$TMP_EXPORT\",\"delimiter\":\"|\"}" > /dev/null
 rm -f "$TMP_EXPORT"
 GOT=$($BIN count default csv_rt)
-assert_contains "round-trip count 2"          '"count":2'               "$GOT"
+assert_contains "round-trip count 2"          '2'               "$GOT"
 GOT=$($BIN query '{"mode":"find","dir":"default","object":"csv_rt","criteria":[{"field":"status","op":"eq","value":"paid"}],"format":"csv","delimiter":"|"}')
 assert_contains "rt: paid row present"        'r1|paid|100|simple'      "$GOT"
 

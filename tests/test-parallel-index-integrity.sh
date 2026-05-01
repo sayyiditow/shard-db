@@ -50,7 +50,7 @@ done
 wait
 
 GOT=$($BIN query '{"mode":"size","dir":"default","object":"idxtest"}')
-COUNT=$(echo "$GOT" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+COUNT=$(echo "$GOT" | tr -dc "0-9")
 if [ "$COUNT" = "100000" ]; then pass "100000 records present"; else
     fail "count=$COUNT"
     echo "    bulk insert outputs:"

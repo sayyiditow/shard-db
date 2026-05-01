@@ -1221,6 +1221,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
     } else if (strcmp(mode, "size") == 0) {
         cmd_size(db_root, object);
+    } else if (strcmp(mode, "orphaned") == 0) {
+        cmd_orphaned(db_root, object);
     } else if (strcmp(mode, "count") == 0) {
         char *criteria = json_obj_strdup_raw(&req, "criteria");
         cmd_count(db_root, object, criteria);
@@ -1760,6 +1762,8 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         cmd_delete(eff_root, object, arg1, NULL, 0);
     } else if (strcasecmp(cmd, "size") == 0) {
         cmd_size(eff_root, object);
+    } else if (strcasecmp(cmd, "orphaned") == 0) {
+        cmd_orphaned(eff_root, object);
     } else if (strcasecmp(cmd, "exists") == 0) {
         cmd_exists(eff_root, object, arg1);
     } else if (strcasecmp(cmd, "keys") == 0) {

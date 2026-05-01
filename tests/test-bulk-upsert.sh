@@ -27,8 +27,7 @@ assert_contains() {
     else fail "$desc: expected '$needle' in: $hay"; fi
 }
 count() {
-    # extract integer from {"count":N}
-    echo "$1" | grep -oE '"count":[0-9]+' | head -1 | sed 's/.*://'
+    echo "$1" | tr -dc "0-9"
 }
 
 echo "=== SETUP ==="

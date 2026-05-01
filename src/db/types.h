@@ -787,6 +787,7 @@ typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *
 void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
 int fetch_record_by_hash(const char *db_root, const char *object, const Schema *sch, const uint8_t hash16[16], int *printed, void *fs);
 int cmd_size(const char *db_root, const char *object);
+int cmd_orphaned(const char *db_root, const char *object);
 int cmd_count(const char *db_root, const char *object, const char *criteria_json);
 int cmd_exists(const char *db_root, const char *object, const char *key);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);

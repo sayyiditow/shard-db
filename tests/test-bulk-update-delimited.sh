@@ -56,7 +56,7 @@ cat > /tmp/shard-db_seed.json <<'EOF'
 EOF
 $BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_seed.json\"}" > /dev/null
 COUNT=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"$OBJ\"}")
-assert_contains "seeded 5 records" '"count":5' "$COUNT"
+assert_contains "seeded 5 records" '5' "$COUNT"
 
 echo ""
 echo "=== BASIC CSV UPDATE ==="
@@ -107,7 +107,7 @@ MISS1=$($BIN get default $OBJ k_missing_1 2>&1 || true)
 assert_not_contains "k_missing_1 was NOT inserted" '"name":"zzz"' "$MISS1"
 
 COUNT=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"$OBJ\"}")
-assert_contains "record count still 5 (no upserts)" '"count":5' "$COUNT"
+assert_contains "record count still 5 (no upserts)" '5' "$COUNT"
 
 echo ""
 echo "=== INDEX UPDATES TRACK CHANGES ==="
@@ -118,21 +118,21 @@ echo "=== INDEX UPDATES TRACK CHANGES ==="
 N_ACT=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}")
 N_INA=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"inactive\"}]}")
 N_SUS=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"suspended\"}]}")
-assert_contains "index: active=3 (unchanged)"            '"count":3' "$N_ACT"
-assert_contains "index: inactive=1 (k3 moved out)"       '"count":1' "$N_INA"
-assert_contains "index: suspended=1 (k3 arrived)"        '"count":1' "$N_SUS"
+assert_contains "index: active=3 (unchanged)"            '3' "$N_ACT"
+assert_contains "index: inactive=1 (k3 moved out)"       '1' "$N_INA"
+assert_contains "index: suspended=1 (k3 arrived)"        '1' "$N_SUS"
 
 # city index: k2 moved Paris → Lyon
 N_PAR=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"city\",\"op\":\"eq\",\"value\":\"Paris\"}]}")
 N_LYON=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"city\",\"op\":\"eq\",\"value\":\"Lyon\"}]}")
-assert_contains "city: Paris=0 (k2 moved out)" '"count":0' "$N_PAR"
-assert_contains "city: Lyon=1 (k2 landed)"      '"count":1' "$N_LYON"
+assert_contains "city: Paris=0 (k2 moved out)" '0' "$N_PAR"
+assert_contains "city: Lyon=1 (k2 landed)"      '1' "$N_LYON"
 
 # name index: k2 moved bob → robert
 N_BOB=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"bob\"}]}")
 N_ROB=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"robert\"}]}")
-assert_contains "name: bob=0"    '"count":0' "$N_BOB"
-assert_contains "name: robert=1" '"count":1' "$N_ROB"
+assert_contains "name: bob=0"    '0' "$N_BOB"
+assert_contains "name: robert=1" '1' "$N_ROB"
 
 echo ""
 echo "=== BLANK-CELL INDEXES ARE UNTOUCHED ==="
@@ -152,9 +152,9 @@ assert_contains "k4 age=36"          '"age":36'   "$K4"
 assert_contains "k4 name=dave still" '"name":"dave"' "$K4"
 
 NAME_DAVE=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"dave\"}]}")
-assert_contains "name=dave index still resolves to 1" '"count":1' "$NAME_DAVE"
+assert_contains "name=dave index still resolves to 1" '1' "$NAME_DAVE"
 CITY_TOKYO=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"city\",\"op\":\"eq\",\"value\":\"Tokyo\"}]}")
-assert_contains "city=Tokyo index still resolves to 1" '"count":1' "$CITY_TOKYO"
+assert_contains "city=Tokyo index still resolves to 1" '1' "$CITY_TOKYO"
 
 echo ""
 echo "=== PIPE DELIMITER ==="

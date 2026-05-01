@@ -124,12 +124,12 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
 /* ========== SIZE ========== */
 
 int cmd_size(const char *db_root, const char *object) {
-    int count = get_live_count(db_root, object);
-    int deleted = get_deleted_count(db_root, object);
-    if (deleted > 0)
-        OUT("{\"count\":%d,\"orphaned\":%d}\n", count, deleted);
-    else
-        OUT("{\"count\":%d}\n", count);
+    OUT("%d\n", get_live_count(db_root, object));
+    return 0;
+}
+
+int cmd_orphaned(const char *db_root, const char *object) {
+    OUT("%d\n", get_deleted_count(db_root, object));
     return 0;
 }
 
@@ -4042,7 +4042,7 @@ int cmd_exists(const char *db_root, const char *object, const char *key) {
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
     FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) { OUT("{\"exists\":false}\n"); return 1; }
+    if (!fc.map) { OUT("false\n"); return 1; }
     uint32_t slots = fc.slots_per_shard;
     uint32_t mask = slots - 1;
 
@@ -4055,12 +4055,12 @@ int cmd_exists(const char *db_root, const char *object, const char *key) {
             h->key_len == klen &&
             memcmp(fc.map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
             fcache_release(fc);
-            OUT("{\"exists\":true}\n");
+            OUT("true\n");
             return 0;
         }
     }
     fcache_release(fc);
-    OUT("{\"exists\":false}\n");
+    OUT("false\n");
     return 1;
 }
 
@@ -8042,7 +8042,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     /* No criteria = O(1) from metadata */
     if (!criteria_json || criteria_json[0] == '\0') {
         int n = get_live_count(db_root, object);
-        OUT("{\"count\":%d}\n", n);
+        OUT("%d\n", n);
         return 0;
     }
 
@@ -8055,7 +8055,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     }
     if (!tree) {
         int n = get_live_count(db_root, object);
-        OUT("{\"count\":%d}\n", n);
+        OUT("%d\n", n);
         return 0;
     }
 
@@ -8097,14 +8097,14 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             else {
                 int total = get_live_count(db_root, object);
                 size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
-                OUT("{\"count\":%zu}\n", neg);
+                OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
             IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
             btree_dispatch(db_root, object, pc->field, sch.splits,
                            pc, pc_tf, idx_count_cb, &ic);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("{\"count\":%zu}\n", ic.count);
+            else OUT("%zu\n", ic.count);
         } else {
             CollectCtx cc;
             collect_ctx_init(&cc);
@@ -8124,7 +8124,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                   cc.entries, (int)cc.count,
                                                   tree, &fs, &dl);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("{\"count\":%zu}\n", count);
+            else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
         }
     } else if (plan.kind == PRIMARY_INTERSECT) {
@@ -8133,7 +8133,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         size_t count = keyset_count_from_intersect(db_root, object, &sch, &plan,
                                                    tree, &fs, &dl);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("{\"count\":%zu}\n", count);
+        else OUT("%zu\n", count);
     } else if (plan.kind == PRIMARY_KEYSET) {
         /* Shape C / hybrid: build KeySet from OR index-union. */
         int budget_exceeded = 0;
@@ -8141,12 +8141,12 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                             &fs, &dl, &budget_exceeded);
         if (budget_exceeded) OUT(QUERY_BUFFER_ERR);
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("{\"count\":%zu}\n", count);
+        else OUT("%zu\n", count);
     } else {
         CountCtx ctx = { tree, &fs, 0, &dl, 0 };
         scan_shards(data_dir, sch.slot_size, count_scan_cb, &ctx);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("{\"count\":%d}\n", ctx.count);
+        else OUT("%d\n", ctx.count);
     }
 
     free_criteria_tree(tree);

@@ -74,7 +74,7 @@ cat > /tmp/shard-db_seed.json <<'EOF'
 ]
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_seed.json\"}")
-assert_contains "fresh insert returns {count:3}" '"count":3' "$RESP"
+assert_contains "fresh insert returns {count:3}" '3' "$RESP"
 assert_not_contains "no skipped field on plain run" '"skipped"' "$RESP"
 assert_not_contains "no inserted field on plain run" '"inserted"' "$RESP"
 
@@ -119,7 +119,7 @@ K5=$($BIN get default $OBJ k5)
 assert_contains "k5 eve inserted" '"name":"eve"' "$K5"
 
 COUNT=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"$OBJ\"}")
-assert_contains "after JSON CAS: 5 records" '"count":5' "$COUNT"
+assert_contains "after JSON CAS: 5 records" '5' "$COUNT"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -132,7 +132,7 @@ k7|grace|pending|1
 k8|henry|pending|0
 EOF
 RESP=$($BIN query "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_new.csv\",\"delimiter\":\"|\"}")
-assert_contains "CSV plain insert: {count:3}" '"count":3' "$RESP"
+assert_contains "CSV plain insert: {count:3}" '3' "$RESP"
 
 # Re-run same CSV with if_not_exists → all skipped
 RESP=$($BIN query "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"$OBJ\",\"file\":\"/tmp/shard-db_new.csv\",\"delimiter\":\"|\",\"if_not_exists\":true}")
@@ -157,7 +157,7 @@ K9=$($BIN get default $OBJ k9)
 assert_contains "k9 iris inserted" '"name":"iris"' "$K9"
 
 COUNT=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"$OBJ\"}")
-assert_contains "after CSV CAS: 9 records total" '"count":9' "$COUNT"
+assert_contains "after CSV CAS: 9 records total" '9' "$COUNT"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -176,9 +176,9 @@ assert_contains "skipped=3 (CAS losers)"         '"skipped":3' "$RESP"
 
 # Index integrity: status=processing must be 6, status=pending must be 3
 N_PROC=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"processing\"}]}")
-assert_contains "index: 6 processing" '"count":6' "$N_PROC"
+assert_contains "index: 6 processing" '6' "$N_PROC"
 N_PEND=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"pending\"}]}")
-assert_contains "index: 3 still pending" '"count":3' "$N_PEND"
+assert_contains "index: 3 still pending" '3' "$N_PEND"
 
 # Spot-check payloads
 K1=$($BIN get default $OBJ k1)
@@ -206,9 +206,9 @@ K5=$($BIN get default $OBJ k5)
 assert_contains "k5 still pending (attempt=2 lost CAS)" '"status":"pending"' "$K5"
 
 N_PEND=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"pending\"}]}")
-assert_contains "1 pending left (k5)" '"count":1' "$N_PEND"
+assert_contains "1 pending left (k5)" '1' "$N_PEND"
 N_ARCH=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"archived\"}]}")
-assert_contains "2 archived" '"count":2' "$N_ARCH"
+assert_contains "2 archived" '2' "$N_ARCH"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -248,7 +248,7 @@ K4=$($BIN get default $OBJ k4)
 assert_contains "k4 survived (attempt=0 lost CAS)" '"name":"dave"' "$K4"
 
 N_PROC=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"processing\"}]}")
-assert_contains "4 processing left after CAS-delete" '"count":4' "$N_PROC"
+assert_contains "4 processing left after CAS-delete" '4' "$N_PROC"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -277,7 +277,7 @@ SIZE_AFTER=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"$OB
 assert_contains "size unchanged after dry runs" "$SIZE_BEFORE" "$SIZE_AFTER"
 
 NONE=$($BIN query "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"$OBJ\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"WOULD-NOT-WRITE\"}]}")
-assert_contains "sentinel not written" '"count":0' "$NONE"
+assert_contains "sentinel not written" '0' "$NONE"
 
 # ----------------------------------------------------------------------
 echo ""

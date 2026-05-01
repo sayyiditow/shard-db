@@ -21,7 +21,7 @@ assert_eq() {
     if [ "$expected" = "$actual" ]; then pass "$desc"
     else fail "$desc: expected='$expected' actual='$actual'"; fi
 }
-count() { echo "$1" | grep -oE '"count":[0-9]+' | head -1 | sed 's/.*://'; }
+count() { echo "$1" | tr -dc "0-9"; }
 
 run_count() {
     # $1 = field, $2 = op, $3 = value

@@ -145,7 +145,7 @@ assert_contains "mig_events kind field restored" '"kind"'              "$DESC3"
 
 # Imported objects start empty (no data carried)
 COUNT1=$($BIN query "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"mig_users\"}")
-assert_contains "mig_users empty after import" '"count":0' "$COUNT1"
+assert_contains "mig_users empty after import" '0' "$COUNT1"
 
 # ----------------------------------------------------------------------
 echo ""

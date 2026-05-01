@@ -59,16 +59,16 @@ $BIN insert default cli_orders o5 '{"status":"cancelled","amount":0,"region":"us
 echo ""
 echo "=== count CLI ==="
 GOT=$($BIN count default cli_orders)
-assert_contains "count no-criteria returns total"         '"count":5'    "$GOT"
+assert_contains "count no-criteria returns total"         '5'    "$GOT"
 
 GOT=$($BIN count default cli_orders '[{"field":"status","op":"eq","value":"paid"}]')
-assert_contains "count with eq criteria"                  '"count":3'    "$GOT"
+assert_contains "count with eq criteria"                  '3'    "$GOT"
 
 GOT=$($BIN count default cli_orders '[{"field":"amount","op":"gte","value":"100"}]')
-assert_contains "count with gte criteria"                 '"count":2'    "$GOT"
+assert_contains "count with gte criteria"                 '2'    "$GOT"
 
 GOT=$($BIN count default cli_orders '[{"field":"status","op":"eq","value":"nope"}]')
-assert_contains "count no-match returns 0"                '"count":0'    "$GOT"
+assert_contains "count no-match returns 0"                '0'    "$GOT"
 
 GOT=$($BIN count default 2>&1 || true)
 assert_contains "count usage when too few args"           'Usage: shard-db count' "$GOT"
