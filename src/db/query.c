@@ -9767,7 +9767,8 @@ int cmd_list_files(const char *db_root, const char *object,
 
     /* Collect all matching filenames into a heap-grown array, then sort. */
     char **names = NULL;
-    size_t cap = 256, count = 0;
+    size_t cap = 256, count = 0, buffer_bytes = 0;
+    int budget_exceeded = 0;
     names = malloc(cap * sizeof(char *));
     if (!names) { closedir(d1); OUT("{\"error\":\"oom\"}\n"); return 1; }
 
@@ -9779,6 +9780,18 @@ int cmd_list_files(const char *db_root, const char *object,
            startup sweep hasn't run (e.g. filesystem was switched mid-life). */
         if (e->d_type == DT_DIR) continue;
         if (!filename_matches(e->d_name, pattern, pattern_len, mmode)) continue;
+
+        /* Per-query memory cap. Models pointer + strdup'd string; ignores
+           glibc malloc bookkeeping (a small constant per chunk that's not
+           worth tracking precisely). At 500 MB default this triggers around
+           7-13M matches depending on filename length. */
+        size_t entry_bytes = sizeof(char *) + strlen(e->d_name) + 1;
+        if (buffer_bytes + entry_bytes > g_query_buffer_max_bytes) {
+            budget_exceeded = 1;
+            break;
+        }
+        buffer_bytes += entry_bytes;
+
         if (count >= cap) {
             cap *= 2;
             /* Plain realloc + walk: names[] holds strdup'd entries. */
@@ -9795,6 +9808,13 @@ int cmd_list_files(const char *db_root, const char *object,
         names[count++] = strdup(e->d_name);
     }
     closedir(d1);
+
+    if (budget_exceeded) {
+        for (size_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        OUT(QUERY_BUFFER_ERR);
+        return 1;
+    }
 
     /* qsort(NULL, 0, ...) is well-defined as a no-op per POSIX, but Coverity
        can't see that — explicit count guard keeps the static analyzer happy

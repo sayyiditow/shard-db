@@ -320,7 +320,7 @@ Use it to give specific callers tighter deadlines (e.g., `"timeout_ms":200` for 
 
 ### Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 500) bounds the intermediate buffers any single query can hold. Checked at 7 collection sites: ordered find buffer, aggregate buckets (shared atomic across parallel workers), bulk-delete/update key list, OR KeySet, `CollectCtx.entries` (btree hash collection), `ShardWorkCtx.results` (downstream of CollectCtx), per-worker aggregate hash tables (via the shared atomic). When exceeded the query aborts with `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
+`QUERY_BUFFER_MB` (default 500) bounds the intermediate buffers any single query can hold. Checked at 8 collection sites: ordered find buffer, aggregate buckets (shared atomic across parallel workers), bulk-delete/update key list, OR KeySet, `CollectCtx.entries` (btree hash collection), `ShardWorkCtx.results` (downstream of CollectCtx), per-worker aggregate hash tables (via the shared atomic), and `cmd_list_files` names buffer (filename pointer + strdup, 500 MB ⇒ ~7-13M matches depending on name length). When exceeded the query aborts with `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
 
 Rough sizing: peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10-15% higher due to malloc chunk overhead not accounted for). Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, container limit, or `ulimit -v`) as a backstop.
 
