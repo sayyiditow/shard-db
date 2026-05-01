@@ -271,6 +271,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         "add-ip", "remove-ip", "list-ips",
         "add-dir", "remove-dir",
         "reindex",
+        "migrate-files",
         NULL
     };
     for (int i = 0; srv[i]; i++)
@@ -967,6 +968,15 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         const char *of = (obj_f && obj_f[0]) ? obj_f : NULL;
         cmd_reindex(g_db_root, df, of);
         free(dir_f); free(obj_f); free(mode);
+        return;
+    }
+
+    /* migrate-files — one-shot upgrade step from pre-2026.05.2 hash-bucketed
+       file storage layout (XX/XX/<filename>) to flat <obj>/files/<filename>.
+       Walks every (dir, object) in schema.conf. Idempotent. */
+    if (mode && strcmp(mode, "migrate-files") == 0) {
+        cmd_migrate_files(g_db_root);
+        free(mode);
         return;
     }
 

@@ -850,6 +850,11 @@ int cmd_put_file_b64(const char *db_root, const char *object,
                      int if_not_exists);
 int cmd_get_file_b64(const char *db_root, const char *object, const char *filename);
 int cmd_delete_file(const char *db_root, const char *object, const char *filename);
+/* One-shot migration: lift any pre-2026.05.2 XX/XX hash-bucketed files
+   into the flat <obj>/files/<filename> layout. Walks every (dir, object)
+   in schema.conf. Idempotent — second run is a no-op. Emits one-line
+   JSON summary. */
+int cmd_migrate_files(const char *db_root);
 /* List files under $DB_ROOT/<dir>/<object>/files/XX/XX/, optional pattern
    match (prefix|suffix|contains|glob — fnmatch(3) for glob), alphabetical
    pagination. NULL/empty pattern matches all. NULL/empty match defaults to

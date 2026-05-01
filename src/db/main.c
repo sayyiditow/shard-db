@@ -52,6 +52,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  list-files <dir> <object> [pattern] [offset] [limit] [--match=<mode>]\n");
         fprintf(stderr, "                                       List stored files (alphabetical, paginated)\n");
         fprintf(stderr, "                                       --match=prefix (default) | suffix | contains | glob\n");
+        fprintf(stderr, "  migrate-files                        One-shot upgrade: lift pre-2026.05.2 XX/XX hash buckets\n");
+        fprintf(stderr, "                                       into the flat <obj>/files/ layout (idempotent)\n");
         fprintf(stderr, "  get-file-path <object> <filename>    Get server-local file path\n");
         fprintf(stderr, "  export-schema [out_path]             Write JSON manifest of all schemas\n");
         fprintf(stderr, "  import-schema <in_path> [--if-not-exists]\n");
@@ -124,6 +126,12 @@ int main(int argc, char *argv[]) {
         else
             snprintf(json, sizeof(json), "{\"mode\":\"shard-stats\",\"format\":\"table\"}");
         return cmd_query_json(port, json);
+    }
+
+    /* migrate-files — one-shot pre-2026.05.2 → 2026.05.2 storage layout
+       upgrade. Walks every (dir, obj) in schema.conf. Idempotent. */
+    if (strcmp(cmd, "migrate-files") == 0) {
+        return cmd_query_json(port, "{\"mode\":\"migrate-files\"}");
     }
 
     /* reindex — rebuild every index for matching objects.

@@ -55,7 +55,7 @@ Changing these requires recompiling. Most don't need to change.
 | Filename | 255 bytes, plain basename | No `/`, `\`, `..`, control chars. |
 | File size (base64 variant) | ~24 MB at default config | Bounded by `MAX_REQUEST_SIZE / 1.33`. Raise `MAX_REQUEST_SIZE` to lift. |
 | File size (server-local variant) | unbounded | Limited only by disk. |
-| `list-files` walk cost | O(file count) | Walks the `XX/XX` bucket tree; comfortable up to ~1M files. |
+| `list-files` walk cost | O(file count) | Single `opendir(<obj>/files)` + `readdir` loop; comfortable up to several million files on ext4/XFS. |
 
 ## Concurrency limits
 

@@ -144,7 +144,7 @@ $DB_ROOT/
         <a>+<b>/                            # Composite index — '+' joined name
           NNN.idx
       files/                       # Stored files (put-file)
-        XX/XX/<filename>           # Hash-bucketed by filename
+        <filename>                 # Flat — basename is the lookup key
   logs/
     info-YYYY-MM-DD.log
     error-YYYY-MM-DD.log

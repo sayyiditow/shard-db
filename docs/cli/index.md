@@ -79,6 +79,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `db-dirs` | — | List registered tenant directories (from `dirs.conf`). |
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
 | `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `splits/4` shard count. No args = all tenants. |
+| `migrate-files` | — | One-shot upgrade step: lift any pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash-bucketed layout into the flat `<obj>/files/<filename>` layout. Walks every (dir, object) in `schema.conf`. Idempotent. Run once after upgrading the binary. |
 
 ## JSON query mode
 

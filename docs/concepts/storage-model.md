@@ -113,4 +113,4 @@ Indexes live in `<object>/indexes/<field>/<NNN>.idx` as B+ trees with prefix-com
 
 ## Files (stored blobs, not records)
 
-`<object>/files/XX/XX/<filename>` — uploaded via [put-file](../query-protocol/files.md), hash-bucketed by filename so directories stay shallow. Not reachable through queries; fetched directly by filename.
+`<object>/files/<filename>` — uploaded via [put-file](../query-protocol/files.md). Flat layout — basename is the lookup key. Not reachable through queries; fetched directly by filename. (Pre-2026.05.2 stored at `<object>/files/<XX>/<XX>/<filename>` with xxh128 hash buckets; existing installs upgrade with one-shot `./shard-db migrate-files`.)

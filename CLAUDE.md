@@ -42,10 +42,11 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
 ./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
 ./tests/test-list-files.sh                # list-files mode + match (prefix/suffix/contains/glob) (49)
+./tests/test-migrate-files.sh             # one-shot pre-2026.05.2 → flat layout migration         (20)
 ./tests/test-field-vs-field.sh            # eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (24)
 ./tests/test-regex.sh                     # POSIX regex / not_regex on varchar    (23)
 ./tests/test-stress-no-hang.sh            # 16 concurrent clients × 15s mixed ops, watchdog probes (4)
-# Total: 906 tests
+# Total: 926 tests
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -183,6 +184,7 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db add-index <dir> <obj> <field> [-f]     # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>       # drop index (exact name match)
 ./shard-db reindex [dir] [obj]                    # rebuild indexes; no args = all tenants
+./shard-db migrate-files                          # one-shot upgrade: lift pre-2026.05.2 XX/XX file buckets into flat layout (idempotent)
 ./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
 
 # Diagnostics
@@ -425,13 +427,15 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 
 ### File storage
 
-Files live at `$DB_ROOT/<dir>/<obj>/files/XX/XX/<filename>`, hash-bucketed by filename. Filenames are validated (no `/`, `\`, `..`, control chars, ≤255 bytes).
+Files live at `$DB_ROOT/<dir>/<obj>/files/<filename>` — flat, basename is the lookup key. Filenames are validated (no `/`, `\`, `..`, control chars, ≤255 bytes).
+
+Pre-2026.05.2 stored at `<obj>/files/<XX>/<XX>/<filename>` (xxh128 hash buckets). The bucketing was vestigial — filenames were already the unique key. Existing installs upgrade with a one-shot `./shard-db migrate-files` (walks every (dir, obj) in schema.conf, lifts each leaf into place; idempotent).
 
 Remote-safe (base64 in JSON):
 - `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
 - `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
 - `{"mode":"delete-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"deleted","filename":"..."}` or `{"error":"file not found","filename":"..."}`.
-- `{"mode":"list-files","dir":"...","object":"...","pattern":"opt","match":"prefix|suffix|contains|glob","offset":0,"limit":100}` — alphabetical paginated listing. `match` defaults to `prefix`; `glob` uses `fnmatch(3)` (`*`, `?`, `[abc]`). Empty/missing pattern matches all. Legacy `prefix:"..."` field still accepted (implies `match:"prefix"`). `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Walks the `XX/XX` bucket tree; cost is O(file count) regardless of match mode (no filename index) — not optimized for filestores beyond ~1M files.
+- `{"mode":"list-files","dir":"...","object":"...","pattern":"opt","match":"prefix|suffix|contains|glob","offset":0,"limit":100}` — alphabetical paginated listing. `match` defaults to `prefix`; `glob` uses `fnmatch(3)` (`*`, `?`, `[abc]`). Empty/missing pattern matches all. Legacy `prefix:"..."` field still accepted (implies `match:"prefix"`). `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Single `opendir(<obj>/files)` + `readdir` loop — O(file count), no fixed-overhead floor. Comfortable up to several million files on ext4/XFS; beyond that, maintain your own index in a regular object.
 
 Server-local zero-copy (same-host callers only — admin fast path):
 - `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.

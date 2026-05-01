@@ -232,7 +232,7 @@ Response:
 }
 ```
 
-`total` is the unpaginated match count (after `prefix` filtering). Walking the `XX/XX` bucket tree is O(file count) — fine up to ~1M files; beyond that, use a separate index.
+`total` is the unpaginated match count (after `prefix` filtering). Single `opendir(<obj>/files)` + `readdir` loop — O(file count). Comfortable up to several million files on ext4/XFS; beyond that, use a separate index.
 
 ## size
 

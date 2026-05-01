@@ -1,6 +1,8 @@
 # File storage
 
-Upload and download arbitrary files (PDFs, images, CSVs, blobs) keyed by filename. Files live under `<obj>/files/XX/XX/<filename>`, hash-bucketed so directories stay shallow.
+Upload and download arbitrary files (PDFs, images, CSVs, blobs) keyed by filename. Files live flat under `<obj>/files/<filename>` — the basename is the lookup key.
+
+> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Run `./shard-db migrate-files` once after upgrading the binary — it walks every (dir, object) and lifts each file into the flat layout. Idempotent, so safe to re-run.
 
 Two variants for both upload and download:
 
@@ -13,12 +15,12 @@ Pick #1 unless you have a specific reason.
 
 ```
 $DB_ROOT/<dir>/<obj>/files/
-  6b/7a/medium.bin
-  b2/38/small.bin
-  b5/e9/hello.txt
+  hello.txt
+  medium.bin
+  small.bin
 ```
 
-Two-level hash-bucketing from the xxh128 of the filename-stem (basename minus last `.ext`). Collisions within a bucket are allowed — the full filename disambiguates.
+Flat — basename is the lookup key. No bucketing or sub-directories. `get-file` / `delete-file` / `get-file-path` all open `<files_dir>/<filename>` directly, no hashing.
 
 ## put-file — bytes in JSON (remote-safe)
 
@@ -76,7 +78,7 @@ The CLI reads the file, base64-encodes, sends the JSON. Works from any host with
 {"mode":"put-file","dir":"<dir>","object":"<obj>","path":"/srv/incoming/invoice.pdf"}
 ```
 
-- `path` is read **on the server's filesystem** — not the client's. The server opens the path and copies it into `<obj>/files/XX/XX/<filename>` (filename = basename of the path).
+- `path` is read **on the server's filesystem** — not the client's. The server opens the path and copies it into `<obj>/files/<filename>` (filename = basename of the path).
 - No base64 overhead. Good for batch ingestion from a shared volume.
 - **Only useful for same-host callers** — a remote client has no way to place a file on the server's filesystem without a separate transport (scp, rsync, shared FS).
 
@@ -123,7 +125,7 @@ Not found:
 ### Response
 
 ```json
-{"path":"<db_root>/<dir>/<obj>/files/XX/XX/invoice.pdf"}
+{"path":"<db_root>/<dir>/<obj>/files/invoice.pdf"}
 ```
 
 No bytes on the wire. The caller is expected to read the returned path directly from the server's filesystem. Useful for:
@@ -207,7 +209,7 @@ Paginated, alphabetical inventory of stored files for one object. Optional patte
 }
 ```
 
-`total` is the unpaginated match count (after pattern filtering, before pagination). Walking the `XX/XX` bucket tree is O(file count) regardless of match mode — there's no filename index. Fine for filestores up to ~1M files. Beyond that, maintain your own index in a regular object.
+`total` is the unpaginated match count (after pattern filtering, before pagination). Single `opendir(<obj>/files)` + `readdir` loop — O(file count). Comfortable up to several million files on ext4/XFS; past that, maintain your own index in a regular object.
 
 Invalid match mode returns `{"error":"invalid match mode (use prefix|suffix|contains|glob)"}`.
 
