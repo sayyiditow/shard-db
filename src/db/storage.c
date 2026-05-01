@@ -1589,11 +1589,8 @@ static void *multi_get_shard_worker(void *arg) {
                 memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, klen) == 0) {
                 const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
                 char *val = typed_decode(sw->fs->ts, (const uint8_t *)raw, h->value_len);
-                /* Pre-render full JSON */
-                size_t jlen = strlen(e->key) + (val ? strlen(val) : 4) + 32;
-                e->result_json = malloc(jlen);
-                snprintf(e->result_json, jlen, "{\"key\":\"%s\",\"value\":%s}", e->key, val ? val : "null");
-                free(val);
+                /* Store just the decoded value JSON. */
+                e->result_json = val ? val : strdup("null");
                 break;
             }
         }
@@ -1635,7 +1632,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         } else p++;
     }
 
-    if (key_count == 0) { free(entries); OUT("[]\n"); return 0; }
+    if (key_count == 0) { free(entries); OUT("{}\n"); return 0; }
 
     /* Sort by shard_id (preserve original order via stable sort for output) */
     /* Use index array to maintain original order */
@@ -1698,17 +1695,11 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         OUT("\n");
         for (int i = 0; i < key_count; i++) {
             if (!entries[i].result_json) continue;
-            /* result_json shape: {"key":"k","value":{...}} — fields live under
-               "value". Parse outer once, parse the value sub-object once, then
-               index per-field from the struct. Previously this walked each
-               record's JSON 1 + N times (once for value extraction, then once
-               per schema field). */
             csv_emit_cell(entries[i].key, csv_delim);
-            JsonObj outer, value_obj;
-            json_parse_object(entries[i].result_json, strlen(entries[i].result_json), &outer);
-            const char *val_raw; size_t val_rawl;
-            int have_value = json_obj_get(&outer, "value", &val_raw, &val_rawl) &&
-                             json_parse_object(val_raw, val_rawl, &value_obj) >= 0;
+            JsonObj value_obj;
+            int have_value = json_parse_object(entries[i].result_json,
+                                               strlen(entries[i].result_json),
+                                               &value_obj) >= 0;
             if (fs.ts) {
                 for (int fi = 0; fi < fs.ts->nfields; fi++) {
                     if (fs.ts->fields[fi].removed) continue;
@@ -1722,16 +1713,19 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             free(entries[i].result_json);
         }
     } else {
-        OUT("[");
-        int printed = 0;
+        OUT("{");
+        int first = 1;
         for (int i = 0; i < key_count; i++) {
+            if (!first) OUT(",");
+            first = 0;
             if (entries[i].result_json) {
-                OUT("%s%s", printed ? "," : "", entries[i].result_json);
+                OUT("\"%s\":%s", entries[i].key, entries[i].result_json);
                 free(entries[i].result_json);
-                printed++;
+            } else {
+                OUT("\"%s\":null", entries[i].key);
             }
         }
-        OUT("]\n");
+        OUT("}\n");
     }
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);

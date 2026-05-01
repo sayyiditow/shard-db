@@ -505,6 +505,116 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
     return 0;
 }
 
+/* Returns 1 if json is a JSON object whose first non-null value is itself a
+   JSON object — the signature of a multi-get dict-of-dicts response. */
+static int is_dict_of_dicts(const char *json) {
+    if (!json || *json != '{') return 0;
+    const char *p = skip_ws(json + 1);
+    while (*p && *p != '}') {
+        if (*p != '"') return 0;
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+        p = skip_ws(p);
+        if (*p != ':') return 0;
+        p++;
+        p = skip_ws(p);
+        /* skip null entries when deciding */
+        if (strncmp(p, "null", 4) == 0) {
+            p += 4;
+            p = skip_ws(p);
+            if (*p == ',') p++;
+            continue;
+        }
+        return (*p == '{');
+    }
+    return 0;  /* empty or all-null — fall through to Shape 6 */
+}
+
+/* Render a dict-of-dicts into the table: top-level key becomes the first
+   column ("key"), inner object fields become additional columns. */
+static void render_dict_of_dicts(const char *json, Table *t) {
+    /* First pass: collect column names from inner objects. */
+    static const char key_col[] = "key";
+    int key_idx = table_col_index(t, key_col, sizeof(key_col) - 1);
+    (void)key_idx;
+
+    const char *p = skip_ws(json + 1);
+    while (*p && *p != '}' && t->nrows < MAX_ROWS) {
+        p = skip_ws(p);
+        if (*p != '"') break;
+        p++;
+        const char *ks = p;
+        while (*p && *p != '"') p++;
+        size_t klen = (size_t)(p - ks);
+        if (*p == '"') p++;
+        p = skip_ws(p);
+        if (*p != ':') break;
+        p++;
+        p = skip_ws(p);
+        const char *vs = p;
+        skip_value(&p);
+        size_t vlen = (size_t)(p - vs);
+
+        int row = t->nrows++;
+        for (int i = 0; i < MAX_COLS; i++) t->cells[row][i] = NULL;
+        t->drilldown[row] = NULL;
+
+        /* Column 0: the lookup key. */
+        int kcol = table_col_index(t, "key", 3);
+        if (kcol >= 0) {
+            t->cells[row][kcol] = malloc(klen + 1);
+            memcpy(t->cells[row][kcol], ks, klen);
+            t->cells[row][kcol][klen] = '\0';
+            if ((int)klen > t->widths[kcol]) t->widths[kcol] = (klen > 32 ? 32 : (int)klen);
+        }
+
+        if (vlen == 4 && strncmp(vs, "null", 4) == 0) {
+            /* Missing key — row has only the key column, others null. */
+        } else if (vlen >= 2 && vs[0] == '{') {
+            /* Inner object: walk its fields as columns. */
+            const char *ip = vs + 1;
+            const char *iend = vs + vlen - 1;
+            while (ip < iend) {
+                ip = skip_ws(ip);
+                if (*ip != '"') break;
+                ip++;
+                const char *fks = ip;
+                while (ip < iend && *ip != '"') ip++;
+                size_t fkl = (size_t)(ip - fks);
+                if (ip < iend) ip++;
+                ip = skip_ws(ip);
+                if (*ip != ':') break;
+                ip++;
+                ip = skip_ws(ip);
+                const char *fvs = ip;
+                skip_value(&ip);
+                size_t fvl = (size_t)(ip - fvs);
+                int col = table_col_index(t, fks, fkl);
+                if (col >= 0) {
+                    char *cell;
+                    if (fvl > 0 && fvs[0] == '"') {
+                        cell = malloc(fvl);
+                        json_string_into(fvs, fvl, cell, fvl);
+                    } else {
+                        cell = malloc(fvl + 1);
+                        memcpy(cell, fvs, fvl);
+                        cell[fvl] = '\0';
+                    }
+                    t->cells[row][col] = cell;
+                    int w = (int)strlen(cell);
+                    if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
+                }
+                ip = skip_ws(ip);
+                if (*ip == ',') ip++;
+            }
+        }
+
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+}
+
 /* tui_show_table returns 0 on close (q/←/ESC), 1 if user pressed 'e' to
    request CSV export. Callers that pass a JSON response can re-issue the
    underlying request with format:"csv" and write the result to a file. */
@@ -513,7 +623,7 @@ int tui_show_table(const char *title, const char *json) {
     memset(&t, 0, sizeof(t));
 
     /* tui_show_table is the single render path for every data-returning
-       JSON response. Five shapes the daemon emits today, all handled here:
+       JSON response. Seven shapes the daemon emits today, all handled here:
 
          1. {"columns":[...],"rows":[[v1,v2],...]}     — find/fetch format=rows
          2. {"results":[{...}], "cursor":...}          — fetch default
@@ -521,11 +631,13 @@ int tui_show_table(const char *title, const char *json) {
          4. [{...},{...}]                              — find default, agg group_by
          5. ["s1","s2"]                                — keys default
          6. {"k1":"v1","k2":"v2"}                      — count, exists, agg scalar
+         7. {"k1":{...},"k2":{...}}                    — get-multi dict-of-dicts
 
        (1) drives column names + array rows. (2)/(3) just unwrap and recurse.
        (4) auto-detects columns from each object's keys (special-cases "value"
        to flatten a nested record). (5) becomes a single-column "value" table.
-       (6) becomes a two-column "metric/value" table. */
+       (6) becomes a two-column "metric/value" table. (7) becomes a table with
+       "key" column + union of inner-object field columns. */
 
     const char *arr = json;
     int rendered = 0;
@@ -563,6 +675,13 @@ int tui_show_table(const char *title, const char *json) {
             arr = res_v;
         } else if (rows_v) {       /* Shape 3: unwrap and re-point. */
             arr = rows_v;
+        }
+        if (!rendered && *json == '{' && !cols_v && !rows_v && !res_v &&
+            is_dict_of_dicts(json)) {
+            /* Shape 7: dict-of-dicts — multi-get result {"k1":{...},"k2":{...}}.
+               Render as a table: "key" column + union of inner-object fields. */
+            render_dict_of_dicts(json, &t);
+            rendered = 1;
         }
         if (!rendered && *json == '{' && !cols_v && !rows_v && !res_v) {
             /* Shape 6: plain object → 2-column metric/value table. */
