@@ -2,7 +2,7 @@
 
 Upload and download arbitrary files (PDFs, images, CSVs, blobs) keyed by filename. Files live flat under `<obj>/files/<filename>` — the basename is the lookup key.
 
-> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Run `./shard-db migrate-files` once after upgrading the binary — it walks every (dir, object) and lifts each file into the flat layout. Idempotent, so safe to re-run.
+> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Run `./migrate` once after upgrading the binary — it walks every (dir, object) and lifts each file into the flat layout. Idempotent, so safe to re-run.
 
 Two variants for both upload and download:
 

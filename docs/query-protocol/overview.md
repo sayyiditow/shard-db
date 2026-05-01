@@ -103,8 +103,8 @@ Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or ab
 // Request
 {"mode":"get","dir":"default","object":"users","key":"u1"}
 
-// Response
-{"key":"u1","value":{"name":"Alice","email":"a@x.com","age":30}}
+// Response — bare value dict (no {key,value} wrapper, since the caller knows the key)
+{"name":"Alice","email":"a@x.com","age":30}
 ```
 
 Multi-get:
@@ -113,9 +113,10 @@ Multi-get:
 // Request
 {"mode":"get","dir":"default","object":"users","keys":["u1","u2","u3"]}
 
-// Response
-[{"key":"u1","value":{...}},{"key":"u2","value":{...}}]
-// (missing keys are omitted)
+// Response — dict keyed by primary key. Missing keys map to null.
+{"u1":{...},"u2":{...},"u3":null}
+// Empty input ([]) → {}
+// CSV format (format:"csv") emits one row per requested key, key column first.
 ```
 
 With field projection:
@@ -125,7 +126,7 @@ With field projection:
 {"mode":"get","dir":"default","object":"users","key":"u1","fields":"name,email"}
 
 // Response
-{"key":"u1","value":{"name":"Alice","email":"a@x.com"}}
+{"name":"Alice","email":"a@x.com"}
 ```
 
 ## Pagination patterns

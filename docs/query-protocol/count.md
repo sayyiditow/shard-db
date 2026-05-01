@@ -10,9 +10,13 @@ Returns the number of records matching the criteria, without materializing any r
 
 ## Response
 
-```json
-{"count": 1234}
+A bare integer (no JSON wrapper):
+
 ```
+1234
+```
+
+Errors still come back as `{"error":"..."}`.
 
 ## Cost
 
@@ -33,7 +37,7 @@ See [find → OR criteria](find.md) for the full planner table.
 {"mode":"count","dir":"default","object":"users","criteria":[]}
 ```
 
-Returns the total active record count (same as `size` without the orphan field). Uses the cached `metadata/counts` value — O(1).
+Returns the total active record count (same as `size`). Uses the cached `metadata/counts` value — O(1). For the deleted-but-not-vacuumed slot count, use the `orphaned` mode.
 
 ## Examples
 
@@ -44,8 +48,8 @@ Returns the total active record count (same as `size` without the orphan field).
 {"mode":"count","dir":"acme","object":"orders",
  "criteria":[{"field":"status","op":"eq","value":"paid"}]}
 
-// Response
-{"count": 8432}
+// Response (bare integer)
+8432
 ```
 
 ### Range count

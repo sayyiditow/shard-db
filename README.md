@@ -33,7 +33,7 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 ## Quick start
 
 ```bash
-./build.sh                      # builds shard-db (daemon) + shard-cli (TUI)
+./build.sh                      # builds shard-db (daemon) + shard-cli (TUI) + migrate (one-shot upgrades)
 ./shard-db start
 
 ./shard-db query '{
@@ -49,6 +49,17 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 ```
 
 More: [Install](docs/getting-started/install.md) · [Quick start](docs/getting-started/quickstart.md) · [Client examples (Python / Java / Node.js)](docs/getting-started/clients.md)
+
+### Upgrading from a prior release
+
+```bash
+./shard-db stop
+# replace build/bin/ contents with the new release (shard-db, shard-cli, migrate)
+./migrate                       # runs every required migration for the new release; idempotent
+./shard-db start
+```
+
+For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to flat layout, then rebuilds every B+ tree under the per-shard layout shipped in 2026.05.1. See [the 2026.05.1 changelog entry](docs/reference/changelog.md#202605132026-05-02-reissued) for the full list of breaking changes (read response shapes are bare values now: `get`, `exists`, `count`, `size` no longer wrap in JSON; `get-multi` returns a dict; `find`/`fetch` gain `format:"dict"`).
 
 ## Performance snapshot
 

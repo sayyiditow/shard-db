@@ -43,12 +43,14 @@ Useful when you want a custom install prefix or a non-default optimization level
 Download the tarball for your platform from the [GitHub releases](https://github.com/sayyiditow/shard-db/releases) page:
 
 ```bash
-tar xzf shard-db-2026.04.3-linux-x86_64.tar.gz
-cd shard-db-2026.04.3
+tar xzf shard-db-2026.05.1-linux-x86_64.tar.gz
+cd shard-db-2026.05.1
 ./shard-db start
 ```
 
-Each release archive contains the stripped binary, default `db.env`, and the helper scripts.
+Each release archive contains the stripped daemon (`shard-db`), the TUI client (`shard-cli`), the upgrade runner (`migrate`), and a default `db.env.example`.
+
+> **Upgrading from a prior release?** Replace `build/bin/` with the new artifacts, then run `./migrate` once before starting the new daemon. See the [changelog](../reference/changelog.md) for the migrations each release runs.
 
 ## First run sanity check
 

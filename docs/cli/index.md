@@ -22,8 +22,8 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 | `insert` | `<dir> <obj> <key> '<json_value>'` | Insert (or overwrite) a record. Set `if_not_exists` via JSON mode. |
 | `get` | `<dir> <obj> <key>` | Retrieve a single record. |
 | `delete` | `<dir> <obj> <key>` | Delete a record by key. |
-| `exists` | `<dir> <obj> <key>` | Returns `{"exists":true/false}`. |
-| `size` | `<dir> <obj>` | Active record count; also returns tombstoned count when > 0. |
+| `exists` | `<dir> <obj> <key>` | Returns bare `true` / `false`. (Multi-key form keeps the `{key:bool}` dict shape.) |
+| `size` | `<dir> <obj>` | Bare integer — live record count, O(1) metadata read. Use `orphaned` for the tombstoned count. |
 
 ## Query
 
@@ -79,7 +79,8 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `db-dirs` | — | List registered tenant directories (from `dirs.conf`). |
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
 | `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `splits/4` shard count. No args = all tenants. |
-| `migrate-files` | — | One-shot upgrade step: lift any pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash-bucketed layout into the flat `<obj>/files/<filename>` layout. Walks every (dir, object) in `schema.conf`. Idempotent. Run once after upgrading the binary. |
+| `orphaned` | `<dir> <obj>` | Bare integer count of tombstoned-but-not-vacuumed slots. O(1) metadata read. New in 2026.05.1. |
+| `(./migrate)` | — | Per-release one-shot upgrade runner — separate binary at `build/bin/migrate`. Stops the daemon, runs every required migration for the release, restarts the daemon, exits. For 2026.05.1: `migrate-files` (lift pre-2026.05.2 `XX/XX/<filename>` to flat) + `reindex` (per-shard btree rebuild). |
 
 ## JSON query mode
 

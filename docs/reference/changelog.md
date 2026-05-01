@@ -4,9 +4,68 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## 2026.05.1 — 2026-05-01
+## 2026.05.1 — 2026-05-02 (reissued)
 
-The per-shard btree release.
+Originally released 2026-04-30 as the per-shard btree release. The tag was deleted and rebuilt 2026-05-02 with the response-shape overhaul + `./migrate` upgrade binary bundled in. **Replace your build from the prior 2026.05.1 download — read responses changed shape.**
+
+### Breaking — read response shapes
+
+Read modes now return bare values where possible. Update your client.
+
+| Mode | Before | After |
+|---|---|---|
+| `get` (single) | `{"key":"u1","value":{...}}` | `{...}` (bare value dict) |
+| `get` (multi) | `[{"key":"u1","value":{...}},...]` | `{"u1":{...},"missing":null,...}` (dict; missing → null; empty → `{}`) |
+| `exists` (single) | `{"exists":true}` | `true` |
+| `count` | `{"count":42}` | `42` |
+| `size` | `{"count":N}` (+ optional `orphaned`) | bare integer (live count only) |
+| `orphaned` (NEW) | — | bare integer (tombstoned slot count, O(1)) |
+
+Errors continue to come back as `{"error":"..."}` so clients can branch on JSON type to disambiguate. Multi-key `exists`, `keys`, `aggregate`, all writes, all admin/file/auth/stats modes are unchanged.
+
+### Added — `find` / `fetch` `format:"dict"`
+
+`format:"dict"` returns `{"k1":{...},"k2":{...}}` — O(1) lookup by primary key on the client side, round-trips with `bulk-insert`'s dict shape. Works on every find path including indexed planner branches (PRIMARY_LEAF, PRIMARY_INTERSECT, PRIMARY_KEYSET) and cursor pagination (envelope becomes `{"results":{...},"cursor":...}`). Rejected with `join` (joins force tabular). With `order_by`, dict iteration order is parser-dependent — use the default array or `format:"rows"` if strict iteration order matters.
+
+### Added — `bulk-update` accepts dict shape
+
+Both `records:` (inline) and `file:` payloads now accept either:
+
+- `{"k1":{...},"k2":{...}}` — round-trips with `get-multi`
+- `[{"id":"k1","data":{...}}, ...]` — existing array form
+
+Same as `bulk-insert` already worked.
+
+### Added — `./migrate` binary
+
+Per-release one-shot upgrade runner. Runs every required migration for the release with the daemon stopped, then exits. For 2026.05.1 it does:
+
+1. **migrate-files** — lift pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to flat `<obj>/files/<filename>` layout (filesystem-only, holds the same `.shard-db.lock` flock as the daemon).
+2. **reindex** — spawn `./shard-db start`, run `./shard-db reindex`, stop the daemon. Rebuilds every B+ tree under the per-shard layout shipped in 2026.05.1.
+
+Idempotent — re-running after a successful pass is a no-op. Linked into `build/bin/migrate` alongside `shard-db` and `shard-cli`.
+
+### Removed
+
+- `./shard-db migrate-files` CLI subcommand → moved to `./migrate`. Running it now redirects with a pointer to the new binary.
+- `{"mode":"migrate-files"}` JSON dispatch removed from the daemon.
+- `cmd_migrate_files()` (and its helpers) removed from query.c so the dead code doesn't ship with future releases.
+
+### Changed
+
+- **`bulk-insert-delimited` default delimiter is now `,`** (was `|`). Aligns with `bulk-update-delimited` and CSV format on `find`/`fetch`. Pass `delimiter:"|"` explicitly if you need pipes.
+- Documented that `bulk-insert` accepts both dict and array shapes (the parser already supported both — the doc was incomplete).
+
+### Upgrade procedure
+
+```bash
+./shard-db stop
+# replace build/bin/ contents with the new release artifacts
+./migrate                        # one-shot; idempotent
+./shard-db start
+```
+
+### Original 2026.05.1 — per-shard btree release
 
 ### Changed
 

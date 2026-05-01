@@ -35,12 +35,12 @@ Required: `mode`, `dir`, `object`, `criteria`.
 | `excludedKeys` | string OR array | none | Skip these keys from results. Comma-separated or array. |
 | `order_by` | string | — | Sort by this field; matches are buffered and sorted before pagination. |
 | `order` | `"asc"` or `"desc"` | `"asc"` | Sort direction when `order_by` is set. |
-| `format` | `"rows"` | JSON objects | Return tabular `{"columns":[...],"rows":[...]}`. Ignored when `join` is present (always tabular). |
+| `format` | `"rows"` / `"csv"` / `"dict"` | JSON array | See response shapes below. Ignored when `join` is present (always tabular). |
 | `join` | array | none | See [joins](joins.md). |
 
 ## Response
 
-**Default (JSON records):**
+**Default (JSON array of records):**
 
 ```json
 [
@@ -62,6 +62,19 @@ Required: `mode`, `dir`, `object`, `criteria`.
 ```
 
 Rows form is ~30% smaller on the wire and drops directly into spreadsheets / charting libraries.
+
+**With `"format":"dict"` (new in 2026.05.1):**
+
+```json
+{
+  "u1":{"name":"Alice","email":"a@x.com","age":30},
+  "u2":{"name":"Bob","email":"b@x.com","age":22}
+}
+```
+
+Dict form gives O(1) lookup by primary key on the client side and round-trips with `bulk-insert`'s dict shape. Combine with `cursor` and the envelope becomes `{"results":{...},"cursor":...}`. Rejected with `join` (joins force tabular). With `order_by`, dict iteration order is parser-dependent — use the default array or `format:"rows"` if you need strict client-side iteration order.
+
+**With `"format":"csv"`:** raw CSV text (no JSON envelope). See [overview](overview.md#csv-output).
 
 **With `"format":"csv"` (raw CSV, not JSON):**
 

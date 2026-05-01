@@ -42,11 +42,12 @@ shard-db is a file-based database in C with a key/value foundation plus full que
 ./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
 ./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
 ./tests/test-list-files.sh                # list-files mode + match (prefix/suffix/contains/glob) (49)
-./tests/test-migrate-files.sh             # one-shot pre-2026.05.2 → flat layout migration         (20)
+./tests/test-migrate-binary.sh            # ./migrate binary: migrate-files + reindex orchestration (23)
+./tests/test-bare-shapes.sh               # 2026.05.1 read response shapes: get/multi/exists/count/size/orphaned/find dict/fetch dict (24)
 ./tests/test-field-vs-field.sh            # eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (24)
 ./tests/test-regex.sh                     # POSIX regex / not_regex on varchar    (23)
 ./tests/test-stress-no-hang.sh            # 16 concurrent clients × 15s mixed ops, watchdog probes (4)
-# Total: 926 tests
+# Total: 970+ tests across 33 scripts
 
 # Benchmarks — all in bench/ folder
 ./bench/bench-queries.sh                  # find/count/aggregate on 1M users
@@ -182,11 +183,18 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db list-files <dir> <obj> [pattern] [offset] [limit] [--match=<prefix|suffix|contains|glob>]
 
 # Maintenance
-./shard-db size|recount|truncate|vacuum|backup <dir> <obj>
+./shard-db size <dir> <obj>                       # bare integer (live record count, O(1))
+./shard-db orphaned <dir> <obj>                   # bare integer (tombstoned slots, O(1)) — new in 2026.05.1
+./shard-db recount|truncate|vacuum|backup <dir> <obj>
 ./shard-db add-index <dir> <obj> <field> [-f]     # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>       # drop index (exact name match)
 ./shard-db reindex [dir] [obj]                    # rebuild indexes; no args = all tenants
-./shard-db migrate-files                          # one-shot upgrade: lift pre-2026.05.2 XX/XX file buckets into flat layout (idempotent)
+
+# Per-release one-shot upgrade — separate binary at build/bin/migrate.
+# 2026.05.1: lifts XX/XX file buckets to flat + rebuilds B+ trees under
+# the per-shard layout. Run with the daemon stopped; it manages start/stop.
+./migrate
+
 ./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
 
 # Diagnostics
@@ -205,6 +213,24 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 
 All advanced queries go through `./shard-db query '<json>'`.
 
+### Read response shapes (2026.05.1 breaking change)
+
+Read modes return bare values where possible. Errors still come back as `{"error":"..."}` so clients branch on JSON type to disambiguate.
+
+| Mode                  | Response                                                                          |
+|-----------------------|-----------------------------------------------------------------------------------|
+| `get` (single)        | bare value dict — `{"name":"alice","age":30}` (no `{key,value}` wrapper)          |
+| `get` (multi keys)    | `{"k1":{...},"k2":{...},"missing":null}` — dict keyed by primary key. Empty input → `{}`. |
+| `exists` (single)     | bare `true` / `false`                                                             |
+| `exists` (multi keys) | `{"k1":true,"k2":false}` (unchanged from prior release)                           |
+| `count`               | bare integer — `42`                                                               |
+| `size`                | bare integer (live record count, O(1) metadata)                                   |
+| `orphaned` (NEW)      | bare integer (tombstoned slot count, O(1) metadata)                               |
+| `find` / `fetch`      | default JSON array; `format:"rows"` / `format:"csv"` / `format:"dict"` (see below) |
+| `aggregate`           | unchanged from prior release                                                      |
+
+`find` / `fetch` `format:"dict"`: returns `{"k1":{...},"k2":{...}}`. With cursor active, envelope becomes `{"results":{...},"cursor":...}`. Rejects `join` (joins force tabular). With `order_by`, dict iteration order is parser-dependent — use the default array or `format:"rows"` if you need strict iteration order.
+
 ### Find / Count / Fetch
 
 ```json
@@ -212,7 +238,7 @@ All advanced queries go through `./shard-db query '<json>'`.
  "criteria":[{"field":"age","op":"gt","value":"30"}],
  "offset":0,"limit":100,
  "fields":["id","name"],
- "format":"rows"}           // optional: "rows" = tabular {"columns":[...],"rows":[[...]]}
+ "format":"rows"}           // optional: "rows" / "csv" / "dict" (see table above)
 ```
 
 ### Find cursor (keyset pagination)
@@ -434,7 +460,7 @@ Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driv
 
 Files live at `$DB_ROOT/<dir>/<obj>/files/<filename>` — flat, basename is the lookup key. Filenames are validated (no `/`, `\`, `..`, control chars, ≤255 bytes).
 
-Pre-2026.05.2 stored at `<obj>/files/<XX>/<XX>/<filename>` (xxh128 hash buckets). The bucketing was vestigial — filenames were already the unique key. Existing installs upgrade with a one-shot `./shard-db migrate-files` (walks every (dir, obj) in schema.conf, lifts each leaf into place; idempotent).
+Pre-2026.05.2 stored at `<obj>/files/<XX>/<XX>/<filename>` (xxh128 hash buckets). The bucketing was vestigial — filenames were already the unique key. Existing installs upgrade with the one-shot `./migrate` binary (walks every (dir, obj) in schema.conf, lifts each leaf into place; idempotent).
 
 Remote-safe (base64 in JSON):
 - `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.

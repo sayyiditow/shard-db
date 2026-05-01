@@ -67,7 +67,7 @@ See [Concepts → Storage model](../concepts/storage-model.md) for what's actual
 ./shard-db get default users u1
 ```
 ```json
-{"key":"u1","value":{"name":"Alice","email":"alice@example.com","age":30,"balance":"1500.75","active":true,"created":"20260418153012"}}
+{"name":"Alice","email":"alice@example.com","age":30,"balance":"1500.75","active":true,"created":"20260418153012"}
 ```
 
 ## 5. Find by indexed field
