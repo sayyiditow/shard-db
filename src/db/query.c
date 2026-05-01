@@ -3155,8 +3155,10 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     int matched = 0, skipped = 0;
 
     const char *p = json_skip(json);
-    if (*p != '[') {
-        OUT("{\"error\":\"bulk-update JSON must be a top-level array\"}\n");
+    int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}}    — round-trips with get-multi */
+    int is_array_format  = (*p == '[');  /* [{"id":"k1","data":{...}},...] */
+    if (!is_object_format && !is_array_format) {
+        OUT("{\"error\":\"bulk-update JSON must be a top-level object or array\"}\n");
         if (json_mmaped) munmap((void *)json, len);
         else if (input_is_file) free(json);
         free(records);
@@ -3171,45 +3173,67 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     while (*p) {
         p = json_skip(p);
-        if (*p == ']') break;
+        if (*p == ']' || *p == '}') break;
         if (*p == ',') { p++; continue; }
-        if (*p != '{') { p++; continue; }
-
-        const char *obj_start = p;
-        const char *obj_end = json_skip_value(p);
-        size_t obj_len = obj_end - obj_start;
-
-        char obj_buf[8192];
-        char *obj_str;
-        int obj_heap = 0;
-        if (obj_len < sizeof(obj_buf)) {
-            memcpy(obj_buf, obj_start, obj_len);
-            obj_buf[obj_len] = '\0';
-            obj_str = obj_buf;
-        } else {
-            obj_str = malloc(obj_len + 1);
-            memcpy(obj_str, obj_start, obj_len);
-            obj_str[obj_len] = '\0';
-            obj_heap = 1;
-        }
-
-        JsonObj rec;
-        json_parse_object(obj_str, obj_len, &rec);
 
         char *key = NULL; size_t klen = 0;
-        const char *iv; size_t ivl;
-        if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
-            key = malloc(ivl + 1);
-            memcpy(key, iv, ivl);
-            key[ivl] = '\0';
-            klen = ivl;
-        }
-
-        const char *dv; size_t dl;
         const char *data_str = NULL;
-        if (json_obj_get(&rec, "data", &dv, &dl)) {
-            data_str = dv;
-            (void)dl;
+        const char *obj_end = NULL;
+        char obj_buf[8192];
+        char *obj_str = NULL;
+        int obj_heap = 0;
+
+        if (is_object_format) {
+            /* "key": {...} */
+            if (*p != '"') { p++; continue; }
+            p++;
+            const char *key_start = p;
+            while (*p && *p != '"') p++;
+            klen = p - key_start;
+            key = malloc(klen + 1);
+            memcpy(key, key_start, klen);
+            key[klen] = '\0';
+            if (*p == '"') p++;
+            p = json_skip(p);
+            if (*p == ':') p = json_skip(p + 1);
+
+            /* Data span points into the original mmap; json_get_fields scans
+               by brace-count so the trailing comma/} doesn't matter. */
+            data_str = p;
+            obj_end = json_skip_value(p);
+        } else {
+            if (*p != '{') { p++; continue; }
+            const char *obj_start = p;
+            obj_end = json_skip_value(p);
+            size_t obj_len = obj_end - obj_start;
+
+            if (obj_len < sizeof(obj_buf)) {
+                memcpy(obj_buf, obj_start, obj_len);
+                obj_buf[obj_len] = '\0';
+                obj_str = obj_buf;
+            } else {
+                obj_str = malloc(obj_len + 1);
+                memcpy(obj_str, obj_start, obj_len);
+                obj_str[obj_len] = '\0';
+                obj_heap = 1;
+            }
+
+            JsonObj rec;
+            json_parse_object(obj_str, obj_len, &rec);
+
+            const char *iv; size_t ivl;
+            if (json_obj_unquoted(&rec, "id", &iv, &ivl)) {
+                key = malloc(ivl + 1);
+                memcpy(key, iv, ivl);
+                key[ivl] = '\0';
+                klen = ivl;
+            }
+
+            const char *dv; size_t dl;
+            if (json_obj_get(&rec, "data", &dv, &dl)) {
+                data_str = dv;
+                (void)dl;
+            }
         }
 
         if (!key || !data_str) {
@@ -4151,6 +4175,37 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
     (*printed)++;
 }
 
+/* Emit a record as a dict entry: "key":<value-json> (with leading comma when needed) */
+void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
+                       const char **proj_fields, int proj_count,
+                       int *printed, FieldSchema *fs) {
+    char *key = malloc(hdr->key_len + 1);
+    memcpy(key, block, hdr->key_len);
+    key[hdr->key_len] = '\0';
+
+    const char *raw = (const char *)block + hdr->key_len;
+
+    OUT("%s\"%s\":", *printed ? "," : "", key);
+    if (proj_count > 0) {
+        OUT("{");
+        int first = 1;
+        for (int i = 0; i < proj_count; i++) {
+            char *pv = decode_field(raw, hdr->value_len, proj_fields[i], fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}");
+    } else {
+        char *val = decode_value(raw, hdr->value_len, fs);
+        OUT("%s", val);
+        free(val);
+    }
+    free(key);
+    (*printed)++;
+}
+
 /* Emit a record as a JSON array row: ["key","v1","v2",...] */
 void print_record_row(const SlotHeader *hdr, const uint8_t *block,
                       const char **proj_fields, int proj_count,
@@ -4308,6 +4363,7 @@ int cmd_fetch(const char *db_root, const char *object,
                      const char *cursor, const char *format,
                      const char *delimiter) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
+    int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     if (limit <= 0) limit = g_global_limit;
     Schema sch = load_schema(db_root, object);
@@ -4383,6 +4439,8 @@ int cmd_fetch(const char *db_root, const char *object,
         csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count, fs_ptr, csv_delim);
     else if (rows_fmt)
         emit_rows_columns(proj_fields, proj_count, fs_ptr);
+    else if (dict_fmt)
+        OUT("{\"results\":{");
     else
         OUT("{\"results\":[");
 
@@ -4422,6 +4480,8 @@ int cmd_fetch(const char *db_root, const char *object,
                 printed++;
             } else if (rows_fmt)
                 print_record_row(hdr, block, proj_fields, proj_count, &printed, fs_ptr);
+            else if (dict_fmt)
+                print_record_dict(hdr, block, proj_fields, proj_count, &printed, fs_ptr);
             else
                 print_record_json(hdr, block, proj_fields, proj_count, &printed, fs_ptr);
             next_path = pi;
@@ -4433,10 +4493,12 @@ int cmd_fetch(const char *db_root, const char *object,
     /* Build next cursor — CSV mode omits cursor (streaming export). */
     if (csv_delim) {
         /* Nothing more to append; body already ends with \n per row. */
-    } else if (printed >= limit && next_path >= 0) {
-        OUT("],\"cursor\":\"%d:%zu\"}\n", next_path, next_slot);
     } else {
-        OUT("],\"cursor\":null}\n");
+        const char *close = dict_fmt ? "}" : "]";
+        if (printed >= limit && next_path >= 0)
+            OUT("%s,\"cursor\":\"%d:%zu\"}\n", close, next_path, next_slot);
+        else
+            OUT("%s,\"cursor\":null}\n", close);
     }
 
     for (int i = 0; i < path_count; i++) free(paths[i]);
@@ -4498,6 +4560,7 @@ typedef struct {
     ExcludedKeys excluded;
     FieldSchema *fs;
     int rows_fmt;
+    int dict_fmt;
     char csv_delim;       /* 0 = not CSV; else delimiter char, overrides rows_fmt */
     /* Joins (when njoins > 0, output is always tabular even if rows_fmt==0) */
     const char *driver_object;
@@ -5816,6 +5879,24 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                         }
                     }
                     OUT("]");
+                } else if (sc->dict_fmt) {
+                    OUT("%s\"%s\":", sc->printed ? "," : "", key);
+                    if (sc->proj_count > 0) {
+                        OUT("{");
+                        int first = 1;
+                        for (int i = 0; i < sc->proj_count; i++) {
+                            char *pv = decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            if (!pv) continue;
+                            OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[i], pv);
+                            first = 0;
+                            free(pv);
+                        }
+                        OUT("}");
+                    } else {
+                        char *val = decode_value(raw, hdr->value_len, sc->fs);
+                        OUT("%s", val);
+                        free(val);
+                    }
                 } else if (sc->proj_count > 0) {
                     OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", key);
                     int first = 1;
@@ -8384,6 +8465,7 @@ typedef struct {
     const char   **proj_fields;
     int            proj_count;
     int            rows_fmt;
+    int            dict_fmt;
     int            limit;
     int            printed;
 
@@ -8490,6 +8572,25 @@ static int cursor_find_cb(const char *val, size_t vlen,
             }
         }
         OUT("]");
+    } else if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, h->value_len,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)raw, h->value_len, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
     } else if (c->proj_count > 0) {
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
@@ -8536,6 +8637,7 @@ int cmd_find(const char *db_root, const char *object,
                     const char *order_by, const char *order_dir,
                     const char *cursor_json) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
+    int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
 
     /* Parse joins (if any) — forces tabular output irrespective of `format`. */
@@ -8548,6 +8650,12 @@ int cmd_find(const char *db_root, const char *object,
         }
     }
     int has_joins = (njoins > 0);
+
+    if (dict_fmt && has_joins) {
+        OUT("{\"error\":\"format=dict is not supported with join\"}\n");
+        free_joins(joins, njoins);
+        return -1;
+    }
 
     Schema sch = load_schema(db_root, object);
     char data_dir[PATH_MAX];
@@ -8683,15 +8791,17 @@ int cmd_find(const char *db_root, const char *object,
         cc.proj_fields = proj_count > 0 ? proj_fields : NULL;
         cc.proj_count  = proj_count;
         cc.rows_fmt    = rows_fmt;
+        cc.dict_fmt    = dict_fmt;
         cc.limit       = limit;
         cc.printed     = 0;
         cc.order_tf    = order_tf;
         cc.order_field_idx = order_field_idx;
         cc.deadline    = &cdl;
 
-        /* Cursor response always uses the {rows:[...],cursor:...} wrapper so
-           clients get a single stable shape regardless of rows_fmt. */
-        OUT("{\"rows\":[");
+        /* Cursor response always uses the {rows:..., cursor:...} wrapper so
+           clients get a single stable shape regardless of format. dict_fmt
+           swaps the inner array for an object. */
+        OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
         if (desc) {
             /* DESC: walk backward. Upper bound = cursor value (inclusive),
                lower bound = "". Ties still handled in the callback. */
@@ -8713,7 +8823,7 @@ int cmd_find(const char *db_root, const char *object,
                                    "\xff\xff\xff\xff", 4, 0,
                                    0, cursor_find_cb, &cc);
         }
-        OUT("]");
+        OUT(dict_fmt ? "}" : "]");
 
         /* Emit next-page cursor if we actually hit the limit (there might be
            more). If printed < limit the walk drained to the end → null. */
@@ -8759,6 +8869,8 @@ int cmd_find(const char *db_root, const char *object,
     } else if (rows_fmt) {
         emit_rows_columns(proj_fields, proj_count,
                           (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL);
+    } else if (dict_fmt) {
+        OUT("{");
     } else {
         OUT("[");
     }
@@ -8843,6 +8955,24 @@ int cmd_find(const char *db_root, const char *object,
                     }
                 }
                 OUT("]");
+            } else if (dict_fmt) {
+                OUT("%s\"%s\":", printed ? "," : "", r->key);
+                if (proj_count > 0) {
+                    OUT("{");
+                    int first = 1;
+                    for (int j = 0; j < proj_count; j++) {
+                        char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        if (!pv) continue;
+                        OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                        first = 0;
+                        free(pv);
+                    }
+                    OUT("}");
+                } else {
+                    char *v = decode_value((const char *)val, r->value_len, &driver_fs);
+                    OUT("%s", v);
+                    free(v);
+                }
             } else if (proj_count > 0) {
                 OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", r->key);
                 int first = 1;
@@ -8889,6 +9019,7 @@ int cmd_find(const char *db_root, const char *object,
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT("]}\n");
+            else if (dict_fmt) OUT("}\n");
             else OUT("]\n");
             free_excluded(&excluded); free_criteria_tree(tree); free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
@@ -8905,6 +9036,7 @@ int cmd_find(const char *db_root, const char *object,
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
             if (csv_delim) { /* no envelope to close */ }
             else if (has_joins || rows_fmt) OUT("]}\n");
+            else if (dict_fmt) OUT("}\n");
             else OUT("]\n");
             free_excluded(&excluded);
             free_criteria_tree(tree);
@@ -8916,7 +9048,7 @@ int cmd_find(const char *db_root, const char *object,
         /* ===== FULL SCAN FALLBACK ===== */
         AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
                              proj_fields, proj_count, excluded, &driver_fs,
-                             rows_fmt, csv_delim,
+                             rows_fmt, dict_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0,
                              PTHREAD_MUTEX_INITIALIZER };
         scan_shards(data_dir, sch.slot_size, adv_search_cb, &ctx);
@@ -8929,6 +9061,8 @@ int cmd_find(const char *db_root, const char *object,
         { /* CSV body already ends with its own \n per row — nothing to close */ }
     else if (rows_fmt)
         OUT("]}\n");
+    else if (dict_fmt)
+        OUT("}\n");
     else
         OUT("]\n");
     free_excluded(&excluded);

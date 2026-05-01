@@ -104,9 +104,19 @@ echo "=== negative: missing records and criteria ==="
 out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t"}' 2>&1)
 assert_contains "no input → error" 'requires criteria' "$out"
 
-echo "=== negative: malformed (object instead of array) ==="
-out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","records":{"id":"k1"}}' 2>&1)
-assert_contains "non-array records → error" 'top-level array' "$out"
+echo "=== dict-form records (round-trips with get-multi) ==="
+# Patch only fields that the criteria-form test below doesn't read, so test ordering stays intact.
+out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","records":{"k1":{"amount":111},"k2":{"amount":250}}}' 2>&1)
+assert_contains "dict-form returns matched=2"  '"matched":2' "$out"
+assert_contains "dict-form returns updated=2"  '"updated":2' "$out"
+g=$($BIN query '{"mode":"get","dir":"default","object":"budj_t","key":"k1"}')
+assert_contains "dict-form patched k1 amount" '"amount":111' "$g"
+g=$($BIN query '{"mode":"get","dir":"default","object":"budj_t","key":"k2"}')
+assert_contains "dict-form patched k2 amount" '"amount":250' "$g"
+
+echo "=== negative: malformed top-level (neither array nor object) ==="
+out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","records":"not-json-records"}' 2>&1)
+assert_contains "scalar records → error" 'top-level object or array' "$out"
 
 echo "=== existing criteria-form bulk-update still works (no regression) ==="
 out=$($BIN query '{"mode":"bulk-update","dir":"default","object":"budj_t","criteria":[{"field":"status","op":"eq","value":"refunded"}],"value":{"note":"audited"}}')

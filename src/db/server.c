@@ -1301,7 +1301,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *delim = json_obj_strdup(&req, "delimiter");
         char *ifne_s = json_obj_strdup(&req, "if_not_exists");
         int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
-        char d = (delim && delim[0]) ? delim[0] : '|'; /* default pipe */
+        char d = (delim && delim[0]) ? delim[0] : ',';
         cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
         free(file); free(delim); free(ifne_s);
     } else if (strcmp(mode, "bulk-delete") == 0) {
