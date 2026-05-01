@@ -41,7 +41,7 @@ esac
 # safely and we never act on the truncated result. The CodeQL +
 # scan-build + cppcheck CI workflows catch real format-string issues
 # more reliably than -Wformat-truncation does.
-WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter"
+WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter -Wno-address-of-packed-member"
 
 BUILD_MODE="${BUILD_MODE:-release}"
 case "$BUILD_MODE" in
