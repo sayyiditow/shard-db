@@ -162,7 +162,9 @@ Records are stored in a fixed-slot typed binary format driven by fields.conf.
 ./shard-db fetch <dir> <obj> [off] [lim] [fields]
 
 # Bulk
-./shard-db bulk-insert <dir> <obj> [file]         # JSON: [{"id":"k","data":{...}},...]
+./shard-db bulk-insert <dir> <obj> [file]         # JSON, either shape:
+                                                  #   {"k1":{...},"k2":{...}}                   (dict — round-trips with get-multi)
+                                                  #   [{"id":"k1","data":{...}}, ...]           (array — explicit id/data pairs)
                                                   # Acts as upsert — overwriting an existing
                                                   # key drops stale index entries before writing.
                                                   # For indexed bulk-insert at scale: prefer
