@@ -1,6 +1,6 @@
 # shard-db
 
-A file-based sharded database in C. Started as a key/value store; now a small-scale database with typed binary records, B+ tree indexes, joins, aggregates, and CAS, served by a multi-threaded TCP server. Single static binary, no external dependencies.
+A high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3.
 
 ## What it is
 

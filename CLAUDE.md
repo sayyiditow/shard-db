@@ -1,523 +1,238 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
 
 ## Overview
 
-shard-db is a file-based database in C with a key/value foundation plus full query features (find, count, aggregate, joins, CAS). Inspired by chronicle-db. xxh128 hashing, mmap for reads and writes, typed binary records via fields.conf, linear probing, per-shard rwlock, multi-threaded TCP server, async logging, 38 search operators.
+shard-db is a high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64; macOS port planned for 2026.05.2.
 
-## Build & Test
+## Build & test
 
 ```bash
-./build.sh                          # compile shard-db + shard-cli, populate build/bin/
-# Builds two binaries: shard-db (daemon, ~324K stripped) and shard-cli
-# (ncurses TUI, ~60K stripped, separate from the daemon).
-
-# Tests — all in tests/ folder, start/stop server automatically, portable CWD
-./tests/test-objlock.sh                   # Schema mutation locking + key ceiling (18)
-./tests/test-rename-field.sh              # rename-field correctness              (24)
-./tests/test-remove-field.sh              # remove-field + vacuum --compact       (35)
-./tests/test-vacuum-addfield.sh           # vacuum + add-field                    (50)
-./tests/test-parallel-index-integrity.sh  # Concurrent bulk-insert integrity      (23)
-./tests/test-joins.sh                     # Join support                          (17)
-./tests/test-cli-shortcuts.sh             # count/aggregate CLI + delete-file     (28)
-./tests/test-or-logic.sh                  # OR criteria, all four shapes          (43)
-./tests/test-csv-export.sh                # CSV on find/fetch/aggregate/get/keys/exists (37)
-./tests/test-per-tenant-auth.sh           # Per-tenant token scoping              (27)
-./tests/test-token-perms.sh               # Per-object tokens + r/rw/rwx perms    (37)
-./tests/test-request-timeout.sh           # Per-request timeout_ms                (10)
-./tests/test-bulk-update-delimited.sh     # CSV per-key partial update            (34)
-./tests/test-binary-index.sh              # Binary-native B+ tree keys + reindex  (21)
-./tests/test-find-cursor.sh               # Keyset cursor pagination on find      (41)
-./tests/test-tls.sh                       # Native TLS 1.3 (auto-skips if no openssl) (12)
-./tests/test-and-intersection.sh          # AND index intersection (count/find/agg) (27)
-./tests/test-describe.sh                  # list-objects + describe-object        (26)
-./tests/test-tenant-mgmt.sh               # add-dir/remove-dir + remove-token by fingerprint (17)
-./tests/test-bulk-cas.sh                  # CAS on bulk-insert / bulk-update / bulk-delete (58)
-./tests/test-schema-export.sh             # export-schema / import-schema CLI argv form (40)
-./tests/test-stats-prom.sh                # Prometheus text-format exposition     (57)
-./tests/test-bulk-upsert.sh               # bulk-insert as true upsert + idx drift (15)
-./tests/test-bulk-update-json.sh          # bulk-update JSON per-key partial update (24)
-./tests/test-agg-neq-shortcut.sh          # aggregate NEQ algebraic shortcut       (21)
-./tests/test-length-ops.sh                # len_eq/lt/gt/lte/gte/between/neq on varchar (23)
-./tests/test-case-sensitivity.sh          # CS like/contains/starts/ends + CI i-variants (41)
-./tests/test-list-files.sh                # list-files mode + match (prefix/suffix/contains/glob) (49)
-./tests/test-migrate-binary.sh            # ./migrate binary: migrate-files + reindex orchestration (23)
-./tests/test-bare-shapes.sh               # 2026.05.1 read response shapes: get/multi/exists/count/size/orphaned/find dict/fetch dict (24)
-./tests/test-field-vs-field.sh            # eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (24)
-./tests/test-regex.sh                     # POSIX regex / not_regex on varchar    (23)
-./tests/test-stress-no-hang.sh            # 16 concurrent clients × 15s mixed ops, watchdog probes (4)
-# Total: 970+ tests across 33 scripts
-
-# Benchmarks — all in bench/ folder
-./bench/bench-queries.sh                  # find/count/aggregate on 1M users
-./bench/bench-joins.sh [count]            # join throughput
-./bench/bench-kv.sh / bench-kv-parallel.sh # bulk insert throughput
-./bench/bench-invoice.sh / bench-parallel.sh # 14-index invoice scenario
+./build.sh                       # builds shard-db (daemon, ~324K), shard-cli (TUI, ~60K), migrate (one-shot upgrades) → build/bin/
+./tests/<name>.sh                # one test; each starts/stops its own server, portable CWD
 ```
 
-## Architecture
+Test scripts (33 total, ~970 assertions; names are self-descriptive — `ls tests/` to enumerate):
 
-### Daemon source files (src/db/)
+```
+test-objlock.sh                  test-cli-shortcuts.sh        test-bulk-cas.sh
+test-rename-field.sh             test-or-logic.sh             test-schema-export.sh
+test-remove-field.sh             test-csv-export.sh           test-stats-prom.sh
+test-vacuum-addfield.sh          test-per-tenant-auth.sh      test-bulk-upsert.sh
+test-parallel-index-integrity.sh test-token-perms.sh          test-bulk-update-json.sh
+test-joins.sh                    test-request-timeout.sh      test-agg-neq-shortcut.sh
+test-bulk-update-delimited.sh    test-binary-index.sh         test-length-ops.sh
+test-find-cursor.sh              test-tls.sh                  test-case-sensitivity.sh
+test-and-intersection.sh         test-describe.sh             test-list-files.sh
+test-tenant-mgmt.sh              test-migrate-binary.sh       test-bare-shapes.sh
+test-field-vs-field.sh           test-regex.sh                test-stress-no-hang.sh
+```
 
-- **types.h** — Shared types, externs, function declarations
-- **util.c** — Utilities, JSON helpers
-- **config.c** — db.env, schema/index/dirs caches, typed-field encode/decode
-- **storage.c** — Hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache
-- **index.c** — B+ tree indexing, parallel indexing
-- **query.c** — Find, count, aggregate, joins, bulk ops, maintenance
-- **server.c** — Multi-threaded TCP server (epoll), JSON dispatch, auth (token + IP allowlist), stats. Optional native TLS 1.3 via OpenSSL (single-port, opt-in via `TLS_ENABLE=1` in db.env); plaintext TCP otherwise. Reverse-proxy termination (nginx `stream`, HAProxy, stunnel) remains a fully supported alternative for shops with existing cert pipelines.
-- **tls.c / tls.h** — OpenSSL wrapper: server/client `SSL_CTX` init, handshake helpers, `tls_fopen()` wraps an `SSL *` as a stdio `FILE *` via `fopencookie` (Linux) / `funopen` (macOS) so every existing `OUT()` / `fgets()` call site stays untouched.
-- **main.c** — CLI entry point
-- **btree.h / btree.c** — B+ tree index (page-based, prefix-compressed leaves, mmap'd)
-- **objlock.c** — Per-object rwlock (normal ops share; vacuum/rebuild exclusive)
+Bench scripts live in `bench/`. **The user runs benches**; do not run them to validate perf.
 
-### shard-cli (src/cli/)
+## Source layout
 
-Separate ncurses TUI binary. Connects to the daemon over the same TCP+TLS wire as the existing CLI; reads `HOST`/`PORT`/`TLS_ENABLE`/`TLS_CA`/`TLS_SKIP_VERIFY`/`TOKEN` from environment (source `db.env` before launch).
+### Daemon (`src/db/`)
 
-- **cli.h** — declarations for connection, widgets, views, criteria builder, ObjectInfo cache.
-- **conn.c** — self-contained TCP+TLS client (mirrors server.c's `ClientConn` but doesn't link the daemon source).
-- **widgets.c** — primitives: menu, pick (single-value picker), form (FF_TEXT/FF_NUMBER/FF_CHOICE), alert/confirm modals, status bar.
-- **views.c** — output panels: text scroll, JSON object as kv-pairs, JSON array as table, live stats refresh; tiny JSON parser tailored to shard-db response shapes; `describe_object()` populates an `ObjectInfo` cache; `tui_criteria_builder()` 6-row × 3-column form that emits a JSON criteria array.
-- **main.c** — entry, env load, top-level menu dispatch.
+- `types.h` — shared types, externs, function declarations
+- `util.c` — JSON helpers, `b64_encode/decode`, `valid_filename`
+- `config.c` — db.env, schema/index/dirs caches, typed-field encode/decode (`encode_field_len`)
+- `storage.c` — xxh128 hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache, `build_idx_path`, `compute_addr`
+- `index.c` — per-shard B+ tree wrappers (`btree_idx_*`), parallel indexing, `reindex_clean_legacy`
+- `query.c` — find, count, aggregate, joins, bulk ops, planner (`choose_primary_source`), maintenance
+- `server.c` — multi-threaded TCP server (epoll), JSON dispatch, auth, stats, optional TLS
+- `tls.c / tls.h` — OpenSSL wrapper; `tls_fopen()` wraps `SSL *` as a stdio `FILE *` via fopencookie/funopen so existing OUT() / fgets() call sites stay untouched
+- `btree.c / btree.h` — B+ tree (page-based, prefix-compressed leaves, mmap'd, `BtRangeIter`, unified `bt_acquire/bt_release`)
+- `objlock.c` — per-object rwlock (normal ops share; vacuum/rebuild exclusive)
+- `keyset.c` — lock-free open-addressed hash table of 16-byte xxh128 keys (OR-union + AND-intersect candidates)
+- `main.c` — CLI entry point
 
-Top-level menus: **Server** (start/stop/status), **Browse** (db-dirs → list-objects → describe-object), **Query** (insert/get/find/count/exists with criteria builder), **Schema** (create/drop-object, add/remove/rename-field, add/remove-index), **Maintenance** (vacuum/recount/truncate/backup), **Auth** (list/add/remove tokens + trusted IPs), **Stats** (5s live refresh). Builds to `./shard-cli` at the repo root, copied to `build/bin/` alongside `shard-db`. Daemon code is untouched — the TUI just composes existing JSON modes.
+### shard-cli (`src/cli/`)
 
-### Configuration
+Separate ncurses TUI binary; links no daemon source. Speaks the same TCP+TLS wire; reads `HOST`/`PORT`/`TLS_*`/`TOKEN` from env (source `db.env` first).
 
-- **db.env** — Config: `DB_ROOT`, `PORT`, `TIMEOUT` (seconds, 0=off), `LOG_DIR`, `LOG_LEVEL`, `LOG_RETAIN_DAYS`, `INDEX_PAGE_SIZE`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX`, `QUERY_BUFFER_MB` (per-query intermediate buffer cap, default 500), `DISABLE_LOCALHOST_TRUST` (strict mode, default 0), `TOKEN_CAP` (token table bucket count, default 1024), `SLOW_QUERY_MS` (floor 100ms, 0=off)
-- **$DB_ROOT/tokens.conf** — Global / admin API tokens (one per line). Line format: `token[:perm]` where `perm ∈ {r, rw, rwx}`; no suffix = `rwx` (admin, backward-compatible with pre-perm files).
-- **$DB_ROOT/\<dir\>/tokens.conf** — Per-tenant tokens. Same line format. Scope covers any object within `<dir>`.
-- **$DB_ROOT/\<dir\>/\<object\>/tokens.conf** — Per-object tokens. Same line format. Scope covers only that one object.
-- **$DB_ROOT/allowed_ips.conf** — Trusted IPs (skip token check entirely; global only — no per-tenant IP lists)
-- **$DB_ROOT/dirs.conf** — Allowed tenant directories
-- **$DB_ROOT/schema.conf** — Per-object: `dir:object:splits:max_key:max_value:prealloc_mb`
-- **$DB_ROOT/\<dir\>/\<object\>/fields.conf** — Typed field schema, one per line: `name:type[:size|P,S][:default=...]`
+`cli.h` (decls), `conn.c` (self-contained TCP+TLS client), `widgets.c` (menu/picker/form/modals/status), `views.c` (panels + tiny JSON parser + `describe_object()` cache + criteria builder), `main.c` (entry, env load, top-level dispatch).
 
-### Storage layout
+Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. Builds to `./shard-cli` and `build/bin/shard-cli`.
 
-- **Shard files**: `data/NNN.bin` (3 hex digits, supports 4096 shards max = `MAX_SPLITS`)
-- **Slot header** (24 bytes): 16-byte xxh128 hash, 2-byte flag, 2-byte key_len, 4-byte value_len
-- **Slot file layout**: `[ShardHeader: 32B][Zone A: slots × 24B headers][Zone B: slots × slot_size payloads]`
-- **Addressing**: `shard = hash[0..1] % splits`, `slot = hash[2..5] % slots_per_shard`, linear probing
-- **Dynamic shard growth**: 50% load → double `slots_per_shard` (no slot cap, grows as data grows). `MAX_SPLITS=4096` is the cap on the *number of shard files* per object (3 hex digits in `NNN.bin`), not on slots.
-- **All I/O via mmap**: MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads
-- **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup
-- **Concurrency**: per-ucache-entry rwlock (shared for read, exclusive for write); per-object rwlock for schema mutations
-- **Index layout**: Each indexed field is sharded into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx` (3-hex, matches data shard naming). Writes route by xxh128 to one shard; reads fan out across all shards in parallel; cursor pagination uses a streaming k-way merge across per-shard `BtRangeIter`s for global ordering. The btree cache mirrors ucache (per-file pthread_rwlock_t, persistent MAP_SHARED, LRU eviction at `BT_CACHE_MAX = FCACHE_MAX/4`).
-- **Multi-tenancy**: `dir` parameter in every data query, validated against dirs.conf
-- **Logging**: Async ring buffer, separate info/error files by date, auto-retention
+## Configuration files
 
-### Typed binary record format
+- `db.env` — `DB_ROOT`, `PORT`, `TIMEOUT`, `LOG_*`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX = FCACHE_MAX/4`, `QUERY_BUFFER_MB`, `DISABLE_LOCALHOST_TRUST`, `TOKEN_CAP`, `SLOW_QUERY_MS`, TLS knobs (`TLS_ENABLE`, `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`). Full reference: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
+- `$DB_ROOT/tokens.conf` — global tokens. Line format `token[:perm]`, `perm ∈ {r, rw, rwx}`, no suffix = `rwx`.
+- `$DB_ROOT/<dir>/tokens.conf` — per-tenant tokens (same format).
+- `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).
+- `$DB_ROOT/allowed_ips.conf` — global trusted IPs (skip token check).
+- `$DB_ROOT/dirs.conf` — allowed tenant directories.
+- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key:max_value:prealloc_mb`.
+- `$DB_ROOT/<dir>/<obj>/fields.conf` — `name:type[:size|P,S][:default=...]`.
 
-Records are stored in a fixed-slot typed binary format driven by fields.conf.
+## Storage model (high-level)
 
-- **varchar:N** — `[uint16 BE length][content]` → on-disk = N+2 bytes. Max content **65535 bytes**.
-- **int/long/short** — 4/8/2 bytes big-endian signed
-- **double** — 8 bytes IEEE 754
-- **bool/byte** — 1 byte
-- **date** — 4 bytes big-endian int32 (`yyyyMMdd`)
-- **datetime** — 6 bytes (`yyyyMMdd` BE int32 + `HHmmss` packed BE uint16)
-- **numeric:P,S** — 8 bytes big-endian int64 × 10^S (decimal fixed-point)
+- **Shard files**: `data/NNN.bin` (3 hex digits, max 4096 = `MAX_SPLITS`).
+- **Slot header** (24B): 16B xxh128 hash, 2B flag, 2B key_len, 4B value_len.
+- **Layout**: `[ShardHeader 32B][Zone A: slots × 24B headers][Zone B: slots × slot_size payloads]`.
+- **Addressing**: `shard = hash[0..1] % splits`, `slot = hash[2..5] % slots_per_shard`, linear probing.
+- **Dynamic growth**: 50% load → double `slots_per_shard`. `MAX_SPLITS=4096` caps shard *files*, not slots.
+- **I/O**: mmap throughout — MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads.
+- **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
+- **Concurrency**: per-ucache-entry rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
+- **Index layout**: each indexed field shards into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`, `idx_shard_for_data_shard(s) = s/4`.
 
-### Field defaults (in fields.conf)
+Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [docs/concepts/indexes.md](docs/concepts/indexes.md), [docs/concepts/concurrency.md](docs/concepts/concurrency.md).
 
-- `:default=<literal>` — constant on INSERT
-- `:auto_create` — server datetime on INSERT
-- `:auto_update` — server datetime on INSERT and every UPDATE
-- `:default=seq(<name>)` — call cmd_sequence, next value on INSERT
-- `:default=uuid()` — UUID v4 on INSERT
-- `:default=random(N)` — N random bytes hex on INSERT
+## Typed binary record format
 
-### Indexes
+Driven by fields.conf. One slot = sum of field sizes (fixed).
 
-- **B+ tree** with prefix-compressed leaves (anchors every K=16 entries, two-stage bsearch)
-- **Per-shard layout**: every indexed field is split into `splits/4` btree files (`indexes/<field>/<NNN>.idx`). `splits` is locked to powers of 2 in [8, 4096]; `index_splits_for(splits) = splits/4` is derived at runtime — no separate config knob. Path constructor: `build_idx_path(buf, db_root, object, field, idx_shard_id)`. Hash routing: `idx_shard_for_hash(hash16, splits)` and the data-shard variant `idx_shard_for_data_shard(data_shard) = data_shard / 4` (contiguous coverage so idx-shard X covers data-shards X*4..X*4+3).
-- **Wrapper API** (`index.c`, declared in `types.h`): `btree_idx_insert/delete` (route to one shard), `btree_idx_search/range/range_ex` (fan out across all shards, callback fires in arbitrary inter-shard order), `btree_idx_walk_ordered` (k-way streaming merge for cursor pagination), `btree_idx_unlink_all/exists` (admin ops on the per-shard directory). Reindex sweeps any pre-2026.05.1 single-file `<field>.idx` artefacts (`reindex_clean_legacy`).
-- Single field: `indexes:["name"]`
-- Composite: `indexes:["country+zip"]` (concatenated field values; the literal `+`-joined name becomes the directory name on disk)
-- **All 38 search operators** use index when available: eq, neq, lt, gt, lte, gte, between, in, not_in, like, not_like, contains, not_contains, starts, ends, exists, not_exists, len_eq, len_neq, len_lt, len_gt, len_lte, len_gte, len_between (length ops on varchar — answered from btree leaf entry's vlen, no record fetch), ilike, not_ilike, icontains, not_icontains, istarts, iends (case-insensitive variants — full leaf scan with per-entry tolower compare), eq_field, neq_field, lt_field, gt_field, lte_field, gte_field (field-vs-field on the same record — full scan only; RHS is per-record so no btree shortcut), regex, not_regex (POSIX extended regex on varchar — compiled once at criteria time, REG_STARTEND on the hot path; full scan only).
-- **Case-sensitivity**: `eq, neq, like, not_like, contains, not_contains, starts, ends` are byte-exact (case-SENSITIVE). `ilike, not_ilike, icontains, not_icontains, istarts, iends` are case-INSENSITIVE (ASCII tolower).
+| Type | Encoding |
+|---|---|
+| `varchar:N` | `[uint16 BE length][content]` → on-disk N+2 bytes. Max content **65535**. |
+| `int / long / short` | 4 / 8 / 2 bytes BE signed |
+| `double` | 8 bytes IEEE 754 |
+| `bool / byte` | 1 byte |
+| `date` | 4 bytes BE int32 (`yyyyMMdd`) |
+| `datetime` | 6 bytes (BE int32 yyyyMMdd + BE uint16 packed HHmmss) |
+| `numeric:P,S` | 8 bytes BE int64 × 10^S |
 
-## Commands
+Field defaults (in fields.conf): `:default=<literal>`, `:auto_create`, `:auto_update`, `:default=seq(<name>)`, `:default=uuid()`, `:default=random(N)`. Reference: [docs/concepts/typed-records.md](docs/concepts/typed-records.md).
+
+## Indexes (high-level)
+
+- B+ tree, prefix-compressed leaves (anchors every K=16, two-stage bsearch).
+- Per-shard layout — every indexed field is `splits/4` btree files; `splits` ∈ powers of 2 in [8, 4096]; `index_splits_for(splits) = splits/4` is derived (no separate config).
+- Wrapper API (`index.c`, declared in `types.h`): `btree_idx_insert/delete` (single shard), `btree_idx_search/range/range_ex` (fan out, callbacks fire in arbitrary inter-shard order), `btree_idx_walk_ordered` (k-way streaming merge for cursor), `btree_idx_unlink_all/exists`.
+- Composite indexes: literal `field1+field2` becomes the on-disk directory name.
+- All **38 search operators** use index when available — eq family, range, between, in/not_in, like/not_like, contains/not_contains, starts/ends, exists/not_exists, len_* (varchar length, btree-leaf-only no record fetch), case-insensitive i-variants, eq_field family (full-scan only — RHS is per-record), regex/not_regex (POSIX, full-scan only).
+- Case-sensitivity: `eq, neq, like, not_like, contains, not_contains, starts, ends` are byte-exact. The i-variants are ASCII tolower.
+
+Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
+
+## CLI commands
 
 ```bash
 # Lifecycle
-./shard-db start                                  # Background TCP server
-./shard-db stop                                   # Graceful shutdown (drains in-flight writes)
-./shard-db status                                 # Running check
-./shard-db server                                 # Foreground (debug)
+./shard-db start | stop | status | server                       # server = foreground (debug)
 
 # CRUD
 ./shard-db insert <dir> <obj> <key> <val>
-./shard-db get <dir> <obj> <key>
-./shard-db delete <dir> <obj> <key>
-./shard-db exists <dir> <obj> <key>
+./shard-db get | exists | delete <dir> <obj> <key>
 
-# Query (CLI — for simple ad-hoc; full query shape via JSON)
+# Query
 ./shard-db find <dir> <obj> '<criteria>' [off] [lim] [fields]
-./shard-db count <dir> <obj> [criteria_json]      # empty criteria = O(1) metadata count
+./shard-db count <dir> <obj> [criteria_json]                    # empty criteria = O(1) metadata
 ./shard-db aggregate <dir> <obj> <aggregates_json> [group_by_csv] [criteria_json] [having_json]
-./shard-db keys <dir> <obj> [off] [lim]
-./shard-db fetch <dir> <obj> [off] [lim] [fields]
+./shard-db keys | fetch <dir> <obj> [off] [lim] [fields]
 
-# Bulk
-./shard-db bulk-insert <dir> <obj> [file]         # JSON, either shape:
-                                                  #   {"k1":{...},"k2":{...}}                   (dict — round-trips with get-multi)
-                                                  #   [{"key":"k1","value":{...}}, ...]         (array — explicit key/value pairs)
-                                                  # Acts as upsert — overwriting an existing
-                                                  # key drops stale index entries before writing.
-                                                  # For indexed bulk-insert at scale: prefer
-                                                  # FEWER, LARGER calls — each request triggers
-                                                  # a sequential bulk_merge per (field, shard),
-                                                  # so cumulative merge work scales O(R²) where
-                                                  # R = request count. Sweet spot at 1M records
-                                                  # is ~5 conns × 200K records per request.
+# Bulk (JSON dict or array of {key,value} — see docs/query-protocol/bulk.md)
+./shard-db bulk-insert <dir> <obj> [file]                       # acts as upsert
 ./shard-db bulk-delete <dir> <obj> [file]
 
-# Files (base64-in-JSON over TCP — remote-safe)
+# Files
 ./shard-db put-file <dir> <obj> <local-path> [--if-not-exists]
 ./shard-db get-file <dir> <obj> <filename> [<out-path>]
 ./shard-db delete-file <dir> <obj> <filename>
 ./shard-db list-files <dir> <obj> [pattern] [offset] [limit] [--match=<prefix|suffix|contains|glob>]
 
 # Maintenance
-./shard-db size <dir> <obj>                       # bare integer (live record count, O(1))
-./shard-db orphaned <dir> <obj>                   # bare integer (tombstoned slots, O(1)) — new in 2026.05.1
-./shard-db recount|truncate|vacuum|backup <dir> <obj>
-./shard-db add-index <dir> <obj> <field> [-f]     # field or field1+field2
-./shard-db remove-index <dir> <obj> <field>       # drop index (exact name match)
-./shard-db reindex [dir] [obj]                    # rebuild indexes; no args = all tenants
-
-# Per-release one-shot upgrade — separate binary at build/bin/migrate.
-# 2026.05.1: lifts XX/XX file buckets to flat + rebuilds B+ trees under
-# the per-shard layout. Run with the daemon stopped; it manages start/stop.
-./migrate
-
-./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
+./shard-db size | orphaned <dir> <obj>                          # bare integers (O(1) metadata)
+./shard-db recount | truncate | vacuum | backup <dir> <obj>
+./shard-db add-index <dir> <obj> <field> [-f]                   # field or field1+field2
+./shard-db remove-index <dir> <obj> <field>
+./shard-db reindex [dir] [obj]                                  # no args = all tenants
 
 # Diagnostics
-./shard-db stats                                  # Global (connections, in-flight, cache hit, slow log)
-./shard-db stats-prom                             # Same counters, Prometheus text-format exposition
-./shard-db shard-stats <dir> <obj>                # Per-shard load table
-./shard-db db-dirs                                # List allowed tenant dirs
-./shard-db vacuum-check                           # Objects needing vacuum
+./shard-db stats | stats-prom | db-dirs | vacuum-check
+./shard-db shard-stats <dir> <obj>
 
-# Object discovery (JSON-only — used by shard-cli to populate menus)
+# JSON-only (advanced)
+./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
 ./shard-db query '{"mode":"list-objects","dir":"<dir>"}'
 ./shard-db query '{"mode":"describe-object","dir":"<dir>","object":"<obj>"}'
+
+# Per-release one-shot upgrade — separate binary at build/bin/migrate. Run with daemon stopped; manages start/stop itself.
+./migrate
 ```
+
+**Bulk-insert at scale**: prefer FEWER, LARGER calls. Each request triggers a sequential `bulk_merge` per (field, shard); cumulative work scales O(R²) where R = request count. Sweet spot at 1M records ≈ 5 conns × 200K records.
 
 ## JSON query protocol
 
-All advanced queries go through `./shard-db query '<json>'`.
+All advanced queries: `./shard-db query '<json>'`. Wire format: newline-delimited JSON over TCP, response framed by `\0\n`. Full reference: [docs/query-protocol/overview.md](docs/query-protocol/overview.md).
 
-### Read response shapes (2026.05.1 breaking change)
+### Modes
 
-Read modes return bare values where possible. Errors still come back as `{"error":"..."}` so clients branch on JSON type to disambiguate.
+| Mode | Reference |
+|---|---|
+| `find`, `fetch` (criteria + offset/limit/fields/format/order_by/cursor) | [find.md](docs/query-protocol/find.md) |
+| `count` | [count.md](docs/query-protocol/count.md) |
+| `aggregate` (count/sum/avg/min/max + group_by + having + order_by) | [aggregate.md](docs/query-protocol/aggregate.md) |
+| `find` + `join` (inner/left, by primary key or indexed field; tabular only) | [joins.md](docs/query-protocol/joins.md) |
+| `bulk-insert / bulk-delete / bulk-update` | [bulk.md](docs/query-protocol/bulk.md) |
+| `insert / update / delete` with `if` / `if_not_exists` (CAS) | [cas.md](docs/query-protocol/cas.md) |
+| `put-file / get-file / delete-file / list-files / get-file-path` | [files.md](docs/query-protocol/files.md) |
+| `add-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
+| `add-token / remove-token / list-tokens / add-ip / remove-ip / list-ips / stats / shard-stats / vacuum-check / list-objects / describe-object` | [diagnostics.md](docs/query-protocol/diagnostics.md) |
+| `create-object / drop-object` | [overview.md](docs/query-protocol/overview.md) |
 
-| Mode                  | Response                                                                          |
-|-----------------------|-----------------------------------------------------------------------------------|
-| `get` (single)        | bare value dict — `{"name":"alice","age":30}` (no `{key,value}` wrapper)          |
-| `get` (multi keys)    | `{"k1":{...},"k2":{...},"missing":null}` — dict keyed by primary key. Empty input → `{}`. |
-| `exists` (single)     | bare `true` / `false`                                                             |
-| `exists` (multi keys) | `{"k1":true,"k2":false}` (unchanged from prior release)                           |
-| `count`               | bare integer — `42`                                                               |
-| `size`                | bare integer (live record count, O(1) metadata)                                   |
-| `orphaned` (NEW)      | bare integer (tombstoned slot count, O(1) metadata)                               |
-| `find` / `fetch`      | default JSON array; `format:"rows"` / `format:"csv"` / `format:"dict"` (see below) |
-| `aggregate`           | unchanged from prior release                                                      |
+Cookbook: [docs/query-protocol/recipes.md](docs/query-protocol/recipes.md).
 
-`find` / `fetch` `format:"dict"`: returns `{"k1":{...},"k2":{...}}`. With cursor active, envelope becomes `{"results":{...},"cursor":...}`. Rejects `join` (joins force tabular). With `order_by`, dict iteration order is parser-dependent — use the default array or `format:"rows"` if you need strict iteration order.
+### Read response shapes (2026.05.1 — bare values)
 
-### Find / Count / Fetch
+| Mode | Response |
+|---|---|
+| `get` (single) | bare value dict (no `{key,value}` wrapper) |
+| `get` (multi) | `{"k1":{...},"k2":{...},"missing":null}` |
+| `exists` (single) | bare `true`/`false` |
+| `exists` (multi) | `{"k1":true,"k2":false}` |
+| `count`, `size`, `orphaned` | bare integer |
+| `find`, `fetch` | array (default), or `format ∈ {rows, csv, dict}` |
 
-```json
-{"mode":"find","dir":"t","object":"o",
- "criteria":[{"field":"age","op":"gt","value":"30"}],
- "offset":0,"limit":100,
- "fields":["id","name"],
- "format":"rows"}           // optional: "rows" / "csv" / "dict" (see table above)
-```
+Errors always: `{"error":"..."}` — clients branch on JSON type to disambiguate.
 
-### Find cursor (keyset pagination)
+### Per-request knobs (any query)
 
-For deep pagination on large result sets, offset-based paging pays O(matches) per page (the full-scan buffer-sort path). A cursor driven off an indexed `order_by` field is O(limit) regardless of page depth.
+- `"timeout_ms":N` — per-request override of global `TIMEOUT` (thread-local; doesn't leak across requests). 0/absent = global. Applies to find/count/aggregate/bulk-delete/bulk-update.
+- `"format":"csv"` — raw CSV text (not JSON-wrapped) on find/fetch/aggregate/get-multi/keys/exists-multi. Optional `delimiter` (single char, default `,`, accepts `\t` literal). RFC 4180 minus multiline. `csv + join` → tabular CSV (`<driver>.<field>` and `<as>.<field>` columns).
+- `"format":"dict"` — `{key:{...}}` on find/fetch. Rejects join.
+- `"cursor":null` (or `{}`) — opt into keyset cursor on find. Requires indexed `order_by`. Rejects `format:"csv"` and `join`. See [find.md](docs/query-protocol/find.md) for cursor protocol.
 
-```json
-// Page 1 — signal cursor pagination with cursor:null (or cursor:{})
-{"mode":"find","dir":"t","object":"orders",
- "criteria":[{"field":"status","op":"eq","value":"paid"}],
- "order_by":"amount","order":"asc","limit":100,"cursor":null}
+### Auth (scope × permission)
 
-// Response wraps rows and emits the next-page cursor
-{"rows":[...], "cursor":{"amount":"500.00","key":"ord_4912"}}
+Token's location determines scope: `tokens.conf` at `$DB_ROOT` = global; at `$DB_ROOT/<dir>` = tenant; at `$DB_ROOT/<dir>/<obj>` = object. Suffix determines perm: `r`/`rw`/`rwx` (no suffix = `rwx`, backward-compat). Trusted IP (global only) bypasses tokens. Localhost trusted by default; `DISABLE_LOCALHOST_TRUST=1` for strict mode. Token storage: open-addressed hash table sized `TOKEN_CAP` (default 1024 buckets). Token management is always server-admin. Full admin-scope-per-command table: [docs/concepts/multi-tenancy.md](docs/concepts/multi-tenancy.md).
 
-// Page N+1 — hand back the previous page's cursor verbatim
-{"mode":"find", ..., "order_by":"amount","limit":100,
- "cursor":{"amount":"500.00","key":"ord_4912"}}
+### Planner (find/count/aggregate criteria tree)
 
-// Last page returns "cursor":null
-```
+`criteria` is implicit AND. OR via `{"or":[...]}`, explicit AND via `{"and":[...]}`. `MAX_CRITERIA_DEPTH = 16`. `MAX_INTERSECT_LEAVES = 8`. The planner picks one of:
 
-Rules:
-- `order_by` field **must be indexed** — cursor queries reject otherwise with a clear error.
-- Cursor tie-breaks on `hash16(primary_key)` when multiple rows share the same `order_by` value, so pagination is stable even with ties.
-- `cursor:null` or `cursor:{}` in the request opts into cursor mode (page 1, walks from start/end).
-- Omitting `cursor` entirely keeps backward-compat behavior (unwrapped array, buffer-sort for `order_by`).
-- `format:"csv"` and `join` are not supported with cursor — use the non-cursor `find` path for those.
-- Cursor validation is strict on shape (must reference `order_by` field + `key`), not on content: a cursor whose key has been deleted since page 1 still seeks to the correct byte position, standard keyset semantics.
+- `PRIMARY_LEAF` — single indexed AND leaf drives, post-filter siblings via `criteria_match_tree`.
+- `PRIMARY_INTERSECT` — pure AND of 2+ indexed leaves on rangeable ops (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf into a KeySet, intersects, **skips per-record fetch entirely for count**.
+- `PRIMARY_KEYSET` — pure OR (every child indexed) → union into KeySet; pure-OR count returns `|KeySet|` directly.
+- AND + OR hybrid → indexed AND leaf as primary, OR sub-tree as per-record post-filter.
+- `PRIMARY_NONE` — full parallel shard scan (`scan_shards`).
 
-### Auth: scope + permissions
-
-Tokens have two independent dimensions: **scope** (what they can touch) and **permission** (what they can do).
-
-**Scope** is determined by which tokens.conf file the token lives in:
-
-| Scope | File | Covers |
-|---|---|---|
-| global | `$DB_ROOT/tokens.conf` | any `dir`, any object |
-| tenant | `$DB_ROOT/<dir>/tokens.conf` | any object within `<dir>` |
-| object | `$DB_ROOT/<dir>/<obj>/tokens.conf` | only `<dir>/<obj>` |
-
-**Permission** is the suffix on the token line:
-
-| Perm | Reads | Writes | Admin |
-|---|---|---|---|
-| `r` | ✓ | ✗ | ✗ |
-| `rw` | ✓ | ✓ | ✗ |
-| `rwx` | ✓ | ✓ | scope-dependent |
-| _(no suffix)_ | same as `rwx` | backward-compat for pre-2026.05 tokens.conf | |
-
-Admin commands themselves have scope. A token needs `rwx` AND scope at least as broad as the command's admin scope:
-
-| Command | Admin scope | Who can run it |
-|---|---|---|
-| `stats`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens` | server | global `rwx` or trusted IP only |
-| `create-object` | tenant | global-`rwx` or tenant-`rwx` on that dir |
-| `truncate`, `vacuum`, `backup`, `recount`, `add-field`, `remove-field`, `rename-field`, `add-index`, `remove-index` | object | any `rwx` whose scope covers that object |
-
-**Precedence on each request**:
-1. Trusted IP (global `allowed_ips.conf`) → bypass.
-2. Token match with sufficient scope + perm → allow.
-3. Otherwise `{"error":"auth failed"}`.
-
-Token management (`add-token`/`remove-token`/`list-tokens`) is **always** server-admin regardless of what scope/perm the token being managed has. Tenant admins and object admins cannot issue new tokens — the platform operator issues all credentials.
-
-Localhost (127.0.0.1/::1) is trusted by default (typical deployment: loopback-connecting proxy). Set `DISABLE_LOCALHOST_TRUST=1` to require tokens from same-host callers too (strict mode).
-
-`add-token` accepts optional `"dir"`, `"object"`, and `"perm"` fields. Default perm is `rw` (principle of least privilege — admins opt into `rwx` explicitly). Invalid perms (`x`, `rx`, etc.) are rejected. `object` scope requires `dir`.
-
-`list-tokens` returns `{"token":"fingerprint","scope":"global"|"<dir>"|"<dir>/<obj>","perm":"r|rw|rwx"}` per entry. Full tokens are never echoed.
-
-Token storage: open-addressed hash table sized by `TOKEN_CAP` (default 1024 buckets). Lookup O(1), lock-free reads. Bump `TOKEN_CAP` in db.env if you expect more than ~700 tokens in total across all scopes.
+Selectivity rank for intersect ordering: `eq < starts_with < between < in < range`. Cardinality estimation from index stats is future work. Substring/suffix ops (like, contains, ends, not_*) and large-set ops (neq, not_in) cannot drive intersection.
 
 ### Native TLS
 
-Optional in-process TLS termination via OpenSSL. Off by default; opt in by setting `TLS_ENABLE=1` in db.env. Single-port model — when enabled, `PORT` becomes TLS-only and plaintext clients are rejected. Reverse-proxy termination (nginx, HAProxy, stunnel) remains supported as the alternative for shops with existing cert pipelines.
-
-```
-TLS_ENABLE=0                          # 0/1; default 0 (plaintext TCP)
-TLS_CERT=/etc/shard-db/cert.pem       # server cert, PEM (chain ok)
-TLS_KEY=/etc/shard-db/key.pem         # server private key, PEM
-TLS_CA=/etc/shard-db/ca.pem           # client-side: CA bundle to verify server (defaults to OS trust store if empty)
-TLS_SKIP_VERIFY=0                     # client-side: skip server cert verify (dev only — emits stderr warning)
-```
-
-- **TLS 1.3 only.** `SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION)` enforced both directions; TLS 1.2 ClientHello gets a protocol-version alert. Relax with a one-line change to `tls_server_init` if you ever need 1.2 compat — but every modern client (OpenSSL ≥1.1.1, Java 8u261+, Go 1.12+, Python 3.7+) speaks 1.3.
-- **Cipher policy**: TLS 1.3's mandatory AEAD set (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305). No db.env knob to bikeshed.
-- **Client identity**: tokens (existing `tokens.conf` machinery), not mTLS. Single identity layer; mTLS would duplicate.
-- **Hostname verification** uses `SSL_set1_host`. SNI / verify name defaults to `localhost` (CLI connects to 127.0.0.1); override via `TLS_SERVER_NAME` env var.
-- Server refuses to start if `TLS_ENABLE=1` and cert/key are missing, unreadable, or mismatched (`SSL_CTX_check_private_key`).
-- Cert hot-reload on SIGHUP is **not** implemented yet. Cert rotation = daemon restart.
+Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single-port model). TLS 1.3 only. Client identity = tokens, not mTLS. SNI/verify defaults to `localhost`; override via `TLS_SERVER_NAME`. Cert hot-reload is not implemented (rotation = restart). Server refuses to start if cert/key missing/unreadable/mismatched. Reverse-proxy termination remains supported. Full config: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
 
 ### Single-instance guard
 
-`cmd_server` takes `flock(LOCK_EX | LOCK_NB)` on `$DB_ROOT/.shard-db.lock` before daemonizing. A second `./shard-db start` on the same `DB_ROOT` — even with a different port, a different config file, or a copied binary — fails fast with a clear error. The kernel holds the lock for the server's lifetime and releases it automatically on normal exit *or crash* (SIGKILL, power loss), so there's nothing to clean up manually. The lock file contains the running daemon's PID for `lsof`/`cat` visibility.
-
-### Per-request statement timeout
-
-Any query can carry a `"timeout_ms":N` field to override the global `TIMEOUT` for that single request. Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. Value is a hard cap in milliseconds; when exceeded, the query aborts with `{"error":"query_timeout"}` and the server keeps serving.
-
-- `"timeout_ms":0` or absent → falls back to the global `TIMEOUT` (unchanged behaviour).
-- Thread-local override — a tight timeout on one request doesn't leak to the next request on the same worker thread.
-- Zero perf cost: the existing `QueryDeadline` mechanism reads the override from a thread-local at construction time, no extra cost per iteration.
-
-Use it to give specific callers tighter deadlines (e.g., `"timeout_ms":200` for an interactive dashboard) without reconfiguring the server.
+`cmd_server` takes `flock(LOCK_EX | LOCK_NB)` on `$DB_ROOT/.shard-db.lock` before daemonizing. Second `start` on the same DB_ROOT fails fast (different port / config / binary doesn't matter). Kernel releases on crash too — no manual cleanup. Lock file contains the PID for `lsof`/`cat`.
 
 ### Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 500) bounds the intermediate buffers any single query can hold. Checked at 8 collection sites: ordered find buffer, aggregate buckets (shared atomic across parallel workers), bulk-delete/update key list, OR KeySet, `CollectCtx.entries` (btree hash collection), `ShardWorkCtx.results` (downstream of CollectCtx), per-worker aggregate hash tables (via the shared atomic), and `cmd_list_files` names buffer (filename pointer + strdup, 500 MB ⇒ ~7-13M matches depending on name length). When exceeded the query aborts with `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
-
-Rough sizing: peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10-15% higher due to malloc chunk overhead not accounted for). Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, container limit, or `ulimit -v`) as a backstop.
-
-### CSV / delimited export
-
-`"format":"csv"` on `find`, `fetch`, `aggregate`, `get` (multi-key), `keys`, and `exists` (multi-key) emits **raw CSV text** (not JSON-wrapped). Optional `delimiter` field picks a single-char separator — defaults to `,`, accepts `\t` literal for tab.
-
-```json
-{"mode":"find","dir":"t","object":"o","criteria":[],"format":"csv","delimiter":"|"}
-```
-
-Body:
-```
-key|status|amount|note
-o1|paid|100|vip
-o2|paid|50|"a,comma,here"
-```
-
-- First row = column names.
-- Newlines (`\n`/`\r`) inside values → replaced with a space so one physical line = one logical row.
-- Values containing the delimiter or `"` are wrapped in `"` with internal `"` doubled (RFC 4180 minus multiline).
-- NULL fields → empty cell.
-- Errors still come as JSON — content type is unified only on success.
-- `csv + join` produces a tabular CSV with `<driver>.<field>` and `<as>.<field>` columns; left-join no-match → empty cell. `dict + join` is still rejected.
-
-### OR criteria
-
-`criteria` is implicit AND. Introduce an OR branch with `{"or":[...]}` (or explicit sub-AND via `{"and":[...]}`). Supported in find / count / aggregate `criteria` and `having`, and in bulk-delete / bulk-update.
-
-```json
-"criteria":[
-  {"field":"status","op":"eq","value":"paid"},
-  {"or":[
-    {"field":"region","op":"eq","value":"us"},
-    {"field":"total","op":"gte","value":"1000"}
-  ]}
-]
-```
-
-Planner picks one of five paths automatically:
-- **Pure AND, single indexed leaf** → primary-indexed-leaf scan, post-filter siblings via `criteria_match_tree`.
-- **Pure AND, 2+ indexed leaves on rangeable ops** → `PRIMARY_INTERSECT` (see "AND index intersection" below) — intersect candidate hash sets via KeySet, skip per-record fetch for count.
-- **AND + OR, indexed AND sibling** → indexed leaf drives candidates, OR sub-tree evaluated per record via tree match.
-- **Pure OR, every child indexed** → per-child B+ tree lookups unioned into a concurrent KeySet (xxh128 hashes, lock-free CAS inserts); pure-OR count returns `|KeySet|` directly without fetching records.
-- **OR with non-indexed child** → full parallel shard scan, tree match per record.
-
-Hybrid (non-indexed AND + fully-indexed OR) uses KeySet as primary-candidate source and applies the AND siblings as a post-filter. Max nesting depth is `MAX_CRITERIA_DEPTH = 16`. Empty `or:[]` / `and:[]` → `{"error":"empty or/and"}`.
-
-### AND index intersection
-
-When the criteria tree is a pure AND of 2+ indexed leaves on btree-rangeable operators (eq/lt/gt/lte/gte/between/in/starts_with), the planner picks `PRIMARY_INTERSECT`: walk each leaf's btree into a KeySet (xxh128 hashes, the same lock-free hash set used by OR-union), intersect candidate sets, **skip the per-record fetch + criteria_match_tree pass entirely** for count, and use the survivor list directly for find / aggregate.
-
-Example: `count(status=paid AND region=us AND amount>150)` over a 5M-row table where `status=paid` matches ~1.4M but the 3-way intersection is ~50k. Today's primary-leaf path pays ~150ns per primary record fetch — ~210ms. Intersection walks three btrees (~30ms) and probes a KeySet (~5ms) — ~35ms. Speedup is bigger when the selectivity gap between primary and intersection is wider, and bigger again for `find` with deep `offset` because the limit/offset apply to the small survivor set, not the primary set.
-
-Eligibility:
-- All AND children must be **indexed** **leaves** with **rangeable operators** (eq, lt, gt, lte, gte, between, in, starts_with). Mixed trees (e.g., one `like` leaf alongside indexed eq leaves) fall back to `PRIMARY_LEAF`.
-- Substring/suffix operators (like, contains, ends_with, not_like, not_contains) need full-record access by definition; they can't drive intersection.
-- Large-set operators (neq, not_in) build near-everything KeySets — the existing primary-leaf path with the count-shortcut (`count(neq X) = count(*) - count(eq X)`) is tighter, so they stay there.
-- Pure OR, hybrid AND+OR, single leaf, and full-scan all keep their existing paths.
-
-Leaves are walked most-selective-first by `op_selectivity_rank` (eq < starts_with < between < in < range), so the smallest candidate set bounds the running intersection. Cardinality estimation from index stats is future work.
-
-`MAX_INTERSECT_LEAVES = 8` caps the number of intersected leaves; trees with more than 8 indexed eligible leaves fall back to `PRIMARY_LEAF`. There is currently no abandon-on-selective-primary heuristic — for queries like `id=X AND status=anything` where the primary leaf has very few candidates, intersection still walks the second leaf's full btree to probe. Add bench coverage and tune if it shows up as a real workload regression.
-
-### Aggregation
-
-```json
-{"mode":"aggregate","dir":"t","object":"o",
- "criteria":[...],
- "group_by":["status"],
- "aggregates":[{"fn":"count","alias":"n"},
-               {"fn":"sum","field":"amount","alias":"total"},
-               {"fn":"avg","field":"score","alias":"avg_score"},
-               {"fn":"min","field":"rank","alias":"best"},
-               {"fn":"max","field":"rank","alias":"worst"}],
- "having":[{"field":"n","op":"gte","value":"10"}],
- "order_by":"total","order_desc":true,"limit":5}
-```
-
-### Joins (read-only, tabular output only)
-
-```json
-{"mode":"find","dir":"t","object":"orders",
- "criteria":[{"field":"status","op":"eq","value":"paid"}],
- "join":[
-   {"object":"users","local":"user_id","remote":"key",
-    "as":"user","type":"inner","fields":["email","name"]},
-   {"object":"products","local":"product_sku","remote":"sku",
-    "as":"product","type":"left","fields":["title"]}
- ],
- "limit":50}
-```
-
-Output is always tabular when `join` is present. Columns: `{driver}.key`, `{driver}.{field}`, `{as}.{field}`. Left-join no-match emits nulls for that join's columns. `remote` must be either `"key"` (primary-key lookup) or an indexed field.
-
-### CAS (conditional writes)
-
-- `{"mode":"insert", ..., "if_not_exists":true}` — idempotent insert, returns error if key exists
-- `{"mode":"update", ..., "if":{"status":"pending"}}` — update only if condition matches
-- `{"mode":"delete", ..., "if":{"version":42}}` — delete only if condition matches
-- `{"mode":"bulk-update", "criteria":[...], "value":{...}, "limit":N, "dry_run":true}` — conditional mass update
-- `{"mode":"bulk-update", "records":<data>}` — JSON per-key partial update. Only fields present in each record overwrite; absent fields kept. `<data>` accepts either shape:
-  - `{"k1":{...},"k2":{...}}` (dict — round-trips with get-multi)
-  - `[{"key":"k1","value":{...}}, ...]` (array of explicit key/value pairs)
-  `file:"path.json"` reads `<data>` from disk (same two shapes). Mode dispatches by content: `criteria` → mass update, `records`/`file` → per-key update.
-- `{"mode":"bulk-delete", "criteria":[...], "limit":N, "dry_run":true}` — mass delete by criteria
-
-### File storage
-
-Files live at `$DB_ROOT/<dir>/<obj>/files/<filename>` — flat, basename is the lookup key. Filenames are validated (no `/`, `\`, `..`, control chars, ≤255 bytes).
-
-Pre-2026.05.2 stored at `<obj>/files/<XX>/<XX>/<filename>` (xxh128 hash buckets). The bucketing was vestigial — filenames were already the unique key. Existing installs upgrade with the one-shot `./migrate` binary (walks every (dir, obj) in schema.conf, lifts each leaf into place; idempotent).
-
-Remote-safe (base64 in JSON):
-- `{"mode":"put-file","dir":"...","object":"...","filename":"...","data":"<b64>","if_not_exists":true}` — atomic `.tmp`+`fsync`+`rename`. `if_not_exists` is optional CAS.
-- `{"mode":"get-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"ok","bytes":N,"data":"<b64>"}`.
-- `{"mode":"delete-file","dir":"...","object":"...","filename":"..."}` — returns `{"status":"deleted","filename":"..."}` or `{"error":"file not found","filename":"..."}`.
-- `{"mode":"list-files","dir":"...","object":"...","pattern":"opt","match":"prefix|suffix|contains|glob","offset":0,"limit":100}` — alphabetical paginated listing. `match` defaults to `prefix`; `glob` uses `fnmatch(3)` (`*`, `?`, `[abc]`). Empty/missing pattern matches all. Legacy `prefix:"..."` field still accepted (implies `match:"prefix"`). `limit` defaults to `GLOBAL_LIMIT` when absent or 0. Returns `{"files":[...],"total":N,"offset":N,"limit":N}` where `total` is the unpaginated match count. Single `opendir(<obj>/files)` + `readdir` loop — O(file count), no fixed-overhead floor. Comfortable up to several million files on ext4/XFS; beyond that, maintain your own index in a regular object.
-
-Server-local zero-copy (same-host callers only — admin fast path):
-- `{"mode":"put-file","dir":"...","object":"...","path":"/srv/file.pdf"}` — server reads the path directly.
-- `{"mode":"get-file-path","dir":"...","object":"...","filename":"..."}` — returns `{"path":"..."}` as a string; no bytes on the wire.
-
-Size ceiling = `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective after base64 inflation). Raise `MAX_REQUEST_SIZE` in db.env to lift it; every connection allocates a read buffer this size.
-
-### Schema mutations
-
-- `{"mode":"rename-field","old":"X","new":"Y"}` — metadata-only, preserves data
-- `{"mode":"remove-field","fields":["a","b"]}` — tombstone (space reclaimed on vacuum --compact)
-- `{"mode":"add-field","fields":["age:int","email:varchar:40"]}` — append fields, triggers rebuild
-- `{"mode":"vacuum","compact":true}` — drop tombstoned fields, shrink slot_size
-- `{"mode":"vacuum","splits":N}` — reshard (indexes survive; hash routing preserved)
-
-## Key internals
-
-- `CriteriaNode` (types.h) + `parse_criteria_tree` / `criteria_match_tree` / `compile_criteria_tree` (query.c): AND/OR tree form of criteria. Leaves hold a pre-compiled `CompiledCriterion` so the hot path stays zero-malloc-per-record
-- `KeySet` (keyset.c): lock-free open-addressed hash table of 16-byte xxh128 keys; lives on the OR index-union fast path
-- `choose_primary_source` (query.c): planner that picks `PRIMARY_LEAF` / `PRIMARY_KEYSET` / `PRIMARY_INTERSECT` / `PRIMARY_NONE` based on indexability + operator class of the tree's leaves
-- `intersect_indexed_leaves` / `keyset_count_from_intersect` / `keyset_find_from_intersect` / `keyset_agg_from_intersect` (query.c): AND-intersection executors. Walk N leaves' btrees into KeySets, intersect via `intersect_probe_cb`, then for count return |result|, for find/agg call the shared `keyset_emit_find` / `keyset_emit_agg` helpers (also used by the OR-union paths) with `tree=NULL` to skip the redundant `criteria_match_tree`
-- `shard_group_batch` (query.c): qsort `CollectedHash[]` by `shard_id` and split into per-shard groups for fan-out — extracted helper used by `process_batch`, `parallel_indexed_count`, `parallel_indexed_agg`, and the search dispatcher
-- `match_typed()` / `CompiledCriterion` (query.c): typed-binary criterion matching — zero malloc per record, direct byte compares
-- `scan_shards()`: parallel mmap-based shard scanner (one thread per shard group)
-- `index_parallel()`: spawns pthread per index field during bulk insert
-- `shard_find_worker` / `shard_count_worker` / `shard_agg_worker`: per-shard parallel workers for indexed find/count/agg
-- `parallel_indexed_count` / `parallel_indexed_agg`: orchestrators for indexed multi-criteria
-- `QueryDeadline` + `query_deadline_tick()`: statement-timeout enforcement (coarse clock, every 1024 iterations)
-- `idx_count_cb`: single-criterion inline count (no record fetch, O(1) per btree hit)
-- `btree_insert/search/range/bulk_build/bulk_merge`: B+ tree ops with prefix-compressed leaves (path-based — single-file API, used by per-shard wrappers and the legacy reindex extract path)
-- `bt_acquire/bt_release` (btree.c): unified ucache-style open path. One `BtCacheEntry` table with per-entry pthread_rwlock_t, persistent MAP_SHARED, LRU eviction. `bt_alloc_page` propagates grow remaps back to the cache entry under wrlock so subsequent acquirers see the new mapping.
-- `BtRangeIter` (btree.c): streaming range iterator. `btree_range_iter_open/next/close` — pull one entry at a time. Holds rdlock for iter lifetime. ASC: `iter_seek_fwd` uses `leaf_iter_seek` to prime the prefix-decoded key_buf, `fwd_pending` flag yields the seeked entry once before advancing. DESC: pre-collects leaves[] list, walks right-to-left with per-leaf snapshot — `iter_init_desc_leaves` pre-loads the rightmost leaf so the first `iter_next_desc` doesn't skip it.
-- `btree_idx_*` wrappers (index.c): per-shard btree dispatch. Reads fan out across `splits/4` shards; writes route by hash16 to one shard. `btree_idx_walk_ordered` runs N=splits/4 streaming iterators and picks the next globally-ordered head via linear-scan-pick-best (cb cost dominates over O(N) selection at splits ≤ 4096). `partition_pairs_by_idx_shard` (index.c, query.c) bucket-sorts collected `BtEntry[]` for parallel per-(field, shard) bulk-build during add-index / cmd_bulk_insert.
-- `reindex_clean_legacy` (index.c): per-object sweep of pre-2026.05.1 single-file `<field>.idx` artefacts. Runs inside `cmd_reindex` before each `cmd_add_indexes(force=1)` rebuild.
-- `ucache`: unified shard mmap cache (FCACHE_MAX entries, per-entry rwlock, LRU eviction)
-- `typed_encode/decode/typed_get_field_str`: typed binary encode/decode with length-prefix varchar
-- `encode_field_len` (config.c): length-based encoder used by the CSV bulk-insert path to parse directly against an mmap'd page cache with (ptr, len) spans — no per-line memcpy. `encode_field()` is a thin `encode_field_len(f, val, strlen(val), out)` wrapper for null-terminated callers (JSON bulk-insert, typed_encode, cmd_update, etc.)
-- `b64_encode/decode` (util.c): RFC 4648 base64, whitespace-tolerant on decode; used by `cmd_put_file_b64`/`cmd_get_file_b64`
-- `valid_filename` (util.c): basename sanitizer (no `/`, `\`, `..`, control chars, ≤255 bytes) — enforced on every remote upload/download
-- `cmd_put_file_tcp`/`cmd_get_file_tcp` (server.c): client-side helpers invoked by CLI; `query_collect` accumulates a full response buffer before parsing
-- `compute_addr` / `addr_from_hash`: xxh128 hash → shard_id/slot
-- `build_shard_filename(dir, shard_id)`: canonical `NNN.bin` formatter (3 hex, MAX_SPLITS=4096)
-- `build_idx_path(buf, db_root, object, field, idx_shard_id)` (storage.c): canonical `<obj>/indexes/<field>/<NNN>.idx` formatter. `index_splits_for(splits) = splits/4`, `idx_shard_for_hash(hash16, splits)`, `idx_shard_for_data_shard(s) = s/4` are the routing helpers (types.h)
-- `g_schema_cache` / `g_idx_cache` / `g_typed_cache`: in-memory caches for config files
-- `is_valid_dir()`: tenant directory whitelist enforcement
+`QUERY_BUFFER_MB` (default 500) bounds intermediate buffers any single query can hold. 8 collection sites checked (ordered find buffer, aggregate buckets, bulk-delete/update key list, OR KeySet, `CollectCtx.entries`, `ShardWorkCtx.results`, per-worker agg hash tables, list-files names buffer). Exceeded → query aborts with `{"error":"query memory buffer exceeded; ..."}`; server keeps serving. Pair with whole-process containment (systemd MemoryMax, cgroup, ulimit -v). See [docs/reference/limits.md](docs/reference/limits.md).
 
 ## Limits / constants
 
-- `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`)
-- `DEFAULT_SPLITS = 8` — used by `create-object` when `splits` is omitted/0. Tuned for the common sub-1M-row case (~70% of objects); larger workloads should pass `splits` explicitly. Floor is `MIN_SPLITS = 8`. Sweet spot = 78K–200K records/shard; see README / `docs/operations/tuning.md` for the full row-count → splits sizing table.
-- `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`; uint16 `SlotHeader.key_len` allows 65535 but every slot reserves `max_key` bytes, so large caps bloat `slot_size`. Keys are stored raw in Zone B, length lives in Zone A header (no in-payload prefix).
-- `varchar` max content = **65535 bytes** (uint16 length prefix)
-- `MAX_FIELDS = 256` fields per schema (bumped from 64 in 2026.04.2)
-- `MAX_AGG_SPECS = 32` aggregates per query
+- `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`).
+- `DEFAULT_SPLITS = 8`, `MIN_SPLITS = 8` — `create-object` default. Sweet spot 78K–200K records/shard. Sizing table: [docs/operations/tuning.md](docs/operations/tuning.md).
+- `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`.
+- `varchar` max content = **65535 bytes** (uint16 length prefix).
+- `MAX_FIELDS = 256` (bumped from 64 in 2026.04.2).
+- `MAX_AGG_SPECS = 32`.
+- `MAX_CRITERIA_DEPTH = 16`, `MAX_INTERSECT_LEAVES = 8`.
+
+Full reference: [docs/reference/limits.md](docs/reference/limits.md), [docs/reference/error-codes.md](docs/reference/error-codes.md), [docs/reference/changelog.md](docs/reference/changelog.md).
