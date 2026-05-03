@@ -1511,6 +1511,8 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
                                int if_not_exists) {
     if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
 
+    uint64_t t0 = now_ms_coarse();
+
     /* Must have typed schema — delimited values map to fields.conf order */
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
@@ -1813,11 +1815,23 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         ws->idx_pair_caps = nidx > 0 ? calloc(nidx, sizeof(size_t)) : NULL;
     }
 
+    uint64_t t1 = now_ms_coarse();  /* end of Phase 1 (parse + bucket) */
+
     /* ===== Phase 2: parallel shard workers via shared pool.
        All concurrent callers share one pool sized to ~4× cores by default;
        oversubscription hides shard-rwlock stalls. */
     parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
+    uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
+
+    /* Phase-2 breakdown across workers (mirrors cmd_bulk_insert JSON path). */
+    uint64_t grow_ms_total = 0, wall_ms_max = 0;
+    int grow_count_total = 0;
+    for (int wi = 0; wi < nshard_groups; wi++) {
+        grow_ms_total    += workers[wi].grow_ms;
+        grow_count_total += workers[wi].grow_count;
+        if (workers[wi].wall_ms > wall_ms_max) wall_ms_max = workers[wi].wall_ms;
+    }
 
     /* Merge per-worker results into caller's counters + index arrays. */
     int delim_skipped_total = 0;
@@ -1882,6 +1896,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
         free(act_args);
     }
+    uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     if (data_mmaped) munmap((void *)data, st.st_size);
     else free((void *)data);
@@ -1911,6 +1926,19 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
 
     if (count > 0) update_count(db_root, object, count);
+
+    uint64_t t4 = now_ms_coarse();  /* end of Phase 4 (index build) */
+    log_msg(3, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
+            object, count,
+            (unsigned long)(t1 - t0),
+            (unsigned long)(t2 - t1),
+            grow_count_total,
+            (unsigned long)grow_ms_total,
+            (unsigned long)wall_ms_max,
+            (unsigned long)(t3 - t2),
+            (unsigned long)(t4 - t3),
+            (unsigned long)(t4 - t0));
+
     if (errors) {
         OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
             count, delim_skipped_total, errors);
