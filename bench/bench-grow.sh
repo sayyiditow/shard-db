@@ -76,7 +76,7 @@ with open('$input','w') as f:
 
     # Pull the BULK-INSERT log line that landed after our offset
     local line
-    line=$(tail -n +$((before_lines + 1)) "$LOG_FILE" 2>/dev/null | grep "BULK-INSERT bench.$obj" | tail -1 || true)
+    line=$(tail -n +$((before_lines + 1)) "$LOG_FILE" 2>/dev/null | grep "BULK-INSERT $obj:" | tail -1 || true)
 
     local grows="-" grow_ms="-" phase2="-" total="-"
     if [[ -n "$line" ]]; then
