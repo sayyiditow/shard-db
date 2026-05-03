@@ -748,6 +748,74 @@ typedef struct {
     size_t         *idx_pair_caps;    /* [nidx] */
 } BulkInsShardWork;
 
+/* Phase 1.6 pre-grow: per-shard worker that reads current slot count + live
+   record count, computes the smallest power-of-2 that holds (live + incoming),
+   and calls ucache_grow_to once. parallel_for-compatible signature. Each
+   worker owns a distinct shard, so the underlying wrlocks are disjoint. */
+typedef struct {
+    const char *db_root;
+    const char *object;
+    int         shard_id;
+    int         incoming;
+    int         slot_size;
+    int         prealloc_mb;
+} PreGrowArg;
+
+static void *pre_grow_shard_worker(void *arg) {
+    PreGrowArg *a = (PreGrowArg *)arg;
+    char shard_path[PATH_MAX];
+    build_shard_path(shard_path, sizeof(shard_path),
+                     a->db_root, a->object, a->shard_id);
+    uint32_t cur_slots = ucache_peek_slots(shard_path, a->slot_size, a->prealloc_mb);
+    if (cur_slots == 0) return NULL;
+    uint32_t live = 0;
+    FcacheRead fc = fcache_get_read(shard_path);
+    if (fc.map) {
+        ShardHeader *hdr = (ShardHeader *)fc.map;
+        if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
+        fcache_release(fc);
+    }
+    uint64_t needed = (uint64_t)live + (uint64_t)a->incoming;
+    uint32_t target = cur_slots;
+    while ((uint64_t)target < needed) {
+        if (target >= (1u << 30)) break; /* sanity ceiling */
+        target *= 2;
+    }
+    if (target > cur_slots) {
+        (void)ucache_grow_to(shard_path, target, a->slot_size, a->prealloc_mb);
+    }
+    return NULL;
+}
+
+/* Drives parallel pre-grow across the shards that have incoming records.
+   Returns 0 on success, -1 on alloc failure (non-fatal — caller proceeds and
+   the worker's in-loop grow path remains as fallback). */
+static int pre_grow_shards_for_bulk_insert(const char *db_root,
+                                           const char *object,
+                                           const Schema *sc,
+                                           const int *shard_counts) {
+    int n = 0;
+    for (int s = 0; s < sc->splits; s++) if (shard_counts[s] > 0) n++;
+    if (n == 0) return 0;
+
+    PreGrowArg *args = malloc((size_t)n * sizeof(PreGrowArg));
+    if (!args) return -1;
+    int j = 0;
+    for (int s = 0; s < sc->splits; s++) {
+        if (shard_counts[s] <= 0) continue;
+        args[j].db_root     = db_root;
+        args[j].object      = object;
+        args[j].shard_id    = s;
+        args[j].incoming    = shard_counts[s];
+        args[j].slot_size   = sc->slot_size;
+        args[j].prealloc_mb = sc->prealloc_mb;
+        j++;
+    }
+    parallel_for(pre_grow_shard_worker, args, n, sizeof(PreGrowArg));
+    free(args);
+    return 0;
+}
+
 /* Probe + write every record in one shard's bucket under a single ucache
    wrlock held from start to finish. On shard-full, release the lock, grow
    the shard, reacquire, and retry the **same** record index — avoids
@@ -1232,39 +1300,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        per grow, and each subsequent grow re-buckets a growing record set —
        so total rebuild work scales with the number of incremental doublings.
        One up-front grow to the right size avoids that.
-       Target: smallest power of 2 that holds (live + incoming) records.
-       We do NOT add the 2× headroom that ucache_maybe_grow uses for non-bulk
-       inserts — bulk-insert workers tolerate high load factors fine (they
-       only grow on shard-full overflow, not at 50%), and over-allocating
-       balloons the sparse mmap region, which costs more in page-fault
-       overhead during the actual write phase than the tighter probe chains
-       cost. Hash variance ⇒ a few records may overflow this target; the
-       worker's in-loop grow path remains the fallback. */
-    for (int s = 0; s < sc.splits; s++) {
-        if (shard_counts[s] <= 0) continue;
-        char shard_path[PATH_MAX];
-        build_shard_path(shard_path, sizeof(shard_path), db_root, object, s);
-        uint32_t cur_slots = ucache_peek_slots(shard_path, sc.slot_size, sc.prealloc_mb);
-        if (cur_slots == 0) continue; /* error path — worker surfaces it */
-        uint32_t live = 0;
-        FcacheRead fc = fcache_get_read(shard_path);
-        if (fc.map) {
-            ShardHeader *hdr = (ShardHeader *)fc.map;
-            if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
-            fcache_release(fc);
-        }
-        uint64_t needed = (uint64_t)live + (uint64_t)shard_counts[s];
-        uint32_t target = cur_slots;
-        while ((uint64_t)target < needed) {
-            if (target >= (1u << 30)) break; /* sanity ceiling */
-            target *= 2;
-        }
-        if (target > cur_slots) {
-            (void)ucache_grow_to(shard_path, target, sc.slot_size, sc.prealloc_mb);
-            /* Errors are non-fatal — the worker's in-loop grow path is the
-               fallback and will surface per-record INSERT_DROP if needed. */
-        }
-    }
+       Target: smallest power of 2 that holds (live + incoming). No 50%
+       headroom — bulk-insert tolerates high load factors fine and
+       over-allocating balloons the sparse mmap (page-fault tax > tighter
+       probe chains). The pre-grow loop runs in parallel across shards. */
+    pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
 
     int nshard_groups = 0;
     for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
@@ -1728,31 +1768,8 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
     /* ===== Phase 1.6: pre-grow shards once, sized to the incoming batch.
-       See cmd_bulk_insert (JSON path) for the rationale — same logic applies
-       to the delimited path. */
-    for (int s = 0; s < sc.splits; s++) {
-        if (shard_counts[s] <= 0) continue;
-        char shard_path[PATH_MAX];
-        build_shard_path(shard_path, sizeof(shard_path), db_root, object, s);
-        uint32_t cur_slots = ucache_peek_slots(shard_path, sc.slot_size, sc.prealloc_mb);
-        if (cur_slots == 0) continue;
-        uint32_t live = 0;
-        FcacheRead fc = fcache_get_read(shard_path);
-        if (fc.map) {
-            ShardHeader *hdr = (ShardHeader *)fc.map;
-            if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
-            fcache_release(fc);
-        }
-        uint64_t needed = (uint64_t)live + (uint64_t)shard_counts[s];
-        uint32_t target = cur_slots;
-        while ((uint64_t)target < needed) {
-            if (target >= (1u << 30)) break;
-            target *= 2;
-        }
-        if (target > cur_slots) {
-            (void)ucache_grow_to(shard_path, target, sc.slot_size, sc.prealloc_mb);
-        }
-    }
+       See cmd_bulk_insert (JSON path) for the rationale. */
+    pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
 
     int nshard_groups = 0;
     for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
