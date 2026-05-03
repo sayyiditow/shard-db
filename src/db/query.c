@@ -1227,6 +1227,40 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
+    /* ===== Phase 1.6: pre-grow shards once, sized to the incoming batch.
+       Letting the worker hit the in-loop grow path repeatedly costs O(slots)
+       per grow, and each subsequent grow re-buckets a growing record set —
+       so total rebuild work scales with the number of incremental doublings.
+       One up-front grow to the right size avoids that.
+       Target: smallest power of 2 such that
+           (live + shard_counts[s]) * GROW_LOAD_DEN < target * GROW_LOAD_NUM
+       which at the 50% load factor means target > 2 * (live + incoming). */
+    for (int s = 0; s < sc.splits; s++) {
+        if (shard_counts[s] <= 0) continue;
+        char shard_path[PATH_MAX];
+        build_shard_path(shard_path, sizeof(shard_path), db_root, object, s);
+        uint32_t cur_slots = ucache_peek_slots(shard_path, sc.slot_size, sc.prealloc_mb);
+        if (cur_slots == 0) continue; /* error path — worker surfaces it */
+        uint32_t live = 0;
+        FcacheRead fc = fcache_get_read(shard_path);
+        if (fc.map) {
+            ShardHeader *hdr = (ShardHeader *)fc.map;
+            if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
+            fcache_release(fc);
+        }
+        uint64_t needed = 2ULL * ((uint64_t)live + (uint64_t)shard_counts[s]) + 1;
+        uint32_t target = cur_slots;
+        while ((uint64_t)target < needed) {
+            if (target >= (1u << 30)) break; /* sanity ceiling */
+            target *= 2;
+        }
+        if (target > cur_slots) {
+            (void)ucache_grow_to(shard_path, target, sc.slot_size, sc.prealloc_mb);
+            /* Errors are non-fatal — the worker's in-loop grow path is the
+               fallback and will surface per-record INSERT_DROP if needed. */
+        }
+    }
+
     int nshard_groups = 0;
     for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
 
@@ -1685,6 +1719,33 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         return 1;
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
+
+    /* ===== Phase 1.6: pre-grow shards once, sized to the incoming batch.
+       See cmd_bulk_insert (JSON path) for the rationale — same logic applies
+       to the delimited path. */
+    for (int s = 0; s < sc.splits; s++) {
+        if (shard_counts[s] <= 0) continue;
+        char shard_path[PATH_MAX];
+        build_shard_path(shard_path, sizeof(shard_path), db_root, object, s);
+        uint32_t cur_slots = ucache_peek_slots(shard_path, sc.slot_size, sc.prealloc_mb);
+        if (cur_slots == 0) continue;
+        uint32_t live = 0;
+        FcacheRead fc = fcache_get_read(shard_path);
+        if (fc.map) {
+            ShardHeader *hdr = (ShardHeader *)fc.map;
+            if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
+            fcache_release(fc);
+        }
+        uint64_t needed = 2ULL * ((uint64_t)live + (uint64_t)shard_counts[s]) + 1;
+        uint32_t target = cur_slots;
+        while ((uint64_t)target < needed) {
+            if (target >= (1u << 30)) break;
+            target *= 2;
+        }
+        if (target > cur_slots) {
+            (void)ucache_grow_to(shard_path, target, sc.slot_size, sc.prealloc_mb);
+        }
+    }
 
     int nshard_groups = 0;
     for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard_groups++;

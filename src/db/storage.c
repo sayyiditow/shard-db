@@ -587,6 +587,13 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
     return ucache_grow_to(path, observed * 2, slot_size, prealloc_mb);
 }
 
+uint32_t ucache_peek_slots(const char *path, int slot_size, int prealloc_mb) {
+    if (!g_ucache) return 0;
+    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    if (slot < 0) return 0;
+    return g_ucache[slot].slots_per_shard;
+}
+
 /* Check threshold; caller holds entry wrlock during the insert but MUST release
    before calling this (we re-acquire inside). ucache_slot is the entry index. */
 void ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb) {

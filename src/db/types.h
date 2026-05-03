@@ -652,6 +652,10 @@ int        ucache_grow_to(const char *path, uint32_t target_slots,
 int        ucache_grow_shard(const char *path, int slot_size, int prealloc_mb);
 /* Post-insert threshold check — calls ucache_grow_shard if load >= 50%. */
 void       ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb);
+/* Returns current slots_per_shard for the shard at `path`, opening it into
+   the ucache if not already present. Returns 0 on error. Used by callers
+   that want to make a sizing decision before kicking off worker writes. */
+uint32_t   ucache_peek_slots(const char *path, int slot_size, int prealloc_mb);
 /* Sweep stale shard.new files after a crash during grow. Called at startup. */
 void       grow_recovery(const char *db_root);
 UCacheEntry *ucache_entry(int slot);
