@@ -67,7 +67,7 @@ Zone B is only read when a probe matches a hash in Zone A — so full-scan filte
 When a shard's load exceeds 50%:
 
 1. Build `.new` file with doubled `slots_per_shard`.
-2. Rehash every active slot into the new file.
+2. Re-bucket every active slot into the new file. The 16-byte xxh128 already lives in the slot header — the worker reuses bytes 2–5 directly and re-ANDs against the wider mask (`slot = raw & (new_slots - 1)`). No re-hashing of keys; we never read the key bytes back through xxh128.
 3. Rename `.new` → original (atomic).
 
 Growth is transparent to concurrent readers (they keep reading the old mmap until they re-open). Writers block briefly during rename. **No slot cap** — shards grow as data grows.
