@@ -1232,9 +1232,14 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        per grow, and each subsequent grow re-buckets a growing record set —
        so total rebuild work scales with the number of incremental doublings.
        One up-front grow to the right size avoids that.
-       Target: smallest power of 2 such that
-           (live + shard_counts[s]) * GROW_LOAD_DEN < target * GROW_LOAD_NUM
-       which at the 50% load factor means target > 2 * (live + incoming). */
+       Target: smallest power of 2 that holds (live + incoming) records.
+       We do NOT add the 2× headroom that ucache_maybe_grow uses for non-bulk
+       inserts — bulk-insert workers tolerate high load factors fine (they
+       only grow on shard-full overflow, not at 50%), and over-allocating
+       balloons the sparse mmap region, which costs more in page-fault
+       overhead during the actual write phase than the tighter probe chains
+       cost. Hash variance ⇒ a few records may overflow this target; the
+       worker's in-loop grow path remains the fallback. */
     for (int s = 0; s < sc.splits; s++) {
         if (shard_counts[s] <= 0) continue;
         char shard_path[PATH_MAX];
@@ -1248,7 +1253,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
             fcache_release(fc);
         }
-        uint64_t needed = 2ULL * ((uint64_t)live + (uint64_t)shard_counts[s]) + 1;
+        uint64_t needed = (uint64_t)live + (uint64_t)shard_counts[s];
         uint32_t target = cur_slots;
         while ((uint64_t)target < needed) {
             if (target >= (1u << 30)) break; /* sanity ceiling */
@@ -1736,7 +1741,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
             if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
             fcache_release(fc);
         }
-        uint64_t needed = 2ULL * ((uint64_t)live + (uint64_t)shard_counts[s]) + 1;
+        uint64_t needed = (uint64_t)live + (uint64_t)shard_counts[s];
         uint32_t target = cur_slots;
         while ((uint64_t)target < needed) {
             if (target >= (1u << 30)) break;
