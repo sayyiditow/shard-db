@@ -640,8 +640,15 @@ void       ucache_write_release(FcacheRead h);
    daemons can drain them (which pushes dirty_ratio over its threshold and
    causes every subsequent write to stall in D-state). */
 void       ucache_nudge_writeback(int ucache_slot);
-/* Double slots_per_shard for this shard: rehash live records into a new file,
-   atomic rename, swap mapping. Caller must NOT hold the entry wrlock. */
+/* Grow `path` to exactly `target_slots` (must be a power of 2 strictly greater
+   than current slots_per_shard). Returns 0 on success, 0 if another writer
+   already grew at/past target (no-op), -1 on error. Caller must NOT hold the
+   entry wrlock. */
+int        ucache_grow_to(const char *path, uint32_t target_slots,
+                          int slot_size, int prealloc_mb);
+/* Double slots_per_shard for this shard: re-bucket live records into a new file,
+   atomic rename, swap mapping. Thin wrapper over ucache_grow_to. Caller must
+   NOT hold the entry wrlock. */
 int        ucache_grow_shard(const char *path, int slot_size, int prealloc_mb);
 /* Post-insert threshold check — calls ucache_grow_shard if load >= 50%. */
 void       ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb);

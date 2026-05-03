@@ -430,22 +430,28 @@ static void *grow_rehash_worker(void *arg) {
     return NULL;
 }
 
-/* Double slots_per_shard for this shard: build `.new`, rehash live
-   records, atomic rename, swap mapping. Caller must NOT hold rwlock. */
-int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
+/* Grow `path` to exactly `target_slots`. Body of the per-shard rebuild;
+   ucache_grow_shard is a thin wrapper that supplies target = old * 2. */
+int ucache_grow_to(const char *path, uint32_t target_slots,
+                   int slot_size, int prealloc_mb) {
     if (!g_ucache) return -1;
+    /* target_slots must be a power of 2. */
+    if (target_slots == 0 || (target_slots & (target_slots - 1)) != 0) return -1;
+
     int slot = ucache_ensure(path, slot_size, prealloc_mb);
     if (slot < 0) return -1;
 
     UCacheEntry *e = &g_ucache[slot];
     /* coverity[lock_evasion] coverity[missing_lock] deliberate lock-free
        snapshot — `_Atomic uint32_t` gives torn-read-free visibility; the
-       value is only used to detect "did another writer grow this shard
-       before us" via the locked `old_slots != observed_slots` comparison
-       after the wrlock acquire. Stale value just means we proceed with the
-       locked check, which is authoritative. Snapshotting before the lock
-       avoids serialising every concurrent grow-detection through the wrlock. */
+       value is only used to detect "did another writer already grow this
+       shard at/past our target" via the locked check after wrlock acquire.
+       Stale value just means we proceed to the locked check, which is
+       authoritative. Snapshotting before the lock avoids serialising every
+       concurrent grow-detection through the wrlock. */
     uint32_t observed_slots = e->slots_per_shard;
+    if (observed_slots >= target_slots) return 0; /* already at/past target */
+
     pthread_rwlock_wrlock(&e->rwlock);
 
     ShardHeader *old_hdr = (ShardHeader *)e->map;
@@ -454,12 +460,12 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
         return -1;
     }
     uint32_t old_slots = e->slots_per_shard;
-    /* Another writer grew this shard while we waited for the lock. */
-    if (old_slots != observed_slots) {
+    /* Another writer already grew us at/past target. */
+    if (old_slots >= target_slots) {
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
-    uint32_t new_slots = old_slots * 2;
+    uint32_t new_slots = target_slots;
     char new_path[PATH_MAX];
     snprintf(new_path, sizeof(new_path), "%s.new", path);
     unlink(new_path);
@@ -569,6 +575,16 @@ int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
 
     pthread_rwlock_unlock(&e->rwlock);
     return 1;
+}
+
+/* Double slots_per_shard for this shard. Thin wrapper over ucache_grow_to. */
+int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
+    if (!g_ucache) return -1;
+    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    if (slot < 0) return -1;
+    uint32_t observed = g_ucache[slot].slots_per_shard;
+    if (observed == 0) return -1;
+    return ucache_grow_to(path, observed * 2, slot_size, prealloc_mb);
 }
 
 /* Check threshold; caller holds entry wrlock during the insert but MUST release
