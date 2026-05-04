@@ -20,25 +20,28 @@ export INDEX_PAGE_SIZE=4096        # B+ tree page size (power-of-2, 1024–65536
 
 Only change what the data says to change.
 
+> **THREADS vs WORKERS at a glance:** they look symmetric but aren't. **THREADS** is the *compute* pool — the parallel-for that fans a single scan / index build across shards. **WORKERS** is the *I/O* pool — one thread per in-flight TCP request. A request arrives on a WORKER, and if it triggers a parallel scan, that scan farms shard-level work onto the THREADS pool. Sizing them is independent.
+
 ## THREADS — scan parallelism
 
-Number of worker threads spawned for parallel shard scans (`find`, `count`, `aggregate`, index builds).
+Number of compute threads in the `parallel_for` pool used for parallel shard scans (`find`, `count`, `aggregate`), index builds, and bulk write phase 2.
 
-- **Default 0** = online CPU count (`nproc`).
-- Lower if the host has other workloads sharing CPU.
-- Higher rarely helps — the work is CPU-bound on mmap reads; going above physical cores causes cache thrash.
+- **Default 0** = `4 × online CPU count` (min 4). Yes, intentional oversubscription.
+- Why 4×: scans take per-shard rwlocks. A thread-per-core pool stalls whenever a shard is briefly contended, leaving cores idle. 4× lets the kernel overlap waiters with runners. Measured ~18% faster on parallel bulk-insert vs 1× cores; no measurable downside on read-only scans (mmap reads are cheap to context-switch into).
+- Lower if the host has other workloads sharing CPU — but going below `nproc` usually hurts.
+- Going above 4× rarely helps — past that you're paying scheduler overhead for diminishing rwlock-overlap returns.
 
-When to care: large full scans. For indexed queries (which touch tiny candidate sets), `THREADS` barely matters.
+When to care: large full scans, parallel bulk-insert at >1M rows, indexed batch ingest. For indexed point queries (tiny candidate sets), `THREADS` barely matters.
 
 ## WORKERS — server thread pool
 
-Number of threads servicing incoming connections.
+Number of threads in the TCP request pool. Each in-flight client request is dispatched onto one WORKER, which drives the request to completion (parsing, planning, optionally fanning out to the THREADS pool, writing the response).
 
 - **Default 0** = `max(online CPUs, 4)`.
-- Bump for heavy pipelining / high connection concurrency.
-- Each worker adds memory (`MAX_REQUEST_SIZE` buffer × number of **concurrent connections**, not workers).
+- The default is conservative and *not* connection-aware — at high connection concurrency you should bump this. Rule of thumb: `WORKERS ≥ p99 concurrent in-flight requests`. If clients pipeline requests on a single connection, the server still serializes them per-connection (one read at a time), so concurrent connections, not pipelined depth, drive sizing.
+- Bumping WORKERS does NOT add per-worker memory unless the workers are actively servicing requests — the `MAX_REQUEST_SIZE` buffer is allocated per active connection, not per idle worker.
 
-When to care: `stats` shows `active_threads` consistently at the cap. Usually not the bottleneck — threads are cheap; memory and disk are the limits.
+When to care: `stats` shows `active_threads` consistently at WORKERS cap → bump it. Usually not the bottleneck; the limits are typically memory (large requests) or disk (cold scans).
 
 ## FCACHE_MAX — unified shard mmap cache (drives `BT_CACHE_MAX` too)
 
