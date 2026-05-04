@@ -1,8 +1,11 @@
 # Build output
 build/
-shard-db
-shard-cli
-shardkv
+/shard-db
+/shard-cli
+/shardkv
+/shard-db-test
+/shard-db-bench
+/migrate
 *.o
 *.a
 
@@ -53,6 +56,10 @@ Thumbs.db
 # directory holds only the hand-written human-named seed inputs.
 fuzz/build/
 fuzz/.cache/
+fuzz/corpora/criteria/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
 crash-*
 leak-*
 timeout-*
+
+# Internal planning docs — kept local, never published.
+docs/superpowers/
