@@ -2162,17 +2162,19 @@ static int validate_metadata(const char *db_root) {
     }
     /* No schema.conf at all is fine on a fresh DB — no objects to validate. */
 
-    /* Rule 3: every dir referenced in schema.conf must be in dirs.conf. */
+    /* Rule 3: every dir referenced in schema.conf SHOULD be in dirs.conf.
+       Soft warning — not fatal. The auth/route layer rejects unknown dirs
+       before any read is dispatched, so a stale schema entry can't cause
+       silent mis-routing. (An older revision treated this as fatal, which
+       blocked startup on any DB that had outlived a removed test tenant —
+       the operator-visible failure mode of "started... immediately
+       stopped" with the only diagnostic in error.log.) */
     for (int i = 0; i < schema_count; i++) {
         if (!is_valid_dir(schema_entries[i].dir)) {
-            fprintf(stderr,
-                "validate: schema.conf references dir [%s] (object [%s]) "
-                "but it is not in dirs.conf\n",
+            log_msg(2,
+                "VALIDATE warning: schema.conf references dir [%s] (object [%s]) "
+                "not in dirs.conf — entry ignored",
                 schema_entries[i].dir, schema_entries[i].obj);
-            log_msg(1,
-                "VALIDATE schema.conf references dir [%s] not in dirs.conf",
-                schema_entries[i].dir);
-            errors++;
         }
     }
 
@@ -2318,6 +2320,27 @@ int cmd_server(const char *db_root, int daemonize) {
         return 1;
     }
 
+    /* Pre-fork validation: dirs.conf + schema.conf consistency must be
+       checked while stderr still reaches the user's terminal. The earlier
+       layout ran validate_metadata after the fork's stderr→/dev/null
+       redirect, leaving the parent's "shard-db started (pid N)" message
+       and a stale pid file with no listener — operators saw "started"
+       then immediate "stopped" with no diagnostic outside error.log. */
+    load_dirs();
+    {
+        int validate_errors = validate_metadata(db_root);
+        if (validate_errors > 0) {
+            fprintf(stderr,
+                "\nshard-db: refusing to start: %d metadata error%s detected.\n"
+                "  Recover with: ./shard-db import-schema <manifest.json>\n"
+                "  Or restore from a backup: ./shard-db restore <object> <timestamp>\n"
+                "  See full error log at %s/error-*.log.\n\n",
+                validate_errors, validate_errors == 1 ? "" : "s", g_log_dir);
+            close(lock_fd);
+            return 1;
+        }
+    }
+
     if (daemonize) {
         pid_t pid = fork();
         if (pid < 0) { perror("fork"); close(lock_fd); return 1; }
@@ -2406,27 +2429,12 @@ int cmd_server(const char *db_root, int daemonize) {
                   : (int)sysconf(_SC_NPROCESSORS_ONLN) * 4;
     if (pool_sz < 4) pool_sz = 4;
     parallel_pool_init(pool_sz);
-    load_dirs();
+    /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
     load_allowed_ips_conf(db_root);
     objlock_init();
     rebuild_recovery(db_root);
     grow_recovery(db_root);
-
-    /* Cross-check dirs.conf, schema.conf, and on-disk objects. Refuse to
-       start on inconsistency rather than silently mis-routing reads with
-       a fallback splits=64. See validate_metadata() for the three rules. */
-    int validate_errors = validate_metadata(db_root);
-    if (validate_errors > 0) {
-        fprintf(stderr,
-            "\nshard-db: refusing to start: %d metadata error%s detected.\n"
-            "  Recover with: ./shard-db import-schema <manifest.json>\n"
-            "  Or restore from a backup: ./shard-db restore <object> <timestamp>\n"
-            "  See full error log at %s/error-*.log.\n\n",
-            validate_errors, validate_errors == 1 ? "" : "s", g_log_dir);
-        log_shutdown();
-        return 1;
-    }
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */

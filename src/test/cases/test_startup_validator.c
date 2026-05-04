@@ -211,8 +211,11 @@ static int test_startup_validator_run(void) {
     refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
     ASSERT_TRUE(refused, "validator refuses start when fields.conf is missing");
 
-    /* === Phase 5: schema.conf references a dir not in dirs.conf. */
-    /* Restore fields.conf so phase 4 isn't conflated. */
+    /* === Phase 5: schema.conf references a dir not in dirs.conf — soft
+       warning, NOT fatal. The auth/route layer rejects unknown dirs
+       before any read is dispatched, so a stale schema entry can't cause
+       silent mis-routing. Earlier behavior (refused start) blocked
+       operators on any DB that had outlived a removed test tenant. */
     {
         char fields_path[400];
         snprintf(fields_path, sizeof(fields_path), "%s/default/v/fields.conf", db_root);
@@ -226,7 +229,7 @@ static int test_startup_validator_run(void) {
         if (sf) { fputs("ghost_tenant:obj:16:16\n", sf); fclose(sf); }
     }
     refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
-    ASSERT_TRUE(refused, "validator refuses start when schema.conf references unknown dir");
+    ASSERT_TRUE(!refused, "stale schema.conf dir is warned, not refused");
 
     run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
