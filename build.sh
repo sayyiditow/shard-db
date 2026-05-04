@@ -102,6 +102,27 @@ gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c s
 gcc $MODE_CFLAGS -o migrate src/migrate/main.c src/migrate/migrate_files.c -Isrc/migrate $MODE_LDFLAGS
 [ "$DO_STRIP" = 1 ] && strip migrate
 
+# shard-db-test — TAP-style C test runner. Links daemon's JSON helpers
+# (src/db/util.c) for response parsing; otherwise self-contained (TCP/TLS
+# client + assertion macros + per-test daemon fixtures). Future test cases
+# under src/test/cases/ get listed here.
+gcc $MODE_CFLAGS -o shard-db-test \
+    src/test/shard-db-test.c \
+    src/db/util.c \
+    -Isrc/db -Isrc/test \
+    $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+[ "$DO_STRIP" = 1 ] && strip shard-db-test
+
+# shard-db-bench — bench runner. Same TCP+TLS client as shard-db-test,
+# different output format (latency histograms + throughput). Future bench
+# files under src/bench/ get listed here.
+gcc $MODE_CFLAGS -o shard-db-bench \
+    src/bench/shard-db-bench.c \
+    src/db/util.c \
+    -Isrc/db -Isrc/test \
+    $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+[ "$DO_STRIP" = 1 ] && strip shard-db-bench
+
 mkdir -p build/bin
 
 # Purge any dev-run artifacts so `./build.sh` always emits a clean tree.
@@ -113,7 +134,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli migrate build/bin/
+cp shard-db shard-cli migrate shard-db-test shard-db-bench build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
 # overwriting the existing config when an upgrade tarball lands on top.
