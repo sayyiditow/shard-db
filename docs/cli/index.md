@@ -39,8 +39,10 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 
 | Command | Args | Description |
 |---|---|---|
-| `bulk-insert` | `<dir> <obj> [file]` | JSON array of `{"id":"<key>","data":{...}}` objects. File path or stdin. |
+| `bulk-insert` | `<dir> <obj> [file]` | JSON array of `{"key":"<key>","value":{...}}` objects, or dict form `{"k1":{...},"k2":{...}}`. File path or stdin. Acts as upsert (overwrites existing keys; `if_not_exists` available via JSON mode). |
 | `bulk-delete` | `<dir> <obj> [file]` | JSON array of keys (e.g. `["k1","k2"]`). For criteria-based deletes, use JSON mode. |
+
+`bulk-update` has no CLI shortcut — use [JSON mode](../query-protocol/bulk.md#bulk-update). It has three sub-shapes: (1) `criteria` + `value` to filter then patch matching records, (2) `records:` for per-key patches inline, (3) `file:` for the same from disk. CSV input via `bulk-update-delimited`.
 
 ## File storage
 
