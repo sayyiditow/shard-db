@@ -12282,6 +12282,109 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    /* Fast path: single-spec MIN/MAX narrowed by ONE indexed criterion.
+       Build candidate KeySet from the criterion's index walk, then walk
+       the agg field's btree in ASC (MIN) or DESC (MAX) order — the first
+       leaf entry whose hash is in the KeySet is the answer. No record
+       fetches; the agg value comes straight from the leaf bytes via
+       decode_index_key_to_double. ~10× faster than agg_run_plan's path
+       which collects all hashes then decodes per record.
+
+       Only fires when:
+         - single spec MIN or MAX, no group_by, no having
+         - criteria is one LEAF (`{...}`) or AND-of-one (`[{...}]`)
+         - criteria leaf is indexed (so collect_hash_cb is fast)
+         - agg field is indexed non-varchar (decode_index_key_to_double works)
+       Falls through to the existing scan / parallel_indexed_agg path
+       for AND-with-multiple, OR, no-index, or composite agg field. */
+    if (tree && no_group && no_having && nspecs == 1 &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
+        CriteriaNode *crit_leaf_node = NULL;
+        if (tree->kind == CNODE_LEAF) crit_leaf_node = tree;
+        else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                 tree->children[0]->kind == CNODE_LEAF)
+            crit_leaf_node = tree->children[0];
+        int agg_fi = typed_field_index(fs.ts, specs[0].field);
+        if (crit_leaf_node && agg_fi >= 0 &&
+            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits) &&
+            leaf_is_indexed(&crit_leaf_node->leaf, db_root, object, NULL, 0)) {
+            const TypedField *agg_tf = &fs.ts->fields[agg_fi];
+            SearchCriterion *crit = &crit_leaf_node->leaf;
+            const TypedField *crit_tf = resolve_idx_field(fs.ts, crit->field);
+
+            /* Step 1: gather candidate hashes from the criterion. */
+            CollectCtx cc;
+            collect_ctx_init(&cc);
+            cc.splits = sch.splits;
+            cc.primary_crit = crit;
+            cc.check_primary = op_needs_check_primary(crit->op);
+            cc.deadline = &dl;
+            btree_dispatch(db_root, object, crit->field, sch.splits,
+                           crit, crit_tf, collect_hash_cb, &cc);
+
+            if (!cc.budget_exceeded && !dl.timed_out && cc.count > 0) {
+                /* Step 2: KeySet for O(1) hash membership. ~25% headroom
+                   keeps the open-addressing probe short. */
+                KeySet *ks = keyset_new(cc.count + cc.count / 4 + 16);
+                if (ks) {
+                    for (size_t i = 0; i < cc.count; i++)
+                        keyset_insert(ks, cc.entries[i].hash);
+
+                    /* Step 3: walk agg field btree in order; first
+                       in-KeySet hash per shard wins, take global. */
+                    int n_idx = index_splits_for(sch.splits);
+                    int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
+                    double best = 0.0;
+                    int have = 0;
+                    for (int s = 0; s < n_idx; s++) {
+                        char idx_path[PATH_MAX];
+                        build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                       object, specs[0].field, s);
+                        BtRangeIter *it = btree_range_iter_open(
+                            idx_path, "", 0, 0,
+                            "\xff\xff\xff\xff", 4, 0, desc);
+                        if (!it) continue;
+                        const char *val; size_t vlen; const uint8_t *hash16;
+                        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                            if (!keyset_contains(ks, hash16)) continue;
+                            double v;
+                            if (decode_index_key_to_double(agg_tf,
+                                                           (const uint8_t *)val,
+                                                           vlen, &v)) {
+                                if (!have) { best = v; have = 1; }
+                                else if (desc) { if (v > best) best = v; }
+                                else           { if (v < best) best = v; }
+                                break; /* per-shard min/max found */
+                            }
+                        }
+                        btree_range_iter_close(it);
+                    }
+                    keyset_free(ks);
+                    collect_ctx_destroy(&cc);
+
+                    char vbuf[64];
+                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                             ? parse_csv_delim(delimiter) : 0;
+                    if (csv_delim_local) {
+                        csv_emit_cell(specs[0].alias, csv_delim_local);
+                        OUT("\n");
+                        csv_emit_cell(vbuf, csv_delim_local);
+                        OUT("\n");
+                    } else {
+                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+                    }
+                    free_criteria_tree(tree);
+                    free(specs);
+                    return 0;
+                }
+            }
+            collect_ctx_destroy(&cc);
+        }
+    }
+
     /* ===== NEQ algebraic shortcut =====
        Narrow eligibility: criteria is exactly one NEQ leaf on an indexed
        field, no group_by, no having, every spec is COUNT/SUM/AVG (algebraic
