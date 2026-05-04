@@ -70,8 +70,10 @@ TestClient *tc_connect(const TestClientCfg *cfg) {
 
         tc->ssl = SSL_new(tc->ctx);
         SSL_set_fd(tc->ssl, fd);
+        /* SSL_set_tlsext_host_name expands to SSL_ctrl(..., void *parg).
+           OpenSSL's signature isn't const-correct; cast away const. */
         SSL_set_tlsext_host_name(tc->ssl,
-            cfg->tls_server_name ? cfg->tls_server_name : "localhost");
+            (char *)(cfg->tls_server_name ? cfg->tls_server_name : "localhost"));
         if (SSL_connect(tc->ssl) != 1) {
             SSL_free(tc->ssl); SSL_CTX_free(tc->ctx); close(fd); free(tc);
             return NULL;

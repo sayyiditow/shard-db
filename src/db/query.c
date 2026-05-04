@@ -1123,10 +1123,17 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     /* ucache handles shard caching */
 
-    /* Pre-allocate BtEntry collectors for bulk B+ tree build at end */
-    BtEntry **idx_pairs = calloc(nfields, sizeof(BtEntry *));
-    size_t *idx_pair_counts = calloc(nfields, sizeof(size_t));
-    size_t *idx_pair_caps = calloc(nfields, sizeof(size_t));
+    /* Pre-allocate BtEntry collectors for bulk B+ tree build at end.
+       Clamp nfields explicitly so GCC's LTO range analysis can see the
+       upper bound (load_index_fields already clamps to MAX_FIELDS, but
+       gcc loses track across TUs and warns about theoretical size_t
+       overflow in the calloc). */
+    if (nfields < 0) nfields = 0;
+    if (nfields > MAX_FIELDS) nfields = MAX_FIELDS;
+    size_t nf_sz = (size_t)nfields;
+    BtEntry **idx_pairs = calloc(nf_sz, sizeof(BtEntry *));
+    size_t *idx_pair_counts = calloc(nf_sz, sizeof(size_t));
+    size_t *idx_pair_caps = calloc(nf_sz, sizeof(size_t));
     for (int i = 0; i < nfields; i++) {
         idx_pair_caps[i] = 4096;
         idx_pairs[i] = malloc(idx_pair_caps[i] * sizeof(BtEntry));
@@ -1383,12 +1390,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
 
     /* Phase-2 breakdown across workers. */
-    uint64_t grow_ms_total = 0, wall_ms_max = 0, wall_ms_sum = 0;
+    uint64_t grow_ms_total = 0, wall_ms_max = 0;
     int grow_count_total = 0;
     for (int wi = 0; wi < nshard_groups; wi++) {
         grow_ms_total  += workers[wi].grow_ms;
         grow_count_total += workers[wi].grow_count;
-        wall_ms_sum    += workers[wi].wall_ms;
         if (workers[wi].wall_ms > wall_ms_max) wall_ms_max = workers[wi].wall_ms;
     }
 
