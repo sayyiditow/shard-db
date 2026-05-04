@@ -25,4 +25,16 @@ void test_env_stop(TestEnv *env);
    closing. Returns -1 on failure. */
 int test_pick_port(void);
 
+/* Spawn a daemon at a caller-supplied db_root + port, no automatic
+   tmpdir / cleanup. Used by crash tests that need to spawn → kill →
+   respawn against the same on-disk state. Caller is responsible for
+   wiping db_root afterwards. Populates env->db_root / env->port /
+   env->daemon_pid. Returns 0 on success. */
+int test_env_start_at(TestEnv *env, const char *db_root, int port);
+
+/* SIGKILL the daemon immediately and reap. Does NOT clean up db_root.
+   Mirrors a crash — no graceful drain, no in-flight write completion.
+   For regular teardown use test_env_stop instead. */
+void test_env_kill(TestEnv *env);
+
 #endif

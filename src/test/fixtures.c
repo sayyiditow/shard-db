@@ -130,6 +130,72 @@ int test_env_start(TestEnv *env) {
     return 0;
 }
 
+int test_env_start_at(TestEnv *env, const char *db_root, int port) {
+    if (!env || !db_root || port <= 0) return -1;
+
+    /* Derive base = parent(db_root). Caller must have created it + db_root. */
+    const char *slash = strrchr(db_root, '/');
+    if (!slash || slash == db_root) return -1;
+    size_t base_len = (size_t)(slash - db_root);
+    char base[256];
+    if (base_len >= sizeof(base)) return -1;
+    memcpy(base, db_root, base_len);
+    base[base_len] = '\0';
+
+    snprintf(env->db_root, sizeof(env->db_root), "%s", db_root);
+    env->port = port;
+
+    /* (Re)write db.env. Idempotent — overwrites any existing file from a
+       previous run with the same base. */
+    char env_path[300];
+    snprintf(env_path, sizeof(env_path), "%s/db.env", base);
+    FILE *f = fopen(env_path, "w");
+    if (!f) return -1;
+    fprintf(f,
+        "export DB_ROOT=\"%s\"\n"
+        "export PORT=%d\n"
+        "export TIMEOUT=0\n"
+        "export LOG_DIR=\"%s/logs\"\n"
+        "export LOG_LEVEL=2\n"
+        "export THREADS=0\n"
+        "export FCACHE_MAX=4096\n"
+        "export TLS_ENABLE=0\n",
+        env->db_root, env->port, base);
+    fclose(f);
+    char logs_dir[400];
+    snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
+    mkdir(logs_dir, 0755);
+
+    const char *binary_rel = "./build/bin/shard-db";
+    if (access(binary_rel, X_OK) != 0) binary_rel = "./shard-db";
+    char binary_abs[PATH_MAX];
+    if (!realpath(binary_rel, binary_abs)) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        chdir(base);
+        execl(binary_abs, binary_abs, "server", (char *)NULL);
+        _exit(127);
+    }
+    env->daemon_pid = pid;
+
+    if (wait_daemon_ready(env->port, 5000) != 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    return 0;
+}
+
+void test_env_kill(TestEnv *env) {
+    if (!env || env->daemon_pid <= 0) return;
+    kill(env->daemon_pid, SIGKILL);
+    waitpid(env->daemon_pid, NULL, 0);
+    env->daemon_pid = -1;
+    /* No db_root cleanup — caller controls persistent state. */
+}
+
 void test_env_stop(TestEnv *env) {
     if (!env || env->daemon_pid <= 0) return;
     kill(env->daemon_pid, SIGTERM);
