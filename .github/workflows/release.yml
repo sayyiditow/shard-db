@@ -150,6 +150,14 @@ jobs:
       contents: write     # softprops/action-gh-release writes assets
       id-token: write     # cosign keyless OIDC
     steps:
+      # Checkout BEFORE the artifact download so docs/release-notes/<tag>.md
+      # is on disk when softprops/action-gh-release reads body_path. Earlier
+      # revisions skipped checkout (the binaries already came from the
+      # build jobs' artifacts), and softprops silently fell back to the
+      # tag annotation message when the file was missing — leaving every
+      # release with a plain-text body instead of the rich markdown.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifact-*
