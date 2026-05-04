@@ -9,27 +9,16 @@ shard-db is a high-performance file-based database in C. Single static binary, s
 ## Build & test
 
 ```bash
-./build.sh                       # builds shard-db (daemon, ~324K), shard-cli (TUI, ~60K), migrate (one-shot upgrades) → build/bin/
-./tests/<name>.sh                # one test; each starts/stops its own server, portable CWD
+./build.sh                                        # builds + runs the C test suite at the end (set SKIP_TESTS=1 to skip)
+./build/bin/shard-db-test run-all                 # all tests; each spawns its own daemon on a free port
+./build/bin/shard-db-test run-all --filter <substr>   # narrow the run
+./build/bin/shard-db-test run <name>              # single case (e.g. test-or-logic)
+./build/bin/shard-db-test list                    # list registered cases
 ```
 
-Test scripts (33 total, ~970 assertions; names are self-descriptive — `ls tests/` to enumerate):
+C test cases live under `src/test/cases/test_*.c` (34 cases, ~1000 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
 
-```
-test-objlock.sh                  test-cli-shortcuts.sh        test-bulk-cas.sh
-test-rename-field.sh             test-or-logic.sh             test-schema-export.sh
-test-remove-field.sh             test-csv-export.sh           test-stats-prom.sh
-test-vacuum-addfield.sh          test-per-tenant-auth.sh      test-bulk-upsert.sh
-test-parallel-index-integrity.sh test-token-perms.sh          test-bulk-update-json.sh
-test-joins.sh                    test-request-timeout.sh      test-agg-neq-shortcut.sh
-test-bulk-update-delimited.sh    test-binary-index.sh         test-length-ops.sh
-test-find-cursor.sh              test-tls.sh                  test-case-sensitivity.sh
-test-and-intersection.sh         test-describe.sh             test-list-files.sh
-test-tenant-mgmt.sh              test-migrate-binary.sh       test-bare-shapes.sh
-test-field-vs-field.sh           test-regex.sh                test-stress-no-hang.sh
-```
-
-Bench scripts live in `bench/`. **The user runs benches**; do not run them to validate perf.
+Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`. **The user runs benches**; do not run them to validate perf.
 
 ## Source layout
 
