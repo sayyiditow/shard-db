@@ -8,7 +8,9 @@
  * Key shape  : sha256(decimal-i)[:16] hex — same as Python bench loader.
  * Value shape: "val_<i>" left-padded to 100 chars with 'x'.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "test_runner.h"
 #include "test_client.h"
 #include "fixtures.h"

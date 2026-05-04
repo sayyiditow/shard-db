@@ -1,4 +1,7 @@
 /* src/test/test_client.c */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "test_client.h"
 #include <fcntl.h>
 #include <netdb.h>

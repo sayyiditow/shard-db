@@ -1,4 +1,7 @@
 /* src/bench/bench_stats.c */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "bench_stats.h"
 #include <stdio.h>
 #include <stdlib.h>
