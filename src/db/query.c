@@ -7822,14 +7822,17 @@ typedef struct {
 } IntersectProbeCtx;
 
 /* btree callback for the second-and-later leaves: drop hashes that aren't
-   already in `running`, surviving hashes go into `out`. */
+   already in `running`, surviving hashes go into `out`. Returns -1 if the
+   destination KeySet refuses an insert (capacity exhausted) — keeps a
+   sizing miss from degrading inserts to O(cap) per call (ouch). */
 static int intersect_probe_cb(const char *val, size_t vlen,
                               const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     IntersectProbeCtx *p = (IntersectProbeCtx *)ctx;
     if (query_deadline_tick(p->deadline, &p->dl_counter)) return -1;
-    if (keyset_contains(p->running, hash16))
-        keyset_insert(p->out, hash16);
+    if (keyset_contains(p->running, hash16)) {
+        if (keyset_insert(p->out, hash16) < 0) return -1;
+    }
     return 0;
 }
 
@@ -7860,22 +7863,33 @@ typedef struct {
     int dl_counter;
 } IntersectCollectCtx;
 
-/* btree callback for the first leaf: every hit drops into the seed KeySet. */
+/* btree callback for the first leaf: every hit drops into the seed KeySet.
+   Returns -1 on insert failure (capacity exhausted) so the btree walk halts
+   instead of paying O(cap) per insert into a full table. */
 static int intersect_collect_cb(const char *val, size_t vlen,
                                 const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     IntersectCollectCtx *c = (IntersectCollectCtx *)ctx;
     if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
-    keyset_insert(c->ks, hash16);
+    if (keyset_insert(c->ks, hash16) < 0) return -1;
     return 0;
 }
 
-/* Walk the first leaf's btree into a fresh KeySet. */
+/* Walk the first leaf's btree into a fresh KeySet. Capacity is the larger
+   of the file-size heuristic and the object's live-record count: at worst a
+   single leaf can match every record (e.g., a low-cardinality bool index
+   where one value covers half the dataset, or a range that spans the whole
+   field). Without the live_count floor, the file-size hint can underestimate
+   by an order of magnitude on densely-compressed btrees and the inserts
+   degrade to O(cap) once the table fills. */
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
-    KeySet *ks = keyset_new(leaf_capacity_hint(db_root, object, leaf->field, splits));
+    size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
+    int live = get_live_count(db_root, object);
+    if (live > 0 && (size_t)live > hint) hint = (size_t)live;
+    KeySet *ks = keyset_new(hint);
     if (!ks) return NULL;
     TypedSchema *ts = load_typed_schema(db_root, object);
     IntersectCollectCtx c = { ks, dl, 0 };
@@ -8028,13 +8042,14 @@ typedef struct {
 } OrChildWorkerCtx;
 
 /* btree callback — drops every hit into the shared KeySet. Returns -1 to
-   halt the btree walk on deadline trip OR when the caller-supplied
-   target_count has been reached (limit pushdown for find queries). */
+   halt the btree walk on deadline trip, on capacity exhaustion (insert
+   failure → O(cap) probe per call if we kept trying), OR when the caller-
+   supplied target_count has been reached (limit pushdown for find). */
 static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
     if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
-    keyset_insert(w->ks, hash16);
+    if (keyset_insert(w->ks, hash16) < 0) return -1;
     if (w->target_count > 0 &&
         atomic_load_explicit(&w->ks->n, memory_order_relaxed) >= (size_t)w->target_count) {
         return -1;
@@ -8071,7 +8086,11 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
 
     /* Estimate total candidate size by summing every shard file's size for
        each child's index field (very rough: 1 entry per 64 bytes of leaf
-       storage). Floor at 1024, cap at 1M to keep memory bounded. */
+       storage). Floored at the object's live_count to handle the worst
+       case where one OR leaf matches every record (low-cardinality field,
+       or wide range bound) — without the floor the file-size estimate
+       under-counts heavily-compressed btrees and inserts degrade to O(cap)
+       per call once the table fills. */
     int idx_n = index_splits_for(splits);
     size_t est_total = 0;
     for (int i = 0; i < n; i++) {
@@ -8083,8 +8102,9 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
             if (stat(p, &st) == 0) est_total += (size_t)st.st_size / 64;
         }
     }
+    int live = get_live_count(db_root, object);
+    if (live > 0 && (size_t)live > est_total) est_total = (size_t)live;
     if (est_total < 1024) est_total = 1024;
-    if (est_total > 1000000) est_total = 1000000;
 
     /* Budget check: KeySet alloc is O(cap_pow2 * 24 bytes) — keys[] + state[].
        Cap est_total to fit the per-query buffer cap. */
