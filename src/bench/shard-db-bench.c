@@ -9,6 +9,12 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
+    /* Line-buffer stdout so each printf flushes on '\n'. Without this,
+       stdout pipes to a file get block-buffered (8 KB) and progress
+       output appears all-at-once at process exit. Benches print
+       progress while running — we want it visible immediately. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) {
         fprintf(stderr, "usage: shard-db-bench list | run <name> | run-all\n");
         return 1;
