@@ -1,24 +1,26 @@
 # Benchmarks
 
-Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a standalone script in `bench/`. All numbers are from end-to-end runs with the server over TCP — **request parse, auth, encode, disk write, ACK** are all in the measurement. Nothing is bypassed.
+Five canonical workloads on **AMD Ryzen 7 7840U** (8C / 16T) · 32 GB · NVMe ext4 · Linux 6.19 · gcc 15.2 `-O2`. Each scenario is a C-level bench in `src/bench/` invoked via `./build/bin/shard-db-bench run <name>`. All numbers are from end-to-end runs with the server over TCP — **request parse, auth, encode, disk write, ACK** are all in the measurement. Nothing is bypassed.
+
+> **Reads are strict request-response.** The single-record read benches (GET / EXISTS / UPDATE / DELETE) wait for each response before sending the next request. Real-world clients that pipeline requests on the wire (multiple in flight at once) will see meaningfully higher per-connection throughput. Treat the per-op latencies as honest single-request floors and the throughputs as the lower-bound for clients that don't pipeline.
 
 ## 1. K/V single-threaded — 10M records
 
-`bench-kv.sh 10000000`, `SPLITS=128`.
+`shard-db-bench run bench-kv` with `SHARD_BENCH_COUNT=10000000`, `SPLITS=128`.
 
 Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape used by LMDB / LevelDB / RocksDB `db_bench` so numbers compare directly. Unlike those embedded libraries, every request below crosses a TCP socket and goes through JSON/CSV parsing on the server.
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **3.76 M inserts/sec** (2.66 s) |
-| Bulk insert (CSV, 10M in one request) | **4.76 M inserts/sec** (2.10 s) |
-| GET ×10,000 (pipelined, 1 conn) | **23.0 k ops/sec** (434 ms) |
-| EXISTS ×10,000 hits (pipelined) | **22.8 k ops/sec** (438 ms) |
-| EXISTS ×10,000 all-miss (cold probe) | **66.2 k ops/sec** (151 ms) |
-| UPDATE ×10,000 (pipelined) | **19.9 k ops/sec** (502 ms) |
-| DELETE ×10,000 (pipelined) | **10.1 k ops/sec** (988 ms) |
-| Parallel GET (5 conns × 10k) | **90.1 k ops/sec** (555 ms) |
-| Parallel UPDATE (5 conns × 10k) | **66.7 k ops/sec** (750 ms) |
+| Bulk insert (JSON, 10M in one request) | **3.99 M inserts/sec** (2.51 s) |
+| Bulk insert (CSV, 10M in one request) | **4.96 M inserts/sec** (2.02 s) |
+| GET ×10,000 (req-resp, 1 conn) | **34.9 k ops/sec** (mean 28.2µs / p50 26.4µs / p99 51.1µs) |
+| EXISTS ×10,000 hits (req-resp) | **36.4 k ops/sec** (mean 27.1µs / p50 25.8µs / p99 49.7µs) |
+| EXISTS ×10,000 all-miss (cold probe) | **37.0 k ops/sec** (mean 26.8µs / p50 25.8µs / p99 43.6µs) |
+| UPDATE ×10,000 (req-resp) | **32.5 k ops/sec** (mean 30.4µs / p50 28.2µs / p99 62.2µs) |
+| DELETE ×10,000 (req-resp) | **17.9 k ops/sec** (mean 55.6µs / p50 51.4µs / p99 116.2µs) |
+| Parallel GET (5 conns × 10k) | **165.9 k ops/sec** (301 ms) |
+| Parallel UPDATE (5 conns × 10k) | **150.0 k ops/sec** (333 ms) |
 | Disk footprint | 2.3 GB |
 
 ## 2. K/V multi-threaded — 10M records, scaling across connections
