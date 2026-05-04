@@ -181,13 +181,20 @@ Numbers are from the parallel K/V bench on 10M rows (128 splits fastest at 3.488
 ## Reproduce
 
 ```bash
-./bench/bench-kv.sh 10000000                          # scenario 1 (default SPLITS=128)
-./bench/bench-kv-parallel.sh 10000000 1000000 10      # scenario 2 (default SPLITS=128)
-./bench/create-user-object.sh && \
-  ./bench/insert-users.sh 1000000 && \
-  ./bench/bench-queries.sh                            # scenario 3
-./bench/bench-invoice.sh 1000000 persistent           # scenario 4 (default SPLITS=64)
-./bench/bench-parallel.sh 1000000 100000 10           # scenario 5 (default SPLITS=64)
+./build.sh
+
+# Each bench self-spawns its own daemon on a tmp DB_ROOT and tears down on exit.
+# Scale via env vars (defaults match the published numbers in the tables above).
+
+SHARD_BENCH_COUNT=10000000 ./build/bin/shard-db-bench run bench-kv             # §1
+SHARD_BENCH_TOTAL=10000000 SHARD_BENCH_CHUNK=2000000 \
+  ./build/bin/shard-db-bench run bench-kv-parallel                              # §2
+./build/bin/shard-db-bench run bench-queries                                    # §3 (1M users)
+./build/bin/shard-db-bench run bench-invoice                                    # §4 (1M invoice)
+./build/bin/shard-db-bench run bench-parallel                                   # §5 (1M invoice parallel)
+
+# Or run the full suite:
+./build/bin/shard-db-bench run-all
 ```
 
-Scripts self-resolve to the repo root regardless of CWD and start/stop the server automatically. All scripts honour `SPLITS=N` to override their per-script default (128 for the K/V scripts, 64 for the invoice scripts — matched to the [splits sizing table](#splits-tuning) for each record count).
+Scale-override env vars: `SHARD_BENCH_COUNT` (single-conn benches), `SHARD_BENCH_TOTAL` + `SHARD_BENCH_CHUNK` (parallel benches), `SHARD_BENCH_USERS` + `SHARD_BENCH_ORDERS` (`bench-joins`). All sub-µs precision via `clock_gettime(CLOCK_MONOTONIC)`.
