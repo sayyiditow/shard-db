@@ -1654,6 +1654,27 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
     return buf;
 }
 
+void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
+                         int data_len, FILE *out) {
+    if (!ts || !ts->typed || !out) return;
+    fputc('{', out);
+    int first = 1;
+    for (int i = 0; i < ts->nfields; i++) {
+        const TypedField *f = &ts->fields[i];
+        if (f->removed) continue;
+        if (f->offset + f->size > data_len) break;
+
+        char vbuf[512];
+        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, sizeof(vbuf));
+        if (vlen <= 0) continue;
+
+        if (!first) fputc(',', out);
+        fprintf(out, "\"%s\":%s", f->name, vbuf);
+        first = 0;
+    }
+    fputc('}', out);
+}
+
 /* Extract a single field as string (for B+ tree keys, query matching) */
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx) {
     if (!ts || field_idx < 0 || field_idx >= ts->nfields) return NULL;

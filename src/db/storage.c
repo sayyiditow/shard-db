@@ -842,9 +842,10 @@ int cmd_get(const char *db_root, const char *object, const char *key) {
     const char *raw = (const char *)(fc.map + zoneB_off(slot, slots, sc.slot_size) + hdr->key_len);
 
     TypedSchema *ts = load_typed_schema(db_root, object);
-    char *json = typed_decode(ts, (const uint8_t *)raw, hdr->value_len);
-    OUT("%s\n", json);
-    free(json);
+    /* Stream straight into g_out — saves a malloc + memcpy on every GET. */
+    typed_decode_stream(ts, (const uint8_t *)raw, hdr->value_len,
+                        g_out ? g_out : stdout);
+    fputc('\n', g_out ? g_out : stdout);
     fcache_release(fc);
     return 0;
 }

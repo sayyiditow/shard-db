@@ -533,6 +533,11 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                           int out_size, const char *db_root, const char *object);
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
+/* Stream variant — writes the JSON object directly to `out` without
+   allocating an intermediate string. Use on the GET hot path; saves one
+   malloc + one memcpy per response vs. typed_decode + OUT("%s\n"). */
+void  typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
+                          int data_len, FILE *out);
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx);
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
