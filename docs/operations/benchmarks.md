@@ -45,31 +45,34 @@ Shard load distribution (128 splits): avg 0.596, records stddev 1.6 %, 1 grow pe
 
 ## 3. Queries on 1M users
 
-`bench-queries.sh`.
+`shard-db-bench run bench-queries`.
 
-13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). Indexes on `username`, `email`, `age`, `active`, `birthday`.
+13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). Indexes on `username`, `email`, `age`, `active`, `birthday`. C-bench measurements; cache is hot from the same-process bulk insert that built the dataset.
 
 | Operation class | Latency band |
 |---|---|
-| `count` metadata (no criteria) | **3 ms** (O(1) counter file) |
-| `count` indexed eq / between / in / lt / gt / lte / gte | **3–12 ms** |
-| `count` indexed `starts` / `exists` | **3–21 ms** |
-| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **41–44 ms** |
-| `count` full-scan (non-indexed field) | **7–10 ms** (scan-path is lock-free; each shard runs concurrently) |
-| `count` indexed + secondary filter | **16–48 ms** |
-| `find` limit 10 — any indexed op | **2–4 ms** |
-| `find` limit 10 — full scan on non-indexed | **2–3 ms** (Zone A probe + typed compare) |
-| `find` indexed + secondary filter | **2–3 ms** |
-| `aggregate count` (metadata) | **3 ms** |
-| `aggregate` where indexed-eq | **12–21 ms** |
-| `aggregate` where indexed range | **54–114 ms** |
-| `aggregate` full-scan (sum/avg/min/max) | **419 ms** |
-| `aggregate` group_by on full scan | **221–279 ms** |
-| `aggregate` group_by + having | **326 ms** |
-| `find` cursor page 1 (ASC/DESC, indexed `order_by`) | **2–4 ms** |
-| `find` cursor continuation (mid-range seek) | **2–3 ms** |
+| `count` metadata (no criteria) | **<1 ms** (O(1) counter file) |
+| `count` indexed eq / between / in / lt / gt / lte / gte | **<1–6 ms** |
+| `count` indexed `starts` | **<1 ms** |
+| `count` indexed `exists` (full-set traversal) | **19 ms** |
+| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **7–8 ms** |
+| `count` full-scan (non-indexed field) | **4–6 ms** (scan-path is lock-free; each shard runs concurrently) |
+| `count` indexed + secondary filter | **22–64 ms** |
+| `find` limit 10 — any indexed op | **<1 ms** |
+| `find` limit 10 — full scan on non-indexed | **<1 ms** (Zone A probe + typed compare) |
+| `find` indexed + secondary filter | **<1 ms** |
+| `aggregate count` (metadata) | **<1 ms** |
+| `aggregate` where indexed-eq | **10–24 ms** |
+| `aggregate` where indexed range | **71–168 ms** |
+| `aggregate` full-scan (sum/avg/min/max) | **390 ms** |
+| `aggregate` group_by on full scan | **220–252 ms** |
+| `aggregate` group_by + having | **296 ms** |
+| `find` cursor page 1 (ASC/DESC, indexed `order_by`) | **<1 ms** |
+| `find` cursor continuation (mid-range seek) | **<1 ms** |
 
-All 17 search operators use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
+All 38 search operators use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
+
+**On deep offset-based pagination:** `offset:50000 limit:100 order_by:age` (no cursor) hits the buffer-sort path which collects the full prefix into the per-query memory buffer; on a 1M dataset with `QUERY_BUFFER_MB=500` this aborts with `query memory buffer exceeded` instead of returning a (very slow) page. Use `cursor:null` + continuation tokens for deep pagination — the cursor path is O(log N) per page regardless of depth and stays sub-millisecond.
 
 ## 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes
 
