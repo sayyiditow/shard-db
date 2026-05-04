@@ -6315,6 +6315,40 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     return 0;
 }
 
+/* Streaming KeySet builder — alternative to collect_hash_cb for paths
+   that only need O(1) hash membership and never fetch records. Skips
+   the entries[] malloc + post-walk iteration entirely; each matching
+   leaf entry inserts directly into the KeySet (lock-free CAS in
+   keyset_insert keeps it parallel-safe under shard fan-out).
+   Used by the min/max-with-criteria fast path in cmd_aggregate. */
+typedef struct {
+    KeySet           *ks;
+    SearchCriterion  *primary_crit;
+    int               check_primary;
+    QueryDeadline    *deadline;
+    int               dl_counter;
+    _Atomic int       full;          /* set when keyset_insert returns -1 */
+} StreamKeysetCtx;
+
+static int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
+    StreamKeysetCtx *sk = (StreamKeysetCtx *)ctx;
+    if (query_deadline_tick(sk->deadline, &sk->dl_counter)) return -1;
+    if (sk->primary_crit && op_is_length(sk->primary_crit->op)) {
+        if (!match_length_vlen(vlen, sk->primary_crit)) return 0;
+    } else if (sk->check_primary && sk->primary_crit) {
+        char tmp[1028];
+        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+        memcpy(tmp, val, cl); tmp[cl] = '\0';
+        if (!match_criterion(tmp, sk->primary_crit)) return 0;
+    }
+    (void)val;
+    if (keyset_insert(sk->ks, hash16) < 0) {
+        atomic_store_explicit(&sk->full, 1, memory_order_relaxed);
+        return -1; /* keyset full — abort walk; caller falls back. */
+    }
+    return 0;
+}
+
 /* Look up TypedField for a criterion's indexed field. Returns NULL for
    composite indexes (pc->field contains '+') or when the field isn't in
    the typed schema — both cases fall through to raw-byte index semantics. */
@@ -12314,26 +12348,27 @@ int cmd_aggregate(const char *db_root, const char *object,
             SearchCriterion *crit = &crit_leaf_node->leaf;
             const TypedField *crit_tf = resolve_idx_field(fs.ts, crit->field);
 
-            /* Step 1: gather candidate hashes from the criterion. */
-            CollectCtx cc;
-            collect_ctx_init(&cc);
-            cc.splits = sch.splits;
-            cc.primary_crit = crit;
-            cc.check_primary = op_needs_check_primary(crit->op);
-            cc.deadline = &dl;
-            btree_dispatch(db_root, object, crit->field, sch.splits,
-                           crit, crit_tf, collect_hash_cb, &cc);
+            /* Build the candidate KeySet inline as the criterion's btree
+               is walked — no entries[] materialization, no second-pass
+               iteration. Capacity floored at live_count so the open-
+               addressing probe stays short under any matched-set size.
+               Lock-free keyset_insert (CAS) keeps it parallel-safe across
+               the shard-fan-out workers in btree_dispatch. */
+            int total = get_live_count(db_root, object);
+            KeySet *ks = keyset_new((size_t)(total > 0 ? total : 16) + 16);
+            if (ks) {
+                StreamKeysetCtx sk = {
+                    .ks = ks, .primary_crit = crit,
+                    .check_primary = op_needs_check_primary(crit->op),
+                    .deadline = &dl, .dl_counter = 0, .full = 0,
+                };
+                btree_dispatch(db_root, object, crit->field, sch.splits,
+                               crit, crit_tf, stream_keyset_cb, &sk);
 
-            if (!cc.budget_exceeded && !dl.timed_out && cc.count > 0) {
-                /* Step 2: KeySet for O(1) hash membership. ~25% headroom
-                   keeps the open-addressing probe short. */
-                KeySet *ks = keyset_new(cc.count + cc.count / 4 + 16);
-                if (ks) {
-                    for (size_t i = 0; i < cc.count; i++)
-                        keyset_insert(ks, cc.entries[i].hash);
-
-                    /* Step 3: walk agg field btree in order; first
-                       in-KeySet hash per shard wins, take global. */
+                if (!atomic_load_explicit(&sk.full, memory_order_relaxed) &&
+                    !dl.timed_out && keyset_size(ks) > 0) {
+                    /* Walk agg field btree in order; first in-KeySet hash
+                       per shard wins, take global min/max. */
                     int n_idx = index_splits_for(sch.splits);
                     int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
                     double best = 0.0;
@@ -12362,7 +12397,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                         btree_range_iter_close(it);
                     }
                     keyset_free(ks);
-                    collect_ctx_destroy(&cc);
 
                     char vbuf[64];
                     fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
@@ -12380,8 +12414,8 @@ int cmd_aggregate(const char *db_root, const char *object,
                     free(specs);
                     return 0;
                 }
+                keyset_free(ks);
             }
-            collect_ctx_destroy(&cc);
         }
     }
 
