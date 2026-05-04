@@ -154,7 +154,11 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./migrate
 ```
 
-**Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds for max throughput. Single-conn is fine for operational simplicity — it's only ~1.4× behind the parallel peak. For indexed loads at 1M+ records, **load-then-index** is competitive and avoids the per-(field, shard) merge cycle; pre-existing-indexes parallel is preferred when streaming and add-index-after isn't an option.
+**Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds.
+
+**Indexed batch ingest (1M scale, 5×200k chunks, C-bench)**: parallel-with-pre-existing-14-idx wins at **2.30 s / 435 k/sec**, beating parallel-no-idx + add-indexes (3.02 s / 331 k/sec) and single-no-idx + add-indexes (3.80 s / 263 k/sec). The earlier "load-then-index always wins" framing came from bash and is reversed in C bench at this scale. **Crossover rule of thumb:** at `R ≈ N/200K`, pre-existing-indexes parallel wins for `R ≤ ~10`, load-then-index wins for `R ≥ ~20` (per-(field, shard) merge cost scales `O(R²)`). Re-bench at your scale; both patterns are valid.
+
+**Bench harness:** `./build/bin/shard-db-bench` (C, sub-µs precision via `clock_gettime(CLOCK_MONOTONIC)`). Eight registered benches: `bench-kv`, `bench-kv-parallel`, `bench-grow`, `bench-invoice`, `bench-parallel`, `bench-queries`, `bench-joins`, `bench-incremental`. Override scale via env vars (`SHARD_BENCH_COUNT` / `SHARD_BENCH_TOTAL` / `SHARD_BENCH_CHUNK` / `SHARD_BENCH_USERS` / `SHARD_BENCH_ORDERS`). Bash bench scripts under `bench/` are deprecated — delete after C-bench is the trusted source.
 
 ## JSON query protocol
 

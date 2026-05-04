@@ -18,7 +18,7 @@ A high-performance file-based database in C. Single static binary, single proces
 
 ## Highlights
 
-- **~5M K/V ops/sec** single-thread bulk insert (CSV, 10M records); sub-5ms indexed find / count / aggregate at 1M rows
+- **~5M / ~7.5M K/V ops/sec** single-thread / 5-conn parallel bulk insert (CSV, 10M records); sub-5ms indexed find / count / aggregate at 1M rows
 - **38 search operators** (eq/neq/range, like/contains/starts/ends, in/not_in, regex, exists, len_*, ilike/icontains, eq_field…) — every one indexed when an index is available
 - **AND-intersection planner** + **lock-free OR-union KeySet** — 2+ indexed criteria intersect candidate sets without per-record fetch for `count`
 - **Joins** (inner, left), **aggregations** (count/sum/avg/min/max with group_by + having), **cursor pagination**, **CAS** (if/if_not_exists, dry-run bulk ops)
@@ -68,11 +68,13 @@ For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/f
 | Workload | Result |
 |---|---|
 | Bulk insert (CSV, 10M, 1 conn) | **4.96 M/sec** |
-| Bulk insert (JSON, 10M, 1 conn) | **3.99 M/sec** |
-| Indexed `find` (1M users, limit 10) | **2–4 ms** |
-| Indexed `count` / `aggregate` | **3–48 ms** |
+| Bulk insert (CSV, 10M, 5 conns × 2M) | **7.55 M/sec** |
+| Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, no idx) | **2.48 M/sec** |
+| Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, 14 idx) | **435 k/sec** |
+| Indexed `find` (1M users, limit 10) | **<1 ms** |
+| Indexed `count` / `aggregate` (warm cache) | **<1–296 ms** |
 | GET ×10k (req-resp, 1 conn) | **35 k ops/sec** (28µs/op) |
-| Disk footprint (10M records) | 2.3 GB |
+| Disk footprint (10M K/V records) | 2.3 GB |
 
 Reads are measured strict request-response (no pipelining); pipelining client-side will push throughput higher. Bench harness: [`src/bench/`](src/bench/) (C-level timing).
 
