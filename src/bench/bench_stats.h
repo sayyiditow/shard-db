@@ -1,0 +1,35 @@
+/* src/bench/bench_stats.h
+ *
+ * Allocation-free latency histogram. Captures every sample into a fixed
+ * array (caller pre-sizes); on summarize() sorts in place to extract
+ * percentiles. Designed for the "do N requests, report mean/p50/p99 +
+ * throughput" pattern.
+ */
+#ifndef BENCH_STATS_H
+#define BENCH_STATS_H
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    uint64_t *samples_ns;   /* caller-owned buffer of length cap */
+    size_t    cap;
+    size_t    count;
+} BenchHist;
+
+uint64_t bench_now_ns(void);  /* CLOCK_MONOTONIC */
+
+static inline void bench_hist_init(BenchHist *h, uint64_t *buf, size_t cap) {
+    h->samples_ns = buf; h->cap = cap; h->count = 0;
+}
+
+static inline void bench_hist_add(BenchHist *h, uint64_t ns) {
+    if (h->count < h->cap) h->samples_ns[h->count++] = ns;
+}
+
+/* Sort in place, then print:
+   "<label>: N=10000 mean=Xµs p50=Yµs p99=Zµs throughput=Q.QQ k ops/sec"
+   If total_wall_ns is 0, throughput is computed from sum-of-samples.
+*/
+void bench_hist_report(BenchHist *h, const char *label, uint64_t total_wall_ns);
+
+#endif

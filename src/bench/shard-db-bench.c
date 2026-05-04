@@ -1,12 +1,25 @@
-/* src/bench/shard-db-bench.c */
+/* src/bench/shard-db-bench.c
+ *
+ * Bench runner. Reuses the test_runner registry/dispatch machinery
+ * because each binary has its own g_head — a bench is just a TEST_REGISTER'd
+ * function that prints latency stats instead of TAP assertions.
+ */
+#include "test_runner.h"
 #include <stdio.h>
+#include <string.h>
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: shard-db-bench list | run <name> | run-all\n");
         return 1;
     }
-    if (argv[1][0] == 'l') { printf("# (no benches registered yet)\n"); return 0; }
-    fprintf(stderr, "not implemented\n");
+    if (strcmp(argv[1], "list") == 0) {
+        for (const TestCaseEntry *p = test_first(); p; p = p->next)
+            printf("%s\n", p->name);
+        return 0;
+    }
+    if (strcmp(argv[1], "run") == 0 && argc >= 3) return test_run_one(argv[2]);
+    if (strcmp(argv[1], "run-all") == 0) return test_run_all(NULL);
+    fprintf(stderr, "unknown subcommand: %s\n", argv[1]);
     return 1;
 }

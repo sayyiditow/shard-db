@@ -122,9 +122,12 @@ gcc $MODE_CFLAGS -o shard-db-test \
 # files under src/bench/ get listed here.
 gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/shard-db-bench.c \
+    src/bench/bench_stats.c \
     src/test/test_client.c \
+    src/test/test_runner.c \
+    src/test/fixtures.c \
     src/db/util.c \
-    -Isrc/db -Isrc/test \
+    -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
 
