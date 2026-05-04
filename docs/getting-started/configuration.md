@@ -155,5 +155,5 @@ Each indexed field is split into `splits/4` btree files (e.g., `splits=64` → 1
 
 ## Next
 
-- [Operations → Deployment](../operations/deployment.md) — systemd unit, reverse proxy for TLS, log rotation.
+- [Operations → Deployment](../operations/deployment.md) — systemd unit, native TLS or reverse-proxy TLS, log rotation.
 - [Operations → Tuning](../operations/tuning.md) — when to raise `THREADS`, `FCACHE_MAX`, etc.

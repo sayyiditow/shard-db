@@ -129,4 +129,4 @@ Files ride the same TCP socket as queries — no separate upload protocol. See [
 - [Concepts → Typed records](../concepts/typed-records.md) — every field type + how defaults work.
 - [Concepts → Indexes](../concepts/indexes.md) — when a query uses an index, composite indexes, cost.
 - [CLI reference](../cli/index.md) — one page listing every command.
-- [Operations → Deployment](../operations/deployment.md) — systemd unit, reverse proxy for TLS, auth.
+- [Operations → Deployment](../operations/deployment.md) — systemd unit, native TLS or reverse-proxy TLS, auth.

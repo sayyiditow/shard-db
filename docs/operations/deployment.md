@@ -1,6 +1,6 @@
 # Deployment
 
-Getting shard-db into a real environment. Covers systemd, reverse proxy for TLS, bind-address hardening, logs, and health checks.
+Getting shard-db into a real environment. Covers systemd, native TLS (built in) and reverse-proxy TLS (HAProxy / nginx) as options, bind-address hardening, logs, and health checks.
 
 ## Prerequisites
 
@@ -78,49 +78,76 @@ sudo journalctl -u shard-db -f
 
 ## Bind address
 
-shard-db listens on all interfaces by default (the `PORT` in db.env). **Bind to localhost only and put a reverse proxy in front** for any non-trivial deployment:
+shard-db listens on all interfaces by default (the `PORT` in db.env). What you do with that depends on which TLS option (below) you pick:
 
-- Bind to `127.0.0.1`: prevents direct access from outside, forces traffic through the proxy, keeps TLS at the edge.
-- Today, the bind address is hard-coded in `src/db/server.c`. For production, wrap with a proxy even if you want it "open" — IP/TLS gating is easier there.
+- **Native TLS (`TLS_ENABLE=1`)**: leaving the default bind is fine — clients connect directly to `PORT` over TLS 1.3. Token-based auth handles client identity; trusted-IP / per-tenant tokens scope access.
+- **Reverse-proxy TLS** or **plaintext-only behind a private network**: bind to `127.0.0.1` so only the proxy (or local clients) can reach the daemon, and let the proxy enforce TLS at the edge.
 
-## TLS via HAProxy (recommended)
+The bind address is currently hard-coded to all-interfaces in `src/db/server.c`. For the localhost-only case, run shard-db inside a network namespace, behind a host firewall rule blocking external traffic to `PORT`, or wrap with a proxy.
 
-shard-db speaks plaintext TCP only. Terminate TLS at a reverse proxy.
+## TLS
 
-### Why HAProxy
+shard-db has **native TLS 1.3** built in (since 2026.05.1, OpenSSL-backed). For most deployments that's all you need — single binary, single port, no extra processes. Reverse-proxy termination (HAProxy / nginx) remains fully supported if you prefer to consolidate TLS at the edge.
 
-- Purpose-built for TCP+TLS termination.
-- Reloads certs without dropping connections.
-- Simplest config for a single TCP backend.
+### Option 1: Native TLS (recommended for most deployments)
 
-Alternatives: nginx `stream` module (fine — pick it if you already run nginx), stunnel (tiny, good for dev).
+Enable in `db.env`:
 
-### 1. Get a certificate
+```bash
+export TLS_ENABLE=1
+export TLS_CERT="/opt/shard-db/certs/cert.pem"
+export TLS_KEY="/opt/shard-db/certs/key.pem"
+# Optional — only set if your CA isn't in the OS trust store
+export TLS_CA="/opt/shard-db/certs/ca.pem"
+```
+
+Get a certificate:
 
 ```bash
 # Self-signed (dev / internal)
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
   -subj '/CN=shard-db.internal'
 
-# HAProxy wants cert + key in one file
-cat cert.pem key.pem > /etc/haproxy/shard-db.pem
-chmod 600 /etc/haproxy/shard-db.pem
+mkdir -p /opt/shard-db/certs
+mv cert.pem key.pem /opt/shard-db/certs/
+chown shard-db:shard-db /opt/shard-db/certs/*.pem
+chmod 600 /opt/shard-db/certs/key.pem
+chmod 644 /opt/shard-db/certs/cert.pem
 ```
 
-Production: use Let's Encrypt or your corporate CA.
+Production: use Let's Encrypt or your corporate CA. Same `mv` + `chown` + `chmod`.
 
-### 2. Install HAProxy
+Restart and verify:
 
 ```bash
-# Debian/Ubuntu
-apt install haproxy
-# Arch
-pacman -S haproxy
-# RHEL/CentOS
-dnf install haproxy
+sudo systemctl restart shard-db
+echo '{"mode":"db-dirs"}' | openssl s_client -connect localhost:9199 -quiet 2>/dev/null
 ```
 
-### 3. Configure
+`PORT` becomes TLS-only when `TLS_ENABLE=1` — plaintext clients are rejected at handshake. Client identity is enforced via tokens (not mTLS). See [Configuration → TLS knobs](../getting-started/configuration.md) for `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`, and the full client-side options.
+
+**Cert rotation:** native TLS does **not** hot-reload certs — replace the cert files and restart the daemon. The single-instance lock plus systemd's restart hooks make this clean. If you need rotation without restart, use Option 2 instead.
+
+**Why use native TLS:**
+
+- Single binary, single process, single port — nothing else to install or supervise.
+- TLS 1.3 only (modern ciphersuites, forward secrecy).
+- Server refuses to start if cert/key are missing, unreadable, or mismatched — fail-fast vs. quietly serving plaintext.
+
+### Option 2: Reverse-proxy TLS (HAProxy / nginx)
+
+Use a reverse proxy when you already have a TLS pipeline (e.g., one HAProxy fronting a fleet of services), need cert hot-reload without restarting the daemon, or want to combine TLS termination with rate limiting / IP gating at the edge. Set `TLS_ENABLE=0` (the default) and bind shard-db to `127.0.0.1` so only the proxy reaches it.
+
+#### HAProxy
+
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj '/CN=shard-db.internal'
+cat cert.pem key.pem > /etc/haproxy/shard-db.pem
+chmod 600 /etc/haproxy/shard-db.pem
+
+apt install haproxy   # or pacman -S haproxy / dnf install haproxy
+```
 
 `/etc/haproxy/haproxy.cfg`:
 
@@ -143,20 +170,15 @@ backend shard_db
     server db1 127.0.0.1:9199 check
 ```
 
-### 4. Start
-
 ```bash
 sudo systemctl enable --now haproxy
-```
-
-### 5. Verify
-
-```bash
 ss -tlnp | grep 9200
 echo '{"mode":"db-dirs"}' | openssl s_client -connect localhost:9200 -quiet 2>/dev/null
 ```
 
-Client connects to port 9200 with TLS; HAProxy decrypts and forwards to shard-db on 127.0.0.1:9199. See the README for Python / Node.js / Java TLS client snippets.
+Client connects to port 9200; HAProxy decrypts and forwards to shard-db on 127.0.0.1:9199. nginx `stream` module is an equivalent option if you already run nginx.
+
+See the README for Python / Node.js / Java TLS client snippets — they're transport-agnostic and work against either option.
 
 ## Authentication
 
