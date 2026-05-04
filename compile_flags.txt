@@ -1,0 +1,12 @@
+-std=c11
+-Isrc/db
+-Isrc/test
+-Isrc/bench
+-Isrc/cli
+-Isrc/migrate
+-D_GNU_SOURCE
+-Wall
+-Wextra
+-Wno-format-truncation
+-Wno-unused-parameter
+-Wno-address-of-packed-member
