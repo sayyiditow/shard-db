@@ -1,0 +1,589 @@
+/* src/bench/bench_kv.c — port of bench/bench-kv.sh
+ *
+ * 16-byte hex key, varchar(100) value, SPLITS=128, COUNT=1M default
+ * (override via SHARD_BENCH_COUNT env var). Mirrors db_bench / LMDB
+ * shape so numbers compare directly. Single-connection throughout
+ * except for the two parallel sections.
+ *
+ * Key shape  : sha256(decimal-i)[:16] hex — same as Python bench loader.
+ * Value shape: "val_<i>" left-padded to 100 chars with 'x'.
+ */
+#define _GNU_SOURCE
+#include "test_runner.h"
+#include "test_client.h"
+#include "fixtures.h"
+#include "bench_stats.h"
+#include <openssl/sha.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define KEY_LEN    16    /* hex chars per key  */
+#define VAL_LEN   100    /* padded value length */
+#define SPLITS    128
+#define N_PAR       5    /* parallel worker count          */
+#define N_PAR_OPS 10000  /* ops per parallel worker        */
+
+/* ------------------------------------------------------------------ helpers */
+
+/* sha256(decimal-i)[:16] hex — matches the bash bench's python loader. */
+static void make_key(int i, char out[KEY_LEN + 1])
+{
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d", i);
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)buf, (size_t)n, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int j = 0; j < KEY_LEN / 2; j++) {
+        out[2 * j]     = hex[digest[j] >> 4];
+        out[2 * j + 1] = hex[digest[j] & 0xF];
+    }
+    out[KEY_LEN] = '\0';
+}
+
+/* "val_<i>" padded to VAL_LEN chars with 'x'. */
+static void make_val(int i, char out[VAL_LEN + 1])
+{
+    char tmp[VAL_LEN + 32];
+    int n = snprintf(tmp, sizeof(tmp), "val_%d", i);
+    if (n > VAL_LEN) n = VAL_LEN;
+    memcpy(out, tmp, (size_t)n);
+    for (int j = n; j < VAL_LEN; j++) out[j] = 'x';
+    out[VAL_LEN] = '\0';
+}
+
+/* --------------------------------------------------------- parallel workers */
+
+typedef enum { PAR_GET, PAR_UPDATE } ParMode;
+
+typedef struct {
+    int         port;
+    ParMode     mode;
+    int         n;
+    char      (*keys)[KEY_LEN+1];  /* pointer to master keys array */
+    int         total_keys;
+    uint64_t    total_ns;
+} ParWorkerArg;
+
+static void *par_worker(void *vp)
+{
+    ParWorkerArg *w = vp;
+    TestClientCfg cfg = { .port = w->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return NULL;
+
+    char req[512];
+    uint64_t s = bench_now_ns();
+    for (int i = 0; i < w->n; i++) {
+        const char *k = w->keys[(unsigned)rand() % (unsigned)w->total_keys];
+        if (w->mode == PAR_GET) {
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\"}",
+                     k);
+        } else {
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\",\"value\":{\"v\":\"par_%s\"}}",
+                     k, k);
+        }
+        char *resp = NULL;
+        tc_request(tc, req, &resp);
+        free(resp);
+    }
+    w->total_ns = bench_now_ns() - s;
+    tc_close(tc);
+    return NULL;
+}
+
+/* ------------------------------------------------ memfd bulk-insert helper */
+
+/*
+ * Write data into a Linux memfd, return the open fd (caller closes).
+ * The daemon child reads it via /proc/<bench-pid>/fd/<n>.
+ */
+static int make_memfd(const char *name, const char *data, size_t size)
+{
+    /* memfd_create syscall number on x86_64 = 319, aarch64 = 279 */
+#if defined(__x86_64__)
+    int fd = (int)syscall(319, name, 0);
+#elif defined(__aarch64__)
+    int fd = (int)syscall(279, name, 0);
+#else
+    /* Fallback: anonymous tmpfs via mkstemp */
+    char path[] = "/tmp/bench-kv-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd >= 0) unlink(path);
+#endif
+    if (fd < 0) { perror("memfd_create"); return -1; }
+
+    size_t written = 0;
+    while (written < size) {
+        ssize_t r = write(fd, data + written, size - written);
+        if (r <= 0) { perror("write memfd"); close(fd); return -1; }
+        written += (size_t)r;
+    }
+    if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
+    return fd;
+}
+
+/* Send a bulk-insert via memfd; return heap-allocated response (caller frees). */
+static char *bulk_insert_memfd(TestClient *tc,
+                               const char *mode,
+                               const char *extra_json_fields,
+                               const char *data, size_t data_size)
+{
+    int fd = make_memfd("kv-blob", data, data_size);
+    if (fd < 0) return NULL;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/fd/%d", (int)getpid(), fd);
+
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"%s\",\"dir\":\"default\",\"object\":\"kvbench\","
+             "\"file\":\"%s\"%s}",
+             mode, path, extra_json_fields);
+
+    char *resp = NULL;
+    tc_request(tc, req, &resp);
+    close(fd);
+    return resp;
+}
+
+/* ---------------------------------------------------------------- main bench */
+
+static int bench_kv_run(void)
+{
+    const char *count_env = getenv("SHARD_BENCH_COUNT");
+    int COUNT = count_env ? atoi(count_env) : 1000000;
+    if (COUNT <= 0) COUNT = 1000000;
+
+    printf("======================================\n");
+    printf("  shard-db K/V benchmark (%d records)\n", COUNT);
+    printf("  key=16B hex, value=varchar(100) — matches db_bench / LMDB shape\n");
+    printf("======================================\n\n");
+
+    /* ---- 1. Spawn daemon -------------------------------------------- */
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) {
+        fprintf(stderr, "bench-kv: daemon spawn failed\n");
+        return 1;
+    }
+
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 300000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) {
+        fprintf(stderr, "bench-kv: connect failed\n");
+        test_env_stop(&env);
+        return 1;
+    }
+
+    /* Register "default" tenant and create object. */
+    char *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
+        "\"splits\":128,\"max_key\":16,"
+        "\"fields\":[\"v:varchar:100\"]}",
+        &resp);
+    free(resp); resp = NULL;
+
+    /* ---- 2. Generate records ---------------------------------------- */
+    printf("Generating %d records (16B hex key, ~100B value)...\n", COUNT);
+    fflush(stdout);
+
+    char (*keys)[KEY_LEN + 1] = malloc((size_t)COUNT * (KEY_LEN + 1));
+    char (*vals)[VAL_LEN + 1] = malloc((size_t)COUNT * (VAL_LEN + 1));
+    if (!keys || !vals) {
+        fprintf(stderr, "bench-kv: OOM allocating keys/vals\n");
+        free(keys); free(vals);
+        tc_close(tc); test_env_stop(&env);
+        return 1;
+    }
+
+    for (int i = 0; i < COUNT; i++) {
+        make_key(i, keys[i]);
+        make_val(i, vals[i]);
+    }
+    printf("  done.\n\n");
+
+    /* Build JSON array blob.
+       Each record: {"key":"<16>","value":{"v":"<100>"}}  = 142 chars (no comma)
+       Commas between records add COUNT-1 bytes.
+       Total: 1 + (COUNT * 142) + (COUNT - 1) + 1 + NUL = COUNT*143 + 2 + NUL. */
+    printf("Building bulk-insert JSON blob...\n");
+    fflush(stdout);
+
+    size_t json_cap  = (size_t)COUNT * 144 + 8; /* 1 byte/rec slack + NUL */
+    size_t json_size = 0;
+    char  *json_buf  = malloc(json_cap);
+    if (!json_buf) {
+        fprintf(stderr, "bench-kv: OOM json_buf\n");
+        free(vals); free(keys);
+        tc_close(tc); test_env_stop(&env);
+        return 1;
+    }
+
+    {
+        size_t jpos = 0;
+        json_buf[jpos++] = '[';
+        for (int i = 0; i < COUNT; i++) {
+            int n = snprintf(json_buf + jpos, json_cap - jpos,
+                             "{\"key\":\"%s\",\"value\":{\"v\":\"%s\"}}%s",
+                             keys[i], vals[i],
+                             i < COUNT - 1 ? "," : "");
+            if (n <= 0 || (size_t)n >= json_cap - jpos) {
+                fprintf(stderr, "bench-kv: JSON overflow at i=%d (jpos=%zu cap=%zu)\n",
+                        i, jpos, json_cap);
+                free(json_buf); free(vals); free(keys);
+                tc_close(tc); test_env_stop(&env);
+                return 1;
+            }
+            jpos += (size_t)n;
+        }
+        json_buf[jpos++] = ']';
+        json_buf[jpos]   = '\0';  /* null-terminate */
+        json_size = jpos;
+        printf("  JSON: %.1f MB\n", (double)json_size / 1048576.0);
+    }
+
+    /* Build CSV blob: <key>,<val>\n
+       Each line: 16 + 1 + 100 + 1 = 118 bytes. */
+    printf("Building bulk-insert CSV blob...\n");
+    fflush(stdout);
+
+    size_t csv_cap  = (size_t)COUNT * 120 + 8;
+    size_t csv_size = 0;
+    char  *csv_buf  = malloc(csv_cap);
+    if (!csv_buf) {
+        fprintf(stderr, "bench-kv: OOM csv_buf\n");
+        free(json_buf); free(vals); free(keys);
+        tc_close(tc); test_env_stop(&env);
+        return 1;
+    }
+
+    {
+        size_t cpos = 0;
+        for (int i = 0; i < COUNT; i++) {
+            int n = snprintf(csv_buf + cpos, csv_cap - cpos,
+                             "%s,%s\n", keys[i], vals[i]);
+            if (n <= 0 || (size_t)n >= csv_cap - cpos) {
+                fprintf(stderr, "bench-kv: CSV overflow at i=%d\n", i);
+                free(csv_buf); free(json_buf); free(vals); free(keys);
+                tc_close(tc); test_env_stop(&env);
+                return 1;
+            }
+            cpos += (size_t)n;
+        }
+        csv_buf[cpos] = '\0';
+        csv_size = cpos;
+        printf("  CSV:  %.1f MB\n\n", (double)csv_size / 1048576.0);
+    }
+
+    /* ---- 3. BULK INSERT JSON ---------------------------------------- */
+    printf("--- BULK INSERT JSON (%d records, 1 file) ---\n", COUNT);
+    fflush(stdout);
+    {
+        uint64_t t0 = bench_now_ns();
+        resp = bulk_insert_memfd(tc, "bulk-insert", "", json_buf, json_size);
+        uint64_t elapsed = bench_now_ns() - t0;
+        double ms  = (double)elapsed / 1e6;
+        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
+        printf("BULK INSERT JSON: rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
+               COUNT, ms, mps);
+        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+    }
+
+    /* ---- 4. Size check ---------------------------------------------- */
+    tc_request(tc,
+        "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
+        &resp);
+    printf("SIZE after JSON insert: %s\n\n", resp ? resp : "(err)");
+    free(resp); resp = NULL;
+
+    /* ---- 5. Truncate + BULK INSERT CSV ------------------------------- */
+    tc_request(tc,
+        "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"kvbench\"}",
+        &resp);
+    free(resp); resp = NULL;
+
+    printf("--- BULK INSERT CSV (%d records, 1 file) ---\n", COUNT);
+    fflush(stdout);
+    {
+        uint64_t t0 = bench_now_ns();
+        resp = bulk_insert_memfd(tc, "bulk-insert-delimited",
+                                 ",\"delimiter\":\",\"",
+                                 csv_buf, csv_size);
+        uint64_t elapsed = bench_now_ns() - t0;
+        double ms  = (double)elapsed / 1e6;
+        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
+        printf("BULK INSERT CSV:  rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
+               COUNT, ms, mps);
+        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+    }
+
+    /* Free CSV blob — no longer needed. */
+    free(csv_buf); csv_buf = NULL;
+
+    /* ---- 6. Size check ---------------------------------------------- */
+    tc_request(tc,
+        "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
+        &resp);
+    printf("SIZE after CSV insert:  %s\n\n", resp ? resp : "(err)");
+    free(resp); resp = NULL;
+
+    /* ---- 7. GET single (warm) --------------------------------------- */
+    {
+        int ri = (int)((unsigned)rand() % (unsigned)COUNT);
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
+                 "\"key\":\"%s\"}",
+                 keys[ri]);
+        uint64_t t0 = bench_now_ns();
+        tc_request(tc, req, &resp);
+        uint64_t elapsed = bench_now_ns() - t0;
+        printf("GET single warm: latency=%.0fµs\n\n",
+               (double)elapsed / 1000.0);
+        free(resp); resp = NULL;
+    }
+
+    /* ---- 8. GET ×10000 pipelined (1 conn) -------------------------- */
+    {
+        const int N = 10000;
+        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+        BenchHist h;
+        bench_hist_init(&h, samples, (size_t)N);
+
+        uint64_t wall_start = bench_now_ns();
+        for (int i = 0; i < N; i++) {
+            int ri = (int)((unsigned)rand() % (unsigned)COUNT);
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\"}",
+                     keys[ri]);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bench_hist_add(&h, bench_now_ns() - t0);
+            free(resp); resp = NULL;
+        }
+        bench_hist_report(&h, "GET x10000 pipelined", bench_now_ns() - wall_start);
+        printf("\n");
+        free(samples);
+    }
+
+    /* ---- 9. EXISTS ×10000 (hits) ----------------------------------- */
+    {
+        const int N = 10000;
+        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+        BenchHist h;
+        bench_hist_init(&h, samples, (size_t)N);
+
+        uint64_t wall_start = bench_now_ns();
+        for (int i = 0; i < N; i++) {
+            int ri = (int)((unsigned)rand() % (unsigned)COUNT);
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\"}",
+                     keys[ri]);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bench_hist_add(&h, bench_now_ns() - t0);
+            free(resp); resp = NULL;
+        }
+        bench_hist_report(&h, "EXISTS x10000 (hits)", bench_now_ns() - wall_start);
+        printf("\n");
+        free(samples);
+    }
+
+    /* ---- 10. EXISTS ×10000 (all-miss) ------------------------------- */
+    {
+        const int N = 10000;
+        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+        BenchHist h;
+        bench_hist_init(&h, samples, (size_t)N);
+
+        uint64_t wall_start = bench_now_ns();
+        for (int i = 0; i < N; i++) {
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"nope_%d\"}",
+                     i + 1);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bench_hist_add(&h, bench_now_ns() - t0);
+            free(resp); resp = NULL;
+        }
+        bench_hist_report(&h, "EXISTS x10000 (all-miss)", bench_now_ns() - wall_start);
+        printf("\n");
+        free(samples);
+    }
+
+    /* ---- 11. UPDATE ×10000 ----------------------------------------- */
+    {
+        const int N = 10000;
+        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+        BenchHist h;
+        bench_hist_init(&h, samples, (size_t)N);
+
+        uint64_t wall_start = bench_now_ns();
+        for (int i = 0; i < N; i++) {
+            int ri = (int)((unsigned)rand() % (unsigned)COUNT);
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\",\"value\":{\"v\":\"updated_%s\"}}",
+                     keys[ri], keys[ri]);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bench_hist_add(&h, bench_now_ns() - t0);
+            free(resp); resp = NULL;
+        }
+        bench_hist_report(&h, "UPDATE x10000", bench_now_ns() - wall_start);
+        printf("\n");
+        free(samples);
+    }
+
+    /* ---- 12. DELETE ×10000 ----------------------------------------- */
+    {
+        const int N = 10000;
+        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+        BenchHist h;
+        bench_hist_init(&h, samples, (size_t)N);
+
+        /* Delete the first N records by key index for deterministic coverage. */
+        uint64_t wall_start = bench_now_ns();
+        for (int i = 0; i < N; i++) {
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"mode\":\"delete\",\"dir\":\"default\",\"object\":\"kvbench\","
+                     "\"key\":\"%s\"}",
+                     keys[i]);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bench_hist_add(&h, bench_now_ns() - t0);
+            free(resp); resp = NULL;
+        }
+        bench_hist_report(&h, "DELETE x10000", bench_now_ns() - wall_start);
+        printf("\n");
+        free(samples);
+
+        tc_request(tc,
+            "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
+            &resp);
+        printf("SIZE after DELETE x10000: %s\n\n", resp ? resp : "(err)");
+        free(resp); resp = NULL;
+    }
+
+    /* ---- 13. Re-populate for parallel section ----------------------- */
+    printf("--- Re-populating for parallel test ---\n");
+    fflush(stdout);
+    {
+        tc_request(tc,
+            "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"kvbench\"}",
+            &resp);
+        free(resp); resp = NULL;
+
+        uint64_t t0 = bench_now_ns();
+        resp = bulk_insert_memfd(tc, "bulk-insert", "", json_buf, json_size);
+        uint64_t elapsed = bench_now_ns() - t0;
+        printf("  repopulate: wall=%.0fms  %.2f M/sec\n\n",
+               (double)elapsed / 1e6,
+               (double)COUNT / ((double)elapsed / 1e9) / 1e6);
+        free(resp); resp = NULL;
+    }
+
+    /* JSON blob no longer needed. */
+    free(json_buf); json_buf = NULL;
+
+    /* ---- 14. PARALLEL GET (5 conns × 10000) ------------------------- */
+    {
+        printf("--- PARALLEL GET %d connections x %d each (%d total) ---\n",
+               N_PAR, N_PAR_OPS, N_PAR * N_PAR_OPS);
+        fflush(stdout);
+
+        pthread_t    threads[N_PAR];
+        ParWorkerArg args[N_PAR];
+
+        uint64_t wall_start = bench_now_ns();
+        for (int t = 0; t < N_PAR; t++) {
+            args[t].port       = env.port;
+            args[t].mode       = PAR_GET;
+            args[t].n          = N_PAR_OPS;
+            args[t].keys       = keys;
+            args[t].total_keys = COUNT;
+            args[t].total_ns   = 0;
+            pthread_create(&threads[t], NULL, par_worker, &args[t]);
+        }
+        for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
+        uint64_t wall_ns = bench_now_ns() - wall_start;
+
+        int    total_ops = N_PAR * N_PAR_OPS;
+        double kops = (double)total_ops / ((double)wall_ns / 1e6);
+        printf("PARALLEL GET %d conns x %d: total_ops=%d  wall=%.0fms  "
+               "throughput=%.2f k ops/sec\n\n",
+               N_PAR, N_PAR_OPS, total_ops,
+               (double)wall_ns / 1e6, kops);
+    }
+
+    /* ---- 15. PARALLEL UPDATE (5 conns × 10000) ---------------------- */
+    {
+        printf("--- PARALLEL UPDATE %d connections x %d each ---\n",
+               N_PAR, N_PAR_OPS);
+        fflush(stdout);
+
+        pthread_t    threads[N_PAR];
+        ParWorkerArg args[N_PAR];
+
+        uint64_t wall_start = bench_now_ns();
+        for (int t = 0; t < N_PAR; t++) {
+            args[t].port       = env.port;
+            args[t].mode       = PAR_UPDATE;
+            args[t].n          = N_PAR_OPS;
+            args[t].keys       = keys;
+            args[t].total_keys = COUNT;
+            args[t].total_ns   = 0;
+            pthread_create(&threads[t], NULL, par_worker, &args[t]);
+        }
+        for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
+        uint64_t wall_ns = bench_now_ns() - wall_start;
+
+        int    total_ops = N_PAR * N_PAR_OPS;
+        double kops = (double)total_ops / ((double)wall_ns / 1e6);
+        printf("PARALLEL UPDATE %d conns x %d: total_ops=%d  wall=%.0fms  "
+               "throughput=%.2f k ops/sec\n\n",
+               N_PAR, N_PAR_OPS, total_ops,
+               (double)wall_ns / 1e6, kops);
+    }
+
+    /* ---- 16. Disk usage -------------------------------------------- */
+    {
+        char du_cmd[512];
+        snprintf(du_cmd, sizeof(du_cmd), "du -sh \"%s/default/kvbench\"",
+                 env.db_root);
+        printf("DISK USAGE: ");
+        fflush(stdout);
+        system(du_cmd);
+        printf("\n");
+    }
+
+    printf("======================================\n");
+    printf("  K/V Benchmark complete\n");
+    printf("======================================\n");
+
+    free(vals);
+    free(keys);
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("bench-kv", bench_kv_run)
