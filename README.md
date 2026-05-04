@@ -9,12 +9,12 @@
 [![Docs](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sayyiditow/shard-db/badge)](https://scorecard.dev/viewer/?uri=github.com/sayyiditow/shard-db)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12704/badge)](https://www.bestpractices.dev/projects/12704)
-[![Coverity Scan](https://scan.coverity.com/projects/33072/badge.svg)](https://scan.coverity.com/projects/sayyiditow-shard-db)
+[![Coverity Scan](https://scan.coverity.com/projects/33072/badge.svg?v=2026-05-05)](https://scan.coverity.com/projects/sayyiditow-shard-db)
 [![codecov](https://codecov.io/gh/sayyiditow/shard-db/branch/main/graph/badge.svg)](https://codecov.io/gh/sayyiditow/shard-db)
 
 A high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3.
 
-**Platform:** Linux x86_64 / ARM64. macOS port planned for 2026.05.2. License: **MIT**.
+**Platform:** Linux x86_64 / ARM64. macOS port planned for 2026.05.3. License: **MIT**.
 
 ## Highlights
 

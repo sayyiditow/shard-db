@@ -4,7 +4,7 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## In flight (post-2026.05.1)
+## 2026.05.2 — 2026-05-05
 
 ### Performance — aggregate fast paths (sum/avg/min/max + NEQ + EXISTS)
 
