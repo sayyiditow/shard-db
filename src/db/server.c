@@ -940,9 +940,15 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 /* Read counts (single file, single read) */
                 int count = get_live_count(eff, de->d_name);
                 int deleted = get_deleted_count(eff, de->d_name);
-                /* Recommend vacuum: deleted >= 10% of (count+deleted) AND deleted >= 1000 */
+                /* Recommend vacuum when both thresholds clear:
+                     deleted >= VACUUM_RECOMMEND_MIN_DELETED  (absolute floor)
+                     deleted * 100 >= total * VACUUM_RECOMMEND_TOMBSTONE_PCT
+                   Defaults (1000, 10%) match the pre-2026.05.2 hardcoded
+                   values. Tunable via db.env. */
                 int total = count + deleted;
-                int recommend = (deleted >= 1000 && total > 0 && deleted * 10 >= total);
+                int recommend = (deleted >= g_vacuum_recommend_min_deleted
+                                 && total > 0
+                                 && deleted * 100 >= total * g_vacuum_recommend_pct);
                 if (deleted > 0) {
                     OUT("%s{\"dir\":\"%s\",\"object\":\"%s\",\"count\":%d,\"orphaned\":%d,\"vacuum\":%s}",
                         printed ? "," : "", dirs_copy[di], de->d_name, count, deleted,
@@ -1978,6 +1984,92 @@ void remove_pid_file(const char *db_root) {
     unlink(pidpath);
 }
 
+/* Background auto-vacuum thread.
+ *
+ * Wakes every g_auto_vacuum_interval_sec, walks every (dir, object), and
+ * runs plain `vacuum` on objects that meet the same thresholds the
+ * `vacuum-check` recommendation uses (g_vacuum_recommend_pct,
+ * g_vacuum_recommend_min_deleted). Single source of truth for "needs
+ * vacuum?" — auto-vacuum and manual vacuum-check agree by construction.
+ *
+ * NEVER auto-runs --compact or --splits: both need the exclusive objlock
+ * for an extended rebuild window. Plain vacuum is in-place flag-flip,
+ * cheap enough to fire on a polling cadence without surprising operators.
+ *
+ * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0)
+ * brings shutdown latency down to <1s instead of waiting out the full
+ * interval. Detached — no join on shutdown; it just exits its loop.
+ */
+typedef struct {
+    char db_root[PATH_MAX];
+} AutoVacuumArg;
+
+static void *auto_vacuum_thread(void *arg) {
+    AutoVacuumArg *a = (AutoVacuumArg *)arg;
+
+    /* Discard cmd_vacuum's JSON output — there's no client connection.
+       /dev/null open failure shouldn't kill the thread; fall back to
+       stderr (which the daemon redirects to /dev/null after fork). */
+    g_out = fopen("/dev/null", "w");
+    if (!g_out) g_out = stderr;
+
+    log_msg(3, "AUTO-VACUUM thread started: interval=%ds pct=%d min_deleted=%d",
+            g_auto_vacuum_interval_sec, g_vacuum_recommend_pct,
+            g_vacuum_recommend_min_deleted);
+
+    while (server_running) {
+        for (int i = 0; i < g_auto_vacuum_interval_sec && server_running; i++)
+            sleep(1);
+        if (!server_running) break;
+
+        /* Snapshot dir table so we don't hold g_dirs_lock for the full sweep
+           (mirrors the vacuum-check handler). */
+        char dirs_copy[DIRS_BUCKETS][256];
+        int used_copy[DIRS_BUCKETS];
+        pthread_mutex_lock(&g_dirs_lock);
+        memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
+        memcpy(used_copy, g_dirs_used, sizeof(used_copy));
+        pthread_mutex_unlock(&g_dirs_lock);
+
+        for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
+            if (!used_copy[di]) continue;
+            char dir_path[PATH_MAX];
+            snprintf(dir_path, sizeof(dir_path), "%s/%s", a->db_root, dirs_copy[di]);
+            DIR *dd = opendir(dir_path);
+            if (!dd) continue;
+            struct dirent *de;
+            while ((de = readdir(dd)) && server_running) {
+                if (de->d_name[0] == '.') continue;
+                char obj_check[PATH_MAX];
+                snprintf(obj_check, sizeof(obj_check),
+                         "%s/%s/fields.conf", dir_path, de->d_name);
+                struct stat ost;
+                if (stat(obj_check, &ost) != 0) continue;
+
+                char eff[PATH_MAX];
+                snprintf(eff, sizeof(eff), "%s/%s", a->db_root, dirs_copy[di]);
+                int count = get_live_count(eff, de->d_name);
+                int deleted = get_deleted_count(eff, de->d_name);
+                int total = count + deleted;
+                int recommend = (deleted >= g_vacuum_recommend_min_deleted
+                                 && total > 0
+                                 && deleted * 100 >= total * g_vacuum_recommend_pct);
+                if (recommend) {
+                    log_msg(2,
+                        "AUTO-VACUUM %s/%s (live=%d deleted=%d pct=%d)",
+                        dirs_copy[di], de->d_name, count, deleted,
+                        total > 0 ? (deleted * 100 / total) : 0);
+                    cmd_vacuum(eff, de->d_name, 0, 0);
+                }
+            }
+            closedir(dd);
+        }
+    }
+
+    if (g_out && g_out != stderr) fclose(g_out);
+    return NULL;
+}
+
 int cmd_server(const char *db_root, int daemonize) {
     int port = g_port;
 
@@ -2172,6 +2264,20 @@ int cmd_server(const char *db_root, int daemonize) {
     fflush(stdout);
     log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
+
+    /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
+    if (g_auto_vacuum_enable) {
+        pthread_t auto_vac_tid;
+        AutoVacuumArg *av = malloc(sizeof(AutoVacuumArg));
+        if (av) {
+            strncpy(av->db_root, db_root, PATH_MAX - 1);
+            av->db_root[PATH_MAX - 1] = '\0';
+            if (pthread_create(&auto_vac_tid, NULL, auto_vacuum_thread, av) == 0)
+                pthread_detach(auto_vac_tid);
+            else
+                free(av);
+        }
+    }
 
     /* epoll-based accept loop */
     int epfd = epoll_create1(0);

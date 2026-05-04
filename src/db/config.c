@@ -35,6 +35,19 @@ uint64_t g_bt_cache_misses = 0;
 uint64_t g_server_start_ms = 0;
 uint64_t g_slow_query_count = 0;
 int g_slow_query_ms = 500;  /* configurable via SLOW_QUERY_MS */
+
+/* vacuum-check thresholds — drive the "vacuum":true recommendation in
+   `vacuum-check` AND the auto-vacuum thread's selection logic (one source
+   of truth). Defaults match the historic hardcoded values. */
+int g_vacuum_recommend_pct = 10;          /* tombstones / total ≥ N% */
+int g_vacuum_recommend_min_deleted = 1000;/* AND deleted ≥ N */
+
+/* Auto-vacuum thread — opt-in. When AUTO_VACUUM=1, a background thread
+   wakes every g_auto_vacuum_interval_sec, calls vacuum-check's selection
+   pass, and runs plain vacuum on candidates. NEVER auto-runs --compact
+   or --splits (both are heavy + need exclusive objlock). */
+int g_auto_vacuum_enable = 0;
+int g_auto_vacuum_interval_sec = 3600;
 SlowQueryEntry g_slow_queries[SLOW_QUERY_RING] = {0};
 int g_slow_query_head = 0;
 pthread_mutex_t g_slow_query_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -299,6 +312,17 @@ int load_db_root(char *out, size_t outlen) {
                 if (n > 600000) n = 600000;
                 g_slow_query_ms = n;
             }
+        } else if (strncmp(p, "VACUUM_RECOMMEND_TOMBSTONE_PCT=", 31) == 0) {
+            int n = atoi(p + 31);
+            if (n >= 1 && n <= 100) g_vacuum_recommend_pct = n;
+        } else if (strncmp(p, "VACUUM_RECOMMEND_MIN_DELETED=", 29) == 0) {
+            int n = atoi(p + 29);
+            if (n >= 0) g_vacuum_recommend_min_deleted = n;
+        } else if (strncmp(p, "AUTO_VACUUM=", 12) == 0) {
+            g_auto_vacuum_enable = (atoi(p + 12) != 0);
+        } else if (strncmp(p, "AUTO_VACUUM_INTERVAL_SEC=", 25) == 0) {
+            int n = atoi(p + 25);
+            if (n >= 60) g_auto_vacuum_interval_sec = n; /* 1-min floor */
         } else if (strncmp(p, "TLS_ENABLE=", 11) == 0) {
             g_tls_enable = (atoi(p + 11) != 0);
         } else if (strncmp(p, "TLS_SKIP_VERIFY=", 16) == 0) {
