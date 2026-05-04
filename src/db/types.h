@@ -37,12 +37,13 @@
 #define SHARD_HDR_SIZE   32          /* ShardHeader at file offset 0 */
 #define INITIAL_SLOTS    256         /* starting slots_per_shard for new shards */
 /* As of 2026.05.1 the valid splits set is restricted to powers of 2 from
-   8 to 4096. The restriction supports the per-shard index layout where
-   index_splits = splits / 4 — keeping splits a power of 2 keeps the
-   shard math (and the routing of records → index shards) regular.
-   Floor lowered from 16 to 8 to give small-server (2-4 core) deployments
-   a tighter sizing option for sub-1M-row objects (8/4 = 2 index shards
-   still preserves k-way merge parallelism on indexed reads). */
+   8 to 4096. The restriction supports the per-shard index layout — each
+   indexed field shards into `index_splits_for(splits)` btree files.
+   Keeping splits a power of 2 keeps the shard math regular.
+
+   2026.05.2 update: index_splits_for is no longer linear — it caps the
+   idx fan-out at high split counts. See is_valid_splits and
+   index_splits_for below for the curve. */
 #define MIN_SPLITS       8
 #define DEFAULT_SPLITS   8           /* used by create-object when splits is omitted/0.
                                         Tuned for the ~70% of objects that never grow past
@@ -58,25 +59,59 @@ static inline int is_valid_splits(int n) {
     return (n & (n - 1)) == 0;   /* power of two */
 }
 
-/* Index shard count for a given data splits — always splits/4. Floor of 2
-   guaranteed by is_valid_splits (8/4 = 2). */
+/* Index shard count for a given data splits.
+ *
+ * Pre-2026.05.2 this was a flat splits/4. That ratio over-shards indexes
+ * at high split counts: at MAX_SPLITS=4096 you'd end up with 1024 idx
+ * files per indexed field, blowing past the default BT_CACHE_MAX=1024
+ * before counting OTHER objects' indexes. Since most operators (every
+ * non-eq operator: range, like, contains, starts/ends, len_*, regex,
+ * cursor pagination, …) fan out across all idx shards in parallel,
+ * the cost shows up on the read path of nearly every indexed query.
+ *
+ * The new "double-double-plateau" curve halves the ratio every three
+ * tiers — small objects keep the 1/4 ratio they always had; large ones
+ * get the cap. At splits=4096 the idx fan-out drops 8× (1024 → 128).
+ *
+ *   splits   idx   ratio    data shards / idx file
+ *      8      2     1/4              4
+ *     16      4     1/4              4
+ *     32      4     1/8              8
+ *     64      8     1/8              8
+ *    128     16     1/8              8
+ *    256     16     1/16            16
+ *    512     32     1/16            16
+ *   1024     64     1/16            16
+ *   2048     64     1/32            32
+ *   4096    128     1/32            32
+ *
+ * The default branch is a sanity floor for invalid splits (shouldn't
+ * happen with is_valid_splits gates upstream, but defensive). */
 static inline int index_splits_for(int splits) {
-    return splits / 4;
-}
-
-/* Index shard id for a record given its data shard id. Contiguous mapping:
-   data shards [0..3] → idx 0, [4..7] → idx 1, etc. Keeps locality. */
-static inline int idx_shard_for_data_shard(int data_shard) {
-    return data_shard / 4;
+    switch (splits) {
+        case    8: return   2;
+        case   16: return   4;
+        case   32: return   4;
+        case   64: return   8;
+        case  128: return  16;
+        case  256: return  16;
+        case  512: return  32;
+        case 1024: return  64;
+        case 2048: return  64;
+        case 4096: return 128;
+        default:   return splits / 4;
+    }
 }
 
 /* Index shard id for a record given its xxh128 hash. Mirrors what the
    data path would compute (data_shard = hash16[0..1] % splits) and then
-   maps that to its index shard (data_shard / 4). Used by every site that
-   needs to route an indexed value to the right per-shard btree file. */
+   maps that to its index shard via the contiguous-locality mapping
+   (data shards [0..k] → idx 0, [k+1..2k] → idx 1, …). Used by every
+   site that routes an indexed value to the right per-shard btree file. */
 static inline int idx_shard_for_hash(const uint8_t hash16[16], int splits) {
     int data_shard = ((uint16_t)hash16[0] << 8 | (uint16_t)hash16[1]) % splits;
-    return data_shard / 4;
+    int idx_n = index_splits_for(splits);
+    return (data_shard * idx_n) / splits;
 }
 #define MAX_KEY_CEILING  1024        /* hard upper bound on per-object max_key
                                         (uint16 allows 65535, but keys near that
@@ -713,8 +748,9 @@ int cmd_add_indexes(const char *db_root, const char *object, const char *fields_
 
 /* ========== Per-shard btree index wrappers ==========
    Each indexed field lives at $DB_ROOT/<obj>/indexes/<field>/<NNN>.idx,
-   sharded into index_splits_for(splits) = splits/4 files. Writes route by
-   hash16 to a single shard; reads fan out across all shards.
+   sharded into index_splits_for(splits) files (non-linear curve, see
+   types.h above for the table). Writes route by hash16 to a single
+   shard; reads fan out across all shards.
 
    For point-search and range scans, results from different shards arrive
    in arbitrary interleaving (per-shard order is preserved within a shard

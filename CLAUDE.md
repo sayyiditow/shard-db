@@ -66,7 +66,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 - **I/O**: mmap throughout — MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads.
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
 - **Concurrency**: per-ucache-entry rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
-- **Index layout**: each indexed field shards into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`, `idx_shard_for_data_shard(s) = s/4`.
+- **Index layout**: each indexed field shards into `index_splits_for(splits)` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`. The `index_splits_for` curve caps idx fan-out at high split counts: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128` (see `src/db/types.h` for the rationale).
 
 Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [docs/concepts/indexes.md](docs/concepts/indexes.md), [docs/concepts/concurrency.md](docs/concepts/concurrency.md).
 
@@ -89,7 +89,7 @@ Field defaults (in fields.conf): `:default=<literal>`, `:auto_create`, `:auto_up
 ## Indexes (high-level)
 
 - B+ tree, prefix-compressed leaves (anchors every K=16, two-stage bsearch).
-- Per-shard layout — every indexed field is `splits/4` btree files; `splits` ∈ powers of 2 in [8, 4096]; `index_splits_for(splits) = splits/4` is derived (no separate config).
+- Per-shard layout — every indexed field is `index_splits_for(splits)` btree files; `splits` ∈ powers of 2 in [8, 4096]. The `index_splits_for()` mapping is non-linear (caps fan-out at high splits — see types.h for the table) and not separately configurable.
 - Wrapper API (`index.c`, declared in `types.h`): `btree_idx_insert/delete` (single shard), `btree_idx_search/range/range_ex` (fan out, callbacks fire in arbitrary inter-shard order), `btree_idx_walk_ordered` (k-way streaming merge for cursor), `btree_idx_unlink_all/exists`.
 - Composite indexes: literal `field1+field2` becomes the on-disk directory name.
 - All **38 search operators** use index when available — eq family, range, between, in/not_in, like/not_like, contains/not_contains, starts/ends, exists/not_exists, len_* (varchar length, btree-leaf-only no record fetch), case-insensitive i-variants, eq_field family (full-scan only — RHS is per-record), regex/not_regex (POSIX, full-scan only).

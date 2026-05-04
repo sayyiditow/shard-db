@@ -32,8 +32,9 @@
 
 /* ========== Per-shard btree index wrappers ==========
    See types.h for the contract. Layout: <db_root>/<obj>/indexes/<field>/<NNN>.idx
-   with index_splits_for(splits) = splits/4 shards. Writes route by hash16
-   to a single shard (idx_shard_for_hash); reads fan out across all shards. */
+   with index_splits_for(splits) shards (non-linear curve, capped at 128
+   for splits=4096). Writes route by hash16 to a single shard
+   (idx_shard_for_hash); reads fan out across all shards. */
 
 void btree_idx_insert(const char *db_root, const char *object,
                       const char *field, int splits,

@@ -4090,11 +4090,12 @@ int rebuild_object(const char *db_root, const char *object,
     rmrf(data_old);
     if (fields_changed) unlink(fpath_old);
 
-    /* Per-shard idx layout uses index_splits = splits/4. Changing splits
-       changes the idx-shard count, so the on-disk idx files no longer match
-       the routing math: writes go to the new shard count, reads fan out
-       across the new count, and any old high-numbered shard files are
-       both unreachable AND poisonous (the old layout stored all entries
+    /* Per-shard idx layout uses index_splits_for(splits) (see types.h).
+       Changing splits changes the idx-shard count, so the on-disk idx
+       files no longer match the routing math: writes go to the new shard
+       count, reads fan out across the new count, and any old high-numbered
+       shard files are both unreachable AND poisonous (the old layout
+       stored all entries
        across the wider hash range, so dropping them leaves stale rows
        indexed and missing rows unindexed). Rebuild every index from the
        data shards atomically with the splits change. Compact-only changes
@@ -6379,7 +6380,8 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
    tf is the TypedField for pc->field (NULL for composite indexes or
    untyped objects — in that case values are passed as raw bytes, matching
    the legacy ASCII storage of composite indexes). With the per-shard index
-   layout each call fans out across splits/4 shard files internally. */
+   layout each call fans out across index_splits_for(splits) shard files
+   internally. */
 static void btree_dispatch(const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
@@ -7493,7 +7495,8 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) return 0;
 
     /* Per-shard layout: index lives at <obj>/indexes/<field>/<NNN>.idx with
-       splits/4 shards. btree_idx_exists checks for any non-empty shard.
+       index_splits_for(splits) shards. btree_idx_exists checks for any
+       non-empty shard.
        Old single-file <field>.idx layout is gone; load_splits trips into
        the schema cache so this stays cheap on the planner hot path. */
     Schema sch = load_schema(db_root, object);
@@ -10542,8 +10545,9 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
 
     /* Defaults + strict validation. As of 2026.05.1, splits must be a
-       power of 2 in [16, 4096]. The per-shard index layout (index_splits
-       = splits / 4) relies on this regularity. */
+       power of 2 in [8, 4096]. The per-shard index layout
+       (index_splits_for(splits) — see types.h for the curve) relies on
+       this regularity. */
     if (splits <= 0) splits = DEFAULT_SPLITS;
     if (!is_valid_splits(splits)) {
         OUT("{\"error\":\"splits=%d invalid; must be a power of 2 in {16, 32, 64, 128, 256, 512, 1024, 2048, 4096}\"}\n",
