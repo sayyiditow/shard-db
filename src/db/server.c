@@ -2068,7 +2068,10 @@ static void *auto_vacuum_thread(void *arg) {
                                  && total > 0
                                  && deleted * 100 >= total * g_vacuum_recommend_pct);
                 if (recommend) {
-                    int pct_observed = total > 0 ? (deleted * 100 / total) : 0;
+                    /* recommend already implies total > 0 (see the
+                       g_vacuum_recommend_min_deleted >= deleted check
+                       and total > 0 gate above), so the divide is safe. */
+                    int pct_observed = (deleted * 100) / total;
                     log_msg(3,
                         "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
                         dirs_copy[di], de->d_name, count, deleted, pct_observed);
@@ -2184,7 +2187,7 @@ static int validate_metadata(const char *db_root) {
        stat-says-dir and opendir, a symlink swap could redirect to an
        attacker-controlled path). The opendir result IS the type check. */
     DIR *root = opendir(db_root);
-    if (!root) return errors;
+    if (!root) { free(schema_entries); return errors; }
     struct dirent *de;
     while ((de = readdir(root))) {
         if (de->d_name[0] == '.') continue;
