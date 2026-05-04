@@ -160,23 +160,20 @@ Real space cost on production datasets typically lands at **+20–30 %** vs the 
 
 - **CSV vs JSON.** CSV bulk insert is faster because the CSV path parses directly against the mmap'd file via `(ptr, len)` spans with zero per-line memcpy, while the JSON path materializes a `JsonObj` per record.
 
-### Splits tuning
+### Splits — bench-derived numbers
 
-Size `splits` to keep **records-per-shard in the 78K–200K sweet spot** (acceptable up to ~500K, degradation past ~1M). `create-object` defaults to `splits=16` when omitted — fine for test/demo loads, too low for anything above a few million rows. Pick from expected row count:
+Splits-sizing guidance lives in [tuning.md → Sizing `splits`](tuning.md#sizing-splits). The numbers below are the bench raw data that table is built from.
 
-| Expected rows | Recommended `splits` | Records/shard at target |
-|---------------|----------------------|-------------------------|
-| < 1M          | 8–32                 | up to ~125K             |
-| 1–10M         | 64                   | ~16K–156K               |
-| 10–25M        | 128                  | ~78K–195K (optimal band) |
-| 25–50M        | 256                  | ~98K–195K               |
-| 50–100M       | 512                  | ~98K–195K               |
-| 100–250M      | 512                  | ~200K–488K (acceptable) |
-| 250–500M      | 1024                 | ~244K–488K              |
-| 500M–1B       | 2048                 | ~244K–488K              |
-| 1–4B          | 4096 (MAX_SPLITS)    | ~244K–976K (at limit)   |
+On the parallel K/V bench at 10M rows:
 
-Numbers are from the parallel K/V bench on 10M rows (128 splits fastest at 3.488s; 64 splits 3.605s; 256 splits 3.986s; 1024 splits 5.454s). Counter-intuitively, raising `splits` *beyond* the sweet spot slows things down even at 10 parallel connections — more shard files = more syscalls and mmap page faults per query, and shard-lock contention isn't the bottleneck at this scale. If you exceed ~1M records/shard you've saturated this design — split across multiple objects (or tenant dirs) rather than climbing past `MAX_SPLITS=4096`.
+| `splits` | Records/shard | Wall time |
+|----------|---------------|-----------|
+| 64       | 156K          | 3.605s    |
+| **128**  | **78K**       | **3.488s** (fastest) |
+| 256      | 39K           | 3.986s    |
+| 1024     | 9K            | 5.454s    |
+
+Counter-intuitively, raising `splits` *beyond* the sweet spot slows things down even at 10 parallel connections — more shard files = more syscalls and mmap page faults per query, and shard-lock contention isn't the bottleneck at this scale. If you exceed ~1M records/shard you've saturated this design — split across multiple objects (or tenant dirs) rather than climbing past `MAX_SPLITS=4096`.
 
 ## Reproduce
 
