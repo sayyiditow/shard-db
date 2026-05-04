@@ -8019,14 +8019,26 @@ typedef struct {
     KeySet *ks;
     QueryDeadline *deadline;
     int dl_counter;
+    /* Short-circuit cap: when > 0, the OR-build callback returns -1 once
+       the shared KeySet's live count reaches this value, halting further
+       btree walks. Set by build_or_keyset's caller for pure-OR find with
+       a known offset+limit; left at 0 for count/aggregate or hybrid cases
+       that genuinely need every candidate. */
+    int target_count;
 } OrChildWorkerCtx;
 
-/* btree callback — drops every hit into the shared KeySet. */
+/* btree callback — drops every hit into the shared KeySet. Returns -1 to
+   halt the btree walk on deadline trip OR when the caller-supplied
+   target_count has been reached (limit pushdown for find queries). */
 static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
     if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
     keyset_insert(w->ks, hash16);
+    if (w->target_count > 0 &&
+        atomic_load_explicit(&w->ks->n, memory_order_relaxed) >= (size_t)w->target_count) {
+        return -1;
+    }
     return 0;
 }
 
@@ -8044,10 +8056,16 @@ static void *or_child_worker(void *arg) {
    Every child must be a LEAF with an index (verified by the planner).
    Caller owns the returned KeySet and must keyset_free() it.
    If the OR's estimated capacity would exceed the per-query buffer cap, returns
-   NULL and sets *out_budget_exceeded = 1 when the pointer is non-NULL. */
+   NULL and sets *out_budget_exceeded = 1 when the pointer is non-NULL.
+
+   target_count: when > 0, the OR walks halt as soon as the KeySet's live
+   count reaches this value. Caller supplies this only when the result will
+   be consumed without re-matching against a wider tree (i.e., need_rematch
+   is false). For find with limit=N, callers pass N + offset; for count and
+   aggregate, callers pass 0 (need every candidate). */
 static KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
                                const CriteriaNode *or_node, QueryDeadline *dl,
-                               int *out_budget_exceeded) {
+                               int *out_budget_exceeded, int target_count) {
     int n = or_node->n_children;
     if (n <= 0) return NULL;
 
@@ -8089,7 +8107,11 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
         ctxs[i].leaf = &c->leaf;
         ctxs[i].ks = ks;
         ctxs[i].deadline = dl;
+        ctxs[i].target_count = target_count;
     }
+
+    /* Even with serial child execution, an early target_count hit on child 0
+       lets us skip children 1..n-1 entirely. Check the cap before each child. */
 
     /* Serial across OR children — each or_child_worker calls btree_dispatch
        which itself fans out across the per-shard btrees via parallel_for.
@@ -8098,7 +8120,13 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
        gives the same total in-flight parallelism (~splits/4) as the prior
        parallel children × serial shards layout, with much higher parallelism
        per child. */
-    for (int i = 0; i < n; i++) or_child_worker(&ctxs[i]);
+    for (int i = 0; i < n; i++) {
+        if (target_count > 0 &&
+            atomic_load_explicit(&ks->n, memory_order_relaxed) >= (size_t)target_count) {
+            break;
+        }
+        or_child_worker(&ctxs[i]);
+    }
 
     free(ctxs);
     return ks;
@@ -8372,13 +8400,24 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
                                QueryDeadline *dl, int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
+    /* Pure-OR (root IS the or_node, OR root is a single-child AND wrapping
+       the or_node — common shape parsed from `[{"or":[...]}]`). In both,
+       every KeySet member already matches the full tree, so we can skip
+       the rematch AND push the limit down into the OR build to short-
+       circuit the btree walks. Hybrid AND+OR (multi-child AND) still
+       needs the rematch and an unbounded build. */
+    int rematch_unnecessary =
+        (tree == or_node) || (tree->kind == CNODE_OR) ||
+        (tree->kind == CNODE_AND && tree->n_children == 1 &&
+         tree->children[0] == or_node);
+    int need_rematch = !rematch_unnecessary;
+
+    int target = (!need_rematch && limit > 0) ? offset + limit : 0;
+
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
+                                 out_budget_exceeded, target);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
-
-    /* Pure-OR (root itself is the or_node) — every KeySet member matches,
-       no need to re-evaluate the tree against each record. */
-    int need_rematch = (tree != or_node && tree->kind != CNODE_OR);
 
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               need_rematch ? tree : NULL,
@@ -8460,7 +8499,9 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
                                const Schema *sch, void *agg_ctx,
                                CriteriaNode *or_node, QueryDeadline *dl,
                                int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
+    /* Aggregate needs the full union — no short-circuit (target_count=0). */
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
+                                 out_budget_exceeded, 0);
     if (!ks) return;
     if (dl->timed_out) { keyset_free(ks); return; }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -8503,7 +8544,9 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
                                    const Schema *sch, CriteriaNode *tree,
                                    CriteriaNode *or_node, FieldSchema *fs,
                                    QueryDeadline *dl, int *out_budget_exceeded) {
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl, out_budget_exceeded);
+    /* Count needs the full union — no short-circuit. */
+    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
+                                 out_budget_exceeded, 0);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
