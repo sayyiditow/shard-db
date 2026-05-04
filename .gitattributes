@@ -1,0 +1,16 @@
+# GitHub Linguist defaults .h files to C++. This is a pure C codebase
+# (the daemon, CLI, tests, benches, migrations, and fuzz harness are all
+# C11; the only .h files are C headers — see src/db/types.h, src/cli/cli.h,
+# etc.). Force the language counter to attribute headers to C.
+*.h        linguist-language=C
+*.c        linguist-language=C
+
+# Vendored dependencies and corpora shouldn't sway the language stats or
+# show up as "code" in GitHub's repo highlights.
+fuzz/corpora/**            linguist-vendored=true
+fuzz/build/**              linguist-generated=true
+build/**                   linguist-generated=true
+
+# Documentation under docs/ is the authoritative user-facing reference;
+# keep it as docs in the language counter.
+docs/**                    linguist-documentation=true
