@@ -8714,6 +8714,30 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 return 0;
             }
         }
+
+        /* IN / NOT_IN whole-domain shortcut for bool fields. If the value
+           list covers both true and false, every (or no) record matches:
+             count(field IN  {true,false}) = live_count
+             count(field NOT_IN {true,false}) = 0
+           Saves ~16ms on the bench's `active in {true,false}` row. */
+        if (exists_leaf && fs.ts &&
+            (exists_leaf->leaf.op == OP_IN || exists_leaf->leaf.op == OP_NOT_IN)) {
+            int fi = typed_field_index(fs.ts, exists_leaf->leaf.field);
+            if (fi >= 0 && fs.ts->fields[fi].type == FT_BOOL) {
+                int saw_t = 0, saw_f = 0;
+                for (int k = 0; k < exists_leaf->leaf.in_count; k++) {
+                    char c0 = exists_leaf->leaf.in_values[k][0];
+                    if (c0 == 't' || c0 == 'T' || c0 == '1') saw_t = 1;
+                    else                                     saw_f = 1;
+                }
+                if (saw_t && saw_f) {
+                    int total = get_live_count(db_root, object);
+                    OUT("%d\n", exists_leaf->leaf.op == OP_IN ? total : 0);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+            }
+        }
     }
 
     QueryPlan plan = choose_primary_source(tree, db_root, object);
