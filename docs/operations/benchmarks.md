@@ -73,28 +73,32 @@ All 17 search operators use indexes when available. Full scans stay fast because
 
 ## 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes
 
-`bench-invoice.sh 1000000 persistent`, `SPLITS=64`.
+`shard-db-bench run bench-invoice`, `SPLITS=64`.
 
 Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmStatus+pdfSent`, `status+source`, `status+createdAt`, `status+invoiceDate`.
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **161 k/sec** (6.19 s) |
-| Bulk insert (with 14 indexes) | **128 k/sec** (7.78 s) — 20 % index overhead |
-| Add 14 indexes post-insert | **2.79 s** (per-shard parallel build — 14 × splits/4 workers) |
-| GET ×1000 (pipelined) | **41 k ops/sec** (24 ms) |
-| EXISTS ×1000 (pipelined) | **55 k ops/sec** (18 ms) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **5 ms** |
-| Indexed `contains` via leaf scan | 5–15 ms |
-| Indexed IN (2 values) | 5 ms |
-| Composite index eq / starts | 4–5 ms |
-| Indexed `range` | 3 ms |
-| Fetch page of 100 @ offset 5000 | 5 ms |
-| Keys (first 100) | 4 ms |
-| **Single DELETE ×1000 (with 14 indexes)** | **7.8 k/sec** (128 ms) — 2.7× faster vs pre-2026.05.1 |
-| **Bulk DELETE ×1000** | **77 k/sec** (13 ms) — 16× faster vs pre-2026.05.1 |
-| VACUUM | 6 ms |
+| Bulk insert (no indexes) | **358 k/sec** (2.79 s) |
+| Bulk insert (with 14 indexes) | **230 k/sec** (4.35 s) — 36% slowdown vs no-idx |
+| Add 14 indexes post-insert | **2.78 s** (per-shard parallel build — 14 × splits/4 workers) |
+| GET ×1000 (req-resp, 1 conn) | **27 k ops/sec** (mean 36µs / p50 34µs / p99 68µs) |
+| EXISTS ×1000 (req-resp) | **35 k ops/sec** (mean 28µs / p50 28µs / p99 33µs) |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **1–2 ms** |
+| Indexed `contains` via leaf scan | 1–11 ms |
+| Indexed IN (2 values) | 1 ms |
+| Composite index eq / starts | 1–2 ms |
+| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | 65–79 ms |
+| Indexed `OR` (two statuses) | 23 ms |
+| Fetch page of 100 @ offset 5000 | 1 ms |
+| Keys (first 100) | <1 ms |
+| `count` full object | <1 ms |
+| **Single DELETE ×1000 (with 14 indexes)** | **10 k/sec** (mean 95µs / p50 91µs / p99 134µs) |
+| **Bulk DELETE ×1000** | **111 k/sec** (9 ms) |
+| VACUUM | 1 ms |
 | Disk footprint | 1.6 GB |
+
+The earlier-published indexed-range figure (3 ms) was borrowed from §3's narrow `between (age 25-35)` query on the user schema; the C bench's invoice range queries cover wider date spans (one-month and two-week windows on `invoiceDate`/`createdAt`) so the 65–79 ms numbers are honest cost for matching tens of thousands of records and returning the first 10 ordered by index leaf order.
 
 The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths now going through the unified shard cache (`ucache_get_write` per shard). Pre-2026.05.1 they did per-call `open + flock + mmap MAP_SHARED + munmap`, paying full page-fault tax per request.
 
