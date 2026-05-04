@@ -186,6 +186,28 @@ export TLS_SKIP_VERIFY=0
 EOF
 
 echo "Built: build/bin/"
+
+# Run the C test suite after every build unless explicitly skipped.
+# Each test self-spawns its own daemon (fork+exec) on a free port and
+# tears down on exit, so they're safe to run from anywhere. Set
+# SKIP_TESTS=1 to suppress (e.g. during quick edit/compile loops).
+if [ -z "$SKIP_TESTS" ]; then
+    echo ""
+    echo "Running C tests..."
+    if ! ./build/bin/shard-db-test run-all 2>&1 | tee /tmp/shard-db-build-tests.log; then
+        echo ""
+        echo "BUILD FAILED: tests reported failures (see output above and /tmp/shard-db-build-tests.log)" >&2
+        exit 1
+    fi
+    # `run-all` exits 0 even when individual cases fail unless we check the
+    # final summary. Grep for failures in the log to be safe.
+    if grep -q "not ok " /tmp/shard-db-build-tests.log; then
+        echo ""
+        echo "BUILD FAILED: tests reported assertion failures (see /tmp/shard-db-build-tests.log)" >&2
+        exit 1
+    fi
+fi
+
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
 echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli + migrate). Run ./migrate before starting the new daemon — db.env / DB_ROOT / logs are untouched."
