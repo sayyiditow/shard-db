@@ -154,7 +154,7 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./migrate
 ```
 
-**Bulk-insert at scale**: as of pre-grow (2026.05.x), single-connection beats parallel for non-indexed loads (CSV K/V hits 4.76 M/sec single, vs. 3.40 M/sec at 5 conns × 2M). For indexed loads at 1M+ records, **load-then-index** with single conn (1.98 + 2.78 s = 4.76 s on invoice 1M × 14 idx) now outperforms pre-existing-indexes parallel (5.22 s at 5×200K). The old "FEWER LARGER calls, R = N/200K" rule was driven by the in-loop shard-grow stall that pre-grow has eliminated. Pre-existing-indexes parallel only helps for streaming workloads where add-index-after isn't an option.
+**Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds for max throughput. Single-conn is fine for operational simplicity — it's only ~1.4× behind the parallel peak. For indexed loads at 1M+ records, **load-then-index** is competitive and avoids the per-(field, shard) merge cycle; pre-existing-indexes parallel is preferred when streaming and add-index-after isn't an option.
 
 ## JSON query protocol
 

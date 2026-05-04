@@ -10,22 +10,27 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 Bulk-insert no longer grows shards incrementally during the write phase. The dispatcher computes each shard's target slot count from the incoming batch (`next_pow2(live + incoming)`) and grows each shard once, in parallel, before workers start. The previous behaviour rebucketed existing data on every doubling — eliminated.
 
-Same-shape benchmark wins on AMD Ryzen 7 7840U (matches existing `docs/operations/benchmarks.md` setup):
+Same-shape benchmark wins on AMD Ryzen 7 7840U (C-bench measurements):
 
-- K/V CSV bulk insert (10M, single conn, SPLITS=128): 2.39 → **4.76 M/sec** (1.99×)
-- Invoice CSV bulk insert (1M, single conn, no idx, SPLITS=64): 238 → **505 k/sec** (2.12×)
-- Invoice CSV bulk insert (1M, single conn, with 14 idx): 90 → **128 k/sec** (1.42×)
+- K/V CSV bulk insert (10M, single conn, SPLITS=128): 2.39 → **5.34 M/sec** (2.23×)
+- K/V CSV bulk insert (10M, 5 conns × 2M): 2.72 → **7.55 M/sec** (2.78×)
+- Invoice CSV bulk insert (1M, single conn, no idx, SPLITS=64): 238 → **505 k/sec** (2.12×, bash measurement; C-bench likely higher)
 - Invoice load-then-index (1M, CSV + add 14 idx): 6.47 s → **4.76 s**
 
-**Tuning rule inverted.** Pre-2026.05.x advice was *use multiple connections (R = N/200K, 5 conns × 200K)* for best throughput. With pre-grow that advice is obsolete:
+**Tuning rule:** the pre-2026.05.x guidance — *use multiple connections (`R ≈ N/200K`, `5 ≤ conns`) for max throughput* — still applies. Pre-grow makes every path ~2× faster; parallel inserts continue to scale ~1.4–1.6× over single-conn at this hardware. Earlier docs in this branch briefly claimed "single now beats parallel"; that was a bash-bench artifact (the bash parallel test forks `shard-db query` subprocesses per chunk, costing 10–30 ms each ×5 chunks). The C bench (`shard-db-bench run bench-kv-parallel`) confirms parallel still wins.
 
-- Non-indexed bulk insert: **use a single connection.** Parallel is now slower than single — each connection pays its own pipeline-tail (parse, bucket, dispatch, activate per call) competing for one shared worker pool, with no grow-stall savings to amortize.
-- Indexed bulk insert at 1M+ records: **load-then-index with single conn.** It now beats pre-existing-indexes parallel by ~10% (was losing by ~14%).
-- Pre-existing-indexes parallel still helps for streaming workloads where add-index isn't an option.
+Operational guidance:
+
+- For max throughput: parallel connections with chunks of ~2 M records.
+- For simplicity: single connection — it's ~1.4× behind the parallel peak, so the trade is real but small.
+- For indexed batch loads at 1M+ records: **load-then-index** is competitive and avoids the per-(field, shard) merge cycle that scales `O(R²)` with request count.
+- For streaming with pre-existing indexes: parallel + small `R = N / 200K` chunks remains the right pattern.
 
 Read paths, single-record writes, deletes, vacuum, recount, query/count/aggregate are all unchanged — no regressions.
 
-Code: `src/db/storage.c` (`ucache_grow_to`, `ucache_peek_slots`), `src/db/query.c` (`pre_grow_shards_for_bulk_insert`), bench harness at `bench/bench-grow.sh`. The delimited-format bulk-insert path now emits the same `BULK-INSERT … grows=N grow_total=Tms` log line as the JSON path at `LOG_LEVEL>=3`.
+Code: `src/db/storage.c` (`ucache_grow_to`, `ucache_peek_slots`), `src/db/query.c` (`pre_grow_shards_for_bulk_insert`), bench harness at `src/bench/bench_grow.c`. The delimited-format bulk-insert path now emits the same `BULK-INSERT … grows=N grow_total=Tms` log line as the JSON path at `LOG_LEVEL>=3`.
+
+A C test/bench framework also landed in this work (`build/bin/shard-db-test`, `build/bin/shard-db-bench`) replacing bash benches with sub-µs-precision C measurements. All future perf claims should come from these.
 
 ## 2026.05.1 — 2026-05-02 (reissued)
 
