@@ -37,40 +37,35 @@ jobs:
             build-essential libssl-dev libncursesw5-dev lcov
 
       - name: Build (BUILD_MODE=coverage)
-        # The flags add ~3× to compile time but the test suite still
-        # finishes well under timeout. -O0 keeps line attribution
-        # accurate.
-        run: ./build.sh && cp build/bin/shard-db ./shard-db
+        # Coverage flags add ~3× to compile time but the test suite still
+        # finishes well under timeout. -O0 keeps line attribution accurate.
+        run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
-      - name: Run test suite
-        # Run the same test set as the main CI, in series (gcov counters
-        # aren't thread-safe across processes; serialised tests keep
-        # the .gcda files coherent).
-        run: |
-          for t in tests/test-*.sh; do
-            echo "=== $t ==="
-            "$t" || exit 1
-          done
+      - name: Run full C test suite (sequential)
+        # gcov counters aren't safe across forked processes when test
+        # cases overlap. The test runner already spawns one daemon per
+        # case sequentially, so .gcda files stay coherent without extra
+        # serialization.
+        run: ./build/bin/shard-db-test run-all
 
       - name: Collect coverage
         run: |
           # lcov reads the .gcno (graph) and .gcda (counters) sibling files
-          # next to each .o. Then strip system headers and tests/ dir.
+          # next to each .o. Then strip system headers and the test/fuzz
+          # source trees so we measure only the daemon code under test.
           #
           # --ignore-errors flags:
           #   negative — racing counter (false positive after our atomic flag)
           #   unused   — lcov 2.x errors on exclude patterns that don't match;
-          #              tests/ and fuzz/ are bash/external so they have no
-          #              .gcda files in the captured tree, but we still pass
-          #              the patterns defensively in case a future contributor
-          #              adds C tests.
+          #              src/test/ files DO have .gcda after the C migration,
+          #              but we still pass defensively if a pattern misses.
           #   gcov     — geninfo warns about "unexecuted block on non-branch
           #              line" for some inlined functions; informational only.
           lcov --capture --directory . --output-file coverage.info \
                --rc branch_coverage=1 \
                --ignore-errors negative,negative,gcov
           lcov --remove coverage.info \
-               '/usr/*' '*/tests/*' '*/fuzz/*' \
+               '/usr/*' '*/src/test/*' '*/src/bench/*' '*/fuzz/*' \
                --output-file coverage.info \
                --rc branch_coverage=1 \
                --ignore-errors negative,negative,unused

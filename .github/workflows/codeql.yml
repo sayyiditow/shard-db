@@ -50,9 +50,10 @@ jobs:
         - language: actions
           build-mode: none
         - language: c-cpp
-          build-mode: autobuild
-        - language: python
-          build-mode: none
+          build-mode: manual
+        # The repo has no python sources after the bench/*.py removal in
+        # 2026.05 — keep python out of the matrix so CodeQL doesn't fail
+        # the run scanning an empty input.
         # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
@@ -84,22 +85,22 @@ jobs:
         # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
         # queries: security-extended,security-and-quality
 
-    # If the analyze step fails for one of the languages you are analyzing with
-    # "We were unable to automatically build your code", modify the matrix above
-    # to set the build mode to "manual" for that language. Then modify this step
-    # to build your code.
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-    - name: Run manual build steps
-      if: matrix.build-mode == 'manual'
+    # Manual build for c-cpp: autobuild kept choosing the wrong target
+    # (CodeQL's heuristic ran make on the absent Makefile after the bash
+    # tests/ directory was removed). Driving build.sh directly is more
+    # explicit and matches how every other workflow compiles the daemon.
+    - name: Install C build deps
+      if: matrix.language == 'c-cpp'
       shell: bash
       run: |
-        echo 'If you are using a "manual" build mode for one or more of the' \
-          'languages you are analyzing, replace this with the commands to build' \
-          'your code, for example:'
-        echo '  make bootstrap'
-        echo '  make release'
-        exit 1
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          build-essential libssl-dev libncursesw5-dev
+
+    - name: Build for c-cpp analysis
+      if: matrix.language == 'c-cpp'
+      shell: bash
+      run: SKIP_TESTS=1 ./build.sh
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3.35.2

@@ -35,96 +35,23 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Build
-        # build.sh uses an explicit file list — avoids pulling in
-        # src/btree_test.c (standalone harness with its own main()).
-        run: ./build.sh && cp build/bin/shard-db ./shard-db
+        # build.sh produces shard-db, shard-cli, migrate, shard-db-test, and
+        # shard-db-bench under build/bin/. Test runner ships as a single
+        # binary linking every src/test/cases/test_*.c case via
+        # TEST_REGISTER static-init; one invocation runs the whole suite.
+        run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
-      - name: Schema mutation locking + key ceiling (test-objlock)
-        run: ./tests/test-objlock.sh
-
-      - name: Rename field (test-rename-field)
-        run: ./tests/test-rename-field.sh
-
-      - name: Remove field + vacuum --compact (test-remove-field)
-        run: ./tests/test-remove-field.sh
-
-      - name: Vacuum + add-field (test-vacuum-addfield)
-        run: ./tests/test-vacuum-addfield.sh
-
-      - name: Concurrent bulk-insert integrity (test-parallel-index-integrity)
-        run: ./tests/test-parallel-index-integrity.sh
-
-      - name: Joins (test-joins)
-        run: ./tests/test-joins.sh
-
-      - name: CLI shortcuts + delete-file (test-cli-shortcuts)
-        run: ./tests/test-cli-shortcuts.sh
-
-      - name: OR criteria (test-or-logic)
-        run: ./tests/test-or-logic.sh
-
-      - name: AND index intersection (test-and-intersection)
-        run: ./tests/test-and-intersection.sh
-
-      - name: CSV export (test-csv-export)
-        run: ./tests/test-csv-export.sh
-
-      - name: Per-tenant auth (test-per-tenant-auth)
-        run: ./tests/test-per-tenant-auth.sh
-
-      - name: Per-object tokens + perms (test-token-perms)
-        run: ./tests/test-token-perms.sh
-
-      - name: Tenant management (test-tenant-mgmt)
-        run: ./tests/test-tenant-mgmt.sh
-
-      - name: Per-request timeout_ms (test-request-timeout)
-        run: ./tests/test-request-timeout.sh
-
-      - name: Binary-native B+ tree keys + reindex (test-binary-index)
-        run: ./tests/test-binary-index.sh
-
-      - name: Keyset cursor pagination (test-find-cursor)
-        run: ./tests/test-find-cursor.sh
-
-      - name: Native TLS 1.3 (test-tls)
-        run: ./tests/test-tls.sh
-
-      - name: list-objects + describe-object (test-describe)
-        run: ./tests/test-describe.sh
-
-      - name: CSV per-key partial update (test-bulk-update-delimited)
-        run: ./tests/test-bulk-update-delimited.sh
-
-      - name: JSON per-key partial update (test-bulk-update-json)
-        run: ./tests/test-bulk-update-json.sh
-
-      - name: bulk-insert as upsert + idx drift (test-bulk-upsert)
-        run: ./tests/test-bulk-upsert.sh
-
-      - name: CAS on bulk ops (test-bulk-cas)
-        run: ./tests/test-bulk-cas.sh
-
-      - name: export-schema / import-schema (test-schema-export)
-        run: ./tests/test-schema-export.sh
-
-      - name: Prometheus text-format exposition (test-stats-prom)
-        run: ./tests/test-stats-prom.sh
-
-      - name: Aggregate NEQ algebraic shortcut (test-agg-neq-shortcut)
-        run: ./tests/test-agg-neq-shortcut.sh
-
-      - name: Concurrent stress, no-hang (test-stress-no-hang)
-        # Default 16 workers × 15s — ~75k ops, 0 hangs. Catches concurrency
-        # races that single-client tests miss (the original write-side
-        # ftruncate-during-read race lived for months before this caught it).
-        run: ./tests/test-stress-no-hang.sh
+      - name: Run full C test suite
+        # 40+ cases / 1000+ assertions. Each case spawns its own daemon on
+        # a free port at a unique tmpdir, so cases are CWD-independent and
+        # parallel-safe within the runner.
+        run: ./build/bin/shard-db-test run-all
 
       - name: Package binary
         # Tag artifact uploads by arch so both binaries can coexist.
         run: |
           tarball="shard-db-${{ matrix.arch }}.tar.gz"
-          tar -C build/bin -czf "$tarball" shard-db shard-cli
+          tar -C build/bin -czf "$tarball" shard-db shard-cli migrate
           ls -l "$tarball"
 
       - name: Upload binary artifact
