@@ -6,6 +6,50 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## In flight (post-2026.05.1)
 
+### Performance — aggregate fast paths (sum/avg/min/max + NEQ + EXISTS)
+
+Single-spec aggregates without group_by/having/criteria on an indexed non-varchar field now walk btree leaves directly. Encoded leaf bytes decode straight to a double via the inverse of `encode_field_for_index`, so no record fetch and no slot-header probe per row. The full record-decode scan path is reserved for multi-spec aggregates (`{"sum","avg","min","max"}` together) and grouped aggregates.
+
+Bench wins on a 1M-record `users` object (single-conn, default schema):
+
+- AGGREGATE single-fn standalone (30 rows: count + sum/avg per type + min/max per type): **8.8s → 202ms total** (~43× faster).
+- `min/max` per-type: 200-400ms each → **0.04-0.35ms** each (record-fetch elimination dominates).
+- `sum/avg` per type: 250-380ms each → **13-22ms** each (still scans every leaf, but no record decode).
+
+Two related shortcuts:
+
+- **NEQ aggregate count-only path** — `agg(count where field neq X) = live_count − count(field eq X)`. Previously the planner ran a full `scan_shards` to compute `count(*)`; now uses metadata `live_count`. **156ms → 0.42ms** at 1M (~370× faster). Works for both `{...}` and `[{...}]` criteria forms — the array form (parsed as `CNODE_AND` with one child) was previously missing from the eligibility check.
+- **EXISTS / NOT_EXISTS shortcut** — for non-varchar typed fields every record carries the field, so `count(EXISTS field) = live_count` and `count(NOT_EXISTS field) = 0` by definition. No scan. **22ms → 0.05ms** for the 12 typed-field rows in `bench-queries`. Varchar EXISTS / NOT_EXISTS now route to `PRIMARY_NONE` (parallel `scan_shards` 64-way) instead of the contended single-counter btree walk; ~22ms → ~3ms.
+
+Code: `src/db/query.c` (`decode_index_key_to_double`, the `Fast path: single-spec SUM / AVG / MIN / MAX` block in `cmd_aggregate`, the `count_only` branch in the NEQ shortcut, the existence shortcut at the top of `cmd_count`, `leaf_is_indexed` change to bail EXISTS/NOT_EXISTS).
+
+### Performance — regex on indexed varchar
+
+`regex` and `not_regex` on indexed varchar fields no longer fall to a full record scan. The planner allows them through `leaf_is_indexed` for varchar and the callback runs `regexec` against the literal leaf bytes. A thread-local `(pattern → regex_t)` cache in `match_criterion` ensures `regcomp` fires once per thread per distinct pattern, not once per leaf entry — without it, enabling the indexed path would have regressed on workloads hitting `collect_hash_cb` / `idx_count_cb` millions of times. Non-varchar indexed fields stay on the full-scan path because their leaves carry encoded sortable bytes (top-bit-flipped ints, etc.) that regex would match against garbage.
+
+### Performance — query planner cleanups
+
+- **Range coalesce on same-field bounds** — `gt/lt/gte/lte` pairs on the same field collapse to one `BETWEEN` with `min_exclusive`/`max_exclusive` flags. All four pairings (`gt+lt`, `gt+lte`, `gte+lt`, `gte+lte`) hit the indexed range path; previously only `gte+lte` got the win and the other three ran two separate range walks. Bench: paired-range rows 4-5ms → 2-3ms.
+- **OR limit pushdown** — pure-OR `find` paths now stop building the union once `offset+limit` candidates are reached. Big rematch step skipped entirely when the limit is small.
+- **KeySet capacity floor on intersect** — capacity is now `max(leaf_capacity_hint, live_count)`. Previously a heavily-compressed btree's `leaf_capacity_hint` could under-size the KeySet and the table would saturate under bulk inserts. The 3-way `active+age+score` intersect on bench-queries went from **74s → 91ms** (~800×) once the capacity stopped capping early.
+- **Index fan-out curve** — `index_splits_for(splits)` is now a non-linear table (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) instead of `splits/4`. Caps idx fan-out at high split counts so a 4096-shard object doesn't open 1024 idx files for every search.
+
+### Fixed — `count(varchar field)` over-counted empty strings
+
+`agg_scan_cb`'s `AGG_COUNT` branch incremented for every matched record without checking the field's value. Typed records always carry every field, but a varchar field can have empty content (`elen == 0`); `count(varchar_field)` should match `OP_EXISTS`-on-varchar semantics and skip empties. Fixed plus three call-site fixes: `spec_tfs[i]` now resolves for `AGG_COUNT` specs (was skipped), the metadata fast path bails when count's field is varchar, and the NEQ count-only shortcut bails on `count(varchar field)` since `idx_count_cb` can't apply the elen filter. Test: `test-count-varchar-field` (7 assertions, including grouped + criteria-narrowed forms).
+
+### Fixed — `./shard-db start` reported success but daemon didn't listen
+
+The startup metadata validator added in 2026.05.2 ran *after* `fork()` so its stderr went to `/dev/null` and the parent had already printed `shard-db started (pid N)`. Operators saw "started" then immediate "stopped" with the only diagnostic in `error.log`. Two fixes: validation moved before fork so any future fatal error reaches the user's terminal, and the `dirs.conf` consistency rule softened from fatal to a warning. Stale schema entries can't cause silent mis-routing — the auth/route layer already rejects unknown tenants — so refusing startup blocked operators on any DB that had outlived a removed test tenant.
+
+### Tooling — bench harness uses unified table view
+
+All eight benches (`bench-queries`, `bench-invoice`, `bench-joins`, `bench-kv`, `bench-kv-parallel`, `bench-parallel`, `bench-grow`, `bench-incremental`) now produce sectioned tables with relative bar charts and min/p50/max/total footers via `src/bench/bench_table.c`. New `bench_table_record(label, us, ok, extra)` lets pre-computed timings (bulk-insert throughput, pipelined latency batches, parallel-worker fan-out) share the same section as single-shot `tc_request` rows; `extra` is an optional trailing column for throughput-style metadata (`0.39 M rows/s`, `p50=31µs  31 k op/s`).
+
+### Tooling — `bench-queries` covers every operator × every applicable type
+
+222 rows across 21 sections. Every operator class touches every applicable field type so per-type pathology surfaces in one run: `eq` / `neq` / range / `in`/`not_in` / `exists` / string ops (CS + CI) / `len_*` / regex / field-vs-field / OR widths / aggregate single-fn + with-criteria + bundled / cursor by 7 indexed types. Insert path uses 10M-record chunks so 1M / 10M / 100M scales all run with bounded peak memory.
+
 ### Performance — bulk-insert pre-grow
 
 Bulk-insert no longer grows shards incrementally during the write phase. The dispatcher computes each shard's target slot count from the incoming batch (`next_pow2(live + incoming)`) and grows each shard once, in parallel, before workers start. The previous behaviour rebucketed existing data on every doubling — eliminated.
