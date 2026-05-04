@@ -163,7 +163,7 @@ static int ucache_probe(const char *path, int *out_found) {
 /* Read ShardHeader from an open fd. On a fresh/empty file, writes a new
    header with INITIAL_SLOTS and ftruncates to the correct file size.
    Returns slots_per_shard, or 0 on failure. */
-static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create, int prealloc_mb) {
+static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create) {
     struct stat st;
     if (fstat(fd, &st) < 0) return 0;
 
@@ -176,17 +176,7 @@ static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create, int 
         hdr.slots_per_shard = INITIAL_SLOTS;
         hdr.record_count = 0;
         size_t need = shard_file_size(INITIAL_SLOTS, slot_size_for_create);
-        int use_prealloc = 0;
-        if (prealloc_mb > 0) {
-            size_t chunk = (size_t)prealloc_mb * 1024 * 1024;
-            if (chunk > need) need = chunk;
-            use_prealloc = 1;
-        }
-        if (use_prealloc) {
-            if (posix_fallocate(fd, 0, need) != 0) return 0;
-        } else {
-            if (ftruncate(fd, need) < 0) return 0;
-        }
+        if (ftruncate(fd, need) < 0) return 0;
         if (pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return 0;
         return INITIAL_SLOTS;
     }
@@ -203,7 +193,7 @@ static uint32_t shard_init_or_read_header(int fd, int slot_size_for_create, int 
    Does NOT acquire rwlock — caller does that after this returns.
    slot_size_for_create<=0 means read-only (don't create file).
    Returns slot index, or -1 on failure. */
-static int ucache_ensure(const char *path, int slot_size_for_create, int prealloc_mb) {
+static int ucache_ensure(const char *path, int slot_size_for_create) {
     pthread_mutex_lock(&g_ucache_table_mutex);
 
     int found = 0;
@@ -229,7 +219,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
         if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         struct stat st;
         if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
-        slots_per_shard = shard_init_or_read_header(fd, 0, 0);
+        slots_per_shard = shard_init_or_read_header(fd, 0);
         if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         sz = st.st_size;
     } else {
@@ -237,7 +227,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create, int preallo
         mkdirp(dirname_of(path));
         fd = open(path, O_RDWR | O_CREAT, 0644);
         if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
-        slots_per_shard = shard_init_or_read_header(fd, slot_size_for_create, prealloc_mb);
+        slots_per_shard = shard_init_or_read_header(fd, slot_size_for_create);
         if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
         struct stat st;
         if (fstat(fd, &st) < 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
@@ -300,7 +290,7 @@ FcacheRead fcache_get_read(const char *path) {
     FcacheRead r = { .map = NULL, .size = 0, .slots_per_shard = 0, .slot = -1 };
     if (!g_ucache) return r;
 
-    int slot = ucache_ensure(path, 0, 0);
+    int slot = ucache_ensure(path, 0);
     if (slot < 0) return r;
 
     r.map = g_ucache[slot].map;
@@ -317,11 +307,11 @@ void fcache_release(FcacheRead h) {
 /* Get cached write handle. Acquires exclusive rwlock.
    slot_size > 0 creates the shard file (with INITIAL_SLOTS) if missing.
    Caller must call ucache_write_release(). */
-FcacheRead ucache_get_write(const char *path, int slot_size, int prealloc_mb) {
+FcacheRead ucache_get_write(const char *path, int slot_size) {
     FcacheRead r = { .map = NULL, .size = 0, .slots_per_shard = 0, .slot = -1 };
     if (!g_ucache) return r;
 
-    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return r;
 
     pthread_rwlock_wrlock(&g_ucache[slot].rwlock);
@@ -433,12 +423,12 @@ static void *grow_rehash_worker(void *arg) {
 /* Grow `path` to exactly `target_slots`. Body of the per-shard rebuild;
    ucache_grow_shard is a thin wrapper that supplies target = old * 2. */
 int ucache_grow_to(const char *path, uint32_t target_slots,
-                   int slot_size, int prealloc_mb) {
+                   int slot_size) {
     if (!g_ucache) return -1;
     /* target_slots must be a power of 2. */
     if (target_slots == 0 || (target_slots & (target_slots - 1)) != 0) return -1;
 
-    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return -1;
 
     UCacheEntry *e = &g_ucache[slot];
@@ -474,16 +464,8 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
     if (nfd < 0) { pthread_rwlock_unlock(&e->rwlock); return -1; }
 
     size_t new_size = shard_file_size(new_slots, slot_size);
-    int use_prealloc = 0;
-    if (prealloc_mb > 0) {
-        size_t chunk = (size_t)prealloc_mb * 1024 * 1024;
-        if (chunk > new_size) new_size = chunk;
-        use_prealloc = 1;
-    }
-    if (use_prealloc) {
-        if (posix_fallocate(nfd, 0, new_size) != 0) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
-    } else {
-        if (ftruncate(nfd, new_size) < 0) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    if (ftruncate(nfd, new_size) < 0) {
+        close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1;
     }
 
     uint8_t *nmap = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
@@ -578,25 +560,25 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
 }
 
 /* Double slots_per_shard for this shard. Thin wrapper over ucache_grow_to. */
-int ucache_grow_shard(const char *path, int slot_size, int prealloc_mb) {
+int ucache_grow_shard(const char *path, int slot_size) {
     if (!g_ucache) return -1;
-    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return -1;
     uint32_t observed = g_ucache[slot].slots_per_shard;
     if (observed == 0) return -1;
-    return ucache_grow_to(path, observed * 2, slot_size, prealloc_mb);
+    return ucache_grow_to(path, observed * 2, slot_size);
 }
 
-uint32_t ucache_peek_slots(const char *path, int slot_size, int prealloc_mb) {
+uint32_t ucache_peek_slots(const char *path, int slot_size) {
     if (!g_ucache) return 0;
-    int slot = ucache_ensure(path, slot_size, prealloc_mb);
+    int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return 0;
     return g_ucache[slot].slots_per_shard;
 }
 
 /* Check threshold; caller holds entry wrlock during the insert but MUST release
    before calling this (we re-acquire inside). ucache_slot is the entry index. */
-void ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb) {
+void ucache_maybe_grow(int ucache_slot, int slot_size) {
     if (!g_ucache || ucache_slot < 0 || ucache_slot >= g_ucache_slots) return;
     UCacheEntry *e = &g_ucache[ucache_slot];
     /* Probe without lock — false positives are OK, grow re-checks under lock. */
@@ -608,7 +590,7 @@ void ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb) {
     char path_copy[PATH_MAX];
     strncpy(path_copy, e->path, PATH_MAX - 1);
     path_copy[PATH_MAX - 1] = '\0';
-    ucache_grow_shard(path_copy, slot_size, prealloc_mb);
+    ucache_grow_shard(path_copy, slot_size);
 }
 
 /* Crash recovery: unlink any leftover `*.bin.new` files under db_root.
@@ -702,8 +684,8 @@ void fcache_invalidate(const char *path_prefix) {
 
 /* ========== Pre-allocation ========== */
 
-/* Schema now supports: dir:object:splits:max_key:max_value:prealloc_mb */
-/* prealloc_mb is the initial allocation per shard in MB (0 = grow on demand) */
+/* Schema format: dir:object:splits:max_key (max_value derived from
+   fields.conf, slot_size = max_key + max_value rounded to 8). */
 
 /* ========== Record Count ==========
    Both live and deleted counts share one file ($obj/metadata/counts)
@@ -930,7 +912,7 @@ int cmd_insert(const char *db_root, const char *object,
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
     /* Acquire write lock on cached shard (creates with INITIAL_SLOTS if missing) */
-    FcacheRead wh = ucache_get_write(shard, sc.slot_size, sc.prealloc_mb);
+    FcacheRead wh = ucache_get_write(shard, sc.slot_size);
     if (!wh.map) { free(typed_buf); OUT("{\"error\":\"Cannot open shard\"}\n"); return 1; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
@@ -1047,7 +1029,7 @@ int cmd_insert(const char *db_root, const char *object,
             object, key, shard_id, slot);
 
     /* Post-insert: check if this shard should grow (50% load factor). */
-    if (!is_update) ucache_maybe_grow(u_slot, sc.slot_size, sc.prealloc_mb);
+    if (!is_update) ucache_maybe_grow(u_slot, sc.slot_size);
 
     free(typed_buf);
     OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n", is_update ? "updated" : "inserted", key);
@@ -1067,7 +1049,7 @@ int cmd_update(const char *db_root, const char *object,
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
@@ -1238,7 +1220,7 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) { OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key); return 0; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;

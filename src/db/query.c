@@ -758,7 +758,6 @@ typedef struct {
     int         shard_id;
     int         incoming;
     int         slot_size;
-    int         prealloc_mb;
 } PreGrowArg;
 
 static void *pre_grow_shard_worker(void *arg) {
@@ -766,7 +765,7 @@ static void *pre_grow_shard_worker(void *arg) {
     char shard_path[PATH_MAX];
     build_shard_path(shard_path, sizeof(shard_path),
                      a->db_root, a->object, a->shard_id);
-    uint32_t cur_slots = ucache_peek_slots(shard_path, a->slot_size, a->prealloc_mb);
+    uint32_t cur_slots = ucache_peek_slots(shard_path, a->slot_size);
     if (cur_slots == 0) return NULL;
     uint32_t live = 0;
     FcacheRead fc = fcache_get_read(shard_path);
@@ -782,7 +781,7 @@ static void *pre_grow_shard_worker(void *arg) {
         target *= 2;
     }
     if (target > cur_slots) {
-        (void)ucache_grow_to(shard_path, target, a->slot_size, a->prealloc_mb);
+        (void)ucache_grow_to(shard_path, target, a->slot_size);
     }
     return NULL;
 }
@@ -808,7 +807,6 @@ static int pre_grow_shards_for_bulk_insert(const char *db_root,
         args[j].shard_id    = s;
         args[j].incoming    = shard_counts[s];
         args[j].slot_size   = sc->slot_size;
-        args[j].prealloc_mb = sc->prealloc_mb;
         j++;
     }
     parallel_for(pre_grow_shard_worker, args, n, sizeof(PreGrowArg));
@@ -831,7 +829,7 @@ static void *bulk_insert_shard_worker(void *arg) {
     char shard_path[PATH_MAX];
     build_shard_path(shard_path, sizeof(shard_path), sw->db_root, sw->object, sw->shard_id);
 
-    FcacheRead wh = ucache_get_write(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+    FcacheRead wh = ucache_get_write(shard_path, sw->sch->slot_size);
     if (!wh.map) {
         log_msg(1, "INSERT_DROP shard=%d (cannot open shard, dropping %zu records)",
                 sw->shard_id, sw->count);
@@ -866,7 +864,7 @@ static void *bulk_insert_shard_worker(void *arg) {
             /* Shard full — release lock so grow can take it, grow, reacquire, retry */
             ucache_write_release(wh);
             uint64_t t_grow_start = now_ms_coarse();
-            int grow_result = ucache_grow_shard(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+            int grow_result = ucache_grow_shard(shard_path, sw->sch->slot_size);
             sw->grow_ms += now_ms_coarse() - t_grow_start;
             sw->grow_count++;
             if (grow_result < 0) {
@@ -878,7 +876,7 @@ static void *bulk_insert_shard_worker(void *arg) {
                 wh.map = NULL;
                 break;
             }
-            wh = ucache_get_write(shard_path, sw->sch->slot_size, sw->sch->prealloc_mb);
+            wh = ucache_get_write(shard_path, sw->sch->slot_size);
             if (!wh.map) {
                 /* Grow succeeded but reacquire failed — e.g. EMFILE hit on open.
                    Count the remaining records as errors so the caller doesn't
@@ -2054,7 +2052,7 @@ static void *bulk_del_shard_worker(void *arg) {
        bulk-delete paid the page-fault hit on each call AND held a
        cross-process flock that blocked concurrent readers using the same
        file via ucache. */
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) return NULL;
     uint8_t *map = wh.map;
     ShardHeader *sh = (ShardHeader *)map;
@@ -2479,7 +2477,7 @@ static void *bulk_upd_shard_worker(void *arg) {
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) { w->skipped += w->count; return NULL; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
@@ -2787,7 +2785,7 @@ static void *bulk_upd_delim_shard_worker(void *arg) {
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) { w->skipped += w->count; return NULL; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
@@ -3153,7 +3151,7 @@ static void *bulk_upd_json_shard_worker(void *arg) {
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0, 0);
+    FcacheRead wh = ucache_get_write(shard, 0);
     if (!wh.map) { w->skipped += w->count; return NULL; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
@@ -3659,7 +3657,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         char shard[PATH_MAX];
         build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
-        FcacheRead wh = ucache_get_write(shard, 0, 0);
+        FcacheRead wh = ucache_get_write(shard, 0);
         if (!wh.map) { skipped++; continue; }
         uint8_t *map = wh.map;
         uint32_t slots = wh.slots_per_shard;
@@ -3757,7 +3755,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
    Caller must hold objlock_wrlock on the object. */
 
 /* Update the splits field for one object's line in $g_db_root/schema.conf.
-   Format: dir:object:splits:max_key:prealloc_mb. Serialised by locking
+   Format: dir:object:splits:max_key. Serialised by locking
    schema.conf itself via flock since this file is shared by all objects. */
 static int update_schema_conf_splits(const char *db_root, const char *object,
                                      int new_splits) {
@@ -3784,10 +3782,10 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
     int replaced = 0;
     while (fgets(line, sizeof(line), fin)) {
         if (strncmp(line, prefix, pfxlen) == 0 && !replaced) {
-            /* splits:max_key:prealloc_mb — keep max_key and prealloc, replace splits */
-            int cur_splits = 0, max_key = 0, prealloc = 0;
-            sscanf(line + pfxlen, "%d:%d:%d", &cur_splits, &max_key, &prealloc);
-            fprintf(fout, "%s%d:%d:%d\n", prefix, new_splits, max_key, prealloc);
+            /* splits:max_key — keep max_key, replace splits. */
+            int cur_splits = 0, max_key = 0;
+            sscanf(line + pfxlen, "%d:%d", &cur_splits, &max_key);
+            fprintf(fout, "%s%d:%d\n", prefix, new_splits, max_key);
             replaced = 1;
         } else {
             fputs(line, fout);
@@ -3938,7 +3936,7 @@ int rebuild_object(const char *db_root, const char *object,
             char npath[PATH_MAX];
             build_shard_filename(npath, sizeof(npath), new_data_dir, new_shard);
 
-            FcacheRead wh = ucache_get_write(npath, new_sch.slot_size, new_sch.prealloc_mb);
+            FcacheRead wh = ucache_get_write(npath, new_sch.slot_size);
             if (!wh.map) continue;
             uint8_t *map = wh.map;
             uint32_t new_slots = wh.slots_per_shard;
@@ -3953,8 +3951,8 @@ int rebuild_object(const char *db_root, const char *object,
             if (slot < 0) {
                 /* Need to grow this new shard — release, grow, retry. */
                 ucache_write_release(wh);
-                if (ucache_grow_shard(npath, new_sch.slot_size, new_sch.prealloc_mb) > 0) {
-                    wh = ucache_get_write(npath, new_sch.slot_size, new_sch.prealloc_mb);
+                if (ucache_grow_shard(npath, new_sch.slot_size) > 0) {
+                    wh = ucache_get_write(npath, new_sch.slot_size);
                     if (!wh.map) continue;
                     map = wh.map;
                     new_slots = wh.slots_per_shard;
@@ -4122,7 +4120,7 @@ typedef struct {
 
 static void *vacuum_worker(void *arg) {
     VacuumWork *vw = (VacuumWork *)arg;
-    FcacheRead wh = ucache_get_write(vw->path, 0, 0);
+    FcacheRead wh = ucache_get_write(vw->path, 0);
     if (!wh.map) return NULL;
     uint32_t slots = wh.slots_per_shard;
     if (wh.size < shard_zoneA_end(slots)) { ucache_write_release(wh); return NULL; }

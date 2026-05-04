@@ -589,13 +589,7 @@ Schema load_schema(const char *effective_root, const char *object) {
             s.splits = atoi(p);
             if (s.splits <= 0) s.splits = 64;
             char *p2 = strchr(p, ':');
-            if (p2) {
-                s.max_key = atoi(p2 + 1);
-                char *p3 = strchr(p2 + 1, ':');
-                if (p3) {
-                    s.prealloc_mb = atoi(p3 + 1);
-                }
-            }
+            if (p2) s.max_key = atoi(p2 + 1);
             break;
         }
     }

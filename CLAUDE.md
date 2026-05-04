@@ -53,7 +53,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 - `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).
 - `$DB_ROOT/allowed_ips.conf` — global trusted IPs (skip token check).
 - `$DB_ROOT/dirs.conf` — allowed tenant directories.
-- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key:max_value:prealloc_mb`.
+- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key`. `max_value` is derived from `fields.conf` (sum of typed-field byte lengths) and `slot_size = max_key + max_value` rounded up to 8.
 - `$DB_ROOT/<dir>/<obj>/fields.conf` — `name:type[:size|P,S][:default=...]`.
 
 ## Storage model (high-level)

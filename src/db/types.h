@@ -89,9 +89,9 @@ static inline int idx_shard_for_hash(const uint8_t hash16[16], int splits) {
 #define SHARD_VERSION    1u
 #define MAX_FIELDS  256
 
-/* Per-shard header at byte 0 of each shard file. Records growth state so
-   we can recover slots_per_shard after a restart without re-deriving it
-   from file size (which would break once prealloc_mb pads the tail). */
+/* Per-shard header at byte 0 of each shard file. Records slots_per_shard
+   so a restart picks up the current grown size directly from the header
+   instead of trying to derive it from file size. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;                  /* SHARD_MAGIC */
     uint32_t version;                /* SHARD_VERSION */
@@ -163,7 +163,6 @@ typedef struct {
     int max_key;
     int max_value;
     int slot_size;        /* = payload_size per slot (max_key + max_value), 8-aligned */
-    int prealloc_mb;
 } Schema;
 
 /* Shard file layout:
@@ -641,7 +640,7 @@ FcacheRead fcache_get_read(const char *path);
 void       fcache_release(FcacheRead h);
 /* Open (or create) a shard for writing. slot_size > 0 creates the file with
    INITIAL_SLOTS slots if missing; slot_size == 0 opens-only (fails if absent). */
-FcacheRead ucache_get_write(const char *path, int slot_size, int prealloc_mb);
+FcacheRead ucache_get_write(const char *path, int slot_size);
 void       ucache_write_release(FcacheRead h);
 /* Non-blocking hint to the kernel to start flushing this shard's dirty pages
    to disk. No-op on non-Linux. Intended for bulk-insert paths that would
@@ -654,17 +653,17 @@ void       ucache_nudge_writeback(int ucache_slot);
    already grew at/past target (no-op), -1 on error. Caller must NOT hold the
    entry wrlock. */
 int        ucache_grow_to(const char *path, uint32_t target_slots,
-                          int slot_size, int prealloc_mb);
+                          int slot_size);
 /* Double slots_per_shard for this shard: re-bucket live records into a new file,
    atomic rename, swap mapping. Thin wrapper over ucache_grow_to. Caller must
    NOT hold the entry wrlock. */
-int        ucache_grow_shard(const char *path, int slot_size, int prealloc_mb);
+int        ucache_grow_shard(const char *path, int slot_size);
 /* Post-insert threshold check — calls ucache_grow_shard if load >= 50%. */
-void       ucache_maybe_grow(int ucache_slot, int slot_size, int prealloc_mb);
+void       ucache_maybe_grow(int ucache_slot, int slot_size);
 /* Returns current slots_per_shard for the shard at `path`, opening it into
    the ucache if not already present. Returns 0 on error. Used by callers
    that want to make a sizing decision before kicking off worker writes. */
-uint32_t   ucache_peek_slots(const char *path, int slot_size, int prealloc_mb);
+uint32_t   ucache_peek_slots(const char *path, int slot_size);
 /* Sweep stale shard.new files after a crash during grow. Called at startup. */
 void       grow_recovery(const char *db_root);
 UCacheEntry *ucache_entry(int slot);
