@@ -2178,7 +2178,11 @@ static int validate_metadata(const char *db_root) {
         }
     }
 
-    /* Rules 1+2: walk filesystem, check each object dir. */
+    /* Rules 1+2: walk filesystem, check each object dir.
+       opendir() returns NULL with ENOTDIR for non-directories, so we skip
+       the explicit stat() pre-check (Coverity TOCTOU CID-1692480: between
+       stat-says-dir and opendir, a symlink swap could redirect to an
+       attacker-controlled path). The opendir result IS the type check. */
     DIR *root = opendir(db_root);
     if (!root) return errors;
     struct dirent *de;
@@ -2186,14 +2190,12 @@ static int validate_metadata(const char *db_root) {
         if (de->d_name[0] == '.') continue;
         char dir_path[PATH_MAX];
         snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, de->d_name);
-        struct stat dst;
-        if (stat(dir_path, &dst) != 0 || !S_ISDIR(dst.st_mode)) continue;
         /* Only treat as a tenant if listed in dirs.conf — skips any other
            top-level dirs an operator may have left at $DB_ROOT. */
         if (!is_valid_dir(de->d_name)) continue;
 
         DIR *dd = opendir(dir_path);
-        if (!dd) continue;
+        if (!dd) continue;  /* not a directory or unreadable — skip */
         struct dirent *oe;
         while ((oe = readdir(dd))) {
             if (oe->d_name[0] == '.') continue;

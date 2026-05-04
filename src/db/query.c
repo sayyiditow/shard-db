@@ -9925,27 +9925,29 @@ int cmd_restore(const char *db_root, const char *object,
     const char *subs[] = { "data", "indexes", "metadata" };
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
 
-    /* Refuse if any live subdir is non-empty, unless force=1. */
+    /* Refuse if any live subdir is non-empty, unless force=1.
+       opendir() returns NULL with ENOTDIR for non-dirs and ENOENT for
+       missing paths; both mean "not a populated dir we need to refuse",
+       so we skip the explicit stat() + S_ISDIR pre-check (TOCTOU between
+       stat-says-dir and opendir-actually-opens). */
     if (!force) {
         for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
             snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
-            if (stat(dst_sub, &st) == 0 && S_ISDIR(st.st_mode)) {
-                DIR *d = opendir(dst_sub);
-                if (d) {
-                    struct dirent *e; int empty = 1;
-                    while ((e = readdir(d))) {
-                        if (e->d_name[0] == '.' &&
-                            (e->d_name[1] == '\0' ||
-                             (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
-                        empty = 0; break;
-                    }
-                    closedir(d);
-                    if (!empty) {
-                        objlock_wrunlock(db_root, object);
-                        OUT("{\"error\":\"%s/ is not empty (use force=true to overwrite)\"}\n",
-                            subs[i]);
-                        return 1;
-                    }
+            DIR *d = opendir(dst_sub);
+            if (d) {
+                struct dirent *e; int empty = 1;
+                while ((e = readdir(d))) {
+                    if (e->d_name[0] == '.' &&
+                        (e->d_name[1] == '\0' ||
+                         (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                    empty = 0; break;
+                }
+                closedir(d);
+                if (!empty) {
+                    objlock_wrunlock(db_root, object);
+                    OUT("{\"error\":\"%s/ is not empty (use force=true to overwrite)\"}\n",
+                        subs[i]);
+                    return 1;
                 }
             }
         }
@@ -10033,6 +10035,15 @@ int cmd_restore(const char *db_root, const char *object,
     invalidate_idx_cache(object);
     invalidate_schema_caches(db_root, object);
     {
+        /* Walk indexes/<field>/ trees and drop btree cache entries for each
+           per-shard .idx file. opendir() distinguishes dir vs file-or-other
+           in one syscall (returns NULL with ENOTDIR for non-dirs), so we
+           skip the explicit stat() pre-check (Coverity TOCTOU CID-1692482:
+           between stat-says-dir and opendir, a symlink swap could redirect
+           to an attacker-controlled path). For paths where opendir fails,
+           call btree_cache_invalidate directly — the cache is keyed on
+           path strings with no file I/O, so a phantom path or non-regular
+           file at that location is harmless (the lookup just misses). */
         char idx_root[PATH_MAX];
         snprintf(idx_root, sizeof(idx_root), "%s/indexes", obj_dir);
         DIR *d = opendir(idx_root);
@@ -10042,21 +10053,19 @@ int cmd_restore(const char *db_root, const char *object,
                 if (e->d_name[0] == '.') continue;
                 char field_dir[PATH_MAX];
                 snprintf(field_dir, sizeof(field_dir), "%s/%s", idx_root, e->d_name);
-                struct stat fst;
-                if (stat(field_dir, &fst) != 0) continue;
-                if (S_ISDIR(fst.st_mode)) {
-                    DIR *sd = opendir(field_dir);
-                    if (sd) {
-                        struct dirent *se;
-                        while ((se = readdir(sd))) {
-                            if (se->d_name[0] == '.') continue;
-                            char sp[PATH_MAX];
-                            snprintf(sp, sizeof(sp), "%s/%s", field_dir, se->d_name);
-                            btree_cache_invalidate(sp);
-                        }
-                        closedir(sd);
+                DIR *sd = opendir(field_dir);
+                if (sd) {
+                    struct dirent *se;
+                    while ((se = readdir(sd))) {
+                        if (se->d_name[0] == '.') continue;
+                        char sp[PATH_MAX];
+                        snprintf(sp, sizeof(sp), "%s/%s", field_dir, se->d_name);
+                        btree_cache_invalidate(sp);
                     }
-                } else if (S_ISREG(fst.st_mode)) {
+                    closedir(sd);
+                } else {
+                    /* Non-dir at this path (legacy single-file layout, or
+                       a stray) — invalidate cache by direct path. */
                     btree_cache_invalidate(field_dir);
                 }
             }
