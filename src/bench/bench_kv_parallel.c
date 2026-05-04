@@ -23,11 +23,13 @@
 
 #define KEY_LEN  16
 #define VAL_LEN 100
-#define TOTAL   1000000
-#define CHUNK   200000
+#define DEFAULT_TOTAL   1000000
+#define DEFAULT_CHUNK    200000
 #define CONNS   5
 #define SPLITS  128
-#define NCHUNKS (TOTAL / CHUNK)
+/* TOTAL / CHUNK / NCHUNKS are now runtime-configurable via env vars
+   SHARD_BENCH_TOTAL and SHARD_BENCH_CHUNK; resolved at the top of
+   bench_kv_parallel_run(). NCHUNKS = TOTAL / CHUNK. */
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -218,26 +220,38 @@ static void *parallel_worker(void *vp)
     return NULL;
 }
 
-static void run_parallel(int port, const char *mode, int *chunk_memfds)
+static void run_parallel(int port, const char *mode, int *chunk_memfds, int nchunks)
 {
-    pthread_t   tids[NCHUNKS];
-    ParallelArg args[NCHUNKS];
+    pthread_t   *tids = malloc((size_t)nchunks * sizeof(pthread_t));
+    ParallelArg *args = malloc((size_t)nchunks * sizeof(ParallelArg));
+    if (!tids || !args) { free(tids); free(args); return; }
 
-    for (int i = 0; i < NCHUNKS; i++) {
+    for (int i = 0; i < nchunks; i++) {
         args[i].port  = port;
         args[i].memfd = chunk_memfds[i];
         args[i].mode  = mode;
         args[i].rc    = 0;
         pthread_create(&tids[i], NULL, parallel_worker, &args[i]);
     }
-    for (int i = 0; i < NCHUNKS; i++)
+    for (int i = 0; i < nchunks; i++)
         pthread_join(tids[i], NULL);
+    free(tids); free(args);
 }
 
 /* ---------------------------------------------------------------- main bench */
 
 static int bench_kv_parallel_run(void)
 {
+    /* Resolve TOTAL / CHUNK from env vars (defaults match the bash bench). */
+    const char *total_env = getenv("SHARD_BENCH_TOTAL");
+    const char *chunk_env = getenv("SHARD_BENCH_CHUNK");
+    int TOTAL = total_env ? atoi(total_env) : DEFAULT_TOTAL;
+    int CHUNK = chunk_env ? atoi(chunk_env) : DEFAULT_CHUNK;
+    if (TOTAL <= 0) TOTAL = DEFAULT_TOTAL;
+    if (CHUNK <= 0) CHUNK = DEFAULT_CHUNK;
+    if (CHUNK > TOTAL) CHUNK = TOTAL;
+    int NCHUNKS = (TOTAL + CHUNK - 1) / CHUNK;
+
     /* Spawn daemon. */
     TestEnv env = {0};
     if (test_env_start(&env) != 0) {
@@ -274,7 +288,13 @@ static int bench_kv_parallel_run(void)
     printf("Generating data blobs...\n");
     fflush(stdout);
 
-    int chunk_json[NCHUNKS], chunk_csv[NCHUNKS];
+    int *chunk_json = malloc((size_t)NCHUNKS * sizeof(int));
+    int *chunk_csv  = malloc((size_t)NCHUNKS * sizeof(int));
+    if (!chunk_json || !chunk_csv) {
+        fprintf(stderr, "bench-kv-parallel: OOM allocating chunk fd arrays\n");
+        free(chunk_json); free(chunk_csv);
+        tc_close(tc); test_env_stop(&env); return 1;
+    }
     for (int c = 0; c < NCHUNKS; c++) {
         int from = c * CHUNK;
         int to   = from + CHUNK;
@@ -352,7 +372,7 @@ static int bench_kv_parallel_run(void)
         fflush(stdout);
         reset_object(tc);
         t0 = bench_now_ns();
-        run_parallel(env.port, "json", chunk_json);
+        run_parallel(env.port, "json", chunk_json, NCHUNKS);
         t1 = bench_now_ns();
         printf("Test 2 parallel JSON %d conns × %d: wall=%.2fs  throughput=%.2f M/sec\n\n",
                NCHUNKS, CHUNK,
@@ -364,7 +384,7 @@ static int bench_kv_parallel_run(void)
         fflush(stdout);
         reset_object(tc);
         t0 = bench_now_ns();
-        run_parallel(env.port, "csv", chunk_csv);
+        run_parallel(env.port, "csv", chunk_csv, NCHUNKS);
         t1 = bench_now_ns();
         printf("Test 3 parallel CSV  %d conns × %d: wall=%.2fs  throughput=%.2f M/sec\n\n",
                NCHUNKS, CHUNK,
@@ -377,6 +397,7 @@ static int bench_kv_parallel_run(void)
         close(chunk_json[c]);
         close(chunk_csv[c]);
     }
+    free(chunk_json); free(chunk_csv);
 
     /* Shard-stats summary. */
     printf("--- shard-stats ---\n");
