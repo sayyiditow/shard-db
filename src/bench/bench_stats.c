@@ -18,6 +18,12 @@ static int cmp_u64(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+uint64_t bench_hist_p50_ns(BenchHist *h) {
+    if (!h || h->count == 0) return 0;
+    qsort(h->samples_ns, h->count, sizeof(uint64_t), cmp_u64);
+    return h->samples_ns[h->count / 2];
+}
+
 void bench_hist_report(BenchHist *h, const char *label, uint64_t total_wall_ns) {
     if (h->count == 0) {
         printf("%s: no samples\n", label);

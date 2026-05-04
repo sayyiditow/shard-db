@@ -29,6 +29,14 @@ void bench_table_section_begin(const char *name);
 /* Run one timed query and buffer the result for end-of-section flush. */
 void bench_table_run(TestClient *tc, const char *label, const char *json);
 
+/* Append a pre-computed timing as a row. Use for measurements that aren't
+   a single round-trip — bulk-insert with memfd setup, pipelined batches,
+   parallel-worker fan-out — so they share the same section's bar chart
+   and footer summary as the single-shot tc_request rows.
+   `us` is microseconds, `ok` is 1/0, `extra` is an optional trailing
+   column (e.g. "0.39 M/sec", "31 k op/s"); pass NULL to omit. */
+void bench_table_record(const char *label, long us, int ok, const char *extra);
+
 /* Flush the current section: emits header, all buffered rows aligned
    with a relative bar chart, and a footer with min/p50/max/total ms. */
 void bench_table_section_end(void);

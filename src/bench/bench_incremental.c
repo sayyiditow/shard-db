@@ -20,6 +20,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,8 +130,6 @@ static int run_strategy(const char *label, const char *ratio_value,
         &resp);
     free(resp); resp = NULL;
 
-    printf("\n=== STRATEGY: %s (SHARDKV_BULK_RATIO=%s) ===\n", label, ratio_value);
-
     /* Insert baseline. */
     {
         char *buf = NULL; size_t sz = 0;
@@ -145,11 +144,18 @@ static int run_strategy(const char *label, const char *ratio_value,
             "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), fd);
         uint64_t t0 = bench_now_ns();
         tc_request(tc, req, &resp);
-        uint64_t t1 = bench_now_ns();
-        printf("  baseline insert (%d): %.3fs resp=%s\n", BASELINE,
-               (double)(t1 - t0) / 1e9, resp ? resp : "(null)");
+        long us = (long)((bench_now_ns() - t0) / 1000);
         free(resp); resp = NULL;
         close(fd);
+
+        char title[128];
+        snprintf(title, sizeof(title),
+                 "STRATEGY %s (SHARDKV_BULK_RATIO=%s) — best-of-3 ms per batch",
+                 label, ratio_value);
+        bench_table_section_begin(title);
+        char extra[48];
+        snprintf(extra, sizeof(extra), "%d records", BASELINE);
+        bench_table_record("baseline insert", us, 1, extra);
     }
 
     /* Best-of-3 per batch size. */
@@ -197,8 +203,14 @@ static int run_strategy(const char *label, const char *ratio_value,
 
         free(ins_buf); free(del_buf);
         results[b] = best;
-        printf("    batch=%-7d %s best-of-3: %.3fs\n", N, label, best);
+
+        char lbl[48], extra[48];
+        snprintf(lbl, sizeof(lbl), "batch=%d", N);
+        snprintf(extra, sizeof(extra), "%.0f k/sec",
+                 (double)N / 1000.0 / best);
+        bench_table_record(lbl, (long)(best * 1e6), 1, extra);
     }
+    bench_table_section_end();
 
     tc_close(tc);
     test_env_stop(&env);

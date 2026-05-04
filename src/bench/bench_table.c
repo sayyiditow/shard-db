@@ -14,6 +14,7 @@ typedef struct {
     char  label[MAX_LABEL];
     long  us;                   /* microseconds — finer than ms for fast queries */
     char  snippet[MAX_SNIPPET];
+    char  extra[48];            /* optional trailing column (e.g. "0.39 M/sec") */
     int   ok;
 } BenchRow;
 
@@ -64,7 +65,15 @@ static void flush_section(void) {
         bar[w] = '\0';
 
         if (r->ok) {
-            printf("  %-*s %s  %-*s\n", MAX_LABEL - 4, r->label, ms_buf, BAR_WIDTH, bar);
+            if (r->extra[0]) {
+                /* Trailing column for throughput-style rows
+                   (bulk-insert "0.39 M/sec", batched-latency "31 k op/s"). */
+                printf("  %-*s %s  %-*s %s\n",
+                       MAX_LABEL - 4, r->label, ms_buf, BAR_WIDTH, bar, r->extra);
+            } else {
+                printf("  %-*s %s  %-*s\n",
+                       MAX_LABEL - 4, r->label, ms_buf, BAR_WIDTH, bar);
+            }
         } else {
             printf("  %-*s %s  ERR\n", MAX_LABEL - 4, r->label, ms_buf);
         }
@@ -107,6 +116,12 @@ void bench_table_section_begin(const char *name) {
 void bench_table_run(TestClient *tc, const char *label, const char *json) {
     if (g_n >= MAX_ROWS) return;
     BenchRow *r = &g_rows[g_n++];
+    /* Zero every field — the slot is reused across sections (g_n resets,
+       g_rows[] doesn't), and a stale `extra` from a prior throughput row
+       would otherwise bleed into a query row's trailing column. */
+    r->label[0] = '\0';
+    r->snippet[0] = '\0';
+    r->extra[0] = '\0';
     strncpy(r->label, label ? label : "", sizeof(r->label) - 1);
     r->label[sizeof(r->label) - 1] = '\0';
 
@@ -131,6 +146,22 @@ void bench_table_run(TestClient *tc, const char *label, const char *json) {
         free(resp);
     } else {
         r->snippet[0] = '\0';
+    }
+}
+
+void bench_table_record(const char *label, long us, int ok, const char *extra) {
+    if (g_n >= MAX_ROWS) return;
+    BenchRow *r = &g_rows[g_n++];
+    strncpy(r->label, label ? label : "", sizeof(r->label) - 1);
+    r->label[sizeof(r->label) - 1] = '\0';
+    r->us = us;
+    r->ok = ok;
+    r->snippet[0] = '\0';
+    if (extra && extra[0]) {
+        strncpy(r->extra, extra, sizeof(r->extra) - 1);
+        r->extra[sizeof(r->extra) - 1] = '\0';
+    } else {
+        r->extra[0] = '\0';
     }
 }
 

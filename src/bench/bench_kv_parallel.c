@@ -14,6 +14,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -335,61 +336,52 @@ static int bench_kv_parallel_run(void)
         int single_csv = make_memfd("kv-par-csv-single", buf, sz);
         free(buf);
 
-        uint64_t t0, t1;
+        long us_1a = 0, us_1b = 0, us_2 = 0, us_3 = 0;
 
         /* TEST 1a: single JSON */
-        printf("--- TEST 1a: single JSON, %d records ---\n", TOTAL);
-        fflush(stdout);
         reset_object(tc);
-        t0 = bench_now_ns();
-        do_bulk_insert(tc, "json", single_json);
-        t1 = bench_now_ns();
-        printf("Test 1a single JSON  %d rows: wall=%.2fs  throughput=%.2f M/sec\n\n",
-               TOTAL,
-               (double)(t1 - t0) / 1e9,
-               (double)TOTAL / 1e6 / ((double)(t1 - t0) / 1e9));
+        { uint64_t t0 = bench_now_ns();
+          do_bulk_insert(tc, "json", single_json);
+          us_1a = (long)((bench_now_ns() - t0) / 1000); }
         close(single_json);
 
         /* TEST 1b: single CSV */
-        printf("--- TEST 1b: single CSV, %d records ---\n", TOTAL);
-        fflush(stdout);
         reset_object(tc);
-        t0 = bench_now_ns();
-        do_bulk_insert(tc, "csv", single_csv);
-        t1 = bench_now_ns();
-        printf("Test 1b single CSV   %d rows: wall=%.2fs  throughput=%.2f M/sec\n\n",
-               TOTAL,
-               (double)(t1 - t0) / 1e9,
-               (double)TOTAL / 1e6 / ((double)(t1 - t0) / 1e9));
+        { uint64_t t0 = bench_now_ns();
+          do_bulk_insert(tc, "csv", single_csv);
+          us_1b = (long)((bench_now_ns() - t0) / 1000); }
         close(single_csv);
-    }
-
-    {
-        uint64_t t0, t1;
 
         /* TEST 2: parallel JSON */
-        printf("--- TEST 2: parallel JSON, %d conns × %d ---\n", NCHUNKS, CHUNK);
-        fflush(stdout);
         reset_object(tc);
-        t0 = bench_now_ns();
-        run_parallel(env.port, "json", chunk_json, NCHUNKS);
-        t1 = bench_now_ns();
-        printf("Test 2 parallel JSON %d conns × %d: wall=%.2fs  throughput=%.2f M/sec\n\n",
-               NCHUNKS, CHUNK,
-               (double)(t1 - t0) / 1e9,
-               (double)TOTAL / 1e6 / ((double)(t1 - t0) / 1e9));
+        { uint64_t t0 = bench_now_ns();
+          run_parallel(env.port, "json", chunk_json, NCHUNKS);
+          us_2 = (long)((bench_now_ns() - t0) / 1000); }
 
         /* TEST 3: parallel CSV */
-        printf("--- TEST 3: parallel CSV, %d conns × %d ---\n", NCHUNKS, CHUNK);
-        fflush(stdout);
         reset_object(tc);
-        t0 = bench_now_ns();
-        run_parallel(env.port, "csv", chunk_csv, NCHUNKS);
-        t1 = bench_now_ns();
-        printf("Test 3 parallel CSV  %d conns × %d: wall=%.2fs  throughput=%.2f M/sec\n\n",
-               NCHUNKS, CHUNK,
-               (double)(t1 - t0) / 1e9,
-               (double)TOTAL / 1e6 / ((double)(t1 - t0) / 1e9));
+        { uint64_t t0 = bench_now_ns();
+          run_parallel(env.port, "csv", chunk_csv, NCHUNKS);
+          us_3 = (long)((bench_now_ns() - t0) / 1000); }
+
+        char e1a[48], e1b[48], e2[48], e3[48], lbl2[64], lbl3[64];
+        snprintf(e1a, sizeof(e1a), "%.2f M rows/s",
+                 (double)TOTAL / 1e6 / ((double)us_1a / 1e6));
+        snprintf(e1b, sizeof(e1b), "%.2f M rows/s",
+                 (double)TOTAL / 1e6 / ((double)us_1b / 1e6));
+        snprintf(e2, sizeof(e2), "%.2f M rows/s",
+                 (double)TOTAL / 1e6 / ((double)us_2 / 1e6));
+        snprintf(e3, sizeof(e3), "%.2f M rows/s",
+                 (double)TOTAL / 1e6 / ((double)us_3 / 1e6));
+        snprintf(lbl2, sizeof(lbl2), "parallel JSON  %d conns × %d", NCHUNKS, CHUNK);
+        snprintf(lbl3, sizeof(lbl3), "parallel CSV   %d conns × %d", NCHUNKS, CHUNK);
+
+        bench_table_section_begin("BULK INSERT throughput (single vs parallel)");
+        bench_table_record("single JSON   1 file", us_1a, 1, e1a);
+        bench_table_record("single CSV    1 file", us_1b, 1, e1b);
+        bench_table_record(lbl2, us_2, 1, e2);
+        bench_table_record(lbl3, us_3, 1, e3);
+        bench_table_section_end();
     }
 
     /* Cleanup chunk memfds. */

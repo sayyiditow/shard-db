@@ -15,6 +15,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,27 +56,9 @@ static int make_memfd(const char *name, const char *data, size_t size) {
     return fd;
 }
 
+/* Wrapper preserved as a thin alias so call sites stay readable. */
 static void run_one(TestClient *tc, const char *label, const char *json) {
-    uint64_t t0 = bench_now_ns();
-    char *resp = NULL;
-    int rc = tc_request(tc, json, &resp);
-    uint64_t t1 = bench_now_ns();
-    long ms = (long)((t1 - t0) / 1000000ULL);
-    char short_buf[160];
-    if (rc == 0 && resp) {
-        size_t len = strlen(resp);
-        size_t copy = len > 140 ? 140 : len;
-        memcpy(short_buf, resp, copy);
-        short_buf[copy] = '\0';
-        if (len > 140) {
-            short_buf[140] = '.'; short_buf[141] = '.';
-            short_buf[142] = '.'; short_buf[143] = '\0';
-        }
-    } else {
-        strcpy(short_buf, "(no response)");
-    }
-    printf("  %-58s %6ldms  %s\n", label, ms, short_buf);
-    free(resp);
+    bench_table_run(tc, label, json);
 }
 
 /* ----- Minimal users dataset: just enough to make the join projection
@@ -280,7 +263,7 @@ static int bench_joins_run(void) {
     }
 
     /* ==================== BASELINE ==================== */
-    printf("--- BASELINE (no join) ---\n");
+    bench_table_section_begin("BASELINE (no join)");
     run_one(tc, "count orders (total)",
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"orders\"}");
     run_one(tc, "count status=paid (indexed)",
@@ -295,7 +278,7 @@ static int bench_joins_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"amount\",\"op\":\"gt\",\"value\":\"4000\"}],\"limit\":10}");
 
     /* ==================== INNER JOIN by KEY ==================== */
-    printf("\n--- INNER join orders → users by KEY (hash lookup) ---\n");
+    bench_table_section_begin("INNER join orders → users by KEY (hash lookup)");
     run_one(tc, "inner limit=10 (paid)",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"fields\":[\"username\",\"email\"]}],\"limit\":10}");
     run_one(tc, "inner limit=100",
@@ -308,7 +291,7 @@ static int bench_joins_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"fields\":[\"username\",\"email\"]}]}");
 
     /* ==================== LEFT JOIN by KEY ==================== */
-    printf("\n--- LEFT join orders → users by KEY ---\n");
+    bench_table_section_begin("LEFT join orders → users by KEY");
     run_one(tc, "left limit=10",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"type\":\"left\",\"fields\":[\"username\",\"email\"]}],\"limit\":10}");
     run_one(tc, "left limit=1000",
@@ -317,23 +300,24 @@ static int bench_joins_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"type\":\"left\",\"fields\":[\"username\",\"email\"]}],\"limit\":10000}");
 
     /* ==================== INDEXED-FIELD JOIN ==================== */
-    printf("\n--- INNER join on INDEXED field (users.username) ---\n");
+    bench_table_section_begin("INNER join on INDEXED field (users.username)");
     run_one(tc, "idx-join limit=10",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"username\",\"as\":\"u\",\"fields\":[\"email\"]}],\"limit\":10}");
     run_one(tc, "idx-join limit=100",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"username\",\"as\":\"u\",\"fields\":[\"email\"]}],\"limit\":100}");
 
     /* ==================== MULTI-JOIN ==================== */
-    printf("\n--- MULTI-JOIN (two keyed joins) ---\n");
+    bench_table_section_begin("MULTI-JOIN (two keyed joins)");
     run_one(tc, "double-inner limit=100",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"fields\":[\"username\"]},{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u2\",\"fields\":[\"email\"]}],\"limit\":100}");
     run_one(tc, "double-inner limit=1000",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"fields\":[\"username\"]},{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u2\",\"fields\":[\"email\"]}],\"limit\":1000}");
 
     /* ==================== JOIN + PROJECTION ==================== */
-    printf("\n--- JOIN + driver projection (fewer columns) ---\n");
+    bench_table_section_begin("JOIN + driver projection (fewer columns)");
     run_one(tc, "inner w/projection limit=1000",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"orders\",\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],\"fields\":[\"order_num\",\"amount\"],\"join\":[{\"object\":\"users\",\"local\":\"user_id\",\"remote\":\"key\",\"as\":\"u\",\"fields\":[\"username\"]}],\"limit\":1000}");
+    bench_table_section_end();
 
     printf("\n======================================\n");
     printf("  Join bench complete\n");

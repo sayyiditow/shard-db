@@ -12,6 +12,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include "bench_invoice_schema.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -281,32 +282,27 @@ static int bench_invoice_run(void)
     json_buf[json_size]   = '\0';
     printf("  JSON blob: %.1f MB\n\n", (double)json_size / 1048576.0);
 
-    /* ---- 3. BULK INSERT (no indexes) ----------------------------------- */
-    printf("--- BULK INSERT (%d records, no index) ---\n", COUNT);
-    fflush(stdout);
+    /* ---- 3. BULK INSERT (no indexes) — captured into table below ------- */
+    long bulk_no_idx_us = 0;
     {
         uint64_t t0 = bench_now_ns();
         resp = bulk_insert_memfd(tc, json_buf, json_size);
-        uint64_t elapsed = bench_now_ns() - t0;
-        double ms  = (double)elapsed / 1e6;
-        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
-        printf("BULK INSERT (no idx): rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
-               COUNT, ms, mps);
-        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+        bulk_no_idx_us = (long)((bench_now_ns() - t0) / 1000);
+        free(resp); resp = NULL;
     }
 
-    /* size check */
+    /* size check (informational) */
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"bench\"}", &resp);
-    printf("SIZE: %s\n\n", resp ? resp : "(err)");
+    printf("SIZE after no-idx insert: %s\n\n", resp ? resp : "(err)");
     free(resp); resp = NULL;
 
-    /* ---- 4. GET x1000 pipelined ---------------------------------------- */
+    /* ---- 4. GET x1000 pipelined --------------------------------------- */
+    long get_total_us = 0; uint64_t get_p50 = 0;
     {
         const int N = 1000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char key[16];
@@ -320,18 +316,18 @@ static int bench_invoice_run(void)
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "GET x1000 pipelined", bench_now_ns() - wall_start);
-        printf("\n");
+        get_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        get_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
     /* ---- 5. EXISTS x1000 pipelined ------------------------------------- */
+    long exists_total_us = 0; uint64_t exists_p50 = 0;
     {
         const int N = 1000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char key[16];
@@ -345,35 +341,30 @@ static int bench_invoice_run(void)
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "EXISTS x1000 pipelined", bench_now_ns() - wall_start);
-        printf("\n");
+        exists_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        exists_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
     /* ---- 6. ADD INDEXES (14 indexes) ----------------------------------- */
-    printf("--- ADD INDEXES (14 indexes, single-pass) ---\n");
-    fflush(stdout);
+    long add_idx_us = 0;
     {
         uint64_t t0 = bench_now_ns();
         tc_request(tc,
             "{\"mode\":\"add-index\",\"dir\":\"default\",\"object\":\"bench\","
             "\"fields\":[" INVOICE_INDEX_FIELDS "]}",
             &resp);
-        uint64_t elapsed = bench_now_ns() - t0;
-        printf("ADD INDEXES: wall=%.0fms\n", (double)elapsed / 1e6);
-        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+        add_idx_us = (long)((bench_now_ns() - t0) / 1000);
+        free(resp); resp = NULL;
     }
-    printf("\n");
 
     /* ---- 7. INDEXED SEARCH x100 (supplierId) --------------------------- */
-    printf("--- INDEXED SEARCH x100 supplierId (pipelined) ---\n");
-    fflush(stdout);
+    long idx_search_total_us = 0; uint64_t idx_search_p50 = 0;
     {
         const int N = 100;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char supplier[48];
@@ -389,195 +380,185 @@ static int bench_invoice_run(void)
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "INDEXED SEARCH x100 supplierId",
-                          bench_now_ns() - wall_start);
-        printf("\n");
+        idx_search_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        idx_search_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 8. BULK INSERT with indexes ------------------------------------ */
-    printf("--- BULK INSERT (%d records, 14 indexes) ---\n", COUNT);
-    fflush(stdout);
-
+    /* ---- 8. BULK INSERT with indexes — captured into table below ------- */
     /* Truncate first */
     tc_request(tc, "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"bench\"}",
                &resp);
     free(resp); resp = NULL;
 
+    long bulk_idx_us = 0;
     {
         uint64_t t0 = bench_now_ns();
         resp = bulk_insert_memfd(tc, json_buf, json_size);
-        uint64_t elapsed = bench_now_ns() - t0;
-        double ms  = (double)elapsed / 1e6;
-        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
-        printf("BULK INSERT (14 idx): rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
-               COUNT, ms, mps);
-        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+        bulk_idx_us = (long)((bench_now_ns() - t0) / 1000);
+        free(resp); resp = NULL;
     }
 
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"bench\"}", &resp);
-    printf("SIZE: %s\n\n", resp ? resp : "(err)");
+    printf("SIZE after 14-idx insert: %s\n\n", resp ? resp : "(err)");
     free(resp); resp = NULL;
+
+    /* ---- BULK INSERT throughput — table view --------------------------- */
+    {
+        char extra1[48], extra2[48];
+        snprintf(extra1, sizeof(extra1), "%.2f M rows/s",
+                 (double)COUNT / 1e6 / ((double)bulk_no_idx_us / 1e6));
+        snprintf(extra2, sizeof(extra2), "%.2f M rows/s",
+                 (double)COUNT / 1e6 / ((double)bulk_idx_us / 1e6));
+        bench_table_section_begin("BULK INSERT (1M invoice records, single-conn JSON)");
+        bench_table_record("no indexes", bulk_no_idx_us, 1, extra1);
+        bench_table_record("14 indexes (4 composite)", bulk_idx_us, 1, extra2);
+        bench_table_section_end();
+    }
+
+    /* ---- READ + WRITE latency (pipelined) — table view ----------------- */
+    {
+        char e_get[48], e_exists[48], e_idx[48];
+        snprintf(e_get, sizeof(e_get), "p50=%.0fµs  %.0f k op/s",
+                 (double)get_p50 / 1000.0,
+                 1e3 / (double)((double)get_total_us / 1000.0));
+        snprintf(e_exists, sizeof(e_exists), "p50=%.0fµs  %.0f k op/s",
+                 (double)exists_p50 / 1000.0,
+                 1e3 / (double)((double)exists_total_us / 1000.0));
+        snprintf(e_idx, sizeof(e_idx), "p50=%.0fµs  %.1f k op/s",
+                 (double)idx_search_p50 / 1000.0,
+                 100.0 / ((double)idx_search_total_us / 1e6) / 1000.0);
+        bench_table_section_begin("READ latency (pipelined batches)");
+        bench_table_record("GET x1000 (random keys)", get_total_us, 1, e_get);
+        bench_table_record("EXISTS x1000 (random keys)", exists_total_us, 1, e_exists);
+        bench_table_record("INDEXED FIND x100 (supplierId)", idx_search_total_us, 1, e_idx);
+        bench_table_section_end();
+    }
+
+    /* ---- ADD INDEXES wall — single-row section ------------------------- */
+    bench_table_section_begin("Schema ops");
+    {
+        char extra[48];
+        snprintf(extra, sizeof(extra), "14 fields, single-pass build");
+        bench_table_record("ADD INDEXES (post-load build)", add_idx_us, 1, extra);
+    }
+    bench_table_section_end();
 
     /* JSON blob no longer needed. */
     free(json_buf); json_buf = NULL;
 
-    /* ---- 9. FIND query battery (13 queries) ----------------------------- */
-    printf("--- FIND query battery ---\n\n");
-
-    /* Helper macro: single-shot timed request */
-#define TIMED_FIND(label, req_json) do { \
-        printf("--- FIND: %s ---\n", label); \
-        fflush(stdout); \
-        uint64_t _t0 = bench_now_ns(); \
-        tc_request(tc, req_json, &resp); \
-        uint64_t _el = bench_now_ns() - _t0; \
-        printf("  wall=%.0fms  resp=%.80s\n\n", (double)_el / 1e6, resp ? resp : "(err)"); \
-        free(resp); resp = NULL; \
-    } while (0)
-
-    /* Supplier ID for eq queries — use pool entry 0 */
-    char sup0[48];
-    make_supplier_id(0, sup0);
-    char buyer0[48];
-    make_buyer_id(0, buyer0);
-
-    /* 1. eq indexed supplierId, ~10K matches */
+    /* ---- 9. FIND query battery (13 queries) — table view --------------- */
     {
-        char req[512];
-        snprintf(req, sizeof(req),
+        /* Supplier/buyer IDs for eq queries — pool entry 0 */
+        char sup0[48];   make_supplier_id(0, sup0);
+        char buyer0[48]; make_buyer_id(0, buyer0);
+
+        bench_table_section_begin("FIND battery (limit=10)");
+
+        char req_sup[512];
+        snprintf(req_sup, sizeof(req_sup),
             "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
             "\"criteria\":[{\"field\":\"supplierId\",\"op\":\"eq\",\"value\":\"%s\"}],"
             "\"limit\":10}", sup0);
-        TIMED_FIND("eq (indexed supplierId, ~10K matches)", req);
-    }
+        bench_table_run(tc, "eq supplierId (~10K matches)", req_sup);
 
-    /* 2. eq indexed buyerId, ~2K matches */
-    {
-        char req[512];
-        snprintf(req, sizeof(req),
+        char req_buy[512];
+        snprintf(req_buy, sizeof(req_buy),
             "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
             "\"criteria\":[{\"field\":\"buyerId\",\"op\":\"eq\",\"value\":\"%s\"}],"
             "\"limit\":10}", buyer0);
-        TIMED_FIND("eq (indexed buyerId, ~2K matches)", req);
+        bench_table_run(tc, "eq buyerId (~2K matches)", req_buy);
+
+        bench_table_run(tc, "contains number (idx leaf scan)",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"number\",\"op\":\"contains\",\"value\":\"00050\"}],"
+            "\"limit\":10}");
+
+        bench_table_run(tc, "contains batchNumber (idx leaf scan)",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"batchNumber\",\"op\":\"contains\",\"value\":\"BATCH-05\"}],"
+            "\"limit\":10}");
+
+        bench_table_run(tc, "IN indexed (2 statuses)",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"status\",\"op\":\"in\",\"value\":[\"APPROVED\",\"PENDING\"]}],"
+            "\"limit\":10}");
+
+        bench_table_run(tc, "indexed status + non-idx currency",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":["
+            "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
+            "{\"field\":\"currencyCode\",\"op\":\"eq\",\"value\":\"MYR\"}"
+            "],\"limit\":10}");
+
+        bench_table_run(tc, "indexed status + amount range",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":["
+            "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
+            "{\"field\":\"totalIncludingTax\",\"op\":\"gte\",\"value\":\"10000\"}"
+            "],\"limit\":10}");
+
+        bench_table_run(tc, "composite status+invoiceDate starts",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"status+invoiceDate\",\"op\":\"starts\","
+            "\"value\":\"APPROVED2024\"}],\"limit\":10}");
+
+        bench_table_run(tc, "composite status+source eq",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"status+source\",\"op\":\"eq\","
+            "\"value\":\"APPROVEDAPI\"}],\"limit\":10}");
+
+        bench_table_run(tc, "composite irbmStatus+pdfSent eq",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"field\":\"irbmStatus+pdfSent\",\"op\":\"eq\","
+            "\"value\":\"VALIDtrue\"}],\"limit\":10}");
+
+        bench_table_run(tc, "RANGE invoiceDate (gte+lte)",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":["
+            "{\"field\":\"invoiceDate\",\"op\":\"gte\",\"value\":\"20240101000000\"},"
+            "{\"field\":\"invoiceDate\",\"op\":\"lte\",\"value\":\"20240201000000\"}"
+            "],\"limit\":10}");
+
+        bench_table_run(tc, "RANGE createdAt (gte+lte)",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":["
+            "{\"field\":\"createdAt\",\"op\":\"gte\",\"value\":\"20240101000000\"},"
+            "{\"field\":\"createdAt\",\"op\":\"lte\",\"value\":\"20240115000000\"}"
+            "],\"limit\":10}");
+
+        bench_table_run(tc, "OR: two indexed statuses",
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"criteria\":[{\"or\":["
+            "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
+            "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"PENDING\"}"
+            "]}],\"limit\":10}");
+        bench_table_section_end();
     }
 
-    /* 3. contains number (indexed leaf scan) */
-    TIMED_FIND("contains number (indexed leaf scan)",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"number\",\"op\":\"contains\",\"value\":\"00050\"}],"
-        "\"limit\":10}");
-
-    /* 4. contains batchNumber (indexed leaf scan) */
-    TIMED_FIND("contains batchNumber (indexed leaf scan)",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"batchNumber\",\"op\":\"contains\",\"value\":\"BATCH-05\"}],"
-        "\"limit\":10}");
-
-    /* 5. IN indexed (2 statuses) */
-    TIMED_FIND("IN indexed (2 statuses)",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"status\",\"op\":\"in\",\"value\":[\"APPROVED\",\"PENDING\"]}],"
-        "\"limit\":10}");
-
-    /* 6. indexed status + non-indexed currency */
-    TIMED_FIND("indexed status + non-indexed currency",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":["
-        "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
-        "{\"field\":\"currencyCode\",\"op\":\"eq\",\"value\":\"MYR\"}"
-        "],\"limit\":10}");
-
-    /* 7. indexed status + amount range */
-    TIMED_FIND("indexed status + amount range",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":["
-        "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
-        "{\"field\":\"totalIncludingTax\",\"op\":\"gte\",\"value\":\"10000\"}"
-        "],\"limit\":10}");
-
-    /* 8. composite status+invoiceDate starts */
-    TIMED_FIND("composite status+invoiceDate starts",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"status+invoiceDate\",\"op\":\"starts\","
-        "\"value\":\"APPROVED2024\"}],\"limit\":10}");
-
-    /* 9. composite status+source eq */
-    TIMED_FIND("composite status+source eq",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"status+source\",\"op\":\"eq\","
-        "\"value\":\"APPROVEDAPI\"}],\"limit\":10}");
-
-    /* 10. composite irbmStatus+pdfSent eq */
-    TIMED_FIND("composite irbmStatus+pdfSent eq",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"field\":\"irbmStatus+pdfSent\",\"op\":\"eq\","
-        "\"value\":\"VALIDtrue\"}],\"limit\":10}");
-
-    /* 11. RANGE indexed invoiceDate */
-    TIMED_FIND("RANGE indexed invoiceDate (gte+lte)",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":["
-        "{\"field\":\"invoiceDate\",\"op\":\"gte\",\"value\":\"20240101000000\"},"
-        "{\"field\":\"invoiceDate\",\"op\":\"lte\",\"value\":\"20240201000000\"}"
-        "],\"limit\":10}");
-
-    /* 12. RANGE indexed createdAt */
-    TIMED_FIND("RANGE indexed createdAt (gte+lte)",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":["
-        "{\"field\":\"createdAt\",\"op\":\"gte\",\"value\":\"20240101000000\"},"
-        "{\"field\":\"createdAt\",\"op\":\"lte\",\"value\":\"20240115000000\"}"
-        "],\"limit\":10}");
-
-    /* 13. OR: two status values */
-    TIMED_FIND("OR: two indexed statuses",
-        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"criteria\":[{\"or\":["
-        "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"APPROVED\"},"
-        "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"PENDING\"}"
-        "]}],\"limit\":10}");
-
-#undef TIMED_FIND
-
-    /* ---- 10. FETCH / KEYS ---------------------------------------------- */
-    printf("--- FETCH / KEYS ---\n\n");
-
-#define TIMED_Q(label, req_json) do { \
-        printf("--- %s ---\n", label); \
-        fflush(stdout); \
-        uint64_t _t0 = bench_now_ns(); \
-        tc_request(tc, req_json, &resp); \
-        uint64_t _el = bench_now_ns() - _t0; \
-        printf("  wall=%.0fms\n\n", (double)_el / 1e6); \
-        free(resp); resp = NULL; \
-    } while (0)
-
-    TIMED_Q("FETCH: page of 100, offset 5000",
+    /* ---- 10. FETCH / KEYS / COUNT — table view ------------------------- */
+    bench_table_section_begin("FETCH / KEYS / COUNT");
+    bench_table_run(tc, "FETCH page=100 offset=5000",
         "{\"mode\":\"fetch\",\"dir\":\"default\",\"object\":\"bench\","
         "\"offset\":\"5000\",\"limit\":\"100\"}");
-
-    TIMED_Q("FETCH: with projection",
+    bench_table_run(tc, "FETCH page=100 with projection",
         "{\"mode\":\"fetch\",\"dir\":\"default\",\"object\":\"bench\","
         "\"offset\":\"0\",\"limit\":\"100\","
         "\"fields\":[\"number\",\"status\",\"totalIncludingTax\",\"supplierId\"]}");
-
-    TIMED_Q("KEYS: first 100",
+    bench_table_run(tc, "KEYS first 100",
         "{\"mode\":\"keys\",\"dir\":\"default\",\"object\":\"bench\","
         "\"offset\":\"0\",\"limit\":\"100\"}");
-
-    TIMED_Q("COUNT (full object)",
+    bench_table_run(tc, "COUNT full object",
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"bench\"}");
+    bench_table_section_end();
 
-#undef TIMED_Q
-
-    /* ---- 11. SINGLE DELETE x1000 --------------------------------------- */
+    /* ---- 11. SINGLE DELETE x1000 — captured into Maintenance section -- */
+    long single_del_total_us = 0; uint64_t single_del_p50 = 0;
     {
         const int N = 1000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char key[16];
@@ -591,17 +572,15 @@ static int bench_invoice_run(void)
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "SINGLE DELETE x1000 (14 indexes)",
-                          bench_now_ns() - wall_start);
-        printf("\n");
+        single_del_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        single_del_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 12. BULK DELETE x1000 ---------------------------------------- */
-    printf("--- BULK DELETE x1000 (inline JSON, 14 indexes) ---\n");
-    fflush(stdout);
+    /* ---- 12-14. BULK DELETE / VACUUM / RECOUNT + SINGLE DELETE summary -- */
     {
-        /* Build key array: ["INV-NNN",...] — 1000 random keys */
+        /* Build a 1000-key array request once so the table row is a clean
+           single-shot timing. Random keys from the surviving population. */
         size_t kbuf_cap = (size_t)1000 * 20 + 8;
         char  *kbuf     = malloc(kbuf_cap);
         if (!kbuf) {
@@ -621,7 +600,6 @@ static int bench_invoice_run(void)
         kbuf[kpos++] = ']';
         kbuf[kpos]   = '\0';
 
-        /* Build request */
         size_t req_cap = kpos + 128;
         char  *req     = malloc(req_cap);
         if (!req) { free(kbuf); tc_close(tc); test_env_stop(&env); return 1; }
@@ -630,40 +608,22 @@ static int bench_invoice_run(void)
                  "\"keys\":%s}", kbuf);
         free(kbuf);
 
-        uint64_t t0 = bench_now_ns();
-        tc_request(tc, req, &resp);
-        uint64_t elapsed = bench_now_ns() - t0;
+        bench_table_section_begin("Maintenance ops");
+        {
+            char extra[48];
+            snprintf(extra, sizeof(extra), "p50=%.0fµs  %.1f k op/s",
+                     (double)single_del_p50 / 1000.0,
+                     1000.0 / ((double)single_del_total_us / 1e6) / 1000.0);
+            bench_table_record("SINGLE DELETE x1000 (14 idx)",
+                               single_del_total_us, 1, extra);
+        }
+        bench_table_run(tc, "BULK DELETE 1000 keys (14 idx)", req);
         free(req);
-        printf("BULK DELETE 1000: wall=%.0fms  resp=%.80s\n\n",
-               (double)elapsed / 1e6, resp ? resp : "(err)");
-        free(resp); resp = NULL;
-    }
-
-    /* ---- 13. VACUUM ------------------------------------------------------- */
-    printf("--- VACUUM ---\n");
-    fflush(stdout);
-    {
-        uint64_t t0 = bench_now_ns();
-        tc_request(tc,
-            "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"bench\"}",
-            &resp);
-        uint64_t elapsed = bench_now_ns() - t0;
-        printf("VACUUM: wall=%.0fms\n\n", (double)elapsed / 1e6);
-        free(resp); resp = NULL;
-    }
-
-    /* ---- 14. RECOUNT ------------------------------------------------------ */
-    printf("--- RECOUNT ---\n");
-    fflush(stdout);
-    {
-        uint64_t t0 = bench_now_ns();
-        tc_request(tc,
-            "{\"mode\":\"recount\",\"dir\":\"default\",\"object\":\"bench\"}",
-            &resp);
-        uint64_t elapsed = bench_now_ns() - t0;
-        printf("RECOUNT: wall=%.0fms  resp=%.80s\n\n",
-               (double)elapsed / 1e6, resp ? resp : "(err)");
-        free(resp); resp = NULL;
+        bench_table_run(tc, "VACUUM",
+            "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"bench\"}");
+        bench_table_run(tc, "RECOUNT",
+            "{\"mode\":\"recount\",\"dir\":\"default\",\"object\":\"bench\"}");
+        bench_table_section_end();
     }
 
     /* ---- 15. DISK USAGE --------------------------------------------------- */

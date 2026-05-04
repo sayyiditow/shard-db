@@ -32,4 +32,9 @@ static inline void bench_hist_add(BenchHist *h, uint64_t ns) {
 */
 void bench_hist_report(BenchHist *h, const char *label, uint64_t total_wall_ns);
 
+/* Sort samples and return the median latency in nanoseconds. Use when you
+   want the p50 separately (e.g., to feed into a bench_table_record extra
+   column) without printing a histogram line. */
+uint64_t bench_hist_p50_ns(BenchHist *h);
+
 #endif

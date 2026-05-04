@@ -15,6 +15,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include "bench_invoice_schema.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -530,128 +531,106 @@ static int bench_parallel_run(void)
     }
 
     int chunk_json[NCHUNKS], chunk_csv[NCHUNKS];
-    /* Will be built fresh before each parallel test that uses them. */
     for (int i = 0; i < NCHUNKS; i++) chunk_json[i] = chunk_csv[i] = -1;
 
-    uint64_t t0, t1;
+    long us_1a = 0, us_1b = 0, us_2 = 0, us_3 = 0, us_4 = 0, us_5 = 0;
+    long us_1a_idx = 0, us_1b_idx = 0, us_2_idx = 0, us_4_idx = 0;
 
-    /* ---- TEST 1a: Single JSON, no idx, then add-14-indexes. ---- */
-    printf("--- TEST 1a: single JSON %d records, no indexes ---\n", TOTAL);
-    fflush(stdout);
+    /* TEST 1a: single JSON, no idx, then add-14-indexes. */
     recreate_object(tc, 0);
-    t0 = bench_now_ns();
-    do_bulk_insert_json(tc, single_json_fd);
-    t1 = bench_now_ns();
-    printf("Test 1a single JSON %d: wall=%.2fs  %.2f k/sec\n",
-           TOTAL, (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
+    { uint64_t t0 = bench_now_ns();
+      do_bulk_insert_json(tc, single_json_fd);
+      us_1a = (long)((bench_now_ns() - t0) / 1000); }
+    { uint64_t t0 = bench_now_ns();
+      add_all_indexes(tc);
+      us_1a_idx = (long)((bench_now_ns() - t0) / 1000); }
 
-    t0 = bench_now_ns();
-    add_all_indexes(tc);
-    t1 = bench_now_ns();
-    printf("        add-14-indexes:   wall=%.2fs\n\n", (double)(t1-t0)/1e9);
-    fflush(stdout);
-
-    /* ---- TEST 1b: Single CSV, no idx, then add-14-indexes. ---- */
-    printf("--- TEST 1b: single CSV  %d records, no indexes ---\n", TOTAL);
-    fflush(stdout);
+    /* TEST 1b: single CSV, no idx, then add-14-indexes. */
     recreate_object(tc, 0);
-    /* Rewind the single CSV fd for reuse. */
     lseek(single_csv_fd, 0, SEEK_SET);
-    t0 = bench_now_ns();
-    do_bulk_insert_csv(tc, single_csv_fd);
-    t1 = bench_now_ns();
-    printf("Test 1b single CSV  %d: wall=%.2fs  %.2f k/sec\n",
-           TOTAL, (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
+    { uint64_t t0 = bench_now_ns();
+      do_bulk_insert_csv(tc, single_csv_fd);
+      us_1b = (long)((bench_now_ns() - t0) / 1000); }
+    { uint64_t t0 = bench_now_ns();
+      add_all_indexes(tc);
+      us_1b_idx = (long)((bench_now_ns() - t0) / 1000); }
 
-    t0 = bench_now_ns();
-    add_all_indexes(tc);
-    t1 = bench_now_ns();
-    printf("        add-14-indexes:   wall=%.2fs\n\n", (double)(t1-t0)/1e9);
-    fflush(stdout);
-
-    /* ---- TEST 2: Parallel JSON, no idx, then add-14-indexes. ---- */
-    printf("--- TEST 2: parallel JSON 5×200K, no indexes ---\n");
-    fflush(stdout);
+    /* TEST 2: parallel JSON 5×200K, no idx, then add-14-indexes. */
     recreate_object(tc, 0);
     if (build_json_memfds(chunk_json) != 0) {
         close(single_json_fd); close(single_csv_fd);
         tc_close(tc); test_env_stop(&env); return 1;
     }
-    t0 = bench_now_ns();
-    run_parallel(env.port, 0, chunk_json);
-    t1 = bench_now_ns();
+    { uint64_t t0 = bench_now_ns();
+      run_parallel(env.port, 0, chunk_json);
+      us_2 = (long)((bench_now_ns() - t0) / 1000); }
     close_fds(chunk_json, NCHUNKS);
-    printf("Test 2 parallel JSON 5×200K no-idx: wall=%.2fs  %.2f k/sec\n",
-           (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
+    { uint64_t t0 = bench_now_ns();
+      add_all_indexes(tc);
+      us_2_idx = (long)((bench_now_ns() - t0) / 1000); }
 
-    t0 = bench_now_ns();
-    add_all_indexes(tc);
-    t1 = bench_now_ns();
-    printf("        add-14-indexes:   wall=%.2fs\n\n", (double)(t1-t0)/1e9);
-    fflush(stdout);
-
-    /* ---- TEST 3: Parallel JSON with pre-existing indexes. ---- */
-    printf("--- TEST 3: parallel JSON 5×200K, WITH 14 pre-existing indexes ---\n");
-    fflush(stdout);
+    /* TEST 3: parallel JSON 5×200K, WITH 14 pre-existing indexes. */
     recreate_object(tc, 1);
     if (build_json_memfds(chunk_json) != 0) {
         close(single_json_fd); close(single_csv_fd);
         tc_close(tc); test_env_stop(&env); return 1;
     }
-    t0 = bench_now_ns();
-    run_parallel(env.port, 0, chunk_json);
-    t1 = bench_now_ns();
+    { uint64_t t0 = bench_now_ns();
+      run_parallel(env.port, 0, chunk_json);
+      us_3 = (long)((bench_now_ns() - t0) / 1000); }
     close_fds(chunk_json, NCHUNKS);
-    printf("Test 3 parallel JSON 5×200K w/ 14 idx: wall=%.2fs  %.2f k/sec\n\n",
-           (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
 
-    /* ---- TEST 4: Parallel CSV, no idx, then add-14-indexes. ---- */
-    printf("--- TEST 4: parallel CSV 5×200K, no indexes ---\n");
-    fflush(stdout);
+    /* TEST 4: parallel CSV 5×200K, no idx, then add-14-indexes. */
     recreate_object(tc, 0);
     if (build_csv_memfds(chunk_csv) != 0) {
         close(single_json_fd); close(single_csv_fd);
         tc_close(tc); test_env_stop(&env); return 1;
     }
-    t0 = bench_now_ns();
-    run_parallel(env.port, 1, chunk_csv);
-    t1 = bench_now_ns();
+    { uint64_t t0 = bench_now_ns();
+      run_parallel(env.port, 1, chunk_csv);
+      us_4 = (long)((bench_now_ns() - t0) / 1000); }
     close_fds(chunk_csv, NCHUNKS);
-    printf("Test 4 parallel CSV 5×200K no-idx: wall=%.2fs  %.2f k/sec\n",
-           (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
+    { uint64_t t0 = bench_now_ns();
+      add_all_indexes(tc);
+      us_4_idx = (long)((bench_now_ns() - t0) / 1000); }
 
-    t0 = bench_now_ns();
-    add_all_indexes(tc);
-    t1 = bench_now_ns();
-    printf("        add-14-indexes:   wall=%.2fs\n\n", (double)(t1-t0)/1e9);
-    fflush(stdout);
-
-    /* ---- TEST 5: Parallel CSV with pre-existing indexes. ---- */
-    printf("--- TEST 5: parallel CSV 5×200K, WITH 14 pre-existing indexes ---\n");
-    fflush(stdout);
+    /* TEST 5: parallel CSV 5×200K, WITH 14 pre-existing indexes. */
     recreate_object(tc, 1);
     if (build_csv_memfds(chunk_csv) != 0) {
         close(single_json_fd); close(single_csv_fd);
         tc_close(tc); test_env_stop(&env); return 1;
     }
-    t0 = bench_now_ns();
-    run_parallel(env.port, 1, chunk_csv);
-    t1 = bench_now_ns();
+    { uint64_t t0 = bench_now_ns();
+      run_parallel(env.port, 1, chunk_csv);
+      us_5 = (long)((bench_now_ns() - t0) / 1000); }
     close_fds(chunk_csv, NCHUNKS);
-    printf("Test 5 parallel CSV 5×200K w/ 14 idx: wall=%.2fs  %.2f k/sec\n\n",
-           (double)(t1-t0)/1e9,
-           (double)TOTAL / 1000.0 / ((double)(t1-t0) / 1e9));
-    fflush(stdout);
+
+    /* ---- BULK INSERT throughput table ---- */
+    {
+#define MK(varname, us) \
+        char varname[48]; \
+        snprintf(varname, sizeof(varname), "%.2f M rows/s", \
+                 (double)TOTAL / 1e6 / ((double)(us) / 1e6));
+        MK(e1a, us_1a);  MK(e1b, us_1b);
+        MK(e2,  us_2);   MK(e3,  us_3);
+        MK(e4,  us_4);   MK(e5,  us_5);
+#undef MK
+        bench_table_section_begin("BULK INSERT 5×200K = 1M (single vs parallel)");
+        bench_table_record("1a single  JSON  no idx",      us_1a, 1, e1a);
+        bench_table_record("1b single  CSV   no idx",      us_1b, 1, e1b);
+        bench_table_record("2  parallel JSON no idx (5 conns)", us_2, 1, e2);
+        bench_table_record("3  parallel JSON 14-idx pre-existing", us_3, 1, e3);
+        bench_table_record("4  parallel CSV  no idx (5 conns)",  us_4, 1, e4);
+        bench_table_record("5  parallel CSV  14-idx pre-existing", us_5, 1, e5);
+        bench_table_section_end();
+
+        bench_table_section_begin("ADD INDEXES (post-load build)");
+        bench_table_record("after 1a single JSON",       us_1a_idx, 1, "14 fields");
+        bench_table_record("after 1b single CSV",        us_1b_idx, 1, "14 fields");
+        bench_table_record("after 2  parallel JSON",     us_2_idx,  1, "14 fields");
+        bench_table_record("after 4  parallel CSV",      us_4_idx,  1, "14 fields");
+        bench_table_section_end();
+    }
 
     /* ---- shard-stats summary ---- */
     tc_request(tc,

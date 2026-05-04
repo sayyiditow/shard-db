@@ -15,6 +15,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -287,155 +288,152 @@ static int bench_kv_run(void)
         printf("  CSV:  %.1f MB\n\n", (double)csv_size / 1048576.0);
     }
 
-    /* ---- 3. BULK INSERT JSON ---------------------------------------- */
-    printf("--- BULK INSERT JSON (%d records, 1 file) ---\n", COUNT);
-    fflush(stdout);
+    /* ---- 3. BULK INSERT JSON — captured into table ------------------- */
+    long bulk_json_us = 0;
     {
         uint64_t t0 = bench_now_ns();
         resp = bulk_insert_memfd(tc, "bulk-insert", "", json_buf, json_size);
-        uint64_t elapsed = bench_now_ns() - t0;
-        double ms  = (double)elapsed / 1e6;
-        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
-        printf("BULK INSERT JSON: rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
-               COUNT, ms, mps);
-        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+        bulk_json_us = (long)((bench_now_ns() - t0) / 1000);
+        free(resp); resp = NULL;
     }
 
-    /* ---- 4. Size check ---------------------------------------------- */
     tc_request(tc,
         "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
         &resp);
-    printf("SIZE after JSON insert: %s\n\n", resp ? resp : "(err)");
+    printf("SIZE after JSON insert: %s\n", resp ? resp : "(err)");
     free(resp); resp = NULL;
 
-    /* ---- 5. Truncate + BULK INSERT CSV ------------------------------- */
+    /* ---- 4. Truncate + BULK INSERT CSV — captured into table --------- */
     tc_request(tc,
         "{\"mode\":\"truncate\",\"dir\":\"default\",\"object\":\"kvbench\"}",
         &resp);
     free(resp); resp = NULL;
 
-    printf("--- BULK INSERT CSV (%d records, 1 file) ---\n", COUNT);
-    fflush(stdout);
+    long bulk_csv_us = 0;
     {
         uint64_t t0 = bench_now_ns();
         resp = bulk_insert_memfd(tc, "bulk-insert-delimited",
                                  ",\"delimiter\":\",\"",
                                  csv_buf, csv_size);
-        uint64_t elapsed = bench_now_ns() - t0;
-        double ms  = (double)elapsed / 1e6;
-        double mps = (double)COUNT / ((double)elapsed / 1e9) / 1e6;
-        printf("BULK INSERT CSV:  rows=%d  wall=%.0fms  throughput=%.2f M/sec\n",
-               COUNT, ms, mps);
-        if (resp) { printf("  response: %.120s\n", resp); free(resp); resp = NULL; }
+        bulk_csv_us = (long)((bench_now_ns() - t0) / 1000);
+        free(resp); resp = NULL;
     }
-
-    /* Free CSV blob — no longer needed. */
     free(csv_buf); csv_buf = NULL;
 
-    /* ---- 6. Size check ---------------------------------------------- */
     tc_request(tc,
         "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
         &resp);
     printf("SIZE after CSV insert:  %s\n\n", resp ? resp : "(err)");
     free(resp); resp = NULL;
 
-    /* ---- 7. GET single (warm) --------------------------------------- */
+    /* ---- BULK INSERT throughput table -------------------------------- */
+    {
+        char e_json[48], e_csv[48];
+        snprintf(e_json, sizeof(e_json), "%.2f M rows/s",
+                 (double)COUNT / 1e6 / ((double)bulk_json_us / 1e6));
+        snprintf(e_csv, sizeof(e_csv), "%.2f M rows/s",
+                 (double)COUNT / 1e6 / ((double)bulk_csv_us / 1e6));
+        bench_table_section_begin("BULK INSERT (single conn)");
+        bench_table_record("JSON 1 file", bulk_json_us, 1, e_json);
+        bench_table_record("CSV  1 file", bulk_csv_us, 1, e_csv);
+        bench_table_section_end();
+    }
+
+    /* ---- 7-12. Single-conn latency batches — captured into table ----- */
+    long get_warm_us = 0;
+    long get_total_us = 0; uint64_t get_p50 = 0;
+    long exists_hit_total_us = 0; uint64_t exists_hit_p50 = 0;
+    long exists_miss_total_us = 0; uint64_t exists_miss_p50 = 0;
+    long update_total_us = 0; uint64_t update_p50 = 0;
+    long delete_total_us = 0; uint64_t delete_p50 = 0;
+
+    /* GET single (warm) */
     {
         int ri = (int)((unsigned)rand() % (unsigned)COUNT);
         char req[256];
         snprintf(req, sizeof(req),
                  "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
-                 "\"key\":\"%s\"}",
-                 keys[ri]);
+                 "\"key\":\"%s\"}", keys[ri]);
         uint64_t t0 = bench_now_ns();
         tc_request(tc, req, &resp);
-        uint64_t elapsed = bench_now_ns() - t0;
-        printf("GET single warm: latency=%.0fµs\n\n",
-               (double)elapsed / 1000.0);
+        get_warm_us = (long)((bench_now_ns() - t0) / 1000);
         free(resp); resp = NULL;
     }
 
-    /* ---- 8. GET ×10000 pipelined (1 conn) -------------------------- */
+    /* GET x10000 */
     {
         const int N = 10000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             int ri = (int)((unsigned)rand() % (unsigned)COUNT);
             char req[256];
             snprintf(req, sizeof(req),
                      "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\"}",
-                     keys[ri]);
+                     "\"key\":\"%s\"}", keys[ri]);
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "GET x10000 pipelined", bench_now_ns() - wall_start);
-        printf("\n");
+        get_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        get_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 9. EXISTS ×10000 (hits) ----------------------------------- */
+    /* EXISTS x10000 (hits) */
     {
         const int N = 10000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             int ri = (int)((unsigned)rand() % (unsigned)COUNT);
             char req[256];
             snprintf(req, sizeof(req),
                      "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\"}",
-                     keys[ri]);
+                     "\"key\":\"%s\"}", keys[ri]);
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "EXISTS x10000 (hits)", bench_now_ns() - wall_start);
-        printf("\n");
+        exists_hit_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        exists_hit_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 10. EXISTS ×10000 (all-miss) ------------------------------- */
+    /* EXISTS x10000 (all-miss) */
     {
         const int N = 10000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char req[256];
             snprintf(req, sizeof(req),
                      "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"nope_%d\"}",
-                     i + 1);
+                     "\"key\":\"nope_%d\"}", i + 1);
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "EXISTS x10000 (all-miss)", bench_now_ns() - wall_start);
-        printf("\n");
+        exists_miss_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        exists_miss_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 11. UPDATE ×10000 ----------------------------------------- */
+    /* UPDATE x10000 */
     {
         const int N = 10000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             int ri = (int)((unsigned)rand() % (unsigned)COUNT);
@@ -449,33 +447,30 @@ static int bench_kv_run(void)
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "UPDATE x10000", bench_now_ns() - wall_start);
-        printf("\n");
+        update_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        update_p50 = bench_hist_p50_ns(&h);
         free(samples);
     }
 
-    /* ---- 12. DELETE ×10000 ----------------------------------------- */
+    /* DELETE x10000 (deterministic coverage of first N keys) */
     {
         const int N = 10000;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
-
-        /* Delete the first N records by key index for deterministic coverage. */
         uint64_t wall_start = bench_now_ns();
         for (int i = 0; i < N; i++) {
             char req[256];
             snprintf(req, sizeof(req),
                      "{\"mode\":\"delete\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\"}",
-                     keys[i]);
+                     "\"key\":\"%s\"}", keys[i]);
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bench_hist_add(&h, bench_now_ns() - t0);
             free(resp); resp = NULL;
         }
-        bench_hist_report(&h, "DELETE x10000", bench_now_ns() - wall_start);
-        printf("\n");
+        delete_total_us = (long)((bench_now_ns() - wall_start) / 1000);
+        delete_p50 = bench_hist_p50_ns(&h);
         free(samples);
 
         tc_request(tc,
@@ -483,6 +478,34 @@ static int bench_kv_run(void)
             &resp);
         printf("SIZE after DELETE x10000: %s\n\n", resp ? resp : "(err)");
         free(resp); resp = NULL;
+    }
+
+    /* ---- Single-conn latency table ----------------------------------- */
+    {
+        char e_get[48], e_exh[48], e_exm[48], e_upd[48], e_del[48];
+        snprintf(e_get, sizeof(e_get), "p50=%.0fµs  %.0f k op/s",
+                 (double)get_p50 / 1000.0,
+                 10.0 / ((double)get_total_us / 1e6));
+        snprintf(e_exh, sizeof(e_exh), "p50=%.0fµs  %.0f k op/s",
+                 (double)exists_hit_p50 / 1000.0,
+                 10.0 / ((double)exists_hit_total_us / 1e6));
+        snprintf(e_exm, sizeof(e_exm), "p50=%.0fµs  %.0f k op/s",
+                 (double)exists_miss_p50 / 1000.0,
+                 10.0 / ((double)exists_miss_total_us / 1e6));
+        snprintf(e_upd, sizeof(e_upd), "p50=%.0fµs  %.0f k op/s",
+                 (double)update_p50 / 1000.0,
+                 10.0 / ((double)update_total_us / 1e6));
+        snprintf(e_del, sizeof(e_del), "p50=%.0fµs  %.0f k op/s",
+                 (double)delete_p50 / 1000.0,
+                 10.0 / ((double)delete_total_us / 1e6));
+        bench_table_section_begin("Single-conn latency batches (N=10000)");
+        bench_table_record("GET   single warm", get_warm_us, 1, NULL);
+        bench_table_record("GET    x10000 pipelined", get_total_us, 1, e_get);
+        bench_table_record("EXISTS x10000 (hits)",   exists_hit_total_us, 1, e_exh);
+        bench_table_record("EXISTS x10000 (all-miss)", exists_miss_total_us, 1, e_exm);
+        bench_table_record("UPDATE x10000",          update_total_us, 1, e_upd);
+        bench_table_record("DELETE x10000",          delete_total_us, 1, e_del);
+        bench_table_section_end();
     }
 
     /* ---- 13. Re-populate for parallel section ----------------------- */
@@ -506,64 +529,50 @@ static int bench_kv_run(void)
     /* JSON blob no longer needed. */
     free(json_buf); json_buf = NULL;
 
-    /* ---- 14. PARALLEL GET (5 conns × 10000) ------------------------- */
+    /* ---- 14-15. PARALLEL GET / UPDATE — table view ------------------- */
+    long par_get_us = 0, par_upd_us = 0;
     {
-        printf("--- PARALLEL GET %d connections x %d each (%d total) ---\n",
-               N_PAR, N_PAR_OPS, N_PAR * N_PAR_OPS);
-        fflush(stdout);
-
         pthread_t    threads[N_PAR];
         ParWorkerArg args[N_PAR];
-
         uint64_t wall_start = bench_now_ns();
         for (int t = 0; t < N_PAR; t++) {
-            args[t].port       = env.port;
-            args[t].mode       = PAR_GET;
-            args[t].n          = N_PAR_OPS;
-            args[t].keys       = keys;
-            args[t].total_keys = COUNT;
-            args[t].total_ns   = 0;
+            args[t] = (ParWorkerArg){
+                .port = env.port, .mode = PAR_GET, .n = N_PAR_OPS,
+                .keys = keys, .total_keys = COUNT, .total_ns = 0,
+            };
             pthread_create(&threads[t], NULL, par_worker, &args[t]);
         }
         for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
-        uint64_t wall_ns = bench_now_ns() - wall_start;
-
-        int    total_ops = N_PAR * N_PAR_OPS;
-        double kops = (double)total_ops / ((double)wall_ns / 1e6);
-        printf("PARALLEL GET %d conns x %d: total_ops=%d  wall=%.0fms  "
-               "throughput=%.2f k ops/sec\n\n",
-               N_PAR, N_PAR_OPS, total_ops,
-               (double)wall_ns / 1e6, kops);
+        par_get_us = (long)((bench_now_ns() - wall_start) / 1000);
     }
-
-    /* ---- 15. PARALLEL UPDATE (5 conns × 10000) ---------------------- */
     {
-        printf("--- PARALLEL UPDATE %d connections x %d each ---\n",
-               N_PAR, N_PAR_OPS);
-        fflush(stdout);
-
         pthread_t    threads[N_PAR];
         ParWorkerArg args[N_PAR];
-
         uint64_t wall_start = bench_now_ns();
         for (int t = 0; t < N_PAR; t++) {
-            args[t].port       = env.port;
-            args[t].mode       = PAR_UPDATE;
-            args[t].n          = N_PAR_OPS;
-            args[t].keys       = keys;
-            args[t].total_keys = COUNT;
-            args[t].total_ns   = 0;
+            args[t] = (ParWorkerArg){
+                .port = env.port, .mode = PAR_UPDATE, .n = N_PAR_OPS,
+                .keys = keys, .total_keys = COUNT, .total_ns = 0,
+            };
             pthread_create(&threads[t], NULL, par_worker, &args[t]);
         }
         for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
-        uint64_t wall_ns = bench_now_ns() - wall_start;
-
-        int    total_ops = N_PAR * N_PAR_OPS;
-        double kops = (double)total_ops / ((double)wall_ns / 1e6);
-        printf("PARALLEL UPDATE %d conns x %d: total_ops=%d  wall=%.0fms  "
-               "throughput=%.2f k ops/sec\n\n",
-               N_PAR, N_PAR_OPS, total_ops,
-               (double)wall_ns / 1e6, kops);
+        par_upd_us = (long)((bench_now_ns() - wall_start) / 1000);
+    }
+    {
+        int total_ops = N_PAR * N_PAR_OPS;
+        char e_get[48], e_upd[48], lbl[64];
+        snprintf(e_get, sizeof(e_get), "%.0f k op/s",
+                 (double)total_ops / ((double)par_get_us / 1e3));
+        snprintf(e_upd, sizeof(e_upd), "%.0f k op/s",
+                 (double)total_ops / ((double)par_upd_us / 1e3));
+        bench_table_section_begin("Parallel latency batches "
+                                  "(5 conns × 10k = 50k ops)");
+        snprintf(lbl, sizeof(lbl), "PARALLEL GET    %d conns × %d", N_PAR, N_PAR_OPS);
+        bench_table_record(lbl, par_get_us, 1, e_get);
+        snprintf(lbl, sizeof(lbl), "PARALLEL UPDATE %d conns × %d", N_PAR, N_PAR_OPS);
+        bench_table_record(lbl, par_upd_us, 1, e_upd);
+        bench_table_section_end();
     }
 
     /* ---- 16. Disk usage -------------------------------------------- */

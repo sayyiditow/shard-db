@@ -16,6 +16,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_table.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,9 +122,6 @@ static void run_scenario(TestClient *tc, const char *label, int splits, int rows
         "\"object\":\"%s\",\"file\":\"%s\",\"delimiter\":\",\"}",
         obj, fdpath);
 
-    printf("--- BULK INSERT CSV (%d rows) ---\n", rows);
-    fflush(stdout);
-
     uint64_t t0 = bench_now_ns();
     if (tc_request(tc, req, &resp) != 0) {
         fprintf(stderr, "%s: bulk-insert-delimited failed\n", label);
@@ -131,29 +129,26 @@ static void run_scenario(TestClient *tc, const char *label, int splits, int rows
         free(resp);
         return;
     }
-    uint64_t t1 = bench_now_ns();
+    long us = (long)((bench_now_ns() - t0) / 1000);
     close(memfd);
+    free(resp); resp = NULL;
 
-    double secs = (double)(t1 - t0) / 1e9;
-    double mps = (double)rows / 1e6 / secs;
-    printf("BULK INSERT CSV: rows=%-8d  wall=%.3fs  throughput=%.2f M/sec\n",
-           rows, secs, mps);
-    if (resp) {
-        printf("  response: %.120s\n", resp);
-        free(resp);
-        resp = NULL;
-    }
+    char extra[64];
+    snprintf(extra, sizeof(extra), "%d rows  %.2f M/sec",
+             rows, (double)rows / 1e6 / ((double)us / 1e6));
+    bench_table_record(label, us, 1, extra);
 
-    /* Grab final shard-stats summary. */
+    /* Final shard-stats summary stays as raw printf — large JSON blob,
+       not a per-row metric. */
     snprintf(req, sizeof(req),
         "{\"mode\":\"shard-stats\",\"dir\":\"default\",\"object\":\"%s\"}", obj);
     if (tc_request(tc, req, &resp) == 0) {
         size_t len = resp ? strlen(resp) : 0;
         if (len > 800) {
-            printf("--- final shard-stats (%s) ---\n", obj);
+            printf("\n--- final shard-stats (%s) ---\n", obj);
             printf("%.800s...\n", resp);
         } else if (len > 0) {
-            printf("--- final shard-stats (%s) ---\n", obj);
+            printf("\n--- final shard-stats (%s) ---\n", obj);
             printf("%s\n", resp);
         }
         free(resp);
@@ -190,9 +185,12 @@ static int bench_grow_run(void)
     free(resp);
     resp = NULL;
 
-    /* Run scenarios. */
-    run_scenario(tc, "heavy-grow",  8,  5000000, "heavy");
-    run_scenario(tc, "light-grow", 16, 1000000, "light");
+    /* Run scenarios — both rows recorded into one BULK INSERT section so
+       the bar chart compares heavy vs light side-by-side. */
+    bench_table_section_begin("BULK INSERT (CSV, single conn) — splits sweep");
+    run_scenario(tc, "heavy-grow  splits=8   rows=5M",  8,  5000000, "heavy");
+    run_scenario(tc, "light-grow  splits=16  rows=1M", 16, 1000000, "light");
+    bench_table_section_end();
 
     printf("\n");
     printf("======================================\n");
