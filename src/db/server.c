@@ -1066,6 +1066,22 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
+    /* restore also bypasses the fields.conf pre-check — it's the recovery
+       path for exactly that file going missing. cmd_restore reads the
+       backup's bundled fields.conf + object.json and reinstates them
+       under the object's wrlock. */
+    if (strcmp(mode, "restore") == 0) {
+        char db_root_eff[PATH_MAX];
+        build_effective_root(db_root_eff, sizeof(db_root_eff), dir);
+        char *fromv = json_obj_strdup(&req, "from");
+        char *fstr = json_obj_strdup(&req, "force");
+        int force = fstr && strcmp(fstr, "true") == 0;
+        cmd_restore(db_root_eff, object, fromv, force);
+        free(fromv); free(fstr);
+        free(mode); free(dir); free(object);
+        return;
+    }
+
     if (!is_valid_dir(dir)) {
         OUT("{\"error\":\"Unknown dir: %s\"}\n", dir);
         free(mode); free(dir); free(object);
@@ -1448,12 +1464,6 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         cmd_truncate(db_root, object);
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
-    } else if (strcmp(mode, "restore") == 0) {
-        char *from = json_obj_strdup(&req, "from");
-        char *fstr = json_obj_strdup(&req, "force");
-        int force = fstr && strcmp(fstr, "true") == 0;
-        cmd_restore(db_root, object, from, force);
-        free(from); free(fstr);
     } else if (strcmp(mode, "put-file") == 0) {
         char *data = json_obj_strdup(&req, "data");
         if (data) {

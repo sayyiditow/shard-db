@@ -9571,19 +9571,91 @@ int cmd_backup(const char *db_root, const char *object) {
         cprf(src_sub, dst_sub);
     }
 
+    /* Schema capture — make the backup directory self-contained. fields.conf
+       has the typed-field layout; object.json carries splits + max_key (which
+       live in the global schema.conf, not under <obj>/). Without these,
+       cmd_restore couldn't recreate the object on a fresh DB. */
+    char src_fields[PATH_MAX], dst_fields[PATH_MAX];
+    snprintf(src_fields, sizeof(src_fields), "%s/fields.conf", src_dir);
+    snprintf(dst_fields, sizeof(dst_fields), "%s/fields.conf", bak_dir);
+    if (stat(src_fields, &st) == 0) copy_file(src_fields, dst_fields, st.st_mode);
+
+    Schema sch = load_schema(db_root, object);
+    char meta_path[PATH_MAX];
+    snprintf(meta_path, sizeof(meta_path), "%s/object.json", bak_dir);
+    FILE *mf = fopen(meta_path, "w");
+    if (mf) {
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d}\n", sch.splits, sch.max_key);
+        fclose(mf);
+    }
+
     OUT("{\"status\":\"backed_up\",\"path\":\"%s\"}\n", bak_dir);
     return 0;
 }
 
+/* Parse a tiny object.json of the shape {"splits":N,"max_key":N} written by
+   cmd_backup. Returns 1 on success with both fields populated. Tolerant of
+   key order; rejects anything else. Used only by cmd_restore. */
+static int parse_object_meta(const char *path, int *out_splits, int *out_max_key) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[256] = {0};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    int splits = -1, max_key = -1;
+    const char *p = strstr(buf, "\"splits\":");
+    if (p) splits = atoi(p + strlen("\"splits\":"));
+    p = strstr(buf, "\"max_key\":");
+    if (p) max_key = atoi(p + strlen("\"max_key\":"));
+    if (splits < 0 || max_key < 0) return 0;
+    *out_splits = splits;
+    *out_max_key = max_key;
+    return 1;
+}
+
+/* Append a `dir:object:splits:max_key` line to schema.conf if it isn't
+   already there. Caller already holds objlock_wrlock on the object.
+   schema.conf is a global file, so we serialise via flock on it.
+   Returns 0 on success, -1 on IO failure. */
+static int ensure_schema_conf_line(const char *db_root, const char *object,
+                                   int splits, int max_key) {
+    const char *dir = db_root + strlen(g_db_root);
+    if (*dir == '/') dir++;
+
+    char conf[PATH_MAX];
+    snprintf(conf, sizeof(conf), "%s/schema.conf", g_db_root);
+
+    char prefix[512];
+    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
+
+    FILE *f = fopen(conf, "a+");
+    if (!f) return -1;
+    int lockfd = fileno(f);
+    flock(lockfd, LOCK_EX);
+
+    rewind(f);
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, prefix, pfxlen) == 0) { found = 1; break; }
+    }
+    if (!found) {
+        fseek(f, 0, SEEK_END);
+        fprintf(f, "%s%d:%d\n", prefix, splits, max_key);
+    }
+    flock(lockfd, LOCK_UN);
+    fclose(f);
+    return 0;
+}
+
 /* ========== RESTORE ==========
-   Symmetric to backup: copies data/ + indexes/ + metadata/ from
-   `<obj>/backup/<from>` over the live tree. Refuses if any of the three
-   subtrees already exist on the live side, unless force=1. Holds the
+   Symmetric to backup: copies data/ + indexes/ + metadata/ + fields.conf
+   from `<obj>/backup/<from>` over the live tree, and ensures the
+   schema.conf line is in place from object.json.
+   Refuses if any live state would conflict, unless force=1. Holds the
    object's write lock for the whole operation; invalidates ucache + bt
    cache + idx cache + schema caches before the swap so the next reader
-   sees the new mappings. fields.conf / schema.conf live above this
-   subtree and are not touched — restore is data-only, schema must
-   match the backup point-in-time. */
+   sees the new mappings. */
 int cmd_restore(const char *db_root, const char *object,
                 const char *from, int force) {
     if (!from || !*from) { OUT("{\"error\":\"from is required\"}\n"); return 1; }
@@ -9632,6 +9704,66 @@ int cmd_restore(const char *db_root, const char *object,
                 }
             }
         }
+    }
+
+    /* Schema reconciliation. If the backup carries object.json, cross-check
+       it against the live schema.conf entry. Mismatch → refuse without
+       force; missing live entry → append (the object exists on disk but
+       got orphaned from schema.conf, exactly the failure mode this
+       protects against). Backups from before this feature have no
+       object.json — accept and skip. */
+    char meta_src[PATH_MAX];
+    snprintf(meta_src, sizeof(meta_src), "%s/object.json", src_dir);
+    int bak_splits = 0, bak_max_key = 0;
+    int have_meta = parse_object_meta(meta_src, &bak_splits, &bak_max_key);
+    if (have_meta) {
+        Schema live = load_schema(db_root, object);
+        if (live.splits > 0 && (live.splits != bak_splits || live.max_key != bak_max_key) && !force) {
+            objlock_wrunlock(db_root, object);
+            OUT("{\"error\":\"schema mismatch: live splits=%d max_key=%d, "
+                "backup splits=%d max_key=%d (use force=true to overwrite)\"}\n",
+                live.splits, live.max_key, bak_splits, bak_max_key);
+            return 1;
+        }
+        if (ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key) != 0) {
+            objlock_wrunlock(db_root, object);
+            OUT("{\"error\":\"failed to update schema.conf\"}\n");
+            return 1;
+        }
+    }
+
+    /* fields.conf reconciliation. Same logic as schema: if the backup has
+       a fields.conf, cross-check against live. Differs → force-required;
+       missing live → install from backup. */
+    char fields_src[PATH_MAX], fields_dst[PATH_MAX];
+    snprintf(fields_src, sizeof(fields_src), "%s/fields.conf", src_dir);
+    snprintf(fields_dst, sizeof(fields_dst), "%s/fields.conf", obj_dir);
+    if (stat(fields_src, &st) == 0 && S_ISREG(st.st_mode)) {
+        struct stat lst;
+        if (stat(fields_dst, &lst) == 0 && S_ISREG(lst.st_mode) && !force) {
+            /* Compare contents — same size + same bytes = identical. */
+            int same = 0;
+            if (lst.st_size == st.st_size) {
+                FILE *fa = fopen(fields_src, "r");
+                FILE *fb = fopen(fields_dst, "r");
+                if (fa && fb) {
+                    same = 1;
+                    int ca, cb;
+                    while ((ca = fgetc(fa)) != EOF && (cb = fgetc(fb)) != EOF) {
+                        if (ca != cb) { same = 0; break; }
+                    }
+                }
+                if (fa) fclose(fa);
+                if (fb) fclose(fb);
+            }
+            if (!same) {
+                objlock_wrunlock(db_root, object);
+                OUT("{\"error\":\"fields.conf differs between live and backup "
+                    "(use force=true to overwrite)\"}\n");
+                return 1;
+            }
+        }
+        copy_file(fields_src, fields_dst, st.st_mode);
     }
 
     /* Drop caches first so readers can't pin the old mappings while we swap.

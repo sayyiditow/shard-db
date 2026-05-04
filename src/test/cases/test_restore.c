@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /* Pull "<key>":"<value>" out of a JSON-ish response. Stops on first '"'. */
 static int extract_str(const char *resp, const char *key, char *out, size_t out_sz) {
@@ -148,6 +151,78 @@ static int test_restore_run(void) {
     tc_request(tc,
         "{\"mode\":\"restore\",\"dir\":\"default\",\"object\":\"rest\"}", &resp);
     ASSERT_CONTAINS(resp, "\"error\":\"from is required\"", "missing from rejected");
+    free(resp); resp = NULL;
+
+    /* Verify backup contains the schema files we promised to capture. */
+    char fields_bak[400];
+    snprintf(fields_bak, sizeof(fields_bak),
+             "%s/default/rest/backup/%s/fields.conf", env.db_root, ts);
+    {
+        struct stat fst;
+        ASSERT_TRUE(stat(fields_bak, &fst) == 0 && fst.st_size > 0,
+                    "backup includes fields.conf");
+    }
+    char meta_bak[400];
+    snprintf(meta_bak, sizeof(meta_bak),
+             "%s/default/rest/backup/%s/object.json", env.db_root, ts);
+    {
+        FILE *f = fopen(meta_bak, "r");
+        ASSERT_NOT_NULL(f, "backup includes object.json");
+        if (f) {
+            char buf[256] = {0};
+            fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            ASSERT_TRUE(strstr(buf, "\"splits\":16") != NULL,
+                        "object.json carries splits");
+            ASSERT_TRUE(strstr(buf, "\"max_key\":16") != NULL,
+                        "object.json carries max_key");
+        }
+    }
+
+    /* Schema-recovery path: simulate the "operator rm'd the metadata"
+       failure mode. Stop the daemon-side caches by deleting the live
+       fields.conf + the schema.conf line, then restore should put them
+       back from the backup. */
+    {
+        /* Live fields.conf path. */
+        char live_fields[400];
+        snprintf(live_fields, sizeof(live_fields),
+                 "%s/default/rest/fields.conf", env.db_root);
+        unlink(live_fields);
+
+        /* Strip the rest line out of schema.conf. */
+        char schema_path[400], tmp_path[400];
+        snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", env.db_root);
+        snprintf(tmp_path, sizeof(tmp_path), "%s/schema.conf.test", env.db_root);
+        FILE *fin = fopen(schema_path, "r");
+        FILE *fout = fopen(tmp_path, "w");
+        if (fin && fout) {
+            char line[512];
+            while (fgets(line, sizeof(line), fin))
+                if (strncmp(line, "default:rest:", 13) != 0) fputs(line, fout);
+        }
+        if (fin) fclose(fin);
+        if (fout) fclose(fout);
+        rename(tmp_path, schema_path);
+    }
+
+    /* Now run restore — should recreate fields.conf + the schema.conf line
+       from backup metadata. */
+    {
+        char req[512];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"restore\",\"dir\":\"default\",\"object\":\"rest\","
+            "\"from\":\"%s\",\"force\":true}", ts);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"restored\"",
+                        "restore succeeds even with schema files deleted");
+        free(resp); resp = NULL;
+    }
+
+    /* Reads work again — proves schema.conf line + fields.conf were recreated. */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"rest\",\"key\":\"k3\"}",
+                   &resp);
+    ASSERT_CONTAINS(resp, "\"name\":\"n3\"", "post-recovery read works");
     free(resp); resp = NULL;
 
     tc_close(tc);
