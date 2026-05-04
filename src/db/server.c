@@ -2041,6 +2041,8 @@ static void *auto_vacuum_thread(void *arg) {
         memcpy(used_copy, g_dirs_used, sizeof(used_copy));
         pthread_mutex_unlock(&g_dirs_lock);
 
+        uint64_t tick_t0 = now_ms();
+        int scanned = 0, vacuumed = 0;
         for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
             if (!used_copy[di]) continue;
             char dir_path[PATH_MAX];
@@ -2055,6 +2057,7 @@ static void *auto_vacuum_thread(void *arg) {
                          "%s/%s/fields.conf", dir_path, de->d_name);
                 struct stat ost;
                 if (stat(obj_check, &ost) != 0) continue;
+                scanned++;
 
                 char eff[PATH_MAX];
                 snprintf(eff, sizeof(eff), "%s/%s", a->db_root, dirs_copy[di]);
@@ -2065,19 +2068,180 @@ static void *auto_vacuum_thread(void *arg) {
                                  && total > 0
                                  && deleted * 100 >= total * g_vacuum_recommend_pct);
                 if (recommend) {
-                    log_msg(2,
-                        "AUTO-VACUUM %s/%s (live=%d deleted=%d pct=%d)",
-                        dirs_copy[di], de->d_name, count, deleted,
-                        total > 0 ? (deleted * 100 / total) : 0);
+                    int pct_observed = total > 0 ? (deleted * 100 / total) : 0;
+                    log_msg(3,
+                        "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
+                        dirs_copy[di], de->d_name, count, deleted, pct_observed);
+                    uint64_t obj_t0 = now_ms();
                     cmd_vacuum(eff, de->d_name, 0, 0);
+                    log_msg(3,
+                        "AUTO-VACUUM done %s/%s in %lums",
+                        dirs_copy[di], de->d_name,
+                        (unsigned long)(now_ms() - obj_t0));
+                    vacuumed++;
                 }
             }
             closedir(dd);
         }
+        log_msg(3, "AUTO-VACUUM tick: scanned=%d vacuumed=%d in %lums",
+                scanned, vacuumed, (unsigned long)(now_ms() - tick_t0));
     }
 
     if (g_out && g_out != stderr) fclose(g_out);
     return NULL;
+}
+
+/* Startup metadata validator.
+ *
+ * Three pure presence checks across dirs.conf, schema.conf, and the
+ * filesystem. Cheap (~1 syscall per object). Refuses to start the
+ * daemon if any fail — a silent fallback from missing metadata would
+ * mis-route reads and corrupt writes, so failing fast is the safer
+ * default than serving with broken state.
+ *
+ * What it checks (errors logged to stderr + error log):
+ *
+ *   Rule 1: every <dir>/<obj>/ on disk that contains data/ must have
+ *           a matching `dir:object:` line in schema.conf. Catches
+ *           "operator deleted the line out of schema.conf".
+ *
+ *   Rule 2: every <dir>/<obj>/ on disk that contains data/ must have
+ *           a fields.conf file. Catches "operator deleted fields.conf".
+ *
+ *   Rule 3: every dir referenced in schema.conf must be allow-listed
+ *           in dirs.conf. Catches "operator dropped the tenant from
+ *           dirs.conf without dropping its objects".
+ *
+ * What it does NOT check (handled elsewhere or left for tooling):
+ *   - Shard-header internal consistency (slots_per_shard, magic)
+ *   - fields.conf content correctness (parses fine but garbage)
+ *   - data/ vs schema.conf splits agreement
+ *
+ * Returns 0 on clean, count-of-errors otherwise.
+ */
+static int validate_metadata(const char *db_root) {
+    int errors = 0;
+
+    /* Pass 1: build an in-memory list of "dir:object:" prefixes from
+       schema.conf so we can do O(1) lookups during the filesystem walk
+       (small, startup-only, won't grow large enough to need a hash). */
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+
+    typedef struct { char dir[64]; char obj[128]; } SchemaEntry;
+    SchemaEntry *schema_entries = NULL;
+    int schema_count = 0, schema_cap = 0;
+
+    FILE *sf = fopen(schema_path, "r");
+    if (sf) {
+        char line[512];
+        while (fgets(line, sizeof(line), sf)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            char *colon1 = strchr(line, ':');
+            if (!colon1) continue;
+            char *colon2 = strchr(colon1 + 1, ':');
+            if (!colon2) continue;
+            if (schema_count >= schema_cap) {
+                schema_cap = schema_cap ? schema_cap * 2 : 32;
+                SchemaEntry *t = realloc(schema_entries,
+                                         (size_t)schema_cap * sizeof(SchemaEntry));
+                if (!t) { free(schema_entries); fclose(sf); return -1; }
+                schema_entries = t;
+            }
+            size_t dlen = (size_t)(colon1 - line);
+            size_t olen = (size_t)(colon2 - colon1 - 1);
+            if (dlen >= sizeof(schema_entries[0].dir)) dlen = sizeof(schema_entries[0].dir) - 1;
+            if (olen >= sizeof(schema_entries[0].obj)) olen = sizeof(schema_entries[0].obj) - 1;
+            memcpy(schema_entries[schema_count].dir, line, dlen);
+            schema_entries[schema_count].dir[dlen] = '\0';
+            memcpy(schema_entries[schema_count].obj, colon1 + 1, olen);
+            schema_entries[schema_count].obj[olen] = '\0';
+            schema_count++;
+        }
+        fclose(sf);
+    }
+    /* No schema.conf at all is fine on a fresh DB — no objects to validate. */
+
+    /* Rule 3: every dir referenced in schema.conf must be in dirs.conf. */
+    for (int i = 0; i < schema_count; i++) {
+        if (!is_valid_dir(schema_entries[i].dir)) {
+            fprintf(stderr,
+                "validate: schema.conf references dir [%s] (object [%s]) "
+                "but it is not in dirs.conf\n",
+                schema_entries[i].dir, schema_entries[i].obj);
+            log_msg(1,
+                "VALIDATE schema.conf references dir [%s] not in dirs.conf",
+                schema_entries[i].dir);
+            errors++;
+        }
+    }
+
+    /* Rules 1+2: walk filesystem, check each object dir. */
+    DIR *root = opendir(db_root);
+    if (!root) return errors;
+    struct dirent *de;
+    while ((de = readdir(root))) {
+        if (de->d_name[0] == '.') continue;
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, de->d_name);
+        struct stat dst;
+        if (stat(dir_path, &dst) != 0 || !S_ISDIR(dst.st_mode)) continue;
+        /* Only treat as a tenant if listed in dirs.conf — skips any other
+           top-level dirs an operator may have left at $DB_ROOT. */
+        if (!is_valid_dir(de->d_name)) continue;
+
+        DIR *dd = opendir(dir_path);
+        if (!dd) continue;
+        struct dirent *oe;
+        while ((oe = readdir(dd))) {
+            if (oe->d_name[0] == '.') continue;
+            char data_check[PATH_MAX];
+            snprintf(data_check, sizeof(data_check),
+                     "%s/%s/data", dir_path, oe->d_name);
+            struct stat ost;
+            /* Only check objects that have on-disk data — pre-create-object
+               work-in-progress dirs without data/ are uninteresting. */
+            if (stat(data_check, &ost) != 0 || !S_ISDIR(ost.st_mode)) continue;
+
+            /* Rule 2: fields.conf must exist. */
+            char fields_check[PATH_MAX];
+            snprintf(fields_check, sizeof(fields_check),
+                     "%s/%s/fields.conf", dir_path, oe->d_name);
+            struct stat fst;
+            if (stat(fields_check, &fst) != 0) {
+                fprintf(stderr,
+                    "validate: object [%s/%s] has data/ but missing fields.conf\n",
+                    de->d_name, oe->d_name);
+                log_msg(1,
+                    "VALIDATE %s/%s has data/ but no fields.conf",
+                    de->d_name, oe->d_name);
+                errors++;
+            }
+
+            /* Rule 1: schema.conf line must exist. */
+            int found = 0;
+            for (int i = 0; i < schema_count; i++) {
+                if (strcmp(schema_entries[i].dir, de->d_name) == 0
+                 && strcmp(schema_entries[i].obj, oe->d_name) == 0) {
+                    found = 1; break;
+                }
+            }
+            if (!found) {
+                fprintf(stderr,
+                    "validate: object [%s/%s] has data/ but missing schema.conf line\n",
+                    de->d_name, oe->d_name);
+                log_msg(1,
+                    "VALIDATE %s/%s has data/ but no schema.conf line",
+                    de->d_name, oe->d_name);
+                errors++;
+            }
+        }
+        closedir(dd);
+    }
+    closedir(root);
+
+    free(schema_entries);
+    return errors;
 }
 
 int cmd_server(const char *db_root, int daemonize) {
@@ -2248,6 +2412,21 @@ int cmd_server(const char *db_root, int daemonize) {
     objlock_init();
     rebuild_recovery(db_root);
     grow_recovery(db_root);
+
+    /* Cross-check dirs.conf, schema.conf, and on-disk objects. Refuse to
+       start on inconsistency rather than silently mis-routing reads with
+       a fallback splits=64. See validate_metadata() for the three rules. */
+    int validate_errors = validate_metadata(db_root);
+    if (validate_errors > 0) {
+        fprintf(stderr,
+            "\nshard-db: refusing to start: %d metadata error%s detected.\n"
+            "  Recover with: ./shard-db import-schema <manifest.json>\n"
+            "  Or restore from a backup: ./shard-db restore <object> <timestamp>\n"
+            "  See full error log at %s/error-*.log.\n\n",
+            validate_errors, validate_errors == 1 ? "" : "s", g_log_dir);
+        log_shutdown();
+        return 1;
+    }
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
