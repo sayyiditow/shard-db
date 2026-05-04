@@ -129,6 +129,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_invoice.c \
     src/bench/bench_parallel.c \
     src/bench/bench_queries.c \
+    src/bench/bench_joins.c \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
