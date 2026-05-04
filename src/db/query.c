@@ -1178,6 +1178,14 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     int count = 0, errors = 0;
 
+    /* Per-request statement timeout (timeout_ms / global TIMEOUT). Trip
+       check is in the parse loop only — the parallel write/index phases
+       run on records already in memory, so a deadline trip mid-parse
+       aborts before any disk write. Records past the trip point are
+       discarded; nothing is committed. */
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+    int dl_counter = 0;
+
     /* ===== Phase 1: parse every record into a buffered records[] array. Per-record
        `id` + `payload` (ts->total_size bytes) are bump-allocated from a single
        BulkArena so the 2-mallocs-per-record cost is replaced by O(1) pointer
@@ -1188,6 +1196,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
     while (*p) {
+        if (query_deadline_tick(&dl, &dl_counter)) break;
         p = json_skip(p);
         if (*p == ']' || *p == '}') break;
         if (*p == ',') { p++; continue; }
@@ -1282,6 +1291,18 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             }
         }
         if (obj_heap) free(obj_str);
+    }
+
+    /* If parse tripped the deadline, abort before any write phase. Same
+       cleanup order as the OOM bail below. */
+    if (dl.timed_out) {
+        free(records);
+        arena_free(arena);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        OUT("{\"error\":\"query_timeout\"}\n");
+        return 1;
     }
 
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
@@ -1655,6 +1676,10 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
        free parse on the numeric / varchar / index sides. */
     struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
 
+    /* Per-request statement timeout — matches the JSON bulk-insert path. */
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+    int dl_counter = 0;
+
     /* ===== Phase 1: parse every CSV line into a buffered records[] array. The
        (ptr, len) span path stays zero-copy for the CSV body; `id` + typed
        `payload` come from a single BulkArena (bump alloc, 8-byte aligned) so
@@ -1665,6 +1690,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
 
     while (rp < data_end) {
+        if (query_deadline_tick(&dl, &dl_counter)) break;
         /* Find end of line without modifying the buffer */
         const char *eol = rp;
         while (eol < data_end && *eol != '\n' && *eol != '\r') eol++;
@@ -1756,6 +1782,17 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         r->payload = payload;
         r->klen = klen;
         compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+    }
+
+    /* If parse tripped the deadline, abort before any write phase. */
+    if (dl.timed_out) {
+        free(records);
+        arena_free(arena);
+        for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        OUT("{\"error\":\"query_timeout\"}\n");
+        return 1;
     }
 
     /* ===== Phase 1.5: bucket by shard — identical to the JSON path.

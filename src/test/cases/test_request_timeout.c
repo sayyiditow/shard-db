@@ -85,6 +85,54 @@ static int test_request_timeout_run(void) {
     ASSERT_CONTAINS(resp, "\"query_timeout\"", "bulk-update tight timeout trips");
     free(resp); resp = NULL;
 
+    /* bulk-insert (JSON) — write a 1.5M-record file too large to ingest in 10ms. */
+    {
+        char bi_path[256];
+        snprintf(bi_path, sizeof(bi_path), "/tmp/rt_bi_%d.json", (int)getpid());
+        FILE *bf = fopen(bi_path, "w");
+        if (bf) {
+            fputc('[', bf);
+            for (int i = 1; i <= SEED_RECORDS; i++) {
+                if (i > 1) fputc(',', bf);
+                fprintf(bf,
+                    "{\"key\":\"bi%d\",\"value\":{\"status\":\"x\",\"amount\":%d,"
+                    "\"note\":\"a-record-padding-here\"}}",
+                    i, i);
+            }
+            fputc(']', bf);
+            fclose(bf);
+        }
+        char req2[512];
+        snprintf(req2, sizeof(req2),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_big\","
+            "\"file\":\"%s\",\"timeout_ms\":10}", bi_path);
+        tc_request(tc, req2, &resp);
+        ASSERT_CONTAINS(resp, "\"query_timeout\"", "bulk-insert tight timeout trips");
+        free(resp); resp = NULL;
+        unlink(bi_path);
+    }
+
+    /* bulk-insert-delimited (CSV) — same idea via pipe-delimited file. */
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "/tmp/rt_bid_%d.csv", (int)getpid());
+        FILE *cf = fopen(csv_path, "w");
+        if (cf) {
+            for (int i = 1; i <= SEED_RECORDS; i++) {
+                fprintf(cf, "csv%d|x|%d|a-record-padding-here\n", i, i);
+            }
+            fclose(cf);
+        }
+        char req2[512];
+        snprintf(req2, sizeof(req2),
+            "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"rt_big\","
+            "\"file\":\"%s\",\"delimiter\":\"|\",\"timeout_ms\":10}", csv_path);
+        tc_request(tc, req2, &resp);
+        ASSERT_CONTAINS(resp, "\"query_timeout\"", "bulk-insert-delimited tight timeout trips");
+        free(resp); resp = NULL;
+        unlink(csv_path);
+    }
+
     /* bulk-delete dry_run. */
     tc_request(tc,
         "{\"mode\":\"bulk-delete\",\"dir\":\"default\",\"object\":\"rt_big\","
