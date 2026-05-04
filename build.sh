@@ -132,6 +132,9 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_binary_index.c \
     src/test/cases/test_stats_prom.c \
     src/test/cases/test_parallel_index_integrity.c \
+    src/test/cases/test_cli_shortcuts.c \
+    src/test/cases/test_agg_neq_shortcut.c \
+    src/test/cases/test_request_timeout.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
