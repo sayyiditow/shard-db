@@ -161,6 +161,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
 gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/shard-db-bench.c \
     src/bench/bench_stats.c \
+    src/bench/bench_table.c \
     src/bench/bench_kv.c \
     src/bench/bench_kv_parallel.c \
     src/bench/bench_grow.c \
