@@ -82,16 +82,16 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **358 k/sec** (2.79 s) |
+| Bulk insert (no indexes) | **357 k/sec** (2.80 s) |
 | Bulk insert (with 14 indexes) | **230 k/sec** (4.35 s) — 36% slowdown vs no-idx |
-| Add 14 indexes post-insert | **2.78 s** (per-shard parallel build — 14 × splits/4 workers) |
-| GET ×1000 (req-resp, 1 conn) | **27 k ops/sec** (mean 36µs / p50 34µs / p99 68µs) |
-| EXISTS ×1000 (req-resp) | **35 k ops/sec** (mean 28µs / p50 28µs / p99 33µs) |
+| Add 14 indexes post-insert | **2.79 s** (per-shard parallel build — 14 × splits/4 workers) |
+| GET ×1000 (req-resp, 1 conn) | **30 k ops/sec** (mean 33µs / p50 31µs / p99 101µs) |
+| EXISTS ×1000 (req-resp) | **37 k ops/sec** (mean 26µs / p50 26µs / p99 43µs) |
 | Indexed eq `find` (any of 14 indexes, limit 10) | **1–2 ms** |
 | Indexed `contains` via leaf scan | 1–11 ms |
 | Indexed IN (2 values) | 1 ms |
 | Composite index eq / starts | 1–2 ms |
-| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | 65–79 ms |
+| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | **64–65 ms** (cold-cache; the bench's pre-range battery never touches these btrees, so they're cold when range fires. Once warm — see §3's age-range numbers — these drop to <1 ms) |
 | Indexed `OR` (two statuses) | 23 ms |
 | Fetch page of 100 @ offset 5000 | 1 ms |
 | Keys (first 100) | <1 ms |
@@ -107,20 +107,22 @@ The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths 
 
 ## 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes
 
-`shard-db-bench run bench-parallel`, `SPLITS=64`. The numbers below come from the bash bench (`bench-parallel.sh`); they understate parallel throughput because the bash version forks a `shard-db query` subprocess per chunk (~10–30 ms per fork ×5 chunks). The C bench replaces the subprocess fan-out with pthreads — running it gives the more honest numbers, particularly for the parallel rows. Numbers in this section will be refreshed once `bench-parallel` C-bench output is captured at this scale.
+`shard-db-bench run bench-parallel`, `SPLITS=64`, 5 connections × 200 k records each.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 5.92 s | **169 k/sec** |
-| Single CSV, 1M, no indexes | 1.98 s | **505 k/sec** |
-| Parallel JSON, 5 conns, no indexes | 3.06 s | 326 k/sec (bash; understated) |
-| Parallel JSON, 5 conns, pre-existing 14 indexes | 5.27 s | **190 k/sec** (bash) |
-| Parallel CSV, 5 conns, no indexes | 3.17 s | 316 k/sec (bash; understated) |
-| Parallel CSV, 5 conns, pre-existing 14 indexes | 5.22 s | **191 k/sec** (bash) |
-| Add 14 indexes after bulk insert | ~2.78 s | (per-shard parallel build) |
+| Single JSON, 1M, no indexes | 2.67 s | 374 k/sec |
+| Single CSV, 1M, no indexes | 1.11 s | **903 k/sec** |
+| **Parallel JSON, 5 conns × 200K, no indexes** | **0.72 s** | **1.40 M/sec** (3.7× single JSON) |
+| Parallel JSON, 5 conns × 200K, pre-existing 14 indexes | 2.61 s | 384 k/sec |
+| **Parallel CSV, 5 conns × 200K, no indexes** | **0.40 s** | **2.48 M/sec** (2.7× single CSV) ← fastest |
+| **Parallel CSV, 5 conns × 200K, pre-existing 14 indexes** | **2.30 s** | **435 k/sec** |
+| Add 14 indexes after bulk insert | ~2.6 s | (per-shard parallel build) |
 | Disk footprint (with 14 indexes) | 1.6 GB |
 
-The K/V parallel C-bench results in §2 above show parallel beating single by ~1.4× at this hardware, so the real invoice parallel numbers are likely ~2× higher than the table shows for the no-index parallel rows. Indexed parallel is bottlenecked on phase-4 per-(field, shard) btree merges and benefits less from pthreads-vs-subprocess.
+**Parallel CSV no-idx hits 2.48 M/sec** — 2.7× single CSV's 903 k/sec, and roughly 5× the previously published bash-bench number for this scenario. Pre-grow contributes a ~2× win on every path; the parallel-vs-single benefit is on top of that and hasn't disappeared. **Use parallel for max throughput.**
+
+For indexed loads at 1M / 5×200K, **parallel CSV with pre-existing indexes (2.30 s) beats parallel CSV no-idx + add-indexes (0.40 + 2.6 = 3.0 s) by 1.3×**, and beats single-conn load-then-index (1.11 + 2.69 = 3.80 s) by 1.65×. So pre-existing-indexes parallel wins at this scale. The R² merge-cost rule (see chunk-size tuning below) means this advantage shrinks as you push R higher: at 10M with the same 200K chunks (R=50), the merge cycles dominate and load-then-index can pull ahead. Re-bench when you change scale.
 
 ### Indexed bulk-insert chunk-size tuning
 
@@ -128,16 +130,19 @@ The per-shard btree layout (2026.05.1+) makes indexed bulk-insert sensitive to t
 
 **Recommended at 1M+ records:** prefer **fewer, larger** bulk-insert calls. `requests ≈ N / 200_000` with `5 ≤ connections` remains a sensible floor: each request triggers one merge cycle per (field, shard), so packing more rows per request keeps the cycle count down. For non-indexed data loads, parallel always pays off (see §2); for indexed loads, parallel still helps, just by less because phase-4 dominates.
 
-### Load-then-index for static schemas
+### Pattern comparison for indexed batch ingest (1M / 5×200K)
 
-For static-schema bulk loads at 1M+ records, the load-then-index pattern is competitive with pre-existing-indexes parallel and avoids the merge-into-existing penalty:
+C-bench measurements:
 
 | Pattern | 1M × 14 idx total time | Throughput |
 |---|---|---|
-| Load CSV (single-conn) → add-indexes | 1.98 s + 2.78 s = 4.76 s | 210 k/sec |
-| Pre-existing indexes (parallel CSV, 5 conns) | 5.22 s | 191 k/sec |
+| **Parallel CSV with pre-existing 14 idx (5 conns × 200K)** | **2.30 s** | **435 k/sec** ← winner at this scale |
+| Parallel CSV no-idx → add-indexes | 0.40 + 2.62 = 3.02 s | 331 k/sec |
+| Single CSV no-idx → add-indexes | 1.11 + 2.69 = 3.80 s | 263 k/sec |
 
-Load-then-index wins on this bash measurement; the C bench at parallel-conn invoice will tell us whether parallel-with-pre-existing-indexes catches up at that path's true throughput. Either way, **load-then-index is the simpler, safer recommendation for batch ingest** of static schemas because it avoids the per-(field, shard) merge cycle entirely. **Use pre-existing indexes for streaming workloads** where add-index isn't an option.
+The earlier "load-then-index always wins" guidance came from bash measurements that under-counted parallel throughput; with C bench, **parallel + pre-existing-indexes is the fastest path at 1M / 5×200K**. The R² merge-cost rule still applies — if you scale to 10M with the same 200K chunks (R=50), the merge cycles balloon and load-then-index reclaims the lead. As a rule of thumb: at the recommended `R ≈ N/200K` chunk count, pre-existing-indexes parallel wins for `R ≤ ~10`, and load-then-index wins for `R ≥ ~20`. Bench at your scale.
+
+**Use load-then-index** when you can afford to drop indexes during the load (static schemas, batch-ingest pipelines), at very large scales where R is high, or when operational simplicity matters. **Use pre-existing-indexes parallel** for streaming workloads or moderate batch sizes (1M ish) where R stays small.
 
 ## Disk footprint
 
