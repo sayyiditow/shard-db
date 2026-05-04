@@ -119,6 +119,8 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_describe.c \
     src/test/cases/test_tenant_mgmt.c \
     src/test/cases/test_regex.c \
+    src/test/cases/test_bare_shapes.c \
+    src/test/cases/test_list_files.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
