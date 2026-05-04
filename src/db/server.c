@@ -1442,6 +1442,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         cmd_truncate(db_root, object);
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
+    } else if (strcmp(mode, "restore") == 0) {
+        char *from = json_obj_strdup(&req, "from");
+        char *fstr = json_obj_strdup(&req, "force");
+        int force = fstr && strcmp(fstr, "true") == 0;
+        cmd_restore(db_root, object, from, force);
+        free(from); free(fstr);
     } else if (strcmp(mode, "put-file") == 0) {
         char *data = json_obj_strdup(&req, "data");
         if (data) {
@@ -1770,6 +1776,10 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
                  arg4[0] ? arg4 : NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     } else if (strcasecmp(cmd, "backup") == 0) {
         cmd_backup(eff_root, object);
+    } else if (strcasecmp(cmd, "restore") == 0) {
+        /* restore\tobj\tfrom[\t--force] */
+        int force = (arg2[0] && strcmp(arg2, "--force") == 0);
+        cmd_restore(eff_root, object, arg1[0] ? arg1 : NULL, force);
     } else if (strcasecmp(cmd, "add-index") == 0) {
         int force = (arg2[0] && strcmp(arg2, "-f") == 0);
         cmd_add_index(eff_root, object, arg1, force);

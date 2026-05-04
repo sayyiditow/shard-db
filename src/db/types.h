@@ -854,6 +854,11 @@ int cmd_recount(const char *db_root, const char *object);
 int cmd_shard_stats(const char *db_root, const char *object, int as_table);
 int cmd_truncate(const char *db_root, const char *object);
 int cmd_backup(const char *db_root, const char *object);
+/* Symmetric to backup: copies data/ + indexes/ + metadata/ from
+   <obj>/backup/<from>/ over the live tree. force=1 overwrites
+   non-empty live subtrees. Holds objlock_wrlock. */
+int cmd_restore(const char *db_root, const char *object,
+                const char *from, int force);
 int cmd_sequence(const char *db_root, const char *object, const char *seq_name, const char *action, int batch_size);
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,

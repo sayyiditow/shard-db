@@ -9577,6 +9577,118 @@ int cmd_backup(const char *db_root, const char *object) {
     return 0;
 }
 
+/* ========== RESTORE ==========
+   Symmetric to backup: copies data/ + indexes/ + metadata/ from
+   `<obj>/backup/<from>` over the live tree. Refuses if any of the three
+   subtrees already exist on the live side, unless force=1. Holds the
+   object's write lock for the whole operation; invalidates ucache + bt
+   cache + idx cache + schema caches before the swap so the next reader
+   sees the new mappings. fields.conf / schema.conf live above this
+   subtree and are not touched — restore is data-only, schema must
+   match the backup point-in-time. */
+int cmd_restore(const char *db_root, const char *object,
+                const char *from, int force) {
+    if (!from || !*from) { OUT("{\"error\":\"from is required\"}\n"); return 1; }
+    if (strchr(from, '/') || strstr(from, "..")) {
+        OUT("{\"error\":\"invalid from (no slashes or '..' allowed)\"}\n");
+        return 1;
+    }
+
+    char obj_dir[PATH_MAX], src_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    snprintf(src_dir, sizeof(src_dir), "%s/backup/%s", obj_dir, from);
+    struct stat st;
+    if (stat(obj_dir, &st) != 0) {
+        OUT("{\"error\":\"object not found\"}\n"); return 1;
+    }
+    if (stat(src_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        OUT("{\"error\":\"backup not found: %s\"}\n", from); return 1;
+    }
+
+    objlock_wrlock(db_root, object);
+
+    const char *subs[] = { "data", "indexes", "metadata" };
+    char src_sub[PATH_MAX], dst_sub[PATH_MAX];
+
+    /* Refuse if any live subdir is non-empty, unless force=1. */
+    if (!force) {
+        for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+            snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
+            if (stat(dst_sub, &st) == 0 && S_ISDIR(st.st_mode)) {
+                DIR *d = opendir(dst_sub);
+                if (d) {
+                    struct dirent *e; int empty = 1;
+                    while ((e = readdir(d))) {
+                        if (e->d_name[0] == '.' &&
+                            (e->d_name[1] == '\0' ||
+                             (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                        empty = 0; break;
+                    }
+                    closedir(d);
+                    if (!empty) {
+                        objlock_wrunlock(db_root, object);
+                        OUT("{\"error\":\"%s/ is not empty (use force=true to overwrite)\"}\n",
+                            subs[i]);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Drop caches first so readers can't pin the old mappings while we swap.
+       fcache_invalidate handles data shards; the btree page cache holds open
+       fd+mmap per <field>/<NNN>.idx, so walk indexes/ explicitly (same
+       pattern as index.c::reindex_clean_legacy). */
+    fcache_invalidate(obj_dir);
+    invalidate_idx_cache(object);
+    invalidate_schema_caches(db_root, object);
+    {
+        char idx_root[PATH_MAX];
+        snprintf(idx_root, sizeof(idx_root), "%s/indexes", obj_dir);
+        DIR *d = opendir(idx_root);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                char field_dir[PATH_MAX];
+                snprintf(field_dir, sizeof(field_dir), "%s/%s", idx_root, e->d_name);
+                struct stat fst;
+                if (stat(field_dir, &fst) != 0) continue;
+                if (S_ISDIR(fst.st_mode)) {
+                    DIR *sd = opendir(field_dir);
+                    if (sd) {
+                        struct dirent *se;
+                        while ((se = readdir(sd))) {
+                            if (se->d_name[0] == '.') continue;
+                            char sp[PATH_MAX];
+                            snprintf(sp, sizeof(sp), "%s/%s", field_dir, se->d_name);
+                            btree_cache_invalidate(sp);
+                        }
+                        closedir(sd);
+                    }
+                } else if (S_ISREG(fst.st_mode)) {
+                    btree_cache_invalidate(field_dir);
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    /* Wipe live subtrees, then copy from backup. */
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
+        rmrf(dst_sub);
+        snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
+        if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    }
+
+    objlock_wrunlock(db_root, object);
+
+    OUT("{\"status\":\"restored\",\"object\":\"%s\",\"from\":\"%s\"}\n", object, from);
+    return 0;
+}
+
 /* ========== RECOUNT ========== */
 
 /* Recount uses its own parallel scan — historically a duplicate of

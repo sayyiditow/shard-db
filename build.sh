@@ -145,6 +145,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_per_tenant_auth.c \
     src/test/cases/test_stress_no_hang.c \
     src/test/cases/test_tls.c \
+    src/test/cases/test_restore.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto

@@ -45,6 +45,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  recount <object>                     Recalculate count\n");
         fprintf(stderr, "  truncate <object>                    Delete all data\n");
         fprintf(stderr, "  backup <object>                      Backup data\n");
+        fprintf(stderr, "  restore <object> <timestamp> [--force]\n");
+        fprintf(stderr, "                                       Restore from <obj>/backup/<timestamp>/\n");
         fprintf(stderr, "  put-file <dir> <object> <local-path> [--if-not-exists]\n");
         fprintf(stderr, "                                       Upload file (base64 over TCP)\n");
         fprintf(stderr, "  get-file <dir> <object> <filename> [<out-path>]\n");
