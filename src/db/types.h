@@ -803,6 +803,15 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *max_val, size_t max_len, int max_exclusive,
                             int desc, bt_result_cb cb, void *ctx);
 
+/* Flush any thread-local accumulator populated by callbacks during the
+   current btree per-shard walk. Defined in query.c (where idx_count_cb
+   lives); shard_walk_worker (index.c) calls it after each per-shard
+   btree_search/btree_range/btree_range_ex returns so the orchestrator's
+   post-parallel_for read of the shared count sees every worker's
+   contribution. Currently only idx_count_cb uses TLS; if more callbacks
+   adopt the pattern, fan out from this single hook. */
+void idx_count_cb_flush_thread(void);
+
 /* Drop every shard file for an index and the parent directory. */
 void btree_idx_unlink_all(const char *db_root, const char *object,
                           const char *field, int splits);

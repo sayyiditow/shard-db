@@ -93,6 +93,12 @@ static void *shard_walk_worker(void *arg) {
                                sw->max_val, sw->max_len, sw->max_exclusive,
                                sw->cb, sw->ctx); break;
     }
+    /* Flush any thread-local accumulator the callback populated while
+       walking this shard. Today only idx_count_cb batches (it amortises
+       per-match atomic-adds into one per-shard-worker atomic-add); if
+       more callbacks adopt the same pattern, hook them in this single
+       cleanup point. No-op for callbacks that don't use TLS. */
+    idx_count_cb_flush_thread();
     return NULL;
 }
 
