@@ -11,6 +11,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"   /* SB_APPEND — safe StringBuilder vs CodeQL snprintf-overflow flag */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,14 +39,14 @@ static char *build_payload(int chunk) {
     char *buf = malloc(cap);
     if (!buf) return NULL;
     size_t len = 0;
-    len += (size_t)snprintf(buf + len, cap - len,
+    SB_APPEND(buf, len, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"idxtest\","
         "\"records\":[");
     for (int i = chunk * PER_CHUNK; i < (chunk + 1) * PER_CHUNK; i++) {
         const char *s = STATUSES[i % 4];
         const char *r = REGIONS[i % 5];
         const char *t = TIERS[i % 3];
-        len += (size_t)snprintf(buf + len, cap - len,
+        SB_APPEND(buf, len, cap,
             "%s{\"key\":\"k%d\",\"value\":{\"status\":\"%s\",\"region\":\"%s\","
             "\"tier\":\"%s\",\"amount\":%d}}",
             (i == chunk * PER_CHUNK) ? "" : ",", i, s, r, t, i);
@@ -56,7 +57,7 @@ static char *build_payload(int chunk) {
             buf = nb;
         }
     }
-    len += (size_t)snprintf(buf + len, cap - len, "]}");
+    SB_APPEND(buf, len, cap, "]}");
     return buf;
 }
 

@@ -9983,32 +9983,46 @@ int cmd_restore(const char *db_root, const char *object,
     char fields_src[PATH_MAX], fields_dst[PATH_MAX];
     snprintf(fields_src, sizeof(fields_src), "%s/fields.conf", src_dir);
     snprintf(fields_dst, sizeof(fields_dst), "%s/fields.conf", obj_dir);
-    if (stat(fields_src, &st) == 0 && S_ISREG(st.st_mode)) {
-        struct stat lst;
-        if (stat(fields_dst, &lst) == 0 && S_ISREG(lst.st_mode) && !force) {
-            /* Compare contents — same size + same bytes = identical. */
-            int same = 0;
-            if (lst.st_size == st.st_size) {
-                FILE *fa = fopen(fields_src, "r");
-                FILE *fb = fopen(fields_dst, "r");
-                if (fa && fb) {
+    /* Open-then-fstat instead of stat-then-open. The earlier pattern was a
+       TOCTOU: between the stat() and fopen(), a malicious symlink swap
+       could redirect us to /etc/passwd or similar. Opening first and
+       fstat'ing the resulting fd makes the type/size check authoritative
+       on the actual stream we're going to read. */
+    FILE *fa_pre = fopen(fields_src, "re");
+    if (fa_pre) {
+        struct stat sa;
+        if (fstat(fileno(fa_pre), &sa) == 0 && S_ISREG(sa.st_mode)) {
+            FILE *fb_pre = fopen(fields_dst, "re");
+            int dst_present = 0;
+            struct stat sb;
+            if (fb_pre && fstat(fileno(fb_pre), &sb) == 0 && S_ISREG(sb.st_mode))
+                dst_present = 1;
+            if (dst_present && !force) {
+                /* Compare contents — same size + same bytes = identical. */
+                int same = 0;
+                if (sb.st_size == sa.st_size) {
                     same = 1;
                     int ca, cb;
-                    while ((ca = fgetc(fa)) != EOF && (cb = fgetc(fb)) != EOF) {
+                    while ((ca = fgetc(fa_pre)) != EOF && (cb = fgetc(fb_pre)) != EOF) {
                         if (ca != cb) { same = 0; break; }
                     }
                 }
-                if (fa) fclose(fa);
-                if (fb) fclose(fb);
+                if (fb_pre) fclose(fb_pre);
+                fclose(fa_pre);
+                if (!same) {
+                    objlock_wrunlock(db_root, object);
+                    OUT("{\"error\":\"fields.conf differs between live and backup "
+                        "(use force=true to overwrite)\"}\n");
+                    return 1;
+                }
+            } else {
+                if (fb_pre) fclose(fb_pre);
+                fclose(fa_pre);
             }
-            if (!same) {
-                objlock_wrunlock(db_root, object);
-                OUT("{\"error\":\"fields.conf differs between live and backup "
-                    "(use force=true to overwrite)\"}\n");
-                return 1;
-            }
+            copy_file(fields_src, fields_dst, sa.st_mode);
+        } else {
+            fclose(fa_pre);
         }
-        copy_file(fields_src, fields_dst, st.st_mode);
     }
 
     /* Drop caches first so readers can't pin the old mappings while we swap.

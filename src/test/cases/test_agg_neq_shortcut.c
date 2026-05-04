@@ -12,6 +12,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"   /* SB_APPEND — safe StringBuilder vs CodeQL snprintf-overflow flag */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,21 +46,24 @@ static int test_agg_neq_shortcut_run(void) {
         "\"fields\":[\"status:varchar:16\",\"region:varchar:8\",\"amount:int\"],"
         "\"indexes\":[\"status\"],\"splits\":16}", &resp); free(resp); resp = NULL;
 
-    /* Seed 100 rows: paid iff i%5==0, region us iff odd, amount=i. */
+    /* Seed 100 rows: paid iff i%5==0, region us iff odd, amount=i.
+       SB_APPEND prevents the `len += snprintf(...)` overflow CodeQL
+       flags — snprintf returns the would-have-written length, so on
+       truncation len could advance past cap and underflow cap-len. */
     size_t cap = 100 * 96 + 256;
     char *payload = malloc(cap);
     if (!payload) { tc_close(tc); test_env_stop(&env); return 1; }
     size_t len = 0;
-    len += (size_t)snprintf(payload + len, cap - len,
+    SB_APPEND(payload, len, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"neq_t\",\"records\":[");
     for (int i = 1; i <= 100; i++) {
         const char *s = (i % 5 == 0) ? "paid" : "pending";
         const char *r = (i % 2 == 1) ? "us" : "eu";
-        len += (size_t)snprintf(payload + len, cap - len,
+        SB_APPEND(payload, len, cap,
             "%s{\"key\":\"k%d\",\"value\":{\"status\":\"%s\",\"region\":\"%s\",\"amount\":%d}}",
             (i == 1) ? "" : ",", i, s, r, i);
     }
-    len += (size_t)snprintf(payload + len, cap - len, "]}");
+    SB_APPEND(payload, len, cap, "]}");
     tc_request(tc, payload, &resp); free(resp); resp = NULL;
     free(payload);
 

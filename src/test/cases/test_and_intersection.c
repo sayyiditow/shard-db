@@ -12,6 +12,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"   /* SB_APPEND — safe StringBuilder vs CodeQL snprintf-overflow flag */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,12 +60,15 @@ static int test_and_intersection_run(void) {
                     "\"region:varchar:16\",\"notes:varchar:64\"],"
         "\"indexes\":[\"status\",\"amount\",\"region\"]}", &resp); free(resp); resp = NULL;
 
-    /* Build 200-record bulk-insert via single payload. */
+    /* Build 200-record bulk-insert via single payload. SB_APPEND prevents
+       the `off += snprintf(...)` overflow that CodeQL flags — snprintf's
+       return value is the would-have-written length, so on truncation
+       len advances past cap and subsequent writes underflow cap-len. */
     size_t cap = 200 * 256 + 256;
     char *payload = malloc(cap);
     if (!payload) { tc_close(tc); test_env_stop(&env); return 1; }
     size_t len = 0;
-    len += (size_t)snprintf(payload + len, cap - len,
+    SB_APPEND(payload, len, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ix_orders\",\"records\":[");
     for (int i = 1; i <= 200; i++) {
         const char *st = "paid"; int amt = 0; const char *region = "us";
@@ -74,12 +78,12 @@ static int test_and_intersection_run(void) {
             case 2: st = "paid"; amt = 200 + i; region = "eu"; break;
             case 3: st = "cancelled"; amt = 30 + i; region = "us"; break;
         }
-        len += (size_t)snprintf(payload + len, cap - len,
+        SB_APPEND(payload, len, cap,
             "%s{\"key\":\"k%d\",\"value\":{\"status\":\"%s\",\"amount\":%d,"
             "\"region\":\"%s\",\"notes\":\"order %d\"}}",
             (i == 1) ? "" : ",", i, st, amt, region, i);
     }
-    len += (size_t)snprintf(payload + len, cap - len, "]}");
+    SB_APPEND(payload, len, cap, "]}");
     tc_request(tc, payload, &resp); free(resp); resp = NULL;
     free(payload);
 
