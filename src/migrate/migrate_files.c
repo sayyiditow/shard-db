@@ -2,12 +2,17 @@
    Filesystem-only, no daemon required, no shared state with the daemon.
    Linked into the ./migrate binary; not part of shard-db. */
 
-#define _POSIX_C_SOURCE 200809L
+/* _GNU_SOURCE for renameat2 + RENAME_NOREPLACE (atomic rename-if-not-exists,
+   used on the moves below to close the stat()→rename() TOCTOU window). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -60,18 +65,23 @@ static int migrate_object_files(const char *db_root, const char *dir,
                 char src[PATH_MAX], dst[PATH_MAX];
                 snprintf(src, sizeof(src), "%s/%s", sub2, e3->d_name);
                 snprintf(dst, sizeof(dst), "%s/%s", files_dir, e3->d_name);
-                struct stat st;
-                if (stat(dst, &st) == 0) {
-                    fprintf(stderr,
-                        "migrate-files: skip %s/%s/%s (flat target exists at %s)\n",
-                        dir, obj, e3->d_name, dst);
-                    conflicts++;
-                    continue;
-                }
-                if (rename(src, dst) != 0) {
-                    fprintf(stderr,
-                        "migrate-files: rename failed for %s -> %s: %s\n",
-                        src, dst, strerror(errno));
+                /* Atomic "rename only if target doesn't exist". Closes
+                   the stat→rename TOCTOU window CodeQL flags — even
+                   though the daemon is stopped during migration so the
+                   race is benign in practice, renameat2 with the
+                   RENAME_NOREPLACE flag does the same thing in one
+                   syscall and lets the kernel enforce exclusivity. */
+                if (renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE) != 0) {
+                    if (errno == EEXIST) {
+                        fprintf(stderr,
+                            "migrate-files: skip %s/%s/%s (flat target exists at %s)\n",
+                            dir, obj, e3->d_name, dst);
+                        conflicts++;
+                    } else {
+                        fprintf(stderr,
+                            "migrate-files: rename failed for %s -> %s: %s\n",
+                            src, dst, strerror(errno));
+                    }
                     continue;
                 }
                 moved++;
