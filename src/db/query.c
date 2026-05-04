@@ -9845,8 +9845,14 @@ static int parse_object_meta(const char *path, int *out_splits, int *out_max_key
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char buf[256] = {0};
-    fread(buf, 1, sizeof(buf) - 1, f);
+    /* Tolerant read — short reads, EOF, or read errors all fall through to
+       the strstr scan below; missing keys → return 0. NUL-terminate at the
+       actual byte count so strstr can't run past valid data. */
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    int read_err = ferror(f);
     fclose(f);
+    if (read_err) return 0;
+    buf[n] = '\0';
     int splits = -1, max_key = -1;
     const char *p = strstr(buf, "\"splits\":");
     if (p) splits = atoi(p + strlen("\"splits\":"));
