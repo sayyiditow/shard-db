@@ -4842,15 +4842,25 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             return 1;
         case OP_REGEX:
         case OP_NOT_REGEX:
-            /* Legacy/composite path: no pre-compiled regex available
-               (CompiledCriterion lives in the typed path). Compile inline
-               per-call — slow but rare; typed-binary records use the fast
-               path in match_typed_varchar. */
+            /* Legacy/composite path: no pre-compiled regex on SearchCriterion
+               (CompiledCriterion lives in the typed path). Per-thread cache
+               of (pattern → regex_t) so regcomp fires once per thread per
+               distinct pattern, not once per match. Hot on indexed-regex
+               callbacks (collect_hash_cb / idx_count_cb) where every leaf
+               entry hits this branch. */
             {
-                regex_t r;
-                if (regcomp(&r, c->value, REG_EXTENDED | REG_NOSUB) != 0) return 0;
-                int hit = (regexec(&r, val_str, 0, NULL, 0) == 0);
-                regfree(&r);
+                static __thread regex_t  re_cached;
+                static __thread char     pat_cached[1024];
+                static __thread int      pat_compiled = 0;
+                if (!pat_compiled || strcmp(pat_cached, c->value) != 0) {
+                    if (pat_compiled) { regfree(&re_cached); pat_compiled = 0; }
+                    if (regcomp(&re_cached, c->value, REG_EXTENDED | REG_NOSUB) != 0)
+                        return c->op == OP_REGEX ? 0 : 1;
+                    strncpy(pat_cached, c->value, sizeof(pat_cached) - 1);
+                    pat_cached[sizeof(pat_cached) - 1] = '\0';
+                    pat_compiled = 1;
+                }
+                int hit = (regexec(&re_cached, val_str, 0, NULL, 0) == 0);
                 return c->op == OP_REGEX ? hit : !hit;
             }
         case OP_LEN_EQ:
@@ -6361,7 +6371,8 @@ static int op_needs_check_primary(enum SearchOp op) {
            op == OP_NOT_LIKE || op == OP_NOT_CONTAINS || op == OP_NOT_IN ||
            op == OP_ILIKE || op == OP_ICONTAINS ||
            op == OP_ISTARTS_WITH || op == OP_IENDS_WITH ||
-           op == OP_INOT_LIKE || op == OP_INOT_CONTAINS;
+           op == OP_INOT_LIKE || op == OP_INOT_CONTAINS ||
+           op == OP_REGEX || op == OP_NOT_REGEX;
 }
 
 /* True if the op is a length comparator answerable from (val, vlen) alone —
@@ -7593,12 +7604,19 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
         c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
         c->op == OP_LTE_FIELD || c->op == OP_GTE_FIELD) return 0;
-    /* Regex needs full content of every value to match — btree leaf bytes
-       could carry it, but the per-entry regexec cost dominates so the
-       indexed path's only saving is record-fetch avoidance, marginal vs
-       the full scan. Keep regex on the full-scan path; revisit only with
-       a real workload signal. */
-    if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) return 0;
+    /* Regex on indexed varchar: the btree leaf carries the literal bytes,
+       so the callback can regexec directly without a record fetch. The
+       legacy match_criterion regex case caches the compiled pattern in a
+       thread-local, so regcomp fires once per thread, not per leaf entry.
+       Non-varchar indexed fields store memcmp-sortable encoded bytes (top-
+       bit-flipped ints, etc.) — running a regex on those would match
+       garbage, so keep them on the full-scan path. */
+    if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) {
+        TypedSchema *ts = load_typed_schema(db_root, object);
+        if (!ts) return 0;
+        int fi = typed_field_index(ts, c->field);
+        if (fi < 0 || ts->fields[fi].type != FT_VARCHAR) return 0;
+    }
 
     /* Per-shard layout: index lives at <obj>/indexes/<field>/<NNN>.idx with
        index_splits_for(splits) shards. btree_idx_exists checks for any
