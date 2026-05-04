@@ -154,7 +154,7 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./migrate
 ```
 
-**Bulk-insert at scale**: prefer FEWER, LARGER calls. Each request triggers a sequential `bulk_merge` per (field, shard); cumulative work scales O(R²) where R = request count. Sweet spot at 1M records ≈ 5 conns × 200K records.
+**Bulk-insert at scale**: as of pre-grow (2026.05.x), single-connection beats parallel for non-indexed loads (CSV K/V hits 4.76 M/sec single, vs. 3.40 M/sec at 5 conns × 2M). For indexed loads at 1M+ records, **load-then-index** with single conn (1.98 + 2.78 s = 4.76 s on invoice 1M × 14 idx) now outperforms pre-existing-indexes parallel (5.22 s at 5×200K). The old "FEWER LARGER calls, R = N/200K" rule was driven by the in-loop shard-grow stall that pre-grow has eliminated. Pre-existing-indexes parallel only helps for streaming workloads where add-index-after isn't an option.
 
 ## JSON query protocol
 

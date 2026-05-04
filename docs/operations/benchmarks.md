@@ -10,33 +10,36 @@ Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape 
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **1.97 M inserts/sec** (5.08 s) |
-| Bulk insert (CSV, 10M in one request) | **2.39 M inserts/sec** (4.19 s) |
-| GET ×10,000 (pipelined, 1 conn) | **22.1 k ops/sec** (453 ms) |
-| EXISTS ×10,000 hits (pipelined) | **22.8 k ops/sec** (439 ms) |
-| EXISTS ×10,000 all-miss (cold probe) | **66.7 k ops/sec** (150 ms) |
-| UPDATE ×10,000 (pipelined) | **17.8 k ops/sec** (561 ms) |
-| DELETE ×10,000 (pipelined) | **9.05 k ops/sec** (1.11 s) |
-| Parallel GET (5 conns × 10k) | **91.2 k ops/sec** (548 ms) |
-| Parallel UPDATE (5 conns × 10k) | **62.9 k ops/sec** (795 ms) |
+| Bulk insert (JSON, 10M in one request) | **3.76 M inserts/sec** (2.66 s) |
+| Bulk insert (CSV, 10M in one request) | **4.76 M inserts/sec** (2.10 s) |
+| GET ×10,000 (pipelined, 1 conn) | **23.0 k ops/sec** (434 ms) |
+| EXISTS ×10,000 hits (pipelined) | **22.8 k ops/sec** (438 ms) |
+| EXISTS ×10,000 all-miss (cold probe) | **66.2 k ops/sec** (151 ms) |
+| UPDATE ×10,000 (pipelined) | **19.9 k ops/sec** (502 ms) |
+| DELETE ×10,000 (pipelined) | **10.1 k ops/sec** (988 ms) |
+| Parallel GET (5 conns × 10k) | **90.1 k ops/sec** (555 ms) |
+| Parallel UPDATE (5 conns × 10k) | **66.7 k ops/sec** (750 ms) |
 | Disk footprint | 2.3 GB |
 
 ## 2. K/V multi-threaded — 10M records, scaling across connections
 
-`bench-kv-parallel.sh 10000000 1000000 10`, `SPLITS=128`.
+`bench-kv-parallel.sh 10000000 2000000 5`, `SPLITS=128`.
 
 Same schema, bulk insert fanned out across TCP connections. `SPLITS=128` is the sweet spot for 10M rows (≈78K records/shard — see the [splits sizing table](#splits-tuning)); going to 1024 at this scale *slows* the benchmark.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 10M | 4.86 s | **2.06 M/sec** |
-| Single CSV, 10M | 4.27 s | **2.34 M/sec** |
-| **Parallel JSON, 10 conns × 1M** | **3.73 s** | **2.68 M/sec** (1.30× single) |
-| **Parallel CSV, 10 conns × 1M** | **3.67 s** | **2.72 M/sec** (1.16× single) |
+| **Single JSON, 10M** | **2.64 s** | **3.79 M/sec** |
+| **Single CSV, 10M** | **2.10 s** | **4.76 M/sec** ← fastest |
+| Parallel JSON, 5 conns × 2M | 3.02 s | 3.31 M/sec (0.87× single) |
+| Parallel CSV, 5 conns × 2M | 2.94 s | 3.40 M/sec (0.71× single) |
 
-Shard load distribution (128 splits): avg 0.596, records stddev 1.6 %, 9 grows per shard.
+Shard load distribution (128 splits): avg 0.596, records stddev 1.6 %, 1 grow per shard (down from 9 pre-2026.05.x — see [pre-grow](#shard-grow-pre-sizing) below).
 
-**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **2.34 M/sec single-connection** (CSV) and **2.72 M/sec** across 10 connections, over TCP with CSV parsing on the server. Single-connection → parallel ratio is now only 1.16–1.30× because the single-connection path is already fast enough that CPU-bound mmap writeback is the ceiling — adding connections mostly shortens the wall clock, not the cost per record.
+**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **4.76 M/sec single-connection** (CSV), over TCP with CSV parsing on the server. **Parallel inserts are now slower than single-connection** — the in-loop shard-grow stall that previously made parallel-conn worthwhile has been eliminated by pre-sizing shards from the incoming batch. Multiple connections each pay their own pipeline tail (parse, bucket, dispatch, activate, index merge per call) competing for the shared worker pool, with no grow-stall savings to amortize. **Use a single connection for K/V bulk insert.**
+
+<a id="shard-grow-pre-sizing"></a>
+**Pre-grow (2026.05.x):** when `bulk-insert` receives a batch, the dispatcher reads each shard's current `slots_per_shard` and live record count, computes the smallest power-of-2 that holds (live + incoming), and grows each shard to that target once before workers start. Pre-grows run in parallel via the worker pool. The previous behaviour (worker grew its shard every time it overflowed during the insert) caused 9 incremental grows per shard at SPLITS=128 / 10M records, each rebucketing the existing data; now that's 1 pre-grow per shard with zero rebucket (the shards are empty when pre-grow fires for a fresh load).
 
 ## 3. Queries on 1M users
 
@@ -74,11 +77,11 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **117 k/sec** (8.55 s) |
-| Bulk insert (with 14 indexes) | **90 k/sec** (11.13 s) — 23 % index overhead |
-| Add 14 indexes post-insert | **2.85 s** (per-shard parallel build — 14 × splits/4 workers) |
-| GET ×1000 (pipelined) | **42 k ops/sec** (24 ms) |
-| EXISTS ×1000 (pipelined) | **48 k ops/sec** (21 ms) |
+| Bulk insert (no indexes) | **161 k/sec** (6.19 s) |
+| Bulk insert (with 14 indexes) | **128 k/sec** (7.78 s) — 20 % index overhead |
+| Add 14 indexes post-insert | **2.79 s** (per-shard parallel build — 14 × splits/4 workers) |
+| GET ×1000 (pipelined) | **41 k ops/sec** (24 ms) |
+| EXISTS ×1000 (pipelined) | **55 k ops/sec** (18 ms) |
 | Indexed eq `find` (any of 14 indexes, limit 10) | **5 ms** |
 | Indexed `contains` via leaf scan | 5–15 ms |
 | Indexed IN (2 values) | 5 ms |
@@ -86,9 +89,9 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 | Indexed `range` | 3 ms |
 | Fetch page of 100 @ offset 5000 | 5 ms |
 | Keys (first 100) | 4 ms |
-| **Single DELETE ×1000 (with 14 indexes)** | **7.8 k/sec** (129 ms) — 2.7× faster vs pre-2026.05.1 |
+| **Single DELETE ×1000 (with 14 indexes)** | **7.8 k/sec** (128 ms) — 2.7× faster vs pre-2026.05.1 |
 | **Bulk DELETE ×1000** | **77 k/sec** (13 ms) — 16× faster vs pre-2026.05.1 |
-| VACUUM | 8 ms |
+| VACUUM | 6 ms |
 | Disk footprint | 1.6 GB |
 
 The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths now going through the unified shard cache (`ucache_get_write` per shard). Pre-2026.05.1 they did per-call `open + flock + mmap MAP_SHARED + munmap`, paying full page-fault tax per request.
@@ -97,37 +100,41 @@ The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths 
 
 `bench-parallel.sh 1000000 200000 5`, `SPLITS=64`.
 
-Same schema, **5 connections × 200 k records each** — the sweet spot for indexed bulk inserts at this scale (see chunk-size tuning below).
+Same schema, comparing single-connection against **5 connections × 200 k records each**.
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 8.20 s | **122 k/sec** |
-| Single CSV, 1M, no indexes | 4.20 s | **238 k/sec** |
-| **Parallel JSON, 5 conns, no indexes** | **3.91 s** | **256 k/sec** |
-| Parallel JSON, 5 conns, pre-existing 14 indexes | 6.21 s | **161 k/sec** |
-| **Parallel CSV, 5 conns, no indexes** | **3.62 s** | **276 k/sec** |
-| Parallel CSV, 5 conns, pre-existing 14 indexes | 5.66 s | **177 k/sec** |
-| Add 14 indexes after parallel bulk insert | ~2.85 s | (per-shard parallel build) |
-| Disk footprint (with 14 indexes) | 1.7 GB |
+| Single JSON, 1M, no indexes | 5.92 s | **169 k/sec** |
+| **Single CSV, 1M, no indexes** | **1.98 s** | **505 k/sec** ← fastest |
+| Parallel JSON, 5 conns, no indexes | 3.06 s | 326 k/sec (0.65× single CSV) |
+| Parallel JSON, 5 conns, pre-existing 14 indexes | 5.27 s | **190 k/sec** |
+| Parallel CSV, 5 conns, no indexes | 3.17 s | 316 k/sec (0.63× single CSV) |
+| Parallel CSV, 5 conns, pre-existing 14 indexes | 5.22 s | **191 k/sec** |
+| Add 14 indexes after bulk insert | ~2.78 s | (per-shard parallel build) |
+| Disk footprint (with 14 indexes) | 1.6 GB |
+
+**Single-connection beats parallel for non-indexed inserts** (1.6× on CSV). Pre-2026.05.x, parallel won by ~1.16× because each connection's worker pool would stall on in-loop shard grows; with [pre-grow](#shard-grow-pre-sizing), that stall is gone, and parallel's per-connection pipeline-tail overhead (parse, bucket, dispatch, activate, index merge per call) becomes pure cost. **Use a single connection for non-indexed bulk-insert.**
+
+For indexed bulk-insert, parallel still helps slightly (~1.5×) because phase-4 (per-shard btree merge per field) is the dominant cost and pre-grow doesn't accelerate it. But see *Load-then-index now clearly wins* below for the recommended pattern.
 
 ### Indexed bulk-insert chunk-size tuning
 
-The per-shard btree layout (2026.05.1+) makes indexed bulk-insert sensitive to the *number* of bulk-insert REQUESTS, because each request triggers a sequential `bulk_merge` cycle per (field, shard). Cumulative extract work scales `O(R²)` where R is request count. Measured on this 1M dataset:
+The per-shard btree layout (2026.05.1+) makes indexed bulk-insert sensitive to the *number* of bulk-insert REQUESTS, because each request triggers a sequential `bulk_merge` cycle per (field, shard). Cumulative extract work scales `O(R²)` where R is request count. The previous recommendation (`requests ≈ N / 200_000`) was driven by the in-loop shard-grow stall that pre-grow has now eliminated, so the optimal request count has dropped — particularly because single-connection no-index bulk-insert is now faster than any parallel variant.
 
-| Shape | Requests | TEST 3 (JSON+idx) | TEST 5 (CSV+idx) |
-|---|---|---|---|
-| 10 conn × 100 k | 10 | 7.34 s | 7.04 s |
-| **5 conn × 200 k** | **5** | **6.21 s** | **5.66 s** |
-| 5 conn × 100 k (queued) | 10 | 8.35 s | 6.42 s |
-| 1 × 1 M (single call) | 1 | 11.13 s (single-thread) | — |
+**Recommended for indexed bulk-insert at 1M+ records:** load the data with a **single connection** (no indexes), then `add-index` in a single call. Both phases now parallelise internally via the worker pool; multiple connections only add per-call overhead.
 
-**Bigger chunks = fewer merge cycles. 5 connections × 200 k each is the sweet spot for 1M records.** Connection count above 5 doesn't speed up phase-2 data writes meaningfully (16-core box doesn't saturate at 5 writers), and pushing chunk count up linearly hurts phase-4 merge cost. Recommended for indexed bulk-insert: **`requests ≈ N / 200_000` rounded down, with `5 ≤ connections ≤ requests`**.
+### Load-then-index now clearly wins for static schemas
 
-### Load-then-index now wins for static schemas
+With pre-grow, the load-then-index pattern is no longer competitive — it's strictly better:
 
-With the per-shard layout, post-hoc add-indexes parallelises 14× wider (14 fields × splits/4 shards = 14 × 16 = 224 workers from a single-pass scan), making it 25–30 % faster than pre-2026.05.1. At 1M × 14 indexes: load CSV (3.62 s) + add-indexes (2.85 s) = **6.47 s** → 155 k/sec. Insert CSV with pre-existing indexes: 5.66 s → 177 k/sec. Pre-existing-indexes still wins on absolute throughput by ~14 %, but the gap shrunk; **load-then-index is preferred when feasible** because the merge-into-existing path scales worse with parallelism.
+| Pattern | 1M × 14 idx total time | Throughput |
+|---|---|---|
+| **Load CSV (single-conn) → add-indexes** | **1.98 s + 2.78 s = 4.76 s** | **210 k/sec** |
+| Pre-existing indexes (parallel CSV, 5 conns) | 5.22 s | 191 k/sec |
 
-**Recommended:** load-then-index for static schemas at 1M+ records; pre-existing indexes for streaming workloads.
+Load-then-index wins by ~10 %. Pre-2026.05.x it lost by ~14 % — the inversion comes entirely from pre-grow making the bare data-write phase 2× faster. The merge-into-existing path scales worse with parallelism, and now even worse on the absolute number too.
+
+**Recommended:** load-then-index for static schemas at 1M+ records; pre-existing indexes for streaming workloads where add-index isn't an option.
 
 ## Disk footprint
 

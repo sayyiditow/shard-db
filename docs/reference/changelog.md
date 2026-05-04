@@ -4,6 +4,29 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## In flight (post-2026.05.1)
+
+### Performance — bulk-insert pre-grow
+
+Bulk-insert no longer grows shards incrementally during the write phase. The dispatcher computes each shard's target slot count from the incoming batch (`next_pow2(live + incoming)`) and grows each shard once, in parallel, before workers start. The previous behaviour rebucketed existing data on every doubling — eliminated.
+
+Same-shape benchmark wins on AMD Ryzen 7 7840U (matches existing `docs/operations/benchmarks.md` setup):
+
+- K/V CSV bulk insert (10M, single conn, SPLITS=128): 2.39 → **4.76 M/sec** (1.99×)
+- Invoice CSV bulk insert (1M, single conn, no idx, SPLITS=64): 238 → **505 k/sec** (2.12×)
+- Invoice CSV bulk insert (1M, single conn, with 14 idx): 90 → **128 k/sec** (1.42×)
+- Invoice load-then-index (1M, CSV + add 14 idx): 6.47 s → **4.76 s**
+
+**Tuning rule inverted.** Pre-2026.05.x advice was *use multiple connections (R = N/200K, 5 conns × 200K)* for best throughput. With pre-grow that advice is obsolete:
+
+- Non-indexed bulk insert: **use a single connection.** Parallel is now slower than single — each connection pays its own pipeline-tail (parse, bucket, dispatch, activate per call) competing for one shared worker pool, with no grow-stall savings to amortize.
+- Indexed bulk insert at 1M+ records: **load-then-index with single conn.** It now beats pre-existing-indexes parallel by ~10% (was losing by ~14%).
+- Pre-existing-indexes parallel still helps for streaming workloads where add-index isn't an option.
+
+Read paths, single-record writes, deletes, vacuum, recount, query/count/aggregate are all unchanged — no regressions.
+
+Code: `src/db/storage.c` (`ucache_grow_to`, `ucache_peek_slots`), `src/db/query.c` (`pre_grow_shards_for_bulk_insert`), bench harness at `bench/bench-grow.sh`. The delimited-format bulk-insert path now emits the same `BULK-INSERT … grows=N grow_total=Tms` log line as the JSON path at `LOG_LEVEL>=3`.
+
 ## 2026.05.1 — 2026-05-02 (reissued)
 
 Originally released 2026-04-30 as the per-shard btree release. The tag was deleted and rebuilt 2026-05-02 with the response-shape overhaul + `./migrate` upgrade binary bundled in. **Replace your build from the prior 2026.05.1 download — read responses changed shape.**
