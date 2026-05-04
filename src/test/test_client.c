@@ -1,6 +1,5 @@
 /* src/test/test_client.c */
 #include "test_client.h"
-#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
