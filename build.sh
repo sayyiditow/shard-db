@@ -138,6 +138,9 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \
     src/test/cases/test_schema_export.c \
+    src/test/cases/test_bulk_cas.c \
+    src/test/cases/test_token_perms.c \
+    src/test/cases/test_csv_export.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
