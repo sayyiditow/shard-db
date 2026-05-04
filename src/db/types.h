@@ -261,6 +261,14 @@ typedef struct {
     char **in_values;
     int in_count;
     int in_cap;
+    /* Exclusivity flags for OP_BETWEEN — populated by the planner's
+       coalesce pass when combining gt/lt bounds. Default 0 = inclusive
+       on both ends (the historic OP_BETWEEN behaviour). When either is
+       1, BETWEEN dispatches to btree_idx_range_ex with the corresponding
+       exclusive-bound flag. Existing user-supplied OP_BETWEEN never sets
+       these — the field is opt-in for the planner's same-field coalescer. */
+    int min_exclusive;
+    int max_exclusive;
 } SearchCriterion;
 
 /* Forward decl — opaque outside query.c. Created by compile_criteria() and

@@ -4756,9 +4756,17 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
         case OP_BETWEEN:
             if (is_number(val_str) && is_number(c->value) && is_number(c->value2)) {
                 double v = atof(val_str);
-                return v >= atof(c->value) && v <= atof(c->value2);
+                int lo = c->min_exclusive ? (v > atof(c->value)) : (v >= atof(c->value));
+                int hi = c->max_exclusive ? (v < atof(c->value2)) : (v <= atof(c->value2));
+                return lo && hi;
             }
-            return strcmp(val_str, c->value) >= 0 && strcmp(val_str, c->value2) <= 0;
+            {
+                int rl = strcmp(val_str, c->value);
+                int rh = strcmp(val_str, c->value2);
+                int lo = c->min_exclusive ? (rl >  0) : (rl >= 0);
+                int hi = c->max_exclusive ? (rh <  0) : (rh <= 0);
+                return lo && hi;
+            }
         case OP_LIKE: {
             /* SQL-style LIKE with `%` wildcard (no `_`). Case-sensitive —
                use `ilike` for case-insensitive. */
@@ -5217,11 +5225,11 @@ static int match_typed_varchar(const uint8_t *p, int size,
         size_t n1 = elen < (int)cc->s1_len ? (size_t)elen : cc->s1_len;
         int r1 = memcmp(hay, cc->s1, n1);
         if (r1 == 0) r1 = (elen < (int)cc->s1_len) ? -1 : (elen > (int)cc->s1_len ? 1 : 0);
-        if (r1 < 0) return 0;
+        if (c->min_exclusive ? (r1 <= 0) : (r1 < 0)) return 0;
         size_t n2 = elen < (int)cc->s2_len ? (size_t)elen : cc->s2_len;
         int r2 = memcmp(hay, cc->s2, n2);
         if (r2 == 0) r2 = (elen < (int)cc->s2_len) ? -1 : (elen > (int)cc->s2_len ? 1 : 0);
-        return r2 <= 0;
+        return c->max_exclusive ? (r2 < 0) : (r2 <= 0);
     }
     /* CS string ops — needle stored raw in cc->needle_lc (despite the
        legacy field name; compile_one only lowers for CI variants below). */
@@ -5347,7 +5355,6 @@ static int match_typed_varchar(const uint8_t *p, int size,
 static inline int cmp_op_i64(int64_t v, int64_t q1, int64_t q2,
                              enum SearchOp op, const int64_t *in_list,
                              int in_count, const CompiledCriterion *cc) {
-    (void)cc;
     switch (op) {
     case OP_EXISTS: return 1; /* numeric fields always "exist" — zero is valid */
     case OP_NOT_EXISTS: return 0;
@@ -5357,7 +5364,11 @@ static inline int cmp_op_i64(int64_t v, int64_t q1, int64_t q2,
     case OP_GREATER: return v > q1;
     case OP_LESS_EQ: return v <= q1;
     case OP_GREATER_EQ: return v >= q1;
-    case OP_BETWEEN: return v >= q1 && v <= q2;
+    case OP_BETWEEN: {
+        int lo = (cc && cc->raw && cc->raw->min_exclusive) ? (v > q1) : (v >= q1);
+        int hi = (cc && cc->raw && cc->raw->max_exclusive) ? (v < q2) : (v <= q2);
+        return lo && hi;
+    }
     case OP_IN:
         for (int i = 0; i < in_count; i++) if (v == in_list[i]) return 1;
         return 0;
@@ -5369,7 +5380,8 @@ static inline int cmp_op_i64(int64_t v, int64_t q1, int64_t q2,
 }
 
 static inline int cmp_op_f64(double v, double q1, double q2,
-                             enum SearchOp op, const double *in_list, int in_count) {
+                             enum SearchOp op, const double *in_list, int in_count,
+                             const CompiledCriterion *cc) {
     switch (op) {
     case OP_EXISTS: return 1;
     case OP_NOT_EXISTS: return 0;
@@ -5379,7 +5391,11 @@ static inline int cmp_op_f64(double v, double q1, double q2,
     case OP_GREATER: return v > q1;
     case OP_LESS_EQ: return v <= q1;
     case OP_GREATER_EQ: return v >= q1;
-    case OP_BETWEEN: return v >= q1 && v <= q2;
+    case OP_BETWEEN: {
+        int lo = (cc && cc->raw && cc->raw->min_exclusive) ? (v > q1) : (v >= q1);
+        int hi = (cc && cc->raw && cc->raw->max_exclusive) ? (v < q2) : (v <= q2);
+        return lo && hi;
+    }
     case OP_IN:
         for (int i = 0; i < in_count; i++) if (v == in_list[i]) return 1;
         return 0;
@@ -5490,7 +5506,7 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
-        return cmp_op_f64(v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count);
+        return cmp_op_f64(v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count, cc);
     }
     case FT_BOOL: case FT_BYTE: {
         int64_t v = (int64_t)p[0];
@@ -6424,9 +6440,16 @@ static void btree_dispatch(const char *db_root, const char *object,
         case OP_BETWEEN:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             encode_criterion_value(tf, pc->value2, strlen(pc->value2), buf2, &len2);
-            btree_idx_range(db_root, object, field, splits,
-                            (const char *)buf1, len1,
-                            (const char *)buf2, len2, cb, ctx);
+            if (pc->min_exclusive || pc->max_exclusive) {
+                btree_idx_range_ex(db_root, object, field, splits,
+                                   (const char *)buf1, len1, pc->min_exclusive,
+                                   (const char *)buf2, len2, pc->max_exclusive,
+                                   cb, ctx);
+            } else {
+                btree_idx_range(db_root, object, field, splits,
+                                (const char *)buf1, len1,
+                                (const char *)buf2, len2, cb, ctx);
+            }
             break;
         case OP_IN:
             for (int iv = 0; iv < pc->in_count; iv++) {
@@ -7367,6 +7390,86 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
     return n;
 }
 
+/* Tree-rewrite pre-pass: collapse paired same-field range bounds under an
+ * AND into a single OP_BETWEEN leaf with explicit min/max exclusivity flags
+ * so the planner can drive a tightly-bounded btree_range_ex walk instead of
+ * intersecting two unbounded KeySets.
+ *
+ * Why this matters: choose_primary_source prefers PRIMARY_INTERSECT whenever
+ * 2+ AND'd indexed range leaves exist. Without this rewrite, criteria like
+ *   [{"field":"d","op":"gte","value":"X"}, {"field":"d","op":"lte","value":"Y"}]
+ * become two leaves on the SAME field, and the intersect path builds two
+ * separate KeySets — leaf 1 walks d >= X (potentially the whole btree),
+ * leaf 2 walks d <= Y (also potentially the whole btree), then intersects.
+ * Two full btree walks for what should be a single bounded range.
+ *
+ * The rewrite handles all four lower×upper pairings on the same field:
+ *   gte + lte → BETWEEN(min, max), both inclusive
+ *   gt  + lte → BETWEEN(min, max), min_exclusive=1
+ *   gte + lt  → BETWEEN(min, max), max_exclusive=1
+ *   gt  + lt  → BETWEEN(min, max), both exclusive
+ *
+ * Recursive into children so nested AND blocks under an OR get the same
+ * treatment. */
+static void coalesce_same_field_ranges(CriteriaNode *node) {
+    if (!node) return;
+    for (int i = 0; i < node->n_children; i++)
+        coalesce_same_field_ranges(node->children[i]);
+    if (node->kind != CNODE_AND) return;
+
+    for (int i = 0; i < node->n_children; i++) {
+        CriteriaNode *a = node->children[i];
+        if (!a || a->kind != CNODE_LEAF) continue;
+        int a_lower = (a->leaf.op == OP_GREATER_EQ || a->leaf.op == OP_GREATER);
+        int a_upper = (a->leaf.op == OP_LESS_EQ    || a->leaf.op == OP_LESS);
+        if (!a_lower && !a_upper) continue;
+
+        for (int j = i + 1; j < node->n_children; j++) {
+            CriteriaNode *b = node->children[j];
+            if (!b || b->kind != CNODE_LEAF) continue;
+            if (strcmp(a->leaf.field, b->leaf.field) != 0) continue;
+            int b_lower = (b->leaf.op == OP_GREATER_EQ || b->leaf.op == OP_GREATER);
+            int b_upper = (b->leaf.op == OP_LESS_EQ    || b->leaf.op == OP_LESS);
+            /* Need exactly one lower and one upper to combine into BETWEEN. */
+            if (!((a_lower && b_upper) || (a_upper && b_lower))) continue;
+
+            CriteriaNode *low = a_lower ? a : b;
+            CriteriaNode *high = a_upper ? a : b;
+            int min_excl = (low->leaf.op  == OP_GREATER); /* GT exclusive, GTE inclusive */
+            int max_excl = (high->leaf.op == OP_LESS);    /* LT exclusive, LTE inclusive */
+
+            /* Snapshot bounds before mutating either leaf. */
+            char gv[sizeof(a->leaf.value)];
+            char hv[sizeof(a->leaf.value)];
+            strncpy(gv, low->leaf.value,  sizeof(gv) - 1); gv[sizeof(gv) - 1] = '\0';
+            strncpy(hv, high->leaf.value, sizeof(hv) - 1); hv[sizeof(hv) - 1] = '\0';
+
+            /* Rewrite a as BETWEEN(low, high) with the right exclusivity. */
+            a->leaf.op = OP_BETWEEN;
+            strncpy(a->leaf.value,  gv, sizeof(a->leaf.value)  - 1);
+            a->leaf.value[sizeof(a->leaf.value)   - 1] = '\0';
+            strncpy(a->leaf.value2, hv, sizeof(a->leaf.value2) - 1);
+            a->leaf.value2[sizeof(a->leaf.value2) - 1] = '\0';
+            a->leaf.min_exclusive = min_excl;
+            a->leaf.max_exclusive = max_excl;
+            /* a's compiled state is stale; null it so planner recompiles on
+               first use (compile_criteria_tree is idempotent). */
+            a->compiled = NULL;
+
+            free_criteria_tree(b);
+            for (int k = j; k < node->n_children - 1; k++)
+                node->children[k] = node->children[k + 1];
+            node->n_children--;
+            /* a is now BETWEEN, no longer a "lower" or "upper" by itself.
+               Leaving the loop — further bounds on the same field are rare
+               and would require BETWEEN+gt-style narrowing (handled below
+               by re-running on the new tree). */
+            a_lower = a_upper = 0;
+            break;
+        }
+    }
+}
+
 CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
     if (err) *err = NULL;
     if (!json || !json[0]) return NULL;
@@ -7385,6 +7488,7 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             free_criteria_tree(root);
             return NULL;
         }
+        coalesce_same_field_ranges(root);
         return root;
     }
 
@@ -7406,6 +7510,7 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
                 return NULL;
             }
             free(or_arr); free(and_arr);
+            coalesce_same_field_ranges(n);
             return n;
         }
 
@@ -7466,6 +7571,7 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             p = vend;
         }
         if (root->n_children == 0) { free_criteria_tree(root); return NULL; }
+        coalesce_same_field_ranges(root);
         return root;
     }
 
