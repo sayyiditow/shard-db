@@ -26,6 +26,10 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
 | `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
 | `SLOW_QUERY_MS` | `500` | Log queries slower than N ms to `slow-*.log` and the in-memory ring (`stats` endpoint). `0` = disable. Minimum 100 ms. |
+| `VACUUM_RECOMMEND_TOMBSTONE_PCT` | `10` | Tombstone ratio at which `vacuum-check` flags an object for cleanup (`deleted * 100 ≥ total * N`). Also drives auto-vacuum when enabled — same threshold for both manual and automated paths. |
+| `VACUUM_RECOMMEND_MIN_DELETED` | `1000` | Absolute floor on `deleted` count below which `vacuum-check` does **not** recommend cleanup, even if the percentage clears. Prevents tiny objects from triggering vacuum overhead that exceeds the work saved. |
+| `AUTO_VACUUM` | `0` | `1` = enable a background thread that periodically polls `vacuum-check`'s recommendation logic and runs **plain `vacuum`** on objects that meet the thresholds. Never auto-runs `--compact` or `--splits` — both need an exclusive objlock for a long rebuild window and stay manual. |
+| `AUTO_VACUUM_INTERVAL_SEC` | `3600` | Auto-vacuum poll cadence in seconds. Floor 60. Sleep is sliced into 1-second chunks so SIGTERM brings the thread down within a second. |
 | `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. See [Operations → Deployment → Native TLS](../operations/deployment.md). |
 | `TLS_CERT` / `TLS_KEY` | (empty) | Server cert + private key paths (PEM). Required when `TLS_ENABLE=1`. |
 | `TLS_CA` | (empty) | Client-side CA bundle for verifying the server (defaults to OS trust store). |
@@ -52,6 +56,12 @@ export QUERY_BUFFER_MB=500
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500
+
+# Auto-vacuum — opt-in. Same thresholds drive `vacuum-check` recommendations.
+export AUTO_VACUUM=0
+export AUTO_VACUUM_INTERVAL_SEC=3600
+export VACUUM_RECOMMEND_TOMBSTONE_PCT=10
+export VACUUM_RECOMMEND_MIN_DELETED=1000
 
 # Native TLS — leave TLS_ENABLE=0 unless terminating TLS in-process
 export TLS_ENABLE=0

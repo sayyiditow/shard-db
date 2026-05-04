@@ -203,11 +203,26 @@ export WORKERS=0
 export GLOBAL_LIMIT=100000
 export MAX_REQUEST_SIZE=33554432
 export FCACHE_MAX=4096
-export BT_CACHE_MAX=256
+# BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX/4 since 2026.05.1.
 export QUERY_BUFFER_MB=500
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500
+
+# Auto-vacuum — opt-in background thread that runs plain `vacuum` on
+# objects exceeding the recommendation thresholds below. Same thresholds
+# drive the manual `vacuum-check` command's "vacuum":true output, so
+# operator and daemon agree on what needs cleaning.
+#   AUTO_VACUUM=1                         to enable
+#   AUTO_VACUUM_INTERVAL_SEC>=60          poll cadence (1-min floor)
+#   VACUUM_RECOMMEND_TOMBSTONE_PCT=N      vacuum when deleted/total >= N%
+#   VACUUM_RECOMMEND_MIN_DELETED=N        absolute floor on deleted count
+# Defaults match the historic hardcoded values (10% / 1000) so existing
+# operators see no behaviour change.
+export AUTO_VACUUM=0
+export AUTO_VACUUM_INTERVAL_SEC=3600
+export VACUUM_RECOMMEND_TOMBSTONE_PCT=10
+export VACUUM_RECOMMEND_MIN_DELETED=1000
 
 # Native TLS — set TLS_ENABLE=1 + TLS_CERT/TLS_KEY (server) and TLS_CA (client)
 # to require TLS 1.3 on PORT. Default 0 = plaintext TCP. Front the daemon
