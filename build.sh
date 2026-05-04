@@ -108,6 +108,7 @@ gcc $MODE_CFLAGS -o migrate src/migrate/main.c src/migrate/migrate_files.c -Isrc
 # under src/test/cases/ get listed here.
 gcc $MODE_CFLAGS -o shard-db-test \
     src/test/shard-db-test.c \
+    src/test/test_client.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
@@ -118,6 +119,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
 # files under src/bench/ get listed here.
 gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/shard-db-bench.c \
+    src/test/test_client.c \
     src/db/util.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
