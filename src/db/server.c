@@ -1666,7 +1666,10 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
 
     if (is_json) {
         dispatch_json_query(db_root, trimmed, client_ip);
-        fflush(g_out);
+        /* Caller (worker loop) does the single fflush after writing the
+           \0\n separator — leaving the response body in g_out's stdio
+           buffer here lets the body, terminator, and separator coalesce
+           into one write() syscall. */
         goto timing;
     }
 
@@ -1699,7 +1702,6 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        phantom drains. */
     if (!is_valid_dir(dir_arg)) {
         OUT("{\"error\":\"Unknown dir: %s\"}\n", dir_arg);
-        fflush(g_out);
         goto timing;
     }
     char eff_root[PATH_MAX];
@@ -1710,7 +1712,6 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        the schema, killing the worker thread. */
     if (!object || !object[0]) {
         OUT("{\"error\":\"object is required\"}\n");
-        fflush(g_out);
         goto timing;
     }
     char obj_check[PATH_MAX];
@@ -1900,7 +1901,6 @@ void *worker_thread(void *arg) {
                     int c;
                     while ((c = fgetc(cf)) != EOF && c != '\n');
                     OUT("{\"error\":\"Request too large (max %d bytes)\"}\n", buf_size - 1);
-                    fflush(g_out);
                     /* Emit command separator (\0\n) so the client read loop unblocks. */
                     fputc('\0', g_out);
                     fputc('\n', g_out);
@@ -1913,7 +1913,6 @@ void *worker_thread(void *arg) {
 
                 if (!server_running) {
                     OUT("{\"error\":\"Server shutting down\"}\n");
-                    fflush(g_out);
                     fputc('\0', g_out);
                     fputc('\n', g_out);
                     fflush(g_out);
@@ -1921,9 +1920,11 @@ void *worker_thread(void *arg) {
                 }
 
                 server_process_fast(wa->db_root, line, client_ip);
-                fflush(g_out);
 
-                /* Write null terminator + newline as command separator */
+                /* Single fflush per response: the response body, the \0
+                   terminator, and the \n separator all share the FILE*
+                   buffer and reach the kernel in one write() syscall.
+                   server_process_fast no longer fflushes internally. */
                 fputc('\0', g_out);
                 fputc('\n', g_out);
                 fflush(g_out);
