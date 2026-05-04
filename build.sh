@@ -124,6 +124,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/shard-db-bench.c \
     src/bench/bench_stats.c \
     src/bench/bench_kv.c \
+    src/bench/bench_kv_parallel.c \
     src/bench/bench_grow.c \
     src/test/test_client.c \
     src/test/test_runner.c \
