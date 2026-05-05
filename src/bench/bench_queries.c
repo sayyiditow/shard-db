@@ -258,59 +258,31 @@ static int bench_queries_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
 
-    /* Load-then-index threshold. At small N, creating indexes upfront and
-       bulk-inserting in one shot is fastest (no separate index-build
-       phase, low merge overhead). Past R = N/200K ≈ 20 the per-(field,
-       shard) merge cost during chunked bulk-insert grows O(R²) — the
-       crossover documented in CLAUDE.md. Above ~5M rows we switch to
-       create-without-indexes → bulk-insert → add-indexes-at-end, which
-       builds each index once from sorted data. */
-    static const char *const INDEX_FIELDS[] = {
-        "username", "email", "age", "user_id", "rank",
-        "score", "active", "level", "birthday",
-        "created_at", "balance", "hourly_rate"
-    };
-    int N_INDEX_FIELDS = (int)(sizeof(INDEX_FIELDS) / sizeof(INDEX_FIELDS[0]));
-    int load_then_index = (COUNT > 5000000L);
-    (void)N_INDEX_FIELDS;  /* unused on the small-N path */
-
     /* Schema: 13 fields, `bio` left non-indexed so we exercise full-scan
-       paths. The `indexes` list is empty in load-then-index mode (added
-       after bulk-insert finishes), or includes all 12 indexes upfront
-       for small-N runs. */
+       paths. ALL 12 indexes created upfront — production workloads
+       always have their indexes from the start, so the bench mirrors
+       that even at high N. (If chunked-bulk-insert into a populated
+       indexed table hits performance issues, the engine needs to fix
+       it — not the bench's job to paper over it.) */
     char create_obj[2048];
-    if (load_then_index) {
-        snprintf(create_obj, sizeof(create_obj),
-            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-            "\"splits\":%ld,\"max_key\":32,"
-            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                        "\"rank:short\",\"score:double\",\"active:bool\","
-                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
-            "\"indexes\":[]}",
-            SPLITS);
-    } else {
-        snprintf(create_obj, sizeof(create_obj),
-            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-            "\"splits\":%ld,\"max_key\":32,"
-            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                        "\"rank:short\",\"score:double\",\"active:bool\","
-                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
-            "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
-                         "\"score\",\"active\",\"level\",\"birthday\","
-                         "\"created_at\",\"balance\",\"hourly_rate\"]}",
-            SPLITS);
-    }
+    snprintf(create_obj, sizeof(create_obj),
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+        "\"splits\":%ld,\"max_key\":32,"
+        "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                    "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                    "\"rank:short\",\"score:double\",\"active:bool\","
+                    "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                    "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
+        "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
+                     "\"score\",\"active\",\"level\",\"birthday\","
+                     "\"created_at\",\"balance\",\"hourly_rate\"]}",
+        SPLITS);
     tc_request(tc, create_obj, &resp);
     free(resp); resp = NULL;
 
     printf("======================================================================\n");
-    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld%s)\n",
-           COUNT, SPLITS, CHUNK_SIZE,
-           load_then_index ? ", load-then-index" : "");
+    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
+           COUNT, SPLITS, CHUNK_SIZE);
     printf("======================================================================\n\n");
 
     /* Chunked insert. Build CHUNK_SIZE records at a time, push via memfd,
@@ -352,32 +324,6 @@ static int bench_queries_run(void) {
     printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
            (double)(insert_t1 - insert_t0) / 1e9,
            (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
-
-    /* Index-build phase (load-then-index path only). Each add-index call
-       sorts the records by the field value once and bulk-builds the per-
-       shard btree files in parallel. For 25M records × 12 indexes this
-       finishes in ~30-60s vs the hours that maintaining indexes during
-       chunked bulk-insert was projecting. */
-    if (load_then_index) {
-        uint64_t idx_t0 = bench_now_ns();
-        for (int i = 0; i < N_INDEX_FIELDS; i++) {
-            printf("  add-index %s…", INDEX_FIELDS[i]);
-            fflush(stdout);
-            char idx_req[256];
-            snprintf(idx_req, sizeof(idx_req),
-                "{\"mode\":\"add-index\",\"dir\":\"default\","
-                "\"object\":\"users\",\"field\":\"%s\"}",
-                INDEX_FIELDS[i]);
-            uint64_t t0 = bench_now_ns();
-            tc_request(tc, idx_req, &resp);
-            uint64_t t1 = bench_now_ns();
-            free(resp); resp = NULL;
-            printf(" %.2fs\n", (double)(t1 - t0) / 1e9);
-        }
-        uint64_t idx_t1 = bench_now_ns();
-        printf("  total index build: %.2fs\n\n",
-               (double)(idx_t1 - idx_t0) / 1e9);
-    }
 
     /* ==================================================================
        Sections — every operator class on every applicable field type.
