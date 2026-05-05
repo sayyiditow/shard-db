@@ -8051,13 +8051,66 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
    fallback is clearly faster, stays on intersection when both sides large. */
 #define INTERSECT_MIN_PRIMARY 10000
 
-/* Intersect N indexed leaves' candidate hash sets. Most-selective leaf walked
-   first; subsequent walks probe the running set and accumulate survivors.
+/* Per-leaf build worker for the parallel intersect path. Walks one leaf's
+   btree into a fresh KeySet stored at per_leaf[my_idx]; on failure leaves
+   it NULL so the caller can detect partial completion. */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    int               splits;
+    SearchCriterion  *leaf;
+    KeySet          **slot;       /* &per_leaf[my_idx] */
+    QueryDeadline    *deadline;
+} LeafBuildArg;
 
-   When the first (most-selective) leaf returns < INTERSECT_MIN_PRIMARY hits,
-   sets *out_small_primary=1 and returns the first leaf's KeySet — caller fans
-   out those hashes as record fetches and applies the full tree as post-filter,
-   which beats walking subsequent leaves' btrees in full.
+static void *leaf_build_worker(void *arg) {
+    LeafBuildArg *a = (LeafBuildArg *)arg;
+    *a->slot = build_keyset_from_leaf(a->db_root, a->object, a->splits,
+                                      a->leaf, a->deadline);
+    return NULL;
+}
+
+/* Walks the smallest per-leaf KeySet, keeping only entries that are present
+   in every other leaf's KeySet. Used by the parallel-build intersect path. */
+typedef struct {
+    KeySet **per_leaf;
+    int      n;
+    int      smallest_i;
+    KeySet  *out;
+    QueryDeadline *deadline;
+    int      dl_counter;
+} IntersectAllCtx;
+
+static int intersect_all_cb(const uint8_t hash[16], void *ctx) {
+    IntersectAllCtx *ic = (IntersectAllCtx *)ctx;
+    if (query_deadline_tick(ic->deadline, &ic->dl_counter)) return -1;
+    for (int i = 0; i < ic->n; i++) {
+        if (i == ic->smallest_i) continue;
+        if (!keyset_contains(ic->per_leaf[i], hash)) return 0;
+    }
+    if (keyset_insert(ic->out, hash) < 0) return -1;
+    return 0;
+}
+
+/* Intersect N indexed leaves' candidate hash sets. Two strategies:
+
+   - n <= 2: SERIAL (original path). Leaf 0 builds seed; each subsequent
+     leaf walks its btree and probes the running set into next, swap.
+     The seed-then-probe pattern minimises peak memory (~|seed|), and
+     for 2 leaves there's no parallelism win — both walks would block
+     on the same shard pool anyway.
+
+   - n > 2: PARALLEL. Walk every leaf's btree in parallel into per-leaf
+     KeySets (max wall = max per-leaf walk time), then walk the smallest
+     and keep only entries present in all others. For 3+ leaves with
+     similar walk costs this collapses N × walk into 1 × walk + final
+     intersect. Falls back to serial if the pool can't host n outer
+     tasks safely.
+
+   Small-primary heuristic preserved for both: when the smallest set is
+   under INTERSECT_MIN_PRIMARY, sets *out_small_primary=1 and returns
+   that set — caller fans out to record-fetch + full-tree post-filter,
+   which beats walking the rest of the leaves in full.
 
    Caller frees the returned KeySet. */
 static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
@@ -8067,6 +8120,69 @@ static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
                                         int *out_small_primary) {
     *out_small_primary = 0;
     if (n < 2) return NULL;
+
+    int pool_n = parallel_pool_size();
+    if (n > 2 && pool_n > 0 && n < pool_n) {
+        /* Parallel build per-leaf sets, then walk smallest and keep entries
+           present in all others. */
+        KeySet **per_leaf = calloc((size_t)n, sizeof(KeySet *));
+        LeafBuildArg *args = calloc((size_t)n, sizeof(LeafBuildArg));
+        if (!per_leaf || !args) { free(per_leaf); free(args); return NULL; }
+        for (int i = 0; i < n; i++) {
+            args[i].db_root  = db_root;
+            args[i].object   = object;
+            args[i].splits   = splits;
+            args[i].leaf     = leaves[i];
+            args[i].slot     = &per_leaf[i];
+            args[i].deadline = dl;
+        }
+        parallel_for(leaf_build_worker, args, n, sizeof(LeafBuildArg));
+        free(args);
+
+        if (dl->timed_out) {
+            for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
+            free(per_leaf);
+            return NULL;
+        }
+        for (int i = 0; i < n; i++) {
+            if (!per_leaf[i]) {
+                /* Build failed for this leaf — clean up and bail. */
+                for (int k = 0; k < n; k++) keyset_free(per_leaf[k]);
+                free(per_leaf);
+                return NULL;
+            }
+        }
+
+        int smallest_i = 0;
+        for (int i = 1; i < n; i++) {
+            if (keyset_size(per_leaf[i]) < keyset_size(per_leaf[smallest_i]))
+                smallest_i = i;
+        }
+
+        if (keyset_size(per_leaf[smallest_i]) < INTERSECT_MIN_PRIMARY) {
+            *out_small_primary = 1;
+            KeySet *result = per_leaf[smallest_i];
+            for (int i = 0; i < n; i++) if (i != smallest_i) keyset_free(per_leaf[i]);
+            free(per_leaf);
+            return result;
+        }
+
+        KeySet *result = keyset_new(keyset_size(per_leaf[smallest_i]));
+        if (!result) {
+            for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
+            free(per_leaf);
+            return NULL;
+        }
+        IntersectAllCtx ic = { per_leaf, n, smallest_i, result, dl, 0 };
+        keyset_iter(per_leaf[smallest_i], intersect_all_cb, &ic);
+
+        for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
+        free(per_leaf);
+        if (dl->timed_out) { keyset_free(result); return NULL; }
+        return result;
+    }
+
+    /* Serial path (n == 2 or pool unavailable). */
     KeySet *running = build_keyset_from_leaf(db_root, object, splits, leaves[0], dl);
     if (!running || dl->timed_out) { keyset_free(running); return NULL; }
 
@@ -8270,22 +8386,30 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
         ctxs[i].target_count = target_count;
     }
 
-    /* Even with serial child execution, an early target_count hit on child 0
-       lets us skip children 1..n-1 entirely. Check the cap before each child. */
+    /* Parallel across OR children via parallel_for. or_child_worker calls
+       btree_dispatch internally, which itself calls parallel_for for the
+       per-shard fan-out — so this is a nested-parallel pattern. Safe iff
+       the pool has room for both layers without saturating: outer tasks
+       block waiting on inner parallel_for, so we need (pool_size - n) >= 1
+       free workers to drain the inner queue. Guard with `n < pool_size`.
 
-    /* Serial across OR children — each or_child_worker calls btree_dispatch
-       which itself fans out across the per-shard btrees via parallel_for.
-       Nesting parallel_for here would risk pool exhaustion / deadlock per
-       parallel.c's contract. Sequential children × parallel shards-per-child
-       gives the same total in-flight parallelism (~splits/4) as the prior
-       parallel children × serial shards layout, with much higher parallelism
-       per child. */
-    for (int i = 0; i < n; i++) {
-        if (target_count > 0 &&
-            atomic_load_explicit(&ks->n, memory_order_relaxed) >= (size_t)target_count) {
-            break;
+       Falls back to serial when:
+         - pool not running (CLI mode)
+         - target_count > 0 (find with limit): the between-child cap check
+           short-circuits the rest, hard to express across parallel workers
+         - n >= pool_size: would risk deadlock on nested parallel_for. */
+    int pool_n = parallel_pool_size();
+    int do_parallel = (target_count == 0 && n > 1 && pool_n > 0 && n < pool_n);
+    if (do_parallel) {
+        parallel_for(or_child_worker, ctxs, n, sizeof(OrChildWorkerCtx));
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (target_count > 0 &&
+                atomic_load_explicit(&ks->n, memory_order_relaxed) >= (size_t)target_count) {
+                break;
+            }
+            or_child_worker(&ctxs[i]);
         }
-        or_child_worker(&ctxs[i]);
     }
 
     free(ctxs);
