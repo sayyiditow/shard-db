@@ -12510,6 +12510,87 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    /* Fast path: single-spec MIN/MAX narrowed by 2+ indexed AND leaves on
+       intersect-eligible ops. Build the intersected candidate KeySet via
+       intersect_indexed_leaves (same machinery PRIMARY_INTERSECT uses for
+       find/count/aggregate), then walk the agg field's btree in MIN/MAX
+       direction; first in-KeySet hash per shard wins. No record fetches.
+
+       Falls through to agg_run_plan for: not-pure-AND (OR / mixed), <2
+       indexed leaves, any non-rangeable child, varchar/composite agg
+       field, or small-primary (where the regular indexed-agg path beats
+       walking subsequent leaves' btrees in full). */
+    if (tree && tree->kind == CNODE_AND && tree->n_children >= 2 &&
+        no_group && no_having && nspecs == 1 &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
+        int agg_fi = typed_field_index(fs.ts, specs[0].field);
+        if (agg_fi >= 0 &&
+            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
+            const TypedField *agg_tf = &fs.ts->fields[agg_fi];
+            SearchCriterion *isect_leaves[MAX_INTERSECT_LEAVES];
+            char isect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
+            int ni = find_intersect_leaves(tree, db_root, object,
+                                           isect_leaves, isect_paths);
+            if (ni >= 2) {
+                int small_primary = 0;
+                KeySet *ks = intersect_indexed_leaves(db_root, object,
+                                                      sch.splits,
+                                                      isect_leaves, ni,
+                                                      &dl, &small_primary);
+                if (ks && !small_primary && !dl.timed_out &&
+                    keyset_size(ks) > 0) {
+                    int n_idx = index_splits_for(sch.splits);
+                    int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
+                    double best = 0.0;
+                    int have = 0;
+                    for (int s = 0; s < n_idx; s++) {
+                        char idx_path[PATH_MAX];
+                        build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                       object, specs[0].field, s);
+                        BtRangeIter *it = btree_range_iter_open(
+                            idx_path, "", 0, 0,
+                            "\xff\xff\xff\xff", 4, 0, desc);
+                        if (!it) continue;
+                        const char *val; size_t vlen; const uint8_t *hash16;
+                        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                            if (!keyset_contains(ks, hash16)) continue;
+                            double v;
+                            if (decode_index_key_to_double(agg_tf,
+                                                           (const uint8_t *)val,
+                                                           vlen, &v)) {
+                                if (!have) { best = v; have = 1; }
+                                else if (desc) { if (v > best) best = v; }
+                                else           { if (v < best) best = v; }
+                                break;
+                            }
+                        }
+                        btree_range_iter_close(it);
+                    }
+                    keyset_free(ks);
+
+                    char vbuf[64];
+                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                             ? parse_csv_delim(delimiter) : 0;
+                    if (csv_delim_local) {
+                        csv_emit_cell(specs[0].alias, csv_delim_local);
+                        OUT("\n");
+                        csv_emit_cell(vbuf, csv_delim_local);
+                        OUT("\n");
+                    } else {
+                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+                    }
+                    free_criteria_tree(tree);
+                    free(specs);
+                    return 0;
+                }
+                if (ks) keyset_free(ks);
+            }
+        }
+    }
+
     /* ===== NEQ algebraic shortcut =====
        Narrow eligibility: criteria is exactly one NEQ leaf on an indexed
        field, no group_by, no having, every spec is COUNT/SUM/AVG (algebraic

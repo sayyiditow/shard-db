@@ -575,6 +575,13 @@ static int bench_queries_run(void) {
     BR("max age where age<60 (same)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"lt\",\"value\":\"60\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"age\"}]}");
     BR("min birthday in 1990..2000 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"19900101\"},{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"20000101\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\"}]}");
     BR("max balance where balance>0 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"gt\",\"value\":\"0\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    /* Multi-leaf AND min/max — 2+ indexed leaves, intersect-eligible ops.
+       Should hit the new PRIMARY_INTERSECT-aware shortcut: build candidate
+       KeySet via intersect_indexed_leaves, walk agg btree, first in-set
+       hash per shard wins. No record fetches. */
+    BR("min age where active=true AND score>50",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
+    BR("max balance where active=true AND age>30","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    BR("min score where age 25..50 AND active=true","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gte\",\"value\":\"25\"},{\"field\":\"age\",\"op\":\"lte\",\"value\":\"50\"},{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"score\"}]}");
     bench_table_section_end();
 
     /* ---------- AGGREGATE — bundled + group_by + having ---------- */
