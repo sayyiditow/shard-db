@@ -8344,26 +8344,21 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
     int n = or_node->n_children;
     if (n <= 0) return NULL;
 
-    /* Estimate total candidate size by summing every shard file's size for
-       each child's index field (very rough: 1 entry per 64 bytes of leaf
-       storage). Floored at the object's live_count to handle the worst
-       case where one OR leaf matches every record (low-cardinality field,
-       or wide range bound) — without the floor the file-size estimate
-       under-counts heavily-compressed btrees and inserts degrade to O(cap)
-       per call once the table fills. */
-    int idx_n = index_splits_for(splits);
-    size_t est_total = 0;
-    for (int i = 0; i < n; i++) {
-        CriteriaNode *c = or_node->children[i];
-        for (int s = 0; s < idx_n; s++) {
-            char p[PATH_MAX];
-            build_idx_path(p, sizeof(p), db_root, object, c->leaf.field, s);
-            struct stat st;
-            if (stat(p, &st) == 0) est_total += (size_t)st.st_size / 64;
-        }
-    }
-    int live = get_live_count(db_root, object);
-    if (live > 0 && (size_t)live > est_total) est_total = (size_t)live;
+    /* The OR union is bounded by live_count — you can't have more matches
+       than rows. Sizing the KeySet to (live × 2) handles every possible
+       OR query correctly without any per-leaf cardinality guessing.
+
+       The previous estimate (file_size / 64 summed across leaves, floored
+       at live) catastrophically over-allocated for OR-of-eq: 5 leaves on
+       a 1M-row int field summed to ~3.9M entries and alloc'd a 160MB
+       KeySet that the actual ~50k union filled 3000x sparsely. calloc
+       and first-touch on 160MB dominated wall time on every OR query.
+
+       Using `live` directly drops that to a 32MB alloc (cap = 2 × live
+       × 20 bytes for keys + state) — 5x smaller, no overflow risk, no
+       per-operator/per-type heuristics that could be wrong. */
+    int live_int = get_live_count(db_root, object);
+    size_t est_total = (size_t)(live_int > 0 ? live_int : 1024);
     if (est_total < 1024) est_total = 1024;
 
     /* Budget check: KeySet alloc is O(cap_pow2 * 24 bytes) — keys[] + state[].
