@@ -8121,8 +8121,12 @@ static KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
     *out_small_primary = 0;
     if (n < 2) return NULL;
 
-    int pool_n = parallel_pool_size();
-    if (n > 2 && pool_n > 0 && n < pool_n) {
+    /* Parallel build per-leaf KeySets when n > 2. Nested parallel_for is
+       structurally safe (work-stealing in parallel.c). For n == 2 the
+       parallel build doesn't beat serial seed+probe because the final
+       intersect step touches |seed| × 1 lookup, roughly cancelling the
+       saved second walk. */
+    if (n > 2 && parallel_pool_size() > 0) {
         /* Parallel build per-leaf sets, then walk smallest and keep entries
            present in all others. */
         KeySet **per_leaf = calloc((size_t)n, sizeof(KeySet *));
@@ -8387,19 +8391,18 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
     }
 
     /* Parallel across OR children via parallel_for. or_child_worker calls
-       btree_dispatch internally, which itself calls parallel_for for the
-       per-shard fan-out — so this is a nested-parallel pattern. Safe iff
-       the pool has room for both layers without saturating: outer tasks
-       block waiting on inner parallel_for, so we need (pool_size - n) >= 1
-       free workers to drain the inner queue. Guard with `n < pool_size`.
+       btree_dispatch which itself uses parallel_for for shard fan-out;
+       work-stealing in parallel_for makes that nesting structurally safe
+       (a thread blocked on its own group always helps drain the queue),
+       so no n-vs-pool-size guard is needed.
 
-       Falls back to serial when:
-         - pool not running (CLI mode)
-         - target_count > 0 (find with limit): the between-child cap check
-           short-circuits the rest, hard to express across parallel workers
-         - n >= pool_size: would risk deadlock on nested parallel_for. */
-    int pool_n = parallel_pool_size();
-    int do_parallel = (target_count == 0 && n > 1 && pool_n > 0 && n < pool_n);
+       Stay serial only when:
+         - pool not running (CLI mode) — parallel_for runs inline anyway
+         - n == 1 — parallel_for runs inline anyway
+         - target_count > 0 (find with limit): between-child cap check
+           short-circuits remaining children once the limit is hit,
+           which doesn't translate cleanly to parallel children. */
+    int do_parallel = (target_count == 0 && n > 1 && parallel_pool_size() > 0);
     if (do_parallel) {
         parallel_for(or_child_worker, ctxs, n, sizeof(OrChildWorkerCtx));
     } else {
