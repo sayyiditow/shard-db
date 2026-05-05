@@ -67,12 +67,20 @@ static int run_cmd(const char *fmt, ...) {
 int test_env_start(TestEnv *env) {
     if (!env) return -1;
 
-    /* Unique DB_ROOT under /tmp/shard-db-test-<pid>-<idx>/db */
+    /* Unique DB_ROOT under <dir>/shard-db-test-<pid>-<idx>/db. Default
+       <dir> is /tmp (fast, RAM-backed on Linux), but tmpfs is typically
+       sized at ~50% of RAM — not enough for high-scale benches (25M+
+       records). Override via SHARD_TEST_TMPDIR to point at a disk-backed
+       path (e.g. /var/tmp, $HOME) when running large benches. */
     static int counter = 0;
     int idx = __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
 
-    char base[256];
-    snprintf(base, sizeof(base), "/tmp/shard-db-test-%d-%d", (int)getpid(), idx);
+    const char *tmpdir = getenv("SHARD_TEST_TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+
+    char base[512];
+    snprintf(base, sizeof(base), "%s/shard-db-test-%d-%d",
+             tmpdir, (int)getpid(), idx);
     snprintf(env->db_root, sizeof(env->db_root), "%s/db", base);
 
     /* Wipe + recreate the directory tree. */
