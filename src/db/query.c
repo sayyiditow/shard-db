@@ -9163,6 +9163,14 @@ typedef struct {
     char          *last_value_str;
     char          *last_key_str;
 
+    /* Offset semantics for ordered find. Decremented per entry that would
+       otherwise emit; emit only fires once skip_remaining hits zero. When
+       skip_remaining > 0 AND the criteria tree is empty, the callback
+       returns before fetching the record at all (each btree entry is
+       guaranteed to match), turning skip cost into a pure btree walk. */
+    int            skip_remaining;
+    int            offset_mode;          /* 1 → no `cursor` JSON field on output */
+
     QueryDeadline *deadline;
     int            dl_counter;
 } CursorFindCtx;
@@ -9201,6 +9209,15 @@ static int cursor_find_cb(const char *val, size_t vlen,
         }
     }
 
+    /* Skip-without-fetch: when offset_mode AND no remaining criteria, every
+       btree entry is guaranteed to match, so we can decrement the skip
+       counter against the bare btree iteration without paying any record
+       fetch cost. Turns offset=N into ~N × 25ns, not ~N × 1µs. */
+    if (c->skip_remaining > 0 && !c->remaining) {
+        c->skip_remaining--;
+        return 0;
+    }
+
     /* Resolve hash16 → (shard, slot) and probe the shard for the record. */
     int shard_id, start_slot;
     addr_from_hash(hash16, c->sch->splits, &shard_id, &start_slot);
@@ -9230,6 +9247,14 @@ static int cursor_find_cb(const char *val, size_t vlen,
        pass a range/eq on the indexed field, and range checks in the tree
        agree with the range in the walk. */
     if (c->remaining && !criteria_match_tree(raw, c->remaining, c->fs)) {
+        fcache_release(fc);
+        return 0;
+    }
+
+    /* Skip-after-match: criteria matched but we're still inside the offset
+       window. Release and decrement; the next match emits. */
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
         fcache_release(fc);
         return 0;
     }
@@ -9561,10 +9586,77 @@ int cmd_find(const char *db_root, const char *object,
 
     int has_order = (order_by && order_by[0] && !has_joins);
 
+    /* ===== ORDERED FIND — indexed-walk fast path =====
+       When order_by is indexed and there are no excluded keys, walk the
+       btree in sort order, skip the first `offset` matching entries,
+       emit the next `limit`. Bypasses scan_shards + qsort entirely.
+
+       For empty criteria the skip phase is a pure btree walk (no record
+       fetches), so offset=50000 limit=100 drops from ~580ms (collect 1M
+       rows + qsort + slice) to ~10-15ms (btree walk + 100 fetches).
+
+       For non-empty criteria the skip phase still fetches each candidate
+       to evaluate the tree, so the win shrinks with selectivity — but we
+       still skip the qsort + the buffering, which is usually a strict
+       improvement. Falls through to the buffered path for unsupported
+       formats / excluded keys / non-indexed order_by. */
+    if (has_order && btree_idx_exists(db_root, object, order_by, sch.splits) &&
+        excluded.count == 0) {
+        const TypedField *order_tf = NULL;
+        if (driver_fs.ts) {
+            for (int i = 0; i < driver_fs.ts->nfields; i++) {
+                if (strcmp(driver_fs.ts->fields[i].name, order_by) == 0) {
+                    order_tf = &driver_fs.ts->fields[i];
+                    break;
+                }
+            }
+        }
+
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        CursorFindCtx cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.db_root         = db_root;
+        cc.object          = object;
+        cc.sch             = &sch;
+        cc.fs              = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        cc.remaining       = tree;
+        cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
+        cc.proj_count      = proj_count;
+        cc.rows_fmt        = rows_fmt;
+        cc.dict_fmt        = dict_fmt;
+        cc.limit           = limit;
+        cc.printed         = 0;
+        cc.order_tf        = order_tf;
+        cc.has_cursor      = 0;
+        cc.desc            = desc;
+        cc.skip_remaining  = offset > 0 ? offset : 0;
+        cc.offset_mode     = 1;
+        cc.deadline        = &dl;
+
+        if (!csv_delim) {
+            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+                                   "", 0, 0,
+                                   "\xff\xff\xff\xff", 4, 0,
+                                   desc, cursor_find_cb, &cc);
+            if (dict_fmt) OUT("}\n");
+            else if (rows_fmt) OUT("]\n");   /* rows_fmt closing handled below normally */
+            else OUT("]\n");
+
+            free(cc.last_value_str);
+            free(cc.last_key_str);
+            free_joins(joins, njoins);
+            free_criteria_tree(tree);
+            free_excluded(&excluded);
+            return 0;
+        }
+    }
+
     if (has_order) {
-        /* ===== ORDERED FIND: full-scan collect → sort → emit slice =====
-           v1.x: buffer all matches, qsort by order_by, then emit offset..offset+limit.
-           Indexed ordered scan is a v2 item. Joins + order_by is not supported. */
+        /* ===== ORDERED FIND — buffered fallback =====
+           Reached when order_by isn't indexed, excluded keys are present,
+           or format=csv (CSV emit isn't wired into cursor_find_cb yet).
+           Buffers all matches, qsort by order_by, slices [offset, offset+limit]. */
 
         int order_idx = -1;
         int order_is_num = 0;
