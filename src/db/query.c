@@ -11895,6 +11895,99 @@ static struct AggBucket *hbk_get(const HashBktMap *m, const uint8_t *hash16) {
     return NULL;
 }
 
+/* ========== Walk-fetch-check for MIN/MAX with arbitrary criteria ==========
+
+   Walk the agg field's btree in MIN/MAX order. For each leaf entry,
+   decode the agg value, fetch the corresponding record by hash, and
+   evaluate the full criteria tree against it. The first matching record
+   per shard wins (the btree iteration is sorted, so the first match
+   has the smallest/largest agg value within that shard); take the
+   global min/max across shards.
+
+   Beats the keyset/intersect paths whenever criteria selectivity is
+   above ~1%: the existing paths build a candidate hash set up-front
+   (~30ms for a 500k-match leaf) before walking the agg btree, while
+   walk-fetch-check finds the answer in a few records (~µs each) and
+   exits.
+
+   Falls back to the existing paths via a per-shard `budget` cap. When
+   budget walks complete without a match, the shard is "indefinite" and
+   the caller falls through to the keyset/intersect path which guarantees
+   completeness regardless of selectivity. */
+
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const Schema     *sch;
+    int               shard_id;
+    const char       *agg_field;
+    const TypedField *agg_tf;
+    int               desc;       /* 0 = MIN (ASC walk), 1 = MAX (DESC) */
+    CriteriaNode     *tree;
+    FieldSchema     *fs;
+    QueryDeadline    *deadline;
+    int               budget;     /* max walks per shard before bailout */
+
+    /* Per-shard outputs */
+    double  best;
+    int     found;
+    int     budget_exceeded;
+    int     dl_counter;
+} WfcArg;
+
+static void *wfc_worker(void *arg) {
+    WfcArg *w = (WfcArg *)arg;
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path),
+                   w->db_root, w->object, w->agg_field, w->shard_id);
+    BtRangeIter *it = btree_range_iter_open(
+        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, w->desc);
+    if (!it) return NULL;
+
+    const char *val; size_t vlen; const uint8_t *hash16;
+    int walks = 0;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        if (query_deadline_tick(w->deadline, &w->dl_counter)) break;
+        if (++walks > w->budget) { w->budget_exceeded = 1; break; }
+
+        double v;
+        if (!decode_index_key_to_double(w->agg_tf, (const uint8_t *)val,
+                                        vlen, &v)) continue;
+
+        /* Fetch the record by hash. */
+        int data_shard, start_slot;
+        addr_from_hash(hash16, w->sch->splits, &data_shard, &start_slot);
+        char shard_path[PATH_MAX];
+        build_shard_path(shard_path, sizeof(shard_path),
+                         w->db_root, w->object, data_shard);
+        FcacheRead fc = fcache_get_read(shard_path);
+        if (!fc.map) continue;
+
+        uint32_t slots = fc.slots_per_shard;
+        uint32_t mask  = slots - 1;
+        int matched = 0;
+        for (uint32_t p = 0; p < slots; p++) {
+            uint32_t s = ((uint32_t)start_slot + p) & mask;
+            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
+            if (h->flag == 0 && h->key_len == 0) break;
+            if (h->flag != 1) continue;
+            if (memcmp(h->hash, hash16, 16) != 0) continue;
+            const uint8_t *raw = fc.map + zoneB_off(s, slots, w->sch->slot_size)
+                                + h->key_len;
+            if (criteria_match_tree(raw, w->tree, w->fs)) matched = 1;
+            break;
+        }
+        fcache_release(fc);
+        if (matched) {
+            w->best = v;
+            w->found = 1;
+            break;  /* first match per shard is the local min/max */
+        }
+    }
+    btree_range_iter_close(it);
+    return NULL;
+}
+
 /* Extract a typed field as a double for SUM/AVG/MIN/MAX accumulation.
    Returns 1 if the field is "present" (non-zero/non-empty), 0 if missing
    (so the record is excluded from the aggregate — matches legacy behavior). */
@@ -13027,6 +13120,91 @@ int cmd_aggregate(const char *db_root, const char *object,
                     return 0;
                 }
                 keyset_free(ks);
+            }
+        }
+    }
+
+    /* Fast path: single-spec MIN/MAX with arbitrary criteria — walk the
+       agg field's btree in MIN/MAX order, fetch each record, evaluate
+       the full criteria tree, return the first match per shard.
+
+       Beats the keyset/intersect paths whenever criteria selectivity is
+       above ~1%: those paths build a candidate hash set up-front (~30ms
+       for a 500k-match leaf, ~80ms for a 2-leaf intersect) before
+       walking the agg btree at all, while walk-fetch-check finds the
+       answer in a few records (~µs each) and exits. For high-selectivity
+       multi-leaf AND aggregate min/max queries this collapses 50-80ms
+       of intersect setup down to single-digit ms.
+
+       Per-shard `budget` cap (10000 walks) bails out for low-selectivity
+       criteria. Any shard hitting budget without a match makes the
+       global result indefinite — fall through to the existing
+       multi-leaf intersect / agg_run_plan path which guarantees
+       completeness regardless of selectivity. */
+    if (tree && no_group && no_having && nspecs == 1 &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
+        int agg_fi = typed_field_index(fs.ts, specs[0].field);
+        if (agg_fi >= 0 &&
+            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
+            const TypedField *agg_tf = &fs.ts->fields[agg_fi];
+            int n_idx = index_splits_for(sch.splits);
+            int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
+            WfcArg *wargs = calloc((size_t)n_idx, sizeof(WfcArg));
+            if (wargs) {
+                for (int s = 0; s < n_idx; s++) {
+                    wargs[s].db_root   = db_root;
+                    wargs[s].object    = object;
+                    wargs[s].sch       = &sch;
+                    wargs[s].shard_id  = s;
+                    wargs[s].agg_field = specs[0].field;
+                    wargs[s].agg_tf    = agg_tf;
+                    wargs[s].desc      = desc;
+                    wargs[s].tree      = tree;
+                    wargs[s].fs        = &fs;
+                    wargs[s].deadline  = &dl;
+                    wargs[s].budget    = 10000;
+                }
+                parallel_for(wfc_worker, wargs, n_idx, sizeof(WfcArg));
+
+                int any_indefinite = 0;
+                double best = 0.0;
+                int have = 0;
+                for (int s = 0; s < n_idx; s++) {
+                    if (wargs[s].budget_exceeded) any_indefinite = 1;
+                    if (wargs[s].found) {
+                        if (!have) { best = wargs[s].best; have = 1; }
+                        else if (desc) { if (wargs[s].best > best) best = wargs[s].best; }
+                        else           { if (wargs[s].best < best) best = wargs[s].best; }
+                    }
+                }
+                free(wargs);
+                if (dl.timed_out) {
+                    OUT("{\"error\":\"query_timeout\"}\n");
+                    free_criteria_tree(tree); free(specs);
+                    return -1;
+                }
+                if (!any_indefinite) {
+                    /* All shards walked their entire btree (or found a
+                       match within budget) — answer is definitive. */
+                    char vbuf[64];
+                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                             ? parse_csv_delim(delimiter) : 0;
+                    if (csv_delim_local) {
+                        csv_emit_cell(specs[0].alias, csv_delim_local);
+                        OUT("\n");
+                        csv_emit_cell(vbuf, csv_delim_local);
+                        OUT("\n");
+                    } else {
+                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+                    }
+                    free_criteria_tree(tree);
+                    free(specs);
+                    return 0;
+                }
+                /* else: fall through to multi-leaf intersect / agg_run_plan */
             }
         }
     }
