@@ -199,14 +199,22 @@ static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t
 
 /* ---------------------------------------------------------------- main bench */
 
-#define CHUNK_SIZE 10000000  /* records per bulk-insert call */
-
 #define BR(label, json) bench_table_run(tc, (label), (json))
 
 static int bench_queries_run(void) {
     const char *count_env = getenv("SHARD_BENCH_COUNT");
     long COUNT = count_env ? atol(count_env) : 1000000L;
     if (COUNT <= 0) COUNT = 1000000;
+
+    /* SHARD_BENCH_CHUNK controls records-per-bulk-insert call. Default
+       1M — small enough for prompt progress on disk-backed runs, big
+       enough that per-chunk overhead stays sub-1% of insert wall time.
+       (10M chunks were silently slow on /tmp tmpfs; on real disk they
+       hide progress for ~1+ min per chunk.) */
+    const char *chunk_env = getenv("SHARD_BENCH_CHUNK");
+    long CHUNK_SIZE = chunk_env ? atol(chunk_env) : 1000000L;
+    if (CHUNK_SIZE <= 0) CHUNK_SIZE = 1000000;
+    if (CHUNK_SIZE > COUNT) CHUNK_SIZE = COUNT;
 
     /* SHARD_BENCH_SPLITS overrides the create-object splits value. Default
        picks the per-tier recommendation from docs/operations/tuning.md so
@@ -269,7 +277,7 @@ static int bench_queries_run(void) {
     free(resp); resp = NULL;
 
     printf("======================================================================\n");
-    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %d)\n",
+    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
            COUNT, SPLITS, CHUNK_SIZE);
     printf("======================================================================\n\n");
 
