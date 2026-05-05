@@ -138,6 +138,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_find_indexed_orderby.c \
     src/test/cases/test_or_keyset_cap.c \
     src/test/cases/test_agg_walk_fetch_check.c \
+    src/test/cases/test_regex_anchor_prefilter.c \
     src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \

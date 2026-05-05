@@ -237,6 +237,23 @@ struct CompiledCriterion {
        even when the criterion is reused across many records. */
     regex_t  *re;
     int       re_compiled;        /* 1 iff regcomp succeeded; 0 → no match */
+
+    /* Literal-substring pre-filter for regex ops. When the pattern
+       reduces to a set of literal alternatives (e.g. `(engineer|developer)`,
+       `^z`, `@(gmail|yahoo)`), at least ONE of those literals must
+       appear in the haystack for the regex to match. Per-record check
+       via memmem (~30ns per anchor) is far cheaper than regexec
+       (~100ns-5µs depending on pattern complexity), so reject early
+       when no anchor is present.
+
+       Soundness: we only set anchors when EVERY top-level alternative
+       can be reduced to a pure literal. If any branch contains
+       metachars, anchor_count stays 0 and the pre-filter is bypassed
+       (regexec runs as before). False positives (anchor present but
+       regex doesn't match) are fine — regexec resolves them. */
+    char    **re_anchors;          /* re_anchors[i] is null-terminated literal */
+    size_t   *re_anchor_lens;      /* lengths in bytes (for memmem) */
+    int       re_anchor_count;     /* 0 = no pre-filter, run regex always */
 };
 
 /* Fetch a record by its hex hash and print as JSON. Returns 1 if found. */
@@ -5000,6 +5017,127 @@ static char *strdup_lower(const char *s, size_t len) {
     return r;
 }
 
+/* Best-effort literal-anchor extraction from a POSIX ERE pattern. Sets
+   *out_anchors / *out_lens (heap-allocated arrays) and *out_count.
+   Sets *out_count = 0 (and leaves the arrays NULL) when the pattern
+   can't be reduced to a set of literal substrings — caller falls back
+   to plain regexec on every record.
+
+   Soundness contract: we only emit anchors when EVERY top-level
+   alternative is a pure literal. Stripping outer `(...)` is allowed
+   only when no other parens or alternation operators appear inside.
+   `^` / `$` anchors are stripped (they impose position constraints
+   that the substring search ignores; that's fine because it can only
+   produce false positives, never false negatives). Branches with
+   `[`, `\`, `.`, `*`, `+`, `?`, `{`, `}`, `(`, `)` make us bail.
+
+   Examples:
+     "(engineer|developer)"   →  ["engineer", "developer"]
+     "@(gmail|yahoo)"         →  ["@gmail", "@yahoo"]   *(see note)
+     "^z"                     →  ["z"]
+     "alice|bob"              →  ["alice", "bob"]
+     "[abc]xy"                →  no anchors (bracket class)
+     ".+@.+"                  →  no anchors
+
+   *Note: `@(gmail|yahoo)` doesn't reduce trivially since the `(` is
+    not at position 0; we'd need a richer grammar. Falls through to
+    no-anchors. The wins still hit the simple cases above. */
+#define MAX_REGEX_ANCHORS 16
+#define MAX_REGEX_ANCHOR_BYTES 64
+
+static int regex_char_is_meta(char c) {
+    return c == '[' || c == ']' || c == '.' || c == '*' || c == '+' ||
+           c == '?' || c == '{' || c == '}' || c == '(' || c == ')' ||
+           c == '\\';
+}
+
+static void regex_extract_anchors(const char *pat,
+                                  char ***out_anchors,
+                                  size_t **out_lens,
+                                  int *out_count) {
+    *out_anchors = NULL;
+    *out_lens = NULL;
+    *out_count = 0;
+    if (!pat) return;
+
+    const char *p = pat;
+    size_t plen = strlen(p);
+
+    /* Strip a single layer of outer (...) only when no inner parens
+       or alternation operators appear (i.e. the parens just group a
+       flat literal alternation). */
+    if (plen >= 2 && p[0] == '(' && p[plen - 1] == ')') {
+        int depth_safe = 1;
+        for (size_t i = 1; i + 1 < plen; i++) {
+            if (p[i] == '(' || p[i] == ')') { depth_safe = 0; break; }
+        }
+        if (depth_safe) { p++; plen -= 2; }
+    }
+    /* Strip ^ at start, $ at end (position anchors don't constrain
+       substring search soundness). */
+    if (plen > 0 && p[0] == '^')           { p++;    plen--; }
+    if (plen > 0 && p[plen - 1] == '$')    { plen--; }
+    if (plen == 0) return;
+
+    /* Split on top-level '|'. Each segment must be pure-literal — no
+       metachars, no positional anchors, no nesting. */
+    char  tmp_anchors[MAX_REGEX_ANCHORS][MAX_REGEX_ANCHOR_BYTES];
+    size_t tmp_lens[MAX_REGEX_ANCHORS];
+    int n = 0;
+
+    const char *seg = p;
+    const char *end = p + plen;
+    while (seg <= end) {
+        const char *cur = seg;
+        int seg_has_meta = 0;
+        while (cur < end && *cur != '|') {
+            if (regex_char_is_meta(*cur)) { seg_has_meta = 1; break; }
+            cur++;
+        }
+        if (seg_has_meta) return;
+        size_t seg_len = (size_t)(cur - seg);
+        if (seg_len == 0 || seg_len >= MAX_REGEX_ANCHOR_BYTES) return;
+        if (n >= MAX_REGEX_ANCHORS) return;
+        memcpy(tmp_anchors[n], seg, seg_len);
+        tmp_anchors[n][seg_len] = '\0';
+        tmp_lens[n] = seg_len;
+        n++;
+        if (cur >= end) break;
+        seg = cur + 1;  /* skip the '|' */
+    }
+    if (n == 0) return;
+
+    /* Promote to heap. */
+    char **anchors = malloc((size_t)n * sizeof(char *));
+    size_t *lens = malloc((size_t)n * sizeof(size_t));
+    if (!anchors || !lens) { free(anchors); free(lens); return; }
+    for (int i = 0; i < n; i++) {
+        anchors[i] = strdup(tmp_anchors[i]);
+        lens[i] = tmp_lens[i];
+        if (!anchors[i]) {
+            for (int k = 0; k < i; k++) free(anchors[k]);
+            free(anchors); free(lens);
+            return;
+        }
+    }
+    *out_anchors = anchors;
+    *out_lens = lens;
+    *out_count = n;
+}
+
+/* Returns 1 iff at least one of the criterion's literal anchors appears
+   anywhere in the (hay, hay_len) byte range. Caller must ensure
+   cc->re_anchor_count > 0 before calling. */
+static inline int regex_anchors_match(const CompiledCriterion *cc,
+                                      const char *hay, size_t hay_len) {
+    for (int i = 0; i < cc->re_anchor_count; i++) {
+        if (memmem(hay, hay_len, cc->re_anchors[i], cc->re_anchor_lens[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                         const TypedSchema *ts) {
     memset(cc, 0, sizeof(*cc));
@@ -5062,6 +5200,9 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         } else if (cc->re) {
             free(cc->re); cc->re = NULL;
         }
+        /* Extract literal anchors for the substring pre-filter. */
+        regex_extract_anchors(c->value, &cc->re_anchors, &cc->re_anchor_lens,
+                              &cc->re_anchor_count);
         return;
     }
 
@@ -5200,6 +5341,13 @@ void free_compiled_criteria(CompiledCriterion *arr, int n) {
         if (arr[i].re) {
             if (arr[i].re_compiled) regfree(arr[i].re);
             free(arr[i].re);
+        }
+        if (arr[i].re_anchors) {
+            for (int k = 0; k < arr[i].re_anchor_count; k++) {
+                free(arr[i].re_anchors[k]);
+            }
+            free(arr[i].re_anchors);
+            free(arr[i].re_anchor_lens);
         }
     }
     free(arr);
@@ -5343,6 +5491,16 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_REGEX:
     case OP_NOT_REGEX: {
         if (!cc->re_compiled) return cc->op == OP_REGEX ? 0 : 1;
+        /* Substring pre-filter: if the pattern reduces to a flat set
+           of literal alternatives, regex CAN'T match unless at least
+           one of those literals appears in `hay`. memmem at ~30ns per
+           anchor beats regexec at ~100ns-5µs. False positives (anchor
+           present but regex doesn't match) fall through to regexec.
+           Skipped when re_anchor_count == 0 (pattern wasn't reducible). */
+        if (cc->re_anchor_count > 0 &&
+            !regex_anchors_match(cc, hay, (size_t)elen)) {
+            return cc->op == OP_REGEX ? 0 : 1;
+        }
         /* REG_STARTEND lets regexec consume (ptr, len) directly so we
            don't need to copy + NUL-terminate every record's value. */
         regmatch_t pm[1];
