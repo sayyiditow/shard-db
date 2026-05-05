@@ -134,6 +134,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_parallel_index_integrity.c \
     src/test/cases/test_cli_shortcuts.c \
     src/test/cases/test_agg_neq_shortcut.c \
+    src/test/cases/test_agg_indexed_groupby.c \
     src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \

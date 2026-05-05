@@ -590,6 +590,15 @@ static int bench_queries_run(void) {
     BR("group by active",              "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"balance\"}]}");
     BR("group by age top 5",           "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}");
     BR("group by age having n>16k",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"having\":[{\"field\":\"n\",\"op\":\"gt\",\"value\":\"16000\"}]}");
+    /* Indexed group_by fast path — group_by field has btree, every spec is
+       count(*) or sum/avg/min/max on an indexed non-varchar field. Walks
+       group_by btree once + each agg field's btree once via a hash16 →
+       bucket map; skips per-record decode. Should drop bundled+grouped
+       cases from ~250-400ms to tens of ms. */
+    BR("group by active, sum(balance)",       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by active, min/max balance",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"min\",\"field\":\"balance\"},{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    BR("group by age, avg(score)",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"score\"}]}");
+    BR("group by birthday, count",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"birthday\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
     bench_table_section_end();
 
     /* ---------- CURSOR — keyset pagination by various indexed types ---------- */

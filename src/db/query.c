@@ -11519,6 +11519,161 @@ static int decode_index_key_to_double(const TypedField *f,
     }
 }
 
+/* Mirror of typed_field_to_buf_raw, but reads from a btree leaf entry's
+   encoded bytes (post encode_field_for_index). Output is byte-identical
+   to what typed_field_to_buf_raw produces from the typed-record bytes,
+   so bucket keys built via the indexed group_by fast path collide with
+   buckets the per-record agg_scan_cb path would create on the same
+   data. Returns the length written; 0 on missing/zero (matches the
+   "missing" semantics). Skip varchar — the indexed group_by fast path
+   doesn't support varchar group_by yet (no decode roundtrip needed
+   since encoded bytes ARE the original content, but the fast path's
+   eligibility check rules it out for now). */
+static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
+                             char *buf, size_t bufsz) {
+    if (!f || !p) return 0;
+    switch (f->type) {
+    case FT_LONG: {
+        if (plen < 8) return 0;
+        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                     ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+        int64_t v = (int64_t)(u ^ (1ULL << 63));
+        if (v == 0) return 0;
+        return snprintf(buf, bufsz, "%lld", (long long)v);
+    }
+    case FT_INT: {
+        if (plen < 4) return 0;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        int32_t v = (int32_t)(u ^ 0x80000000u);
+        if (v == 0) return 0;
+        return snprintf(buf, bufsz, "%d", v);
+    }
+    case FT_SHORT: {
+        if (plen < 2) return 0;
+        uint16_t u = ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+        int16_t v = (int16_t)(u ^ 0x8000u);
+        if (v == 0) return 0;
+        return snprintf(buf, bufsz, "%d", v);
+    }
+    case FT_DOUBLE: {
+        if (plen < 8) return 0;
+        uint64_t bits = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                        ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                        ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                        ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+        if (bits & (1ULL << 63)) bits ^= (1ULL << 63);
+        else bits = ~bits;
+        double v; memcpy(&v, &bits, 8);
+        if (v == 0.0) return 0;
+        return snprintf(buf, bufsz, "%g", v);
+    }
+    case FT_BOOL:
+        if (plen < 1) return 0;
+        return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
+    case FT_BYTE:
+        if (plen < 1) return 0;
+        return snprintf(buf, bufsz, "%u", p[0]);
+    case FT_DATE: {
+        if (plen < 4) return 0;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        int32_t v = (int32_t)(u ^ 0x80000000u);
+        if (v == 0) return 0;
+        return snprintf(buf, bufsz, "%08d", v);
+    }
+    case FT_DATETIME: {
+        if (plen < 6) return 0;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        uint16_t t = ((uint16_t)p[4] << 8) | (uint16_t)p[5];
+        if (d == 0 && t == 0) return 0;
+        int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
+        return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
+    }
+    case FT_NUMERIC: {
+        if (plen < 8) return 0;
+        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                     ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+        int64_t v = (int64_t)(u ^ (1ULL << 63));
+        if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
+        int64_t scale = 1;
+        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
+        int64_t whole = v / scale;
+        int64_t frac = v % scale;
+        int neg = (v < 0);
+        if (frac < 0) frac = -frac;
+        if (whole < 0) whole = -whole;
+        if (frac == 0)
+            return snprintf(buf, bufsz, "%s%lld", neg ? "-" : "", (long long)whole);
+        return snprintf(buf, bufsz, "%s%lld.%0*lld", neg ? "-" : "",
+                        (long long)whole, f->numeric_scale, (long long)frac);
+    }
+    default: return 0;
+    }
+}
+
+/* Open-addressed map keyed by 16-byte hash, value = AggBucket pointer. Used
+   by the indexed group_by fast path so each agg field btree entry can be
+   attributed to its bucket in O(1). The first 8 bytes of hash16 are
+   already a high-quality xxh128 prefix, used directly as the probe seed.
+   Forward-declared AggBucket because the typedef lives further down. */
+struct AggBucket;
+typedef struct {
+    uint8_t          *keys;   /* cap × 16 bytes */
+    struct AggBucket **vals;  /* cap entries; NULL = empty */
+    size_t            cap;    /* power of 2 */
+    size_t            mask;
+} HashBktMap;
+
+static int hbk_init(HashBktMap *m, size_t cap_hint) {
+    size_t cap = 64;
+    while (cap < cap_hint * 2) cap <<= 1;  /* load factor ≤ 0.5 */
+    m->keys = calloc(cap, 16);
+    m->vals = calloc(cap, sizeof(struct AggBucket *));
+    if (!m->keys || !m->vals) {
+        free(m->keys); free(m->vals);
+        m->keys = NULL; m->vals = NULL; m->cap = m->mask = 0;
+        return -1;
+    }
+    m->cap = cap;
+    m->mask = cap - 1;
+    return 0;
+}
+
+static void hbk_free(HashBktMap *m) {
+    free(m->keys); free(m->vals);
+    m->keys = NULL; m->vals = NULL; m->cap = m->mask = 0;
+}
+
+static inline size_t hbk_seed(const uint8_t *h) {
+    return ((size_t)h[0] << 56) | ((size_t)h[1] << 48) |
+           ((size_t)h[2] << 40) | ((size_t)h[3] << 32) |
+           ((size_t)h[4] << 24) | ((size_t)h[5] << 16) |
+           ((size_t)h[6] << 8)  |  (size_t)h[7];
+}
+
+static void hbk_insert(HashBktMap *m, const uint8_t *hash16, struct AggBucket *b) {
+    size_t idx = hbk_seed(hash16) & m->mask;
+    while (m->vals[idx] != NULL) idx = (idx + 1) & m->mask;
+    memcpy(m->keys + idx * 16, hash16, 16);
+    m->vals[idx] = b;
+}
+
+static struct AggBucket *hbk_get(const HashBktMap *m, const uint8_t *hash16) {
+    size_t idx = hbk_seed(hash16) & m->mask;
+    while (m->vals[idx] != NULL) {
+        if (memcmp(m->keys + idx * 16, hash16, 16) == 0) return m->vals[idx];
+        idx = (idx + 1) & m->mask;
+    }
+    return NULL;
+}
+
 /* Extract a typed field as a double for SUM/AVG/MIN/MAX accumulation.
    Returns 1 if the field is "present" (non-zero/non-empty), 0 if missing
    (so the record is excluded from the aggregate — matches legacy behavior). */
@@ -12769,7 +12924,181 @@ int cmd_aggregate(const char *db_root, const char *object,
         return 0;
     }
 
-    if (agg_run_plan(&ctx, tree, db_root, object, &sch) != 0) {
+    /* Fast path: indexed group_by (single field, non-varchar, btree
+       exists), no criteria. Walk the group_by btree directly to bucket
+       per encoded value; for any sum/avg/min/max specs whose target
+       field is also indexed and non-varchar, walk that field's btree
+       and attribute each entry to its bucket via a hash16→bid map.
+       Skips the per-record scan entirely (1.1s on 1M records → tens of
+       ms), and feeds the existing having / order_by / limit / emit
+       pipeline.
+
+       Eligibility:
+         - no criteria (tree == NULL)
+         - exactly one group_by field, indexed, non-composite, non-varchar
+         - every spec is one of:
+             * AGG_COUNT (with no field, or non-varchar typed field)
+             * AGG_SUM/AVG/MIN/MAX on an indexed non-varchar non-composite
+       Records whose group_by field encodes to zero/empty (the index
+       skip-zero rule) are excluded — same semantics as the existing
+       no-criteria sum/avg/min/max btree fast path. */
+    int igb_eligible = (!tree && ctx.ngroups == 1 && fs.ts &&
+                        ctx.group_tfs[0] &&
+                        ctx.group_tfs[0]->type != FT_VARCHAR &&
+                        !strchr(ctx.group_fields[0], '+') &&
+                        btree_idx_exists(db_root, object,
+                                         ctx.group_fields[0], sch.splits));
+    int igb_needs_hbm = 0;
+    if (igb_eligible) {
+        for (int i = 0; i < ctx.nspecs; i++) {
+            AggSpec *sp = &ctx.specs[i];
+            if (sp->fn == AGG_COUNT) {
+                if (sp->field[0] && ctx.spec_tfs[i] &&
+                    ctx.spec_tfs[i]->type == FT_VARCHAR) {
+                    igb_eligible = 0; break;  /* count(varchar): per-record elen */
+                }
+                continue;
+            }
+            /* sum/avg/min/max: need indexed non-varchar agg field. */
+            if (!ctx.spec_tfs[i] ||
+                ctx.spec_tfs[i]->type == FT_VARCHAR ||
+                strchr(sp->field, '+') ||
+                !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
+                igb_eligible = 0; break;
+            }
+            igb_needs_hbm = 1;
+        }
+    }
+
+    int igb_done = 0;
+    if (igb_eligible) {
+        const TypedField *gtf = ctx.group_tfs[0];
+        int n_idx_g = index_splits_for(sch.splits);
+        HashBktMap hbk = {0};
+        int hbk_ready = 0;
+        if (igb_needs_hbm) {
+            int live = get_live_count(db_root, object);
+            if (live <= 0) live = 1024;
+            if (hbk_init(&hbk, (size_t)live) == 0) hbk_ready = 1;
+            else goto igb_skip;
+        }
+
+        /* Pass 1: walk group_by btree, find/create bucket per encoded
+           value, increment any AGG_COUNT specs, and (for multi-spec)
+           record hash16 → bucket in hbk for pass 2.
+
+           Within a shard, btree iter is sorted ASC, so consecutive
+           entries usually share the same encoded value — cache the
+           last (encoded value, bucket) pair to skip a bucket re-lookup
+           on each repeat. Reset across shard boundaries since shards
+           are independent. */
+        char prev_enc[64]; size_t prev_enc_len = 0;
+        struct AggBucket *prev_bkt = NULL;
+        int dl_counter = 0;
+        int aborted = 0;
+        for (int s = 0; s < n_idx_g && !aborted; s++) {
+            char idx_path[PATH_MAX];
+            build_idx_path(idx_path, sizeof(idx_path), db_root,
+                           object, ctx.group_fields[0], s);
+            BtRangeIter *it = btree_range_iter_open(
+                idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+            if (!it) continue;
+            const char *val; size_t vlen; const uint8_t *hash16;
+            prev_enc_len = 0; prev_bkt = NULL;
+            while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                struct AggBucket *bkt;
+                if (prev_bkt && vlen == prev_enc_len &&
+                    memcmp(val, prev_enc, vlen) == 0) {
+                    bkt = prev_bkt;
+                } else {
+                    char gbuf[256];
+                    int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
+                                              vlen, gbuf, sizeof(gbuf));
+                    if (n <= 0) continue;
+                    char *gv = gbuf;
+                    bkt = (struct AggBucket *)agg_find_or_create(&ctx, &gv, 1);
+                    if (!bkt) { aborted = 1; break; }
+                    if (vlen <= sizeof(prev_enc)) {
+                        memcpy(prev_enc, val, vlen);
+                        prev_enc_len = vlen;
+                        prev_bkt = bkt;
+                    } else {
+                        prev_bkt = NULL; prev_enc_len = 0;
+                    }
+                }
+                AggBucket *ab = (AggBucket *)bkt;
+                for (int i = 0; i < ctx.nspecs; i++) {
+                    if (ctx.specs[i].fn == AGG_COUNT) ab->accums[i].count++;
+                }
+                if (hbk_ready) hbk_insert(&hbk, hash16, bkt);
+            }
+            btree_range_iter_close(it);
+        }
+        if (aborted) {
+            if (hbk_ready) hbk_free(&hbk);
+            goto igb_skip;
+        }
+
+        /* Pass 2 (only when there are non-count specs on indexed agg
+           fields): walk each distinct agg field's btree ONCE, even when
+           multiple specs target the same field (e.g. min(balance) +
+           max(balance) — single walk, both specs updated per entry).
+           Per agg-btree entry: one hbk_get + one decode + N accums where
+           N is the number of specs sharing that field. */
+        if (hbk_ready) {
+            int n_idx_a = index_splits_for(sch.splits);
+            int processed[MAX_AGG_SPECS] = {0};
+            for (int i = 0; i < ctx.nspecs && !aborted; i++) {
+                if (processed[i] || ctx.specs[i].fn == AGG_COUNT) continue;
+                const char *fld = ctx.specs[i].field;
+                const TypedField *atf = ctx.spec_tfs[i];
+                /* Collect every spec sharing this field. */
+                int sibs[MAX_AGG_SPECS]; int nsibs = 0;
+                for (int j = i; j < ctx.nspecs; j++) {
+                    if (ctx.specs[j].fn == AGG_COUNT) continue;
+                    if (strcmp(ctx.specs[j].field, fld) != 0) continue;
+                    sibs[nsibs++] = j;
+                    processed[j] = 1;
+                }
+                for (int s = 0; s < n_idx_a && !aborted; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                   object, fld, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                        struct AggBucket *bkt = hbk_get(&hbk, hash16);
+                        if (!bkt) continue;
+                        double v;
+                        if (!decode_index_key_to_double(atf,
+                                                       (const uint8_t *)val,
+                                                       vlen, &v)) continue;
+                        AggBucket *ab = (AggBucket *)bkt;
+                        for (int k = 0; k < nsibs; k++) {
+                            AggAccum *a = &ab->accums[sibs[k]];
+                            a->count++;
+                            a->sum += v;
+                            if (v < a->min) a->min = v;
+                            if (v > a->max) a->max = v;
+                        }
+                    }
+                    btree_range_iter_close(it);
+                }
+            }
+            hbk_free(&hbk);
+        }
+        if (aborted) goto igb_skip;
+        igb_done = 1;
+    }
+igb_skip:
+    if (igb_done) {
+        /* fast path populated ctx — skip agg_run_plan, fall through to
+           the shared having / sort / limit / emit pipeline below. */
+    } else if (agg_run_plan(&ctx, tree, db_root, object, &sch) != 0) {
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else if (ctx.budget_exceeded) OUT(QUERY_BUFFER_ERR);
         free_criteria_tree(tree);
