@@ -7707,12 +7707,19 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
 static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
                            const char *object, char *out_idx_path, size_t out_sz) {
     if (!c || !c->field[0]) return 0;
-    /* Existence ops: route to PRIMARY_NONE (parallel scan_shards). The
-       indexed-btree walk has a single shared atomic counter that bottlenecks
-       on millions of cache-line bounces, while scan_shards fans out across
-       data shards naturally. (For non-varchar typed fields cmd_count
-       already shortcuts to live_count above this point.) */
-    if (c->op == OP_EXISTS || c->op == OP_NOT_EXISTS) return 0;
+    /* OP_EXISTS rides the indexed btree path: idx_count_cb walks the
+       btree and counts entries (the index only contains non-empty
+       varchar values, so btree_size = count(exists)). Per-thread batch
+       counter (2528e17) removed the prior shared-atomic bottleneck —
+       count(exists varchar_idx) on 1M records is ~5ms (down from
+       ~22ms full scan).
+
+       OP_NOT_EXISTS is *deliberately* kept on PRIMARY_NONE: scan_shards
+       parallelizes a varchar elen check across 8 data shards × 16
+       workers at ~3ms — beats the indexed path's `live_count - count(
+       exists)` at ~5ms. Non-varchar EXISTS / NOT_EXISTS hits the
+       live_count shortcut earlier in cmd_count regardless. */
+    if (c->op == OP_NOT_EXISTS) return 0;
     /* Field-vs-field ops can't use a btree on the LHS alone — the RHS is
        per-record, so even a perfect btree walk still pays record fetches.
        Force full-scan to keep the planner honest. */
@@ -12424,6 +12431,151 @@ int cmd_aggregate(const char *db_root, const char *object,
                 OUT("\n");
             } else {
                 OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+            }
+            free(specs);
+            return 0;
+        }
+    }
+
+    /* Fast path: bundled multi-spec aggregate, no criteria, no group, no
+       having. Every spec must be COUNT (count(*) or count(non-varchar))
+       or SUM/AVG/MIN/MAX on an indexed non-varchar non-composite field.
+       Walks each unique non-count agg field's btree ONCE, accumulating
+       sum/min/max into every spec sharing that field — `count + sum +
+       avg + min + max balance` is one balance walk, not five. COUNT
+       specs read live_count (typed records always carry every field;
+       count metadata path semantics).
+
+       Subsumes the single-spec path above when nspecs > 1; nspecs == 1
+       still routes through that path so MIN/MAX retain their first-leaf
+       early-exit (~50µs vs ~25ms full walk). Saves ~16x on the bench's
+       `sum/avg/min/max balance` (404ms → ~25ms). */
+    if (!tree && no_group && no_having && nspecs > 1 && fs.ts) {
+        int eligible = 1;
+        int has_noncount = 0;
+        for (int i = 0; i < nspecs && eligible; i++) {
+            AggSpec *sp = &specs[i];
+            if (sp->fn == AGG_COUNT) {
+                if (sp->field[0]) {
+                    if (strchr(sp->field, '+')) { eligible = 0; break; }
+                    int fi = typed_field_index(fs.ts, sp->field);
+                    if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
+                        eligible = 0; break;
+                    }
+                }
+                continue;
+            }
+            if (sp->fn != AGG_SUM && sp->fn != AGG_AVG &&
+                sp->fn != AGG_MIN && sp->fn != AGG_MAX) {
+                eligible = 0; break;
+            }
+            if (!sp->field[0] || strchr(sp->field, '+')) {
+                eligible = 0; break;
+            }
+            int fi = typed_field_index(fs.ts, sp->field);
+            if (fi < 0 || fs.ts->fields[fi].type == FT_VARCHAR ||
+                !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
+                eligible = 0; break;
+            }
+            has_noncount = 1;
+        }
+
+        if (eligible) {
+            long live = (long)get_live_count(db_root, object);
+            int64_t counts[MAX_AGG_SPECS] = {0};
+            double  sums[MAX_AGG_SPECS]   = {0};
+            double  mins[MAX_AGG_SPECS], maxs[MAX_AGG_SPECS];
+            int     present[MAX_AGG_SPECS] = {0};
+            for (int i = 0; i < nspecs; i++) {
+                mins[i] = 1e308;
+                maxs[i] = -1e308;
+            }
+
+            int processed[MAX_AGG_SPECS] = {0};
+            int n_idx = index_splits_for(sch.splits);
+            for (int i = 0; i < nspecs && has_noncount; i++) {
+                if (processed[i] || specs[i].fn == AGG_COUNT) continue;
+                const char *fld = specs[i].field;
+                int fi = typed_field_index(fs.ts, fld);
+                const TypedField *tf = &fs.ts->fields[fi];
+                /* Collect every spec sharing this field. */
+                int sibs[MAX_AGG_SPECS]; int nsibs = 0;
+                for (int j = i; j < nspecs; j++) {
+                    if (specs[j].fn == AGG_COUNT) continue;
+                    if (strcmp(specs[j].field, fld) != 0) continue;
+                    sibs[nsibs++] = j;
+                    processed[j] = 1;
+                }
+                for (int s = 0; s < n_idx; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root, object, fld, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        double v;
+                        if (!decode_index_key_to_double(tf, (const uint8_t *)val,
+                                                       vlen, &v)) continue;
+                        for (int k = 0; k < nsibs; k++) {
+                            int idx = sibs[k];
+                            counts[idx]++;
+                            sums[idx] += v;
+                            if (v < mins[idx]) mins[idx] = v;
+                            if (v > maxs[idx]) maxs[idx] = v;
+                            present[idx] = 1;
+                        }
+                    }
+                    btree_range_iter_close(it);
+                }
+            }
+
+            char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                     ? parse_csv_delim(delimiter) : 0;
+            if (csv_delim_local) {
+                for (int i = 0; i < nspecs; i++) {
+                    if (i > 0) { char d[2] = {csv_delim_local, '\0'}; OUT("%s", d); }
+                    csv_emit_cell(specs[i].alias, csv_delim_local);
+                }
+                OUT("\n");
+                for (int i = 0; i < nspecs; i++) {
+                    if (i > 0) { char d[2] = {csv_delim_local, '\0'}; OUT("%s", d); }
+                    char vbuf[64];
+                    switch (specs[i].fn) {
+                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", live); break;
+                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0); break;
+                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf),
+                                               counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0); break;
+                    case AGG_MIN:   fmt_double(vbuf, sizeof(vbuf), present[i] ? mins[i] : 0.0); break;
+                    case AGG_MAX:   fmt_double(vbuf, sizeof(vbuf), present[i] ? maxs[i] : 0.0); break;
+                    default: vbuf[0] = '\0'; break;
+                    }
+                    csv_emit_cell(vbuf, csv_delim_local);
+                }
+                OUT("\n");
+            } else {
+                OUT("{");
+                for (int i = 0; i < nspecs; i++) {
+                    if (i > 0) OUT(",");
+                    char vbuf[64];
+                    switch (specs[i].fn) {
+                    case AGG_COUNT: OUT("\"%s\":%ld", specs[i].alias, live); break;
+                    case AGG_SUM:
+                        fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    case AGG_AVG:
+                        fmt_double(vbuf, sizeof(vbuf),
+                                   counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    case AGG_MIN:
+                        fmt_double(vbuf, sizeof(vbuf), present[i] ? mins[i] : 0.0);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    case AGG_MAX:
+                        fmt_double(vbuf, sizeof(vbuf), present[i] ? maxs[i] : 0.0);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
+                    }
+                }
+                OUT("}\n");
             }
             free(specs);
             return 0;
