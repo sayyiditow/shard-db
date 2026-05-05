@@ -29,7 +29,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#define SPLITS 64
+/* SPLITS is now derived per-run from SHARD_BENCH_COUNT (or overridden via
+   SHARD_BENCH_SPLITS); see bench_queries_run() for the tier table. */
 
 /* Mirrors the python lists in insert-users.sh — 30 first names, 30
    last names, 7 domains, 15 bios — so that username/email/bio
@@ -207,6 +208,35 @@ static int bench_queries_run(void) {
     long COUNT = count_env ? atol(count_env) : 1000000L;
     if (COUNT <= 0) COUNT = 1000000;
 
+    /* SHARD_BENCH_SPLITS overrides the create-object splits value. Default
+       picks the per-tier recommendation from docs/operations/tuning.md so
+       higher SHARD_BENCH_COUNT runs land in the 78K–200K rec/shard sweet
+       spot without manual tuning. Power-of-2 in [8, 4096]. */
+    const char *splits_env = getenv("SHARD_BENCH_SPLITS");
+    long SPLITS;
+    if (splits_env) {
+        SPLITS = atol(splits_env);
+    } else {
+        if      (COUNT <=    1000000L) SPLITS = 8;
+        else if (COUNT <=    4000000L) SPLITS = 16;
+        else if (COUNT <=   10000000L) SPLITS = 32;
+        else if (COUNT <=   25000000L) SPLITS = 64;
+        else if (COUNT <=   60000000L) SPLITS = 128;
+        else if (COUNT <=  125000000L) SPLITS = 256;
+        else if (COUNT <=  250000000L) SPLITS = 512;
+        else if (COUNT <=  500000000L) SPLITS = 1024;
+        else if (COUNT <= 1000000000L) SPLITS = 2048;
+        else                           SPLITS = 4096;
+    }
+    if (SPLITS < 8) SPLITS = 8;
+    if (SPLITS > 4096) SPLITS = 4096;
+    /* Round to power of two if needed. */
+    {
+        long p = 8;
+        while (p < SPLITS) p <<= 1;
+        SPLITS = p;
+    }
+
     TestEnv env = {0};
     if (test_env_start(&env) != 0) {
         fprintf(stderr, "bench-queries: daemon spawn failed\n");
@@ -222,9 +252,10 @@ static int bench_queries_run(void) {
 
     /* Schema indexes every typed field except `bio` (left non-indexed
        so we can exercise full-scan paths). 13 fields, 12 indexes. */
-    tc_request(tc,
+    char create_obj[1024];
+    snprintf(create_obj, sizeof(create_obj),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-        "\"splits\":64,\"max_key\":32,"
+        "\"splits\":%ld,\"max_key\":32,"
         "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
                     "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
                     "\"rank:short\",\"score:double\",\"active:bool\","
@@ -233,12 +264,13 @@ static int bench_queries_run(void) {
         "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
                      "\"score\",\"active\",\"level\",\"birthday\","
                      "\"created_at\",\"balance\",\"hourly_rate\"]}",
-        &resp);
+        SPLITS);
+    tc_request(tc, create_obj, &resp);
     free(resp); resp = NULL;
 
     printf("======================================================================\n");
-    printf("  shard-db QUERY benchmark — %ld users  (chunk = %d)\n",
-           COUNT, CHUNK_SIZE);
+    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %d)\n",
+           COUNT, SPLITS, CHUNK_SIZE);
     printf("======================================================================\n\n");
 
     /* Chunked insert. Build CHUNK_SIZE records at a time, push via memfd,
