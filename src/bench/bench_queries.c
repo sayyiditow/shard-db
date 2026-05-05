@@ -568,6 +568,13 @@ static int bench_queries_run(void) {
     BR("min age birthday 1990..2000",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"19900101\"},{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"20000101\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
     BR("agg where active=false (count+avg)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"age\"}]}");
     BR("agg age neq 30 (NEQ short)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"neq\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Same-field min/max — criterion field == agg field. Should hit the
+       btree-only shortcut: walk the agg btree within criterion bounds, take
+       first leaf entry per shard. No KeySet, no record fetch. */
+    BR("min age where age>30 (same)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
+    BR("max age where age<60 (same)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"lt\",\"value\":\"60\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"age\"}]}");
+    BR("min birthday in 1990..2000 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"19900101\"},{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"20000101\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\"}]}");
+    BR("max balance where balance>0 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"gt\",\"value\":\"0\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
     bench_table_section_end();
 
     /* ---------- AGGREGATE — bundled + group_by + having ---------- */
