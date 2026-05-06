@@ -1,0 +1,1367 @@
+/* slotcask.c — bitcask + snake-game free-slot reuse, ported from
+ * src/proto_bitcask/proto_bitcask_v2.c (validated 2026-05-07 at 5M scale).
+ *
+ * Production adaptations vs the prototype:
+ *   - Keyfile shards live in the global `kfcache` (mmap MAP_SHARED, per-entry
+ *     rwlock, LRU). Modeled on bt_cache in btree.c. Cap from db.env FCACHE_MAX.
+ *   - Data segments live in the global `segcache` (same model). Each segment
+ *     is mmap'd MAP_SHARED at full SLOTCASK_SEG_MAX_BYTES (sparse file via
+ *     ftruncate) so writes are memcpy-into-mmap, eliminating the prototype's
+ *     open/close/pwrite per-call bottleneck.
+ *
+ * Per-object DB state (SlotcaskDb): only per-stream rotation/pool primitives
+ * — keyfile and segment data live in the global caches, not the DB struct.
+ * That keeps SlotcaskDb tiny (a handful of mutexes + ints per stream) so the
+ * engine can keep many of them resident.
+ */
+#define _GNU_SOURCE
+#include "slotcask.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <dirent.h>
+#include <pthread.h>
+
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
+/* ============================================================ Helpers */
+
+static int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+
+static uint32_t path_hash(const char *s) {
+    uint32_t h = 5381;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h;
+}
+
+static void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
+    XXH128_hash_t h = XXH3_128bits(key, klen);
+    memcpy(out, &h.high64, 8);
+    memcpy(out + 8, &h.low64, 8);
+}
+
+static int shard_for_hash(const uint8_t hash[16], int num_shards) {
+    uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
+    return (int)(v % (uint16_t)num_shards);
+}
+
+static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
+    uint64_t v;
+    memcpy(&v, hash, 8);
+    return (size_t)(v % cap);
+}
+
+/* mkdir -p */
+static int mkdirp_local(const char *path) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t n = strlen(tmp);
+    if (n > 0 && tmp[n - 1] == '/') tmp[n - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
+    snprintf(out, PATH_MAX, "%s/keyfile_%03d.kf", data_dir, shard_id);
+}
+static void stream_dir_for(char out[PATH_MAX], const char *data_dir, int stream_id) {
+    snprintf(out, PATH_MAX, "%s/stream_%03d", data_dir, stream_id);
+}
+static void seg_path_for(char out[PATH_MAX], const char *data_dir,
+                         int stream_id, uint32_t file_id) {
+    snprintf(out, PATH_MAX, "%s/stream_%03d/data_%06u.dat",
+             data_dir, stream_id, (unsigned)file_id);
+}
+
+/* ============================================================ kfcache */
+
+typedef struct {
+    char     path[PATH_MAX];
+    int      fd;
+    SlotcaskKfEntry *map;
+    size_t   map_size;
+    size_t   capacity;          /* slots in this shard */
+    pthread_rwlock_t rwlock;
+    int      used;
+    uint64_t last_access;
+} KfCacheEntry;
+
+static KfCacheEntry    *g_kfcache = NULL;
+static int              g_kfcache_slots = 0;
+static int              g_kfcache_count = 0;
+static pthread_mutex_t  g_kfcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t g_kfcache_clock = 0;
+
+void kfcache_init(int cap) {
+    if (g_kfcache) return;
+    if (cap < 16) cap = 16;
+    g_kfcache_slots = next_pow2(cap * 2);
+    g_kfcache = calloc(g_kfcache_slots, sizeof(KfCacheEntry));
+    g_kfcache_count = 0;
+    for (int i = 0; i < g_kfcache_slots; i++) {
+        pthread_rwlock_init(&g_kfcache[i].rwlock, NULL);
+        g_kfcache[i].fd = -1;
+    }
+}
+
+void kfcache_shutdown(void) {
+    pthread_mutex_lock(&g_kfcache_lock);
+    if (g_kfcache) {
+        for (int i = 0; i < g_kfcache_slots; i++) {
+            KfCacheEntry *e = &g_kfcache[i];
+            if (!e->used) continue;
+            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_SYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            pthread_rwlock_destroy(&e->rwlock);
+        }
+        free(g_kfcache);
+        g_kfcache = NULL;
+        g_kfcache_slots = 0;
+        g_kfcache_count = 0;
+    }
+    pthread_mutex_unlock(&g_kfcache_lock);
+}
+
+static int kfcache_probe(const char *path, int *out_found) {
+    uint32_t h = path_hash(path);
+    int mask = g_kfcache_slots - 1;
+    int idx = h & mask;
+    for (int i = 0; i < g_kfcache_slots; i++) {
+        int s = (idx + i) & mask;
+        if (!g_kfcache[s].used) { *out_found = 0; return s; }
+        if (strcmp(g_kfcache[s].path, path) == 0) { *out_found = 1; return s; }
+    }
+    *out_found = 0;
+    return -1;
+}
+
+static void kfcache_drop_slot(int slot) {
+    KfCacheEntry *e = &g_kfcache[slot];
+    if (!e->used) return;
+    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+    if (e->map) munmap(e->map, e->map_size);
+    if (e->fd >= 0) close(e->fd);
+    e->map = NULL;
+    e->fd = -1;
+    e->map_size = 0;
+    e->capacity = 0;
+    e->used = 0;
+    e->path[0] = '\0';
+    g_kfcache_count--;
+}
+
+/* Open + size + mmap a keyfile shard. Caller may NOT hold g_kfcache_lock when
+   the file system call could block, so we do the heavy lifting outside the
+   table mutex (matching bt_open_file's contract in btree.c). */
+static int kf_open_file(const char *path, size_t slots_capacity, int writer,
+                        int *out_fd, SlotcaskKfEntry **out_map, size_t *out_size) {
+    int fd;
+    if (writer) {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = 0; mkdirp_local(dir); }
+        fd = open(path, O_RDWR | O_CREAT, 0644);
+    } else {
+        fd = open(path, O_RDWR);
+    }
+    if (fd < 0) return -1;
+
+    size_t want = slots_capacity * sizeof(SlotcaskKfEntry);
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    if ((size_t)st.st_size < want) {
+        if (!writer) { close(fd); return -1; }
+        if (ftruncate(fd, (off_t)want) < 0) { close(fd); return -1; }
+    } else if ((size_t)st.st_size > want) {
+        /* Existing file is bigger than expected — keep it (auto-resplit may
+           have grown it). Use the actual size for the mmap; capacity is the
+           actual slot count. */
+        want = (size_t)st.st_size;
+    }
+
+    void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return -1; }
+
+    *out_fd = fd;
+    *out_map = (SlotcaskKfEntry *)m;
+    *out_size = want;
+    return 0;
+}
+
+int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
+                    size_t slots_capacity, int writer) {
+    h->slot = -1;
+    h->writer = writer;
+    h->fd = -1;
+    h->map = NULL;
+    h->map_size = 0;
+    h->capacity = 0;
+
+    if (!g_kfcache) {
+        /* Cache not initialised — direct mmap, no locking. */
+        if (kf_open_file(path, slots_capacity, writer,
+                         &h->fd, &h->map, &h->map_size) < 0) return -1;
+        h->capacity = h->map_size / sizeof(SlotcaskKfEntry);
+        return 0;
+    }
+
+    /* Verify-and-retry on cache hit (mirrors bt_acquire). */
+    int retries = 0;
+    int found = 0, slot = -1;
+    pthread_mutex_lock(&g_kfcache_lock);
+    while (1) {
+        slot = kfcache_probe(path, &found);
+        if (!found) break;
+        g_kfcache[slot].last_access =
+            __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
+        pthread_mutex_unlock(&g_kfcache_lock);
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+
+        KfCacheEntry *e = &g_kfcache[slot];
+        if (e->used && strcmp(e->path, path) == 0) {
+            h->slot = slot;
+            h->fd = e->fd;
+            h->map = e->map;
+            h->map_size = e->map_size;
+            h->capacity = e->capacity;
+            return 0;
+        }
+        pthread_rwlock_unlock(lock);
+        if (++retries >= 4) {
+            slot = -1; found = 0;
+            pthread_mutex_lock(&g_kfcache_lock);
+            break;
+        }
+        pthread_mutex_lock(&g_kfcache_lock);
+    }
+
+    /* Miss path: open + install. Drop table lock during open since it can
+       block on disk. */
+    pthread_mutex_unlock(&g_kfcache_lock);
+    int fd; SlotcaskKfEntry *map; size_t sz;
+    if (kf_open_file(path, slots_capacity, writer, &fd, &map, &sz) < 0) return -1;
+    pthread_mutex_lock(&g_kfcache_lock);
+
+    /* Re-probe — another thread may have installed it while we were opening. */
+    slot = kfcache_probe(path, &found);
+    if (found) {
+        /* Lost the install race. Discard our open; use the cached entry. */
+        munmap(map, sz);
+        close(fd);
+        g_kfcache[slot].last_access =
+            __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
+        pthread_mutex_unlock(&g_kfcache_lock);
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+        KfCacheEntry *e = &g_kfcache[slot];
+        if (e->used && strcmp(e->path, path) == 0) {
+            h->slot = slot;
+            h->fd = e->fd;
+            h->map = e->map;
+            h->map_size = e->map_size;
+            h->capacity = e->capacity;
+            return 0;
+        }
+        /* Slot was evicted under us; serve uncached this once. */
+        pthread_rwlock_unlock(lock);
+        if (kf_open_file(path, slots_capacity, writer,
+                         &h->fd, &h->map, &h->map_size) < 0) return -1;
+        h->capacity = h->map_size / sizeof(SlotcaskKfEntry);
+        return 0;
+    }
+
+    /* Evict LRU if half-full or no empty slot. */
+    if (slot < 0 || g_kfcache_count >= g_kfcache_slots / 2) {
+        int lru = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < g_kfcache_slots; i++) {
+            if (g_kfcache[i].used && g_kfcache[i].last_access < oldest) {
+                oldest = g_kfcache[i].last_access;
+                lru = i;
+            }
+        }
+        if (lru >= 0) { kfcache_drop_slot(lru); slot = lru; }
+    }
+
+    if (slot < 0) {
+        /* Cache truly full — serve uncached. */
+        pthread_mutex_unlock(&g_kfcache_lock);
+        h->slot = -1;
+        h->fd = fd;
+        h->map = map;
+        h->map_size = sz;
+        h->capacity = sz / sizeof(SlotcaskKfEntry);
+        return 0;
+    }
+
+    KfCacheEntry *e = &g_kfcache[slot];
+    strncpy(e->path, path, PATH_MAX - 1);
+    e->path[PATH_MAX - 1] = '\0';
+    e->fd = fd;
+    e->map = map;
+    e->map_size = sz;
+    e->capacity = sz / sizeof(SlotcaskKfEntry);
+    e->used = 1;
+    e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
+    g_kfcache_count++;
+
+    /* Take rwlock before releasing table mutex (closes evict-after-install race). */
+    pthread_rwlock_t *lock = &e->rwlock;
+    if (writer) pthread_rwlock_wrlock(lock);
+    else        pthread_rwlock_rdlock(lock);
+    pthread_mutex_unlock(&g_kfcache_lock);
+
+    h->slot = slot;
+    h->fd = fd;
+    h->map = map;
+    h->map_size = sz;
+    h->capacity = e->capacity;
+    return 0;
+}
+
+void kfcache_release(SlotcaskKfHandle *h) {
+    if (h->slot >= 0) {
+        pthread_rwlock_unlock(&g_kfcache[h->slot].rwlock);
+    } else if (h->map) {
+        /* Uncached fallback. */
+        munmap(h->map, h->map_size);
+        if (h->fd >= 0) close(h->fd);
+    }
+    h->slot = -1;
+    h->fd = -1;
+    h->map = NULL;
+    h->map_size = 0;
+    h->capacity = 0;
+}
+
+/* ============================================================ segcache */
+
+typedef struct {
+    char     path[PATH_MAX];
+    int      fd;
+    uint8_t *map;
+    size_t   map_size;
+    pthread_rwlock_t rwlock;
+    int      used;
+    uint64_t last_access;
+} SegCacheEntry;
+
+static SegCacheEntry   *g_segcache = NULL;
+static int              g_segcache_slots = 0;
+static int              g_segcache_count = 0;
+static pthread_mutex_t  g_segcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t g_segcache_clock = 0;
+
+void segcache_init(int cap) {
+    if (g_segcache) return;
+    if (cap < 16) cap = 16;
+    g_segcache_slots = next_pow2(cap * 2);
+    g_segcache = calloc(g_segcache_slots, sizeof(SegCacheEntry));
+    g_segcache_count = 0;
+    for (int i = 0; i < g_segcache_slots; i++) {
+        pthread_rwlock_init(&g_segcache[i].rwlock, NULL);
+        g_segcache[i].fd = -1;
+    }
+}
+
+void segcache_shutdown(void) {
+    pthread_mutex_lock(&g_segcache_lock);
+    if (g_segcache) {
+        for (int i = 0; i < g_segcache_slots; i++) {
+            SegCacheEntry *e = &g_segcache[i];
+            if (!e->used) continue;
+            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_SYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            pthread_rwlock_destroy(&e->rwlock);
+        }
+        free(g_segcache);
+        g_segcache = NULL;
+        g_segcache_slots = 0;
+        g_segcache_count = 0;
+    }
+    pthread_mutex_unlock(&g_segcache_lock);
+}
+
+static int segcache_probe(const char *path, int *out_found) {
+    uint32_t h = path_hash(path);
+    int mask = g_segcache_slots - 1;
+    int idx = h & mask;
+    for (int i = 0; i < g_segcache_slots; i++) {
+        int s = (idx + i) & mask;
+        if (!g_segcache[s].used) { *out_found = 0; return s; }
+        if (strcmp(g_segcache[s].path, path) == 0) { *out_found = 1; return s; }
+    }
+    *out_found = 0;
+    return -1;
+}
+
+static void segcache_drop_slot(int slot) {
+    SegCacheEntry *e = &g_segcache[slot];
+    if (!e->used) return;
+    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+    if (e->map) munmap(e->map, e->map_size);
+    if (e->fd >= 0) close(e->fd);
+    e->map = NULL;
+    e->fd = -1;
+    e->map_size = 0;
+    e->used = 0;
+    e->path[0] = '\0';
+    g_segcache_count--;
+}
+
+/* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */
+static int seg_open_file(const char *path, int writer,
+                         int *out_fd, uint8_t **out_map, size_t *out_size) {
+    int fd;
+    if (writer) {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = 0; mkdirp_local(dir); }
+        fd = open(path, O_RDWR | O_CREAT, 0644);
+    } else {
+        fd = open(path, O_RDWR);
+    }
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+    if ((size_t)st.st_size < SLOTCASK_SEG_MAX_BYTES) {
+        if (!writer) { close(fd); return -1; }
+        if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0) {
+            close(fd); return -1;
+        }
+    }
+    void *m = mmap(NULL, SLOTCASK_SEG_MAX_BYTES, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return -1; }
+    *out_fd = fd;
+    *out_map = (uint8_t *)m;
+    *out_size = SLOTCASK_SEG_MAX_BYTES;
+    return 0;
+}
+
+int segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer) {
+    h->slot = -1;
+    h->writer = writer;
+    h->fd = -1;
+    h->map = NULL;
+    h->map_size = 0;
+
+    if (!g_segcache) {
+        if (seg_open_file(path, writer, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        return 0;
+    }
+
+    int retries = 0;
+    int found = 0, slot = -1;
+    pthread_mutex_lock(&g_segcache_lock);
+    while (1) {
+        slot = segcache_probe(path, &found);
+        if (!found) break;
+        g_segcache[slot].last_access =
+            __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &g_segcache[slot].rwlock;
+        pthread_mutex_unlock(&g_segcache_lock);
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+
+        SegCacheEntry *e = &g_segcache[slot];
+        if (e->used && strcmp(e->path, path) == 0) {
+            h->slot = slot;
+            h->fd = e->fd;
+            h->map = e->map;
+            h->map_size = e->map_size;
+            return 0;
+        }
+        pthread_rwlock_unlock(lock);
+        if (++retries >= 4) {
+            slot = -1; found = 0;
+            pthread_mutex_lock(&g_segcache_lock);
+            break;
+        }
+        pthread_mutex_lock(&g_segcache_lock);
+    }
+
+    pthread_mutex_unlock(&g_segcache_lock);
+    int fd; uint8_t *map; size_t sz;
+    if (seg_open_file(path, writer, &fd, &map, &sz) < 0) return -1;
+    pthread_mutex_lock(&g_segcache_lock);
+
+    slot = segcache_probe(path, &found);
+    if (found) {
+        munmap(map, sz);
+        close(fd);
+        g_segcache[slot].last_access =
+            __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &g_segcache[slot].rwlock;
+        pthread_mutex_unlock(&g_segcache_lock);
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+        SegCacheEntry *e = &g_segcache[slot];
+        if (e->used && strcmp(e->path, path) == 0) {
+            h->slot = slot;
+            h->fd = e->fd;
+            h->map = e->map;
+            h->map_size = e->map_size;
+            return 0;
+        }
+        pthread_rwlock_unlock(lock);
+        if (seg_open_file(path, writer, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        return 0;
+    }
+
+    if (slot < 0 || g_segcache_count >= g_segcache_slots / 2) {
+        int lru = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < g_segcache_slots; i++) {
+            if (g_segcache[i].used && g_segcache[i].last_access < oldest) {
+                oldest = g_segcache[i].last_access;
+                lru = i;
+            }
+        }
+        if (lru >= 0) { segcache_drop_slot(lru); slot = lru; }
+    }
+
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_segcache_lock);
+        h->slot = -1;
+        h->fd = fd;
+        h->map = map;
+        h->map_size = sz;
+        return 0;
+    }
+
+    SegCacheEntry *e = &g_segcache[slot];
+    strncpy(e->path, path, PATH_MAX - 1);
+    e->path[PATH_MAX - 1] = '\0';
+    e->fd = fd;
+    e->map = map;
+    e->map_size = sz;
+    e->used = 1;
+    e->last_access = __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
+    g_segcache_count++;
+
+    pthread_rwlock_t *lock = &e->rwlock;
+    if (writer) pthread_rwlock_wrlock(lock);
+    else        pthread_rwlock_rdlock(lock);
+    pthread_mutex_unlock(&g_segcache_lock);
+
+    h->slot = slot;
+    h->fd = fd;
+    h->map = map;
+    h->map_size = sz;
+    return 0;
+}
+
+void segcache_release(SlotcaskSegHandle *h) {
+    if (h->slot >= 0) {
+        pthread_rwlock_unlock(&g_segcache[h->slot].rwlock);
+    } else if (h->map) {
+        munmap(h->map, h->map_size);
+        if (h->fd >= 0) close(h->fd);
+    }
+    h->slot = -1;
+    h->fd = -1;
+    h->map = NULL;
+    h->map_size = 0;
+}
+
+/* ============================================================ Init / shutdown */
+
+void slotcask_init(int kfcache_cap, int segcache_cap) {
+    kfcache_init(kfcache_cap);
+    segcache_init(segcache_cap);
+}
+
+void slotcask_shutdown(void) {
+    kfcache_shutdown();
+    segcache_shutdown();
+}
+
+int slotcask_streams_for_nproc(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 4;
+    if (n <= 8) return (int)n;
+    if (n <= 16) return 8;
+    return 16;
+}
+
+/* ============================================================ Keyfile ops
+ *
+ * All keyfile mutations route through kfcache_acquire(writer=1). The cache
+ * entry's rwlock serializes writers per shard; readers go via rdlock + atomic
+ * loads. The 24B SlotcaskKfEntry layout keeps the trailing 8B (flag + stream +
+ * file_id + offset) 8-byte aligned, so kf_repoint commits via a single
+ * __atomic_store_n on that uint64. */
+
+/* Verify the on-disk record's stored key matches `key`. Returns 1 if match,
+   0 if different (hash collision), -1 on I/O error. */
+static int verify_stored_key(const char *data_dir, uint8_t stream_id,
+                             uint16_t file_id, uint32_t offset,
+                             const void *key, size_t klen) {
+    char path[PATH_MAX];
+    seg_path_for(path, data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 0) != 0) return -1;
+    const uint8_t *rec = h.map + offset;
+    uint16_t k_stored;
+    memcpy(&k_stored, rec + 16, 2);
+    if (k_stored != klen) { segcache_release(&h); return 0; }
+    int match = (memcmp(rec + 24, key, klen) == 0);
+    segcache_release(&h);
+    return match ? 1 : 0;
+}
+
+/* Insert NEW key (no upsert). Returns 0 ok, 1 already exists, -1 error.
+   Caller holds the kf shard's wrlock via the kfcache handle. */
+static int kf_put_new(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                      uint8_t stream_id, uint16_t file_id, uint32_t offset,
+                      const void *key, size_t klen, const char *data_dir,
+                      size_t *used_delta) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) {
+            memcpy(e->hash, hash, 16);
+            e->stream_id = stream_id;
+            e->file_id = file_id;
+            e->offset = offset;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            e->flag = 1;
+            (*used_delta)++;
+            return 0;
+        }
+        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) return 1;
+        }
+        if (e->flag == 2 && memcmp(e->hash, hash, 16) == 0) {
+            e->stream_id = stream_id;
+            e->file_id = file_id;
+            e->offset = offset;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            e->flag = 1;
+            (*used_delta)++;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Look up. Returns 0 found (writes outputs), -1 not present. */
+static int kf_lookup(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                     const void *key, size_t klen, const char *data_dir,
+                     uint8_t *flag_out, uint8_t *stream_id_out,
+                     uint16_t *file_id_out, uint32_t *offset_out) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) return -1;
+        if (memcmp(e->hash, hash, 16) == 0) {
+            if (e->flag == 2) return -1;
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) {
+                *flag_out = e->flag;
+                *stream_id_out = e->stream_id;
+                *file_id_out = e->file_id;
+                *offset_out = e->offset;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Repoint EXISTING key's slot. Atomic 8B store on the trailing group keeps
+   the on-disk state self-consistent if we crash mid-flight. */
+static int kf_repoint(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                      uint8_t new_stream_id, uint16_t new_file_id,
+                      uint32_t new_offset, const void *key, size_t klen,
+                      const char *data_dir) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) return -1;
+        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) {
+                union {
+                    struct {
+                        uint8_t  flag;
+                        uint8_t  stream_id;
+                        uint16_t file_id;
+                        uint32_t offset;
+                    } parts;
+                    uint64_t u64;
+                } combo;
+                combo.parts.flag = 1;
+                combo.parts.stream_id = new_stream_id;
+                combo.parts.file_id = new_file_id;
+                combo.parts.offset = new_offset;
+                __atomic_store_n((uint64_t *)((uint8_t *)e + 16), combo.u64,
+                                 __ATOMIC_RELEASE);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+static int kf_tombstone(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                        const void *key, size_t klen, const char *data_dir,
+                        uint8_t *out_stream_id, uint16_t *out_file_id,
+                        uint32_t *out_offset, size_t *used_delta) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) return -1;
+        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) {
+                *out_stream_id = e->stream_id;
+                *out_file_id = e->file_id;
+                *out_offset = e->offset;
+                e->flag = 2;
+                (*used_delta)++;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* ============================================================ Free pool */
+
+static int pool_push_free(SlotcaskStream *p, uint16_t file_id, uint32_t offset) {
+    pthread_mutex_lock(&p->pool_lock);
+    if (p->free_count == p->free_cap) {
+        size_t new_cap = p->free_cap ? p->free_cap * 2 : 4096;
+        SlotcaskFreeSlot *na = realloc(p->free_slots,
+                                       new_cap * sizeof(SlotcaskFreeSlot));
+        if (!na) { pthread_mutex_unlock(&p->pool_lock); return -1; }
+        p->free_slots = na;
+        p->free_cap = new_cap;
+    }
+    p->free_slots[p->free_count].file_id = file_id;
+    p->free_slots[p->free_count].offset = offset;
+    p->free_count++;
+    pthread_mutex_unlock(&p->pool_lock);
+    return 0;
+}
+
+static int pool_try_pop_n(SlotcaskStream *p, size_t n, SlotcaskFreeSlot *out) {
+    if (pthread_mutex_trylock(&p->pool_lock) != 0) return 1;
+    if (p->free_count < n) { pthread_mutex_unlock(&p->pool_lock); return 2; }
+    for (size_t i = 0; i < n; i++) {
+        out[i] = p->free_slots[p->free_count - 1 - i];
+    }
+    p->free_count -= n;
+    pthread_mutex_unlock(&p->pool_lock);
+    return 0;
+}
+
+/* ============================================================ Append path */
+
+/* Reserve N consecutive slots in the active segment of stream `p`. Rotates if
+   the active segment is full. Returns 0 on success, -1 on error. */
+static int append_reserve_n(SlotcaskDb *db, SlotcaskStream *p,
+                            size_t n, uint32_t *file_id_out,
+                            uint32_t *offsets_out) {
+    pthread_mutex_lock(&p->rotation_lock);
+    size_t need = n * (size_t)db->slot_size;
+    if (p->reserve_off + need > SLOTCASK_SEG_MAX_BYTES) {
+        /* Rotate. */
+        p->active_file_id++;
+        p->reserve_off = 0;
+    }
+    *file_id_out = p->active_file_id;
+    for (size_t i = 0; i < n; i++) {
+        offsets_out[i] = (uint32_t)(p->reserve_off + i * (size_t)db->slot_size);
+    }
+    p->reserve_off += need;
+    pthread_mutex_unlock(&p->rotation_lock);
+    return 0;
+}
+
+/* ============================================================ Record I/O */
+
+/* Build a slot record in `buf` (caller-allocated, slot_size bytes). */
+static void build_record_buf(uint8_t *buf, int slot_size,
+                             const uint8_t hash[16], uint8_t flag,
+                             const void *key, size_t klen,
+                             const void *value, size_t vlen) {
+    memset(buf, 0, slot_size);
+    memcpy(buf, hash, 16);
+    uint16_t k16 = (uint16_t)klen;
+    memcpy(buf + 16, &k16, 2);
+    buf[18] = flag;
+    buf[19] = 0;
+    uint32_t v32 = (uint32_t)vlen;
+    memcpy(buf + 20, &v32, 4);
+    memcpy(buf + 24, key, klen);
+    memcpy(buf + 24 + klen, value, vlen);
+}
+
+/* Memcpy a complete record (key+value already concatenated) into the segment
+   mmap with crash-safe ordering: payload first, fence, flag byte last. */
+static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
+                            uint16_t file_id, uint32_t offset,
+                            const uint8_t hash[16],
+                            const void *key, size_t klen,
+                            const void *value, size_t vlen) {
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 1) != 0) return -1;
+
+    uint8_t *dst = h.map + offset;
+    /* Header without flag set yet. */
+    memcpy(dst, hash, 16);
+    uint16_t k16 = (uint16_t)klen;
+    memcpy(dst + 16, &k16, 2);
+    dst[18] = 0;          /* flag stays 0 until payload is in place */
+    dst[19] = 0;
+    uint32_t v32 = (uint32_t)vlen;
+    memcpy(dst + 20, &v32, 4);
+    memcpy(dst + 24, key, klen);
+    memcpy(dst + 24 + klen, value, vlen);
+    /* Zero pad up to slot_size — keeps recovery scans deterministic. */
+    size_t used = 24 + klen + vlen;
+    if (used < (size_t)db->slot_size) {
+        memset(dst + used, 0, (size_t)db->slot_size - used);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    dst[18] = 1;
+    segcache_release(&h);
+    return 0;
+}
+
+/* Set the flag byte at slot (file_id, offset) to `flag`. Used for tombstones. */
+static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
+                          uint16_t file_id, uint32_t offset, uint8_t flag) {
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 1) != 0) return -1;
+    h.map[offset + 18] = flag;
+    segcache_release(&h);
+    return 0;
+}
+
+/* ============================================================ Public CRUD */
+
+int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
+                    const void *key, size_t klen,
+                    const void *value, size_t vlen) {
+    if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+    if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
+
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+
+    int sid_data = stream_id_hint;
+    if (sid_data < 0 || sid_data >= db->num_streams)
+        sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
+    SlotcaskStream *pool = &db->streams[sid_data];
+
+    SlotcaskFreeSlot fs;
+    uint8_t target_stream = (uint8_t)sid_data;
+    uint16_t target_fid;
+    uint32_t target_off;
+    int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+    } else {
+        uint32_t fid;
+        uint32_t off;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+    }
+
+    if (seg_write_record(db, target_stream, target_fid, target_off,
+                         hash, key, klen, value, vlen) != 0) {
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+    size_t used_delta = 0;
+    int put_rc = kf_put_new(&kh, hash, target_stream, target_fid, target_off,
+                            key, klen, db->data_dir, &used_delta);
+    kfcache_release(&kh);
+    if (put_rc != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        return (put_rc == 1) ? -2 : -1;
+    }
+    return 0;
+}
+
+int slotcask_update(SlotcaskDb *db, int stream_id_hint,
+                    const void *key, size_t klen,
+                    const void *value, size_t vlen) {
+    if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+    if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
+
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    /* 1. Lookup. */
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    uint8_t old_flag, old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    int lookup_rc = kf_lookup(&kh, hash, key, klen, db->data_dir,
+                              &old_flag, &old_sid, &old_fid, &old_off);
+    kfcache_release(&kh);
+    if (lookup_rc < 0) return -1;
+
+    /* 2. Reserve target. */
+    int sid_data = stream_id_hint;
+    if (sid_data < 0 || sid_data >= db->num_streams)
+        sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
+    SlotcaskStream *pool = &db->streams[sid_data];
+    SlotcaskFreeSlot fs;
+    uint8_t target_stream = (uint8_t)sid_data;
+    uint16_t target_fid;
+    uint32_t target_off;
+    int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+    } else {
+        uint32_t fid, off;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+    }
+
+    /* 3. Write new record. */
+    if (seg_write_record(db, target_stream, target_fid, target_off,
+                         hash, key, klen, value, vlen) != 0) {
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    /* 4. Repoint keyfile (commit point). */
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+    int repoint_rc = kf_repoint(&kh, hash, target_stream, target_fid, target_off,
+                                key, klen, db->data_dir);
+    kfcache_release(&kh);
+    if (repoint_rc != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    /* 5. Tombstone old slot + return to pool. */
+    seg_write_flag(db, old_sid, old_fid, old_off, 2);
+    pool_push_free(&db->streams[old_sid], old_fid, old_off);
+    return 0;
+}
+
+int slotcask_delete(SlotcaskDb *db,
+                    const void *key, size_t klen) {
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    uint8_t old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    size_t used_delta = 0;
+    int rc = kf_tombstone(&kh, hash, key, klen, db->data_dir,
+                          &old_sid, &old_fid, &old_off, &used_delta);
+    kfcache_release(&kh);
+    if (rc < 0) return -1;
+    seg_write_flag(db, old_sid, old_fid, old_off, 2);
+    pool_push_free(&db->streams[old_sid], old_fid, old_off);
+    return 0;
+}
+
+#define SLOTCASK_GET_MAX_RETRIES 4
+
+int slotcask_get(SlotcaskDb *db,
+                 const void *key, size_t klen,
+                 void **val_out, size_t *vlen_out) {
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    for (int attempt = 0; attempt < SLOTCASK_GET_MAX_RETRIES; attempt++) {
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+        uint8_t flag, stream_id;
+        uint16_t file_id;
+        uint32_t offset;
+        int rc = kf_lookup(&kh, hash, key, klen, db->data_dir,
+                           &flag, &stream_id, &file_id, &offset);
+        kfcache_release(&kh);
+        if (rc < 0) return -1;
+
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, stream_id, file_id);
+        SlotcaskSegHandle sh;
+        if (segcache_acquire(&sh, path, 0) != 0) return -1;
+
+        const uint8_t *rec = sh.map + offset;
+        if (rec[18] != 1 || memcmp(rec, hash, 16) != 0) {
+            segcache_release(&sh);
+            continue;
+        }
+        uint16_t k_stored;
+        uint32_t v_stored;
+        memcpy(&k_stored, rec + 16, 2);
+        memcpy(&v_stored, rec + 20, 4);
+        if (k_stored != klen || memcmp(rec + 24, key, klen) != 0) {
+            segcache_release(&sh);
+            continue;
+        }
+        void *vbuf = malloc(v_stored ? v_stored : 1);
+        if (!vbuf) { segcache_release(&sh); return -1; }
+        if (v_stored) memcpy(vbuf, rec + 24 + klen, v_stored);
+        segcache_release(&sh);
+        *val_out = vbuf;
+        *vlen_out = v_stored;
+        return 0;
+    }
+    return -1;
+}
+
+/* ============================================================ Bulk update */
+
+typedef struct {
+    size_t   orig_idx;
+    uint8_t  hash[16];
+    uint8_t  old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    uint8_t  target_sid;
+    SlotcaskFreeSlot target;
+    int      old_found;
+} BulkInfo;
+
+int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n) {
+    if (n == 0) return 0;
+    BulkInfo *infos = calloc(n, sizeof(BulkInfo));
+    if (!infos) return -1;
+
+    /* 1. Hash + lookup old slot for each record. */
+    for (size_t i = 0; i < n; i++) {
+        infos[i].orig_idx = i;
+        compute_hash(recs[i].key, recs[i].klen, infos[i].hash);
+        infos[i].target_sid = (uint8_t)((unsigned)infos[i].hash[15] %
+                                        (unsigned)db->num_streams);
+        int sid_kf = shard_for_hash(infos[i].hash, db->num_shards);
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, sid_kf);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+            free(infos); return -1;
+        }
+        uint8_t f;
+        int rc = kf_lookup(&kh, infos[i].hash, recs[i].key, recs[i].klen,
+                           db->data_dir, &f, &infos[i].old_sid,
+                           &infos[i].old_fid, &infos[i].old_off);
+        kfcache_release(&kh);
+        infos[i].old_found = (rc == 0);
+        if (!infos[i].old_found) { free(infos); return -1; }
+    }
+
+    /* 2. Bucket by stream + try-pool-or-append all-or-nothing. */
+    size_t per_stream[SLOTCASK_MAX_STREAMS] = {0};
+    for (size_t i = 0; i < n; i++) per_stream[infos[i].target_sid]++;
+
+    for (int s = 0; s < db->num_streams; s++) {
+        size_t sub_n = per_stream[s];
+        if (sub_n == 0) continue;
+        SlotcaskFreeSlot *targets = malloc(sub_n * sizeof(SlotcaskFreeSlot));
+        if (!targets) { free(infos); return -1; }
+        int from_pool = (pool_try_pop_n(&db->streams[s], sub_n, targets) == 0);
+        if (!from_pool) {
+            uint32_t *offsets = malloc(sub_n * sizeof(uint32_t));
+            uint32_t fid;
+            if (!offsets || append_reserve_n(db, &db->streams[s], sub_n,
+                                             &fid, offsets) != 0) {
+                free(offsets); free(targets); free(infos); return -1;
+            }
+            for (size_t i = 0; i < sub_n; i++) {
+                targets[i].file_id = (uint16_t)fid;
+                targets[i].offset = offsets[i];
+            }
+            free(offsets);
+        }
+        size_t tgt_idx = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (infos[i].target_sid != s) continue;
+            infos[i].target = targets[tgt_idx++];
+        }
+        free(targets);
+    }
+
+    /* 3. Write + repoint + tombstone. */
+    for (size_t i = 0; i < n; i++) {
+        if (seg_write_record(db, infos[i].target_sid,
+                             infos[i].target.file_id, infos[i].target.offset,
+                             infos[i].hash, recs[i].key, recs[i].klen,
+                             recs[i].value, recs[i].vlen) != 0) {
+            free(infos); return -1;
+        }
+        int sid_kf = shard_for_hash(infos[i].hash, db->num_shards);
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, sid_kf);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+            free(infos); return -1;
+        }
+        kf_repoint(&kh, infos[i].hash, infos[i].target_sid,
+                   infos[i].target.file_id, infos[i].target.offset,
+                   recs[i].key, recs[i].klen, db->data_dir);
+        kfcache_release(&kh);
+        seg_write_flag(db, infos[i].old_sid, infos[i].old_fid,
+                       infos[i].old_off, 2);
+        pool_push_free(&db->streams[infos[i].old_sid],
+                       infos[i].old_fid, infos[i].old_off);
+    }
+
+    free(infos);
+    return 0;
+}
+
+/* ============================================================ Open / close */
+
+static void dirty_marker_path(const SlotcaskDb *db, char out[PATH_MAX]) {
+    snprintf(out, PATH_MAX, "%s/.dirty", db->data_dir);
+}
+static int touch_dirty_marker(const SlotcaskDb *db) {
+    char p[PATH_MAX]; dirty_marker_path(db, p);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    close(fd); return 0;
+}
+static int dirty_marker_exists(const SlotcaskDb *db) {
+    char p[PATH_MAX]; dirty_marker_path(db, p);
+    struct stat st; return stat(p, &st) == 0;
+}
+static int remove_dirty_marker(const SlotcaskDb *db) {
+    char p[PATH_MAX]; dirty_marker_path(db, p);
+    if (unlink(p) != 0 && errno != ENOENT) return -1;
+    return 0;
+}
+
+static int data_file_id_from_name(const char *name) {
+    int id;
+    return (sscanf(name, "data_%d.dat", &id) == 1) ? id : -1;
+}
+static int cmp_int(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);
+}
+
+/* Walk every segment for every stream, populate the in-memory free-slot pool
+   from flag=2 slots, and position each stream's reserve_off past the last
+   live slot in the highest-numbered segment. */
+static int recover_streams(SlotcaskDb *db) {
+    for (int sid = 0; sid < db->num_streams; sid++) {
+        char dir[PATH_MAX];
+        stream_dir_for(dir, db->data_dir, sid);
+        DIR *d = opendir(dir);
+        if (!d) {
+            if (errno == ENOENT) continue;
+            return -1;
+        }
+        int *ids = NULL; size_t n_ids = 0, cap_ids = 0;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            int id = data_file_id_from_name(de->d_name);
+            if (id < 0) continue;
+            if (n_ids == cap_ids) {
+                cap_ids = cap_ids ? cap_ids * 2 : 64;
+                ids = realloc(ids, cap_ids * sizeof(int));
+                if (!ids) { closedir(d); return -1; }
+            }
+            ids[n_ids++] = id;
+        }
+        closedir(d);
+        if (n_ids == 0) { free(ids); continue; }
+        qsort(ids, n_ids, sizeof(int), cmp_int);
+
+        int last_id = ids[n_ids - 1];
+        off_t last_offset = 0;
+
+        for (size_t fi = 0; fi < n_ids; fi++) {
+            int file_id = ids[fi];
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 0) != 0) { free(ids); return -1; }
+            off_t pos = 0;
+            off_t lim = (off_t)h.map_size;
+            while (pos + db->slot_size <= lim) {
+                uint8_t flag = h.map[pos + 18];
+                if (flag == 2) {
+                    pool_push_free(&db->streams[sid], (uint16_t)file_id,
+                                   (uint32_t)pos);
+                } else if (flag == 0) {
+                    /* First empty slot in highest-numbered segment marks the
+                       reserve frontier. Earlier segments may have empty tails
+                       too (preallocated 128 MB), but only the latest one
+                       matters for reserve_off. */
+                    if (file_id == last_id) break;
+                }
+                pos += db->slot_size;
+            }
+            if (file_id == last_id) last_offset = pos;
+            segcache_release(&h);
+        }
+        db->streams[sid].active_file_id = (uint32_t)last_id;
+        db->streams[sid].reserve_off = (uint64_t)last_offset;
+        free(ids);
+    }
+    return 0;
+}
+
+int slotcask_open(SlotcaskDb *db, const char *data_dir,
+                  int num_shards, int num_streams, int slot_size) {
+    memset(db, 0, sizeof(*db));
+    if (num_shards < 1 || num_shards > SLOTCASK_MAX_SHARDS) return -1;
+    if (num_streams < 1 || num_streams > SLOTCASK_MAX_STREAMS) return -1;
+    if (slot_size < 32) return -1;
+    snprintf(db->data_dir, sizeof(db->data_dir), "%s", data_dir);
+    db->num_shards = num_shards;
+    db->num_streams = num_streams;
+    db->slot_size = slot_size;
+    db->slots_per_shard = SLOTCASK_DEFAULT_SLOTS_PER_SHARD;
+
+    if (mkdirp_local(data_dir) != 0) return -1;
+
+    db->streams = calloc(num_streams, sizeof(SlotcaskStream));
+    if (!db->streams) return -1;
+    for (int i = 0; i < num_streams; i++) {
+        SlotcaskStream *s = &db->streams[i];
+        s->stream_id = i;
+        stream_dir_for(s->stream_dir, data_dir, i);
+        if (mkdirp_local(s->stream_dir) != 0) goto fail;
+        pthread_mutex_init(&s->rotation_lock, NULL);
+        pthread_mutex_init(&s->pool_lock, NULL);
+        s->active_file_id = 0;
+        s->reserve_off = 0;
+    }
+
+    /* Eagerly create file_000 in each stream so the first append doesn't
+       race the create path through the cache. */
+    for (int i = 0; i < num_streams; i++) {
+        char path[PATH_MAX];
+        seg_path_for(path, data_dir, i, 0);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 1) != 0) goto fail;
+        segcache_release(&h);
+    }
+
+    int dirty = dirty_marker_exists(db);
+    if (dirty) {
+        if (recover_streams(db) != 0) goto fail;
+    }
+    if (touch_dirty_marker(db) != 0) {
+        /* Non-fatal — recovery will simply re-walk on the next open. */
+    }
+    return 0;
+
+fail:
+    if (db->streams) {
+        for (int i = 0; i < num_streams; i++) {
+            pthread_mutex_destroy(&db->streams[i].rotation_lock);
+            pthread_mutex_destroy(&db->streams[i].pool_lock);
+            free(db->streams[i].free_slots);
+        }
+        free(db->streams);
+        db->streams = NULL;
+    }
+    return -1;
+}
+
+void slotcask_close(SlotcaskDb *db) {
+    if (db->streams) {
+        for (int i = 0; i < db->num_streams; i++) {
+            pthread_mutex_destroy(&db->streams[i].rotation_lock);
+            pthread_mutex_destroy(&db->streams[i].pool_lock);
+            free(db->streams[i].free_slots);
+        }
+        free(db->streams);
+    }
+    remove_dirty_marker(db);
+    memset(db, 0, sizeof(*db));
+}
+
+/* Suppress unused-static warnings for build_record_buf which remains in the
+   file as a reference for migrators / future bulk paths but isn't called
+   from the current code (seg_write_record builds inline into the mmap). */
+__attribute__((unused)) static void *_silence_build_record_buf =
+    (void *)build_record_buf;
