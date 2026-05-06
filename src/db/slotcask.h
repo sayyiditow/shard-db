@@ -190,4 +190,95 @@ typedef struct {
 
 int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n);
 
+/* Stripped-down lookup. Returns 1 if the key exists (not tombstoned), 0 if
+   missing, -1 on I/O error. No value copy. */
+int slotcask_exists(SlotcaskDb *db, const void *key, size_t klen);
+
+/* ============================================================ CAS hooks
+ *
+ * The plain slotcask_insert / _update / _delete are straight-line — no CAS,
+ * no index hooks. The hook variants below give callers two callbacks that
+ * fire at well-defined points under the kf-shard wrlock:
+ *
+ *   check_fn      — fires AFTER lookup (so it sees the current old record,
+ *                   if any) but BEFORE any data is written. Caller validates
+ *                   if_not_exists, criteria, etc.
+ *
+ *   pre_commit_fn — fires AFTER the new record is written to a segment but
+ *                   BEFORE the kf entry is repointed/inserted (commit point).
+ *                   Caller updates secondary indexes here. Returning non-zero
+ *                   aborts: the freshly-written slot is tombstoned and
+ *                   pushed to the free pool, no kf change happens.
+ *
+ * The kf-shard wrlock is held across both callbacks for the upsert path
+ * (and the lookup → kf-mutation window for delete). Reads to the same shard
+ * block while a CAS path is running. Phase-1-prototype-style fine-grained
+ * lock acquisition can be reintroduced in the perf phase.
+ */
+
+typedef struct {
+    /* NULL when key doesn't exist (fresh insert). Otherwise points to the
+       OLD on-disk value bytes — caller must copy if it wants to retain
+       past pre_commit return. */
+    const uint8_t *value;
+    size_t         vlen;
+} SlotcaskOldRecord;
+
+/* Return 1 to proceed; 0 to abort with condition_not_met. NULL = always proceed. */
+typedef int (*slotcask_check_fn)(const SlotcaskOldRecord *old, void *ctx);
+
+/* Return 0 to commit; non-zero to abort. NULL = always commit. */
+typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
+                                       const uint8_t *new_value, size_t new_vlen,
+                                       int is_update, void *ctx);
+
+typedef struct {
+    int                       if_not_exists;     /* fail if key exists (insert path) */
+    int                       require_existing;  /* fail if key missing (update path) */
+    slotcask_check_fn         check;
+    void                     *check_ctx;
+    slotcask_pre_commit_fn    pre_commit;
+    void                     *pre_commit_ctx;
+} SlotcaskUpsertOpts;
+
+typedef struct {
+    int     was_update;             /* 1 if existing key was updated, 0 if created */
+    int     condition_not_met;      /* 1 if check_fn or if_not_exists/require_existing rejected */
+    /* On condition_not_met=1, malloc'd copy of the OLD record's value (NULL if
+       no old record). Caller frees. */
+    uint8_t *current_value;
+    size_t   current_vlen;
+} SlotcaskUpsertResult;
+
+/* Returns 0 on success (record written), -1 on hard error, -2 on
+   condition_not_met. result->was_update / current_value are populated
+   regardless of return code (current_value present only on -2 with old). */
+int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                const SlotcaskUpsertOpts *opts,
+                                SlotcaskUpsertResult *result);
+
+typedef struct {
+    slotcask_check_fn   check;
+    void               *check_ctx;
+    /* Fires with the old record under the kf wrlock, after kf_lookup but
+       before kf flag=2. Caller removes index entries. Return 0 to commit
+       the deletion; non-zero to abort (kf untouched, no tombstone). */
+    int (*pre_commit)(const SlotcaskOldRecord *old, void *ctx);
+    void               *pre_commit_ctx;
+} SlotcaskDeleteOpts;
+
+typedef struct {
+    int      not_found;
+    int      condition_not_met;
+    uint8_t *current_value;
+    size_t   current_vlen;
+} SlotcaskDeleteResult;
+
+int slotcask_delete_with_hooks(SlotcaskDb *db,
+                                const void *key, size_t klen,
+                                const SlotcaskDeleteOpts *opts,
+                                SlotcaskDeleteResult *result);
+
 #endif

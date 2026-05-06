@@ -1374,6 +1374,299 @@ void slotcask_close(SlotcaskDb *db) {
     memset(db, 0, sizeof(*db));
 }
 
+/* ============================================================ CAS hooks
+ *
+ * Atomic upsert / delete with caller-supplied check + pre-commit callbacks.
+ * Held under the kf-shard wrlock for the whole CAS path. Slow under
+ * contention but correctness-simple. The plain insert/update/delete paths
+ * above stay fast for the non-CAS bulk write workloads.
+ */
+
+/* Read a record's value bytes into a malloc'd buffer. Returns 0 ok, -1 on
+   error. *out_buf is malloc'd (caller frees) even when vlen==0 (1-byte
+   sentinel) so callers can free unconditionally. */
+static int read_record_value(const SlotcaskDb *db, uint8_t stream_id,
+                              uint16_t file_id, uint32_t offset,
+                              const void *key, size_t klen,
+                              uint8_t **out_buf, size_t *out_vlen) {
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 0) != 0) return -1;
+    const uint8_t *rec = h.map + offset;
+    if (rec[18] != 1) { segcache_release(&h); return -1; }
+    uint16_t k_stored;
+    uint32_t v_stored;
+    memcpy(&k_stored, rec + 16, 2);
+    memcpy(&v_stored, rec + 20, 4);
+    if (k_stored != klen || memcmp(rec + 24, key, klen) != 0) {
+        segcache_release(&h);
+        return -1;
+    }
+    uint8_t *buf = malloc(v_stored ? v_stored : 1);
+    if (!buf) { segcache_release(&h); return -1; }
+    if (v_stored) memcpy(buf, rec + 24 + klen, v_stored);
+    segcache_release(&h);
+    *out_buf = buf;
+    *out_vlen = v_stored;
+    return 0;
+}
+
+int slotcask_exists(SlotcaskDb *db, const void *key, size_t klen) {
+    if (klen > UINT16_MAX) return -1;
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+    uint8_t flag, sid;
+    uint16_t fid;
+    uint32_t off;
+    int rc = kf_lookup(&kh, hash, key, klen, db->data_dir,
+                       &flag, &sid, &fid, &off);
+    kfcache_release(&kh);
+    return (rc == 0) ? 1 : 0;
+}
+
+int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                const SlotcaskUpsertOpts *opts,
+                                SlotcaskUpsertResult *result) {
+    if (result) {
+        result->was_update = 0;
+        result->condition_not_met = 0;
+        result->current_value = NULL;
+        result->current_vlen = 0;
+    }
+    if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+    if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
+    SlotcaskUpsertOpts blank = {0};
+    if (!opts) opts = &blank;
+
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    /* Lookup current state. */
+    uint8_t old_flag = 0, old_sid = 0;
+    uint16_t old_fid = 0;
+    uint32_t old_off = 0;
+    int found = (kf_lookup(&kh, hash, key, klen, db->data_dir,
+                           &old_flag, &old_sid, &old_fid, &old_off) == 0);
+
+    /* Read OLD value bytes (only if present — we'll need them for check_fn /
+       pre_commit / current_value-on-rejection). */
+    uint8_t *old_buf = NULL;
+    size_t   old_vlen = 0;
+    if (found) {
+        if (read_record_value(db, old_sid, old_fid, old_off, key, klen,
+                              &old_buf, &old_vlen) != 0) {
+            kfcache_release(&kh);
+            return -1;
+        }
+    }
+
+    SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+    const SlotcaskOldRecord *old_ptr = found ? &old_rec : NULL;
+
+    /* Built-in CAS gates (if_not_exists / require_existing) before user check. */
+    int rejected = 0;
+    if (found && opts->if_not_exists)        rejected = 1;
+    if (!found && opts->require_existing)    rejected = 1;
+    if (!rejected && opts->check) {
+        if (opts->check(old_ptr, opts->check_ctx) == 0) rejected = 1;
+    }
+
+    if (rejected) {
+        kfcache_release(&kh);
+        if (result) {
+            result->was_update = found ? 1 : 0;
+            result->condition_not_met = 1;
+            result->current_value = old_buf;     /* transfer ownership */
+            result->current_vlen = old_vlen;
+        } else {
+            free(old_buf);
+        }
+        return -2;
+    }
+
+    /* Reserve target slot. */
+    int sid_data = stream_id_hint;
+    if (sid_data < 0 || sid_data >= db->num_streams)
+        sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
+    SlotcaskStream *pool = &db->streams[sid_data];
+
+    SlotcaskFreeSlot fs;
+    uint8_t  target_stream = (uint8_t)sid_data;
+    uint16_t target_fid;
+    uint32_t target_off;
+    int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+    } else {
+        uint32_t fid, off;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+        target_fid = (uint16_t)fid;
+        target_off = off;
+    }
+
+    /* Write new record. */
+    if (seg_write_record(db, target_stream, target_fid, target_off,
+                         hash, key, klen, value, vlen) != 0) {
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        kfcache_release(&kh);
+        free(old_buf);
+        return -1;
+    }
+
+    /* Pre-commit hook (Option B index ordering). Caller updates indexes
+       here; if it errors out we tombstone the new slot and bail. */
+    if (opts->pre_commit) {
+        int rc = opts->pre_commit(old_ptr, value, vlen, found,
+                                  opts->pre_commit_ctx);
+        if (rc != 0) {
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+    }
+
+    /* Commit point: kf_put_new for fresh inserts, kf_repoint for updates. */
+    int kf_rc;
+    if (found) {
+        kf_rc = kf_repoint(&kh, hash, target_stream, target_fid, target_off,
+                           key, klen, db->data_dir);
+    } else {
+        size_t used_delta = 0;
+        kf_rc = kf_put_new(&kh, hash, target_stream, target_fid, target_off,
+                           key, klen, db->data_dir, &used_delta);
+        /* Under wrlock; a "1 = already exists" return here would mean a race
+           we haven't seen evidence of, but treat it as a hard error. */
+        if (kf_rc == 1) kf_rc = -1;
+    }
+
+    if (kf_rc != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        kfcache_release(&kh);
+        free(old_buf);
+        return -1;
+    }
+
+    /* kf is now committed to the new slot. Drop wrlock before tombstoning
+       the old slot — that's a separate segment write. */
+    kfcache_release(&kh);
+
+    if (found) {
+        seg_write_flag(db, old_sid, old_fid, old_off, 2);
+        pool_push_free(&db->streams[old_sid], old_fid, old_off);
+    }
+
+    if (result) {
+        result->was_update = found ? 1 : 0;
+        result->condition_not_met = 0;
+    }
+    free(old_buf);
+    return 0;
+}
+
+int slotcask_delete_with_hooks(SlotcaskDb *db,
+                                const void *key, size_t klen,
+                                const SlotcaskDeleteOpts *opts,
+                                SlotcaskDeleteResult *result) {
+    if (result) {
+        result->not_found = 0;
+        result->condition_not_met = 0;
+        result->current_value = NULL;
+        result->current_vlen = 0;
+    }
+    if (klen > UINT16_MAX) return -1;
+    SlotcaskDeleteOpts blank = {0};
+    if (!opts) opts = &blank;
+
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    uint8_t old_flag = 0, old_sid = 0;
+    uint16_t old_fid = 0;
+    uint32_t old_off = 0;
+    int found = (kf_lookup(&kh, hash, key, klen, db->data_dir,
+                           &old_flag, &old_sid, &old_fid, &old_off) == 0);
+
+    if (!found) {
+        kfcache_release(&kh);
+        if (result) result->not_found = 1;
+        return -2;
+    }
+
+    uint8_t *old_buf = NULL;
+    size_t   old_vlen = 0;
+    if (read_record_value(db, old_sid, old_fid, old_off, key, klen,
+                          &old_buf, &old_vlen) != 0) {
+        kfcache_release(&kh);
+        return -1;
+    }
+    SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+
+    if (opts->check && opts->check(&old_rec, opts->check_ctx) == 0) {
+        kfcache_release(&kh);
+        if (result) {
+            result->condition_not_met = 1;
+            result->current_value = old_buf;
+            result->current_vlen = old_vlen;
+        } else {
+            free(old_buf);
+        }
+        return -2;
+    }
+
+    if (opts->pre_commit) {
+        int rc = opts->pre_commit(&old_rec, opts->pre_commit_ctx);
+        if (rc != 0) {
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+    }
+
+    /* Commit: tombstone the kf entry. */
+    size_t used_delta = 0;
+    uint8_t out_sid; uint16_t out_fid; uint32_t out_off;
+    int rc = kf_tombstone(&kh, hash, key, klen, db->data_dir,
+                          &out_sid, &out_fid, &out_off, &used_delta);
+    kfcache_release(&kh);
+    if (rc < 0) {
+        free(old_buf);
+        return -1;
+    }
+
+    seg_write_flag(db, out_sid, out_fid, out_off, 2);
+    pool_push_free(&db->streams[out_sid], out_fid, out_off);
+    free(old_buf);
+    return 0;
+}
+
 /* Suppress unused-static warnings for build_record_buf which remains in the
    file as a reference for migrators / future bulk paths but isn't called
    from the current code (seg_write_record builds inline into the mmap). */
