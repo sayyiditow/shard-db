@@ -1,4 +1,5 @@
 #include "types.h"
+#include "slotcask.h"
 
 /* ========== Hashing & Addressing ========== */
 
@@ -795,8 +796,32 @@ int is_number(const char *s);
 
 int cmd_get(const char *db_root, const char *object, const char *key) {
     Schema sc = load_schema(db_root, object);
-    uint8_t hash[16]; int shard_id, start_slot;
     size_t klen = strlen(key);
+
+    /* v2 dispatch: route through slotcask. The wire response shape (bare
+       value dict for single-key get, per 2026.05.1) stays the same. */
+    if (sc.storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size,
+            .streams = sc.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
+        void *val = NULL; size_t vlen = 0;
+        if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+            OUT("{\"error\":\"Not found\"}\n");
+            return 1;
+        }
+        log_msg(4, "GET %s.%s (%zu bytes)", object, key, vlen);
+        TypedSchema *ts = load_typed_schema(db_root, object);
+        typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
+                             g_out ? g_out : stdout);
+        fputc('\n', g_out ? g_out : stdout);
+        free(val);
+        return 0;
+    }
+
+    uint8_t hash[16]; int shard_id, start_slot;
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
 
     char shard[PATH_MAX];
@@ -872,12 +897,196 @@ int cas_check(TypedSchema *ts, const uint8_t *value_ptr,
     return 1;
 }
 
+/* ========== INSERT — v2 (slotcask) helper ==========
+ *
+ * Closure carries everything the upsert callbacks need. check_fn validates
+ * if_json criteria; pre_commit_fn diffs and updates indexes between data
+ * write and kf commit (Option B). The ts pointer is borrowed from
+ * load_typed_schema's cache and stays valid for the request's lifetime.
+ */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    int               splits;
+    uint8_t           hash[16];
+    char            (*fields)[256];
+    int               nfields;
+    const char       *value_json;
+    TypedSchema      *idx_ts;
+    SearchCriterion  *crit;
+    int               ncrit;
+} V2InsertCtx;
+
+static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
+    V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
+    if (c->ncrit > 0) {
+        /* if_json criteria require an existing record; reject if missing. */
+        if (!old) return 0;
+        if (!cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+    }
+    return 1;
+}
+
+static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
+                                const uint8_t *new_value, size_t new_vlen,
+                                int is_update, void *ctx_ptr) {
+    (void)new_value; (void)new_vlen;
+    V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
+    if (c->nfields == 0) return 0;
+
+    if (is_update && old) {
+        /* Per-field diff: write/delete only entries that changed. */
+        char *old_json = typed_decode(c->idx_ts, old->value, (uint32_t)old->vlen);
+        for (int i = 0; i < c->nfields; i++) {
+            uint8_t *new_key = NULL, *old_key = NULL;
+            size_t new_len = 0, old_len = 0;
+            int have_new = build_index_key_from_json(c->idx_ts, c->value_json,
+                                                     c->fields[i], &new_key, &new_len);
+            int have_old = old_json
+                ? build_index_key_from_json(c->idx_ts, old_json,
+                                            c->fields[i], &old_key, &old_len)
+                : 0;
+            int changed = 0;
+            if (have_new && !have_old) changed = 1;
+            else if (have_new && have_old) {
+                if (new_len != old_len ||
+                    memcmp(new_key, old_key, new_len) != 0) changed = 1;
+            }
+            if (changed) {
+                if (have_old)
+                    delete_index_entry(c->db_root, c->object, c->fields[i],
+                                       c->splits, old_key, old_len, c->hash);
+                if (have_new)
+                    write_index_entry(c->db_root, c->object, c->fields[i],
+                                      c->splits, new_key, new_len, c->hash);
+            }
+            free(new_key); free(old_key);
+        }
+        free(old_json);
+    } else {
+        /* Fresh insert: parallel write of all index entries. */
+        index_parallel(c->db_root, c->object, c->splits,
+                       c->value_json, c->hash, c->fields, c->nfields);
+    }
+    return 0;
+}
+
+static int cmd_insert_v2(const char *db_root, const char *object,
+                         const char *key, const char *value,
+                         const char *if_json, int if_not_exists,
+                         const Schema *sc) {
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
+        return 1;
+    }
+
+    size_t klen = strlen(key);
+    if ((int)klen > sc->max_key) {
+        fprintf(stderr, "Error: Key too large (%zu > %d)\n", klen, sc->max_key);
+        return 1;
+    }
+
+    uint8_t *typed_buf = malloc(ts->total_size);
+    if (!typed_buf) { OUT("{\"error\":\"oom\"}\n"); return 1; }
+    int enc = typed_encode_defaults(ts, value, typed_buf, ts->total_size,
+                                    db_root, object);
+    if (enc < 0) {
+        free(typed_buf);
+        OUT("{\"error\":\"Typed encode failed\"}\n");
+        return 1;
+    }
+    size_t vlen = ts->total_size;
+    if ((int)vlen > sc->max_value) {
+        free(typed_buf);
+        fprintf(stderr, "Error: Value too large (%zu > %d)\n", vlen, sc->max_value);
+        return 1;
+    }
+
+    SlotcaskSchemaInfo info = {
+        .splits = sc->splits, .slot_size = sc->slot_size,
+        .streams = sc->streams, .storage_version = 2,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        free(typed_buf);
+        OUT("{\"error\":\"Cannot open shard\"}\n");
+        return 1;
+    }
+
+    /* Index fields + criteria (only parsed if if_json is present). */
+    char fields[MAX_FIELDS][256];
+    int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    for (int _i = 0; _i < nfields; _i++) fields[_i][255] = '\0';
+
+    SearchCriterion *crit = NULL;
+    int ncrit = 0;
+    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+
+    V2InsertCtx ctx = {
+        .db_root = db_root, .object = object, .splits = sc->splits,
+        .fields = fields, .nfields = nfields,
+        .value_json = value,
+        .idx_ts = ts,
+        .crit = crit, .ncrit = ncrit,
+    };
+    compute_hash_raw(key, klen, ctx.hash);
+
+    SlotcaskUpsertOpts opts = {
+        .if_not_exists  = if_not_exists,
+        .check          = v2_insert_check_fn,
+        .check_ctx      = &ctx,
+        .pre_commit     = v2_insert_pre_commit,
+        .pre_commit_ctx = &ctx,
+    };
+    SlotcaskUpsertResult result = {0};
+    int rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
+                                        typed_buf, vlen, &opts, &result);
+
+    if (rc == -2) {
+        char *cur = result.current_value
+            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+            : NULL;
+        OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+            cur ? cur : "null");
+        free(cur);
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        free(typed_buf);
+        return 1;
+    }
+    if (rc != 0) {
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        free(typed_buf);
+        OUT("{\"error\":\"upsert failed\"}\n");
+        return 1;
+    }
+
+    if (!result.was_update) update_count(db_root, object, 1);
+    log_msg(3, "%s %s.%s (slotcask)",
+            result.was_update ? "UPDATE" : "INSERT", object, key);
+
+    free(result.current_value);
+    free_criteria(crit, ncrit);
+    free(typed_buf);
+    OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
+        result.was_update ? "updated" : "inserted", key);
+    return 0;
+}
+
 /* ========== INSERT (mmap + atomic flag flip) ========== */
 
 int cmd_insert(const char *db_root, const char *object,
                const char *key, const char *value,
                const char *if_json, int if_not_exists) {
     Schema sc = load_schema(db_root, object);
+
+    if (sc.storage_version == 2) {
+        return cmd_insert_v2(db_root, object, key, value, if_json,
+                             if_not_exists, &sc);
+    }
+
     uint8_t hash[16]; int shard_id, start_slot;
     size_t klen = strlen(key);
 
@@ -1041,12 +1250,194 @@ int cmd_insert(const char *db_root, const char *object,
     return 0;
 }
 
+/* ========== PARTIAL UPDATE — v2 (slotcask) helper ==========
+ *
+ * Two-phase: slotcask_get → apply partial → upsert(require_existing=1) with a
+ * pre_commit hook that diffs old vs new typed records for index updates.
+ * The two reads of OLD (one outside the wrlock to compute new, one inside
+ * the wrlock that the upsert handles) introduce a tiny last-writer-wins race
+ * window vs v1's full-shard wrlock. Acceptable for partial-update workloads;
+ * documented behavior change.
+ */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    int               splits;
+    uint8_t           hash[16];
+    char            (*idx_fields)[256];
+    int               nidx;
+    TypedSchema      *idx_ts;
+} V2UpdateCtx;
+
+static int v2_update_pre_commit(const SlotcaskOldRecord *old,
+                                const uint8_t *new_value, size_t new_vlen,
+                                int is_update, void *ctx_ptr) {
+    (void)new_vlen; (void)is_update;
+    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
+    if (!old || c->nidx == 0) return 0;
+    for (int i = 0; i < c->nidx; i++) {
+        uint8_t *old_buf = NULL, *new_buf = NULL;
+        size_t   old_len = 0, new_len = 0;
+        int have_old = build_index_key_from_record(c->idx_ts, old->value,
+                                                   c->idx_fields[i],
+                                                   &old_buf, &old_len);
+        int have_new = build_index_key_from_record(c->idx_ts, new_value,
+                                                   c->idx_fields[i],
+                                                   &new_buf, &new_len);
+        int changed = 0;
+        if (have_new && !have_old) changed = 1;
+        else if (!have_new && have_old) changed = 1;
+        else if (have_new && have_old) {
+            if (new_len != old_len ||
+                memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
+        }
+        if (changed) {
+            if (have_old)
+                delete_index_entry(c->db_root, c->object, c->idx_fields[i],
+                                   c->splits, old_buf, old_len, c->hash);
+            if (have_new)
+                write_index_entry(c->db_root, c->object, c->idx_fields[i],
+                                  c->splits, new_buf, new_len, c->hash);
+        }
+        free(old_buf); free(new_buf);
+    }
+    return 0;
+}
+
+static int cmd_update_v2(const char *db_root, const char *object,
+                         const char *key, const char *partial_json,
+                         const char *if_json, int dry_run, const Schema *sc) {
+    SlotcaskSchemaInfo info = {
+        .splits = sc->splits, .slot_size = sc->slot_size,
+        .streams = sc->streams, .storage_version = 2,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
+
+    size_t klen = strlen(key);
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
+
+    void *old_val = NULL; size_t old_vlen = 0;
+    if (slotcask_get(sdb, key, klen, &old_val, &old_vlen) != 0) {
+        OUT("{\"error\":\"Not found\"}\n");
+        return 1;
+    }
+
+    if (if_json) {
+        SearchCriterion *crit = NULL; int ncrit = 0;
+        parse_criteria_json(if_json, &crit, &ncrit);
+        int pass = cas_check(ts, old_val, crit, ncrit);
+        if (!pass) {
+            char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen);
+            OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+                cur ? cur : "null");
+            free(cur); free(old_val); free_criteria(crit, ncrit);
+            return 1;
+        }
+        free_criteria(crit, ncrit);
+    }
+
+    if (dry_run) {
+        free(old_val);
+        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", key);
+        return 0;
+    }
+
+    /* Build new typed buffer = copy of old, with partial fields applied. */
+    uint8_t *new_buf = malloc(old_vlen);
+    if (!new_buf) {
+        free(old_val);
+        OUT("{\"error\":\"oom\"}\n"); return 1;
+    }
+    memcpy(new_buf, old_val, old_vlen);
+    free(old_val);
+
+    const char *field_names[MAX_FIELDS];
+    char *field_vals[MAX_FIELDS] = {0};
+    for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
+    json_get_fields(partial_json, field_names, ts->nfields, field_vals);
+
+    for (int i = 0; i < ts->nfields; i++) {
+        if (field_vals[i]) {
+            if (!ts->fields[i].removed)
+                encode_field(&ts->fields[i], field_vals[i],
+                             new_buf + ts->fields[i].offset);
+            free(field_vals[i]);
+        }
+    }
+
+    /* auto_update fields: stamp current datetime/date on every update. */
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed) continue;
+        if (ts->fields[i].default_kind == DK_AUTO_UPDATE) {
+            char tbuf[20];
+            time_t now = time(NULL);
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            if (ts->fields[i].type == FT_DATE)
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+            encode_field(&ts->fields[i], tbuf, new_buf + ts->fields[i].offset);
+        }
+    }
+
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+
+    V2UpdateCtx ctx = {
+        .db_root = db_root, .object = object, .splits = sc->splits,
+        .idx_fields = idx_fields, .nidx = nidx,
+        .idx_ts = ts,
+    };
+    compute_hash_raw(key, klen, ctx.hash);
+
+    SlotcaskUpsertOpts opts = {
+        .require_existing = 1,
+        .pre_commit       = v2_update_pre_commit,
+        .pre_commit_ctx   = &ctx,
+    };
+    SlotcaskUpsertResult result = {0};
+    int rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
+                                        new_buf, old_vlen, &opts, &result);
+    free(new_buf);
+
+    if (rc == -2) {
+        /* require_existing fired → key got deleted between our slotcask_get
+           and the upsert's wrlock acquire. Race; treat as Not found. */
+        free(result.current_value);
+        OUT("{\"error\":\"Not found\"}\n");
+        return 1;
+    }
+    if (rc != 0) {
+        free(result.current_value);
+        OUT("{\"error\":\"update failed\"}\n");
+        return 1;
+    }
+
+    log_msg(3, "UPDATE %s.%s (slotcask)", object, key);
+    free(result.current_value);
+    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", key);
+    return 0;
+}
+
 /* ========== PARTIAL UPDATE ========== */
 
 int cmd_update(const char *db_root, const char *object,
                const char *key, const char *partial_json,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
+
+    if (sc.storage_version == 2) {
+        return cmd_update_v2(db_root, object, key, partial_json,
+                             if_json, dry_run, &sc);
+    }
+
     uint8_t hash[16]; int shard_id, start_slot;
     size_t klen = strlen(key);
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
@@ -1213,11 +1604,151 @@ static void *del_idx_fn(void *arg) {
     return NULL;
 }
 
+/* ========== DELETE — v2 (slotcask) helper ========== */
+
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    int               splits;
+    uint8_t           hash[16];
+    char            (*idx_fields)[256];
+    int               nidx;
+    TypedSchema      *idx_ts;
+    SearchCriterion  *crit;
+    int               ncrit;
+} V2DeleteCtx;
+
+static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
+    V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
+    if (c->ncrit > 0) {
+        if (!old) return 0;
+        if (!cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+    }
+    return 1;
+}
+
+static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
+    V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
+    if (!old || c->nidx == 0) return 0;
+    for (int i = 0; i < c->nidx; i++) {
+        uint8_t *ikey = NULL;
+        size_t   ilen = 0;
+        if (build_index_key_from_record(c->idx_ts, old->value,
+                                        c->idx_fields[i], &ikey, &ilen)) {
+            delete_index_entry(c->db_root, c->object, c->idx_fields[i],
+                               c->splits, ikey, ilen, c->hash);
+            free(ikey);
+        }
+    }
+    return 0;
+}
+
+static int cmd_delete_v2(const char *db_root, const char *object,
+                         const char *key, const char *if_json, int dry_run,
+                         const Schema *sc) {
+    SlotcaskSchemaInfo info = {
+        .splits = sc->splits, .slot_size = sc->slot_size,
+        .streams = sc->streams, .storage_version = 2,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+        return 0;
+    }
+
+    size_t klen = strlen(key);
+    TypedSchema *ts = load_typed_schema(db_root, object);
+
+    /* dry_run: read + validate, never tombstone. */
+    if (dry_run) {
+        void *val = NULL; size_t vlen = 0;
+        if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+            OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+            return 0;
+        }
+        if (if_json) {
+            SearchCriterion *crit = NULL; int ncrit = 0;
+            parse_criteria_json(if_json, &crit, &ncrit);
+            int pass = cas_check(ts, val, crit, ncrit);
+            if (!pass) {
+                char *cur = typed_decode(ts, val, (uint32_t)vlen);
+                OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+                    cur ? cur : "null");
+                free(cur); free(val); free_criteria(crit, ncrit);
+                return 1;
+            }
+            free_criteria(crit, ncrit);
+        }
+        free(val);
+        OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", key);
+        return 0;
+    }
+
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+
+    SearchCriterion *crit = NULL;
+    int ncrit = 0;
+    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+
+    V2DeleteCtx ctx = {
+        .db_root = db_root, .object = object, .splits = sc->splits,
+        .idx_fields = idx_fields, .nidx = nidx,
+        .idx_ts = ts,
+        .crit = crit, .ncrit = ncrit,
+    };
+    compute_hash_raw(key, klen, ctx.hash);
+
+    SlotcaskDeleteOpts opts = {
+        .check          = v2_delete_check_fn,
+        .check_ctx      = &ctx,
+        .pre_commit     = v2_delete_pre_commit,
+        .pre_commit_ctx = &ctx,
+    };
+    SlotcaskDeleteResult result = {0};
+    int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);
+
+    if (result.not_found) {
+        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        return 0;
+    }
+    if (rc == -2 && result.condition_not_met) {
+        char *cur = result.current_value
+            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+            : NULL;
+        OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+            cur ? cur : "null");
+        free(cur); free(result.current_value); free_criteria(crit, ncrit);
+        return 1;
+    }
+    if (rc != 0) {
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        OUT("{\"error\":\"delete failed\"}\n");
+        return 1;
+    }
+
+    update_counts(db_root, object, -1, 1);
+    log_msg(3, "DELETE %s.%s (slotcask)", object, key);
+    free(result.current_value);
+    free_criteria(crit, ncrit);
+    OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", key);
+    return 0;
+}
+
 /* ========== DELETE (with probing) ========== */
 
 int cmd_delete(const char *db_root, const char *object, const char *key,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
+
+    if (sc.storage_version == 2) {
+        return cmd_delete_v2(db_root, object, key, if_json, dry_run, &sc);
+    }
+
     uint8_t hash[16]; int shard_id, start_slot;
     size_t klen = strlen(key);
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);

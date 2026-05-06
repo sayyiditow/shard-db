@@ -281,4 +281,39 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
                                 const SlotcaskDeleteOpts *opts,
                                 SlotcaskDeleteResult *result);
 
+/* ============================================================ Registry
+ *
+ * Process-wide cache of per-object SlotcaskDb handles. Lazy-opened on first
+ * slotcask_registry_get() call; remains alive until shutdown or explicit
+ * invalidate (drop-object, schema mutation that changes splits/streams/
+ * slot_size). Footprint per entry is small (per-stream rotation lock + free
+ * pool — keyfile/segment mmaps live in kfcache/segcache, not here).
+ *
+ * Keyed by (effective_root, object) where effective_root = "$DB_ROOT/<dir>".
+ * That matches how the engine's cmd_* functions receive db-root context
+ * (server.c builds the effective root once at dispatch time).
+ *
+ * Returns NULL when info->storage_version != 2 — the caller is expected to
+ * fall back to the legacy probe-into-slot path. NULL is also returned on
+ * open failure (logged via fprintf to stderr).
+ *
+ * The pointer is BORROWED — never call slotcask_close on it. The registry
+ * owns lifetime.
+ */
+typedef struct {
+    int splits;            /* num_shards for the keyfile */
+    int slot_size;         /* fixed per-record byte width */
+    int streams;           /* persisted at create time, hardcoded by nproc */
+    int storage_version;   /* 1 = legacy (registry returns NULL), 2 = slotcask */
+} SlotcaskSchemaInfo;
+
+SlotcaskDb *slotcask_registry_get(const char *effective_root,
+                                  const char *object,
+                                  const SlotcaskSchemaInfo *info);
+
+void slotcask_registry_invalidate(const char *effective_root,
+                                  const char *object);
+
+void slotcask_registry_shutdown(void);
+
 #endif

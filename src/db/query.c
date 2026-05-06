@@ -4228,8 +4228,21 @@ int is_number(const char *s) {
 
 int cmd_exists(const char *db_root, const char *object, const char *key) {
     Schema sc = load_schema(db_root, object);
-    uint8_t hash[16]; int shard_id, start_slot;
     size_t klen = strlen(key);
+
+    if (sc.storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size,
+            .streams = sc.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) { OUT("false\n"); return 1; }
+        int rc = slotcask_exists(sdb, key, klen);
+        OUT("%s\n", rc == 1 ? "true" : "false");
+        return rc == 1 ? 0 : 1;
+    }
+
+    uint8_t hash[16]; int shard_id, start_slot;
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
 
     char shard[PATH_MAX];
@@ -11550,7 +11563,10 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
        up a stale mmap after we unlink the backing files. */
     char eff_obj[PATH_MAX];
     snprintf(eff_obj, sizeof(eff_obj), "%s/%s", dir, object);
+    char eff_root[PATH_MAX];
+    snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
     fcache_invalidate(obj_dir);
+    slotcask_registry_invalidate(eff_root, object);
     invalidate_idx_cache(object);
     invalidate_schema_caches(db_root, object);
 

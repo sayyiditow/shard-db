@@ -597,6 +597,9 @@ void slotcask_init(int kfcache_cap, int segcache_cap) {
 }
 
 void slotcask_shutdown(void) {
+    /* Close all per-object DBs first — they msync segments through segcache,
+       so the caches must still be alive when slotcask_close runs. */
+    slotcask_registry_shutdown();
     kfcache_shutdown();
     segcache_shutdown();
 }
@@ -1665,6 +1668,130 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     pool_push_free(&db->streams[out_sid], out_fid, out_off);
     free(old_buf);
     return 0;
+}
+
+/* ============================================================ Registry */
+
+#define SLOTCASK_REG_BUCKETS 1024
+
+typedef struct {
+    char        key[PATH_MAX];   /* "effective_root:object" */
+    SlotcaskDb *db;
+    int         used;
+} RegEntry;
+
+static RegEntry         g_reg[SLOTCASK_REG_BUCKETS];
+static pthread_mutex_t  g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void reg_key(char out[PATH_MAX], const char *effective_root,
+                    const char *object) {
+    snprintf(out, PATH_MAX, "%s:%s", effective_root, object);
+}
+
+/* Linear probe from path_hash. Returns the matching bucket (used=1, key matches),
+   or the first empty bucket (used=0) suitable for insertion. -1 if the table is
+   completely full. */
+static int reg_probe(const char *key) {
+    uint32_t h = path_hash(key);
+    int idx = (int)(h % SLOTCASK_REG_BUCKETS);
+    for (int i = 0; i < SLOTCASK_REG_BUCKETS; i++) {
+        int s = (idx + i) % SLOTCASK_REG_BUCKETS;
+        if (!g_reg[s].used) return s;
+        if (strcmp(g_reg[s].key, key) == 0) return s;
+    }
+    return -1;
+}
+
+SlotcaskDb *slotcask_registry_get(const char *effective_root,
+                                  const char *object,
+                                  const SlotcaskSchemaInfo *info) {
+    if (!info || info->storage_version != 2) return NULL;
+    if (info->splits <= 0 || info->slot_size <= 0 || info->streams <= 0)
+        return NULL;
+
+    char key[PATH_MAX];
+    reg_key(key, effective_root, object);
+
+    pthread_mutex_lock(&g_reg_lock);
+    int slot = reg_probe(key);
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_reg_lock);
+        fprintf(stderr, "slotcask_registry: table full (%d buckets)\n",
+                SLOTCASK_REG_BUCKETS);
+        return NULL;
+    }
+    if (g_reg[slot].used) {
+        SlotcaskDb *db = g_reg[slot].db;
+        pthread_mutex_unlock(&g_reg_lock);
+        return db;
+    }
+
+    /* Cache miss — open under the mutex. Opens are rare (per-object, once
+       per process) so the global serialization is acceptable. */
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/%s", effective_root, object);
+
+    SlotcaskDb *db = calloc(1, sizeof(SlotcaskDb));
+    if (!db) {
+        pthread_mutex_unlock(&g_reg_lock);
+        return NULL;
+    }
+    if (slotcask_open(db, data_dir, info->splits, info->streams,
+                      info->slot_size) != 0) {
+        free(db);
+        pthread_mutex_unlock(&g_reg_lock);
+        fprintf(stderr, "slotcask_registry: open failed for %s/%s\n",
+                effective_root, object);
+        return NULL;
+    }
+
+    snprintf(g_reg[slot].key, sizeof(g_reg[slot].key), "%s", key);
+    g_reg[slot].db = db;
+    g_reg[slot].used = 1;
+    pthread_mutex_unlock(&g_reg_lock);
+    return db;
+}
+
+void slotcask_registry_invalidate(const char *effective_root,
+                                  const char *object) {
+    char key[PATH_MAX];
+    reg_key(key, effective_root, object);
+
+    pthread_mutex_lock(&g_reg_lock);
+    int slot = reg_probe(key);
+    if (slot >= 0 && g_reg[slot].used) {
+        SlotcaskDb *db = g_reg[slot].db;
+        g_reg[slot].used = 0;
+        g_reg[slot].key[0] = '\0';
+        g_reg[slot].db = NULL;
+        pthread_mutex_unlock(&g_reg_lock);
+        /* slotcask_close acquires its own internal locks; safe to call after
+           dropping the registry mutex. Anyone holding a borrowed pointer
+           that races with this is a use-after-free — the contract is that
+           invalidate is paired with quiescence (no in-flight requests on
+           this object), which the caller (drop-object handler under per-
+           object wrlock) provides. */
+        slotcask_close(db);
+        free(db);
+        /* (kfcache/segcache eviction by prefix is future work — for now the
+           entries simply LRU out as new objects compete for slots.) */
+        return;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+void slotcask_registry_shutdown(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    for (int i = 0; i < SLOTCASK_REG_BUCKETS; i++) {
+        if (g_reg[i].used && g_reg[i].db) {
+            slotcask_close(g_reg[i].db);
+            free(g_reg[i].db);
+            g_reg[i].db = NULL;
+            g_reg[i].used = 0;
+            g_reg[i].key[0] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_reg_lock);
 }
 
 /* Suppress unused-static warnings for build_record_buf which remains in the
