@@ -1325,6 +1325,20 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         segcache_release(&h);
     }
 
+    /* Eagerly materialize every keyfile shard on disk. Mirrors the prototype's
+       pb_open behavior (shard_init opens + ftruncates each kf upfront). Costs
+       splits * 12 MB of sparse-file address space but gives operators a fully
+       formed on-disk shape that's safe to inspect with `ls`/`du` immediately
+       after create-object. The mmaps drop out of memory under cache pressure
+       just like any other kfcache entry. */
+    for (int i = 0; i < num_shards; i++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, data_dir, i);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) goto fail;
+        kfcache_release(&kh);
+    }
+
     int dirty = dirty_marker_exists(db);
     if (dirty) {
         if (recover_streams(db) != 0) goto fail;

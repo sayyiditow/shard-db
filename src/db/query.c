@@ -1,4 +1,5 @@
 #include "types.h"
+#include "slotcask.h"
 #include <fnmatch.h>
 
 /* ========== Probing helpers ========== */
@@ -11220,7 +11221,8 @@ static int validate_field_type(const char *field_spec) {
 
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
-                      int splits, int max_key, int if_not_exists) {
+                      int splits, int max_key, int if_not_exists,
+                      int storage_version) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -11323,6 +11325,15 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
+    /* storage_version: 0 (omitted) → default 1 (legacy probe-into-slot).
+       2 → slotcask. Any other value rejected. */
+    if (storage_version == 0) storage_version = 1;
+    if (storage_version != 1 && storage_version != 2) {
+        OUT("{\"error\":\"storage_version=%d invalid; must be 1 (legacy) or 2 (slotcask)\"}\n",
+            storage_version);
+        return 1;
+    }
+
     /* Validate indexes reference defined field names */
     if (indexes_json && indexes_json[0]) {
         p = json_skip(indexes_json);
@@ -11379,8 +11390,12 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s/data", eff_root, object);
-    mkdirp(path);
+    /* Legacy probe-into-slot needs data/. Slotcask uses keyfile_*.kf +
+       stream_NNN/ created lazily by slotcask_open() below. */
+    if (storage_version == 1) {
+        snprintf(path, sizeof(path), "%s/%s/data", eff_root, object);
+        mkdirp(path);
+    }
     snprintf(path, sizeof(path), "%s/%s/metadata", eff_root, object);
     mkdirp(path);
     snprintf(path, sizeof(path), "%s/%s/indexes", eff_root, object);
@@ -11413,10 +11428,21 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
         fclose(f);
     }
+    /* Streams count for slotcask: hardcoded by nproc at create time so subsequent
+       opens use the same count (stream_id is on-disk in the keyfile entry). */
+    int streams = (storage_version == 2) ? slotcask_streams_for_nproc() : 0;
+
     if (!exists) {
         f = fopen(schema_path, "a");
         if (f) {
-            fprintf(f, "%s:%s:%d:%d\n", dir, object, splits, max_key);
+            if (storage_version == 1) {
+                /* v1 line stays at the historical 4-field form so old parsers
+                   keep working byte-for-byte. */
+                fprintf(f, "%s:%s:%d:%d\n", dir, object, splits, max_key);
+            } else {
+                fprintf(f, "%s:%s:%d:%d:%d:%d\n",
+                        dir, object, splits, max_key, storage_version, streams);
+            }
             fclose(f);
         }
     }
@@ -11441,6 +11467,21 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     load_dirs();
 
+    /* Slotcask v2: create the on-disk layout (keyfile_*.kf + stream_NNN/) so
+       the object is immediately usable. slotcask_open is idempotent — recovery
+       semantics handle a re-open if we crash partway. */
+    if (storage_version == 2) {
+        char obj_data_dir[PATH_MAX];
+        snprintf(obj_data_dir, sizeof(obj_data_dir), "%s/%s", eff_root, object);
+        int slot_size = (max_key + total_value_size + 7) & ~7;
+        SlotcaskDb sdb;
+        if (slotcask_open(&sdb, obj_data_dir, splits, streams, slot_size) != 0) {
+            OUT("{\"error\":\"slotcask_open failed for %s/%s\"}\n", dir, object);
+            return 1;
+        }
+        slotcask_close(&sdb);
+    }
+
     /* Write index.conf if indexes provided */
     if (indexes_json && indexes_json[0]) {
         snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", eff_root, object);
@@ -11464,8 +11505,13 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d}\n",
-           object, dir, splits, max_key, total_value_size, nfields);
+    if (storage_version == 2) {
+        OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
+            object, dir, splits, max_key, total_value_size, nfields, streams);
+    } else {
+        OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d}\n",
+            object, dir, splits, max_key, total_value_size, nfields);
+    }
     return 0;
 }
 

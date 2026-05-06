@@ -157,6 +157,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_range_coalesce.c \
     src/test/cases/test_count_varchar_field.c \
     src/test/cases/test_slotcask_basic.c \
+    src/test/cases/test_slotcask_v2_object.c \
     src/db/util.c \
     src/db/slotcask.c \
     -Isrc/db -Isrc/test \

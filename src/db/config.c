@@ -585,11 +585,24 @@ Schema load_schema(const char *effective_root, const char *object) {
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, prefix, pfxlen) == 0) {
+            /* Strip trailing newline so atoi on the last field doesn't blow up. */
+            line[strcspn(line, "\r\n")] = '\0';
             char *p = line + pfxlen;
             s.splits = atoi(p);
             if (s.splits <= 0) s.splits = 64;
             char *p2 = strchr(p, ':');
-            if (p2) s.max_key = atoi(p2 + 1);
+            if (p2) {
+                s.max_key = atoi(p2 + 1);
+                /* Optional trailing fields (added in 2026.06 for slotcask v2):
+                   :storage_version:streams. Absent → defaults: version=1, streams=0. */
+                char *p3 = strchr(p2 + 1, ':');
+                if (p3) {
+                    s.storage_version = atoi(p3 + 1);
+                    char *p4 = strchr(p3 + 1, ':');
+                    if (p4) s.streams = atoi(p4 + 1);
+                }
+            }
+            if (s.storage_version <= 0) s.storage_version = 1;
             break;
         }
     }

@@ -1,5 +1,6 @@
 #include "types.h"
 #include "tls.h"
+#include "slotcask.h"
 
 /* Forward decls for monitoring counters (defined lower in this file). */
 extern volatile int active_threads;
@@ -1042,14 +1043,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *splits_s = json_obj_strdup(&req, "splits");
         char *max_key_s = json_obj_strdup(&req, "max_key");
         char *ine_s = json_obj_strdup(&req, "if_not_exists");
+        char *sv_s = json_obj_strdup(&req, "storage_version");
         int if_not_exists = ine_s && (strcmp(ine_s, "true") == 0 || strcmp(ine_s, "1") == 0);
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
                           max_key_s ? atoi(max_key_s) : 0,
-                          if_not_exists);
+                          if_not_exists,
+                          sv_s ? atoi(sv_s) : 0);
         free(fields_j); free(indexes_j);
-        free(splits_s); free(max_key_s); free(ine_s);
+        free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
         free(mode); free(dir); free(object);
         return;
     }
@@ -2426,6 +2429,10 @@ int cmd_server(const char *db_root, int daemonize) {
     bt_page_size = g_index_page_size;
     fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);
+    /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
+       objects route reads/writes through these; v1 (legacy) objects continue
+       to use ucache. Both engines coexist until migration. */
+    slotcask_init(g_fcache_cap, g_fcache_cap);
     /* Pool size: explicit THREADS wins; otherwise 4× cores.
        Oversubscription hides shard-rwlock stalls that a thread-per-core
        pool can't overlap — measured ~18% faster on parallel bulk-insert. */
@@ -2529,6 +2536,7 @@ int cmd_server(const char *db_root, int daemonize) {
     parallel_pool_shutdown();
     fcache_shutdown();
     bt_cache_shutdown();
+    slotcask_shutdown();
     tls_shutdown();
     log_msg(3, "SERVER STOP pid=%d", getpid());
     log_shutdown();

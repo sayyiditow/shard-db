@@ -198,6 +198,18 @@ typedef struct {
     int max_key;
     int max_value;
     int slot_size;        /* = payload_size per slot (max_key + max_value), 8-aligned */
+    /* Storage engine version. 1 = legacy probe-into-slot (Zone A/B + ucache).
+       2 = slotcask (keyfile shards + append-only data segments + per-stream
+       free-slot pool). Defaults to 1 for objects created before 2026.06 — the
+       schema.conf line format `dir:object:splits:max_key` produces 1 because
+       the trailing fields are absent. v2 objects write the extended form
+       `dir:object:splits:max_key:2:streams` at create time. */
+    int storage_version;
+    /* Slotcask streams count, only meaningful when storage_version=2. The
+       value is hardcoded by nproc at create time (see slotcask_streams_for_nproc)
+       and persisted in schema.conf so subsequent opens use the same count —
+       stream_id is on-disk in keyfile entries, so changing it would orphan data. */
+    int streams;
 } Schema;
 
 /* Shard file layout:
@@ -942,7 +954,8 @@ int cmd_list_files(const char *db_root, const char *object,
                    int offset, int limit);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
-                      int splits, int max_key, int if_not_exists);
+                      int splits, int max_key, int if_not_exists,
+                      int storage_version);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */
