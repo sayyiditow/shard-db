@@ -3846,6 +3846,18 @@ static int v2_bulk_upd_json_pre_commit(const SlotcaskOldRecord *old,
     return 0;
 }
 
+/* Concurrency caveat (v2 bulk-update-json + delim, partial-field):
+   the read-old → patch → upsert sequence is NOT atomic. v1 holds the
+   ucache wrlock across the whole shard worker, so partial updates see
+   a consistent snapshot. v2 acquires the kf-shard wrlock per record,
+   which gives finer parallelism but means a concurrent writer between
+   the slotcask_get and the upsert can lose the racing writer's changes
+   to fields THIS bulk doesn't touch. Bulk-update has no CAS semantics
+   in either version (`if_json` is not a per-record knob in the bulk
+   protocol), so the loss is silent. Use single-record cmd_update with
+   `if_json` for strict CAS; bulk-update is documented as
+   "last-writer-wins on the touched fields, snapshot-of-read on the
+   untouched fields." */
 static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,

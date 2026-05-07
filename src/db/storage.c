@@ -1263,7 +1263,20 @@ typedef struct {
     char            (*idx_fields)[256];
     int               nidx;
     TypedSchema      *idx_ts;
+    /* CAS criteria — verified inside check_fn under the kf-shard wrlock
+       so the check + commit are atomic against concurrent writers. NULL
+       when the caller didn't pass `if`. */
+    SearchCriterion  *crit;
+    int               ncrit;
 } V2UpdateCtx;
+
+static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
+    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
+    if (!old) return 0;  /* require_existing handles this, but defensive */
+    if (c->crit && c->ncrit > 0 &&
+        !cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+    return 1;
+}
 
 static int v2_update_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
@@ -1320,21 +1333,21 @@ static int cmd_update_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    if (if_json) {
-        SearchCriterion *crit = NULL; int ncrit = 0;
-        parse_criteria_json(if_json, &crit, &ncrit);
-        int pass = cas_check(ts, old_val, crit, ncrit);
-        if (!pass) {
-            char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen);
-            OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
-                cur ? cur : "null");
-            free(cur); free(old_val); free_criteria(crit, ncrit);
-            return 1;
-        }
-        free_criteria(crit, ncrit);
-    }
-
+    /* dry_run validates criteria but doesn't write — race-tolerant. */
     if (dry_run) {
+        if (if_json) {
+            SearchCriterion *crit = NULL; int ncrit = 0;
+            parse_criteria_json(if_json, &crit, &ncrit);
+            int pass = cas_check(ts, old_val, crit, ncrit);
+            free_criteria(crit, ncrit);
+            if (!pass) {
+                char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen);
+                OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+                    cur ? cur : "null");
+                free(cur); free(old_val);
+                return 1;
+            }
+        }
         free(old_val);
         OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", key);
         return 0;
@@ -1386,15 +1399,24 @@ static int cmd_update_v2(const char *db_root, const char *object,
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
 
+    /* Parse `if` once; check_fn runs cas_check under the kf-shard wrlock
+       so the verify + commit are atomic against concurrent writers. */
+    SearchCriterion *crit = NULL;
+    int ncrit = 0;
+    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+
     V2UpdateCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
         .idx_fields = idx_fields, .nidx = nidx,
         .idx_ts = ts,
+        .crit = crit, .ncrit = ncrit,
     };
     compute_hash_raw(key, klen, ctx.hash);
 
     SlotcaskUpsertOpts opts = {
         .require_existing = 1,
+        .check            = v2_update_check_fn,
+        .check_ctx        = &ctx,
         .pre_commit       = v2_update_pre_commit,
         .pre_commit_ctx   = &ctx,
     };
@@ -1404,17 +1426,30 @@ static int cmd_update_v2(const char *db_root, const char *object,
     free(new_buf);
 
     if (rc == -2) {
-        /* require_existing fired → key got deleted between our slotcask_get
-           and the upsert's wrlock acquire. Race; treat as Not found. */
+        /* Either require_existing fired (record vanished) or check_fn
+           rejected (criteria didn't match). Disambiguate by whether the
+           result has an old value attached. */
+        if (result.was_update && result.condition_not_met) {
+            char *cur = result.current_value
+                ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+                : NULL;
+            OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+                cur ? cur : "null");
+            free(cur);
+        } else {
+            OUT("{\"error\":\"Not found\"}\n");
+        }
         free(result.current_value);
-        OUT("{\"error\":\"Not found\"}\n");
+        free_criteria(crit, ncrit);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
+        free_criteria(crit, ncrit);
         OUT("{\"error\":\"update failed\"}\n");
         return 1;
     }
+    free_criteria(crit, ncrit);
 
     log_msg(3, "UPDATE %s.%s (slotcask)", object, key);
     free(result.current_value);
