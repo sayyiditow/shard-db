@@ -1121,8 +1121,12 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     }
 
     SlotcaskBulkOpts opts = {
-        .if_not_exists = sw->if_not_exists,
-        .pre_commit    = v2_bulk_ins_pre_commit_bulk,
+        .if_not_exists        = sw->if_not_exists,
+        .pre_commit           = v2_bulk_ins_pre_commit_bulk,
+        /* OLD value only needed when there are indexes to update; otherwise
+           the hook returns immediately. Tells the primitive to skip the
+           per-record read_record_value on UPDATE. */
+        .pre_commit_needs_old = sw->nidx > 0,
     };
     for (int s = 0; s < splits; s++) {
         if (counts[s] == 0) continue;

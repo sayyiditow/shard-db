@@ -287,6 +287,12 @@ typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
 typedef struct {
     int                          if_not_exists;     /* skip if key exists */
     slotcask_bulk_pre_commit_fn  pre_commit;        /* fired per record under kf wrlock; NULL = no-op */
+    /* Set to 1 iff pre_commit will dereference the SlotcaskOldRecord *old
+       arg. When 0 (e.g. non-indexed bulk-insert), the primitive skips the
+       per-record read_record_value on UPDATE — that's the dominant per-
+       record cost on update-heavy workloads. Hook still fires with
+       old=NULL. */
+    int                          pre_commit_needs_old;
 } SlotcaskBulkOpts;
 
 /* Returns 0 if the batch ran (per-record results in recs[].status), -1 on

@@ -1771,7 +1771,7 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             continue;
         }
 
-        if (found) {
+        if (found && opts->pre_commit_needs_old) {
             if (read_record_value(db, st[i].old_sid, st[i].old_fid,
                                    st[i].old_off, r->key, r->klen,
                                    &st[i].old_buf, &st[i].old_vlen) != 0) {
