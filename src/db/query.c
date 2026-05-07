@@ -176,6 +176,85 @@ int scan_dispatch(const char *db_root, const char *object,
     return 0;
 }
 
+/* ========== Index-driven record lookup dispatch ==========
+ *
+ * Indexed query paths (PRIMARY_LEAF / INTERSECT / KEYSET) get a list of
+ * 16-byte hashes from the btree and need to fetch the underlying record.
+ * v1 resolves hash → (shard, slot) via addr_from_hash and probes the
+ * Zone A mmap. v2 calls slotcask_lookup_by_hash, which gives transient
+ * pointers under the segcache rdlock — so we copy key+value into a
+ * malloc'd buffer that outlives the cb.
+ *
+ * RecordRef carries either lifecycle. release_record_ref handles both.
+ * The (key, val) pointers are laid out contiguously so callers using the
+ * existing v1 (key followed by val) layout work unchanged.
+ */
+
+static int v2_record_capture_cb(const uint8_t hash[16],
+                                 const void *key, size_t klen,
+                                 const void *value, size_t vlen,
+                                 void *ctx) {
+    (void)hash;
+    RecordRef *r = (RecordRef *)ctx;
+    r->v2_buf = malloc(klen + vlen + 1);
+    if (!r->v2_buf) return 1;
+    memcpy(r->v2_buf, key, klen);
+    if (vlen) memcpy(r->v2_buf + klen, value, vlen);
+    r->v2_buf[klen + vlen] = 0;
+    r->key = r->v2_buf;
+    r->klen = klen;
+    r->val = r->v2_buf + klen;
+    r->vlen = vlen;
+    return 1;  /* found; stop */
+}
+
+int read_record_ref(const char *db_root, const char *object,
+                    const Schema *sch, const uint8_t hash[16],
+                    RecordRef *out) {
+    memset(out, 0, sizeof(*out));
+    if (sch->storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) return -1;
+        slotcask_lookup_by_hash(sdb, hash, v2_record_capture_cb, out);
+        return out->v2_buf ? 0 : -1;
+    }
+    int shard_id, start_slot;
+    addr_from_hash(hash, sch->splits, &shard_id, &start_slot);
+    char shard_path[PATH_MAX];
+    build_shard_path(shard_path, sizeof(shard_path), db_root, object, shard_id);
+    FcacheRead fc = fcache_get_read(shard_path);
+    if (!fc.map) return -1;
+    uint32_t slots = fc.slots_per_shard;
+    uint32_t mask  = slots - 1;
+    for (uint32_t p = 0; p < slots; p++) {
+        uint32_t s = ((uint32_t)start_slot + p) & mask;
+        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
+        if (h->flag == 0 && h->key_len == 0) break;
+        if (h->flag != 1) continue;
+        if (memcmp(h->hash, hash, 16) != 0) continue;
+        out->fc   = fc;
+        out->key  = fc.map + zoneB_off(s, slots, sch->slot_size);
+        out->klen = h->key_len;
+        out->val  = out->key + h->key_len;
+        out->vlen = h->value_len;
+        return 0;
+    }
+    fcache_release(fc);
+    return -1;
+}
+
+void release_record_ref(RecordRef *r) {
+    if (!r) return;
+    if (r->fc.map) { fcache_release(r->fc); r->fc.map = NULL; }
+    if (r->v2_buf) { free(r->v2_buf); r->v2_buf = NULL; }
+    r->key = r->val = NULL;
+    r->klen = r->vlen = 0;
+}
+
 /* ========== SIZE ========== */
 
 int cmd_size(const char *db_root, const char *object) {
@@ -315,37 +394,17 @@ struct CompiledCriterion {
 int fetch_record_by_hash(const char *db_root, const char *object,
                                 const Schema *sch, const uint8_t hash16[16], int *printed,
                                 void *fs) {
-    int r_shard_id, r_slot;
-    addr_from_hash(hash16, sch->splits, &r_shard_id, &r_slot);
-    char r_shard[PATH_MAX];
-    build_shard_path(r_shard, sizeof(r_shard), db_root, object, r_shard_id);
-
-    FcacheRead fc = fcache_get_read(r_shard);
-    if (!fc.map) return 0;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    int found = 0;
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)r_slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash16, 16) != 0) continue;
-
-        char *rkey = malloc(h->key_len + 1);
-        memcpy(rkey, fc.map + zoneB_off(s, slots, sch->slot_size), h->key_len);
-        rkey[h->key_len] = '\0';
-        const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sch->slot_size) + h->key_len);
-        char *rval = decode_value(raw, h->value_len, fs);
-        OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", rkey, rval);
-        free(rkey); free(rval);
-        (*printed)++;
-        found = 1;
-        break;
-    }
-    fcache_release(fc);
-    return found;
+    RecordRef rr;
+    if (read_record_ref(db_root, object, sch, hash16, &rr) != 0) return 0;
+    char *rkey = malloc(rr.klen + 1);
+    memcpy(rkey, rr.key, rr.klen);
+    rkey[rr.klen] = '\0';
+    char *rval = decode_value((const char *)rr.val, (uint32_t)rr.vlen, fs);
+    OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", rkey, rval);
+    free(rkey); free(rval);
+    (*printed)++;
+    release_record_ref(&rr);
+    return 1;
 }
 
 /* ========== Parallel fetch: collect hashes → group by shard → parallel fetch ========== */
@@ -8640,52 +8699,9 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
     return ks;
 }
 
-/* Read the record at `hash` from the object's shards. Writes the value payload
-   start + length into *out_val, *out_len. Returns 0 on success, -1 not found.
-   Caller holds the returned pointer only for the duration of the mmap lease. */
-typedef struct {
-    FcacheRead fc;            /* persistent shard mmap; fcache_release on free */
-    const uint8_t *val;
-    size_t val_len;
-} KeysetRecordRead;
-
-static int read_record_by_hash(const char *db_root, const char *object,
-                               const Schema *sch, const uint8_t hash[16],
-                               KeysetRecordRead *out) {
-    memset(out, 0, sizeof(*out));
-    int shard_id, slot;
-    addr_from_hash(hash, sch->splits, &shard_id, &slot);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    /* Persistent ucache mapping — same as every other read worker. The
-       previous open + mmap MAP_PRIVATE per call paid page-fault + close
-       overhead per KeySet entry, swamping the actual record probe. */
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return -1;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask  = slots - 1;
-
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash, 16) != 0) continue;
-
-        out->fc = fc;
-        out->val = fc.map + zoneB_off(s, slots, sch->slot_size) + h->key_len;
-        out->val_len = h->value_len;
-        return 0;
-    }
-    fcache_release(fc);
-    return -1;
-}
-
-static void release_record_read(KeysetRecordRead *r) {
-    if (r && r->fc.map) { fcache_release(r->fc); r->fc.map = NULL; }
-}
+/* (legacy KeysetRecordRead / read_record_by_hash / release_record_read removed
+   2026-05-07 — superseded by RecordRef + read_record_ref/release_record_ref in
+   the storage-version-agnostic dispatch helpers above.) */
 
 /* Emit records matching `tree` by iterating a KeySet built from the OR branch.
    Honours offset/limit at emit time. Excluded keys, joins, projections, and
@@ -8712,48 +8728,26 @@ static int keyset_emit_find(const char *db_root, const char *object,
         if (query_deadline_tick(dl, &dl_counter)) break;
         if (ks->state[b] != 2) continue;
 
-        KeysetRecordRead r;
-        if (read_record_by_hash(db_root, object, sch, ks->keys[b], &r) != 0) continue;
+        /* Storage-version-agnostic fetch: v1 returns a live mmap pointer
+           held by an FcacheRead handle; v2 returns a malloc'd copy. Caller
+           releases via release_record_ref. The previous v1-only path did
+           a redundant lookup-then-walk to recover the key pointer; the
+           dispatch helper returns key+val together in one shot. */
+        RecordRef rr;
+        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
 
-        /* Extract key for exclusion + output. */
-        uint32_t shard_id, slot;
-        (void)shard_id; (void)slot;
         char keybuf[1024];
-        /* To get the key, re-scan the shard. But we already matched the slot in
-           read_record_by_hash. We can compute the slot from the hash — but we
-           lost the key pointer. Simpler: re-open the shard here for the one
-           record. For now, extract the key via a follow-up scan. */
-        release_record_read(&r);
+        size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, rr.key, kl);
+        keybuf[kl] = '\0';
 
-        /* Re-walk for key + value together via the persistent ucache. The
-           prior open + mmap MAP_PRIVATE per KeySet hit was paying ~100µs
-           page-fault overhead per emitted row. */
-        int sid, slt;
-        addr_from_hash(ks->keys[b], sch->splits, &sid, &slt);
-        char shard[PATH_MAX];
-        build_shard_path(shard, sizeof(shard), db_root, object, sid);
-        FcacheRead fc = fcache_get_read(shard);
-        if (!fc.map) continue;
-        uint8_t *map = fc.map;
-        uint32_t slots = fc.slots_per_shard;
-        uint32_t mask = slots - 1;
+        if (is_excluded(excluded, keybuf)) { release_record_ref(&rr); continue; }
 
-        int found = 0;
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)slt + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, ks->keys[b], 16) != 0) continue;
+        const uint8_t *raw = rr.val;
+        uint32_t value_len = (uint32_t)rr.vlen;
+        if (need_rematch && !criteria_match_tree(raw, tree, fs)) { release_record_ref(&rr); continue; }
 
-            size_t kl = h->key_len < sizeof(keybuf) - 1 ? h->key_len : sizeof(keybuf) - 1;
-            memcpy(keybuf, map + zoneB_off(s, slots, sch->slot_size), kl);
-            keybuf[kl] = '\0';
-
-            if (is_excluded(excluded, keybuf)) { found = 1; break; }
-
-            const uint8_t *raw = map + zoneB_off(s, slots, sch->slot_size) + h->key_len;
-            if (need_rematch && !criteria_match_tree(raw, tree, fs)) { found = 1; break; }
+        {  /* Single-iteration block — no probe loop in the dispatched path. */
 
             /* Match. Apply joins (inner-drop), offset, emit. */
             FcacheRead *jhs = NULL;
@@ -8823,14 +8817,14 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         SB_APPEND(buf, pos, sizeof(buf), "]");
                         OUT("%s%s", printed ? "," : "", buf);
                     } else if (csv_delim) {
-                        csv_emit_row(keybuf, raw, h->value_len,
+                        csv_emit_row(keybuf, raw, value_len,
                                      proj_count > 0 ? proj_fields : NULL,
                                      proj_count, fs, csv_delim);
                     } else if (rows_fmt) {
                         OUT("%s[\"%s\"", printed ? "," : "", keybuf);
                         if (proj_count > 0) {
                             for (int j = 0; j < proj_count; j++) {
-                                char *pv = decode_field((const char *)raw, h->value_len,
+                                char *pv = decode_field((const char *)raw, value_len,
                                                         proj_fields[j], fs);
                                 OUT(",\"%s\"", pv ? pv : "");
                                 free(pv);
@@ -8850,7 +8844,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             OUT("{");
                             int first = 1;
                             for (int j = 0; j < proj_count; j++) {
-                                char *pv = decode_field((const char *)raw, h->value_len,
+                                char *pv = decode_field((const char *)raw, value_len,
                                                         proj_fields[j], fs);
                                 if (!pv) continue;
                                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
@@ -8859,7 +8853,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             }
                             OUT("}");
                         } else {
-                            char *v = decode_value((const char *)raw, h->value_len, fs);
+                            char *v = decode_value((const char *)raw, value_len, fs);
                             OUT("%s", v);
                             free(v);
                         }
@@ -8867,7 +8861,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
                         int first = 1;
                         for (int j = 0; j < proj_count; j++) {
-                            char *pv = decode_field((const char *)raw, h->value_len,
+                            char *pv = decode_field((const char *)raw, value_len,
                                                     proj_fields[j], fs);
                             if (!pv) continue;
                             OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
@@ -8876,7 +8870,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         }
                         OUT("}}");
                     } else {
-                        char *v = decode_value((const char *)raw, h->value_len, fs);
+                        char *v = decode_value((const char *)raw, value_len, fs);
                         OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", keybuf, v);
                         free(v);
                     }
@@ -8889,11 +8883,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
                     if (jhs[i].map) fcache_release(jhs[i]);
                 free(jhs); free(jraws);
             }
-            found = 1;
-            break;
         }
-        fcache_release(fc);
-        if (!found) continue;
+        release_record_ref(&rr);
     }
 
     return printed;
@@ -9071,10 +9062,10 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
     for (size_t b = 0; b < ks->cap; b++) {
         if (query_deadline_tick(dl, &dl_counter)) break;
         if (ks->state[b] != 2) continue;
-        KeysetRecordRead r;
-        if (read_record_by_hash(db_root, object, sch, ks->keys[b], &r) != 0) continue;
-        if (criteria_match_tree(r.val, tree, fs)) n++;
-        release_record_read(&r);
+        RecordRef rr;
+        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
+        if (criteria_match_tree(rr.val, tree, fs)) n++;
+        release_record_ref(&rr);
     }
     keyset_free(ks);
     return n;
@@ -9566,36 +9557,19 @@ static int cursor_find_cb(const char *val, size_t vlen,
         return 0;
     }
 
-    /* Resolve hash16 → (shard, slot) and probe the shard for the record. */
-    int shard_id, start_slot;
-    addr_from_hash(hash16, c->sch->splits, &shard_id, &start_slot);
-    char shard_path[PATH_MAX];
-    build_shard_path(shard_path, sizeof(shard_path), c->db_root, c->object, shard_id);
-    FcacheRead fc = fcache_get_read(shard_path);
-    if (!fc.map) return 0;
-
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask  = slots - 1;
-    int slot = -1;
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)start_slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash16, 16) == 0) { slot = (int)s; break; }
-    }
-    if (slot < 0) { fcache_release(fc); return 0; }
-
-    SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(slot));
-    const uint8_t *key_start = fc.map + zoneB_off(slot, slots, c->sch->slot_size);
-    const uint8_t *raw = key_start + h->key_len;
+    /* Storage-version-agnostic fetch via the dispatch helper. */
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    const uint8_t *key_start = rr.key;
+    const uint8_t *raw       = rr.val;
+    uint32_t       value_len = (uint32_t)rr.vlen;
 
     /* Remaining criteria (full tree). Order_by leaf still gets checked — it
        stays correct because the btree walk only visits entries that would
        pass a range/eq on the indexed field, and range checks in the tree
        agree with the range in the walk. */
     if (c->remaining && !criteria_match_tree(raw, c->remaining, c->fs)) {
-        fcache_release(fc);
+        release_record_ref(&rr);
         return 0;
     }
 
@@ -9603,13 +9577,13 @@ static int cursor_find_cb(const char *val, size_t vlen,
        window. Release and decrement; the next match emits. */
     if (c->skip_remaining > 0) {
         c->skip_remaining--;
-        fcache_release(fc);
+        release_record_ref(&rr);
         return 0;
     }
 
     /* Emit row. Supports json-default and rows_fmt. */
     char key_buf[1024];
-    size_t klen = h->key_len < sizeof(key_buf) - 1 ? h->key_len : sizeof(key_buf) - 1;
+    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
     memcpy(key_buf, key_start, klen);
     key_buf[klen] = '\0';
 
@@ -9617,7 +9591,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
         if (c->proj_count > 0) {
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, h->value_len,
+                char *pv = decode_field((const char *)raw, value_len,
                                         c->proj_fields[i], c->fs);
                 OUT(",\"%s\"", pv ? pv : "");
                 free(pv);
@@ -9637,7 +9611,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, h->value_len,
+                char *pv = decode_field((const char *)raw, value_len,
                                         c->proj_fields[i], c->fs);
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
@@ -9646,7 +9620,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
             }
             OUT("}");
         } else {
-            char *dv = decode_value((const char *)raw, h->value_len, c->fs);
+            char *dv = decode_value((const char *)raw, value_len, c->fs);
             OUT("%s", dv ? dv : "{}");
             free(dv);
         }
@@ -9654,7 +9628,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = decode_field((const char *)raw, h->value_len,
+            char *pv = decode_field((const char *)raw, value_len,
                                     c->proj_fields[i], c->fs);
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
@@ -9663,7 +9637,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         }
         OUT("}}");
     } else {
-        char *dv = decode_value((const char *)raw, h->value_len, c->fs);
+        char *dv = decode_value((const char *)raw, value_len, c->fs);
         OUT("%s{\"key\":\"%s\",\"value\":%s}",
             c->printed ? "," : "", key_buf, dv ? dv : "{}");
         free(dv);
@@ -9684,7 +9658,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
     c->last_key_str = strndup(key_buf, klen);
 
     c->printed++;
-    fcache_release(fc);
+    release_record_ref(&rr);
     return 0;
 }
 
@@ -12253,30 +12227,12 @@ static void *wfc_worker(void *arg) {
         if (!decode_index_key_to_double(w->agg_tf, (const uint8_t *)val,
                                         vlen, &v)) continue;
 
-        /* Fetch the record by hash. */
-        int data_shard, start_slot;
-        addr_from_hash(hash16, w->sch->splits, &data_shard, &start_slot);
-        char shard_path[PATH_MAX];
-        build_shard_path(shard_path, sizeof(shard_path),
-                         w->db_root, w->object, data_shard);
-        FcacheRead fc = fcache_get_read(shard_path);
-        if (!fc.map) continue;
-
-        uint32_t slots = fc.slots_per_shard;
-        uint32_t mask  = slots - 1;
-        int matched = 0;
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, hash16, 16) != 0) continue;
-            const uint8_t *raw = fc.map + zoneB_off(s, slots, w->sch->slot_size)
-                                + h->key_len;
-            if (criteria_match_tree(raw, w->tree, w->fs)) matched = 1;
-            break;
-        }
-        fcache_release(fc);
+        /* Fetch the record via the storage-version-agnostic dispatcher. */
+        RecordRef rr;
+        if (read_record_ref(w->db_root, w->object, w->sch, hash16, &rr) != 0)
+            continue;
+        int matched = criteria_match_tree(rr.val, w->tree, w->fs);
+        release_record_ref(&rr);
         if (matched) {
             w->best = v;
             w->found = 1;
@@ -12900,25 +12856,20 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
         memcpy(tmp, val, cl); tmp[cl] = '\0';
         if (!match_criterion(tmp, ia->primary_crit)) return 0;
     }
-    int r_shard_id, r_slot;
-    addr_from_hash(hash16, ia->sch->splits, &r_shard_id, &r_slot);
-    char r_shard[PATH_MAX];
-    build_shard_path(r_shard, sizeof(r_shard), ia->db_root, ia->object, r_shard_id);
-    FcacheRead fc = fcache_get_read(r_shard);
-    if (!fc.map) return 0;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)r_slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash16, 16) != 0) continue;
-        const uint8_t *block = fc.map + zoneB_off(s, slots, ia->sch->slot_size);
-        agg_scan_cb(h, block, ia->agg);
-        break;
-    }
-    fcache_release(fc);
+    /* Layout-agnostic fetch + invoke agg_scan_cb on the synthesized header. */
+    RecordRef rr;
+    if (read_record_ref(ia->db_root, ia->object, ia->sch, hash16, &rr) != 0)
+        return 0;
+    SlotHeader hdr;
+    memcpy(hdr.hash, hash16, 16);
+    hdr.flag      = 1;
+    hdr.key_len   = (uint16_t)rr.klen;
+    hdr.value_len = (uint32_t)rr.vlen;
+    /* block layout: key bytes followed by value bytes — matches v1 Zone B
+       and is exactly how RecordRef lays them out (whether v1's mmap or v2's
+       malloc'd copy). */
+    agg_scan_cb(&hdr, rr.key, ia->agg);
+    release_record_ref(&rr);
     return 0;
 }
 
