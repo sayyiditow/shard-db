@@ -41,10 +41,16 @@
 /* Keyfile shard count cap mirrors splits ceiling for the engine. */
 #define SLOTCASK_MAX_SHARDS      4096
 
-/* Default keyfile slots per shard. Pre-sized for 50 % load at the documented
-   ~150K-records-per-shard sweet spot from CLAUDE.md. Constant across splits
-   because create-object takes no expected_records hint. 12 MB per shard. */
-#define SLOTCASK_DEFAULT_SLOTS_PER_SHARD  (512u * 1024)
+/* Default keyfile slots per shard. 128K × 24B = 3 MB per shard. Sized to
+   stay near 50 % load at ~64K records/shard — the working sweet-spot from
+   the bench harness when SPLITS is tuned to 78K-200K rec/shard. Beyond
+   that, per-shard auto-resplit at 80 % load doubles slots in place
+   (no global rehash) up to SLOTCASK_MAX_SLOTS_PER_SHARD.
+   Tuning history: started at 2M, dropped to 512K (still oversized for
+   typical workloads — 1.5 GB kf at splits=128, ≥ 50 % of total disk
+   footprint at 10M records), now 128K which trims the kf to ~384 MB at
+   splits=128 while keeping the resplit ladder well below the 16M cap. */
+#define SLOTCASK_DEFAULT_SLOTS_PER_SHARD  (128u * 1024)
 #define SLOTCASK_MAX_SLOTS_PER_SHARD      (16u * 1024 * 1024)
 
 /* Keyfile entry header (24 B, packed). hash16 + 1B flag + 1B stream_id +

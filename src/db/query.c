@@ -4768,28 +4768,6 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
     return 0;
 }
 
-/* Move every keyfile_*.kf and stream_* entry from `from_dir` into `to_dir`.
-   `to_dir` must already exist. Returns 0 on success. */
-static int move_slotcask_data(const char *from_dir, const char *to_dir) {
-    DIR *d = opendir(from_dir);
-    if (!d) return -1;
-    struct dirent *e;
-    int rc = 0;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        int is_kf = (strncmp(e->d_name, "keyfile_", 8) == 0);
-        int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
-        int is_dirty  = (strcmp(e->d_name, ".dirty") == 0);
-        if (!is_kf && !is_stream && !is_dirty) continue;
-        char src[PATH_MAX], dst[PATH_MAX];
-        snprintf(src, sizeof(src), "%s/%s", from_dir, e->d_name);
-        snprintf(dst, sizeof(dst), "%s/%s", to_dir, e->d_name);
-        if (rename(src, dst) != 0) { rc = -1; break; }
-    }
-    closedir(d);
-    return rc;
-}
-
 static int rebuild_object_v2(const char *db_root, const char *object,
                               const Schema *old_sch, const TypedSchema *old_ts,
                               const Schema *new_sch, TypedSchema *new_ts,
@@ -4798,30 +4776,56 @@ static int rebuild_object_v2(const char *db_root, const char *object,
                               char added_lines[][256], int n_added) {
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/data", obj_dir);
     char legacy_dir[PATH_MAX];
-    snprintf(legacy_dir, sizeof(legacy_dir), "%s/.legacy", obj_dir);
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/data.legacy", obj_dir);
 
-    /* Clean any stale .legacy from a prior crashed rebuild. */
+    /* Clean any stale data.legacy from a prior crashed rebuild. */
     rmrf(legacy_dir);
-    mkdirp(legacy_dir);
 
-    /* Drop the cached slotcask handle so file moves don't tug on live
-       mmap regions. The next slotcask_registry_get will re-open fresh. */
+    /* Drop the cached slotcask handle so the rename below doesn't tug
+       on live mmap regions. The next slotcask_registry_get will
+       re-open fresh against the new data/ that we'll create. */
     slotcask_registry_invalidate(db_root, object);
 
-    /* Move data files (keyfile_*.kf and stream_* dirs) into .legacy/. */
-    if (move_slotcask_data(obj_dir, legacy_dir) != 0) {
-        log_msg(1, "rebuild_v2: move into %s failed", legacy_dir);
-        rmrf(legacy_dir);
+    /* Atomic rename: data/ → data.legacy/. The new slotcask_open below
+       will re-create data/ from scratch with the new schema. */
+    if (rename(data_dir, legacy_dir) != 0) {
+        log_msg(1, "rebuild_v2: rename(%s → %s) failed: %s",
+                data_dir, legacy_dir, strerror(errno));
         OUT("{\"error\":\"Failed to stage legacy data\"}\n");
         return 1;
     }
 
     /* Open standalone handles — bypass the registry (it would re-open
        the live obj_dir under the new schema and we want both handles
-       coexisting for the walk). */
+       coexisting for the walk). slotcask_open's data_dir parameter is
+       <obj>/, not <obj>/data/, so legacy_db needs the parent of
+       data.legacy/ — but the layout helpers prepend /data/ to the
+       passed dir, so we point legacy_db at a dir whose /data/ resolves
+       to data.legacy/. Symlink would be cleaner; instead we move
+       data.legacy → ./data inside a throwaway dir. Simpler: pass the
+       parent of data.legacy and have the helpers find data/ — but
+       the parent IS obj_dir. Solution: temporarily rename
+       data.legacy → data inside a sibling dir. */
+    char legacy_root[PATH_MAX];
+    snprintf(legacy_root, sizeof(legacy_root), "%s/.rebuild_legacy_root", obj_dir);
+    rmrf(legacy_root);
+    mkdirp(legacy_root);
+    char legacy_data_under_root[PATH_MAX];
+    snprintf(legacy_data_under_root, sizeof(legacy_data_under_root),
+             "%s/data", legacy_root);
+    if (rename(legacy_dir, legacy_data_under_root) != 0) {
+        log_msg(1, "rebuild_v2: rename(%s → %s): %s",
+                legacy_dir, legacy_data_under_root, strerror(errno));
+        rmrf(legacy_root);
+        OUT("{\"error\":\"Failed to stage legacy data root\"}\n");
+        return 1;
+    }
+
     SlotcaskDb legacy_db, new_db;
-    int legacy_open = (slotcask_open(&legacy_db, legacy_dir,
+    int legacy_open = (slotcask_open(&legacy_db, legacy_root,
                                        old_sch->splits, old_sch->streams,
                                        old_sch->slot_size) == 0);
     int new_open = (slotcask_open(&new_db, obj_dir,
@@ -4851,7 +4855,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
 
     if (walk_err) {
         log_msg(1, "rebuild_v2: walk error after %d records", live_count);
-        OUT("{\"error\":\"Rebuild walk failed; %s/.legacy preserved\"}\n", obj_dir);
+        OUT("{\"error\":\"Rebuild walk failed; %s/.rebuild_legacy_root preserved\"}\n", obj_dir);
         return 1;
     }
 
@@ -4904,9 +4908,9 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     reset_deleted_count(db_root, object);
     set_count(db_root, object, live_count);
 
-    /* Drop the legacy data + force the registry to re-open against the
-       new on-disk state on the next request. */
-    rmrf(legacy_dir);
+    /* Drop the legacy data root + force the registry to re-open against
+       the new on-disk state on the next request. */
+    rmrf(legacy_root);
     slotcask_registry_invalidate(db_root, object);
 
     int idx_rebuilt = 0;
@@ -11528,43 +11532,16 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
     mkdirp(bak_dir);
 
-    /* Recursively copy data/, indexes/, and metadata/ via in-process
-       directory walk — no shell. v1 stores records under data/; v2's
-       slotcask uses keyfile_*.kf + stream_NNN/ directly at the obj
-       root, copied below. */
+    /* Recursively copy data/, indexes/, and metadata/. v2 stores
+       kf shards + segments under the same data/ umbrella, so a single
+       cprf("data") captures both layouts. */
+    Schema sch = load_schema(db_root, object);
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
     const char *subs[] = { "data", "indexes", "metadata" };
     for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
         cprf(src_sub, dst_sub);
-    }
-
-    /* v2: also capture keyfile_*.kf files + stream_NNN/ directories.
-       Walk the obj root and copy anything matching those prefixes. */
-    Schema sch = load_schema(db_root, object);
-    if (sch.storage_version == 2) {
-        DIR *d = opendir(src_dir);
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d))) {
-                if (e->d_name[0] == '.') continue;
-                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
-                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
-                if (!is_kf && !is_stream) continue;
-                char src_p[PATH_MAX], dst_p[PATH_MAX];
-                snprintf(src_p, sizeof(src_p), "%s/%s", src_dir, e->d_name);
-                snprintf(dst_p, sizeof(dst_p), "%s/%s", bak_dir, e->d_name);
-                if (is_kf) {
-                    struct stat kfst;
-                    if (stat(src_p, &kfst) == 0)
-                        copy_file(src_p, dst_p, kfst.st_mode);
-                } else {
-                    cprf(src_p, dst_p);
-                }
-            }
-            closedir(d);
-        }
     }
 
     /* Schema capture — make the backup directory self-contained. fields.conf
@@ -11842,56 +11819,19 @@ int cmd_restore(const char *db_root, const char *object,
         }
     }
 
+    /* v2: drop slotcask registry first so the upcoming wipe doesn't
+       tug on live mmaps. The data/ wipe + cprf in the next loop
+       handles the kf + stream files (they live under data/). */
+    if (have_meta && bak_sv == 2) {
+        slotcask_registry_invalidate(db_root, object);
+    }
+
     /* Wipe live subtrees, then copy from backup. */
     for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
         rmrf(dst_sub);
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
-    }
-
-    /* v2: also wipe + restore keyfile_*.kf files and stream_NNN/ dirs.
-       Drop slotcask registry first so the next access re-opens against
-       the freshly-restored files (otherwise the registry would still
-       hold the pre-restore handle and route reads to old inodes). */
-    if (have_meta && bak_sv == 2) {
-        slotcask_registry_invalidate(db_root, object);
-        DIR *od = opendir(obj_dir);
-        if (od) {
-            struct dirent *e;
-            while ((e = readdir(od))) {
-                if (e->d_name[0] == '.') continue;
-                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
-                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
-                if (!is_kf && !is_stream) continue;
-                char p[PATH_MAX];
-                snprintf(p, sizeof(p), "%s/%s", obj_dir, e->d_name);
-                if (is_stream) rmrf(p);
-                else           unlink(p);
-            }
-            closedir(od);
-        }
-        DIR *bd = opendir(src_dir);
-        if (bd) {
-            struct dirent *e;
-            while ((e = readdir(bd))) {
-                if (e->d_name[0] == '.') continue;
-                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
-                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
-                if (!is_kf && !is_stream) continue;
-                char src_p[PATH_MAX], dst_p[PATH_MAX];
-                snprintf(src_p, sizeof(src_p), "%s/%s", src_dir, e->d_name);
-                snprintf(dst_p, sizeof(dst_p), "%s/%s", obj_dir, e->d_name);
-                if (is_kf) {
-                    struct stat kfst;
-                    if (stat(src_p, &kfst) == 0)
-                        copy_file(src_p, dst_p, kfst.st_mode);
-                } else {
-                    cprf(src_p, dst_p);
-                }
-            }
-            closedir(bd);
-        }
     }
 
     objlock_wrunlock(db_root, object);
@@ -12160,33 +12100,13 @@ int cmd_truncate(const char *db_root, const char *object) {
     fcache_invalidate(obj_dir);
     invalidate_idx_cache(object);
 
-    /* v2: drop the cached slotcask handle, then unlink keyfile_*.kf files
-       and stream_* dirs at the object root. Falls through to the v1
-       cleanup below (data/, metadata/, indexes/ — those still apply:
-       metadata stores counts, indexes stores btrees regardless of storage
-       version). */
+    /* v2: drop the cached slotcask handle so the rmrf below doesn't tug
+       on live mmaps. The data/ wipe further down handles the actual
+       file removal — v2's kf + stream files all live under data/, same
+       umbrella as v1's data/NNN.bin. */
     Schema sch = load_schema(db_root, object);
     if (sch.storage_version == 2) {
         slotcask_registry_invalidate(db_root, object);
-        DIR *d = opendir(obj_dir);
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d))) {
-                if (e->d_name[0] == '.') continue;
-                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
-                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
-                if (!is_kf && !is_stream) continue;
-                char fp[PATH_MAX];
-                snprintf(fp, sizeof(fp), "%s/%s", obj_dir, e->d_name);
-                if (is_stream) rmrf(fp);
-                else           unlink(fp);
-            }
-            closedir(d);
-        }
-        /* Also drop a stale .dirty marker if present. */
-        char dirty[PATH_MAX];
-        snprintf(dirty, sizeof(dirty), "%s/.dirty", obj_dir);
-        unlink(dirty);
     }
 
     /* Only delete data, metadata, and index data — preserve config files */
@@ -12344,34 +12264,9 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
     int new_slot_size = (24 + sc.max_key + sc.max_value + 7) & ~7;
     if (new_slot_size < 32) new_slot_size = 32;
 
-    /* Open new slotcask in obj_dir (alongside the v1 data/ which is
-       still in place). slotcask creates keyfile_*.kf and stream_NNN
-       sub-dirs at the obj root; v1's data/ subdir doesn't conflict. */
-    SlotcaskDb sdb;
-    if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
-        OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-            dir, object);
-        return 1;
-    }
-
-    /* Walk every live v1 record and insert into the new slotcask. */
-    MigrateWalkCtx wctx = { &sdb, 0, 0 };
-    scan_shards(data_dir, sc.slot_size, migrate_walk_cb, &wctx);
-    slotcask_close(&sdb);
-
-    if (wctx.err) {
-        /* Leave the new kf+stream files in place for inspection; data/
-           is untouched. Operator can rmrf <obj>/keyfile_*.kf and stream_*
-           and retry. */
-        OUT("{\"error\":\"insert failed during migration after %d records\",\"inserted\":%d}\n",
-            wctx.inserted, wctx.inserted);
-        return 1;
-    }
-
-    /* Atomic swap: v1 data/ → data.legacy/. After this the daemon's
-       next request for this object should see storage_version=2 (after
-       the schema.conf update + cache invalidation below) and route
-       through slotcask. */
+    /* Step 1: rename v1 data/ → data.legacy/ so the new slotcask can
+       create its own data/ subtree (kf/, streams/) without colliding
+       with the v1 NNN.bin files. */
     fcache_invalidate(data_dir);
     if (rename(data_dir, data_legacy) != 0) {
         OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
@@ -12379,14 +12274,35 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
         return 1;
     }
 
-    /* Update schema.conf line to append :2:streams. */
+    /* Step 2: open the new v2 slotcask. mkdirp's data/kf/ and
+       data/streams/ on the way in. */
+    SlotcaskDb sdb;
+    if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
+        /* Best-effort rollback of the rename. */
+        if (rename(data_legacy, data_dir) != 0)
+            log_msg(1, "migrate: rollback rename failed: %s", strerror(errno));
+        OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 1;
+    }
+
+    /* Step 3: walk every live v1 record (now at data.legacy/) and
+       insert into the new slotcask. */
+    MigrateWalkCtx wctx = { &sdb, 0, 0 };
+    scan_shards(data_legacy, sc.slot_size, migrate_walk_cb, &wctx);
+    slotcask_close(&sdb);
+
+    if (wctx.err) {
+        OUT("{\"error\":\"insert failed during migration after %d records\",\"inserted\":%d}\n",
+            wctx.inserted, wctx.inserted);
+        return 1;
+    }
+
+    /* Step 4: update schema.conf line to append :2:streams. After this
+       the next request sees storage_version=2 and routes through
+       slotcask. */
     if (update_schema_conf_to_v2(db_root, object, streams) != 0) {
-        /* Try to roll back the rename. Best-effort. */
-        if (rename(data_legacy, data_dir) != 0) {
-            log_msg(1, "migrate: data.legacy → data rollback failed: %s",
-                    strerror(errno));
-        }
-        OUT("{\"error\":\"schema.conf update failed; rolled back rename\"}\n");
+        OUT("{\"error\":\"schema.conf update failed\"}\n");
         return 1;
     }
 

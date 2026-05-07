@@ -92,28 +92,24 @@ static int test_slotcask_v2_object_run(void) {
         free(line);
     }
 
-    /* on-disk: keyfile_000.kf + stream_000/data_000000.dat + .dirty */
+    /* on-disk: data/kf/000.kf + data/streams/000/000000.dat */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/keyfile_000.kf",
+    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/kf/000.kf",
              env.db_root);
-    ASSERT_TRUE(file_exists(path), "keyfile_000.kf created");
+    ASSERT_TRUE(file_exists(path), "data/kf/000.kf created");
 
-    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/stream_000",
+    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/streams/000",
              env.db_root);
-    ASSERT_TRUE(dir_exists(path), "stream_000 dir created");
+    ASSERT_TRUE(dir_exists(path), "data/streams/000 dir created");
 
-    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/stream_000/data_000000.dat",
+    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/streams/000/000000.dat",
              env.db_root);
-    ASSERT_TRUE(file_exists(path), "data_000000.dat created");
+    ASSERT_TRUE(file_exists(path), "data/streams/000/000000.dat created");
 
     /* `.dirty` is a runtime crash marker — touched on slotcask_open, removed
        on slotcask_close. cmd_create_object opens+closes immediately, so the
        file is correctly absent after a clean create. (Recovery exercise lives
        in a separate test.) */
-
-    /* v2 must NOT create the legacy data/ dir. */
-    snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data", env.db_root);
-    ASSERT_TRUE(!dir_exists(path), "v2 omits legacy data/ dir");
 
     /* --- default create (no storage_version) — should land on v2 --- */
     tc_request(tc,
@@ -134,12 +130,10 @@ static int test_slotcask_v2_object_run(void) {
         free(line);
     }
 
-    snprintf(path, sizeof(path), "%s/v2tenant/default_users/data", env.db_root);
-    ASSERT_TRUE(!dir_exists(path), "default omits legacy data/ dir");
-
-    snprintf(path, sizeof(path), "%s/v2tenant/default_users/keyfile_000.kf",
+    snprintf(path, sizeof(path), "%s/v2tenant/default_users/data/kf/000.kf",
              env.db_root);
-    ASSERT_TRUE(file_exists(path), "default has keyfile_000.kf (v2 layout)");
+    ASSERT_TRUE(file_exists(path),
+                "default lands on v2 layout (data/kf/000.kf present)");
 
     /* --- explicit storage_version=1 also works --- */
     tc_request(tc,

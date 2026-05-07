@@ -83,14 +83,15 @@ static int test_slotcask_v2_migrate_run(void) {
         tc_request(tc, req, &resp); free(resp); resp = NULL;
     }
 
-    /* Confirm v1 layout on disk: obj_dir/data/ exists, no keyfile_*.kf. */
+    /* Confirm v1 layout on disk: obj_dir/data/ exists with NNN.bin
+       files, no v2 kf/ subdir. */
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/mig/users", env.db_root);
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/data", obj_dir);
     ASSERT_TRUE(mig_file_exists(path), "pre-migrate: data/ exists");
-    snprintf(path, sizeof(path), "%s/keyfile_000.kf", obj_dir);
-    ASSERT_TRUE(!mig_file_exists(path), "pre-migrate: no keyfile_000.kf");
+    snprintf(path, sizeof(path), "%s/data/kf", obj_dir);
+    ASSERT_TRUE(!mig_file_exists(path), "pre-migrate: no data/kf/ (v1 layout)");
 
     /* count by indexed field — pre-migration baseline. */
     tc_request(tc,
@@ -108,16 +109,14 @@ static int test_slotcask_v2_migrate_run(void) {
     ASSERT_CONTAINS(resp, "\"records\":6", "migrated 6 records");
     free(resp); resp = NULL;
 
-    /* Post-migrate disk layout: data/ renamed to data.legacy/,
-       keyfile_*.kf + stream_NNN/ at obj root. */
-    snprintf(path, sizeof(path), "%s/data", obj_dir);
-    ASSERT_TRUE(!mig_file_exists(path), "post-migrate: data/ gone");
+    /* Post-migrate disk layout: v1 data/ renamed to data.legacy/,
+       new v2 data/kf/ + data/streams/ created. */
     snprintf(path, sizeof(path), "%s/data.legacy", obj_dir);
     ASSERT_TRUE(mig_file_exists(path), "post-migrate: data.legacy/ exists");
-    snprintf(path, sizeof(path), "%s/keyfile_000.kf", obj_dir);
-    ASSERT_TRUE(mig_file_exists(path), "post-migrate: keyfile_000.kf exists");
-    snprintf(path, sizeof(path), "%s/stream_000", obj_dir);
-    ASSERT_TRUE(mig_file_exists(path), "post-migrate: stream_000 exists");
+    snprintf(path, sizeof(path), "%s/data/kf/000.kf", obj_dir);
+    ASSERT_TRUE(mig_file_exists(path), "post-migrate: data/kf/000.kf exists");
+    snprintf(path, sizeof(path), "%s/data/streams/000", obj_dir);
+    ASSERT_TRUE(mig_file_exists(path), "post-migrate: data/streams/000 exists");
 
     /* schema.conf gained :2:streams. */
     {

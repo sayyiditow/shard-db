@@ -2222,22 +2222,17 @@ static int validate_metadata(const char *db_root) {
         struct dirent *oe;
         while ((oe = readdir(dd))) {
             if (oe->d_name[0] == '.') continue;
-            /* Object is "real" (worth validating) iff it has either v1's
-               data/ subdir or v2's keyfile_000.kf at the obj root. Both
-               are markers that the operator has actually finished
-               creating the object. */
+            /* Object is "real" (worth validating) iff data/ exists.
+               Both v1 (data/NNN.bin) and v2 (data/kf/, data/streams/)
+               share the data/ umbrella, so a single stat() covers
+               both layouts. */
             char data_check[PATH_MAX];
             snprintf(data_check, sizeof(data_check),
                      "%s/%s/data", dir_path, oe->d_name);
-            char kf_check[PATH_MAX];
-            snprintf(kf_check, sizeof(kf_check),
-                     "%s/%s/keyfile_000.kf", dir_path, oe->d_name);
             struct stat ost;
-            int has_v1 = (stat(data_check, &ost) == 0 && S_ISDIR(ost.st_mode));
-            int has_v2 = (stat(kf_check, &ost) == 0 && S_ISREG(ost.st_mode));
-            if (!has_v1 && !has_v2) continue;
+            if (stat(data_check, &ost) != 0 || !S_ISDIR(ost.st_mode)) continue;
 
-            const char *layout_marker = has_v1 ? "data/" : "keyfile_*.kf";
+            const char *layout_marker = "data/";
 
             /* Rule 2: fields.conf must exist. */
             char fields_check[PATH_MAX];

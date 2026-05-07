@@ -78,15 +78,23 @@ static int mkdirp_local(const char *path) {
     return 0;
 }
 
+/* On-disk layout:
+     <data_dir>/data/kf/NNN.kf              keyfile shards (sharded by `splits`)
+     <data_dir>/data/streams/NNN/NNNNNN.dat rotating segment files per stream
+   The `data/` umbrella keeps engine internals out of the obj root, so
+   fields.conf, indexes/, files/, etc. aren't visually mixed with kf/seg
+   files. `data/` here mirrors the v1 path of the same name; the migrate
+   runner moves v1's data/ to data.legacy/ so the new structure can be
+   created cleanly. */
 static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
-    snprintf(out, PATH_MAX, "%s/keyfile_%03d.kf", data_dir, shard_id);
+    snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }
 static void stream_dir_for(char out[PATH_MAX], const char *data_dir, int stream_id) {
-    snprintf(out, PATH_MAX, "%s/stream_%03d", data_dir, stream_id);
+    snprintf(out, PATH_MAX, "%s/data/streams/%03d", data_dir, stream_id);
 }
 static void seg_path_for(char out[PATH_MAX], const char *data_dir,
                          int stream_id, uint32_t file_id) {
-    snprintf(out, PATH_MAX, "%s/stream_%03d/data_%06u.dat",
+    snprintf(out, PATH_MAX, "%s/data/streams/%03d/%06u.dat",
              data_dir, stream_id, (unsigned)file_id);
 }
 
@@ -1288,8 +1296,9 @@ static int remove_dirty_marker(const SlotcaskDb *db) {
 }
 
 static int data_file_id_from_name(const char *name) {
+    /* Segment files: <data_dir>/data/streams/SSS/NNNNNN.dat */
     int id;
-    return (sscanf(name, "data_%d.dat", &id) == 1) ? id : -1;
+    return (sscanf(name, "%d.dat", &id) == 1) ? id : -1;
 }
 static int cmp_int(const void *a, const void *b) {
     int ia = *(const int *)a, ib = *(const int *)b;
