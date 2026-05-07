@@ -4991,8 +4991,14 @@ int rebuild_object(const char *db_root, const char *object,
     Schema new_sch = old_sch;
     new_sch.splits = new_splits;
     new_sch.max_value = new_ts.total_size;
-    new_sch.slot_size = new_sch.max_key + new_sch.max_value;
-    new_sch.slot_size = (new_sch.slot_size + 7) & ~7;
+    /* slot_size depends on storage version — v2 includes a 24B inline
+       per-record header, v1 doesn't (see load_schema commentary). */
+    if (old_sch.storage_version == 2) {
+        new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
+        if (new_sch.slot_size < 32) new_sch.slot_size = 32;
+    } else {
+        new_sch.slot_size = (new_sch.max_key + new_sch.max_value + 7) & ~7;
+    }
 
     int slot_changed = (new_sch.slot_size != old_sch.slot_size);
 
@@ -11966,8 +11972,31 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     return 0;
 }
 
+/* v2 recount callback: increments a counter for every live record. */
+static int recount_v2_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
+    (void)hdr; (void)block;
+    int *total = (int *)ctx;
+    __sync_fetch_and_add(total, 1);
+    return 0;
+}
+
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
+
+    /* v2: walk the slotcask via scan_dispatch — slotcask_walk_live
+       visits every live (flag=1) entry across every kf shard. */
+    if (sch.storage_version == 2) {
+        int total = 0;
+        char data_dir_unused[PATH_MAX];
+        snprintf(data_dir_unused, sizeof(data_dir_unused),
+                 "%s/%s/data", db_root, object);
+        scan_dispatch(db_root, object, &sch, data_dir_unused,
+                      recount_v2_cb, &total);
+        set_count(db_root, object, total);
+        OUT("{\"count\":%d}\n", total);
+        return 0;
+    }
+
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
@@ -12218,11 +12247,11 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
         return 1;
     }
 
-    /* Compute v2 layout. slot_size formula matches create-object's:
-       max_key + max_value rounded up to 8. streams from nproc. */
+    /* v2 slot_size includes the 24B inline per-record header (see
+       load_schema commentary). streams from nproc. */
     int streams = slotcask_streams_for_nproc();
-    int new_slot_size = (sc.max_key + sc.max_value + 7) & ~7;
-    if (new_slot_size < 32) new_slot_size = 32;  /* slotcask_open floor */
+    int new_slot_size = (24 + sc.max_key + sc.max_value + 7) & ~7;
+    if (new_slot_size < 32) new_slot_size = 32;
 
     /* Open new slotcask in obj_dir (alongside the v1 data/ which is
        still in place). slotcask creates keyfile_*.kf and stream_NNN
@@ -12904,7 +12933,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     if (storage_version == 2) {
         char obj_data_dir[PATH_MAX];
         snprintf(obj_data_dir, sizeof(obj_data_dir), "%s/%s", eff_root, object);
-        int slot_size = (max_key + total_value_size + 7) & ~7;
+        /* v2 slot_size includes the 24B per-record inline header (see
+           load_schema commentary). */
+        int slot_size = (24 + max_key + total_value_size + 7) & ~7;
+        if (slot_size < 32) slot_size = 32;
         SlotcaskDb sdb;
         if (slotcask_open(&sdb, obj_data_dir, splits, streams, slot_size) != 0) {
             OUT("{\"error\":\"slotcask_open failed for %s/%s\"}\n", dir, object);

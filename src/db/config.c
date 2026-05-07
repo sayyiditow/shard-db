@@ -613,8 +613,24 @@ Schema load_schema(const char *effective_root, const char *object) {
     if (ts && ts->total_size > 0) {
         s.max_value = ts->total_size;
     }
-    s.slot_size = s.max_key + s.max_value;
-    s.slot_size = (s.slot_size + 7) & ~7;
+    /* slot_size meaning differs by storage version:
+       v1: width of one Zone B slot, header lives separately in Zone A.
+           formula: max_key + max_value, rounded to 8.
+       v2: width of one slotcask segment slot, header is INLINE
+           (24 bytes: hash + klen + flag + reserved + vlen).
+           formula: 24 + max_key + max_value, rounded to 8, floor 32.
+       Mixing the two semantics — i.e., feeding a v1 slot_size to
+       slotcask_open — silently fails inserts when klen+vlen approaches
+       max because slotcask_insert's "24 + klen + vlen <= slot_size"
+       guard rejects records that should fit. */
+    if (s.storage_version == 2) {
+        s.slot_size = 24 + s.max_key + s.max_value;
+        s.slot_size = (s.slot_size + 7) & ~7;
+        if (s.slot_size < 32) s.slot_size = 32;
+    } else {
+        s.slot_size = s.max_key + s.max_value;
+        s.slot_size = (s.slot_size + 7) & ~7;
+    }
 
     pthread_mutex_lock(&g_schema_lock);
     uint32_t sidx = str_hash(cache_key) % SCHEMA_BUCKETS;
