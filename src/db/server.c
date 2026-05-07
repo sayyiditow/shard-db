@@ -1046,6 +1046,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *ine_s = json_obj_strdup(&req, "if_not_exists");
         char *sv_s = json_obj_strdup(&req, "storage_version");
         int if_not_exists = ine_s && (strcmp(ine_s, "true") == 0 || strcmp(ine_s, "1") == 0);
+
+        /* storage_version is no longer part of the public create-object
+           API. Every new object is v2 (slotcask). The field is rejected
+           outright unless the daemon is running with SHARD_ALLOW_V1_CREATE=1
+           (test-fixture-only opt-in for the migrate runner's setup). */
+        const char *allow = getenv("SHARD_ALLOW_V1_CREATE");
+        int test_legacy = (allow && allow[0] == '1');
+        if (sv_s && !test_legacy) {
+            OUT("{\"error\":\"storage_version is not configurable; objects are always v2 (slotcask)\"}\n");
+            free(fields_j); free(indexes_j);
+            free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
+            free(mode); free(dir); free(object);
+            return;
+        }
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
