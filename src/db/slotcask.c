@@ -688,6 +688,18 @@ int slotcask_streams_for_nproc(void) {
     return 16;
 }
 
+/* Pick kf slots/shard from a tier table keyed on `splits`. Per-tier
+   targets ~50 % load at 78K-200K rec/shard (CLAUDE.md sweet spot).
+   Total kf footprint stays bounded (24 MB at splits=8 → 6 GB at
+   splits=4096); auto-resplit handles any tier overshoot. See the
+   comment block in slotcask.h for the full table + rationale. */
+size_t slotcask_default_slots_for_splits(int splits) {
+    if (splits <= 16)   return 1024u * 1024;   /* 1M  */
+    if (splits <= 128)  return 256u  * 1024;   /* 256K */
+    if (splits <= 1024) return 128u  * 1024;   /* 128K */
+    return 64u * 1024;                         /* 64K  */
+}
+
 /* ============================================================ Keyfile ops
  *
  * All keyfile mutations route through kfcache_acquire(writer=1). The cache
@@ -1378,7 +1390,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     db->num_shards = num_shards;
     db->num_streams = num_streams;
     db->slot_size = slot_size;
-    db->slots_per_shard = SLOTCASK_DEFAULT_SLOTS_PER_SHARD;
+    db->slots_per_shard = slotcask_default_slots_for_splits(num_shards);
 
     if (mkdirp_local(data_dir) != 0) return -1;
 

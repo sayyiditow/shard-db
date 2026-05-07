@@ -41,17 +41,20 @@
 /* Keyfile shard count cap mirrors splits ceiling for the engine. */
 #define SLOTCASK_MAX_SHARDS      4096
 
-/* Default keyfile slots per shard. 128K × 24B = 3 MB per shard. Sized to
-   stay near 50 % load at ~64K records/shard — the working sweet-spot from
-   the bench harness when SPLITS is tuned to 78K-200K rec/shard. Beyond
-   that, per-shard auto-resplit at 80 % load doubles slots in place
-   (no global rehash) up to SLOTCASK_MAX_SLOTS_PER_SHARD.
-   Tuning history: started at 2M, dropped to 512K (still oversized for
-   typical workloads — 1.5 GB kf at splits=128, ≥ 50 % of total disk
-   footprint at 10M records), now 128K which trims the kf to ~384 MB at
-   splits=128 while keeping the resplit ladder well below the 16M cap. */
-#define SLOTCASK_DEFAULT_SLOTS_PER_SHARD  (128u * 1024)
+/* Per-shard slot count is chosen by tier, parameterised on `splits`:
+     splits ≤ 16     → 1M  slots/shard   (24-48 MB total kf — small DBs)
+     splits ≤ 128    → 256K slots/shard  (96 MB - 384 MB total — medium)
+     splits ≤ 1024   → 128K slots/shard  (768 MB - 3 GB total — large)
+     splits ≤ 4096   → 64K  slots/shard  (3 GB - 6 GB total — very large)
+   Each tier targets ~50 % load at the documented 78K-200K rec/shard
+   sweet spot. Per-shard auto-resplit at 80 % load doubles slots in place
+   (no global rehash) up to SLOTCASK_MAX_SLOTS_PER_SHARD = 16M. The
+   floor for all tiers is 64K so even max-splits objects have headroom.
+   Tuning history: started at 2M flat, dropped to 512K, then 128K flat,
+   now per-tier so the kf stays bounded at all splits.
+   Public via slotcask_default_slots_for_splits(). */
 #define SLOTCASK_MAX_SLOTS_PER_SHARD      (16u * 1024 * 1024)
+size_t slotcask_default_slots_for_splits(int splits);
 
 /* Keyfile entry header (24 B, packed). hash16 + 1B flag + 1B stream_id +
    2B file_id + 4B offset. The trailing 8 bytes (flag/stream/file/offset) are
@@ -153,9 +156,9 @@ int  slotcask_streams_for_nproc(void);
 
 /* Open (or create) an object's slotcask state. data_dir is the per-object root
    (e.g., $DB_ROOT/<dir>/<obj>). num_shards must be a power of 2 in
-   [SLOTCASK_DEFAULT_SLOTS_PER_SHARD floor, SLOTCASK_MAX_SHARDS]. slot_size is
-   the fixed per-record byte width (header + max key + max value, rounded to 8).
-   Performs crash recovery if `.dirty` marker is present. */
+   [1, SLOTCASK_MAX_SHARDS]. slot_size is the fixed per-record byte width
+   (header + max key + max value, rounded to 8). Performs crash recovery
+   if `.dirty` marker is present. */
 int  slotcask_open(SlotcaskDb *db, const char *data_dir,
                    int num_shards, int num_streams, int slot_size);
 void slotcask_close(SlotcaskDb *db);
