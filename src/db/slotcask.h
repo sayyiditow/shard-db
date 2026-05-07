@@ -275,6 +275,13 @@ typedef struct {
     const void *value;
     size_t      vlen;
     void       *user_ctx;              /* passed to pre_commit per record */
+    /* Optional: caller-provided OLD value. If old_value != NULL the bulk
+       primitive uses it for pre_commit and skips its own segcache read
+       — useful when the caller already has OLD in hand (bulk-update
+       computes new_value from old_value, so it must read OLD anyway).
+       Lifetime: caller owns the buffer; must outlive the bulk call. */
+    const void *old_value;
+    size_t      old_vlen;
     /* output: callee fills */
     int         status;                /* 0=ok, -2=cond_not_met, -1=error */
     int         was_update;
@@ -286,6 +293,7 @@ typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
 
 typedef struct {
     int                          if_not_exists;     /* skip if key exists */
+    int                          require_existing;  /* skip if key missing (bulk-update use) */
     slotcask_bulk_pre_commit_fn  pre_commit;        /* fired per record under kf wrlock; NULL = no-op */
     /* Set to 1 iff pre_commit will dereference the SlotcaskOldRecord *old
        arg. When 0 (e.g. non-indexed bulk-insert), the primitive skips the
@@ -296,12 +304,40 @@ typedef struct {
 } SlotcaskBulkOpts;
 
 /* Returns 0 if the batch ran (per-record results in recs[].status), -1 on
-   hard error (kf_acquire failed). Records that hit if_not_exists or
-   pre_commit returning non-zero get rec.status=-2 with rec.was_update
-   set from the existing key. */
+   hard error (kf_acquire failed). Records that hit if_not_exists,
+   require_existing, or pre_commit returning non-zero get rec.status=-2
+   with rec.was_update set from the existing key. */
 int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *opts);
+
+/* ============================================================ Bulk delete
+ *
+ * Same shape as bulk_upsert_in_kfshard but for deletes — no NEW value, no
+ * seg writes, just kf_tombstone per record + batched seg flag-flips.
+ * 4 phases under one held kf wrlock:
+ *   1a. kf_lookup per record. Records not found get status=-2.
+ *   1b. Batched OLD reads (sorted by old_sid/old_fid) iff
+ *       pre_commit_needs_old=1; otherwise skipped entirely.
+ *   2.  Per-record pre_commit hook + kf_tombstone (under wrlock).
+ *   3.  Post-kf-release: batched seg flag-flips, sorted by (old_sid,
+ *       old_fid) — one segcache rdlock per unique seg file.
+ *
+ * Crash safety: kf_tombstone is the commit point. A crash between
+ * kf_tombstone and the seg flag-flip leaves the OLD slot live-looking on
+ * disk but unreachable via kf — recovery treats it as orphan free space.
+ */
+typedef int (*slotcask_bulk_del_pre_commit_fn)(const SlotcaskOldRecord *old,
+                                                SlotcaskBulkRec *rec);
+
+typedef struct {
+    slotcask_bulk_del_pre_commit_fn pre_commit;
+    int                              pre_commit_needs_old;
+} SlotcaskBulkDeleteOpts;
+
+int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                     SlotcaskBulkRec *recs, size_t n,
+                                     const SlotcaskBulkDeleteOpts *opts);
 
 /* For shard-id mapping use compute_record_shard(hash, splits, 2) from
    types.h — the single version-aware helper that slotcask itself

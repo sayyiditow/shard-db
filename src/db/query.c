@@ -1116,6 +1116,8 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         batch[pos].value     = r->payload;
         batch[pos].vlen      = sw->ts->total_size;
         batch[pos].user_ctx  = &ctxs[pos];
+        batch[pos].old_value = NULL;
+        batch[pos].old_vlen  = 0;
         batch[pos].status    = 0;
         batch[pos].was_update = 0;
     }
@@ -2406,8 +2408,10 @@ typedef struct {
     int               ki;
 } V2BulkDelCtx;
 
-static int v2_bulk_del_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
-    V2BulkDelCtx *ctx = (V2BulkDelCtx *)ctx_ptr;
+/* Per-record pre_commit, bulk-shaped: ctx via rec->user_ctx. */
+static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                        SlotcaskBulkRec *rec) {
+    V2BulkDelCtx *ctx = (V2BulkDelCtx *)rec->user_ctx;
     BulkDelShardWork *sw = ctx->sw;
     int ki = ctx->ki;
     if (!old || sw->nidx == 0 || !sw->ts) return 0;
@@ -2432,20 +2436,40 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) return NULL;
 
+    /* All keys in this worker hash to the same kf shard (dispatcher
+       aligned shard_id with compute_record_shard, see cmd_bulk_delete). */
+    int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits, 2);
+
+    SlotcaskBulkRec *batch = malloc(sw->key_count * sizeof(SlotcaskBulkRec));
+    V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
+    if (!batch || !ctxs) { free(batch); free(ctxs); return NULL; }
+
     for (int ki = 0; ki < sw->key_count; ki++) {
-        V2BulkDelCtx hctx = { sw, ki };
-        SlotcaskDeleteOpts opts = {
-            .check          = NULL,
-            .pre_commit     = v2_bulk_del_pre_commit,
-            .pre_commit_ctx = &hctx,
-        };
-        SlotcaskDeleteResult result = {0};
-        int rc = slotcask_delete_with_hooks(sdb, sw->keys[ki],
-                                              strlen(sw->keys[ki]),
-                                              &opts, &result);
-        if (rc == 0) sw->deleted++;
-        free(result.current_value);
+        ctxs[ki].sw  = sw;
+        ctxs[ki].ki  = ki;
+        batch[ki].key       = sw->keys[ki];
+        batch[ki].klen      = strlen(sw->keys[ki]);
+        batch[ki].value     = NULL;
+        batch[ki].vlen      = 0;
+        batch[ki].user_ctx  = &ctxs[ki];
+        batch[ki].old_value = NULL;
+        batch[ki].old_vlen  = 0;
+        batch[ki].status    = 0;
+        batch[ki].was_update = 0;
     }
+
+    SlotcaskBulkDeleteOpts opts = {
+        .pre_commit           = v2_bulk_del_pre_commit_bulk,
+        .pre_commit_needs_old = sw->nidx > 0,
+    };
+    (void)slotcask_bulk_delete_in_kfshard(sdb, kf_shard_id,
+                                           batch, sw->key_count, &opts);
+
+    for (int ki = 0; ki < sw->key_count; ki++) {
+        if (batch[ki].status == 0) sw->deleted++;
+        /* status=-2 (not found) and status=-1 (error) are not counted. */
+    }
+    free(batch); free(ctxs);
     return NULL;
 }
 

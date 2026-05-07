@@ -1767,6 +1767,12 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             r->was_update = 1;
             continue;
         }
+        if (!found && opts->require_existing) {
+            /* bulk-update gate: don't auto-insert when caller wanted update. */
+            r->status = -2;
+            r->was_update = 0;
+            continue;
+        }
 
         st[i].target_stream = (uint8_t)((unsigned)st[i].hash[15] %
                                          (unsigned)db->num_streams);
@@ -1779,13 +1785,17 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
        handle for every record in that file. Drops one segcache_acquire/
        release pair per record on indexed update-heavy workloads (where
        pre_commit_needs_old=1). For non-indexed workloads
-       pre_commit_needs_old=0, so this whole phase is a no-op. */
+       pre_commit_needs_old=0, so this whole phase is a no-op.
+       Skips records whose caller already supplied recs[i].old_value —
+       e.g. bulk-update workers, which read OLD to compute NEW and don't
+       want to re-read here. */
     if (opts->pre_commit_needs_old) {
         int *read_idx = malloc(n * sizeof(int));
         if (read_idx) {
             int rcount = 0;
             for (size_t i = 0; i < n; i++) {
-                if (recs[i].status == 0 && st[i].old_found && st[i].needs_write)
+                if (recs[i].status == 0 && st[i].old_found && st[i].needs_write &&
+                    recs[i].old_value == NULL)
                     read_idx[rcount++] = (int)i;
             }
             /* Insertion sort by (old_sid, old_fid). For typical batches
@@ -2031,7 +2041,11 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         SlotcaskBulkRec *r = &recs[i];
 
         if (opts->pre_commit) {
-            SlotcaskOldRecord old_rec = { st[i].old_buf, st[i].old_vlen };
+            /* Prefer caller-supplied old_value (bulk-update path); fall back
+               to whatever Phase 1b loaded internally. */
+            const void *old_v = r->old_value ? r->old_value : st[i].old_buf;
+            size_t      old_l = r->old_value ? r->old_vlen  : st[i].old_vlen;
+            SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
             int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
                                        r, st[i].old_found);
             if (rc != 0) {
@@ -2092,6 +2106,220 @@ oom:
     for (size_t i = 0; i < n; i++) free(st[i].old_buf);
     free(st);
     return -1;
+}
+
+/* ============================================================ Bulk delete
+ *
+ * Mirror of slotcask_bulk_upsert_in_kfshard for deletes. Per-record state
+ * is leaner — no target slot reservation, no NEW seg write — but the
+ * lock-amortisation pattern is identical: one kf wrlock for the whole
+ * batch, batched OLD reads sorted by old slot, batched tombstone flag-
+ * flips sorted by old slot. Caller pre-buckets records so all hash to
+ * `kf_shard_id`. */
+typedef struct {
+    uint8_t  hash[16];
+    uint8_t  old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    uint8_t *old_buf;       /* malloc'd if pre_commit_needs_old, NULL otherwise */
+    size_t   old_vlen;
+    uint8_t  found;         /* 1 if kf entry exists, 0 otherwise */
+    uint8_t  committed;     /* 1 once kf_tombstone has succeeded */
+} SlotcaskBulkDelState;
+
+int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                     SlotcaskBulkRec *recs, size_t n,
+                                     const SlotcaskBulkDeleteOpts *opts) {
+    if (n == 0) return 0;
+    SlotcaskBulkDeleteOpts blank = {0};
+    if (!opts) opts = &blank;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    SlotcaskBulkDelState *st = calloc(n, sizeof(SlotcaskBulkDelState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    /* ===== Phase 1a — kf_lookup per record. */
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+
+        if (r->klen > UINT16_MAX) {
+            r->status = -1;
+            continue;
+        }
+        compute_hash(r->key, r->klen, st[i].hash);
+        uint8_t old_flag = 0;
+        int found = (kf_lookup(&kh, st[i].hash, r->key, r->klen, db->data_dir,
+                                &old_flag, &st[i].old_sid,
+                                &st[i].old_fid, &st[i].old_off) == 0);
+        st[i].found = found ? 1 : 0;
+        if (!found) {
+            r->status = -2;        /* not found — skipped */
+            continue;
+        }
+    }
+
+    /* ===== Phase 1b — batched OLD reads (sorted by old_sid/old_fid).
+       Skipped entirely when pre_commit_needs_old=0. */
+    if (opts->pre_commit_needs_old) {
+        int *read_idx = malloc(n * sizeof(int));
+        if (read_idx) {
+            int rcount = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (recs[i].status == 0 && st[i].found)
+                    read_idx[rcount++] = (int)i;
+            }
+            for (int a = 1; a < rcount; a++) {
+                int tmp = read_idx[a];
+                uint8_t  ta_sid = st[tmp].old_sid;
+                uint16_t ta_fid = st[tmp].old_fid;
+                int b = a - 1;
+                while (b >= 0) {
+                    int bi = read_idx[b];
+                    if (st[bi].old_sid < ta_sid ||
+                        (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
+                        break;
+                    read_idx[b + 1] = read_idx[b];
+                    b--;
+                }
+                read_idx[b + 1] = tmp;
+            }
+            int k = 0;
+            while (k < rcount) {
+                int run_end = k + 1;
+                uint8_t  sid = st[read_idx[k]].old_sid;
+                uint16_t fid = st[read_idx[k]].old_fid;
+                while (run_end < rcount &&
+                       st[read_idx[run_end]].old_sid == sid &&
+                       st[read_idx[run_end]].old_fid == fid)
+                    run_end++;
+                char path[PATH_MAX];
+                seg_path_for(path, db->data_dir, sid, fid);
+                SlotcaskSegHandle h;
+                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                    for (int j = k; j < run_end; j++) recs[read_idx[j]].status = -1;
+                    k = run_end;
+                    continue;
+                }
+                for (int j = k; j < run_end; j++) {
+                    int i = read_idx[j];
+                    SlotcaskBulkRec *r = &recs[i];
+                    const uint8_t *rec = h.map + st[i].old_off;
+                    if (rec[18] != 1) { r->status = -1; continue; }
+                    uint16_t k_stored;
+                    uint32_t v_stored;
+                    memcpy(&k_stored, rec + 16, 2);
+                    memcpy(&v_stored, rec + 20, 4);
+                    if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
+                        r->status = -1;
+                        continue;
+                    }
+                    uint8_t *buf = malloc(v_stored ? v_stored : 1);
+                    if (!buf) { r->status = -1; continue; }
+                    if (v_stored) memcpy(buf, rec + 24 + r->klen, v_stored);
+                    st[i].old_buf  = buf;
+                    st[i].old_vlen = v_stored;
+                }
+                segcache_release(&h);
+                k = run_end;
+            }
+            free(read_idx);
+        }
+    }
+
+    /* ===== Phase 2 — per-record pre_commit + kf_tombstone (under wrlock). */
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].status != 0) continue;
+        if (!st[i].found) continue;
+        SlotcaskBulkRec *r = &recs[i];
+
+        if (opts->pre_commit) {
+            SlotcaskOldRecord old_rec = { st[i].old_buf, st[i].old_vlen };
+            int rc = opts->pre_commit(opts->pre_commit_needs_old ? &old_rec : NULL, r);
+            if (rc != 0) { r->status = -1; continue; }
+        }
+
+        size_t used_delta = 0;
+        uint8_t out_sid; uint16_t out_fid; uint32_t out_off;
+        int rc = kf_tombstone(&kh, st[i].hash, r->key, r->klen, db->data_dir,
+                              &out_sid, &out_fid, &out_off, &used_delta);
+        if (rc < 0) { r->status = -1; continue; }
+        /* kf_tombstone returns the OLD slot location; should match what
+           kf_lookup told us in Phase 1a. Use the kf_tombstone output as
+           authoritative for the seg flag-flip. */
+        st[i].old_sid = out_sid;
+        st[i].old_fid = out_fid;
+        st[i].old_off = out_off;
+        st[i].committed = 1;
+        r->was_update = 1;
+    }
+
+    kfcache_release(&kh);
+
+    /* ===== Phase 3 — batched seg tombstones, post-kf-release. Sort by
+       (old_sid, old_fid) and reuse one segcache rdlock per unique file.
+       Mirror of bulk_upsert's Phase 5 batching. */
+    int *tomb_idx = malloc(n * sizeof(int));
+    if (tomb_idx) {
+        int tcount = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (st[i].committed) tomb_idx[tcount++] = (int)i;
+        }
+        for (int a = 1; a < tcount; a++) {
+            int tmp = tomb_idx[a];
+            uint8_t  ta_sid = st[tmp].old_sid;
+            uint16_t ta_fid = st[tmp].old_fid;
+            int b = a - 1;
+            while (b >= 0) {
+                int bi = tomb_idx[b];
+                if (st[bi].old_sid < ta_sid ||
+                    (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
+                    break;
+                tomb_idx[b + 1] = tomb_idx[b];
+                b--;
+            }
+            tomb_idx[b + 1] = tmp;
+        }
+        int k = 0;
+        while (k < tcount) {
+            int run_end = k + 1;
+            uint8_t  sid = st[tomb_idx[k]].old_sid;
+            uint16_t fid = st[tomb_idx[k]].old_fid;
+            while (run_end < tcount &&
+                   st[tomb_idx[run_end]].old_sid == sid &&
+                   st[tomb_idx[run_end]].old_fid == fid)
+                run_end++;
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, sid, fid);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 0, 0) != 0) { k = run_end; continue; }
+            for (int j = k; j < run_end; j++) {
+                int i = tomb_idx[j];
+                h.map[st[i].old_off + 18] = 2;
+                pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off);
+            }
+            segcache_release(&h);
+            k = run_end;
+        }
+        free(tomb_idx);
+    } else {
+        /* OOM: fall back to per-record tombstone via the existing helper. */
+        for (size_t i = 0; i < n; i++) {
+            if (!st[i].committed) continue;
+            seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
+            pool_push_free(&db->streams[st[i].old_sid],
+                            st[i].old_fid, st[i].old_off);
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) free(st[i].old_buf);
+    free(st);
+    return 0;
 }
 
 int slotcask_delete_with_hooks(SlotcaskDb *db,
