@@ -61,7 +61,9 @@ static int test_vacuum_addfield_run(void) {
 
     tc_request(tc, "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"vac1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"vacuumed\"", "plain vacuum status");
-    ASSERT_CONTAINS(resp, "\"cleaned\":2", "plain vacuum cleaned 2");
+    /* On v2 (the default) the snake-game free-slot pool reuses
+       tombstones inline, so no-arg vacuum reports cleaned=0. */
+    ASSERT_CONTAINS(resp, "\"cleaned\":0", "plain vacuum cleaned 0 on v2");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"vac1\",\"key\":\"k2\"}", &resp);

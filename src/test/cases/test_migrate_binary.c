@@ -136,7 +136,7 @@ static int test_migrate_binary_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mft\","
-        "\"fields\":[\"k:varchar:32\"]}", &resp); free(resp); resp = NULL;
+        "\"storage_version\":1,\"fields\":[\"k:varchar:32\"]}", &resp); free(resp); resp = NULL;
     tc_close(tc); tc = NULL;
 
     /* Stop test daemon gracefully WITHOUT wiping db_root (test_env_stop wipes,

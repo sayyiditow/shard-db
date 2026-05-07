@@ -5274,8 +5274,13 @@ int cmd_vacuum(const char *db_root, const char *object,
     /* v2 no-arg vacuum: slotcask's snake-game pool already returns
        tombstoned slots to writers as they're produced. There is no Zone A
        flag-2 array to sweep. Per-segment "drop fully-tombstoned segments"
-       compaction is a future refinement; for now report 0 cleaned. */
+       compaction is a future refinement; for now report 0 cleaned and
+       reset the `orphaned` metadata counter — for v2 the counter no
+       longer represents "live tombstones taking space" (they don't
+       persist), so leaving it stuck at the deletion total would
+       mislead operators reading vacuum-check / stats output. */
     if (sch.storage_version == 2) {
+        reset_deleted_count(db_root, object);
         OUT("{\"status\":\"vacuumed\",\"cleaned\":0}\n");
         return 0;
     }
@@ -10155,25 +10160,26 @@ static void keyset_emit_agg(const char *db_root, const char *object,
         if (query_deadline_tick(dl, &dl_counter)) break;
         if (ks->state[b] != 2) continue;
 
-        int sid, slt;
-        addr_from_hash(ks->keys[b], sch->splits, &sid, &slt);
-        char shard[PATH_MAX];
-        build_shard_path(shard, sizeof(shard), db_root, object, sid);
-        FcacheRead fc = fcache_get_read(shard);
-        if (!fc.map) continue;
-        uint32_t slots = fc.slots_per_shard;
-        uint32_t mask = slots - 1;
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)slt + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, ks->keys[b], 16) != 0) continue;
-            const uint8_t *block = fc.map + zoneB_off(s, slots, sch->slot_size);
-            agg_scan_cb(h, block, agg_ctx);
-            break;
+        /* Layout-agnostic per-hash fetch (v1 Zone A probe / v2 slotcask
+           lookup). Synthesise a SlotHeader for agg_scan_cb so the same
+           callback works under both backends. */
+        RecordRef rr;
+        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
+        SlotHeader hdr = {0};
+        memcpy(hdr.hash, ks->keys[b], 16);
+        hdr.flag = 1;
+        hdr.key_len = (uint16_t)rr.klen;
+        hdr.value_len = (uint32_t)rr.vlen;
+        uint8_t stk[2048];
+        uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
+            ? stk : malloc(rr.klen + rr.vlen);
+        if (block) {
+            memcpy(block, rr.key, rr.klen);
+            memcpy(block + rr.klen, rr.val, rr.vlen);
+            agg_scan_cb(&hdr, block, agg_ctx);
+            if (block != stk) free(block);
         }
-        fcache_release(fc);
+        release_record_ref(&rr);
     }
 }
 
@@ -11523,13 +11529,42 @@ int cmd_backup(const char *db_root, const char *object) {
     mkdirp(bak_dir);
 
     /* Recursively copy data/, indexes/, and metadata/ via in-process
-       directory walk — no shell. */
+       directory walk — no shell. v1 stores records under data/; v2's
+       slotcask uses keyfile_*.kf + stream_NNN/ directly at the obj
+       root, copied below. */
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
     const char *subs[] = { "data", "indexes", "metadata" };
     for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
         cprf(src_sub, dst_sub);
+    }
+
+    /* v2: also capture keyfile_*.kf files + stream_NNN/ directories.
+       Walk the obj root and copy anything matching those prefixes. */
+    Schema sch = load_schema(db_root, object);
+    if (sch.storage_version == 2) {
+        DIR *d = opendir(src_dir);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
+                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
+                if (!is_kf && !is_stream) continue;
+                char src_p[PATH_MAX], dst_p[PATH_MAX];
+                snprintf(src_p, sizeof(src_p), "%s/%s", src_dir, e->d_name);
+                snprintf(dst_p, sizeof(dst_p), "%s/%s", bak_dir, e->d_name);
+                if (is_kf) {
+                    struct stat kfst;
+                    if (stat(src_p, &kfst) == 0)
+                        copy_file(src_p, dst_p, kfst.st_mode);
+                } else {
+                    cprf(src_p, dst_p);
+                }
+            }
+            closedir(d);
+        }
     }
 
     /* Schema capture — make the backup directory self-contained. fields.conf
@@ -11541,12 +11576,12 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(dst_fields, sizeof(dst_fields), "%s/fields.conf", bak_dir);
     if (stat(src_fields, &st) == 0) copy_file(src_fields, dst_fields, st.st_mode);
 
-    Schema sch = load_schema(db_root, object);
     char meta_path[PATH_MAX];
     snprintf(meta_path, sizeof(meta_path), "%s/object.json", bak_dir);
     FILE *mf = fopen(meta_path, "w");
     if (mf) {
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d}\n", sch.splits, sch.max_key);
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":%d,\"streams\":%d}\n",
+                sch.splits, sch.max_key, sch.storage_version, sch.streams);
         fclose(mf);
     }
 
@@ -11554,38 +11589,44 @@ int cmd_backup(const char *db_root, const char *object) {
     return 0;
 }
 
-/* Parse a tiny object.json of the shape {"splits":N,"max_key":N} written by
-   cmd_backup. Returns 1 on success with both fields populated. Tolerant of
-   key order; rejects anything else. Used only by cmd_restore. */
-static int parse_object_meta(const char *path, int *out_splits, int *out_max_key) {
+/* Parse object.json written by cmd_backup. splits + max_key are required;
+   storage_version + streams are optional (older backups predate them).
+   Returns 1 on success. Defaults out_storage_version to 1 / out_streams
+   to 0 when missing, matching legacy semantics. */
+static int parse_object_meta(const char *path, int *out_splits, int *out_max_key,
+                              int *out_storage_version, int *out_streams) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char buf[256] = {0};
-    /* Tolerant read — short reads, EOF, or read errors all fall through to
-       the strstr scan below; missing keys → return 0. NUL-terminate at the
-       actual byte count so strstr can't run past valid data. */
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     int read_err = ferror(f);
     fclose(f);
     if (read_err) return 0;
     buf[n] = '\0';
-    int splits = -1, max_key = -1;
+    int splits = -1, max_key = -1, sv = 1, streams = 0;
     const char *p = strstr(buf, "\"splits\":");
     if (p) splits = atoi(p + strlen("\"splits\":"));
     p = strstr(buf, "\"max_key\":");
     if (p) max_key = atoi(p + strlen("\"max_key\":"));
+    p = strstr(buf, "\"storage_version\":");
+    if (p) sv = atoi(p + strlen("\"storage_version\":"));
+    p = strstr(buf, "\"streams\":");
+    if (p) streams = atoi(p + strlen("\"streams\":"));
     if (splits < 0 || max_key < 0) return 0;
     *out_splits = splits;
     *out_max_key = max_key;
+    if (out_storage_version) *out_storage_version = sv;
+    if (out_streams)         *out_streams = streams;
     return 1;
 }
 
-/* Append a `dir:object:splits:max_key` line to schema.conf if it isn't
-   already there. Caller already holds objlock_wrlock on the object.
-   schema.conf is a global file, so we serialise via flock on it.
+/* Append a `dir:object:splits:max_key[:storage_version:streams]` line to
+   schema.conf if it isn't already there. Caller holds objlock_wrlock.
+   storage_version=0 omits the trailing fields (legacy v1 form).
    Returns 0 on success, -1 on IO failure. */
 static int ensure_schema_conf_line(const char *db_root, const char *object,
-                                   int splits, int max_key) {
+                                   int splits, int max_key,
+                                   int storage_version, int streams) {
     const char *dir = db_root + strlen(g_db_root);
     if (*dir == '/') dir++;
 
@@ -11608,7 +11649,11 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     }
     if (!found) {
         fseek(f, 0, SEEK_END);
-        fprintf(f, "%s%d:%d\n", prefix, splits, max_key);
+        if (storage_version >= 2)
+            fprintf(f, "%s%d:%d:%d:%d\n", prefix, splits, max_key,
+                    storage_version, streams);
+        else
+            fprintf(f, "%s%d:%d\n", prefix, splits, max_key);
     }
     flock(lockfd, LOCK_UN);
     fclose(f);
@@ -11683,8 +11728,9 @@ int cmd_restore(const char *db_root, const char *object,
        object.json — accept and skip. */
     char meta_src[PATH_MAX];
     snprintf(meta_src, sizeof(meta_src), "%s/object.json", src_dir);
-    int bak_splits = 0, bak_max_key = 0;
-    int have_meta = parse_object_meta(meta_src, &bak_splits, &bak_max_key);
+    int bak_splits = 0, bak_max_key = 0, bak_sv = 1, bak_streams = 0;
+    int have_meta = parse_object_meta(meta_src, &bak_splits, &bak_max_key,
+                                       &bak_sv, &bak_streams);
     if (have_meta) {
         Schema live = load_schema(db_root, object);
         if (live.splits > 0 && (live.splits != bak_splits || live.max_key != bak_max_key) && !force) {
@@ -11694,7 +11740,8 @@ int cmd_restore(const char *db_root, const char *object,
                 live.splits, live.max_key, bak_splits, bak_max_key);
             return 1;
         }
-        if (ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key) != 0) {
+        if (ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key,
+                                     bak_sv, bak_streams) != 0) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"failed to update schema.conf\"}\n");
             return 1;
@@ -11801,6 +11848,50 @@ int cmd_restore(const char *db_root, const char *object,
         rmrf(dst_sub);
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    }
+
+    /* v2: also wipe + restore keyfile_*.kf files and stream_NNN/ dirs.
+       Drop slotcask registry first so the next access re-opens against
+       the freshly-restored files (otherwise the registry would still
+       hold the pre-restore handle and route reads to old inodes). */
+    if (have_meta && bak_sv == 2) {
+        slotcask_registry_invalidate(db_root, object);
+        DIR *od = opendir(obj_dir);
+        if (od) {
+            struct dirent *e;
+            while ((e = readdir(od))) {
+                if (e->d_name[0] == '.') continue;
+                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
+                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
+                if (!is_kf && !is_stream) continue;
+                char p[PATH_MAX];
+                snprintf(p, sizeof(p), "%s/%s", obj_dir, e->d_name);
+                if (is_stream) rmrf(p);
+                else           unlink(p);
+            }
+            closedir(od);
+        }
+        DIR *bd = opendir(src_dir);
+        if (bd) {
+            struct dirent *e;
+            while ((e = readdir(bd))) {
+                if (e->d_name[0] == '.') continue;
+                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
+                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
+                if (!is_kf && !is_stream) continue;
+                char src_p[PATH_MAX], dst_p[PATH_MAX];
+                snprintf(src_p, sizeof(src_p), "%s/%s", src_dir, e->d_name);
+                snprintf(dst_p, sizeof(dst_p), "%s/%s", obj_dir, e->d_name);
+                if (is_kf) {
+                    struct stat kfst;
+                    if (stat(src_p, &kfst) == 0)
+                        copy_file(src_p, dst_p, kfst.st_mode);
+                } else {
+                    cprf(src_p, dst_p);
+                }
+            }
+            closedir(bd);
+        }
     }
 
     objlock_wrunlock(db_root, object);
@@ -12785,17 +12876,25 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* storage_version: 0 (omitted) → default 1 (legacy probe-into-slot)
-       for now. Flipping the default to 2 surfaced v2 gaps in aggregate's
-       PRIMARY_INTERSECT path and a few other places that aren't in the
-       Phase 3 audit. The flip is queued behind those fixes — until then,
-       new objects must opt into v2 explicitly via "storage_version":2,
-       and benches do so via SHARD_BENCH_STORAGE_VERSION (default 2). */
-    if (storage_version == 0) storage_version = 1;
-    if (storage_version != 1 && storage_version != 2) {
-        OUT("{\"error\":\"storage_version=%d invalid; must be 1 (legacy) or 2 (slotcask)\"}\n",
-            storage_version);
-        return 1;
+    /* All new objects are v2 (slotcask). The storage_version JSON
+       field is no longer part of the public create-object API — any
+       value sent is ignored. v1 is supported only for reading
+       existing on-disk objects and for the migrate runner's tests
+       (which set SHARD_ALLOW_V1_CREATE=1 to opt into the legacy
+       writer for setup). */
+    {
+        const char *allow = getenv("SHARD_ALLOW_V1_CREATE");
+        int test_legacy = (allow && allow[0] == '1');
+        if (!test_legacy) {
+            storage_version = 2;
+        } else {
+            if (storage_version == 0) storage_version = 2;
+            if (storage_version != 1 && storage_version != 2) {
+                OUT("{\"error\":\"storage_version=%d invalid; must be 1 (legacy) or 2 (slotcask)\"}\n",
+                    storage_version);
+                return 1;
+            }
+        }
     }
 
     /* Validate indexes reference defined field names */
@@ -14044,6 +14143,36 @@ typedef struct {
 static void *shard_agg_worker(void *arg) {
     ShardAggCtx *sa = (ShardAggCtx *)arg;
     if (sa->entry_count == 0) return NULL;
+
+    /* v2: layout-agnostic per-hash fetch via read_record_ref. The
+       shard grouping the planner did was a v1 locality hint; v2
+       slotcask routes per-hash internally so we just iterate. */
+    if (sa->sch->storage_version == 2) {
+        for (int ei = 0; ei < sa->entry_count; ei++) {
+            if (query_deadline_tick(sa->deadline, &sa->dl_counter)) break;
+            RecordRef rr;
+            if (read_record_ref(sa->db_root, sa->object, sa->sch,
+                                 sa->entries[ei].hash, &rr) != 0) continue;
+            /* Synthesise a SlotHeader for the cb. block = key bytes
+               followed by value bytes — exactly what agg_scan_cb walks. */
+            SlotHeader hdr = {0};
+            memcpy(hdr.hash, sa->entries[ei].hash, 16);
+            hdr.flag = 1;
+            hdr.key_len = (uint16_t)rr.klen;
+            hdr.value_len = (uint32_t)rr.vlen;
+            uint8_t stk[2048];
+            uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
+                ? stk : malloc(rr.klen + rr.vlen);
+            if (block) {
+                memcpy(block, rr.key, rr.klen);
+                memcpy(block + rr.klen, rr.val, rr.vlen);
+                agg_scan_cb(&hdr, block, &sa->local);
+                if (block != stk) free(block);
+            }
+            release_record_ref(&rr);
+        }
+        return NULL;
+    }
 
     int sid = sa->entries[0].shard_id;
     char shard[PATH_MAX];

@@ -2208,13 +2208,22 @@ static int validate_metadata(const char *db_root) {
         struct dirent *oe;
         while ((oe = readdir(dd))) {
             if (oe->d_name[0] == '.') continue;
+            /* Object is "real" (worth validating) iff it has either v1's
+               data/ subdir or v2's keyfile_000.kf at the obj root. Both
+               are markers that the operator has actually finished
+               creating the object. */
             char data_check[PATH_MAX];
             snprintf(data_check, sizeof(data_check),
                      "%s/%s/data", dir_path, oe->d_name);
+            char kf_check[PATH_MAX];
+            snprintf(kf_check, sizeof(kf_check),
+                     "%s/%s/keyfile_000.kf", dir_path, oe->d_name);
             struct stat ost;
-            /* Only check objects that have on-disk data — pre-create-object
-               work-in-progress dirs without data/ are uninteresting. */
-            if (stat(data_check, &ost) != 0 || !S_ISDIR(ost.st_mode)) continue;
+            int has_v1 = (stat(data_check, &ost) == 0 && S_ISDIR(ost.st_mode));
+            int has_v2 = (stat(kf_check, &ost) == 0 && S_ISREG(ost.st_mode));
+            if (!has_v1 && !has_v2) continue;
+
+            const char *layout_marker = has_v1 ? "data/" : "keyfile_*.kf";
 
             /* Rule 2: fields.conf must exist. */
             char fields_check[PATH_MAX];
@@ -2223,11 +2232,11 @@ static int validate_metadata(const char *db_root) {
             struct stat fst;
             if (stat(fields_check, &fst) != 0) {
                 fprintf(stderr,
-                    "validate: object [%s/%s] has data/ but missing fields.conf\n",
-                    de->d_name, oe->d_name);
+                    "validate: object [%s/%s] has %s but missing fields.conf\n",
+                    de->d_name, oe->d_name, layout_marker);
                 log_msg(1,
-                    "VALIDATE %s/%s has data/ but no fields.conf",
-                    de->d_name, oe->d_name);
+                    "VALIDATE %s/%s has %s but no fields.conf",
+                    de->d_name, oe->d_name, layout_marker);
                 errors++;
             }
 
@@ -2241,11 +2250,11 @@ static int validate_metadata(const char *db_root) {
             }
             if (!found) {
                 fprintf(stderr,
-                    "validate: object [%s/%s] has data/ but missing schema.conf line\n",
-                    de->d_name, oe->d_name);
+                    "validate: object [%s/%s] has %s but missing schema.conf line\n",
+                    de->d_name, oe->d_name, layout_marker);
                 log_msg(1,
-                    "VALIDATE %s/%s has data/ but no schema.conf line",
-                    de->d_name, oe->d_name);
+                    "VALIDATE %s/%s has %s but no schema.conf line",
+                    de->d_name, oe->d_name, layout_marker);
                 errors++;
             }
         }

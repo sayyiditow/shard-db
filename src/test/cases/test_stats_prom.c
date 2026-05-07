@@ -118,9 +118,13 @@ static int test_stats_prom_run(void) {
     long miss_before = sample_value(resp, "shard_db_ucache_misses_total");
     free(resp); resp = NULL;
 
-    /* Generate traffic. */
+    /* Generate traffic. ucache holds v1 shard mmaps; pin this object
+       to storage_version=1 so the get loop below increments
+       ucache_hits_total (v2's slotcask uses kfcache/segcache, not
+       ucache). The test fixture sets SHARD_ALLOW_V1_CREATE=1. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"prom_test\","
+        "\"storage_version\":1,"
         "\"fields\":[\"name:varchar:32\"],\"splits\":16}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"prom_test\","

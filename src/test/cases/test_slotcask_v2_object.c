@@ -115,32 +115,31 @@ static int test_slotcask_v2_object_run(void) {
     snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data", env.db_root);
     ASSERT_TRUE(!dir_exists(path), "v2 omits legacy data/ dir");
 
-    /* --- v1 (default) create — should be unchanged --- */
+    /* --- default create (no storage_version) — should land on v2 --- */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"legacy_users\","
+        "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"default_users\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "v1 default create succeeds");
-    /* Legacy response shape: NO storage_version field emitted. */
-    ASSERT_TRUE(strstr(resp, "\"storage_version\":") == NULL,
-                "v1 default response omits storage_version");
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "default create succeeds");
+    ASSERT_CONTAINS(resp, "\"storage_version\":2",
+                    "default create lands on v2");
     free(resp); resp = NULL;
 
-    line = read_schema_line(env.db_root, "v2tenant", "legacy_users");
-    ASSERT_NOT_NULL(line, "v1 schema.conf line present");
+    line = read_schema_line(env.db_root, "v2tenant", "default_users");
+    ASSERT_NOT_NULL(line, "default schema.conf line present");
     if (line) {
         int colons = 0;
         for (char *c = line; *c; c++) if (*c == ':') colons++;
-        ASSERT_TRUE(colons == 3, "v1 schema line has 3 colons (legacy form)");
+        ASSERT_TRUE(colons == 5, "default schema line has 5 colons (v2 form)");
         free(line);
     }
 
-    snprintf(path, sizeof(path), "%s/v2tenant/legacy_users/data", env.db_root);
-    ASSERT_TRUE(dir_exists(path), "v1 creates legacy data/ dir");
+    snprintf(path, sizeof(path), "%s/v2tenant/default_users/data", env.db_root);
+    ASSERT_TRUE(!dir_exists(path), "default omits legacy data/ dir");
 
-    snprintf(path, sizeof(path), "%s/v2tenant/legacy_users/keyfile_000.kf",
+    snprintf(path, sizeof(path), "%s/v2tenant/default_users/keyfile_000.kf",
              env.db_root);
-    ASSERT_TRUE(!file_exists(path), "v1 has no keyfile_000.kf");
+    ASSERT_TRUE(file_exists(path), "default has keyfile_000.kf (v2 layout)");
 
     /* --- explicit storage_version=1 also works --- */
     tc_request(tc,

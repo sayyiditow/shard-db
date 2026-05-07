@@ -53,10 +53,12 @@ static int test_slotcask_v2_migrate_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"mig\"}", &resp);
     free(resp); resp = NULL;
 
-    /* Create a v1 object (storage_version omitted defaults to 1). */
+    /* Create a v1 object explicitly — production create-object only
+       writes v2; the test fixture sets SHARD_ALLOW_V1_CREATE=1 so
+       this opt-in is honoured. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"mig\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,"
+        "\"splits\":8,\"max_key\":40,\"storage_version\":1,"
         "\"fields\":[\"name:varchar:32\",\"age:int\",\"city:varchar:16\"],"
         "\"indexes\":[\"age\",\"city\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "v1 object created");
