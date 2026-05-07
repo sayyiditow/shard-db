@@ -643,6 +643,24 @@ void parse_field_type(const char *spec, TypedField *f);
 /* storage.c */
 void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]);
 void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot);
+
+/* Single source of truth for hash → shard_id, version-aware.
+   storage_version=1 → v1 big-endian (legacy zone-A layout).
+   storage_version=2 → v2 little-endian (slotcask kf layout).
+   addr_from_hash and slotcask's shard_for_hash both delegate to this;
+   cross-version callers (bulk-insert / multi-get / multi-exists
+   dispatchers) call this directly. static inline so every TU
+   (including shard-db-test/bench which don't link storage.c) sees
+   the definition without an extra link target. */
+static inline int compute_record_shard(const uint8_t hash[16], int splits,
+                                        int storage_version) {
+    if (storage_version == 2) {
+        uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
+        return (int)(v % (uint16_t)splits);
+    }
+    unsigned int h4 = ((unsigned)hash[0] << 8) | hash[1];
+    return (int)(h4 % (unsigned int)splits);
+}
 void compute_addr(const char *key, size_t key_len, int splits, uint8_t hash_out[16], int *shard_id, int *slot);
 void build_shard_path(char *buf, size_t buflen, const char *db_root, const char *object, int shard_id);
 void build_shard_filename(char *buf, size_t buflen, const char *data_dir, int shard_id);

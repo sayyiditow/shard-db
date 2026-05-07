@@ -303,11 +303,9 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *opts);
 
-/* Returns the kf shard id slotcask uses for the given hash. Exposed so
-   callers (bulk-insert dispatcher) can pre-bucket records to match the
-   bulk primitive's expectation that all records in one batch target the
-   same kf shard. */
-int slotcask_kf_shard_for_hash(const uint8_t hash[16], int num_shards);
+/* For shard-id mapping use compute_record_shard(hash, splits, 2) from
+   types.h — the single version-aware helper that slotcask itself
+   delegates to. */
 
 typedef struct {
     int     was_update;             /* 1 if existing key was updated, 0 if created */

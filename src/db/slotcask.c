@@ -16,6 +16,7 @@
  */
 #define _GNU_SOURCE
 #include "slotcask.h"
+#include "types.h"        /* compute_record_shard — single byte-order source */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,13 +51,10 @@ static inline void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
     compute_hash_raw((const char *)key, klen, out);
 }
 
+/* Delegates to the version-aware compute_record_shard so the byte-order
+   logic lives in exactly one place (storage.c). v2 = little-endian. */
 static int shard_for_hash(const uint8_t hash[16], int num_shards) {
-    uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
-    return (int)(v % (uint16_t)num_shards);
-}
-
-int slotcask_kf_shard_for_hash(const uint8_t hash[16], int num_shards) {
-    return shard_for_hash(hash, num_shards);
+    return compute_record_shard(hash, num_shards, 2);
 }
 
 static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
@@ -1745,8 +1743,7 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     SlotcaskBulkState *st = calloc(n, sizeof(SlotcaskBulkState));
     if (!st) { kfcache_release(&kh); return -1; }
 
-    /* ===== Phase 1 — kf_lookup per record + read OLD value if upsert.
-       All under the held kf wrlock. */
+    /* ===== Phase 1a — kf_lookup per record. No segcache touched here. */
     for (size_t i = 0; i < n; i++) {
         SlotcaskBulkRec *r = &recs[i];
         r->status = 0;
@@ -1771,18 +1768,87 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             continue;
         }
 
-        if (found && opts->pre_commit_needs_old) {
-            if (read_record_value(db, st[i].old_sid, st[i].old_fid,
-                                   st[i].old_off, r->key, r->klen,
-                                   &st[i].old_buf, &st[i].old_vlen) != 0) {
-                r->status = -1;
-                continue;
-            }
-        }
-
         st[i].target_stream = (uint8_t)((unsigned)st[i].hash[15] %
                                          (unsigned)db->num_streams);
         st[i].needs_write = 1;
+    }
+
+    /* ===== Phase 1b — batched OLD-value reads.
+       Sort the indices that need OLD reads by (old_sid, old_fid) and walk
+       linearly: take the segcache rdlock once per unique file, reuse the
+       handle for every record in that file. Drops one segcache_acquire/
+       release pair per record on indexed update-heavy workloads (where
+       pre_commit_needs_old=1). For non-indexed workloads
+       pre_commit_needs_old=0, so this whole phase is a no-op. */
+    if (opts->pre_commit_needs_old) {
+        int *read_idx = malloc(n * sizeof(int));
+        if (read_idx) {
+            int rcount = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (recs[i].status == 0 && st[i].old_found && st[i].needs_write)
+                    read_idx[rcount++] = (int)i;
+            }
+            /* Insertion sort by (old_sid, old_fid). For typical batches
+               rcount <= n_per_kf_shard (~78 K); insertion sort is fine
+               vs allocating a callback for qsort. */
+            for (int a = 1; a < rcount; a++) {
+                int tmp = read_idx[a];
+                uint8_t  ta_sid = st[tmp].old_sid;
+                uint16_t ta_fid = st[tmp].old_fid;
+                int b = a - 1;
+                while (b >= 0) {
+                    int bi = read_idx[b];
+                    if (st[bi].old_sid < ta_sid ||
+                        (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
+                        break;
+                    read_idx[b + 1] = read_idx[b];
+                    b--;
+                }
+                read_idx[b + 1] = tmp;
+            }
+
+            int k = 0;
+            while (k < rcount) {
+                int run_end = k + 1;
+                uint8_t  sid = st[read_idx[k]].old_sid;
+                uint16_t fid = st[read_idx[k]].old_fid;
+                while (run_end < rcount &&
+                       st[read_idx[run_end]].old_sid == sid &&
+                       st[read_idx[run_end]].old_fid == fid)
+                    run_end++;
+                /* records [k..run_end) all read from the same seg file. */
+                char path[PATH_MAX];
+                seg_path_for(path, db->data_dir, sid, fid);
+                SlotcaskSegHandle h;
+                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                    for (int j = k; j < run_end; j++) recs[read_idx[j]].status = -1;
+                    k = run_end;
+                    continue;
+                }
+                for (int j = k; j < run_end; j++) {
+                    int i = read_idx[j];
+                    SlotcaskBulkRec *r = &recs[i];
+                    const uint8_t *rec = h.map + st[i].old_off;
+                    if (rec[18] != 1) { r->status = -1; continue; }
+                    uint16_t k_stored;
+                    uint32_t v_stored;
+                    memcpy(&k_stored, rec + 16, 2);
+                    memcpy(&v_stored, rec + 20, 4);
+                    if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
+                        r->status = -1;
+                        continue;
+                    }
+                    uint8_t *buf = malloc(v_stored ? v_stored : 1);
+                    if (!buf) { r->status = -1; continue; }
+                    if (v_stored) memcpy(buf, rec + 24 + r->klen, v_stored);
+                    st[i].old_buf  = buf;
+                    st[i].old_vlen = v_stored;
+                }
+                segcache_release(&h);
+                k = run_end;
+            }
+            free(read_idx);
+        }
     }
 
     /* ===== Phase 2 — bucket records-needing-write by target stream. */

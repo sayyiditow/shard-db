@@ -1098,7 +1098,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     }
 
     for (size_t i = 0; i < sw->count; i++) {
-        kf_shards[i] = slotcask_kf_shard_for_hash(sw->records[i].hash, splits);
+        kf_shards[i] = compute_record_shard(sw->records[i].hash, splits, 2);
         counts[kf_shards[i]]++;
     }
     int run = 0;
@@ -1629,15 +1629,12 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 r->payload = payload;
                 r->klen = klen;
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
-                /* For v2, override the dispatcher shard with slotcask's
-                   kf-shard mapping. Without this, dispatcher's big-endian
-                   bucketing disagrees with slotcask's little-endian one,
-                   so worker-N's records spread across all kf shards and
-                   every parent worker contends on every kf wrlock. With
-                   the alignment, each parent worker owns exactly one kf
-                   shard and runs lock-free against its peers. */
+                /* Override shard_id with the version-aware mapping so v2
+                   workers each own one kf shard (no cross-worker kf-wrlock
+                   contention). compute_addr itself stays v1 byte-order
+                   to preserve the legacy slot-probe semantics for v1. */
                 if (sc.storage_version == 2)
-                    r->shard_id = slotcask_kf_shard_for_hash(r->hash, sc.splits);
+                    r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
             }
         }
         if (obj_heap) free(obj_str);
@@ -2140,7 +2137,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
         /* v2 dispatcher-shard alignment — see cmd_bulk_insert (JSON path) */
         if (sc.storage_version == 2)
-            r->shard_id = slotcask_kf_shard_for_hash(r->hash, sc.splits);
+            r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
     }
 
     /* If parse tripped the deadline, abort before any write phase. */

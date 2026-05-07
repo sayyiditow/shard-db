@@ -10,10 +10,9 @@
    support dynamic per-shard growth beyond 65K slots; callers mask with
    (slots_per_shard - 1) when probing. */
 void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot) {
-    /* Bytes 0-1: shard selection */
-    unsigned int h4 = ((unsigned)hash[0] << 8) | hash[1];
-    *shard_id = h4 % splits;
-    /* Bytes 2-5: 32 bits of slot entropy */
+    /* v1 byte order — addr_from_hash is the v1 path's helper. */
+    *shard_id = compute_record_shard(hash, splits, 1);
+    /* Bytes 2-5: 32 bits of slot entropy (v1 zone-A probe; v2 ignores). */
     uint32_t raw = ((uint32_t)hash[2] << 24) | ((uint32_t)hash[3] << 16)
                  | ((uint32_t)hash[4] << 8)  |  (uint32_t)hash[5];
     *slot = (int)raw;
@@ -1980,6 +1979,9 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             MultiExistsEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+            /* v2 alignment — see cmd_get_multi for rationale. */
+            if (sc.storage_version == 2)
+                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
             e->found = 0;
         } else p++;
     }
@@ -2075,6 +2077,9 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             MultiExistsEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+            /* v2 alignment — see cmd_get_multi for rationale. */
+            if (sc.storage_version == 2)
+                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
             e->found = 0;
         } else p++;
     }
@@ -2242,6 +2247,11 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             MultiGetEntry *e = &entries[key_count++];
             e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
             compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+            /* For v2, override the bucketing shard with slotcask's kf-shard
+               mapping so each parallel_for worker owns one kf shard and
+               doesn't queue on cross-worker kf-cache contention. */
+            if (sc.storage_version == 2)
+                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
             e->result_json = NULL;
         } else p++;
     }
