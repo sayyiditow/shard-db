@@ -879,6 +879,25 @@ void scan_shards_v2(struct SlotcaskDb *db, scan_callback cb, void *ctx);
 int  scan_dispatch(const char *db_root, const char *object,
                    const Schema *sc, const char *data_dir,
                    scan_callback cb, void *ctx);
+
+/* Indexed record fetch: layout-agnostic dispatch for hash-based lookups.
+   v1 path holds an FcacheRead handle; v2 holds a malloc'd copy of the
+   record. Either way, key + val point into a contiguous buffer with
+   layout `[key bytes][val bytes]`, matching v1 Zone B. Caller must
+   call release_record_ref to free both lifetimes. */
+typedef struct {
+    FcacheRead     fc;        /* v1: kept open to keep mmap alive; .map=NULL on v2 */
+    uint8_t       *v2_buf;    /* v2: malloc'd; NULL on v1 */
+    const uint8_t *key;
+    size_t         klen;
+    const uint8_t *val;
+    size_t         vlen;
+} RecordRef;
+
+int  read_record_ref(const char *db_root, const char *object,
+                     const Schema *sch, const uint8_t hash[16],
+                     RecordRef *out);
+void release_record_ref(RecordRef *r);
 int fetch_record_by_hash(const char *db_root, const char *object, const Schema *sch, const uint8_t hash16[16], int *printed, void *fs);
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);

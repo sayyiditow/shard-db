@@ -43,9 +43,14 @@ static uint32_t path_hash(const char *s) {
 }
 
 static void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
+    /* MUST match storage.c's compute_hash_raw byte-for-byte — the engine
+       writes index entries with that canonical (big-endian) form, and
+       slotcask_lookup_by_hash receives those same bytes from the index
+       layer. A mismatch silently makes every indexed lookup miss. */
     XXH128_hash_t h = XXH3_128bits(key, klen);
-    memcpy(out, &h.high64, 8);
-    memcpy(out + 8, &h.low64, 8);
+    XXH128_canonical_t c;
+    XXH128_canonicalFromHash(&c, h);
+    memcpy(out, c.digest, 16);
 }
 
 static int shard_for_hash(const uint8_t hash[16], int num_shards) {
