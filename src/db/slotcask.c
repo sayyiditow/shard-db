@@ -29,8 +29,12 @@
 #include <dirent.h>
 #include <pthread.h>
 
-#define XXH_INLINE_ALL
-#include "xxhash.h"
+/* Single source of truth for primary-key hashing — defined in util.c. We
+   forward-declare it instead of pulling in types.h so slotcask stays
+   decoupled from the engine's wider header surface (it links cleanly into
+   the standalone test binary alongside util.c). */
+extern void compute_hash_raw(const char *key, size_t key_len,
+                              uint8_t hash_out[16]);
 
 /* ============================================================ Helpers */
 
@@ -42,15 +46,8 @@ static uint32_t path_hash(const char *s) {
     return h;
 }
 
-static void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
-    /* MUST match storage.c's compute_hash_raw byte-for-byte — the engine
-       writes index entries with that canonical (big-endian) form, and
-       slotcask_lookup_by_hash receives those same bytes from the index
-       layer. A mismatch silently makes every indexed lookup miss. */
-    XXH128_hash_t h = XXH3_128bits(key, klen);
-    XXH128_canonical_t c;
-    XXH128_canonicalFromHash(&c, h);
-    memcpy(out, c.digest, 16);
+static inline void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
+    compute_hash_raw((const char *)key, klen, out);
 }
 
 static int shard_for_hash(const uint8_t hash[16], int num_shards) {

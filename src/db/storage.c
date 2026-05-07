@@ -1,14 +1,10 @@
 #include "types.h"
 #include "slotcask.h"
 
-/* ========== Hashing & Addressing ========== */
-
-void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]) {
-    XXH128_hash_t h = XXH3_128bits(key, key_len);
-    XXH128_canonical_t c;
-    XXH128_canonicalFromHash(&c, h);
-    memcpy(hash_out, c.digest, 16);
-}
+/* ========== Hashing & Addressing ==========
+ * compute_hash_raw lives in util.c (single source of truth — slotcask.c
+ * also calls it, so the canonical-XXH128 byte layout stays bit-identical
+ * across the engine and the storage layer). */
 
 /* Derive shard_id and raw slot position from hash. Slot is 32-bit to
    support dynamic per-shard growth beyond 65K slots; callers mask with
