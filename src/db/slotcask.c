@@ -168,6 +168,44 @@ static void kfcache_drop_slot(int slot) {
     g_kfcache_count--;
 }
 
+/* Drop every cached kf shard whose path starts with `prefix`. Used by
+   slotcask_registry_invalidate to flush stale mmap regions before the
+   on-disk files move (rebuild_object_v2) or vanish (drop-object).
+
+   Lock-ordering: kfcache_acquire's install path holds g_kfcache_lock
+   while taking the per-entry rwlock. To avoid deadlock we must NOT
+   hold the rwlock while reaching for the table mutex. Pattern: read
+   (path, used) without mutex (slots array is fixed-size, fields are
+   pointer/byte-sized so torn reads aren't a concern; install only
+   writes them under mutex), take rwlock for matching slots, do the
+   munmap/close/clear under rwlock alone, decrement g_kfcache_count
+   atomically. The caller (per-object wrlock) guarantees no concurrent
+   ops on THIS object so the rwlock contention is bounded. */
+static void kfcache_invalidate_prefix(const char *prefix) {
+    if (!g_kfcache || !prefix || !prefix[0]) return;
+    size_t pl = strlen(prefix);
+    for (int i = 0; i < g_kfcache_slots; i++) {
+        KfCacheEntry *e = &g_kfcache[i];
+        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (strncmp(e->path, prefix, pl) != 0) continue;
+        pthread_rwlock_wrlock(&e->rwlock);
+        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            strncmp(e->path, prefix, pl) == 0) {
+            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            e->map = NULL;
+            e->fd = -1;
+            e->map_size = 0;
+            e->capacity = 0;
+            e->path[0] = '\0';
+            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            __sync_fetch_and_sub(&g_kfcache_count, 1);
+        }
+        pthread_rwlock_unlock(&e->rwlock);
+    }
+}
+
 /* Open + size + mmap a keyfile shard. Caller may NOT hold g_kfcache_lock when
    the file system call could block, so we do the heavy lifting outside the
    table mutex (matching bt_open_file's contract in btree.c). */
@@ -417,6 +455,34 @@ static int segcache_probe(const char *path, int *out_found) {
     }
     *out_found = 0;
     return -1;
+}
+
+/* Mirrors kfcache_invalidate_prefix — drop every cached segment under a
+   given path prefix. Same lock-ordering rules: never hold the entry
+   rwlock while reaching for g_segcache_lock; that would deadlock against
+   segcache_acquire's install path. */
+static void segcache_invalidate_prefix(const char *prefix) {
+    if (!g_segcache || !prefix || !prefix[0]) return;
+    size_t pl = strlen(prefix);
+    for (int i = 0; i < g_segcache_slots; i++) {
+        SegCacheEntry *e = &g_segcache[i];
+        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (strncmp(e->path, prefix, pl) != 0) continue;
+        pthread_rwlock_wrlock(&e->rwlock);
+        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            strncmp(e->path, prefix, pl) == 0) {
+            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            e->map = NULL;
+            e->fd = -1;
+            e->map_size = 0;
+            e->path[0] = '\0';
+            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            __sync_fetch_and_sub(&g_segcache_count, 1);
+        }
+        pthread_rwlock_unlock(&e->rwlock);
+    }
 }
 
 static void segcache_drop_slot(int slot) {
@@ -1344,10 +1410,12 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         kfcache_release(&kh);
     }
 
-    int dirty = dirty_marker_exists(db);
-    if (dirty) {
-        if (recover_streams(db) != 0) goto fail;
-    }
+    /* Always run recover_streams — reserve_off / active_file_id aren't
+       persisted, so a clean close + reopen would otherwise leave them
+       at 0 and the next write would clobber a live record at the head
+       of the active segment. No-op when the directory is empty. */
+    (void)dirty_marker_exists;  /* silence unused warning */
+    if (recover_streams(db) != 0) goto fail;
     if (touch_dirty_marker(db) != 0) {
         /* Non-fatal — recovery will simply re-walk on the next open. */
     }
@@ -1759,6 +1827,13 @@ void slotcask_registry_invalidate(const char *effective_root,
     char key[PATH_MAX];
     reg_key(key, effective_root, object);
 
+    /* Drop cached kf + seg mmaps for this object's data_dir. Without this
+       flush, rebuild_object_v2 (which renames the data files into
+       .legacy/) would have a fresh slotcask_open hit a cached path entry
+       and keep writing into the moved-away inodes. */
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/%s/", effective_root, object);
+
     pthread_mutex_lock(&g_reg_lock);
     int slot = reg_probe(key);
     if (slot >= 0 && g_reg[slot].used) {
@@ -1767,19 +1842,18 @@ void slotcask_registry_invalidate(const char *effective_root,
         g_reg[slot].key[0] = '\0';
         g_reg[slot].db = NULL;
         pthread_mutex_unlock(&g_reg_lock);
-        /* slotcask_close acquires its own internal locks; safe to call after
-           dropping the registry mutex. Anyone holding a borrowed pointer
-           that races with this is a use-after-free — the contract is that
-           invalidate is paired with quiescence (no in-flight requests on
-           this object), which the caller (drop-object handler under per-
-           object wrlock) provides. */
         slotcask_close(db);
         free(db);
-        /* (kfcache/segcache eviction by prefix is future work — for now the
-           entries simply LRU out as new objects compete for slots.) */
+        kfcache_invalidate_prefix(data_dir);
+        segcache_invalidate_prefix(data_dir);
         return;
     }
     pthread_mutex_unlock(&g_reg_lock);
+    /* No registry entry — still flush any cache entries that linger from
+       earlier opens (e.g. cmd_create_object opens + closes a SlotcaskDb
+       directly without registering it). */
+    kfcache_invalidate_prefix(data_dir);
+    segcache_invalidate_prefix(data_dir);
 }
 
 void slotcask_registry_shutdown(void) {

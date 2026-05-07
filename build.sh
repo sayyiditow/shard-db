@@ -163,6 +163,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_v2_query.c \
     src/test/cases/test_slotcask_v2_bulk.c \
     src/test/cases/test_slotcask_v2_parity.c \
+    src/test/cases/test_slotcask_v2_schema.c \
     src/db/util.c \
     src/db/slotcask.c \
     -Isrc/db -Isrc/test \

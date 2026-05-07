@@ -4653,10 +4653,20 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
     int replaced = 0;
     while (fgets(line, sizeof(line), fin)) {
         if (strncmp(line, prefix, pfxlen) == 0 && !replaced) {
-            /* splits:max_key — keep max_key, replace splits. */
+            /* Format: dir:object:splits:max_key[:storage_version[:streams]].
+               Preserve every trailing field so v2 objects don't silently
+               downgrade to v1 on a splits change. */
+            line[strcspn(line, "\r\n")] = '\0';
             int cur_splits = 0, max_key = 0;
-            sscanf(line + pfxlen, "%d:%d", &cur_splits, &max_key);
-            fprintf(fout, "%s%d:%d\n", prefix, new_splits, max_key);
+            int sv = 0, streams = 0;
+            int n = sscanf(line + pfxlen, "%d:%d:%d:%d",
+                            &cur_splits, &max_key, &sv, &streams);
+            if (n >= 4)
+                fprintf(fout, "%s%d:%d:%d:%d\n", prefix, new_splits, max_key, sv, streams);
+            else if (n >= 3)
+                fprintf(fout, "%s%d:%d:%d\n", prefix, new_splits, max_key, sv);
+            else
+                fprintf(fout, "%s%d:%d\n", prefix, new_splits, max_key);
             replaced = 1;
         } else {
             fputs(line, fout);
@@ -4680,6 +4690,223 @@ static int parse_field_line(const char *line, TypedField *out) {
     out->name[nlen] = '\0';
     parse_field_type(colon + 1, out);
     return out->type != FT_NONE && out->size > 0;
+}
+
+/* === v2 (slotcask) rebuild path ===
+ *
+ * Used by add-fields, vacuum --compact, and vacuum --splits when the object
+ * is storage_version=2. Caller holds objlock_wrlock — no concurrent ops can
+ * race with the rebuild.
+ *
+ * Strategy: stage the object's current slotcask data files into a
+ * `.legacy/` subdir, open a read-only slotcask handle against that dir,
+ * open a fresh write handle in the object root with the new schema, walk
+ * legacy via slotcask_walk_live, transform each record (memcpy by
+ * new_to_old field map; new fields stay zero from calloc), insert into
+ * new. fields.conf and schema.conf rewrites mirror v1. .legacy/ is
+ * removed on success; on crash mid-rebuild the operator restores
+ * the .legacy contents back into the object root. */
+typedef struct {
+    SlotcaskDb        *new_db;
+    const TypedSchema *old_ts;
+    TypedSchema       *new_ts;
+    int               *new_to_old;
+    int                slot_changed;
+    int                live_count;
+    int                error;
+} V2RebuildCtx;
+
+static int v2_rebuild_walk_cb(const uint8_t hash16[16],
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                void *ctxp) {
+    (void)hash16;
+    V2RebuildCtx *ctx = (V2RebuildCtx *)ctxp;
+    if (ctx->error) return 1;
+
+    if (!ctx->slot_changed) {
+        /* Layout unchanged (e.g., splits-only resplit). Re-insert the
+           record bytes verbatim. */
+        if (slotcask_insert(ctx->new_db, -1, key, klen, value, vlen) != 0) {
+            ctx->error = 1; return 1;
+        }
+        ctx->live_count++;
+        return 0;
+    }
+
+    /* Slot layout changed (compact, add-field, or both): recompose typed
+       payload by mapping new field offsets ← old field offsets. New fields
+       (new_to_old == -1) stay zero from calloc. */
+    uint8_t *buf = calloc(1, ctx->new_ts->total_size);
+    if (!buf) { ctx->error = 1; return 1; }
+    for (int k = 0; k < ctx->new_ts->nfields; k++) {
+        int oi = ctx->new_to_old[k];
+        if (oi < 0) continue;
+        size_t off = ctx->old_ts->fields[oi].offset;
+        size_t sz  = ctx->old_ts->fields[oi].size;
+        if (off + sz > vlen) continue;  /* defensive */
+        memcpy(buf + ctx->new_ts->fields[k].offset,
+               (const uint8_t *)value + off, sz);
+    }
+    int rc = slotcask_insert(ctx->new_db, -1, key, klen,
+                              buf, ctx->new_ts->total_size);
+    free(buf);
+    if (rc != 0) { ctx->error = 1; return 1; }
+    ctx->live_count++;
+    return 0;
+}
+
+/* Move every keyfile_*.kf and stream_* entry from `from_dir` into `to_dir`.
+   `to_dir` must already exist. Returns 0 on success. */
+static int move_slotcask_data(const char *from_dir, const char *to_dir) {
+    DIR *d = opendir(from_dir);
+    if (!d) return -1;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        int is_kf = (strncmp(e->d_name, "keyfile_", 8) == 0);
+        int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
+        int is_dirty  = (strcmp(e->d_name, ".dirty") == 0);
+        if (!is_kf && !is_stream && !is_dirty) continue;
+        char src[PATH_MAX], dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s/%s", from_dir, e->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", to_dir, e->d_name);
+        if (rename(src, dst) != 0) { rc = -1; break; }
+    }
+    closedir(d);
+    return rc;
+}
+
+static int rebuild_object_v2(const char *db_root, const char *object,
+                              const Schema *old_sch, const TypedSchema *old_ts,
+                              const Schema *new_sch, TypedSchema *new_ts,
+                              int *new_to_old, int slot_changed,
+                              int splits_changed, int drop_tombstoned,
+                              char added_lines[][256], int n_added) {
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    char legacy_dir[PATH_MAX];
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/.legacy", obj_dir);
+
+    /* Clean any stale .legacy from a prior crashed rebuild. */
+    rmrf(legacy_dir);
+    mkdirp(legacy_dir);
+
+    /* Drop the cached slotcask handle so file moves don't tug on live
+       mmap regions. The next slotcask_registry_get will re-open fresh. */
+    slotcask_registry_invalidate(db_root, object);
+
+    /* Move data files (keyfile_*.kf and stream_* dirs) into .legacy/. */
+    if (move_slotcask_data(obj_dir, legacy_dir) != 0) {
+        log_msg(1, "rebuild_v2: move into %s failed", legacy_dir);
+        rmrf(legacy_dir);
+        OUT("{\"error\":\"Failed to stage legacy data\"}\n");
+        return 1;
+    }
+
+    /* Open standalone handles — bypass the registry (it would re-open
+       the live obj_dir under the new schema and we want both handles
+       coexisting for the walk). */
+    SlotcaskDb legacy_db, new_db;
+    int legacy_open = (slotcask_open(&legacy_db, legacy_dir,
+                                       old_sch->splits, old_sch->streams,
+                                       old_sch->slot_size) == 0);
+    int new_open = (slotcask_open(&new_db, obj_dir,
+                                    new_sch->splits, new_sch->streams,
+                                    new_sch->slot_size) == 0);
+    if (!legacy_open || !new_open) {
+        if (legacy_open) slotcask_close(&legacy_db);
+        if (new_open)    slotcask_close(&new_db);
+        log_msg(1, "rebuild_v2: open failed (legacy=%d new=%d)",
+                legacy_open, new_open);
+        OUT("{\"error\":\"Failed to open slotcask handles for rebuild\"}\n");
+        return 1;
+    }
+
+    V2RebuildCtx walk_ctx = {0};
+    walk_ctx.new_db        = &new_db;
+    walk_ctx.old_ts        = old_ts;
+    walk_ctx.new_ts        = new_ts;
+    walk_ctx.new_to_old    = new_to_old;
+    walk_ctx.slot_changed  = slot_changed;
+    slotcask_walk_live(&legacy_db, v2_rebuild_walk_cb, &walk_ctx);
+    int live_count = walk_ctx.live_count;
+    int walk_err   = walk_ctx.error;
+
+    slotcask_close(&legacy_db);
+    slotcask_close(&new_db);
+
+    if (walk_err) {
+        log_msg(1, "rebuild_v2: walk error after %d records", live_count);
+        OUT("{\"error\":\"Rebuild walk failed; %s/.legacy preserved\"}\n", obj_dir);
+        return 1;
+    }
+
+    /* Stage fields.conf rewrite (drop :removed lines if compact, append
+       n_added at the end) — mirrors the v1 fields_changed branch. */
+    int fields_changed = drop_tombstoned || n_added > 0;
+    if (fields_changed) {
+        char fpath[PATH_MAX], fpath_new[PATH_MAX], fpath_old[PATH_MAX];
+        snprintf(fpath,     sizeof(fpath),     "%s/fields.conf", obj_dir);
+        snprintf(fpath_new, sizeof(fpath_new), "%s/fields.conf.new", obj_dir);
+        snprintf(fpath_old, sizeof(fpath_old), "%s/fields.conf.old", obj_dir);
+
+        FILE *fin = fopen(fpath, "r");
+        FILE *fout = fopen(fpath_new, "w");
+        if (!fin || !fout) {
+            if (fin) fclose(fin);
+            if (fout) fclose(fout);
+            OUT("{\"error\":\"Failed to stage fields.conf.new\"}\n");
+            return 1;
+        }
+        char line[512];
+        while (fgets(line, sizeof(line), fin)) {
+            char stripped[512];
+            strncpy(stripped, line, sizeof(stripped) - 1);
+            stripped[sizeof(stripped) - 1] = '\0';
+            stripped[strcspn(stripped, "\n")] = '\0';
+            if (stripped[0] == '\0' || stripped[0] == '#') { fputs(line, fout); continue; }
+            if (drop_tombstoned && strstr(stripped, ":removed")) continue;
+            fputs(line, fout);
+        }
+        for (int a = 0; a < n_added; a++) fprintf(fout, "%s\n", added_lines[a]);
+        fclose(fin);
+        fclose(fout);
+        if (rename(fpath, fpath_old) != 0)
+            log_msg(1, "rebuild_v2: rename(%s → %s) failed", fpath, fpath_old);
+        if (rename(fpath_new, fpath) != 0) {
+            log_msg(1, "rebuild_v2: rename(%s → %s) failed — restoring", fpath_new, fpath);
+            (void)rename(fpath_old, fpath);
+            OUT("{\"error\":\"Failed to swap fields.conf\"}\n");
+            return 1;
+        }
+        unlink(fpath_old);
+    }
+
+    if (splits_changed)
+        update_schema_conf_splits(db_root, object, new_sch->splits);
+
+    invalidate_schema_caches(db_root, object);
+    invalidate_idx_cache(object);
+    reset_deleted_count(db_root, object);
+    set_count(db_root, object, live_count);
+
+    /* Drop the legacy data + force the registry to re-open against the
+       new on-disk state on the next request. */
+    rmrf(legacy_dir);
+    slotcask_registry_invalidate(db_root, object);
+
+    int idx_rebuilt = 0;
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+
+    log_msg(3, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+            db_root, object, live_count, old_sch->splits, new_sch->splits,
+            old_sch->slot_size, new_sch->slot_size, drop_tombstoned, idx_rebuilt);
+    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
+        live_count, new_sch->splits, new_sch->slot_size,
+        drop_tombstoned ? "true" : "false", idx_rebuilt);
+    return 0;
 }
 
 int rebuild_object(const char *db_root, const char *object,
@@ -4761,6 +4988,14 @@ int rebuild_object(const char *db_root, const char *object,
     if (!splits_changed && !slot_changed && n_added == 0) {
         OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
         return 0;
+    }
+
+    /* v2 path runs an entirely separate rebuild over slotcask files. */
+    if (old_sch.storage_version == 2) {
+        return rebuild_object_v2(db_root, object, &old_sch, old_ts,
+                                  &new_sch, &new_ts, new_to_old,
+                                  slot_changed, splits_changed,
+                                  drop_tombstoned, added_lines, n_added);
     }
 
     char obj_dir[PATH_MAX];
@@ -5011,12 +5246,21 @@ static void *vacuum_worker(void *arg) {
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits) {
     /* Compact rewrite path: delegate to rebuild_object (task #4).
-       Triggered by --compact or --splits. */
+       Triggered by --compact or --splits. rebuild_object dispatches on
+       storage_version internally. */
     if (compact || new_splits > 0) {
         return rebuild_object(db_root, object, new_splits, compact, NULL, 0);
     }
 
     Schema sch = load_schema(db_root, object);
+    /* v2 no-arg vacuum: slotcask's snake-game pool already returns
+       tombstoned slots to writers as they're produced. There is no Zone A
+       flag-2 array to sweep. Per-segment "drop fully-tombstoned segments"
+       compaction is a future refinement; for now report 0 cleaned. */
+    if (sch.storage_version == 2) {
+        OUT("{\"status\":\"vacuumed\",\"cleaned\":0}\n");
+        return 0;
+    }
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
@@ -11783,6 +12027,35 @@ int cmd_truncate(const char *db_root, const char *object) {
     }
     fcache_invalidate(obj_dir);
     invalidate_idx_cache(object);
+
+    /* v2: drop the cached slotcask handle, then unlink keyfile_*.kf files
+       and stream_* dirs at the object root. Falls through to the v1
+       cleanup below (data/, metadata/, indexes/ — those still apply:
+       metadata stores counts, indexes stores btrees regardless of storage
+       version). */
+    Schema sch = load_schema(db_root, object);
+    if (sch.storage_version == 2) {
+        slotcask_registry_invalidate(db_root, object);
+        DIR *d = opendir(obj_dir);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                int is_kf     = (strncmp(e->d_name, "keyfile_", 8) == 0);
+                int is_stream = (strncmp(e->d_name, "stream_", 7) == 0);
+                if (!is_kf && !is_stream) continue;
+                char fp[PATH_MAX];
+                snprintf(fp, sizeof(fp), "%s/%s", obj_dir, e->d_name);
+                if (is_stream) rmrf(fp);
+                else           unlink(fp);
+            }
+            closedir(d);
+        }
+        /* Also drop a stale .dirty marker if present. */
+        char dirty[PATH_MAX];
+        snprintf(dirty, sizeof(dirty), "%s/.dirty", obj_dir);
+        unlink(dirty);
+    }
 
     /* Only delete data, metadata, and index data — preserve config files */
     char path[PATH_MAX];
