@@ -24,7 +24,8 @@ static int mode_is_schema(const char *m) {
     if (!m) return 0;
     return strcasecmp(m, "rename-field") == 0 || strcasecmp(m, "remove-field") == 0 ||
            strcasecmp(m, "add-field") == 0 || strcasecmp(m, "vacuum") == 0 ||
-           strcasecmp(m, "truncate") == 0;
+           strcasecmp(m, "truncate") == 0 ||
+           strcasecmp(m, "migrate-storage-version") == 0;
 }
 
 /* ========== Auth: IP allowlist + token set ========== */
@@ -1465,6 +1466,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(fmt);
     } else if (strcmp(mode, "truncate") == 0) {
         cmd_truncate(db_root, object);
+    } else if (strcmp(mode, "migrate-storage-version") == 0) {
+        cmd_migrate_storage_version(db_root, dir, object);
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
     } else if (strcmp(mode, "put-file") == 0) {

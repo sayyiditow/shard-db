@@ -991,6 +991,15 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 int cmd_drop_object(const char *db_root, const char *dir, const char *object,
                     int if_exists);
 
+/* One-shot upgrade of a v1 object to the v2 (slotcask) layout. Walks the
+   object's existing v1 shard data, writes every live record into a new
+   slotcask in the obj root, atomic-renames data/ to data.legacy/, and
+   updates the schema.conf line to append :2:streams. Idempotent —
+   already-v2 objects return status=already_v2. Caller holds
+   objlock_wrlock. */
+int cmd_migrate_storage_version(const char *db_root, const char *dir,
+                                 const char *object);
+
 /* Object discovery — used by shard-cli to populate menus. Both are read-level
    operations: list-objects needs tenant scope (or broader); describe-object
    needs object scope (or broader). */

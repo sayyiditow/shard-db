@@ -12102,6 +12102,190 @@ int cmd_truncate(const char *db_root, const char *object) {
     return 0;
 }
 
+/* ========== MIGRATE-STORAGE-VERSION (v1 → v2) ==========
+ *
+ * Walks the object's existing v1 shard files, writes each live record
+ * into a fresh slotcask, atomic-renames data/ to data.legacy/, and
+ * appends :2:streams to the schema.conf line.
+ *
+ * Hashes survive the migration unchanged (compute_hash_raw is canonical
+ * across both layouts after the Phase 3E refactor), so the per-shard
+ * btree indexes already at <obj>/indexes/<field>/<NNN>.idx keep
+ * pointing to valid records — read_record_ref dispatches on
+ * storage_version and routes to slotcask_lookup_by_hash post-migration.
+ * No reindex needed.
+ *
+ * Caller holds objlock_wrlock (mode_is_schema). */
+
+typedef struct {
+    SlotcaskDb *sdb;
+    int         inserted;
+    int         err;
+} MigrateWalkCtx;
+
+static int migrate_walk_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
+    MigrateWalkCtx *c = (MigrateWalkCtx *)ctx;
+    const uint8_t *key = block;
+    const uint8_t *value = block + hdr->key_len;
+    int rc = slotcask_insert(c->sdb, -1,
+                              key, hdr->key_len,
+                              value, hdr->value_len);
+    if (rc != 0) { c->err = 1; return 1; }  /* halt scan on insert failure */
+    c->inserted++;
+    return 0;
+}
+
+/* Append :2:streams to the matching dir:object: line in schema.conf. */
+static int update_schema_conf_to_v2(const char *db_root, const char *object,
+                                     int streams) {
+    const char *dir = db_root + strlen(g_db_root);
+    if (*dir == '/') dir++;
+
+    char conf[PATH_MAX], tmp[PATH_MAX];
+    snprintf(conf, sizeof(conf), "%s/schema.conf", g_db_root);
+    snprintf(tmp,  sizeof(tmp),  "%s/schema.conf.tmp.%d", g_db_root, (int)getpid());
+
+    char prefix[512];
+    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
+
+    FILE *fin = fopen(conf, "r");
+    if (!fin) return -1;
+    int lockfd = fileno(fin);
+    flock(lockfd, LOCK_EX);
+
+    FILE *fout = fopen(tmp, "w");
+    if (!fout) { flock(lockfd, LOCK_UN); fclose(fin); return -1; }
+
+    char line[512];
+    int replaced = 0;
+    while (fgets(line, sizeof(line), fin)) {
+        if (!replaced && strncmp(line, prefix, pfxlen) == 0) {
+            line[strcspn(line, "\r\n")] = '\0';
+            int splits = 0, max_key = 0, sv = 0, st = 0;
+            int n = sscanf(line + pfxlen, "%d:%d:%d:%d",
+                            &splits, &max_key, &sv, &st);
+            if (n >= 4) {
+                /* Already has trailing version+streams — overwrite. */
+                fprintf(fout, "%s%d:%d:2:%d\n", prefix, splits, max_key, streams);
+            } else if (n >= 2) {
+                fprintf(fout, "%s%d:%d:2:%d\n", prefix, splits, max_key, streams);
+            } else {
+                fputs(line, fout); fputc('\n', fout);
+            }
+            replaced = 1;
+        } else {
+            fputs(line, fout);
+        }
+    }
+    fclose(fout);
+    int ok = (rename(tmp, conf) == 0);
+    flock(lockfd, LOCK_UN);
+    fclose(fin);
+    return ok ? 0 : -1;
+}
+
+int cmd_migrate_storage_version(const char *db_root, const char *dir,
+                                 const char *object) {
+    Schema sc = load_schema(db_root, object);
+    if (sc.splits <= 0) {
+        OUT("{\"error\":\"object [%s/%s] not found\"}\n", dir, object);
+        return 1;
+    }
+    if (sc.storage_version == 2) {
+        OUT("{\"status\":\"already_v2\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 0;
+    }
+
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/data", obj_dir);
+    char data_legacy[PATH_MAX];
+    snprintf(data_legacy, sizeof(data_legacy), "%s/data.legacy", obj_dir);
+
+    /* Already-renamed legacy from a prior aborted migration → bail with
+       a clear error so the operator can investigate. We won't auto-restore. */
+    struct stat st;
+    if (stat(data_legacy, &st) == 0) {
+        OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 1;
+    }
+    if (stat(data_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        OUT("{\"error\":\"data/ missing for v1 object [%s/%s]\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object, dir, object);
+        return 1;
+    }
+
+    /* Compute v2 layout. slot_size formula matches create-object's:
+       max_key + max_value rounded up to 8. streams from nproc. */
+    int streams = slotcask_streams_for_nproc();
+    int new_slot_size = (sc.max_key + sc.max_value + 7) & ~7;
+    if (new_slot_size < 32) new_slot_size = 32;  /* slotcask_open floor */
+
+    /* Open new slotcask in obj_dir (alongside the v1 data/ which is
+       still in place). slotcask creates keyfile_*.kf and stream_NNN
+       sub-dirs at the obj root; v1's data/ subdir doesn't conflict. */
+    SlotcaskDb sdb;
+    if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
+        OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+            dir, object);
+        return 1;
+    }
+
+    /* Walk every live v1 record and insert into the new slotcask. */
+    MigrateWalkCtx wctx = { &sdb, 0, 0 };
+    scan_shards(data_dir, sc.slot_size, migrate_walk_cb, &wctx);
+    slotcask_close(&sdb);
+
+    if (wctx.err) {
+        /* Leave the new kf+stream files in place for inspection; data/
+           is untouched. Operator can rmrf <obj>/keyfile_*.kf and stream_*
+           and retry. */
+        OUT("{\"error\":\"insert failed during migration after %d records\",\"inserted\":%d}\n",
+            wctx.inserted, wctx.inserted);
+        return 1;
+    }
+
+    /* Atomic swap: v1 data/ → data.legacy/. After this the daemon's
+       next request for this object should see storage_version=2 (after
+       the schema.conf update + cache invalidation below) and route
+       through slotcask. */
+    fcache_invalidate(data_dir);
+    if (rename(data_dir, data_legacy) != 0) {
+        OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
+            strerror(errno));
+        return 1;
+    }
+
+    /* Update schema.conf line to append :2:streams. */
+    if (update_schema_conf_to_v2(db_root, object, streams) != 0) {
+        /* Try to roll back the rename. Best-effort. */
+        if (rename(data_legacy, data_dir) != 0) {
+            log_msg(1, "migrate: data.legacy → data rollback failed: %s",
+                    strerror(errno));
+        }
+        OUT("{\"error\":\"schema.conf update failed; rolled back rename\"}\n");
+        return 1;
+    }
+
+    invalidate_schema_caches(db_root, object);
+    /* The slotcask we just opened was a stack-local handle; the registry
+       doesn't know about it. Drop any lingering registry entry so the
+       next request re-opens with the freshly-written schema.conf
+       metadata. */
+    slotcask_registry_invalidate(db_root, object);
+
+    log_msg(3, "MIGRATE %s/%s: v1 → v2, %d records, streams=%d, slot_size=%d",
+            dir, object, wctx.inserted, streams, new_slot_size);
+    /* `upgraded` (not `migrated`) to disambiguate from migrate-files's
+       summary line in mixed-output captures. */
+    OUT("{\"status\":\"upgraded\",\"dir\":\"%s\",\"object\":\"%s\",\"records\":%d,\"streams\":%d,\"slot_size\":%d}\n",
+        dir, object, wctx.inserted, streams, new_slot_size);
+    return 0;
+}
+
 /* ========== PUT-FILE / GET-FILE-PATH ========== */
 
 int cmd_put_file(const char *db_root, const char *object, const char *src) {
