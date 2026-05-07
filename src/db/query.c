@@ -961,11 +961,13 @@ typedef struct {
     BulkInsRecord    *rec;
 } V2BulkInsCtx;
 
-static int v2_bulk_ins_pre_commit(const SlotcaskOldRecord *old,
-                                   const uint8_t *new_value, size_t new_vlen,
-                                   int is_update, void *ctx_ptr) {
-    (void)new_vlen;
-    V2BulkInsCtx *ctx = (V2BulkInsCtx *)ctx_ptr;
+/* Per-record pre_commit hook fired under the kf-shard wrlock by
+   slotcask_bulk_upsert_in_kfshard. Reads the V2BulkInsCtx via
+   rec->user_ctx and accumulates idx entries into sw->idx_pairs[fi]. */
+static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                        SlotcaskBulkRec *rec,
+                                        int is_update) {
+    V2BulkInsCtx *ctx = (V2BulkInsCtx *)rec->user_ctx;
     BulkInsShardWork *sw = ctx->sw;
     BulkInsRecord    *r  = ctx->rec;
     if (sw->nidx == 0) return 0;
@@ -983,7 +985,8 @@ static int v2_bulk_ins_pre_commit(const SlotcaskOldRecord *old,
         }
     }
 
-    /* New idx values from the typed payload (mirrors v1 worker block). */
+    const uint8_t *new_value = (const uint8_t *)rec->value;
+
     for (int fi = 0; fi < sw->nidx; fi++) {
         uint8_t *key_buf = NULL;
         size_t   key_len = 0;
@@ -1073,30 +1076,78 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         return NULL;
     }
 
+    /* Sub-bucket records by their TRUE kf shard. The dispatcher buckets by
+       v1's big-endian addr_from_hash, but slotcask uses little-endian
+       shard_for_hash, so a single big-endian bucket can spread across
+       many kf shards. The bulk primitive holds one kf wrlock per call,
+       so calling it once per kf shard amortises the lock acquisition
+       across all records in that shard. */
+    int splits = sw->sch->splits;
+    SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+    V2BulkInsCtx    *ctxs  = malloc(sw->count * sizeof(V2BulkInsCtx));
+    int *kf_shards = malloc(sw->count * sizeof(int));
+    int *counts    = calloc(splits, sizeof(int));
+    int *offsets   = malloc(splits * sizeof(int));
+    int *cursors   = calloc(splits, sizeof(int));
+    if (!batch || !ctxs || !kf_shards || !counts || !offsets || !cursors) {
+        free(batch); free(ctxs); free(kf_shards);
+        free(counts); free(offsets); free(cursors);
+        sw->errors += (int)sw->count;
+        sw->wall_ms = now_ms_coarse() - t_worker_start;
+        return NULL;
+    }
+
     for (size_t i = 0; i < sw->count; i++) {
+        kf_shards[i] = slotcask_kf_shard_for_hash(sw->records[i].hash, splits);
+        counts[kf_shards[i]]++;
+    }
+    int run = 0;
+    for (int s = 0; s < splits; s++) { offsets[s] = run; run += counts[s]; }
+
+    /* Pack records into [batch] grouped by kf shard, with [ctxs] mirrored. */
+    for (size_t i = 0; i < sw->count; i++) {
+        int s = kf_shards[i];
+        int pos = offsets[s] + cursors[s]++;
         BulkInsRecord *r = &sw->records[i];
-        V2BulkInsCtx ctx = { sw, r };
-        SlotcaskUpsertOpts opts = {
-            .if_not_exists  = sw->if_not_exists,
-            .check          = NULL,
-            .check_ctx      = NULL,
-            .pre_commit     = v2_bulk_ins_pre_commit,
-            .pre_commit_ctx = &ctx,
-        };
-        SlotcaskUpsertResult result = {0};
-        int rc = slotcask_upsert_with_hooks(sdb, -1,
-                                             r->id, r->klen,
-                                             r->payload, sw->ts->total_size,
-                                             &opts, &result);
-        if (rc == 0) {
-            if (!result.was_update) sw->inserted++;
-        } else if (rc == -2) {
+        ctxs[pos].sw  = sw;
+        ctxs[pos].rec = r;
+        batch[pos].key       = r->id;
+        batch[pos].klen      = r->klen;
+        batch[pos].value     = r->payload;
+        batch[pos].vlen      = sw->ts->total_size;
+        batch[pos].user_ctx  = &ctxs[pos];
+        batch[pos].status    = 0;
+        batch[pos].was_update = 0;
+    }
+
+    SlotcaskBulkOpts opts = {
+        .if_not_exists = sw->if_not_exists,
+        .pre_commit    = v2_bulk_ins_pre_commit_bulk,
+    };
+    for (int s = 0; s < splits; s++) {
+        if (counts[s] == 0) continue;
+        int rc = slotcask_bulk_upsert_in_kfshard(sdb, s,
+                                                  batch + offsets[s],
+                                                  (size_t)counts[s], &opts);
+        if (rc != 0) {
+            for (int k = 0; k < counts[s]; k++) {
+                if (batch[offsets[s] + k].status == 0)
+                    batch[offsets[s] + k].status = -1;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < sw->count; i++) {
+        if (batch[i].status == 0) {
+            if (!batch[i].was_update) sw->inserted++;
+        } else if (batch[i].status == -2) {
             sw->skipped++;
-            free(result.current_value);
         } else {
             sw->errors++;
         }
     }
+    free(batch); free(ctxs); free(kf_shards);
+    free(counts); free(offsets); free(cursors);
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }

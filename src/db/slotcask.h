@@ -250,6 +250,51 @@ typedef struct {
     void                     *pre_commit_ctx;
 } SlotcaskUpsertOpts;
 
+/* ============================================================ Bulk upsert
+ *
+ * Per-record kfcache_acquire/release pairs were the dominant cost in
+ * bulk-insert-via-slotcask_upsert_with_hooks (4× single-conn regression
+ * vs v1's mmap-batch path). The bulk primitive amortises that lock by
+ * accepting a batch where every record hashes to the SAME kf-shard,
+ * acquiring the wrlock once for the whole batch. Caller pre-buckets
+ * records by kf_shard_id (the engine's bulk_insert_shard_worker_v2
+ * already does so via compute_addr).
+ */
+typedef struct {
+    /* input: caller fills */
+    const void *key;
+    size_t      klen;
+    const void *value;
+    size_t      vlen;
+    void       *user_ctx;              /* passed to pre_commit per record */
+    /* output: callee fills */
+    int         status;                /* 0=ok, -2=cond_not_met, -1=error */
+    int         was_update;
+} SlotcaskBulkRec;
+
+typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
+                                            SlotcaskBulkRec *rec,
+                                            int is_update);
+
+typedef struct {
+    int                          if_not_exists;     /* skip if key exists */
+    slotcask_bulk_pre_commit_fn  pre_commit;        /* fired per record under kf wrlock; NULL = no-op */
+} SlotcaskBulkOpts;
+
+/* Returns 0 if the batch ran (per-record results in recs[].status), -1 on
+   hard error (kf_acquire failed). Records that hit if_not_exists or
+   pre_commit returning non-zero get rec.status=-2 with rec.was_update
+   set from the existing key. */
+int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                     SlotcaskBulkRec *recs, size_t n,
+                                     const SlotcaskBulkOpts *opts);
+
+/* Returns the kf shard id slotcask uses for the given hash. Exposed so
+   callers (bulk-insert dispatcher) can pre-bucket records to match the
+   bulk primitive's expectation that all records in one batch target the
+   same kf shard. */
+int slotcask_kf_shard_for_hash(const uint8_t hash[16], int num_shards);
+
 typedef struct {
     int     was_update;             /* 1 if existing key was updated, 0 if created */
     int     condition_not_met;      /* 1 if check_fn or if_not_exists/require_existing rejected */

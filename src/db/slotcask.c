@@ -55,6 +55,10 @@ static int shard_for_hash(const uint8_t hash[16], int num_shards) {
     return (int)(v % (uint16_t)num_shards);
 }
 
+int slotcask_kf_shard_for_hash(const uint8_t hash[16], int num_shards) {
+    return shard_for_hash(hash, num_shards);
+}
+
 static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
     uint64_t v;
     memcpy(&v, hash, 8);
@@ -1676,6 +1680,175 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->condition_not_met = 0;
     }
     free(old_buf);
+    return 0;
+}
+
+/* ============================================================ Bulk upsert
+ *
+ * Whole batch under one kfcache wrlock. The savings vs calling
+ * slotcask_upsert_with_hooks per record:
+ *
+ *     N=78K records / shard
+ *     before: 78K × 2 lock ops (wrlock acquire + release) = 156K ops
+ *     after:  2 lock ops (one acquire, one release) for the whole shard
+ *
+ * Per-record cost still pays:
+ *  - kf_lookup (linear-probe inside the held mmap, no syscall)
+ *  - read_record_value if upsert (reads OLD record from segment cache)
+ *  - per-stream rotation_lock + segcache wrlock for the seg_write
+ *  - kf_put_new / kf_repoint (mmap atomic store, no syscall)
+ *
+ * Tombstoning of old slots (for upserts) happens AFTER kfcache_release
+ * so segcache wrlocks for old segments don't hold the kf lock too.
+ */
+int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                     SlotcaskBulkRec *recs, size_t n,
+                                     const SlotcaskBulkOpts *opts) {
+    if (n == 0) return 0;
+    SlotcaskBulkOpts blank = {0};
+    if (!opts) opts = &blank;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    /* Per-record old-slot bookkeeping for post-batch tombstoning. */
+    typedef struct {
+        uint8_t  hash[16];
+        uint8_t  old_sid;
+        uint16_t old_fid;
+        uint32_t old_off;
+        uint8_t  old_found;
+    } OldRef;
+    OldRef *olds = calloc(n, sizeof(OldRef));
+    if (!olds) { kfcache_release(&kh); return -1; }
+
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+
+        if (r->klen > UINT16_MAX || r->vlen > UINT32_MAX ||
+            (size_t)24 + r->klen + r->vlen > (size_t)db->slot_size) {
+            r->status = -1;
+            continue;
+        }
+
+        compute_hash(r->key, r->klen, olds[i].hash);
+
+        /* Lookup current state. */
+        uint8_t old_flag = 0;
+        int found = (kf_lookup(&kh, olds[i].hash, r->key, r->klen, db->data_dir,
+                                &old_flag, &olds[i].old_sid,
+                                &olds[i].old_fid, &olds[i].old_off) == 0);
+        olds[i].old_found = found ? 1 : 0;
+
+        /* if_not_exists gate. Tombstone-free skip — no slot was reserved yet. */
+        if (found && opts->if_not_exists) {
+            r->status = -2;
+            r->was_update = 1;
+            continue;
+        }
+
+        /* Optionally read OLD value bytes for the pre_commit hook (only
+           if this is an update and the caller wants the old record). */
+        uint8_t *old_buf = NULL;
+        size_t   old_vlen = 0;
+        if (found) {
+            if (read_record_value(db, olds[i].old_sid, olds[i].old_fid,
+                                   olds[i].old_off, r->key, r->klen,
+                                   &old_buf, &old_vlen) != 0) {
+                r->status = -1;
+                continue;
+            }
+        }
+
+        /* Reserve target slot. Stream chosen by hash[15] mod streams. */
+        int sid_data = (int)((unsigned)olds[i].hash[15] % (unsigned)db->num_streams);
+        SlotcaskStream *pool = &db->streams[sid_data];
+        SlotcaskFreeSlot fs;
+        uint8_t  target_stream = (uint8_t)sid_data;
+        uint16_t target_fid;
+        uint32_t target_off;
+        int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+        if (got_pool) {
+            target_fid = fs.file_id;
+            target_off = fs.offset;
+        } else {
+            uint32_t fid, off;
+            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
+                free(old_buf);
+                r->status = -1;
+                continue;
+            }
+            target_fid = (uint16_t)fid;
+            target_off = off;
+        }
+
+        /* Write the new record. */
+        if (seg_write_record(db, target_stream, target_fid, target_off,
+                              olds[i].hash, r->key, r->klen,
+                              r->value, r->vlen) != 0) {
+            if (got_pool) pool_push_free(pool, target_fid, target_off);
+            free(old_buf);
+            r->status = -1;
+            continue;
+        }
+
+        /* Pre-commit hook (Option B index ordering). */
+        if (opts->pre_commit) {
+            SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+            int rc = opts->pre_commit(found ? &old_rec : NULL, r, found);
+            if (rc != 0) {
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free(pool, target_fid, target_off);
+                free(old_buf);
+                r->status = -1;
+                continue;
+            }
+        }
+
+        /* Commit point: atomic kf entry update under the held wrlock. */
+        int kf_rc;
+        if (found) {
+            kf_rc = kf_repoint(&kh, olds[i].hash, target_stream,
+                                target_fid, target_off,
+                                r->key, r->klen, db->data_dir);
+        } else {
+            size_t used_delta = 0;
+            kf_rc = kf_put_new(&kh, olds[i].hash, target_stream,
+                                target_fid, target_off,
+                                r->key, r->klen, db->data_dir, &used_delta);
+            if (kf_rc == 1) kf_rc = -1;
+        }
+
+        if (kf_rc != 0) {
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            free(old_buf);
+            r->status = -1;
+            continue;
+        }
+
+        r->was_update = found ? 1 : 0;
+        free(old_buf);
+    }
+
+    kfcache_release(&kh);
+
+    /* Tombstone old slots (for upserts) outside the kf wrlock so the seg
+       write doesn't hold both locks at once. */
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].status != 0) continue;
+        if (!olds[i].old_found) continue;
+        seg_write_flag(db, olds[i].old_sid, olds[i].old_fid,
+                        olds[i].old_off, 2);
+        pool_push_free(&db->streams[olds[i].old_sid],
+                        olds[i].old_fid, olds[i].old_off);
+    }
+
+    free(olds);
     return 0;
 }
 
