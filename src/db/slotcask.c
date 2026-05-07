@@ -512,10 +512,10 @@ static void segcache_drop_slot(int slot) {
 }
 
 /* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */
-static int seg_open_file(const char *path, int writer,
+static int seg_open_file(const char *path, int create,
                          int *out_fd, uint8_t **out_map, size_t *out_size) {
     int fd;
-    if (writer) {
+    if (create) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof(dir), "%s", path);
         char *slash = strrchr(dir, '/');
@@ -529,7 +529,7 @@ static int seg_open_file(const char *path, int writer,
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }
     if ((size_t)st.st_size < SLOTCASK_SEG_MAX_BYTES) {
-        if (!writer) { close(fd); return -1; }
+        if (!create) { close(fd); return -1; }
         if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0) {
             close(fd); return -1;
         }
@@ -543,7 +543,8 @@ static int seg_open_file(const char *path, int writer,
     return 0;
 }
 
-int segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer) {
+int segcache_acquire(SlotcaskSegHandle *h, const char *path,
+                     int create, int writer) {
     h->slot = -1;
     h->writer = writer;
     h->fd = -1;
@@ -551,7 +552,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer) {
     h->map_size = 0;
 
     if (!g_segcache) {
-        if (seg_open_file(path, writer, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size) < 0) return -1;
         return 0;
     }
 
@@ -587,7 +588,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer) {
 
     pthread_mutex_unlock(&g_segcache_lock);
     int fd; uint8_t *map; size_t sz;
-    if (seg_open_file(path, writer, &fd, &map, &sz) < 0) return -1;
+    if (seg_open_file(path, create, &fd, &map, &sz) < 0) return -1;
     pthread_mutex_lock(&g_segcache_lock);
 
     slot = segcache_probe(path, &found);
@@ -609,7 +610,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer) {
             return 0;
         }
         pthread_rwlock_unlock(lock);
-        if (seg_open_file(path, writer, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size) < 0) return -1;
         return 0;
     }
 
@@ -720,7 +721,7 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
     uint16_t k_stored;
     memcpy(&k_stored, rec + 16, 2);
@@ -950,7 +951,13 @@ static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 1) != 0) return -1;
+    /* rdlock is sufficient: each caller owns a unique reserved offset
+       (via append_reserve_n / pool_try_pop_n), so concurrent writes
+       don't race; the segcache rwlock only serialises us against
+       eviction, which takes wrlock and waits for all rdlock holders.
+       create=1: first writer to a freshly-rotated segment file
+       materialises it (open O_CREAT + ftruncate to max). */
+    if (segcache_acquire(&h, path, 1, 0) != 0) return -1;
 
     uint8_t *dst = h.map + offset;
     /* Header without flag set yet. */
@@ -980,7 +987,11 @@ static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 1) != 0) return -1;
+    /* rdlock — same reasoning as seg_write_record: single-byte write to
+       a unique offset, only need to keep eviction at bay. The target
+       file always exists (we're tombstoning a previously-written
+       record), so create=0. */
+    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     h.map[offset + 18] = flag;
     segcache_release(&h);
     return 0;
@@ -1164,7 +1175,7 @@ int slotcask_get(SlotcaskDb *db,
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, stream_id, file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, path, 0) != 0) return -1;
+        if (segcache_acquire(&sh, path, 0, 0) != 0) return -1;
 
         const uint8_t *rec = sh.map + offset;
         if (rec[18] != 1 || memcmp(rec, hash, 16) != 0) {
@@ -1357,7 +1368,7 @@ static int recover_streams(SlotcaskDb *db) {
             char path[PATH_MAX];
             seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
             SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 0) != 0) { free(ids); return -1; }
+            if (segcache_acquire(&h, path, 0, 0) != 0) { free(ids); return -1; }
             off_t pos = 0;
             off_t lim = (off_t)h.map_size;
             while (pos + db->slot_size <= lim) {
@@ -1417,7 +1428,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         char path[PATH_MAX];
         seg_path_for(path, data_dir, i, 0);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 1) != 0) goto fail;
+        if (segcache_acquire(&h, path, 1, 1) != 0) goto fail;
         segcache_release(&h);
     }
 
@@ -1490,7 +1501,7 @@ static int read_record_value(const SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
     if (rec[18] != 1) { segcache_release(&h); return -1; }
     uint16_t k_stored;
@@ -2090,7 +2101,7 @@ static int walk_one_shard(SlotcaskDb *db, int kf_shard_id,
         char seg_path[PATH_MAX];
         seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, seg_path, 0) != 0) continue;
+        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
 
         const uint8_t *rec = sh.map + e->offset;
         if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
@@ -2169,7 +2180,7 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
         char seg_path[PATH_MAX];
         seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, seg_path, 0) != 0) continue;
+        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
         const uint8_t *rec = sh.map + e->offset;
         if (rec[18] != 1 || memcmp(rec, hash16, 16) != 0) {
             segcache_release(&sh);

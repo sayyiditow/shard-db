@@ -1625,6 +1625,15 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 r->payload = payload;
                 r->klen = klen;
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+                /* For v2, override the dispatcher shard with slotcask's
+                   kf-shard mapping. Without this, dispatcher's big-endian
+                   bucketing disagrees with slotcask's little-endian one,
+                   so worker-N's records spread across all kf shards and
+                   every parent worker contends on every kf wrlock. With
+                   the alignment, each parent worker owns exactly one kf
+                   shard and runs lock-free against its peers. */
+                if (sc.storage_version == 2)
+                    r->shard_id = slotcask_kf_shard_for_hash(r->hash, sc.splits);
             }
         }
         if (obj_heap) free(obj_str);
@@ -2125,6 +2134,9 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         r->payload = payload;
         r->klen = klen;
         compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+        /* v2 dispatcher-shard alignment — see cmd_bulk_insert (JSON path) */
+        if (sc.storage_version == 2)
+            r->shard_id = slotcask_kf_shard_for_hash(r->hash, sc.splits);
     }
 
     /* If parse tripped the deadline, abort before any write phase. */

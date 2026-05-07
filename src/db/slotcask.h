@@ -108,7 +108,15 @@ typedef struct {
 void segcache_init(int cap);
 void segcache_shutdown(void);
 /* writer=1: create+mmap MAP_SHARED. writer=0: open+mmap, fail if absent. */
-int  segcache_acquire(SlotcaskSegHandle *h, const char *path, int writer);
+/* `create` controls O_CREAT + ftruncate-to-max in seg_open_file (set on
+   write paths so the first write to a freshly-rotated segment file
+   materialises it). `writer` controls the entry rwlock mode: 1 = wrlock
+   (exclusive — used by callers that mutate cache state, e.g. recovery).
+   Routine record writes use create=1, writer=0: rdlock is sufficient
+   because each caller owns a unique reserved offset, and rdlock still
+   serialises against eviction (which takes wrlock). */
+int  segcache_acquire(SlotcaskSegHandle *h, const char *path,
+                      int create, int writer);
 void segcache_release(SlotcaskSegHandle *h);
 
 /* ============================================================ Per-stream pool */
