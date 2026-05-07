@@ -1871,6 +1871,24 @@ static void *multi_exists_shard_worker(void *arg) {
     MultiExistsShardWork *sw = (MultiExistsShardWork *)arg;
     if (sw->count == 0) return NULL;
 
+    /* v2 dispatch: call slotcask_exists per key. The shard-grouping the
+       caller did is harmless for v2 (slotcask routes per hash internally).
+       Doing it per-worker keeps the worker signature uniform. */
+    if (sw->sch->storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
+            .streams = sw->sch->streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+        if (!sdb) return NULL;
+        for (int ei = 0; ei < sw->count; ei++) {
+            MultiExistsEntry *e = &sw->entries[ei];
+            int rc = slotcask_exists(sdb, e->key, strlen(e->key));
+            e->found = (rc == 1) ? 1 : 0;
+        }
+        return NULL;
+    }
+
     int sid = sw->entries[0].shard_id;
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
@@ -2105,6 +2123,29 @@ typedef struct {
 static void *multi_get_shard_worker(void *arg) {
     MultiGetShardWork *sw = (MultiGetShardWork *)arg;
     if (sw->count == 0) return NULL;
+
+    /* v2 dispatch: slotcask_get per key, decode via the same TypedSchema.
+       Workers can share fs->ts because typed_decode is read-only. */
+    if (sw->sch->storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
+            .streams = sw->sch->streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+        if (!sdb) return NULL;
+        for (int ei = 0; ei < sw->count; ei++) {
+            MultiGetEntry *e = &sw->entries[ei];
+            void *val = NULL; size_t vlen = 0;
+            if (slotcask_get(sdb, e->key, strlen(e->key), &val, &vlen) == 0) {
+                char *decoded = sw->fs ? typed_decode(sw->fs->ts,
+                                                       (const uint8_t *)val,
+                                                       (uint32_t)vlen) : NULL;
+                e->result_json = decoded ? decoded : strdup("null");
+                free(val);
+            }
+        }
+        return NULL;
+    }
 
     int sid = sw->entries[0].shard_id;
     char shard[PATH_MAX];
