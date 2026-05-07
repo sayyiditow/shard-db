@@ -1712,6 +1712,24 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
  * Tombstoning of old slots (for upserts) happens AFTER kfcache_release
  * so segcache wrlocks for old segments don't hold the kf lock too.
  */
+/* Per-record state carried across the four phases of bulk_upsert. Computed
+   in Phase 1 (kf lookup), populated in Phase 3 (slot reservation), consumed
+   in Phase 4 (kf commit) and Phase 5 (old-slot tombstoning). */
+typedef struct {
+    uint8_t  hash[16];
+    uint8_t  old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    uint8_t *old_buf;       /* malloc'd if old_found, NULL otherwise */
+    size_t   old_vlen;
+    uint8_t  old_found;
+    uint8_t  needs_write;   /* 0 = early-skipped (validation, if_not_exists, lookup err) */
+    uint8_t  target_stream;
+    uint16_t target_fid;
+    uint32_t target_off;
+    uint8_t  got_pool;      /* 1 = slot came from free pool (rollback path differs) */
+} SlotcaskBulkState;
+
 int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *opts) {
@@ -1724,17 +1742,11 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
 
-    /* Per-record old-slot bookkeeping for post-batch tombstoning. */
-    typedef struct {
-        uint8_t  hash[16];
-        uint8_t  old_sid;
-        uint16_t old_fid;
-        uint32_t old_off;
-        uint8_t  old_found;
-    } OldRef;
-    OldRef *olds = calloc(n, sizeof(OldRef));
-    if (!olds) { kfcache_release(&kh); return -1; }
+    SlotcaskBulkState *st = calloc(n, sizeof(SlotcaskBulkState));
+    if (!st) { kfcache_release(&kh); return -1; }
 
+    /* ===== Phase 1 — kf_lookup per record + read OLD value if upsert.
+       All under the held kf wrlock. */
     for (size_t i = 0; i < n; i++) {
         SlotcaskBulkRec *r = &recs[i];
         r->status = 0;
@@ -1746,121 +1758,274 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             continue;
         }
 
-        compute_hash(r->key, r->klen, olds[i].hash);
-
-        /* Lookup current state. */
+        compute_hash(r->key, r->klen, st[i].hash);
         uint8_t old_flag = 0;
-        int found = (kf_lookup(&kh, olds[i].hash, r->key, r->klen, db->data_dir,
-                                &old_flag, &olds[i].old_sid,
-                                &olds[i].old_fid, &olds[i].old_off) == 0);
-        olds[i].old_found = found ? 1 : 0;
+        int found = (kf_lookup(&kh, st[i].hash, r->key, r->klen, db->data_dir,
+                                &old_flag, &st[i].old_sid,
+                                &st[i].old_fid, &st[i].old_off) == 0);
+        st[i].old_found = found ? 1 : 0;
 
-        /* if_not_exists gate. Tombstone-free skip — no slot was reserved yet. */
         if (found && opts->if_not_exists) {
             r->status = -2;
             r->was_update = 1;
             continue;
         }
 
-        /* Optionally read OLD value bytes for the pre_commit hook (only
-           if this is an update and the caller wants the old record). */
-        uint8_t *old_buf = NULL;
-        size_t   old_vlen = 0;
         if (found) {
-            if (read_record_value(db, olds[i].old_sid, olds[i].old_fid,
-                                   olds[i].old_off, r->key, r->klen,
-                                   &old_buf, &old_vlen) != 0) {
+            if (read_record_value(db, st[i].old_sid, st[i].old_fid,
+                                   st[i].old_off, r->key, r->klen,
+                                   &st[i].old_buf, &st[i].old_vlen) != 0) {
                 r->status = -1;
                 continue;
             }
         }
 
-        /* Reserve target slot. Stream chosen by hash[15] mod streams. */
-        int sid_data = (int)((unsigned)olds[i].hash[15] % (unsigned)db->num_streams);
-        SlotcaskStream *pool = &db->streams[sid_data];
-        SlotcaskFreeSlot fs;
-        uint8_t  target_stream = (uint8_t)sid_data;
-        uint16_t target_fid;
-        uint32_t target_off;
-        int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+        st[i].target_stream = (uint8_t)((unsigned)st[i].hash[15] %
+                                         (unsigned)db->num_streams);
+        st[i].needs_write = 1;
+    }
+
+    /* ===== Phase 2 — bucket records-needing-write by target stream. */
+    int *stream_counts = calloc(db->num_streams, sizeof(int));
+    int **stream_idx   = calloc(db->num_streams, sizeof(int *));
+    int *stream_pos    = calloc(db->num_streams, sizeof(int));
+    if (!stream_counts || !stream_idx || !stream_pos) goto oom;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].needs_write) stream_counts[st[i].target_stream]++;
+    }
+    for (int s = 0; s < db->num_streams; s++) {
+        if (stream_counts[s] > 0) {
+            stream_idx[s] = malloc(stream_counts[s] * sizeof(int));
+            if (!stream_idx[s]) goto oom;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].needs_write) {
+            int s = st[i].target_stream;
+            stream_idx[s][stream_pos[s]++] = (int)i;
+        }
+    }
+
+    /* ===== Phase 3 — per-stream batched reserve + seg write.
+       Common path (fresh-insert / pool empty): one append_reserve_n + one
+       segcache_acquire per stream-bucket, vs N each before. */
+    for (int s = 0; s < db->num_streams; s++) {
+        int cnt = stream_counts[s];
+        if (cnt == 0) continue;
+        SlotcaskStream *pool = &db->streams[s];
+
+        SlotcaskFreeSlot *fs = malloc((size_t)cnt * sizeof(SlotcaskFreeSlot));
+        if (!fs) {
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        int got_pool = (pool_try_pop_n(pool, (size_t)cnt, fs) == 0);
+
         if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid, off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
-                free(old_buf);
-                r->status = -1;
+            /* Pool slots can span multiple file_ids. Sort (rec_idx, fs)
+               pairs by file_id so consecutive records in the loop hit the
+               same segcache entry — single segcache_acquire per unique
+               file_id, vs N per record. Tombstoned slots for an update-
+               heavy workload typically cluster in a handful of files,
+               so this batches well in practice. */
+            typedef struct { uint16_t fid; uint32_t off; int rec_idx; } PoolItem;
+            PoolItem *items = malloc((size_t)cnt * sizeof(PoolItem));
+            if (!items) {
+                for (int k = 0; k < cnt; k++) {
+                    int i = stream_idx[s][k];
+                    pool_push_free(pool, fs[k].file_id, fs[k].offset);
+                    recs[i].status = -1;
+                }
+                free(fs);
                 continue;
             }
-            target_fid = (uint16_t)fid;
-            target_off = off;
-        }
+            for (int k = 0; k < cnt; k++) {
+                items[k].fid     = fs[k].file_id;
+                items[k].off     = fs[k].offset;
+                items[k].rec_idx = stream_idx[s][k];
+            }
+            free(fs);
+            /* Sort by file_id (insertion sort — cnt typically small for
+               pool path; n^2 is fine and avoids qsort callback overhead). */
+            for (int a = 1; a < cnt; a++) {
+                PoolItem tmp = items[a];
+                int b = a - 1;
+                while (b >= 0 && items[b].fid > tmp.fid) {
+                    items[b + 1] = items[b];
+                    b--;
+                }
+                items[b + 1] = tmp;
+            }
 
-        /* Write the new record. */
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              olds[i].hash, r->key, r->klen,
-                              r->value, r->vlen) != 0) {
-            if (got_pool) pool_push_free(pool, target_fid, target_off);
-            free(old_buf);
-            r->status = -1;
+            int k = 0;
+            while (k < cnt) {
+                int run_end = k + 1;
+                while (run_end < cnt && items[run_end].fid == items[k].fid)
+                    run_end++;
+                /* records [k..run_end) all target file items[k].fid. */
+                char path[PATH_MAX];
+                seg_path_for(path, db->data_dir, (uint8_t)s, items[k].fid);
+                SlotcaskSegHandle h;
+                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                    for (int j = k; j < run_end; j++) {
+                        int i = items[j].rec_idx;
+                        pool_push_free(pool, items[j].fid, items[j].off);
+                        recs[i].status = -1;
+                    }
+                    k = run_end;
+                    continue;
+                }
+                for (int j = k; j < run_end; j++) {
+                    int i = items[j].rec_idx;
+                    SlotcaskBulkRec *r = &recs[i];
+                    st[i].target_fid = items[j].fid;
+                    st[i].target_off = items[j].off;
+                    st[i].got_pool   = 1;
+
+                    uint8_t *dst = h.map + items[j].off;
+                    memcpy(dst, st[i].hash, 16);
+                    uint16_t k16 = (uint16_t)r->klen;
+                    memcpy(dst + 16, &k16, 2);
+                    dst[18] = 0;
+                    dst[19] = 0;
+                    uint32_t v32 = (uint32_t)r->vlen;
+                    memcpy(dst + 20, &v32, 4);
+                    memcpy(dst + 24, r->key, r->klen);
+                    memcpy(dst + 24 + r->klen, r->value, r->vlen);
+                    size_t used = 24 + r->klen + r->vlen;
+                    if (used < (size_t)db->slot_size) {
+                        memset(dst + used, 0, (size_t)db->slot_size - used);
+                    }
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
+                    dst[18] = 1;
+                }
+                segcache_release(&h);
+                k = run_end;
+            }
+            free(items);
+            continue;
+        }
+        free(fs);
+
+        uint32_t *offsets = malloc((size_t)cnt * sizeof(uint32_t));
+        if (!offsets) {
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        uint32_t base_fid = 0;
+        if (append_reserve_n(db, pool, (size_t)cnt, &base_fid, offsets) != 0) {
+            free(offsets);
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
             continue;
         }
 
-        /* Pre-commit hook (Option B index ordering). */
+        /* All cnt slots are in one file (append_reserve_n rotates upfront,
+           never mid-batch). Single segcache_acquire covers them all. */
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, (uint8_t)s, base_fid);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 1, 0) != 0) {
+            free(offsets);
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+
+        for (int k = 0; k < cnt; k++) {
+            int i = stream_idx[s][k];
+            SlotcaskBulkRec *r = &recs[i];
+            st[i].target_fid = (uint16_t)base_fid;
+            st[i].target_off = offsets[k];
+            st[i].got_pool   = 0;
+
+            uint8_t *dst = h.map + offsets[k];
+            memcpy(dst, st[i].hash, 16);
+            uint16_t k16 = (uint16_t)r->klen;
+            memcpy(dst + 16, &k16, 2);
+            dst[18] = 0;        /* flag stays 0 until payload is in place */
+            dst[19] = 0;
+            uint32_t v32 = (uint32_t)r->vlen;
+            memcpy(dst + 20, &v32, 4);
+            memcpy(dst + 24, r->key, r->klen);
+            memcpy(dst + 24 + r->klen, r->value, r->vlen);
+            size_t used = 24 + r->klen + r->vlen;
+            if (used < (size_t)db->slot_size) {
+                memset(dst + used, 0, (size_t)db->slot_size - used);
+            }
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            dst[18] = 1;
+        }
+        segcache_release(&h);
+        free(offsets);
+    }
+
+    /* ===== Phase 4 — per-record pre_commit + kf commit (under held kf wrlock). */
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].status != 0) continue;
+        if (!st[i].needs_write) continue;
+        SlotcaskBulkRec *r = &recs[i];
+
         if (opts->pre_commit) {
-            SlotcaskOldRecord old_rec = { old_buf, old_vlen };
-            int rc = opts->pre_commit(found ? &old_rec : NULL, r, found);
+            SlotcaskOldRecord old_rec = { st[i].old_buf, st[i].old_vlen };
+            int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
+                                       r, st[i].old_found);
             if (rc != 0) {
-                seg_write_flag(db, target_stream, target_fid, target_off, 2);
-                pool_push_free(pool, target_fid, target_off);
-                free(old_buf);
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
                 r->status = -1;
                 continue;
             }
         }
 
-        /* Commit point: atomic kf entry update under the held wrlock. */
         int kf_rc;
-        if (found) {
-            kf_rc = kf_repoint(&kh, olds[i].hash, target_stream,
-                                target_fid, target_off,
+        if (st[i].old_found) {
+            kf_rc = kf_repoint(&kh, st[i].hash, st[i].target_stream,
+                                st[i].target_fid, st[i].target_off,
                                 r->key, r->klen, db->data_dir);
         } else {
             size_t used_delta = 0;
-            kf_rc = kf_put_new(&kh, olds[i].hash, target_stream,
-                                target_fid, target_off,
+            kf_rc = kf_put_new(&kh, st[i].hash, st[i].target_stream,
+                                st[i].target_fid, st[i].target_off,
                                 r->key, r->klen, db->data_dir, &used_delta);
             if (kf_rc == 1) kf_rc = -1;
         }
-
         if (kf_rc != 0) {
-            seg_write_flag(db, target_stream, target_fid, target_off, 2);
-            pool_push_free(pool, target_fid, target_off);
-            free(old_buf);
+            seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                            st[i].target_off, 2);
+            pool_push_free(&db->streams[st[i].target_stream],
+                            st[i].target_fid, st[i].target_off);
             r->status = -1;
             continue;
         }
-
-        r->was_update = found ? 1 : 0;
-        free(old_buf);
+        r->was_update = st[i].old_found ? 1 : 0;
     }
 
     kfcache_release(&kh);
 
-    /* Tombstone old slots (for upserts) outside the kf wrlock so the seg
-       write doesn't hold both locks at once. */
+    /* ===== Phase 5 — tombstone OLD slots for successful upserts.
+       Done outside the kf wrlock so the seg write doesn't hold both locks. */
     for (size_t i = 0; i < n; i++) {
         if (recs[i].status != 0) continue;
-        if (!olds[i].old_found) continue;
-        seg_write_flag(db, olds[i].old_sid, olds[i].old_fid,
-                        olds[i].old_off, 2);
-        pool_push_free(&db->streams[olds[i].old_sid],
-                        olds[i].old_fid, olds[i].old_off);
+        if (!st[i].old_found) continue;
+        seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
+        pool_push_free(&db->streams[st[i].old_sid],
+                        st[i].old_fid, st[i].old_off);
     }
 
-    free(olds);
+    for (size_t i = 0; i < n; i++) free(st[i].old_buf);
+    if (stream_idx) for (int s = 0; s < db->num_streams; s++) free(stream_idx[s]);
+    free(stream_idx); free(stream_pos); free(stream_counts);
+    free(st);
     return 0;
+
+oom:
+    kfcache_release(&kh);
+    if (stream_idx) for (int s = 0; s < db->num_streams; s++) free(stream_idx[s]);
+    free(stream_idx); free(stream_pos); free(stream_counts);
+    for (size_t i = 0; i < n; i++) free(st[i].old_buf);
+    free(st);
+    return -1;
 }
 
 int slotcask_delete_with_hooks(SlotcaskDb *db,
