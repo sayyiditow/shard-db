@@ -267,7 +267,7 @@ static int bench_queries_run(void) {
     char create_obj[2048];
     snprintf(create_obj, sizeof(create_obj),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-        "\"splits\":%ld,\"max_key\":32,"
+        "\"splits\":%ld,\"max_key\":32,\"storage_version\":%d,"
         "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
                     "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
                     "\"rank:short\",\"score:double\",\"active:bool\","
@@ -276,7 +276,7 @@ static int bench_queries_run(void) {
         "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
                      "\"score\",\"active\",\"level\",\"birthday\","
                      "\"created_at\",\"balance\",\"hourly_rate\"]}",
-        SPLITS);
+        SPLITS, bench_storage_version());
     tc_request(tc, create_obj, &resp);
     free(resp); resp = NULL;
 

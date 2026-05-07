@@ -12785,8 +12785,12 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* storage_version: 0 (omitted) → default 1 (legacy probe-into-slot).
-       2 → slotcask. Any other value rejected. */
+    /* storage_version: 0 (omitted) → default 1 (legacy probe-into-slot)
+       for now. Flipping the default to 2 surfaced v2 gaps in aggregate's
+       PRIMARY_INTERSECT path and a few other places that aren't in the
+       Phase 3 audit. The flip is queued behind those fixes — until then,
+       new objects must opt into v2 explicitly via "storage_version":2,
+       and benches do so via SHARD_BENCH_STORAGE_VERSION (default 2). */
     if (storage_version == 0) storage_version = 1;
     if (storage_version != 1 && storage_version != 2) {
         OUT("{\"error\":\"storage_version=%d invalid; must be 1 (legacy) or 2 (slotcask)\"}\n",

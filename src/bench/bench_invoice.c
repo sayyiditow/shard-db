@@ -244,13 +244,17 @@ static int bench_invoice_run(void)
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
-        "\"splits\":64,\"max_key\":16,"
-        "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
-        "\"indexes\":[]}",
-        &resp);
-    free(resp); resp = NULL;
+    {
+        char create[2048];
+        snprintf(create, sizeof(create),
+            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
+            "\"splits\":64,\"max_key\":16,\"storage_version\":%d,"
+            "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
+            "\"indexes\":[]}",
+            bench_storage_version());
+        tc_request(tc, create, &resp);
+        free(resp); resp = NULL;
+    }
 
     /* ---- 2. Generate records ------------------------------------------- */
     printf("Generating %d invoice records...\n", COUNT);
