@@ -6080,20 +6080,17 @@ static int join_bt_first_cb(const char *val, size_t vlen, const uint8_t *hash16,
 }
 
 /* Look up the remote record for one join. Returns 1 if found, 0 otherwise.
-   On success, *out_fc holds the mmap handle (caller must fcache_release) and
-   *out_raw points to the record's value bytes in the shard map. */
+   On success, *out_rr is populated; caller must release_record_ref(out_rr).
+   Storage-version-agnostic: read_record_ref dispatches v1/v2 internally. */
 static int lookup_remote(const JoinSpec *j, const char *db_root,
                          const char *local_key, size_t local_len,
-                         FcacheRead *out_fc, const uint8_t **out_raw) {
-    out_fc->map = NULL;
-    *out_raw = NULL;
+                         RecordRef *out_rr) {
+    memset(out_rr, 0, sizeof(*out_rr));
     if (local_len == 0) return 0;
 
     uint8_t hash[16];
-    int shard_id, start_slot;
-
     if (j->remote_is_key) {
-        compute_addr(local_key, local_len, j->remote_sch.splits, hash, &shard_id, &start_slot);
+        compute_hash_raw(local_key, local_len, hash);
     } else {
         JoinBtHit hit = {{0}, 0};
         /* Encode local_key as an index key for the REMOTE field's type —
@@ -6112,36 +6109,22 @@ static int lookup_remote(const JoinSpec *j, const char *db_root,
         }
         if (!hit.found) return 0;
         memcpy(hash, hit.hash, 16);
-        addr_from_hash(hash, j->remote_sch.splits, &shard_id, &start_slot);
     }
 
-    char path[PATH_MAX];
-    build_shard_path(path, sizeof(path), db_root, j->object, shard_id);
-    FcacheRead fc = fcache_get_read(path);
-    if (!fc.map) return 0;
+    if (read_record_ref(db_root, j->object, &j->remote_sch, hash, out_rr) != 0)
+        return 0;
 
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask  = slots - 1;
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)start_slot + p) & mask;
-        const SlotHeader *h = (const SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash, 16) != 0) continue;
-        /* For indexed lookup, also verify key equality is satisfied by the index
-           (btree values equal local_key by construction). For primary-key lookup,
-           verify key bytes match local_key. */
-        if (j->remote_is_key) {
-            if (h->key_len != local_len) continue;
-            const uint8_t *kb = fc.map + zoneB_off(s, slots, j->remote_sch.slot_size);
-            if (memcmp(kb, local_key, local_len) != 0) continue;
+    /* For primary-key joins, guard against 16-byte hash collisions by
+       verifying the stored key bytes match. The indexed-field path already
+       verified equality via the btree. */
+    if (j->remote_is_key) {
+        if (out_rr->klen != local_len ||
+            memcmp(out_rr->key, local_key, local_len) != 0) {
+            release_record_ref(out_rr);
+            return 0;
         }
-        *out_fc = fc;
-        *out_raw = fc.map + zoneB_off(s, slots, j->remote_sch.slot_size) + h->key_len;
-        return 1;
     }
-    fcache_release(fc);
-    return 0;
+    return 1;
 }
 
 /* Write one field value as a JSON token (number/"string"/null) into buf.
@@ -6386,12 +6369,12 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     int match = criteria_match_tree((const uint8_t *)raw, sc->tree, sc->fs);
 
     if (match) {
-        FcacheRead *join_handles = NULL;
-        const uint8_t **join_raws = NULL;
+        RecordRef     *join_refs = NULL;
+        const uint8_t **join_raws = NULL;  /* parallel array of value ptrs for emit helpers */
         int dropped = 0;
         if (sc->njoins > 0) {
-            join_handles = calloc(sc->njoins, sizeof(FcacheRead));
-            join_raws    = calloc(sc->njoins, sizeof(const uint8_t *));
+            join_refs = calloc(sc->njoins, sizeof(RecordRef));
+            join_raws = calloc(sc->njoins, sizeof(const uint8_t *));
             for (int i = 0; i < sc->njoins; i++) {
                 char lk[1024];
                 int llen = extract_local_key(&sc->joins[i], (const uint8_t *)raw,
@@ -6399,7 +6382,8 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                 int found = 0;
                 if (llen > 0) {
                     found = lookup_remote(&sc->joins[i], sc->db_root, lk, (size_t)llen,
-                                          &join_handles[i], &join_raws[i]);
+                                          &join_refs[i]);
+                    if (found) join_raws[i] = join_refs[i].val;
                 }
                 if (!found && sc->joins[i].type == JOIN_INNER) { dropped = 1; break; }
             }
@@ -6413,9 +6397,8 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
             if (sc->limit > 0 && sc->printed >= sc->limit) {
                 pthread_mutex_unlock(&sc->lock);
                 if (sc->njoins > 0) {
-                    for (int i = 0; i < sc->njoins; i++)
-                        if (join_handles[i].map) fcache_release(join_handles[i]);
-                    free(join_handles); free(join_raws);
+                    for (int i = 0; i < sc->njoins; i++) release_record_ref(&join_refs[i]);
+                    free(join_refs); free(join_raws);
                 }
                 free(key);
                 return 1;
@@ -6506,10 +6489,8 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
         }
 
         if (sc->njoins > 0) {
-            for (int i = 0; i < sc->njoins; i++) {
-                if (join_handles[i].map) fcache_release(join_handles[i]);
-            }
-            free(join_handles);
+            for (int i = 0; i < sc->njoins; i++) release_record_ref(&join_refs[i]);
+            free(join_refs);
             free(join_raws);
         }
     }
@@ -7036,11 +7017,11 @@ static void *shard_find_worker(void *arg) {
 
             if (match) {
                 /* Apply joins if present — inner-drop on no-match. */
-                FcacheRead *jhs = NULL;
-                const uint8_t **jraws = NULL;
+                RecordRef     *jrr = NULL;
+                const uint8_t **jraws = NULL;  /* parallel value-ptr array for emit helpers */
                 int dropped = 0;
                 if (sw->njoins > 0) {
-                    jhs = calloc(sw->njoins, sizeof(FcacheRead));
+                    jrr = calloc(sw->njoins, sizeof(RecordRef));
                     jraws = calloc(sw->njoins, sizeof(const uint8_t *));
                     for (int i = 0; i < sw->njoins; i++) {
                         char lk[1024];
@@ -7048,9 +7029,11 @@ static void *shard_find_worker(void *arg) {
                                                      sw->fs ? sw->fs->ts : NULL,
                                                      lk, sizeof(lk));
                         int found = 0;
-                        if (llen > 0)
+                        if (llen > 0) {
                             found = lookup_remote(&sw->joins[i], sw->db_root, lk, (size_t)llen,
-                                                  &jhs[i], &jraws[i]);
+                                                  &jrr[i]);
+                            if (found) jraws[i] = jrr[i].val;
+                        }
                         if (!found && sw->joins[i].type == JOIN_INNER) { dropped = 1; break; }
                     }
                 }
@@ -7065,9 +7048,8 @@ static void *shard_find_worker(void *arg) {
                             sw->result_cap = 0;
                             free(key);
                             if (sw->njoins > 0) {
-                                for (int i = 0; i < sw->njoins; i++)
-                                    if (jhs[i].map) fcache_release(jhs[i]);
-                                free(jhs); free(jraws);
+                                for (int i = 0; i < sw->njoins; i++) release_record_ref(&jrr[i]);
+                                free(jrr); free(jraws);
                             }
                             fcache_release(fc);
                             return NULL;
@@ -7134,9 +7116,8 @@ static void *shard_find_worker(void *arg) {
                 }
 
                 if (sw->njoins > 0) {
-                    for (int i = 0; i < sw->njoins; i++)
-                        if (jhs[i].map) fcache_release(jhs[i]);
-                    free(jhs); free(jraws);
+                    for (int i = 0; i < sw->njoins; i++) release_record_ref(&jrr[i]);
+                    free(jrr); free(jraws);
                 }
             }
             free(key);
@@ -7354,6 +7335,15 @@ static int process_batch(CollectedHash *batch, int batch_count,
     return batch_matches;
 }
 
+/* Forward decl — keyset_emit_find lives further down. v2 path calls it. */
+static int keyset_emit_find(const char *db_root, const char *object,
+                            const Schema *sch, KeySet *ks,
+                            CriteriaNode *tree_for_rematch,
+                            ExcludedKeys *excluded, int offset, int limit,
+                            const char **proj_fields, int proj_count,
+                            FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
+                            JoinSpec *joins, int njoins, QueryDeadline *dl);
+
 /* Orchestrate: collect hashes from B+ tree, group by shard, process */
 static int idx_find_parallel(const char *db_root, const char *object, const Schema *sch,
                              const char *primary_idx_path, CriteriaNode *tree,
@@ -7387,6 +7377,27 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
 
     if (cc.budget_exceeded) { collect_ctx_destroy(&cc); return -2; }
     if (cc.count == 0)      { collect_ctx_destroy(&cc); return 0; }
+
+    /* v2 dispatch: process_batch is coupled to v1's Zone A layout (groups
+       hashes by shard_id, opens each shard mmap once, runs shard_find_worker
+       per group). For v2 the per-shard grouping doesn't help — slotcask
+       routes per hash internally — so we feed the collected hashes through
+       keyset_emit_find which already speaks RecordRef + read_record_ref.
+       Joins handled there too via the dispatched lookup_remote (Phase 3G). */
+    if (sch->storage_version == 2) {
+        KeySet *ks = keyset_new(cc.count);
+        if (!ks) { collect_ctx_destroy(&cc); return -2; }
+        for (size_t i = 0; i < cc.count; i++)
+            keyset_insert(ks, cc.entries[i].hash);
+        int rc = keyset_emit_find(db_root, object, sch, ks,
+                                  tree, excluded, offset, limit,
+                                  proj_fields, proj_count, fs,
+                                  rows_fmt, dict_fmt, csv_delim,
+                                  joins, njoins, dl);
+        keyset_free(ks);
+        collect_ctx_destroy(&cc);
+        return rc;
+    }
 
     int count = 0, printed = 0;
     process_batch(cc.entries, cc.count, db_root, object, sch,
@@ -8750,20 +8761,22 @@ static int keyset_emit_find(const char *db_root, const char *object,
         {  /* Single-iteration block — no probe loop in the dispatched path. */
 
             /* Match. Apply joins (inner-drop), offset, emit. */
-            FcacheRead *jhs = NULL;
-            const uint8_t **jraws = NULL;
+            RecordRef *jrr = NULL;
+            const uint8_t **jraws = NULL;  /* parallel value-ptr array for emit helpers */
             int dropped = 0;
             if (njoins > 0) {
-                jhs = calloc(njoins, sizeof(FcacheRead));
+                jrr = calloc(njoins, sizeof(RecordRef));
                 jraws = calloc(njoins, sizeof(const uint8_t *));
                 for (int i = 0; i < njoins; i++) {
                     char lk[1024];
                     int llen = extract_local_key(&joins[i], raw,
                                                  fs ? fs->ts : NULL, lk, sizeof(lk));
                     int jfound = 0;
-                    if (llen > 0)
+                    if (llen > 0) {
                         jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
-                                               &jhs[i], &jraws[i]);
+                                               &jrr[i]);
+                        if (jfound) jraws[i] = jrr[i].val;
+                    }
                     if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
                 }
             }
@@ -8878,10 +8891,9 @@ static int keyset_emit_find(const char *db_root, const char *object,
                 }
             }
 
-            if (jhs) {
-                for (int i = 0; i < njoins; i++)
-                    if (jhs[i].map) fcache_release(jhs[i]);
-                free(jhs); free(jraws);
+            if (jrr) {
+                for (int i = 0; i < njoins; i++) release_record_ref(&jrr[i]);
+                free(jrr); free(jraws);
             }
         }
         release_record_ref(&rr);
