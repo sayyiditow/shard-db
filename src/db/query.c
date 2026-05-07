@@ -11961,6 +11961,50 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     if (!rows) { OUT("{\"error\":\"oom\"}\n"); return 1; }
     int nrows = 0;
 
+    if (sch.storage_version == 2) {
+        /* v2 layout: walk data/kf/NNN.kf. Each file is an array of 24-byte
+           SlotcaskKfEntry (hash16 + flag + stream + file_id + offset).
+           slots = file_bytes / 24; live records = count of entries with
+           flag==1 at stride 24. The walk is cheap (sequential mmap reads). */
+        char kf_dir[PATH_MAX];
+        snprintf(kf_dir, sizeof(kf_dir), "%s/kf", data_dir);
+        DIR *d1 = opendir(kf_dir);
+        if (!d1) { OUT("{\"error\":\"Object [%s] has no kf data\"}\n", object); free(rows); return 1; }
+        struct dirent *e1;
+        while ((e1 = readdir(d1))) {
+            if (e1->d_name[0] == '.') continue;
+            size_t nl = strlen(e1->d_name);
+            if (nl < 4 || strcmp(e1->d_name + nl - 3, ".kf") != 0) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", kf_dir, e1->d_name);
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st; if (fstat(fd, &st) < 0) { close(fd); continue; }
+            uint32_t slots = (uint32_t)(st.st_size / 24);
+            uint32_t live  = 0;
+            if (slots > 0) {
+                void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    const uint8_t *p = (const uint8_t *)m + 16;  /* flag byte */
+                    for (uint32_t k = 0; k < slots; k++, p += 24)
+                        if (*p == 1) live++;
+                    munmap(m, (size_t)st.st_size);
+                }
+            }
+            close(fd);
+            int sid = (int)strtol(e1->d_name, NULL, 10);
+            if (nrows >= cap) {
+                cap *= 2;
+                Row *t = xrealloc_or_free(rows, cap * sizeof(*t));
+                if (!t) { rows = NULL; nrows = 0; break; }
+                rows = t;
+            }
+            rows[nrows++] = (Row){ sid, slots, live, (uint64_t)st.st_size };
+        }
+        closedir(d1);
+        goto sort_and_emit;
+    }
+
     DIR *d1 = opendir(data_dir);
     if (!d1) { OUT("{\"error\":\"Object [%s] has no data\"}\n", object); free(rows); return 1; }
     struct dirent *e1;
@@ -11987,6 +12031,8 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         rows[nrows++] = (Row){ sid, hdr.slots_per_shard, hdr.record_count, (uint64_t)st.st_size };
     }
     closedir(d1);
+
+sort_and_emit:
 
     /* Sort by shard_id */
     for (int i = 1; i < nrows; i++) {
