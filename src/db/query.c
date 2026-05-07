@@ -2643,6 +2643,9 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
 
     for (int i = 0; i < key_count; i++) {
         compute_addr(keys[i], strlen(keys[i]), sch.splits, hashes[i], &shard_ids[i], &start_slots[i]);
+        /* v2 alignment — see cmd_bulk_insert for rationale. */
+        if (sch.storage_version == 2)
+            shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
         order[i] = i;
     }
 
@@ -3240,6 +3243,9 @@ int cmd_bulk_update(const char *db_root, const char *object,
         all[i].klen = strlen(ctx.keys[i]);
         compute_addr(all[i].key, all[i].klen, sch.splits,
                      all[i].hash, &all[i].shard_id, &all[i].start_slot);
+        /* v2 alignment — see cmd_bulk_insert for rationale. */
+        if (sch.storage_version == 2)
+            all[i].shard_id = compute_record_shard(all[i].hash, sch.splits, 2);
     }
 
     /* Bucket by shard_id. */
@@ -3728,6 +3734,9 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
         r->body_start = key_end + 1;
         r->line_end   = line_end;
         compute_addr(r->key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+        /* v2 alignment — see cmd_bulk_insert for rationale. */
+        if (sch.storage_version == 2)
+            r->shard_id = compute_record_shard(r->hash, sch.splits, 2);
     }
 
     /* ===== Phase 1.5: bucket by shard_id.
@@ -4298,6 +4307,9 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         r->key = key;
         r->klen = klen;
         compute_addr(key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+        /* v2 alignment — see cmd_bulk_insert for rationale. */
+        if (sch.storage_version == 2)
+            r->shard_id = compute_record_shard(r->hash, sch.splits, 2);
         if (n_touched > 0) {
             r->n_fields = n_touched;
             r->field_indices = malloc(n_touched * sizeof(int));
