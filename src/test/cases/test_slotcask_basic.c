@@ -169,9 +169,98 @@ static int test_slotcask_basic_run(void) {
     ASSERT_EQ_INT(rc, -1, "deleted key still missing after reopen");
     if (v) free(v);
 
+    /* ===== Phase 3A primitives: walk_live + lookup_by_hash ===== */
+
+    /* Live record count should match what we expect:
+       inserted 10 (user_000..009), deleted 2 (user_007, user_008),
+       inserted 1 (user_999) — net 9 live records. */
+    struct { int n; } walk_ctx = {0};
+    int walk_inc(const uint8_t hash[16], const void *key, size_t klen,
+                 const void *value, size_t vlen, void *ctx);
+    rc = slotcask_walk_live(&db, walk_inc, &walk_ctx);
+    ASSERT_EQ_INT(rc, 0, "walk_live returns 0");
+    ASSERT_EQ_INT(walk_ctx.n, 9, "walk_live visited 9 live records");
+
+    /* lookup_by_hash for a known key: derive its hash and confirm we hit it. */
+    {
+        /* Use the same xxh3-128 the engine uses. We can't include xxhash.h
+           here (test layer), so instead exercise lookup_by_hash via the
+           same data slotcask_get returns: get the value once, then walk
+           live records and capture the hash for "user_999", then look up
+           by that hash. */
+        struct { uint8_t hash[16]; int found; } seek = {{0}, 0};
+        int find_user999(const uint8_t hash[16], const void *key, size_t klen,
+                         const void *value, size_t vlen, void *ctx);
+        rc = slotcask_walk_live(&db, find_user999, &seek);
+        ASSERT_EQ_INT(seek.found, 1, "found user_999 during walk");
+
+        /* Now look up by that hash directly. */
+        struct { int n; size_t got_vlen; uint8_t got_first; } hl = {0, 0, 0};
+        int hash_lookup_cb(const uint8_t hash[16], const void *key, size_t klen,
+                           const void *value, size_t vlen, void *ctx);
+        rc = slotcask_lookup_by_hash(&db, seek.hash, hash_lookup_cb, &hl);
+        ASSERT_EQ_INT(rc, 0, "lookup_by_hash returns 0");
+        ASSERT_EQ_INT(hl.n, 1, "lookup_by_hash found exactly one record");
+        ASSERT_EQ_INT((int)hl.got_vlen, 5, "lookup_by_hash value vlen=5");
+        ASSERT_EQ_INT(hl.got_first, 'R', "lookup_by_hash value starts with 'R'");
+    }
+
+    /* lookup_by_hash for a hash that doesn't exist returns 0 callbacks. */
+    {
+        uint8_t fake[16] = {0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8,
+                            0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0};
+        struct { int n; } hl = {0};
+        int hash_count_cb(const uint8_t hash[16], const void *key, size_t klen,
+                          const void *value, size_t vlen, void *ctx);
+        rc = slotcask_lookup_by_hash(&db, fake, hash_count_cb, &hl);
+        ASSERT_EQ_INT(rc, 0, "lookup_by_hash on absent hash → 0");
+        ASSERT_EQ_INT(hl.n, 0, "lookup_by_hash on absent hash invokes cb 0 times");
+    }
+
     slotcask_close(&db);
     slotcask_shutdown();
     rm_rf(dir);
+    return 0;
+}
+
+/* ===== Phase 3A callback definitions ===== */
+
+int walk_inc(const uint8_t hash[16], const void *key, size_t klen,
+             const void *value, size_t vlen, void *ctx) {
+    (void)hash; (void)key; (void)klen; (void)value; (void)vlen;
+    struct walk_ctx_t { int n; };
+    ((struct walk_ctx_t *)ctx)->n++;
+    return 0;
+}
+
+int find_user999(const uint8_t hash[16], const void *key, size_t klen,
+                 const void *value, size_t vlen, void *ctx) {
+    (void)value; (void)vlen;
+    struct seek_t { uint8_t hash[16]; int found; };
+    struct seek_t *s = (struct seek_t *)ctx;
+    if (klen == 8 && memcmp(key, "user_999", 8) == 0) {
+        memcpy(s->hash, hash, 16);
+        s->found = 1;
+    }
+    return 0;
+}
+
+int hash_lookup_cb(const uint8_t hash[16], const void *key, size_t klen,
+                   const void *value, size_t vlen, void *ctx) {
+    (void)hash; (void)key; (void)klen;
+    struct hl_t { int n; size_t got_vlen; uint8_t got_first; };
+    struct hl_t *h = (struct hl_t *)ctx;
+    h->n++;
+    h->got_vlen = vlen;
+    h->got_first = vlen ? ((const uint8_t *)value)[0] : 0;
+    return 0;
+}
+
+int hash_count_cb(const uint8_t hash[16], const void *key, size_t klen,
+                  const void *value, size_t vlen, void *ctx) {
+    (void)hash; (void)key; (void)klen; (void)value; (void)vlen;
+    struct c_t { int n; };
+    ((struct c_t *)ctx)->n++;
     return 0;
 }
 

@@ -316,4 +316,36 @@ void slotcask_registry_invalidate(const char *effective_root,
 
 void slotcask_registry_shutdown(void);
 
+/* ============================================================ Query primitives
+ *
+ * Below APIs feed the query layer (find/count/aggregate/keys/fetch). Both
+ * exist because the engine needs to:
+ *   1. Walk every live record across all keyfile shards (full-table scan).
+ *   2. Look up records by hash16 alone (index-driven access — the btree
+ *      stores hashes, not keys).
+ *
+ * Both callbacks receive raw payload pointers backed by the segment mmap. The
+ * pointers are valid only for the duration of the cb invocation — the
+ * underlying segcache rdlock is dropped on return. Callers that need the
+ * data past the cb (collecting keys for later emit) must copy it.
+ */
+
+/* cb returns 0 to continue, 1 to stop the walk early. */
+typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
+                               const void *key, size_t klen,
+                               const void *value, size_t vlen,
+                               void *ctx);
+
+/* Walk every live (flag=1) record. Parallelized across keyfile shards
+   internally; cb may run on multiple threads — caller's ctx is responsible
+   for its own synchronization. */
+int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
+
+/* Look up by hash16 only (index-driven access). Walks the keyfile shard for
+   `hash16`, invokes cb for each live entry whose hash matches. Almost
+   always 0 or 1 invocation per call (hash collisions are rare). cb returning
+   1 stops further probing. */
+int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
+                             SlotcaskScanCb cb, void *ctx);
+
 #endif

@@ -1794,6 +1794,130 @@ void slotcask_registry_shutdown(void) {
     pthread_mutex_unlock(&g_reg_lock);
 }
 
+/* ============================================================ Query primitives
+ *
+ * Phase 3A: walk_live + lookup_by_hash. Both feed the query layer's scan
+ * primitives (find/count/aggregate/keys/fetch + index-driven access).
+ */
+
+/* Walk one keyfile shard. For each flag=1 entry, follow the pointer to the
+   segment, hold the segcache rdlock, invoke cb. cb returning 1 stops. */
+static int walk_one_shard(SlotcaskDb *db, int kf_shard_id,
+                          SlotcaskScanCb cb, void *ctx) {
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    size_t cap = kh.capacity;
+    SlotcaskKfEntry *kf = kh.map;
+    int stop = 0;
+    for (size_t i = 0; i < cap && !stop; i++) {
+        SlotcaskKfEntry *e = &kf[i];
+        uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+        if (flag != 1) continue;
+
+        char seg_path[PATH_MAX];
+        seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle sh;
+        if (segcache_acquire(&sh, seg_path, 0) != 0) continue;
+
+        const uint8_t *rec = sh.map + e->offset;
+        if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
+            /* Stale-pointer race: another writer repointed mid-walk. Skip. */
+            segcache_release(&sh);
+            continue;
+        }
+        uint16_t klen;
+        uint32_t vlen;
+        memcpy(&klen, rec + 16, 2);
+        memcpy(&vlen, rec + 20, 4);
+        const uint8_t *key   = rec + 24;
+        const uint8_t *value = rec + 24 + klen;
+
+        if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
+        segcache_release(&sh);
+    }
+    kfcache_release(&kh);
+    return stop;
+}
+
+typedef struct {
+    SlotcaskDb     *db;
+    int             kf_shard_id;
+    SlotcaskScanCb  cb;
+    void           *ctx;
+    int            *stop_flag;
+} WalkWorkerArg;
+
+static void *walk_worker(void *arg) {
+    WalkWorkerArg *w = (WalkWorkerArg *)arg;
+    if (__atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
+    int stop = walk_one_shard(w->db, w->kf_shard_id, w->cb, w->ctx);
+    if (stop) __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return -1;
+    /* Sequential walk for now — no engine-wide thread pool dep here.
+       Phase 3 perf can revisit using parallel_for from the engine. */
+    int stop_flag = 0;
+    for (int s = 0; s < db->num_shards; s++) {
+        if (__atomic_load_n(&stop_flag, __ATOMIC_ACQUIRE)) break;
+        WalkWorkerArg arg = {
+            .db = db, .kf_shard_id = s,
+            .cb = cb, .ctx = ctx,
+            .stop_flag = &stop_flag,
+        };
+        walk_worker(&arg);
+    }
+    return 0;
+}
+
+int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
+                            SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return -1;
+    int sid_kf = shard_for_hash(hash16, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    size_t cap = kh.capacity;
+    SlotcaskKfEntry *kf = kh.map;
+    size_t start = kf_slot_for(hash16, cap);
+    int stop = 0;
+    for (size_t i = 0; i < cap && !stop; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+        if (flag == 0) break;                      /* probe end */
+        if (flag != 1) continue;                    /* tombstone */
+        if (memcmp(e->hash, hash16, 16) != 0) continue;
+
+        char seg_path[PATH_MAX];
+        seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle sh;
+        if (segcache_acquire(&sh, seg_path, 0) != 0) continue;
+        const uint8_t *rec = sh.map + e->offset;
+        if (rec[18] != 1 || memcmp(rec, hash16, 16) != 0) {
+            segcache_release(&sh);
+            continue;
+        }
+        uint16_t klen;
+        uint32_t vlen;
+        memcpy(&klen, rec + 16, 2);
+        memcpy(&vlen, rec + 20, 4);
+        const uint8_t *key   = rec + 24;
+        const uint8_t *value = rec + 24 + klen;
+        if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
+        segcache_release(&sh);
+    }
+    kfcache_release(&kh);
+    return 0;
+}
+
 /* Suppress unused-static warnings for build_record_buf which remains in the
    file as a reference for migrators / future bulk paths but isn't called
    from the current code (seg_write_record builds inline into the mmap). */
