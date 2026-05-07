@@ -869,6 +869,16 @@ int  match_criterion(const char *val_str, const SearchCriterion *c);
 extern volatile int g_scan_stop; /* set to 1 to abort all in-flight shard scans */
 typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *ctx); /* return 0=continue, 1=stop */
 void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
+/* v2 scan bridge — adapts slotcask_walk_live to the SlotHeader-shaped
+   scan_callback so existing callbacks work unchanged. */
+struct SlotcaskDb;
+void scan_shards_v2(struct SlotcaskDb *db, scan_callback cb, void *ctx);
+/* Storage-version-aware scan dispatch. v2 objects route through the
+   slotcask registry; v1 fall through to scan_shards. Returns -1 only
+   when v2 dispatch fails (open-time error). */
+int  scan_dispatch(const char *db_root, const char *object,
+                   const Schema *sc, const char *data_dir,
+                   scan_callback cb, void *ctx);
 int fetch_record_by_hash(const char *db_root, const char *object, const Schema *sch, const uint8_t hash16[16], int *printed, void *fs);
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);

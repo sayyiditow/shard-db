@@ -127,7 +127,7 @@ typedef struct {
 
 /* ============================================================ DB handle */
 
-typedef struct {
+typedef struct SlotcaskDb {
     char    data_dir[PATH_MAX];
     int     num_shards;
     int     num_streams;

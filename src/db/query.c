@@ -122,6 +122,60 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
     free(paths);
 }
 
+/* ========== v2 (slotcask) scan bridge ========== */
+
+/* The engine's scan_callback signature predates slotcask. To keep all
+   existing find/count/aggregate/keys/fetch callbacks working unchanged
+   on v2 objects, we adapt slotcask_walk_live to that signature here.
+   Synthesizes a SlotHeader (hash, flag=1, klen, vlen) and passes the
+   key-bytes pointer as `block` — slotcask stores key + value contiguously
+   in the segment slot, which is exactly the v1 Zone B layout the cb
+   expects (block[0..klen]=key, block[klen..klen+vlen]=value). */
+typedef struct {
+    scan_callback cb;
+    void         *ctx;
+} V2ScanWrap;
+
+static int v2_scan_wrap_cb(const uint8_t hash[16],
+                            const void *key, size_t klen,
+                            const void *value, size_t vlen,
+                            void *wrap_ctx) {
+    (void)value;  /* contiguous with key; cb derives via klen */
+    V2ScanWrap *w = (V2ScanWrap *)wrap_ctx;
+    SlotHeader hdr;
+    memcpy(hdr.hash, hash, 16);
+    hdr.flag      = 1;
+    hdr.key_len   = (uint16_t)klen;
+    hdr.value_len = (uint32_t)vlen;
+    return w->cb(&hdr, (const uint8_t *)key, w->ctx);
+}
+
+void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
+    g_scan_stop = 0;
+    V2ScanWrap wrap = { cb, ctx };
+    slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
+}
+
+/* Dispatch helper: callers that have a Schema in scope use this to pick
+   the right scan path. Returns 0 on success, -1 if v2 dispatch failed
+   (caller can fall back to the legacy path or report no rows). */
+int scan_dispatch(const char *db_root, const char *object,
+                  const Schema *sc, const char *data_dir,
+                  scan_callback cb, void *ctx) {
+    if (sc->storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sc->splits, .slot_size = sc->slot_size,
+            .streams = sc->streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) return -1;
+        scan_shards_v2(sdb, cb, ctx);
+        return 0;
+    }
+    scan_shards(data_dir, sc->slot_size, cb, ctx);
+    return 0;
+}
+
 /* ========== SIZE ========== */
 
 int cmd_size(const char *db_root, const char *object) {
@@ -2645,7 +2699,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
                             PTHREAD_MUTEX_INITIALIZER };
-    scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
+    scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
     pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
 
@@ -3635,7 +3689,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
                             PTHREAD_MUTEX_INITIALIZER };
-    scan_shards(data_dir, sch.slot_size, bulk_criteria_scan_cb, &ctx);
+    scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
     pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
 
@@ -4320,7 +4374,7 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
     KeysCtx ctx = { offset, limit, 0, 0, csv_delim, PTHREAD_MUTEX_INITIALIZER };
     if (csv_delim) OUT("key\n");  /* header */
     else OUT("[");
-    scan_shards(data_dir, sch.slot_size, keys_cb, &ctx);
+    scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
     pthread_mutex_destroy(&ctx.lock);
     if (!csv_delim) OUT("]\n");
     return 0;
@@ -9205,7 +9259,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         else OUT("%zu\n", count);
     } else {
         CountCtx ctx = { tree, &fs, 0, &dl, 0 };
-        scan_shards(data_dir, sch.slot_size, count_scan_cb, &ctx);
+        scan_dispatch(db_root, object, &sch, data_dir, count_scan_cb, &ctx);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("%d\n", ctx.count);
     }
@@ -9975,7 +10029,7 @@ int cmd_find(const char *db_root, const char *object,
         oc.order_is_numeric = order_is_num;
         pthread_mutex_init(&oc.lock, NULL);
 
-        scan_shards(data_dir, sch.slot_size, ordered_collect_cb, &oc);
+        scan_dispatch(db_root, object, &sch, data_dir, ordered_collect_cb, &oc);
 
         if (oc.budget_exceeded) {
             for (size_t i = 0; i < oc.count; i++) {
@@ -10121,7 +10175,7 @@ int cmd_find(const char *db_root, const char *object,
                              rows_fmt, dict_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0,
                              PTHREAD_MUTEX_INITIALIZER };
-        scan_shards(data_dir, sch.slot_size, adv_search_cb, &ctx);
+        scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
         pthread_mutex_destroy(&ctx.lock);
     }
 
@@ -12917,7 +12971,18 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
            merged into main ctx at end. Replaces the old shared-ctx
            scan_shards(agg_scan_cb, ctx) path that serialised every
            record through ctx->lock. */
-        parallel_agg_scan_shards(ctx, data_dir, sch->slot_size);
+        if (sch->storage_version == 2) {
+            /* v2: sequential walk via slotcask_walk_live + agg_scan_cb on
+               the main ctx. Phase 8 perf can parallelise across kf shards. */
+            SlotcaskSchemaInfo info = {
+                .splits = sch->splits, .slot_size = sch->slot_size,
+                .streams = sch->streams, .storage_version = 2,
+            };
+            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+            if (sdb) scan_shards_v2(sdb, agg_scan_cb, ctx);
+        } else {
+            parallel_agg_scan_shards(ctx, data_dir, sch->slot_size);
+        }
     }
 
     if (ctx->deadline->timed_out) return -1;
