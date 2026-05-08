@@ -1907,15 +1907,21 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     };
     compute_hash_raw(key, klen, ctx.hash);
 
+    /* Only set the check hook when there's actual CAS criteria — otherwise
+       v2_delete_check_fn would just return 1 unconditionally but the
+       primitive doesn't know that and reads OLD anyway. Combined with
+       skip_old_read on non-indexed paths, a plain DELETE bypasses
+       read_record_value entirely. */
+    int has_cas = (crit && ncrit > 0);
     SlotcaskDeleteOpts opts = {
-        .check          = v2_delete_check_fn,
+        .check          = has_cas ? v2_delete_check_fn : NULL,
         .check_ctx      = &ctx,
         .pre_commit     = v2_delete_pre_commit,
         .pre_commit_ctx = &ctx,
         /* pre_commit only dereferences old when there are index entries
-           to drop. On non-indexed delete, opt out of read_record_value
-           — saves a segcache_acquire + 100B memcpy + malloc/free per
-           call. v2_delete_pre_commit handles old=NULL gracefully. */
+           to drop. On non-indexed + non-CAS delete, opt out of
+           read_record_value — saves a segcache_acquire + 100B memcpy +
+           malloc/free per call. v2_delete_pre_commit handles old=NULL. */
         .skip_old_read  = (nidx == 0),
     };
     SlotcaskDeleteResult result = {0};
