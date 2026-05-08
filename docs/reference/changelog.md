@@ -6,16 +6,17 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased — slotcask-engine branch
 
-### kf shard auto-resplit — unbounded inserts without operator intervention
+### kf shard auto-resplit — unbounded inserts, no per-shard cap
 
-When a kf shard's global load crosses 75 %, the next insert into that shard doubles the kf file in place via linear-hashing rehash:
+Each kf shard now grows in place by doubling whenever its load crosses 75 %. No global ceiling; shards keep doubling indefinitely. If a single shard ever becomes operationally unwieldy, `shard-stats` surfaces it and the operator reshards via `vacuum --splits=N`.
 
-- Snapshot every flag=1 entry, stage a fresh kf.new at 2× size, repopulate by linear-probing at the new capacity, atomic rename + fsync(parent dir), tear down the old fd/map under the entry wrlock.
-- Trigger is one relaxed atomic load on `SlotcaskDb.live_count` per insert — sub-ns on the hot path. Resplit fires once per doubling, amortised over hundreds of thousands of inserts.
-- Hard ceiling: `SLOTCASK_KF_MAX_SLOTS_PER_SHARD = 16M` slots per shard. At 16M × 24B × 4096 shards that's 1.5 TB of kf — past any realistic dataset. Beyond the cap, operator reshards via `vacuum --splits=N`.
-- Crash safety: kf.new is staged-then-renamed; if the rebuild crashes mid-write the old kf is still the live file. `slotcask_open`'s kf-walk loop now also unlinks any leftover `kf.new` at startup. Idempotent.
+Mechanics:
+- **24-byte header** prefixes every kf file: `[magic 'SKF1'][version][total uint64][deleted uint64]`. `total` counts non-empty slots (live + tombstoned) — the resplit trigger metric, since tombstones still create lookup probe-chain pressure. `deleted` counts tombstones; live = total − deleted, computed only when callers need it. Updates happen under the kf wrlock, no atomics.
+- **Streaming resplit:** walk old kf in order, write each flag=1 entry directly into `kf.new`'s mmap'd region via linear-probe at the new capacity. Zero malloc — memory cost stays flat regardless of shard size. Tombstones are dropped during resplit (`new.total = live_copied`, `new.deleted = 0`), so resplit also reclaims tombstone space.
+- **Crash safety:** `kf.new` is staged-then-renamed; old kf stays live until the atomic rename. `slotcask_open` unlinks leftover `kf.new` files at startup — idempotent recovery.
+- **Trigger:** `header.total * 4 >= capacity * 3` checked once per `kf_put_new`. One mmap load on the hot path.
 
-Closes the gap where the engine had a hard insert cap based on `splits × slots_per_shard` (e.g. 8M at splits=8, 32M at splits=128) — inserts past that cap used to fail silently. They now grow the kf instead.
+Closes the gap where the engine had a hard insert cap based on `splits × slots_per_shard`. The cap is gone; doubling is bounded only by disk space.
 
 ### v2 default vacuum — Direction-C seg compaction + streams-mismatch self-heal
 
