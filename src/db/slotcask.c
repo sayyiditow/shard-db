@@ -799,6 +799,73 @@ static int kf_lookup(SlotcaskKfHandle *kh, const uint8_t hash[16],
     return -1;
 }
 
+/* Variant of kf_lookup that ALSO returns the slot index it found the entry
+   at. The bulk primitives use this so Phase 4 (kf_repoint) and Phase 2
+   (kf_tombstone) can skip re-probing — under a held kf wrlock the slot
+   index from Phase 1a is still authoritative. */
+static int kf_lookup_with_slot(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                                const void *key, size_t klen,
+                                const char *data_dir,
+                                uint8_t *flag_out, uint8_t *stream_id_out,
+                                uint16_t *file_id_out, uint32_t *offset_out,
+                                size_t *slot_out) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) return -1;
+        if (memcmp(e->hash, hash, 16) == 0) {
+            if (e->flag == 2) return -1;
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) {
+                *flag_out = e->flag;
+                *stream_id_out = e->stream_id;
+                *file_id_out = e->file_id;
+                *offset_out = e->offset;
+                *slot_out = slot;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Direct kf_repoint at a known slot — skips probe + verify since the
+   caller (bulk primitive Phase 4) already holds the wrlock that was
+   acquired BEFORE the kf_lookup_with_slot call, so the slot is still
+   authoritative. The on-disk state stays self-consistent on crash via
+   the same single-uint64 atomic store kf_repoint uses. */
+static inline void kf_repoint_at_slot(SlotcaskKfHandle *kh, size_t slot,
+                                       uint8_t new_stream_id,
+                                       uint16_t new_file_id,
+                                       uint32_t new_offset) {
+    SlotcaskKfEntry *e = &kh->map[slot];
+    union {
+        struct {
+            uint8_t  flag;
+            uint8_t  stream_id;
+            uint16_t file_id;
+            uint32_t offset;
+        } parts;
+        uint64_t u64;
+    } combo;
+    combo.parts.flag = 1;
+    combo.parts.stream_id = new_stream_id;
+    combo.parts.file_id = new_file_id;
+    combo.parts.offset = new_offset;
+    __atomic_store_n((uint64_t *)((uint8_t *)e + 16), combo.u64,
+                     __ATOMIC_RELEASE);
+}
+
+/* Direct tombstone at a known slot — see kf_repoint_at_slot rationale. */
+static inline void kf_tombstone_at_slot(SlotcaskKfHandle *kh, size_t slot) {
+    kh->map[slot].flag = 2;
+}
+
 /* Repoint EXISTING key's slot. Atomic 8B store on the trailing group keeps
    the on-disk state self-consistent if we crash mid-flight. */
 static int kf_repoint(SlotcaskKfHandle *kh, const uint8_t hash[16],
@@ -1718,6 +1785,8 @@ typedef struct {
     uint8_t  old_sid;
     uint16_t old_fid;
     uint32_t old_off;
+    size_t   old_kf_slot;   /* kf entry slot — captured in Phase 1a so
+                              Phase 4 can repoint without re-probing */
     uint8_t *old_buf;       /* malloc'd if old_found, NULL otherwise */
     size_t   old_vlen;
     uint8_t  old_found;
@@ -1757,9 +1826,11 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
 
         compute_hash(r->key, r->klen, st[i].hash);
         uint8_t old_flag = 0;
-        int found = (kf_lookup(&kh, st[i].hash, r->key, r->klen, db->data_dir,
-                                &old_flag, &st[i].old_sid,
-                                &st[i].old_fid, &st[i].old_off) == 0);
+        int found = (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
+                                          db->data_dir,
+                                          &old_flag, &st[i].old_sid,
+                                          &st[i].old_fid, &st[i].old_off,
+                                          &st[i].old_kf_slot) == 0);
         st[i].old_found = found ? 1 : 0;
 
         if (found && opts->if_not_exists) {
@@ -2083,9 +2154,12 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
 
         int kf_rc;
         if (st[i].old_found) {
-            kf_rc = kf_repoint(&kh, st[i].hash, st[i].target_stream,
-                                st[i].target_fid, st[i].target_off,
-                                r->key, r->klen, db->data_dir);
+            /* Skip kf_repoint's probe + verify_stored_key — the slot index
+               from Phase 1a is still valid because the kf wrlock has been
+               held continuously. Direct atomic 8B store. */
+            kf_repoint_at_slot(&kh, st[i].old_kf_slot, st[i].target_stream,
+                                st[i].target_fid, st[i].target_off);
+            kf_rc = 0;
         } else {
             size_t used_delta = 0;
             kf_rc = kf_put_new(&kh, st[i].hash, st[i].target_stream,
@@ -2144,6 +2218,8 @@ typedef struct {
     uint8_t  old_sid;
     uint16_t old_fid;
     uint32_t old_off;
+    size_t   kf_slot;       /* kf entry slot — captured in Phase 1a so
+                              Phase 2 can tombstone without re-probing */
     uint8_t *old_buf;       /* malloc'd if pre_commit_needs_old, NULL otherwise */
     size_t   old_vlen;
     uint8_t  found;         /* 1 if kf entry exists, 0 otherwise */
@@ -2177,9 +2253,11 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         }
         compute_hash(r->key, r->klen, st[i].hash);
         uint8_t old_flag = 0;
-        int found = (kf_lookup(&kh, st[i].hash, r->key, r->klen, db->data_dir,
-                                &old_flag, &st[i].old_sid,
-                                &st[i].old_fid, &st[i].old_off) == 0);
+        int found = (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
+                                          db->data_dir,
+                                          &old_flag, &st[i].old_sid,
+                                          &st[i].old_fid, &st[i].old_off,
+                                          &st[i].kf_slot) == 0);
         st[i].found = found ? 1 : 0;
         if (!found) {
             r->status = -2;        /* not found — skipped */
@@ -2267,17 +2345,10 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             if (rc != 0) { r->status = -1; continue; }
         }
 
-        size_t used_delta = 0;
-        uint8_t out_sid; uint16_t out_fid; uint32_t out_off;
-        int rc = kf_tombstone(&kh, st[i].hash, r->key, r->klen, db->data_dir,
-                              &out_sid, &out_fid, &out_off, &used_delta);
-        if (rc < 0) { r->status = -1; continue; }
-        /* kf_tombstone returns the OLD slot location; should match what
-           kf_lookup told us in Phase 1a. Use the kf_tombstone output as
-           authoritative for the seg flag-flip. */
-        st[i].old_sid = out_sid;
-        st[i].old_fid = out_fid;
-        st[i].old_off = out_off;
+        /* Skip kf_tombstone's probe + verify_stored_key — Phase 1a captured
+           the slot, and the kf wrlock has been held continuously, so the
+           slot is still authoritative. Direct flag flip. */
+        kf_tombstone_at_slot(&kh, st[i].kf_slot);
         st[i].committed = 1;
         r->was_update = 1;
     }
