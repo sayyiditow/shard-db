@@ -4,6 +4,17 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased — slotcask-engine branch
+
+### v2 default vacuum — Direction-C seg compaction + streams-mismatch self-heal
+
+Default `{"mode":"vacuum"}` (no flags) on a v2 object used to be a no-op besides resetting the `deleted` counter. It now does two things:
+
+1. **Direction-C seg compaction.** Per stream, every non-active seg file is stat'd for live count. The sparsest are pair-merged into denser ones — donor's live records are migrated into recipient's tombstone holes via `kf_repoint_at_slot`, then the donor file is unlinked (segcache wrlock drains in-flight readers, `msync + munmap + close + unlink + fsync(parent)`). The active seg of each stream is never touched, so concurrent appends after vacuum return are unaffected. Reclaims disk for delete-heavy / no-write workloads where the snake-game pool can't reuse tombstones inline.
+2. **Streams-mismatch self-heal.** If `slotcask_streams_for_nproc()` no longer matches `schema.streams` (CPU upgrade, container resize, hand-edited schema), the call promotes to a full rebuild that re-routes records into the new stream layout. `vacuum --splits=N` folds in the same check on the same rebuild.
+
+`./shard-db vacuum <dir> <obj>` and the auto-vacuum thread both pick this up. Response shape: `{"status":"vacuumed","cleaned":<files-dropped>}` for the light path; `{"status":"rebuilt", ...,"streams":N,...}` for the heavy path.
+
 ## 2026.05.2 — 2026-05-05
 
 ### Performance — aggregate fast paths (sum/avg/min/max + NEQ + EXISTS)
