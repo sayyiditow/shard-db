@@ -448,6 +448,119 @@ static int bench_invoice_run(void)
     }
     bench_table_section_end();
 
+    /* ---- Bulk ops on the indexed object --------------------------------
+       Same N=10000-in-one-request shape as bench-kv, but against the
+       fully-indexed invoice schema (14 indexes incl. 4 composites) so
+       it exercises the indexed bulk paths: pre_commit hooks fire under
+       the kf wrlock and update each indexed field's btree shards.
+       Order: get, exists, update (touches one indexed field), delete.
+       Bulk-delete is destructive but it's the last bench step. */
+    long bget_us = 0, bexi_us = 0, bupd_us = 0, bdel_us = 0;
+    {
+        const int N = 10000;
+        const int START = 0;        /* first 10K invoices, all alive after the indexed insert */
+
+        /* Pre-build the JSON keys array — reused for get/exists/delete. */
+        size_t key_buf_cap = (size_t)N * 24 + 64;
+        char *key_arr = malloc(key_buf_cap);
+        size_t kp = 0;
+        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "[");
+        for (int i = 0; i < N; i++) {
+            char key[16]; make_inv_key(START + i, key);
+            kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp,
+                                    "%s\"%s\"", i ? "," : "", key);
+        }
+        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "]");
+
+        /* bulk-get */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"bench\","
+                "\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bget_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-exists */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"bench\","
+                "\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bexi_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-update-json — patch a non-indexed field (status is indexed,
+           keep this simple by patching `notes`/`description`-equivalent;
+           use the bench schema's `metaJson` field which exists in the
+           invoice schema). Touching an indexed field would also exercise
+           the index drop+insert hot path — switch the field name below
+           to `status` if you want to bench that. */
+        {
+            size_t cap = (size_t)N * 96 + 256;
+            char *req = malloc(cap);
+            size_t p = 0;
+            p += (size_t)snprintf(req + p, cap - p,
+                "{\"mode\":\"bulk-update\",\"dir\":\"default\","
+                "\"object\":\"bench\",\"records\":[");
+            for (int i = 0; i < N; i++) {
+                char key[16]; make_inv_key(START + i, key);
+                p += (size_t)snprintf(req + p, cap - p,
+                    "%s{\"key\":\"%s\",\"value\":{\"status\":\"APPROVED\"}}",
+                    i ? "," : "", key);
+            }
+            p += (size_t)snprintf(req + p, cap - p, "]}");
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bupd_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-delete (destructive — last bench op). */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"bulk-delete\",\"dir\":\"default\","
+                "\"object\":\"bench\",\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bdel_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+        free(key_arr);
+    }
+    {
+        const int N = 10000;
+        char e_get[48], e_exi[48], e_upd[48], e_del[48];
+        snprintf(e_get, sizeof(e_get), "%.0f k op/s",
+                 (double)N / ((double)bget_us / 1e3));
+        snprintf(e_exi, sizeof(e_exi), "%.0f k op/s",
+                 (double)N / ((double)bexi_us / 1e3));
+        snprintf(e_upd, sizeof(e_upd), "%.0f k op/s",
+                 (double)N / ((double)bupd_us / 1e3));
+        snprintf(e_del, sizeof(e_del), "%.0f k op/s",
+                 (double)N / ((double)bdel_us / 1e3));
+        bench_table_section_begin("Bulk ops on indexed object (N=10000)");
+        bench_table_record("BULK GET    x10000 in one call", bget_us, 1, e_get);
+        bench_table_record("BULK EXISTS x10000 in one call", bexi_us, 1, e_exi);
+        bench_table_record("BULK UPDATE x10000 (touches indexed status)", bupd_us, 1, e_upd);
+        bench_table_record("BULK DELETE x10000 (drops idx entries)", bdel_us, 1, e_del);
+        bench_table_section_end();
+    }
+
     /* JSON blob no longer needed. */
     free(json_buf); json_buf = NULL;
 

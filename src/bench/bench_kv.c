@@ -512,6 +512,111 @@ static int bench_kv_run(void)
         bench_table_section_end();
     }
 
+    /* ---- Bulk ops (single conn, one request handles N keys) -----------
+       Exercises the multi-key paths: bulk-get / bulk-exists land in
+       cmd_get_multi / cmd_exists_multi (parallel_for shard fan-out);
+       bulk-update-json / bulk-delete land in cmd_bulk_update_json /
+       cmd_bulk_delete (parallel shard workers + slotcask bulk
+       primitives on v2). All four reuse the same N=10000 sample so the
+       table compares cleanly to single-conn latency batches above. */
+    long bget_us = 0, bexi_us = 0, bupd_us = 0, bdel_us = 0;
+    {
+        const int N = 10000;
+        /* Keys 0..9999 are dead from the single-conn DELETE batch above.
+           Use keys[10000..19999] so bulk-get/exists/update see live keys. */
+        const int START = 10000 < COUNT - N ? 10000 : 0;
+
+        size_t key_buf_cap = (size_t)N * (size_t)(KEY_LEN + 4) + 64;
+        char *key_arr = malloc(key_buf_cap);
+        size_t kp = 0;
+        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "[");
+        for (int i = 0; i < N; i++)
+            kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp,
+                                    "%s\"%s\"", i ? "," : "", keys[START + i]);
+        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "]");
+
+        /* bulk-get */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
+                "\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bget_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-exists */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"kvbench\","
+                "\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bexi_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-update-json — small per-record patch, all keys updated. */
+        {
+            size_t cap = (size_t)N * (size_t)(KEY_LEN + 64) + 128;
+            char *req = malloc(cap);
+            size_t p = 0;
+            p += (size_t)snprintf(req + p, cap - p,
+                "{\"mode\":\"bulk-update\",\"dir\":\"default\","
+                "\"object\":\"kvbench\",\"records\":[");
+            for (int i = 0; i < N; i++)
+                p += (size_t)snprintf(req + p, cap - p,
+                    "%s{\"key\":\"%s\",\"value\":{\"v\":\"bulkupd_%d\"}}",
+                    i ? "," : "", keys[START + i], i);
+            p += (size_t)snprintf(req + p, cap - p, "]}");
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bupd_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+
+        /* bulk-delete (destructive — truncate+repopulate below restores). */
+        {
+            size_t cap = key_buf_cap + 128;
+            char *req = malloc(cap);
+            snprintf(req, cap,
+                "{\"mode\":\"bulk-delete\",\"dir\":\"default\","
+                "\"object\":\"kvbench\",\"keys\":%s}", key_arr);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, req, &resp);
+            bdel_us = (long)((bench_now_ns() - t0) / 1000);
+            free(resp); resp = NULL;
+            free(req);
+        }
+        free(key_arr);
+    }
+    {
+        const int N = 10000;
+        char e_get[48], e_exi[48], e_upd[48], e_del[48];
+        snprintf(e_get, sizeof(e_get), "%.0f k op/s",
+                 (double)N / ((double)bget_us / 1e3));
+        snprintf(e_exi, sizeof(e_exi), "%.0f k op/s",
+                 (double)N / ((double)bexi_us / 1e3));
+        snprintf(e_upd, sizeof(e_upd), "%.0f k op/s",
+                 (double)N / ((double)bupd_us / 1e3));
+        snprintf(e_del, sizeof(e_del), "%.0f k op/s",
+                 (double)N / ((double)bdel_us / 1e3));
+        bench_table_section_begin("Bulk ops (single request, N=10000)");
+        bench_table_record("BULK GET    x10000 in one call", bget_us, 1, e_get);
+        bench_table_record("BULK EXISTS x10000 in one call", bexi_us, 1, e_exi);
+        bench_table_record("BULK UPDATE x10000 in one call", bupd_us, 1, e_upd);
+        bench_table_record("BULK DELETE x10000 in one call", bdel_us, 1, e_del);
+        bench_table_section_end();
+    }
+
     /* ---- 13. Re-populate for parallel section ----------------------- */
     printf("--- Re-populating for parallel test ---\n");
     fflush(stdout);
