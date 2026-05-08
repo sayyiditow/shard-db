@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
 
 ## Overview
 
-shard-db is a high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64; macOS port planned for 2026.05.2.
+shard-db is a high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64; macOS port planned for 2026.05.2.
 
 ## Build & test
 
