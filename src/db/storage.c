@@ -718,20 +718,180 @@ static void counts_write_locked(const char *cpath, int live, int del) {
     fclose(f);
 }
 
-/* Apply deltas to both counts atomically under one lock. */
-static void update_counts(const char *db_root, const char *object, int live_delta, int del_delta) {
-    char cpath[PATH_MAX], lpath[PATH_MAX];
-    counts_paths(cpath, lpath, db_root, object);
+/* ========== In-memory counts cache ==========
+ *
+ * The on-disk counts file (text "<live> <deleted>\n") was being
+ * read+written under flock on every insert/delete — ~9 syscalls per call,
+ * ~24 µs single-thread. For single-conn DELETE x10K that was the
+ * dominant cost (DELETE 17k op/s vs UPDATE 29k op/s in bench-kv).
+ *
+ * Now: per-object atomic int64s in a process-wide hash table. update at
+ * insert/delete is a single atomic_fetch_add. Reads (cmd_size, etc.) hit
+ * the atomic load. Disk file is the persistence layer — flushed on
+ * demand via counts_flush() (called from shutdown / vacuum / recount /
+ * server stop, plus opportunistically every FLUSH_INTERVAL atomic
+ * updates). Counts may be slightly stale on crash; recount rebuilds.
+ */
+typedef struct {
+    char             path[PATH_MAX];
+    _Atomic int64_t  live;
+    _Atomic int64_t  deleted;
+    _Atomic uint64_t pending_writes;   /* atomic ops since last flush */
+    int              used;
+} CountsCacheEntry;
+
+#define COUNTS_CACHE_BUCKETS 1024
+#define COUNTS_FLUSH_INTERVAL 10000   /* atomic updates between auto-flushes */
+
+static CountsCacheEntry g_counts_cache[COUNTS_CACHE_BUCKETS];
+static pthread_mutex_t  g_counts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned counts_hash_path(const char *p) {
+    unsigned h = 5381;
+    while (*p) h = ((h << 5) + h) + (unsigned char)(*p++);
+    return h;
+}
+
+static CountsCacheEntry *counts_cache_lookup_locked(const char *path) {
+    unsigned h = counts_hash_path(path);
+    for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
+        int idx = (int)((h + (unsigned)i) % COUNTS_CACHE_BUCKETS);
+        if (!g_counts_cache[idx].used) return NULL;
+        if (strcmp(g_counts_cache[idx].path, path) == 0)
+            return &g_counts_cache[idx];
+    }
+    return NULL;
+}
+
+static CountsCacheEntry *counts_cache_get(const char *path) {
+    pthread_mutex_lock(&g_counts_lock);
+    CountsCacheEntry *e = counts_cache_lookup_locked(path);
+    if (e) { pthread_mutex_unlock(&g_counts_lock); return e; }
+
+    /* Install — find empty slot, init from disk. */
+    unsigned h = counts_hash_path(path);
+    int idx = -1;
+    for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
+        int probe = (int)((h + (unsigned)i) % COUNTS_CACHE_BUCKETS);
+        if (!g_counts_cache[probe].used) { idx = probe; break; }
+    }
+    if (idx < 0) {
+        /* Cache full — fall back to direct file I/O via a NULL return.
+           Callers handle this gracefully. */
+        pthread_mutex_unlock(&g_counts_lock);
+        return NULL;
+    }
+
+    int live = 0, del = 0;
+    counts_read_locked(path, &live, &del);
+    strncpy(g_counts_cache[idx].path, path, PATH_MAX - 1);
+    g_counts_cache[idx].path[PATH_MAX - 1] = '\0';
+    atomic_init(&g_counts_cache[idx].live, (int64_t)live);
+    atomic_init(&g_counts_cache[idx].deleted, (int64_t)del);
+    atomic_init(&g_counts_cache[idx].pending_writes, 0);
+    g_counts_cache[idx].used = 1;
+    pthread_mutex_unlock(&g_counts_lock);
+    return &g_counts_cache[idx];
+}
+
+/* Persist current cached counts back to disk. Called on shutdown and
+   periodically from update_counts after FLUSH_INTERVAL ops. */
+static void counts_flush_entry(const char *cpath, const char *lpath,
+                                CountsCacheEntry *e) {
+    int live = (int)atomic_load_explicit(&e->live, memory_order_relaxed);
+    int del  = (int)atomic_load_explicit(&e->deleted, memory_order_relaxed);
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
-    if (lockfd < 0) { log_msg(1, "update_counts: open(%s) failed: %s", lpath, strerror(errno)); return; }
+    if (lockfd < 0) return;
     flock(lockfd, LOCK_EX);
-    int live, del;
-    counts_read_locked(cpath, &live, &del);
-    live += live_delta; if (live < 0) live = 0;
-    del  += del_delta;  if (del  < 0) del  = 0;
     counts_write_locked(cpath, live, del);
     flock(lockfd, LOCK_UN);
     close(lockfd);
+    atomic_store_explicit(&e->pending_writes, 0, memory_order_relaxed);
+}
+
+void counts_flush(const char *db_root, const char *object) {
+    char cpath[PATH_MAX], lpath[PATH_MAX];
+    counts_paths(cpath, lpath, db_root, object);
+    pthread_mutex_lock(&g_counts_lock);
+    CountsCacheEntry *e = counts_cache_lookup_locked(cpath);
+    if (e) counts_flush_entry(cpath, lpath, e);
+    pthread_mutex_unlock(&g_counts_lock);
+}
+
+/* Drop the in-memory entry for an object — used after drop-object /
+   create-object so a recreated object starts from on-disk state instead
+   of inheriting the stale cached counters. Does NOT touch the disk file
+   (drop-object's rmrf removes that). */
+void counts_invalidate(const char *db_root, const char *object) {
+    char cpath[PATH_MAX], lpath[PATH_MAX];
+    counts_paths(cpath, lpath, db_root, object);
+    pthread_mutex_lock(&g_counts_lock);
+    CountsCacheEntry *e = counts_cache_lookup_locked(cpath);
+    if (e) {
+        e->used = 0;
+        e->path[0] = '\0';
+        atomic_store_explicit(&e->live, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->deleted, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->pending_writes, 0, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_counts_lock);
+}
+
+/* Flush every cached entry. Called from server-shutdown paths so the
+   on-disk counts file is up-to-date when the daemon stops cleanly. */
+void counts_flush_all(void) {
+    pthread_mutex_lock(&g_counts_lock);
+    for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
+        if (!g_counts_cache[i].used) continue;
+        char lpath[PATH_MAX];
+        snprintf(lpath, PATH_MAX, "%s.lock", g_counts_cache[i].path);
+        counts_flush_entry(g_counts_cache[i].path, lpath, &g_counts_cache[i]);
+    }
+    pthread_mutex_unlock(&g_counts_lock);
+}
+
+/* Apply deltas to both counts. Atomic in-memory; opportunistic flush to
+   disk every COUNTS_FLUSH_INTERVAL updates. Drops the per-call flock +
+   open + read + write + close + funlock cycle the original did. */
+static void update_counts(const char *db_root, const char *object, int live_delta, int del_delta) {
+    char cpath[PATH_MAX], lpath[PATH_MAX];
+    counts_paths(cpath, lpath, db_root, object);
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (!e) {
+        /* Cache full — fall back to direct file I/O so the counts still
+           progress (slow path; bumping COUNTS_CACHE_BUCKETS is the fix). */
+        int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
+        if (lockfd < 0) return;
+        flock(lockfd, LOCK_EX);
+        int live, del;
+        counts_read_locked(cpath, &live, &del);
+        live += live_delta; if (live < 0) live = 0;
+        del  += del_delta;  if (del  < 0) del  = 0;
+        counts_write_locked(cpath, live, del);
+        flock(lockfd, LOCK_UN);
+        close(lockfd);
+        return;
+    }
+
+    if (live_delta) {
+        int64_t after = atomic_fetch_add_explicit(&e->live, (int64_t)live_delta,
+                                                    memory_order_relaxed)
+                        + (int64_t)live_delta;
+        if (after < 0) atomic_store_explicit(&e->live, 0, memory_order_relaxed);
+    }
+    if (del_delta) {
+        int64_t after = atomic_fetch_add_explicit(&e->deleted, (int64_t)del_delta,
+                                                    memory_order_relaxed)
+                        + (int64_t)del_delta;
+        if (after < 0) atomic_store_explicit(&e->deleted, 0, memory_order_relaxed);
+    }
+
+    /* Opportunistic flush. */
+    uint64_t p = atomic_fetch_add_explicit(&e->pending_writes, 1,
+                                             memory_order_relaxed) + 1;
+    if (p % COUNTS_FLUSH_INTERVAL == 0) {
+        counts_flush_entry(cpath, lpath, e);
+    }
 }
 
 void update_count(const char *db_root, const char *object, int delta) {
@@ -745,6 +905,13 @@ void update_deleted_count(const char *db_root, const char *object, int delta) {
 void set_count(const char *db_root, const char *object, int count) {
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (e) {
+        atomic_store_explicit(&e->live, (int64_t)count, memory_order_relaxed);
+        counts_flush_entry(cpath, lpath, e);  /* set_count callers expect persistence */
+        return;
+    }
+    /* Cache-full fallback — direct disk write. */
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
     if (lockfd < 0) { log_msg(1, "set_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
     flock(lockfd, LOCK_EX);
@@ -758,6 +925,12 @@ void set_count(const char *db_root, const char *object, int count) {
 void reset_deleted_count(const char *db_root, const char *object) {
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (e) {
+        atomic_store_explicit(&e->deleted, 0, memory_order_relaxed);
+        counts_flush_entry(cpath, lpath, e);
+        return;
+    }
     int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
     if (lockfd < 0) { log_msg(1, "reset_deleted_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
     flock(lockfd, LOCK_EX);
@@ -769,16 +942,20 @@ void reset_deleted_count(const char *db_root, const char *object) {
 }
 
 int get_deleted_count(const char *db_root, const char *object) {
-    char cpath[PATH_MAX];
-    snprintf(cpath, sizeof(cpath), "%s/%s/metadata/counts", db_root, object);
+    char cpath[PATH_MAX], lpath[PATH_MAX];
+    counts_paths(cpath, lpath, db_root, object);
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (e) return (int)atomic_load_explicit(&e->deleted, memory_order_relaxed);
     int live = 0, del = 0;
     counts_read_locked(cpath, &live, &del);
     return del;
 }
 
 int get_live_count(const char *db_root, const char *object) {
-    char cpath[PATH_MAX];
-    snprintf(cpath, sizeof(cpath), "%s/%s/metadata/counts", db_root, object);
+    char cpath[PATH_MAX], lpath[PATH_MAX];
+    counts_paths(cpath, lpath, db_root, object);
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (e) return (int)atomic_load_explicit(&e->live, memory_order_relaxed);
     int live = 0, del = 0;
     counts_read_locked(cpath, &live, &del);
     return live;

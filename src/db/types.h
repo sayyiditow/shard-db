@@ -750,6 +750,16 @@ void update_deleted_count(const char *db_root, const char *object, int delta);
 void reset_deleted_count(const char *db_root, const char *object);
 int get_deleted_count(const char *db_root, const char *object);
 int get_live_count(const char *db_root, const char *object);
+/* Persist any in-memory counts cache for the object back to disk. Called
+   from vacuum / recount / shutdown so cmd_size on the next process boot
+   reflects recent updates. */
+void counts_flush(const char *db_root, const char *object);
+void counts_flush_all(void);
+
+/* Drop the cached counters for an object — used after drop-object /
+   create-object / truncate so a fresh object reads its starting count
+   from disk (typically 0) instead of the stale cache. */
+void counts_invalidate(const char *db_root, const char *object);
 int cmd_get(const char *db_root, const char *object, const char *key);
 int cmd_insert(const char *db_root, const char *object, const char *key, const char *value,
                const char *if_json, int if_not_exists);

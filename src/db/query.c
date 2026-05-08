@@ -12531,6 +12531,7 @@ int cmd_truncate(const char *db_root, const char *object) {
     }
     fcache_invalidate(obj_dir);
     invalidate_idx_cache(object);
+    counts_invalidate(db_root, object);
 
     /* v2: drop the cached slotcask handle so the rmrf below doesn't tug
        on live mmaps. The data/ wipe further down handles the actual
@@ -13470,6 +13471,7 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
     slotcask_registry_invalidate(eff_root, object);
     invalidate_idx_cache(object);
     invalidate_schema_caches(db_root, object);
+    counts_invalidate(eff_root, object);
 
     /* Nuke the on-disk object tree entirely. */
     rmrf(obj_dir);

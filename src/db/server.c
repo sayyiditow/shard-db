@@ -2566,6 +2566,7 @@ int cmd_server(const char *db_root, int daemonize) {
 
     remove_pid_file(db_root);
     parallel_pool_shutdown();
+    counts_flush_all();        /* persist in-memory atomic counts → disk */
     fcache_shutdown();
     bt_cache_shutdown();
     slotcask_shutdown();
