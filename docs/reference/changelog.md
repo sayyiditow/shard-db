@@ -6,6 +6,17 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased — slotcask-engine branch
 
+### kf shard auto-resplit — unbounded inserts without operator intervention
+
+When a kf shard's global load crosses 75 %, the next insert into that shard doubles the kf file in place via linear-hashing rehash:
+
+- Snapshot every flag=1 entry, stage a fresh kf.new at 2× size, repopulate by linear-probing at the new capacity, atomic rename + fsync(parent dir), tear down the old fd/map under the entry wrlock.
+- Trigger is one relaxed atomic load on `SlotcaskDb.live_count` per insert — sub-ns on the hot path. Resplit fires once per doubling, amortised over hundreds of thousands of inserts.
+- Hard ceiling: `SLOTCASK_KF_MAX_SLOTS_PER_SHARD = 16M` slots per shard. At 16M × 24B × 4096 shards that's 1.5 TB of kf — past any realistic dataset. Beyond the cap, operator reshards via `vacuum --splits=N`.
+- Crash safety: kf.new is staged-then-renamed; if the rebuild crashes mid-write the old kf is still the live file. `slotcask_open`'s kf-walk loop now also unlinks any leftover `kf.new` at startup. Idempotent.
+
+Closes the gap where the engine had a hard insert cap based on `splits × slots_per_shard` (e.g. 8M at splits=8, 32M at splits=128) — inserts past that cap used to fail silently. They now grow the kf instead.
+
 ### v2 default vacuum — Direction-C seg compaction + streams-mismatch self-heal
 
 Default `{"mode":"vacuum"}` (no flags) on a v2 object used to be a no-op besides resetting the `deleted` counter. It now does two things:
