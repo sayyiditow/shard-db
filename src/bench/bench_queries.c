@@ -643,6 +643,32 @@ static int bench_queries_run(void) {
     BR("group by active, min/max balance",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"min\",\"field\":\"balance\"},{\"fn\":\"max\",\"field\":\"balance\"}]}");
     BR("group by age, avg(score)",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"score\"}]}");
     BR("group by birthday, count",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"birthday\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Varchar group_by — exercises the post-2026.05.x indexed-path
+       extension that decodes raw varchar leaf bytes into bucket keys. */
+    BR("group by username, count             (varchar idx)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"username\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"limit\":10}");
+    BR("group by email, sum(balance)         (varchar idx)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"email\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}],\"limit\":10}");
+    /* group_by + criteria — indexed-path extension that builds a candidate
+       KeySet from the criteria's index, then filters the group_by walk by
+       it. Was a record-scan path before this fix. */
+    BR("group by active where age>30",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"balance\"}]}");
+    BR("group by age where active=true       (eq crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    BR("group by active where age 25..50 AND score>50  (AND crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"criteria\":[{\"field\":\"age\",\"op\":\"between\",\"value\":[\"25\",\"50\"]},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by age where active=true OR score>80    (OR crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"criteria\":[{\"or\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"80\"}]}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Multi-field group_by — composite bucket key built by walking the
+       primary group field's btree and resolving each secondary field's
+       value via a hash16 → encoded-value map. */
+    BR("group by active, age                  (2-field)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\",\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    BR("group by active, age, sum(balance)    (2-field + agg)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\",\"age\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by age, level                   (2-field, both int)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\",\"level\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
     bench_table_section_end();
 
     /* ---------- CURSOR — keyset pagination by various indexed types ---------- */

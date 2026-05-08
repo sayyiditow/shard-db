@@ -1951,6 +1951,12 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     Schema sc = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    /* Clamp to make the bound visible to -Walloc-size-larger-than: the
+       loader caps at MAX_FIELDS internally, but the signed int return
+       leaves the static analyzer treating `(size_t)nidx` as potentially
+       huge. */
+    if (nidx < 0) nidx = 0;
+    if (nidx > MAX_FIELDS) nidx = MAX_FIELDS;
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
     /* Synthesise a stat-like view so the existing body that referred to
@@ -1965,9 +1971,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         return 1;
     }
 
-    BtEntry **idx_pairs = calloc(nidx, sizeof(BtEntry *));
-    size_t *idx_pair_counts = calloc(nidx, sizeof(size_t));
-    size_t *idx_pair_caps = calloc(nidx, sizeof(size_t));
+    size_t nidx_sz = (size_t)nidx;  /* now demonstrably ≤ MAX_FIELDS */
+    BtEntry **idx_pairs = calloc(nidx_sz, sizeof(BtEntry *));
+    size_t *idx_pair_counts = calloc(nidx_sz, sizeof(size_t));
+    size_t *idx_pair_caps = calloc(nidx_sz, sizeof(size_t));
     for (int i = 0; i < nidx; i++) {
         idx_pair_caps[i] = 4096;
         idx_pairs[i] = malloc(idx_pair_caps[i] * sizeof(BtEntry));
@@ -10776,6 +10783,37 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 free_criteria_tree(tree);
                 return 0;
             }
+            /* Varchar NOT_EXISTS with an index: count(NOT_EXISTS) =
+               live_count − count(EXISTS). The btree only stores non-empty
+               varchars, so count(EXISTS) on the index = btree size, which
+               idx_count_cb resolves in ~5-15ms at 1M. The prior path was
+               PRIMARY_NONE (full record scan) at ~305ms — the planner
+               override at leaf_is_indexed claimed 3ms for scan_shards but
+               that estimate predates v2 segment-walk cost.
+               The EXISTS half (without the negation) already uses the
+               indexed path via the planner; only NOT_EXISTS needs this
+               local shortcut so cmd_find's NOT_EXISTS keeps the correct
+               PRIMARY_NONE record-walk semantics. */
+            if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR &&
+                exists_leaf->leaf.op == OP_NOT_EXISTS &&
+                btree_idx_exists(db_root, object, exists_leaf->leaf.field,
+                                 sch.splits)) {
+                SearchCriterion pos = exists_leaf->leaf;
+                pos.op = OP_EXISTS;
+                const TypedField *pc_tf = &fs.ts->fields[fi];
+                IdxCountCtx ic = { &pos, 0, 0, &dl, 0 };
+                btree_dispatch(db_root, object, pos.field, sch.splits,
+                               &pos, pc_tf, idx_count_cb, &ic);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else {
+                    int total = get_live_count(db_root, object);
+                    size_t neg = ((size_t)total > ic.count)
+                                  ? (size_t)total - ic.count : 0;
+                    OUT("%zu\n", neg);
+                }
+                free_criteria_tree(tree);
+                return 0;
+            }
         }
 
         /* IN / NOT_IN whole-domain shortcut for bool fields. If the value
@@ -13717,8 +13755,76 @@ typedef struct AggBucket {
     struct AggBucket *next;     /* hash chain */
 } AggBucket;
 
-#define AGG_HT_SIZE 16384
+/* Bump-allocator arena for AggBucket and its strings. The pre-arena path
+   did 5+ malloc/strdup calls per bucket (~1.3 µs amortised on glibc) which
+   serialised the indexed group_by Pass 1 walk on high-cardinality fields
+   — at 1M unique varchar buckets it dominated wall time. The arena lets
+   bucket creation amortise to ~50 ns by carving pre-allocated slabs;
+   teardown is one free() per slab instead of N per bucket. */
+typedef struct AggArenaSlab {
+    struct AggArenaSlab *next;
+    size_t used;
+    size_t cap;
+    /* buf[] follows the header in the same allocation */
+} AggArenaSlab;
+
+typedef struct {
+    AggArenaSlab *head;   /* most recent slab; new allocs come from here */
+} AggArena;
+
+/* AggCtx hash table sizing. Starts at AGG_HT_INIT, doubles when load
+   factor crosses 1.0 (total_buckets > ht_cap). Bounded by AGG_HT_MAX so
+   a runaway query can't consume unlimited memory; once at AGG_HT_MAX we
+   accept longer chains and rely on the per-query QUERY_BUFFER_MB cap to
+   stop allocating buckets. AGG_HT_MAX = 1<<24 = 16M slots × 8 B = 128 MB
+   in the worst case — the same scale as the existing query-buffer cap. */
+#define AGG_HT_INIT  256u
+#define AGG_HT_MAX   (1u << 24)
 #define MAX_AGG_SPECS 32
+
+/* 8-byte aligned bump allocation. Grows by allocating a new slab when the
+   current one can't fit the request (slab caps double, with a per-request
+   floor). Returns NULL on malloc failure. */
+static void *agg_arena_alloc(AggArena *a, size_t bytes) {
+    bytes = (bytes + 7u) & ~(size_t)7;
+    if (a->head && a->head->used + bytes <= a->head->cap) {
+        char *base = (char *)(a->head + 1);
+        void *p = base + a->head->used;
+        a->head->used += bytes;
+        return p;
+    }
+    /* Slab geometry: start at 64 KB, double thereafter; never below the
+       request size. Linked-list of slabs so we can free them in bulk. */
+    size_t prev_cap = a->head ? a->head->cap : 65536 / 2;
+    size_t new_cap = prev_cap * 2;
+    if (new_cap < bytes) new_cap = bytes;
+    AggArenaSlab *s = malloc(sizeof(AggArenaSlab) + new_cap);
+    if (!s) return NULL;
+    s->next = a->head;
+    s->used = bytes;
+    s->cap = new_cap;
+    a->head = s;
+    return (char *)(s + 1);
+}
+
+/* Strdup-style helper that copies into the arena. */
+static char *agg_arena_strdup(AggArena *a, const char *s, size_t sl) {
+    char *out = agg_arena_alloc(a, sl + 1);
+    if (!out) return NULL;
+    if (sl > 0) memcpy(out, s, sl);
+    out[sl] = '\0';
+    return out;
+}
+
+static void agg_arena_free(AggArena *a) {
+    AggArenaSlab *s = a->head;
+    while (s) {
+        AggArenaSlab *next = s->next;
+        free(s);
+        s = next;
+    }
+    a->head = NULL;
+}
 
 typedef struct {
     CriteriaNode *tree;
@@ -13731,8 +13837,13 @@ typedef struct {
     AggSpec *specs;
     int nspecs;
     const TypedField *spec_tfs[MAX_AGG_SPECS]; /* resolved typed field per agg spec — NULL = count or composite */
-    /* hash table */
-    AggBucket *ht[AGG_HT_SIZE];
+    /* Dynamic hash table — grows on demand to keep load factor ≤ 1.0
+       so chain length stays O(1). Replaces a fixed 16384-bucket array
+       that became the bottleneck at high cardinality (1M unique values
+       → 61-deep chains → 3 µs per insert via per-bucket strcmp). */
+    AggBucket **ht;
+    size_t      ht_cap;        /* power of 2 */
+    size_t      ht_mask;       /* ht_cap - 1 */
     int total_buckets;
     QueryDeadline *deadline;
     int dl_counter;
@@ -13746,6 +13857,13 @@ typedef struct {
        pre-existed this and uses per-worker ctxs merged later, so the lock is
        harmless there (no contention). */
     pthread_mutex_t lock;
+    /* Slab arena for AggBucket + group_key + group_vals + accums. All
+       per-bucket allocations live here so teardown is O(slabs) not
+       O(buckets) and bucket creation skips ~5 malloc/strdup calls. Per-
+       worker AggCtx clones each have their own arena; the merge path
+       copies what it needs into the destination's arena and frees the
+       source's arena en masse. */
+    AggArena arena;
 } AggCtx;
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
@@ -13923,10 +14041,8 @@ static int decode_index_key_to_double(const TypedField *f,
    so bucket keys built via the indexed group_by fast path collide with
    buckets the per-record agg_scan_cb path would create on the same
    data. Returns the length written; 0 on missing/zero (matches the
-   "missing" semantics). Skip varchar — the indexed group_by fast path
-   doesn't support varchar group_by yet (no decode roundtrip needed
-   since encoded bytes ARE the original content, but the fast path's
-   eligibility check rules it out for now). */
+   "missing" semantics). Varchar is handled via direct byte copy — the
+   index stores raw varchar content, so encoded bytes ARE the original. */
 static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                              char *buf, size_t bufsz) {
     if (!f || !p) return 0;
@@ -14011,6 +14127,16 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
             return snprintf(buf, bufsz, "%s%lld", neg ? "-" : "", (long long)whole);
         return snprintf(buf, bufsz, "%s%lld.%0*lld", neg ? "-" : "",
                         (long long)whole, f->numeric_scale, (long long)frac);
+    }
+    case FT_VARCHAR: {
+        /* Index stores raw varchar bytes. Empty-string semantics match
+           the index's skip-zero rule: zero-length entries don't appear
+           in the btree, so any leaf we see has plen > 0. */
+        if (plen == 0) return 0;
+        size_t cl = plen < bufsz - 1 ? plen : bufsz - 1;
+        memcpy(buf, p, cl);
+        buf[cl] = '\0';
+        return (int)cl;
     }
     default: return 0;
     }
@@ -14097,6 +14223,98 @@ static inline size_t hbk_index(const HashBktMap *m, const uint8_t *hash16) {
     return hbk_seed(hash16) & m->mask;
 }
 
+/* Hash16 → variable-length string map. Used by the indexed group_by fast
+   path for secondary group fields (when ngroups > 1) so we can resolve
+   each record's secondary value by hash16 without fetching the record.
+   Strings are appended into a single arena; entries store (offset, len).
+   Same open-addressed shape as HashBktMap, sized at ~0.75 load factor. */
+typedef struct {
+    uint8_t  hash[16];
+    uint32_t off;        /* offset into arena */
+    uint16_t len;        /* string length */
+    uint8_t  occupied;   /* 0 = empty slot, 1 = occupied */
+} HashStrEntry;
+
+typedef struct {
+    HashStrEntry *entries;
+    size_t        cap;
+    size_t        mask;
+    char         *arena;
+    size_t        arena_used;
+    size_t        arena_cap;
+} HashStrMap;
+
+static int hsm_init(HashStrMap *m, size_t cap_hint, size_t arena_hint) {
+    size_t cap = 64;
+    while (cap * 3 < cap_hint * 4) cap <<= 1;
+    m->entries = calloc(cap, sizeof(HashStrEntry));
+    if (arena_hint < 1024) arena_hint = 1024;
+    m->arena = malloc(arena_hint);
+    if (!m->entries || !m->arena) {
+        free(m->entries); m->entries = NULL;
+        free(m->arena); m->arena = NULL;
+        m->cap = m->mask = m->arena_used = m->arena_cap = 0;
+        return -1;
+    }
+    m->cap = cap;
+    m->mask = cap - 1;
+    m->arena_used = 0;
+    m->arena_cap = arena_hint;
+    return 0;
+}
+
+static void hsm_free(HashStrMap *m) {
+    free(m->entries); m->entries = NULL;
+    free(m->arena);   m->arena = NULL;
+    m->cap = m->mask = m->arena_used = m->arena_cap = 0;
+}
+
+/* Append a string to the arena (growing it if needed) and place an
+   entry into the map. Linear probing on collision. Returns 0 on success,
+   -1 on allocation failure. */
+static int hsm_insert(HashStrMap *m, const uint8_t hash[16],
+                       const char *val, size_t vlen) {
+    if (m->arena_used + vlen > m->arena_cap) {
+        size_t new_cap = m->arena_cap;
+        while (m->arena_used + vlen > new_cap) new_cap *= 2;
+        char *na = realloc(m->arena, new_cap);
+        if (!na) return -1;
+        m->arena = na;
+        m->arena_cap = new_cap;
+    }
+    uint32_t off = (uint32_t)m->arena_used;
+    if (vlen > 0) memcpy(m->arena + off, val, vlen);
+    m->arena_used += vlen;
+
+    size_t idx = hbk_seed(hash) & m->mask;
+    while (m->entries[idx].occupied) {
+        /* Duplicate hash → keep first occurrence; the index walk visits
+           each entry once so this only happens on real hash collisions. */
+        if (memcmp(m->entries[idx].hash, hash, 16) == 0) return 0;
+        idx = (idx + 1) & m->mask;
+    }
+    memcpy(m->entries[idx].hash, hash, 16);
+    m->entries[idx].off = off;
+    m->entries[idx].len = (uint16_t)(vlen > UINT16_MAX ? UINT16_MAX : vlen);
+    m->entries[idx].occupied = 1;
+    return 0;
+}
+
+/* Lookup. Returns 1 with out_val/out_len set on hit, 0 on miss. */
+static int hsm_get(const HashStrMap *m, const uint8_t hash[16],
+                    const char **out_val, size_t *out_len) {
+    size_t idx = hbk_seed(hash) & m->mask;
+    while (m->entries[idx].occupied) {
+        if (memcmp(m->entries[idx].hash, hash, 16) == 0) {
+            *out_val = m->arena + m->entries[idx].off;
+            *out_len = m->entries[idx].len;
+            return 1;
+        }
+        idx = (idx + 1) & m->mask;
+    }
+    return 0;
+}
+
 /* ========== Walk-fetch-check for MIN/MAX with arbitrary criteria ==========
 
    Walk the agg field's btree in MIN/MAX order. For each leaf entry,
@@ -14172,6 +14390,57 @@ static void *wfc_worker(void *arg) {
     return NULL;
 }
 
+/* Per-shard worker for the SUM/AVG/MIN/MAX-with-criteria fast path. Each
+   worker walks one idx shard's btree, filters entries by the candidate
+   KeySet, decodes the value, and accumulates into per-spec local arrays.
+   The orchestrator merges across shards after parallel_for returns. */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const char       *fld;
+    int               shard_id;
+    const TypedField *tf;
+    KeySet           *crit_ks;
+    const int        *sibs;       /* spec indices sharing this field */
+    int               nsibs;
+    QueryDeadline    *deadline;
+    int               dl_counter;
+    /* outputs (one slot per agg spec — only sibs[] entries are touched) */
+    int64_t          *counts;     /* MAX_AGG_SPECS-wide */
+    double           *sums;
+    double           *mins;
+    double           *maxs;
+    int              *present;
+} AwcShardArg;
+
+static void *awc_shard_worker(void *raw) {
+    AwcShardArg *a = (AwcShardArg *)raw;
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path),
+                   a->db_root, a->object, a->fld, a->shard_id);
+    BtRangeIter *it = btree_range_iter_open(
+        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+    if (!it) return NULL;
+    const char *val; size_t vlen; const uint8_t *hash16;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        if (query_deadline_tick(a->deadline, &a->dl_counter)) break;
+        if (!keyset_contains(a->crit_ks, hash16)) continue;
+        double v;
+        if (!decode_index_key_to_double(a->tf, (const uint8_t *)val,
+                                        vlen, &v)) continue;
+        for (int k = 0; k < a->nsibs; k++) {
+            int idx = a->sibs[k];
+            a->counts[idx]++;
+            a->sums[idx] += v;
+            if (v < a->mins[idx]) a->mins[idx] = v;
+            if (v > a->maxs[idx]) a->maxs[idx] = v;
+            a->present[idx] = 1;
+        }
+    }
+    btree_range_iter_close(it);
+    return NULL;
+}
+
 /* Extract a typed field as a double for SUM/AVG/MIN/MAX accumulation.
    Returns 1 if the field is "present" (non-zero/non-empty), 0 if missing
    (so the record is excluded from the aggregate — matches legacy behavior). */
@@ -14233,6 +14502,47 @@ static uint32_t agg_hash(const char *s) {
     return h;
 }
 
+/* Lazy-allocate the AggCtx hash table on first insert. Starting size
+   AGG_HT_INIT (256 slots, 2 KB) — typical low-cardinality group_by
+   queries fit comfortably without ever resizing. Returns 0 on success,
+   -1 on alloc failure. */
+static int agg_ht_lazy_init(AggCtx *ctx) {
+    if (ctx->ht) return 0;
+    ctx->ht = calloc(AGG_HT_INIT, sizeof(AggBucket *));
+    if (!ctx->ht) return -1;
+    ctx->ht_cap = AGG_HT_INIT;
+    ctx->ht_mask = AGG_HT_INIT - 1;
+    return 0;
+}
+
+/* Double the ht in place. Walks each existing chain once, re-routing
+   buckets by (hash & new_mask). All AggBucket structs stay where they
+   are (in the arena); only the table of head pointers is reallocated.
+   Returns 0 on success, -1 on alloc failure (caller falls through to
+   the existing chain — slow but correct). */
+static int agg_ht_resize(AggCtx *ctx) {
+    if (ctx->ht_cap >= AGG_HT_MAX) return 0;  /* hard cap reached */
+    size_t new_cap = ctx->ht_cap * 2;
+    AggBucket **new_ht = calloc(new_cap, sizeof(AggBucket *));
+    if (!new_ht) return -1;
+    size_t new_mask = new_cap - 1;
+    for (size_t i = 0; i < ctx->ht_cap; i++) {
+        AggBucket *b = ctx->ht[i];
+        while (b) {
+            AggBucket *next = b->next;
+            uint32_t h = agg_hash(b->group_key) & (uint32_t)new_mask;
+            b->next = new_ht[h];
+            new_ht[h] = b;
+            b = next;
+        }
+    }
+    free(ctx->ht);
+    ctx->ht = new_ht;
+    ctx->ht_cap = new_cap;
+    ctx->ht_mask = new_mask;
+    return 0;
+}
+
 static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
     /* Build composite key */
     char key[4096];
@@ -14246,7 +14556,13 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
     }
     key[kp] = '\0';
 
-    uint32_t h = agg_hash(key) % AGG_HT_SIZE;
+    /* Lazy-init on first insert so an empty AggCtx pays no allocation. */
+    if (!ctx->ht && agg_ht_lazy_init(ctx) != 0) {
+        ctx->budget_exceeded = 1;
+        return NULL;
+    }
+    uint32_t khash = agg_hash(key);
+    uint32_t h = khash & (uint32_t)ctx->ht_mask;
     for (AggBucket *b = ctx->ht[h]; b; b = b->next) {
         if (strcmp(b->group_key, key) == 0) return b;
     }
@@ -14267,12 +14583,25 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
         }
     }
 
-    /* Create new bucket */
-    AggBucket *b = calloc(1, sizeof(AggBucket));
-    b->group_key = strdup(key);
-    b->group_vals = malloc(nvals * sizeof(char *));
-    for (int i = 0; i < nvals; i++) b->group_vals[i] = strdup(vals[i]);
-    b->accums = calloc(ctx->nspecs, sizeof(AggAccum));
+    /* Create new bucket — all storage carved from ctx->arena so teardown
+       is O(slabs) not O(buckets). */
+    AggBucket *b = agg_arena_alloc(&ctx->arena, sizeof(AggBucket));
+    if (!b) { ctx->budget_exceeded = 1; return NULL; }
+    b->group_key = agg_arena_strdup(&ctx->arena, key, (size_t)kp);
+    b->group_vals = agg_arena_alloc(&ctx->arena, (size_t)nvals * sizeof(char *));
+    if (!b->group_key || !b->group_vals) {
+        ctx->budget_exceeded = 1;
+        return NULL;
+    }
+    for (int i = 0; i < nvals; i++) {
+        size_t sl = strlen(vals[i]);
+        b->group_vals[i] = agg_arena_strdup(&ctx->arena, vals[i], sl);
+        if (!b->group_vals[i]) { ctx->budget_exceeded = 1; return NULL; }
+    }
+    b->accums = agg_arena_alloc(&ctx->arena,
+                                 (size_t)ctx->nspecs * sizeof(AggAccum));
+    if (!b->accums) { ctx->budget_exceeded = 1; return NULL; }
+    memset(b->accums, 0, (size_t)ctx->nspecs * sizeof(AggAccum));
     for (int i = 0; i < ctx->nspecs; i++) {
         b->accums[i].min = 1e308;
         b->accums[i].max = -1e308;
@@ -14280,6 +14609,15 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
     b->next = ctx->ht[h];
     ctx->ht[h] = b;
     ctx->total_buckets++;
+    /* Grow the table when load factor exceeds 1.0 to keep chains O(1).
+       Resize is amortised O(1) per insert (each bucket moves at most
+       O(log N) times across all resizes). The capped AGG_HT_MAX prevents
+       unbounded memory growth — past it, chains lengthen and the
+       per-query QUERY_BUFFER_MB cap stops us before damage. */
+    if ((size_t)ctx->total_buckets > ctx->ht_cap &&
+        ctx->ht_cap < AGG_HT_MAX) {
+        (void)agg_ht_resize(ctx);  /* failure → keep going on old table */
+    }
     return b;
 }
 
@@ -14475,11 +14813,13 @@ static int agg_having_match(AggBucket *bkt, AggSpec *specs, int nspecs,
 
 /* Collect all buckets into a flat array */
 static AggBucket **agg_collect(AggCtx *ctx, int *out_count) {
-    AggBucket **arr = malloc(ctx->total_buckets * sizeof(AggBucket *));
+    AggBucket **arr = malloc((size_t)ctx->total_buckets * sizeof(AggBucket *));
     int n = 0;
-    for (int i = 0; i < AGG_HT_SIZE; i++) {
-        for (AggBucket *b = ctx->ht[i]; b; b = b->next) {
-            arr[n++] = b;
+    if (ctx->ht) {
+        for (size_t i = 0; i < ctx->ht_cap; i++) {
+            for (AggBucket *b = ctx->ht[i]; b; b = b->next) {
+                arr[n++] = b;
+            }
         }
     }
     *out_count = n;
@@ -14502,14 +14842,17 @@ static void agg_ctx_clone_shared(AggCtx *dst, const AggCtx *src) {
     /* dl_counter stays 0 (per-worker local) */
 }
 
-/* Merge src's hash table into dst, freeing src's buckets in place. */
+/* Merge src's hash table into dst. Buckets in src live in src->arena
+   so we don't free them individually — agg_find_or_create copies the
+   group_vals strings into dst->arena, then the caller (or
+   agg_ctx_free_local on src) frees src->arena en masse. */
 static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     int nvals = src->ngroups > 0 ? src->ngroups : 1;
-    for (int i = 0; i < AGG_HT_SIZE; i++) {
-        AggBucket *b = src->ht[i];
-        while (b) {
-            AggBucket *next = b->next;
+    if (!src->ht) { src->total_buckets = 0; return; }
+    for (size_t i = 0; i < src->ht_cap; i++) {
+        for (AggBucket *b = src->ht[i]; b; b = b->next) {
             AggBucket *dbkt = agg_find_or_create(dst, b->group_vals, nvals);
+            if (!dbkt) continue;  /* dst budget exhausted — caller checks flag */
             for (int k = 0; k < src->nspecs; k++) {
                 AggAccum *sa = &b->accums[k], *da = &dbkt->accums[k];
                 da->sum += sa->sum;
@@ -14519,13 +14862,6 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
                     if (sa->max > da->max) da->max = sa->max;
                 }
             }
-            free(b->group_key);
-            for (int j = 0; j < src->ngroups; j++) free(b->group_vals[j]);
-            if (src->ngroups == 0) free(b->group_vals[0]);
-            free(b->group_vals);
-            free(b->accums);
-            free(b);
-            b = next;
         }
         src->ht[i] = NULL;
     }
@@ -14768,18 +15104,13 @@ static int agg_sort_cmp(const void *a, const void *b) {
 }
 
 static void agg_free(AggCtx *ctx) {
-    for (int i = 0; i < AGG_HT_SIZE; i++) {
-        AggBucket *b = ctx->ht[i];
-        while (b) {
-            AggBucket *next = b->next;
-            free(b->group_key);
-            for (int j = 0; j < ctx->ngroups; j++) free(b->group_vals[j]);
-            free(b->group_vals);
-            free(b->accums);
-            free(b);
-            b = next;
-        }
-    }
+    /* Arena owns every per-bucket allocation — one bulk free vs
+       O(buckets × 5) malloc-companion frees in the pre-arena path. */
+    agg_arena_free(&ctx->arena);
+    free(ctx->ht);
+    ctx->ht = NULL;
+    ctx->ht_cap = ctx->ht_mask = 0;
+    ctx->total_buckets = 0;
     free(ctx->specs);
     pthread_mutex_destroy(&ctx->lock);
 }
@@ -14904,20 +15235,12 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
    that omits `free(ctx->specs)` and `pthread_mutex_destroy()` because
    those resources are owned by the cloning origin. */
 static void agg_ctx_free_local(AggCtx *ctx) {
-    for (int i = 0; i < AGG_HT_SIZE; i++) {
-        AggBucket *b = ctx->ht[i];
-        while (b) {
-            AggBucket *next = b->next;
-            free(b->group_key);
-            for (int j = 0; j < ctx->ngroups; j++) free(b->group_vals[j]);
-            if (ctx->ngroups == 0 && b->group_vals) free(b->group_vals[0]);
-            free(b->group_vals);
-            free(b->accums);
-            free(b);
-            b = next;
-        }
-        ctx->ht[i] = NULL;
-    }
+    /* Same arena teardown as agg_free, but without freeing the shared
+       resources (specs, mutex) — those are owned by the cloning origin. */
+    agg_arena_free(&ctx->arena);
+    free(ctx->ht);
+    ctx->ht = NULL;
+    ctx->ht_cap = ctx->ht_mask = 0;
     ctx->total_buckets = 0;
 }
 
@@ -15249,6 +15572,188 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    /* Fast path: single-spec MIN/MAX where the criterion is on the SAME
+       field as the agg (e.g. `min age where age > 30`). The criterion's
+       btree IS the agg field's btree, so we just walk it within the
+       criterion's bounds in MIN/MAX direction and take the first leaf —
+       pure btree, no record fetch, no KeySet. Lifted out of Path A so it
+       runs BEFORE walk-fetch-check, otherwise these queries pay an
+       unnecessary record-fetch tax (12+ ms vs <1 ms). */
+    if (tree && no_group && no_having && nspecs == 1 &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
+        CriteriaNode *sf_leaf_node = NULL;
+        if (tree->kind == CNODE_LEAF) sf_leaf_node = tree;
+        else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                 tree->children[0]->kind == CNODE_LEAF)
+            sf_leaf_node = tree->children[0];
+        int sf_agg_fi = typed_field_index(fs.ts, specs[0].field);
+        if (sf_leaf_node && sf_agg_fi >= 0 &&
+            fs.ts->fields[sf_agg_fi].type != FT_VARCHAR &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
+            const TypedField *agg_tf = &fs.ts->fields[sf_agg_fi];
+            SearchCriterion *crit = &sf_leaf_node->leaf;
+            int rangeable = (crit->op == OP_EQUAL ||
+                             crit->op == OP_GREATER ||
+                             crit->op == OP_GREATER_EQ ||
+                             crit->op == OP_LESS ||
+                             crit->op == OP_LESS_EQ ||
+                             crit->op == OP_BETWEEN);
+            if (rangeable && strcmp(crit->field, specs[0].field) == 0) {
+                uint8_t buf1[1032], buf2[1032];
+                size_t len1 = 0, len2 = 0;
+                const char *min_v = "";    size_t min_l = 0; int min_x = 0;
+                const char *max_v = "\xff\xff\xff\xff"; size_t max_l = 4; int max_x = 0;
+                switch (crit->op) {
+                case OP_EQUAL:
+                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+                    min_v = (const char *)buf1; min_l = len1;
+                    max_v = (const char *)buf1; max_l = len1;
+                    break;
+                case OP_GREATER:
+                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+                    min_v = (const char *)buf1; min_l = len1; min_x = 1;
+                    break;
+                case OP_GREATER_EQ:
+                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+                    min_v = (const char *)buf1; min_l = len1;
+                    break;
+                case OP_LESS:
+                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+                    max_v = (const char *)buf1; max_l = len1; max_x = 1;
+                    break;
+                case OP_LESS_EQ:
+                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+                    max_v = (const char *)buf1; max_l = len1;
+                    break;
+                case OP_BETWEEN:
+                    encode_criterion_value(agg_tf, crit->value,  strlen(crit->value),  buf1, &len1);
+                    encode_criterion_value(agg_tf, crit->value2, strlen(crit->value2), buf2, &len2);
+                    min_v = (const char *)buf1; min_l = len1; min_x = crit->min_exclusive;
+                    max_v = (const char *)buf2; max_l = len2; max_x = crit->max_exclusive;
+                    break;
+                default: break;
+                }
+                int n_idx = index_splits_for(sch.splits);
+                int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
+                double best = 0.0;
+                int have = 0;
+                for (int s = 0; s < n_idx; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                   object, specs[0].field, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, min_v, min_l, min_x,
+                        max_v, max_l, max_x, desc);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        double v;
+                        if (decode_index_key_to_double(agg_tf,
+                                                       (const uint8_t *)val,
+                                                       vlen, &v)) {
+                            if (!have) { best = v; have = 1; }
+                            else if (desc) { if (v > best) best = v; }
+                            else           { if (v < best) best = v; }
+                            break;
+                        }
+                    }
+                    btree_range_iter_close(it);
+                }
+                char vbuf[64];
+                fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                         ? parse_csv_delim(delimiter) : 0;
+                if (csv_delim_local) {
+                    csv_emit_cell(specs[0].alias, csv_delim_local);
+                    OUT("\n");
+                    csv_emit_cell(vbuf, csv_delim_local);
+                    OUT("\n");
+                } else {
+                    OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+                }
+                free_criteria_tree(tree);
+                free(specs);
+                return 0;
+            }
+        }
+    }
+
+    /* Fast path: single-spec MIN/MAX with arbitrary criteria — walk the
+       agg field's btree in MIN/MAX order, fetch each record, evaluate the
+       full criteria tree, return the first match per shard. Tried FIRST
+       (before any keyset-building paths) because for any criterion with
+       selectivity > ~0.05% it finds the answer within a few µs while the
+       keyset/intersect paths spend 30-80ms building candidate sets up
+       front. Per-shard 10K-walk budget bails out cleanly for low-
+       selectivity criteria; falls through to the keyset / intersect /
+       agg_run_plan paths below which guarantee completeness. */
+    if (tree && no_group && no_having && nspecs == 1 &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
+        int agg_fi = typed_field_index(fs.ts, specs[0].field);
+        if (agg_fi >= 0 &&
+            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
+            const TypedField *agg_tf = &fs.ts->fields[agg_fi];
+            int n_idx = index_splits_for(sch.splits);
+            int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
+            WfcArg *wargs = calloc((size_t)n_idx, sizeof(WfcArg));
+            if (wargs) {
+                for (int s = 0; s < n_idx; s++) {
+                    wargs[s].db_root   = db_root;
+                    wargs[s].object    = object;
+                    wargs[s].sch       = &sch;
+                    wargs[s].shard_id  = s;
+                    wargs[s].agg_field = specs[0].field;
+                    wargs[s].agg_tf    = agg_tf;
+                    wargs[s].desc      = desc;
+                    wargs[s].tree      = tree;
+                    wargs[s].fs        = &fs;
+                    wargs[s].deadline  = &dl;
+                    wargs[s].budget    = 10000;
+                }
+                parallel_for(wfc_worker, wargs, n_idx, sizeof(WfcArg));
+
+                int any_indefinite = 0;
+                double best = 0.0;
+                int have = 0;
+                for (int s = 0; s < n_idx; s++) {
+                    if (wargs[s].budget_exceeded) any_indefinite = 1;
+                    if (wargs[s].found) {
+                        if (!have) { best = wargs[s].best; have = 1; }
+                        else if (desc) { if (wargs[s].best > best) best = wargs[s].best; }
+                        else           { if (wargs[s].best < best) best = wargs[s].best; }
+                    }
+                }
+                free(wargs);
+                if (dl.timed_out) {
+                    OUT("{\"error\":\"query_timeout\"}\n");
+                    free_criteria_tree(tree); free(specs);
+                    return -1;
+                }
+                if (!any_indefinite) {
+                    char vbuf[64];
+                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                             ? parse_csv_delim(delimiter) : 0;
+                    if (csv_delim_local) {
+                        csv_emit_cell(specs[0].alias, csv_delim_local);
+                        OUT("\n");
+                        csv_emit_cell(vbuf, csv_delim_local);
+                        OUT("\n");
+                    } else {
+                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
+                    }
+                    free_criteria_tree(tree);
+                    free(specs);
+                    return 0;
+                }
+                /* else: fall through to keyset/intersect paths below */
+            }
+        }
+    }
+
     /* Fast path: single-spec MIN/MAX narrowed by ONE indexed criterion.
        Build candidate KeySet from the criterion's index walk, then walk
        the agg field's btree in ASC (MIN) or DESC (MAX) order — the first
@@ -15257,13 +15762,9 @@ int cmd_aggregate(const char *db_root, const char *object,
        decode_index_key_to_double. ~10× faster than agg_run_plan's path
        which collects all hashes then decodes per record.
 
-       Only fires when:
-         - single spec MIN or MAX, no group_by, no having
-         - criteria is one LEAF (`{...}`) or AND-of-one (`[{...}]`)
-         - criteria leaf is indexed (so collect_hash_cb is fast)
-         - agg field is indexed non-varchar (decode_index_key_to_double works)
-       Falls through to the existing scan / parallel_indexed_agg path
-       for AND-with-multiple, OR, no-index, or composite agg field. */
+       Reached only when walk-fetch-check above bailed (low-selectivity
+       criterion) or when the criterion isn't indexed-eligible. Provides
+       a complete answer regardless of selectivity. */
     if (tree && no_group && no_having && nspecs == 1 &&
         (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
         fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
@@ -15439,91 +15940,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     return 0;
                 }
                 keyset_free(ks);
-            }
-        }
-    }
-
-    /* Fast path: single-spec MIN/MAX with arbitrary criteria — walk the
-       agg field's btree in MIN/MAX order, fetch each record, evaluate
-       the full criteria tree, return the first match per shard.
-
-       Beats the keyset/intersect paths whenever criteria selectivity is
-       above ~1%: those paths build a candidate hash set up-front (~30ms
-       for a 500k-match leaf, ~80ms for a 2-leaf intersect) before
-       walking the agg btree at all, while walk-fetch-check finds the
-       answer in a few records (~µs each) and exits. For high-selectivity
-       multi-leaf AND aggregate min/max queries this collapses 50-80ms
-       of intersect setup down to single-digit ms.
-
-       Per-shard `budget` cap (10000 walks) bails out for low-selectivity
-       criteria. Any shard hitting budget without a match makes the
-       global result indefinite — fall through to the existing
-       multi-leaf intersect / agg_run_plan path which guarantees
-       completeness regardless of selectivity. */
-    if (tree && no_group && no_having && nspecs == 1 &&
-        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
-        fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
-        int agg_fi = typed_field_index(fs.ts, specs[0].field);
-        if (agg_fi >= 0 &&
-            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
-            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
-            const TypedField *agg_tf = &fs.ts->fields[agg_fi];
-            int n_idx = index_splits_for(sch.splits);
-            int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
-            WfcArg *wargs = calloc((size_t)n_idx, sizeof(WfcArg));
-            if (wargs) {
-                for (int s = 0; s < n_idx; s++) {
-                    wargs[s].db_root   = db_root;
-                    wargs[s].object    = object;
-                    wargs[s].sch       = &sch;
-                    wargs[s].shard_id  = s;
-                    wargs[s].agg_field = specs[0].field;
-                    wargs[s].agg_tf    = agg_tf;
-                    wargs[s].desc      = desc;
-                    wargs[s].tree      = tree;
-                    wargs[s].fs        = &fs;
-                    wargs[s].deadline  = &dl;
-                    wargs[s].budget    = 10000;
-                }
-                parallel_for(wfc_worker, wargs, n_idx, sizeof(WfcArg));
-
-                int any_indefinite = 0;
-                double best = 0.0;
-                int have = 0;
-                for (int s = 0; s < n_idx; s++) {
-                    if (wargs[s].budget_exceeded) any_indefinite = 1;
-                    if (wargs[s].found) {
-                        if (!have) { best = wargs[s].best; have = 1; }
-                        else if (desc) { if (wargs[s].best > best) best = wargs[s].best; }
-                        else           { if (wargs[s].best < best) best = wargs[s].best; }
-                    }
-                }
-                free(wargs);
-                if (dl.timed_out) {
-                    OUT("{\"error\":\"query_timeout\"}\n");
-                    free_criteria_tree(tree); free(specs);
-                    return -1;
-                }
-                if (!any_indefinite) {
-                    /* All shards walked their entire btree (or found a
-                       match within budget) — answer is definitive. */
-                    char vbuf[64];
-                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
-                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                             ? parse_csv_delim(delimiter) : 0;
-                    if (csv_delim_local) {
-                        csv_emit_cell(specs[0].alias, csv_delim_local);
-                        OUT("\n");
-                        csv_emit_cell(vbuf, csv_delim_local);
-                        OUT("\n");
-                    } else {
-                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                    }
-                    free_criteria_tree(tree);
-                    free(specs);
-                    return 0;
-                }
-                /* else: fall through to multi-leaf intersect / agg_run_plan */
             }
         }
     }
@@ -15787,30 +16203,291 @@ int cmd_aggregate(const char *db_root, const char *object,
         return 0;
     }
 
-    /* Fast path: indexed group_by (single field, non-varchar, btree
-       exists), no criteria. Walk the group_by btree directly to bucket
-       per encoded value; for any sum/avg/min/max specs whose target
-       field is also indexed and non-varchar, walk that field's btree
-       and attribute each entry to its bucket via a hash16→bid map.
-       Skips the per-record scan entirely (1.1s on 1M records → tens of
-       ms), and feeds the existing having / order_by / limit / emit
-       pipeline.
+    /* Fast path: aggregate(s) with criteria, no group_by, no having.
+       Builds a candidate KeySet from the indexed criteria (LEAF /
+       INTERSECT / KEYSET planner kinds), then walks each unique non-
+       count agg field's btree once, accumulating sum/avg/min/max from
+       leaf bytes only when the entry's hash is in the KeySet. COUNT
+       specs read |KeySet| directly. No record fetches, no group bucketing.
+       Replaces the prior fall-through to parallel_indexed_agg which had
+       to fetch every matching record (~5µs each) just to read fields it
+       could have decoded straight from index leaves.
 
        Eligibility:
-         - no criteria (tree == NULL)
-         - exactly one group_by field, indexed, non-composite, non-varchar
+         - no group_by, no having, nspecs >= 1
+         - every spec is one of:
+             * AGG_COUNT (no field, or non-varchar typed field)
+             * AGG_SUM/AVG/MIN/MAX on an indexed non-varchar non-composite
+         - criteria is present and index-friendly (planner returns
+           PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET)
+       Single-spec MIN/MAX is *not* eligible here — the walk-fetch-check
+       and same-field shortcuts above are faster for those. */
+    if (tree && no_group && no_having && nspecs >= 1 && fs.ts) {
+        int aw_eligible = 1;
+        int aw_min_max_only = 1;
+        for (int i = 0; i < nspecs && aw_eligible; i++) {
+            AggSpec *sp = &specs[i];
+            if (sp->fn == AGG_COUNT) {
+                if (sp->field[0]) {
+                    if (strchr(sp->field, '+')) { aw_eligible = 0; break; }
+                    int fi = typed_field_index(fs.ts, sp->field);
+                    if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
+                        aw_eligible = 0; break;
+                    }
+                }
+                aw_min_max_only = 0;
+                continue;
+            }
+            if (sp->fn != AGG_SUM && sp->fn != AGG_AVG &&
+                sp->fn != AGG_MIN && sp->fn != AGG_MAX) {
+                aw_eligible = 0; break;
+            }
+            if (!sp->field[0] || strchr(sp->field, '+')) {
+                aw_eligible = 0; break;
+            }
+            int fi = typed_field_index(fs.ts, sp->field);
+            if (fi < 0 || fs.ts->fields[fi].type == FT_VARCHAR ||
+                !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
+                aw_eligible = 0; break;
+            }
+            if (sp->fn != AGG_MIN && sp->fn != AGG_MAX) aw_min_max_only = 0;
+        }
+        /* Single-spec MIN/MAX already had a faster shortcut above (early
+           per-shard exit on first matching leaf). Skip those here so we
+           don't regress them. */
+        if (nspecs == 1 && aw_min_max_only) aw_eligible = 0;
+
+        if (aw_eligible) {
+            QueryPlan crit_plan = choose_primary_source(tree, db_root, object);
+            KeySet *crit_ks = NULL;
+            int aw_indef = 0;
+            if (crit_plan.kind == PRIMARY_LEAF) {
+                /* build_keyset_from_leaf walks the btree but its callback
+                   doesn't apply check_primary or length-op filtering — fine
+                   for rangeable ops (eq/lt/gt/range/between/in/starts), but
+                   over-includes for ops like contains/like/ends/regex/len_*
+                   where the leaf walk visits all entries and the filter is
+                   per-entry. Falling through to agg_run_plan / record-scan
+                   keeps the result correct; the cost is higher but bounded. */
+                enum SearchOp lop = crit_plan.primary_leaf->op;
+                if (op_needs_check_primary(lop) || op_is_length(lop)) {
+                    aw_indef = 1;
+                } else {
+                    crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
+                                                      crit_plan.primary_leaf, &dl);
+                }
+            } else if (crit_plan.kind == PRIMARY_INTERSECT) {
+                int small_primary = 0;
+                crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
+                                                    crit_plan.intersect_leaves,
+                                                    crit_plan.intersect_count,
+                                                    &dl, &small_primary);
+                if (small_primary) {
+                    if (crit_ks) keyset_free(crit_ks);
+                    crit_ks = NULL;
+                    aw_indef = 1;
+                }
+            } else if (crit_plan.kind == PRIMARY_KEYSET) {
+                int budget_exceeded = 0;
+                crit_ks = build_or_keyset(db_root, object, sch.splits,
+                                           crit_plan.or_node, &dl,
+                                           &budget_exceeded, 0);
+                if (budget_exceeded) {
+                    if (crit_ks) keyset_free(crit_ks);
+                    crit_ks = NULL;
+                    aw_indef = 1;
+                }
+            } else {
+                aw_indef = 1; /* PRIMARY_NONE */
+            }
+
+            if (!aw_indef && crit_ks && !dl.timed_out) {
+                long match_count = (long)keyset_size(crit_ks);
+                int64_t counts[MAX_AGG_SPECS] = {0};
+                double  sums[MAX_AGG_SPECS]   = {0};
+                double  mins[MAX_AGG_SPECS], maxs[MAX_AGG_SPECS];
+                int     present[MAX_AGG_SPECS] = {0};
+                for (int i = 0; i < nspecs; i++) {
+                    mins[i] = 1e308;
+                    maxs[i] = -1e308;
+                }
+                int processed[MAX_AGG_SPECS] = {0};
+                int n_idx = index_splits_for(sch.splits);
+                for (int i = 0; i < nspecs; i++) {
+                    if (processed[i] || specs[i].fn == AGG_COUNT) continue;
+                    const char *fld = specs[i].field;
+                    int fi = typed_field_index(fs.ts, fld);
+                    const TypedField *tf = &fs.ts->fields[fi];
+                    int sibs[MAX_AGG_SPECS]; int nsibs = 0;
+                    for (int j = i; j < nspecs; j++) {
+                        if (specs[j].fn == AGG_COUNT) continue;
+                        if (strcmp(specs[j].field, fld) != 0) continue;
+                        sibs[nsibs++] = j;
+                        processed[j] = 1;
+                    }
+                    /* Parallelise across the agg field's idx shards. Each
+                       worker walks one shard with local accumulators; we
+                       merge after parallel_for returns. Per-worker memory
+                       is small (4 × MAX_AGG_SPECS × 8B ≈ 1KB) so spawn
+                       cost is the only worry — n_idx ≤ 128 here, well
+                       within the pool's tolerance. */
+                    AwcShardArg *wargs = calloc((size_t)n_idx, sizeof(AwcShardArg));
+                    int64_t (*w_counts)[MAX_AGG_SPECS] =
+                        calloc((size_t)n_idx, sizeof(*w_counts));
+                    double (*w_sums)[MAX_AGG_SPECS] =
+                        calloc((size_t)n_idx, sizeof(*w_sums));
+                    double (*w_mins)[MAX_AGG_SPECS] =
+                        calloc((size_t)n_idx, sizeof(*w_mins));
+                    double (*w_maxs)[MAX_AGG_SPECS] =
+                        calloc((size_t)n_idx, sizeof(*w_maxs));
+                    int (*w_present)[MAX_AGG_SPECS] =
+                        calloc((size_t)n_idx, sizeof(*w_present));
+                    if (!wargs || !w_counts || !w_sums || !w_mins ||
+                        !w_maxs || !w_present) {
+                        free(wargs); free(w_counts); free(w_sums);
+                        free(w_mins); free(w_maxs); free(w_present);
+                        keyset_free(crit_ks);
+                        free_criteria_tree(tree); free(specs);
+                        OUT(QUERY_BUFFER_ERR);
+                        return -1;
+                    }
+                    for (int s = 0; s < n_idx; s++) {
+                        for (int k = 0; k < nsibs; k++) {
+                            w_mins[s][sibs[k]] = 1e308;
+                            w_maxs[s][sibs[k]] = -1e308;
+                        }
+                        wargs[s].db_root  = db_root;
+                        wargs[s].object   = object;
+                        wargs[s].fld      = fld;
+                        wargs[s].shard_id = s;
+                        wargs[s].tf       = tf;
+                        wargs[s].crit_ks  = crit_ks;
+                        wargs[s].sibs     = sibs;
+                        wargs[s].nsibs    = nsibs;
+                        wargs[s].deadline = &dl;
+                        wargs[s].counts   = w_counts[s];
+                        wargs[s].sums     = w_sums[s];
+                        wargs[s].mins     = w_mins[s];
+                        wargs[s].maxs     = w_maxs[s];
+                        wargs[s].present  = w_present[s];
+                    }
+                    parallel_for(awc_shard_worker, wargs, n_idx, sizeof(AwcShardArg));
+                    /* Merge per-shard results into the outer accumulators. */
+                    for (int s = 0; s < n_idx; s++) {
+                        for (int k = 0; k < nsibs; k++) {
+                            int idx = sibs[k];
+                            counts[idx] += w_counts[s][idx];
+                            sums[idx]   += w_sums[s][idx];
+                            if (w_present[s][idx]) {
+                                if (w_mins[s][idx] < mins[idx]) mins[idx] = w_mins[s][idx];
+                                if (w_maxs[s][idx] > maxs[idx]) maxs[idx] = w_maxs[s][idx];
+                                present[idx] = 1;
+                            }
+                        }
+                    }
+                    free(wargs); free(w_counts); free(w_sums);
+                    free(w_mins); free(w_maxs); free(w_present);
+                }
+
+                /* Emit. COUNT specs use match_count (= |KeySet|). */
+                char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                                         ? parse_csv_delim(delimiter) : 0;
+                if (csv_delim_local) {
+                    for (int i = 0; i < nspecs; i++) {
+                        if (i > 0) { char d[2] = { csv_delim_local, '\0' }; OUT("%s", d); }
+                        csv_emit_cell(specs[i].alias, csv_delim_local);
+                    }
+                    OUT("\n");
+                    for (int i = 0; i < nspecs; i++) {
+                        if (i > 0) { char d[2] = { csv_delim_local, '\0' }; OUT("%s", d); }
+                        char vbuf[64];
+                        if (specs[i].fn == AGG_COUNT) {
+                            snprintf(vbuf, sizeof(vbuf), "%ld", match_count);
+                        } else {
+                            double r = 0.0;
+                            switch (specs[i].fn) {
+                                case AGG_SUM: r = sums[i]; break;
+                                case AGG_AVG: r = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0; break;
+                                case AGG_MIN: r = present[i] ? mins[i] : 0.0; break;
+                                case AGG_MAX: r = present[i] ? maxs[i] : 0.0; break;
+                                default: break;
+                            }
+                            fmt_double(vbuf, sizeof(vbuf), r);
+                        }
+                        csv_emit_cell(vbuf, csv_delim_local);
+                    }
+                    OUT("\n");
+                } else {
+                    OUT("{");
+                    for (int i = 0; i < nspecs; i++) {
+                        if (i > 0) OUT(",");
+                        if (specs[i].fn == AGG_COUNT) {
+                            OUT("\"%s\":%ld", specs[i].alias, match_count);
+                        } else {
+                            double r = 0.0;
+                            switch (specs[i].fn) {
+                                case AGG_SUM: r = sums[i]; break;
+                                case AGG_AVG: r = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0; break;
+                                case AGG_MIN: r = present[i] ? mins[i] : 0.0; break;
+                                case AGG_MAX: r = present[i] ? maxs[i] : 0.0; break;
+                                default: break;
+                            }
+                            char vbuf[64];
+                            fmt_double(vbuf, sizeof(vbuf), r);
+                            OUT("\"%s\":%s", specs[i].alias, vbuf);
+                        }
+                    }
+                    OUT("}\n");
+                }
+
+                keyset_free(crit_ks);
+                free_criteria_tree(tree);
+                free(specs);
+                return 0;
+            }
+            if (crit_ks) keyset_free(crit_ks);
+            /* else: fall through to agg_run_plan / record-scan path. */
+        }
+    }
+
+    /* Fast path: indexed group_by (single field, btree exists). Walks the
+       group_by btree directly to bucket per encoded value; for any
+       sum/avg/min/max specs whose target field is also indexed and
+       non-varchar, walks that field's btree and attributes each entry to
+       its bucket via a hash16→bid map. Skips the per-record scan entirely
+       (1.1s on 1M records → tens of ms), and feeds the existing having /
+       order_by / limit / emit pipeline.
+
+       Eligibility:
+         - exactly one group_by field, indexed, non-composite (varchar OK)
          - every spec is one of:
              * AGG_COUNT (with no field, or non-varchar typed field)
              * AGG_SUM/AVG/MIN/MAX on an indexed non-varchar non-composite
+         - if criteria is present, it must be index-friendly (planner
+           returns PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET) so
+           we can build a candidate KeySet to filter the group_by walk.
        Records whose group_by field encodes to zero/empty (the index
        skip-zero rule) are excluded — same semantics as the existing
        no-criteria sum/avg/min/max btree fast path. */
-    int igb_eligible = (!tree && ctx.ngroups == 1 && fs.ts &&
-                        ctx.group_tfs[0] &&
-                        ctx.group_tfs[0]->type != FT_VARCHAR &&
-                        !strchr(ctx.group_fields[0], '+') &&
-                        btree_idx_exists(db_root, object,
-                                         ctx.group_fields[0], sch.splits));
+    int igb_eligible = (ctx.ngroups >= 1 && ctx.ngroups <= MAX_FIELDS && fs.ts);
+    if (igb_eligible) {
+        for (int g = 0; g < ctx.ngroups; g++) {
+            if (!ctx.group_tfs[g] ||
+                strchr(ctx.group_fields[g], '+') ||
+                !btree_idx_exists(db_root, object,
+                                  ctx.group_fields[g], sch.splits)) {
+                igb_eligible = 0;
+                break;
+            }
+            /* No varchar size threshold: measured indexed path beats the
+               scan path even at 1M unique varchar values (one btree leaf
+               walk + arena-backed bucket creation finishes faster than
+               parallel record decode + per-worker bucket merges). The
+               arena allocator below makes this true at every cardinality
+               we benchmark; the only remaining gate is "field is indexed
+               and non-composite". */
+        }
+    }
     int igb_needs_hbm = 0;
     if (igb_eligible) {
         for (int i = 0; i < ctx.nspecs; i++) {
@@ -15832,14 +16509,23 @@ int cmd_aggregate(const char *db_root, const char *object,
             igb_needs_hbm = 1;
         }
     }
-    /* Restrict the indexed group_by path to count-only. For multi-spec
-       (count + sum/avg/min/max) the per-worker scan_shards path below
-       (parallel_agg_scan_shards) is faster: walking 1M records ÷ 16
-       workers without a shared mutex hits ~25ms, vs the indexed path's
-       ~120ms which pays for the agg-field btree walk + 1M cache-cold
-       hash16 → bucket lookups. Count-only stays on the indexed path
-       (~17ms — beats the per-record path on this case). */
-    if (igb_needs_hbm) igb_eligible = 0;
+    /* Multi-spec indexed group_by (count + sum/avg/min/max on indexed
+       non-varchar agg fields) stays on the indexed path. The earlier
+       restriction here assumed parallel record scan (~25ms) beat the
+       indexed path (~120ms), but that estimate was a v1 measurement —
+       v2 segment-walk record scans run ~5× slower, putting the indexed
+       path firmly ahead at every scale we benchmark. The gate is kept
+       in place as a no-op for diff continuity, but `igb_needs_hbm` no
+       longer disqualifies. */
+
+    /* Plan the criteria (if any). PRIMARY_NONE means we can't build a
+       candidate KeySet from the index alone — fall through to the
+       per-record scan path so non-indexed leaves are evaluated correctly. */
+    QueryPlan crit_plan = { .kind = PRIMARY_NONE };
+    if (igb_eligible && tree) {
+        crit_plan = choose_primary_source(tree, db_root, object);
+        if (crit_plan.kind == PRIMARY_NONE) igb_eligible = 0;
+    }
 
     int igb_done = 0;
     if (igb_eligible) {
@@ -15850,8 +16536,152 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (igb_needs_hbm) {
             int live = get_live_count(db_root, object);
             if (live <= 0) live = 1024;
+            /* Estimate hbk footprint before allocating. Capacity is the
+               next power of 2 such that cap*3 >= live*4 (load factor ~0.75);
+               each entry is 24 bytes. If the projected footprint would
+               exceed half of QUERY_BUFFER_MB, skip the indexed path and
+               let the per-record scan handle it — the scan is slower at
+               1M scale but has constant memory, so the user always gets
+               an answer instead of a buffer-exceeded error. */
+            size_t cap_est = 64;
+            while (cap_est * 3 < (size_t)live * 4) cap_est <<= 1;
+            size_t hbk_bytes = cap_est * sizeof(HashBktEntry);
+            if (hbk_bytes > g_query_buffer_max_bytes / 2) goto igb_skip;
             if (hbk_init(&hbk, (size_t)live) == 0) hbk_ready = 1;
             else goto igb_skip;
+        }
+
+        /* If we have criteria, build a candidate KeySet from the indexed
+           plan and filter Pass 1 / Pass 2 by it. PRIMARY_LEAF →
+           build_keyset_from_leaf, PRIMARY_INTERSECT → intersect_indexed_leaves
+           (with small-primary fallthrough since that path needs record-rematch
+           which we don't do here), PRIMARY_KEYSET → build_or_keyset. On any
+           failure, fall through to the scan path. */
+        KeySet *crit_ks = NULL;
+        if (tree) {
+            if (crit_plan.kind == PRIMARY_LEAF) {
+                /* Same caveat as the no-group_by path above:
+                   build_keyset_from_leaf doesn't filter via check_primary,
+                   so non-rangeable ops would over-include. Fall through to
+                   agg_run_plan for those — correctness over speed. */
+                enum SearchOp lop = crit_plan.primary_leaf->op;
+                if (op_needs_check_primary(lop) || op_is_length(lop)) {
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+                crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
+                                                  crit_plan.primary_leaf, &dl);
+            } else if (crit_plan.kind == PRIMARY_INTERSECT) {
+                int small_primary = 0;
+                crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
+                                                    crit_plan.intersect_leaves,
+                                                    crit_plan.intersect_count,
+                                                    &dl, &small_primary);
+                if (small_primary) {
+                    /* Small-primary intersect needs criteria_match_tree per
+                       record to confirm — that's the scan-path's job, not
+                       ours. Fall through cleanly. */
+                    if (crit_ks) keyset_free(crit_ks);
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+            } else if (crit_plan.kind == PRIMARY_KEYSET) {
+                int budget_exceeded = 0;
+                crit_ks = build_or_keyset(db_root, object, sch.splits,
+                                           crit_plan.or_node, &dl,
+                                           &budget_exceeded, 0);
+                if (budget_exceeded) {
+                    if (crit_ks) keyset_free(crit_ks);
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+            }
+            if (!crit_ks || dl.timed_out) {
+                if (crit_ks) keyset_free(crit_ks);
+                if (hbk_ready) hbk_free(&hbk);
+                goto igb_skip;
+            }
+        }
+
+        /* Multi-field group_by: walk each *secondary* group field's btree
+           once and build a hash16 → encoded-value map. Pass 1 then composes
+           the bucket key as [primary_value, sec_map[0].lookup(hash16),
+           sec_map[1].lookup(hash16), ...]. Memory budget: ~24B per slot
+           plus arena (avg 8-16B per varchar value) — capped at
+           QUERY_BUFFER_MB/(2*n_sec) per map; if over, falls through to
+           the per-record scan path. */
+        int n_sec = ctx.ngroups - 1;
+        HashStrMap *sec_maps = NULL;
+        int dl_counter_sec = 0;
+        if (n_sec > 0) {
+            sec_maps = calloc((size_t)n_sec, sizeof(HashStrMap));
+            if (!sec_maps) {
+                if (crit_ks) keyset_free(crit_ks);
+                if (hbk_ready) hbk_free(&hbk);
+                goto igb_skip;
+            }
+            int live = get_live_count(db_root, object);
+            if (live <= 0) live = 1024;
+            int n_idx_s = index_splits_for(sch.splits);
+            for (int g = 0; g < n_sec; g++) {
+                /* Per-map memory cap: split QUERY_BUFFER_MB / 2 across
+                   secondary maps + the (already-allocated) hbk. */
+                size_t cap_est = 64;
+                while (cap_est * 3 < (size_t)live * 4) cap_est <<= 1;
+                size_t map_bytes = cap_est * sizeof(HashStrEntry)
+                                   + (size_t)live * 16;  /* arena estimate */
+                if (map_bytes > g_query_buffer_max_bytes / (size_t)(2 * (n_sec + 1))) {
+                    for (int k = 0; k < g; k++) hsm_free(&sec_maps[k]);
+                    free(sec_maps); sec_maps = NULL;
+                    if (crit_ks) keyset_free(crit_ks);
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+                if (hsm_init(&sec_maps[g], (size_t)live, (size_t)live * 8) != 0) {
+                    for (int k = 0; k < g; k++) hsm_free(&sec_maps[k]);
+                    free(sec_maps); sec_maps = NULL;
+                    if (crit_ks) keyset_free(crit_ks);
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+                const TypedField *gtf_s = ctx.group_tfs[g + 1];
+                const char *gfld_s = ctx.group_fields[g + 1];
+                int sec_aborted = 0;
+                for (int s = 0; s < n_idx_s && !sec_aborted; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                   object, gfld_s, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        if (query_deadline_tick(&dl, &dl_counter_sec)) {
+                            sec_aborted = 1; break;
+                        }
+                        /* Filter by crit_ks here too so we don't waste arena
+                           on records the criteria excludes. */
+                        if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
+                        char dbuf[512];
+                        int dlen = decode_idx_to_buf(gtf_s,
+                                                     (const uint8_t *)val,
+                                                     vlen, dbuf, sizeof(dbuf));
+                        if (dlen <= 0) continue;
+                        if (hsm_insert(&sec_maps[g], hash16, dbuf,
+                                       (size_t)dlen) != 0) {
+                            sec_aborted = 1; break;
+                        }
+                    }
+                    btree_range_iter_close(it);
+                }
+                if (sec_aborted) {
+                    for (int k = 0; k <= g; k++) hsm_free(&sec_maps[k]);
+                    free(sec_maps); sec_maps = NULL;
+                    if (crit_ks) keyset_free(crit_ks);
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+            }
         }
 
         /* Pass 1: walk group_by btree, find/create bucket per encoded
@@ -15861,8 +16691,9 @@ int cmd_aggregate(const char *db_root, const char *object,
            Within a shard, btree iter is sorted ASC, so consecutive
            entries usually share the same encoded value — cache the
            last (encoded value, bucket) pair to skip a bucket re-lookup
-           on each repeat. Reset across shard boundaries since shards
-           are independent. */
+           on each repeat. The cache only fires for ngroups==1 since the
+           composite bucket key for multi-field includes secondaries that
+           vary per record even when primary repeats. */
         char prev_enc[64]; size_t prev_enc_len = 0;
         struct AggBucket *prev_bkt = NULL;
         int dl_counter = 0;
@@ -15878,19 +16709,44 @@ int cmd_aggregate(const char *db_root, const char *object,
             prev_enc_len = 0; prev_bkt = NULL;
             while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
                 if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                /* Criteria filter: skip leaf entries whose record didn't
+                   match the criteria-derived KeySet. crit_ks NULL means
+                   no criteria, so every entry passes. */
+                if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
                 struct AggBucket *bkt;
-                if (prev_bkt && vlen == prev_enc_len &&
+                if (n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
                     memcmp(val, prev_enc, vlen) == 0) {
                     bkt = prev_bkt;
                 } else {
-                    char gbuf[256];
+                    char gbufs[MAX_FIELDS][512];
+                    char *gvals[MAX_FIELDS];
                     int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                              vlen, gbuf, sizeof(gbuf));
+                                              vlen, gbufs[0], sizeof(gbufs[0]));
                     if (n <= 0) continue;
-                    char *gv = gbuf;
-                    bkt = (struct AggBucket *)agg_find_or_create(&ctx, &gv, 1);
+                    gvals[0] = gbufs[0];
+                    /* Compose composite key for ngroups > 1 by looking up
+                       each secondary field's value via its hash16 map.
+                       A miss means the record doesn't have that field
+                       indexed (skip-zero rule) — skip the entry to match
+                       the per-record path's "missing field" semantics. */
+                    int multi_skip = 0;
+                    for (int g = 0; g < n_sec; g++) {
+                        const char *sval; size_t slen;
+                        if (!hsm_get(&sec_maps[g], hash16, &sval, &slen)) {
+                            multi_skip = 1;
+                            break;
+                        }
+                        size_t cl = slen < sizeof(gbufs[g + 1]) - 1
+                                     ? slen : sizeof(gbufs[g + 1]) - 1;
+                        memcpy(gbufs[g + 1], sval, cl);
+                        gbufs[g + 1][cl] = '\0';
+                        gvals[g + 1] = gbufs[g + 1];
+                    }
+                    if (multi_skip) continue;
+                    bkt = (struct AggBucket *)agg_find_or_create(
+                                                  &ctx, gvals, ctx.ngroups);
                     if (!bkt) { aborted = 1; break; }
-                    if (vlen <= sizeof(prev_enc)) {
+                    if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
                         memcpy(prev_enc, val, vlen);
                         prev_enc_len = vlen;
                         prev_bkt = bkt;
@@ -15908,6 +16764,11 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
         if (aborted) {
             if (hbk_ready) hbk_free(&hbk);
+            if (crit_ks) keyset_free(crit_ks);
+            if (sec_maps) {
+                for (int k = 0; k < n_sec; k++) hsm_free(&sec_maps[k]);
+                free(sec_maps);
+            }
             goto igb_skip;
         }
 
@@ -15993,6 +16854,11 @@ int cmd_aggregate(const char *db_root, const char *object,
                 #undef PFB
             }
             hbk_free(&hbk);
+        }
+        if (crit_ks) keyset_free(crit_ks);
+        if (sec_maps) {
+            for (int k = 0; k < n_sec; k++) hsm_free(&sec_maps[k]);
+            free(sec_maps);
         }
         if (aborted) goto igb_skip;
         igb_done = 1;
