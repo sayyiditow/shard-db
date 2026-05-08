@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <linux/limits.h>
 
@@ -40,6 +41,12 @@
 
 /* Keyfile shard count cap mirrors splits ceiling for the engine. */
 #define SLOTCASK_MAX_SHARDS      4096
+
+/* Per-shard kf capacity ceiling. When a shard's resplit would push it past
+   this, the put-new path returns -1 and the operator must reshard (more
+   shards via vacuum --splits=N). At 16M slots × 24B × 4096 shards =
+   1.5 TB of kf address space — well past any realistic dataset. */
+#define SLOTCASK_KF_MAX_SLOTS_PER_SHARD  (16u * 1024 * 1024)
 
 /* Per-shard slot count is chosen by tier, parameterised on `splits`:
      splits ≤ 16     → 1M  slots/shard   (24-48 MB total kf — small DBs)
@@ -149,9 +156,21 @@ typedef struct SlotcaskDb {
     int     num_shards;
     int     num_streams;
     int     slot_size;       /* fixed; set at open time from schema or arg */
-    size_t  slots_per_shard;
+    size_t  slots_per_shard; /* per-shard kf capacity floor; individual
+                                shards may have grown larger via auto-resplit */
 
     SlotcaskStream *streams;
+
+    /* Live-key tally, mirrors what the engine's metadata/counts file
+       already tracks at the storage.c layer. Slotcask keeps its own
+       internal copy so the kf-resplit hot path can decide
+       "is this shard ~75 % full?" without crossing the storage.c
+       boundary (linker isolation: src/test/ links slotcask.c
+       without storage.c). Updated by kf_put_new on success and by
+       kf_tombstone on success; rebuilt at slotcask_open by walking
+       every kf shard's flag=1 entries (the same loop that already
+       reconstructs the per-stream free-pool from flag=2). */
+    _Atomic int64_t live_count;
 } SlotcaskDb;
 
 /* Initialize global caches. Call once at process startup, after db.env load. */
