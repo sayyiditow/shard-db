@@ -2726,12 +2726,22 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         return -2;
     }
 
+    /* Read OLD value unless caller explicitly opts out via skip_old_read.
+       check needs OLD by definition (it inspects the record). pre_commit
+       might or might not — caller signals via skip_old_read. Default
+       behavior (flag = 0) reads OLD whenever any hook is set, matching
+       the original contract. Saves one segcache_acquire + 100B memcpy +
+       malloc/free pair per call when set on non-indexed delete. */
+    int needs_old = (opts->check != NULL) ||
+                    (opts->pre_commit != NULL && !opts->skip_old_read);
     uint8_t *old_buf = NULL;
     size_t   old_vlen = 0;
-    if (read_record_value(db, old_sid, old_fid, old_off, key, klen,
-                          &old_buf, &old_vlen) != 0) {
-        kfcache_release(&kh);
-        return -1;
+    if (needs_old) {
+        if (read_record_value(db, old_sid, old_fid, old_off, key, klen,
+                              &old_buf, &old_vlen) != 0) {
+            kfcache_release(&kh);
+            return -1;
+        }
     }
     SlotcaskOldRecord old_rec = { old_buf, old_vlen };
 
@@ -2748,7 +2758,8 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     }
 
     if (opts->pre_commit) {
-        int rc = opts->pre_commit(&old_rec, opts->pre_commit_ctx);
+        int rc = opts->pre_commit(needs_old ? &old_rec : NULL,
+                                   opts->pre_commit_ctx);
         if (rc != 0) {
             kfcache_release(&kh);
             free(old_buf);

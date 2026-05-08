@@ -1912,6 +1912,11 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         .check_ctx      = &ctx,
         .pre_commit     = v2_delete_pre_commit,
         .pre_commit_ctx = &ctx,
+        /* pre_commit only dereferences old when there are index entries
+           to drop. On non-indexed delete, opt out of read_record_value
+           — saves a segcache_acquire + 100B memcpy + malloc/free per
+           call. v2_delete_pre_commit handles old=NULL gracefully. */
+        .skip_old_read  = (nidx == 0),
     };
     SlotcaskDeleteResult result = {0};
     int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);

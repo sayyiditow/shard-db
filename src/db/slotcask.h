@@ -402,6 +402,12 @@ typedef struct {
        the deletion; non-zero to abort (kf untouched, no tombstone). */
     int (*pre_commit)(const SlotcaskOldRecord *old, void *ctx);
     void               *pre_commit_ctx;
+    /* Set to 1 to opt OUT of the per-record read_record_value when
+       neither `check` nor `pre_commit` will dereference the OLD record
+       (e.g. non-indexed delete with no CAS). Default 0 = preserve the
+       original behavior (always read OLD when a hook is set). pre_commit
+       still fires; old is passed as NULL when this flag is on. */
+    int                 skip_old_read;
 } SlotcaskDeleteOpts;
 
 typedef struct {
