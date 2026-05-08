@@ -3171,6 +3171,327 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
     return 0;
 }
 
+/* ============================================================ Compaction
+ *
+ * Direction-C seg compaction. Pair-merges sparse non-active seg files within
+ * a stream. Donor's live records get migrated into recipient's tombstone
+ * holes (or post-watermark unused slots), kf entries are repointed at the
+ * commit boundary, and the donor file is unlinked. The active seg of each
+ * stream is never touched.
+ *
+ * Per-record migration protocol (one record at a time):
+ *   1. write recipient slot (header bytes, payload, fence, flag=1 last).
+ *      Crash here = orphan flag=1 in recipient with no kf reference; cleaned
+ *      by the next compaction or rebuild.
+ *   2. kf wrlock + kf_lookup_with_slot to find the kf entry.
+ *   3. Verify kf still points at (donor_fid, donor_off). If repointed by
+ *      an interleaved op (shouldn't happen under objlock_wrlock but harmless
+ *      to check), skip. The recipient slot becomes another orphan.
+ *   4. kf_repoint_at_slot(recipient_fid, target_off) — atomic 8B store, the
+ *      commit point for this record.
+ *   5. release kf wrlock. Donor slot stays flag=1; the file is unlinked
+ *      wholesale at the end. Stale readers reading donor pre-unlink see
+ *      correct bytes; segcache_invalidate_prefix at the unlink step
+ *      drains them via the per-entry rwlock.
+ *
+ * Caller invariants:
+ *   - objlock_wrlock held for this object (no concurrent writes).
+ *   - The light path of cmd_vacuum already runs under that lock. */
+
+typedef struct {
+    int      stream_id;
+    uint32_t file_id;
+    uint32_t total_slots;
+    uint32_t live_count;
+} SegStat;
+
+static int seg_stat_cmp_live_asc(const void *a, const void *b) {
+    const SegStat *x = (const SegStat *)a;
+    const SegStat *y = (const SegStat *)b;
+    if (x->live_count != y->live_count)
+        return (x->live_count < y->live_count) ? -1 : 1;
+    return 0;
+}
+
+/* Walk a non-active seg file; count flag==1 slots and capacity. */
+static int seg_stat_one(SlotcaskDb *db, int stream_id, uint32_t file_id,
+                        uint32_t *out_live, uint32_t *out_total) {
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    size_t total = h.map_size / (size_t)db->slot_size;
+    uint32_t live = 0;
+    for (size_t s = 0; s < total; s++) {
+        const uint8_t *rec = h.map + s * (size_t)db->slot_size;
+        if (rec[18] == 1) live++;
+    }
+    segcache_release(&h);
+    *out_live = live;
+    *out_total = (uint32_t)total;
+    return 0;
+}
+
+/* Filter a stream's free-pool: drop entries whose file_id matches `fid`.
+   Called immediately after the donor file is unlinked so popping callers
+   never see stale (file_id, offset) pairs. */
+static void pool_drop_for_file(SlotcaskStream *p, uint16_t fid) {
+    pthread_mutex_lock(&p->pool_lock);
+    size_t w = 0;
+    for (size_t r = 0; r < p->free_count; r++) {
+        if (p->free_slots[r].file_id != fid)
+            p->free_slots[w++] = p->free_slots[r];
+    }
+    p->free_count = w;
+    pthread_mutex_unlock(&p->pool_lock);
+}
+
+/* Migrate every flag==1 record from donor → recipient (both non-active).
+   Caller pre-verified `recipient_free >= donor_live` so all donor records
+   fit. After return, donor still holds (now stale) flag=1 records bytewise;
+   caller invokes compact_drop_seg_file to evict + unlink it. */
+static int compact_migrate_records(SlotcaskDb *db, int stream_id,
+                                    uint32_t donor_fid, uint32_t recipient_fid) {
+    char donor_path[PATH_MAX], recipient_path[PATH_MAX];
+    seg_path_for(donor_path, db->data_dir, stream_id, donor_fid);
+    seg_path_for(recipient_path, db->data_dir, stream_id, recipient_fid);
+
+    SlotcaskSegHandle dh, rh;
+    if (segcache_acquire(&dh, donor_path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&rh, recipient_path, 0, 0) != 0) {
+        segcache_release(&dh);
+        return -1;
+    }
+
+    int slot_size = db->slot_size;
+    size_t total = dh.map_size / (size_t)slot_size;
+
+    /* Build recipient free-offset list (every slot whose flag != 1). Done
+       once up front so the migration loop is O(donor_live) instead of
+       O(donor_live × recipient_total). */
+    uint32_t *free_offs = NULL;
+    size_t free_count = 0, free_cap = 0;
+    for (size_t s = 0; s < total; s++) {
+        const uint8_t *rec = rh.map + s * (size_t)slot_size;
+        if (rec[18] == 1) continue;
+        if (free_count == free_cap) {
+            size_t nc = free_cap ? free_cap * 2 : 256;
+            uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
+            if (!t) {
+                free(free_offs);
+                segcache_release(&rh);
+                segcache_release(&dh);
+                return -1;
+            }
+            free_offs = t;
+            free_cap = nc;
+        }
+        free_offs[free_count++] = (uint32_t)(s * (size_t)slot_size);
+    }
+
+    int rc = 0;
+    size_t free_idx = 0;
+    for (size_t s = 0; s < total && rc == 0; s++) {
+        const uint8_t *drec = dh.map + s * (size_t)slot_size;
+        if (drec[18] != 1) continue;
+
+        if (free_idx >= free_count) { rc = -1; break; }
+
+        uint8_t hash[16];
+        memcpy(hash, drec, 16);
+        uint16_t klen;
+        uint32_t vlen;
+        memcpy(&klen, drec + 16, 2);
+        memcpy(&vlen, drec + 20, 4);
+        const uint8_t *key = drec + 24;
+        const uint8_t *value = drec + 24 + (size_t)klen;
+
+        uint32_t donor_off = (uint32_t)(s * (size_t)slot_size);
+        uint32_t target_off = free_offs[free_idx];
+
+        /* Step 1: write recipient slot. Vacuum holds objlock_wrlock so no
+           concurrent writer can race on this offset. The flag-byte-last
+           ordering is what makes a mid-write crash safe — partial bytes
+           stay flag=0 until the fence + final store. */
+        uint8_t *dst = rh.map + target_off;
+        memcpy(dst, hash, 16);
+        memcpy(dst + 16, &klen, 2);
+        dst[18] = 0;
+        dst[19] = 0;
+        memcpy(dst + 20, &vlen, 4);
+        memcpy(dst + 24, key, klen);
+        memcpy(dst + 24 + (size_t)klen, value, vlen);
+        size_t used = 24 + (size_t)klen + (size_t)vlen;
+        if (used < (size_t)slot_size)
+            memset(dst + used, 0, (size_t)slot_size - used);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        dst[18] = 1;
+
+        /* Step 2-4: repoint kf entry under the kf shard's wrlock. */
+        int kfshard = shard_for_hash(hash, db->num_shards);
+        char kfp[PATH_MAX];
+        kf_path_for(kfp, db->data_dir, kfshard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kfp, db->slots_per_shard, 1) != 0) {
+            rc = -1; break;
+        }
+        uint8_t cur_flag, cur_sid;
+        uint16_t cur_fid;
+        uint32_t cur_off;
+        size_t kf_slot_idx;
+        int lr = kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                       &cur_flag, &cur_sid, &cur_fid,
+                                       &cur_off, &kf_slot_idx);
+        if (lr != 0) {
+            /* No kf entry — donor record is an orphan from a prior crash.
+               Its recipient mirror also becomes an orphan; no harm. */
+            kfcache_release(&kh);
+            free_idx++;
+            continue;
+        }
+        if ((int)cur_sid != stream_id || (uint32_t)cur_fid != donor_fid ||
+            cur_off != donor_off) {
+            /* kf points elsewhere — donor slot was already superseded
+               (e.g. by an earlier-in-this-vacuum migration). Skip. */
+            kfcache_release(&kh);
+            free_idx++;
+            continue;
+        }
+        kf_repoint_at_slot(&kh, kf_slot_idx, (uint8_t)stream_id,
+                            (uint16_t)recipient_fid, target_off);
+        kfcache_release(&kh);
+        free_idx++;
+    }
+
+    free(free_offs);
+    segcache_release(&rh);
+    segcache_release(&dh);
+    return rc;
+}
+
+/* Evict from segcache (msync + munmap + close under entry wrlock), unlink,
+   fsync parent dir, drop pool entries pointing at this file_id. */
+static int compact_drop_seg_file(SlotcaskDb *db, int stream_id,
+                                  uint32_t file_id) {
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+
+    /* Eviction is keyed by exact path here (prefix-match on a full path is
+       an exact match). The wrlock inside ensures every reader has finished
+       its mmap-protected read before we close the fd. */
+    segcache_invalidate_prefix(path);
+
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", path);
+    char *slash = strrchr(parent, '/');
+    if (slash) {
+        *slash = '\0';
+        int dfd = open(parent, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { fsync(dfd); close(dfd); }
+    }
+
+    pool_drop_for_file(&db->streams[stream_id], (uint16_t)file_id);
+    return 0;
+}
+
+/* Direction-C compaction for one stream. Returns # of files dropped. */
+static int compact_one_stream(SlotcaskDb *db, int stream_id) {
+    char dir[PATH_MAX];
+    stream_dir_for(dir, db->data_dir, stream_id);
+
+    SlotcaskStream *p = &db->streams[stream_id];
+    pthread_mutex_lock(&p->rotation_lock);
+    uint32_t active = p->active_file_id;
+    pthread_mutex_unlock(&p->rotation_lock);
+
+    DIR *dh = opendir(dir);
+    if (!dh) return 0;
+
+    SegStat *files = NULL;
+    size_t nfiles = 0, fcap = 0;
+    struct dirent *de;
+    while ((de = readdir(dh)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        size_t nlen = strlen(de->d_name);
+        if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
+        uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
+        if (fid == active) continue;
+
+        if (nfiles == fcap) {
+            size_t nc = fcap ? fcap * 2 : 16;
+            SegStat *t = realloc(files, nc * sizeof(SegStat));
+            if (!t) { free(files); closedir(dh); return 0; }
+            files = t;
+            fcap = nc;
+        }
+        files[nfiles].stream_id = stream_id;
+        files[nfiles].file_id = fid;
+        files[nfiles].live_count = 0;
+        files[nfiles].total_slots = 0;
+        nfiles++;
+    }
+    closedir(dh);
+
+    for (size_t i = 0; i < nfiles; i++) {
+        if (seg_stat_one(db, stream_id, files[i].file_id,
+                          &files[i].live_count, &files[i].total_slots) != 0) {
+            files[i].live_count = files[i].total_slots = 0;
+        }
+    }
+
+    qsort(files, nfiles, sizeof(SegStat), seg_stat_cmp_live_asc);
+
+    int dropped = 0;
+    if (nfiles == 0) { free(files); return 0; }
+
+    /* Two-pointer pair-merge: i = sparsest donor, j = densest recipient.
+       Skip empties first (drop unconditionally), then merge i→j when j
+       has free room for all of i's live records. */
+    size_t i = 0;
+    size_t j = nfiles - 1;
+    while (i < j) {
+        if (files[i].total_slots == 0) { i++; continue; }
+        if (files[i].live_count == 0) {
+            if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
+                dropped++;
+            i++;
+            continue;
+        }
+        uint32_t recip_free = files[j].total_slots - files[j].live_count;
+        if (recip_free >= files[i].live_count) {
+            if (compact_migrate_records(db, stream_id,
+                                          files[i].file_id, files[j].file_id) == 0) {
+                if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
+                    dropped++;
+                files[j].live_count += files[i].live_count;
+            }
+            i++;
+        } else {
+            /* Recipient too full for this donor; donors only get sparser
+               below i so no point retrying with a sparser donor. Move
+               recipient down. */
+            if (j == i + 1) break;
+            j--;
+        }
+    }
+
+    free(files);
+    return dropped;
+}
+
+/* Public entry point. Caller must hold objlock_wrlock for the object. */
+int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
+    if (!db) return -1;
+    int total = 0;
+    for (int s = 0; s < db->num_streams; s++) {
+        total += compact_one_stream(db, s);
+    }
+    if (out_dropped) *out_dropped = total;
+    return 0;
+}
+
 /* Suppress unused-static warnings for build_record_buf which remains in the
    file as a reference for migrators / future bulk paths but isn't called
    from the current code (seg_write_record builds inline into the mmap). */

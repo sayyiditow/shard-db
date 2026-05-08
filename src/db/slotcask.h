@@ -171,6 +171,14 @@ int  slotcask_open(SlotcaskDb *db, const char *data_dir,
                    int num_shards, int num_streams, int slot_size);
 void slotcask_close(SlotcaskDb *db);
 
+/* Direction-C seg compaction. For each stream, pair-merges sparse non-active
+   seg files into denser ones — donor's live records are migrated into
+   recipient's tombstone holes via kf_repoint_at_slot, then the donor file
+   is unlinked. Active seg of each stream is never touched. Caller must hold
+   objlock_wrlock for the object. *out_dropped (optional) receives the total
+   number of seg files unlinked across all streams. Returns 0 on success. */
+int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
+
 /* ============================================================ Public CRUD */
 
 /* Insert a NEW key. Returns 0 on success, -2 if key already exists, -1 on error.

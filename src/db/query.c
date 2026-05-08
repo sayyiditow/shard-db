@@ -5699,15 +5699,24 @@ int cmd_vacuum(const char *db_root, const char *object,
     }
 
     /* v2 light path: streams already match, no flags. The snake-game pool
-       reuses tombstoned slots automatically as writers produce them; the
-       `deleted` metadata counter doesn't track on-disk waste in v2 (it's
-       just delete-call cumulative), so reset it. Direction-C seg
-       compaction (drain sparse non-active seg files into each other and
-       drop the empty donor) is the next compaction refinement; for now
-       this branch reports cleaned=0 unless that work has shipped. */
+       reuses tombstoned slots inline for new writes, but a delete-heavy /
+       no-write workload accumulates sparse non-active seg files. Direction-C
+       compaction pair-merges those: live records of the sparsest non-active
+       seg get migrated into a denser non-active seg's tombstone holes, then
+       the now-empty donor file is unlinked. The active seg is never touched
+       so concurrent appends after vacuum return are unaffected. */
     if (sch.storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sch.splits, .slot_size = sch.slot_size,
+            .streams = sch.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        int dropped = 0;
+        if (sdb) {
+            (void)slotcask_compact_segs(sdb, &dropped);
+        }
         reset_deleted_count(db_root, object);
-        OUT("{\"status\":\"vacuumed\",\"cleaned\":0}\n");
+        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
         return 0;
     }
     char data_dir[PATH_MAX];
