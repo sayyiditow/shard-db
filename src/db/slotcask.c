@@ -730,7 +730,17 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
 }
 
 /* Insert NEW key (no upsert). Returns 0 ok, 1 already exists, -1 error.
-   Caller holds the kf shard's wrlock via the kfcache handle. */
+   Caller holds the kf shard's wrlock via the kfcache handle.
+   First-tombstone strategy: probe the full chain to detect existence,
+   remembering the first flag=2 (tombstone) slot we passed. If the key
+   isn't found by chain end (flag=0), insert at the first-tombstone slot
+   if any, else at the empty slot. This reuses kf tombstones for any new
+   key — same shape as the seg pool — so kf doesn't accumulate dead
+   entries in delete-heavy workloads.
+   Same-key resurrection still gets a hot-path shortcut: when we hit a
+   flag=2 slot whose hash matches, we reuse it directly without
+   continuing the probe. That's the most-common reuse case (delete-and-
+   reinsert) and is one less probe step. */
 static int kf_put_new(SlotcaskKfHandle *kh, const uint8_t hash[16],
                       uint8_t stream_id, uint16_t file_id, uint32_t offset,
                       const void *key, size_t klen, const char *data_dir,
@@ -738,16 +748,22 @@ static int kf_put_new(SlotcaskKfHandle *kh, const uint8_t hash[16],
     size_t cap = kh->capacity;
     SlotcaskKfEntry *kf = kh->map;
     size_t start = kf_slot_for(hash, cap);
+    size_t first_tomb = (size_t)-1;
     for (size_t i = 0; i < cap; i++) {
         size_t slot = (start + i) % cap;
         SlotcaskKfEntry *e = &kf[slot];
         if (e->flag == 0) {
-            memcpy(e->hash, hash, 16);
-            e->stream_id = stream_id;
-            e->file_id = file_id;
-            e->offset = offset;
+            /* End of probe chain. Insert at first-tombstone if we saw one;
+               otherwise at this empty slot. Counted as +1 either way —
+               first-tomb reuse still represents one more live record. */
+            size_t target_idx = (first_tomb != (size_t)-1) ? first_tomb : slot;
+            SlotcaskKfEntry *t = &kf[target_idx];
+            memcpy(t->hash, hash, 16);
+            t->stream_id = stream_id;
+            t->file_id = file_id;
+            t->offset = offset;
             __atomic_thread_fence(__ATOMIC_RELEASE);
-            e->flag = 1;
+            t->flag = 1;
             (*used_delta)++;
             return 0;
         }
@@ -758,6 +774,7 @@ static int kf_put_new(SlotcaskKfHandle *kh, const uint8_t hash[16],
             if (km == 1) return 1;
         }
         if (e->flag == 2 && memcmp(e->hash, hash, 16) == 0) {
+            /* Same-key resurrection — reuse this exact slot, skip probe. */
             e->stream_id = stream_id;
             e->file_id = file_id;
             e->offset = offset;
@@ -766,6 +783,22 @@ static int kf_put_new(SlotcaskKfHandle *kh, const uint8_t hash[16],
             (*used_delta)++;
             return 0;
         }
+        if (e->flag == 2 && first_tomb == (size_t)-1) {
+            first_tomb = slot;
+        }
+    }
+    /* Probed full chain without finding flag=0. If we saw a tombstone,
+       reuse it. Otherwise the table is genuinely full. */
+    if (first_tomb != (size_t)-1) {
+        SlotcaskKfEntry *t = &kf[first_tomb];
+        memcpy(t->hash, hash, 16);
+        t->stream_id = stream_id;
+        t->file_id = file_id;
+        t->offset = offset;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        t->flag = 1;
+        (*used_delta)++;
+        return 0;
     }
     return -1;
 }
@@ -1549,6 +1582,30 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     if (touch_dirty_marker(db) != 0) {
         /* Non-fatal — recovery will simply re-walk on the next open. */
     }
+
+    /* Rebuild the per-stream free-slot pool from kf state. The pool is
+       in-memory only — every daemon start would otherwise lose track of
+       tombstoned seg slots, leaving them unreusable until the next
+       vacuum compaction. Walking each kf shard's flag=2 entries and
+       pushing (file_id, offset) to the right stream's pool restores the
+       snake-game property across restarts. ~24 MB of sequential mmap
+       reads for a 1M-record DB at default sizing. */
+    for (int s = 0; s < db->num_shards; s++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) continue;
+        size_t cap = kh.capacity;
+        SlotcaskKfEntry *kf = kh.map;
+        for (size_t i = 0; i < cap; i++) {
+            if (kf[i].flag == 2 && kf[i].stream_id < db->num_streams) {
+                pool_push_free(&db->streams[kf[i].stream_id],
+                                kf[i].file_id, kf[i].offset);
+            }
+        }
+        kfcache_release(&kh);
+    }
+
     return 0;
 
 fail:
