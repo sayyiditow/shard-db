@@ -2926,29 +2926,74 @@ typedef struct {
 typedef struct {
     BulkUpdShardWork *w;
     BulkUpdRec       *rec;
-    /* Workspace to avoid re-parsing value_json per record. */
-    char           **field_names;     /* length ts->nfields */
+    /* Pointer (not owner) to the shared per-worker field_vals array
+       parsed once from value_json. */
+    char            **field_vals;
 } V2BulkUpdCtx;
 
-static int v2_bulk_upd_check(const SlotcaskOldRecord *old, void *ctx_ptr) {
-    V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)ctx_ptr;
+/* value_compute: rolls together the per-record steps that the old
+   slotcask_upsert_with_hooks call did across .check + the inline
+   patching loop:
+     1. Re-verify criteria_match_tree on OLD (closes the
+        scan→write race window).
+     2. Re-verify CAS (`if_json` translates to cas_crit).
+     3. Copy OLD into the worker scratch, apply value_json patches,
+        apply auto_update fields.
+   Returns 0 to write, -1 to skip (criteria/CAS rejection). */
+static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
+                                       SlotcaskBulkRec *rec) {
+    V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)rec->user_ctx;
     BulkUpdShardWork *w = ctx->w;
-    if (!old) return 0;  /* require existing */
-    if (!criteria_match_tree(old->value, w->tree, w->fs)) return 0;
+    if (!old) return -1;
+    if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
-        !cas_check(w->ts, old->value, w->cas_crit, w->cas_ncrit)) return 0;
-    return 1;
+        !cas_check(w->ts, old->value, w->cas_crit, w->cas_ncrit)) return -1;
+
+    uint8_t *new_buf = (uint8_t *)rec->value;
+    if (old->vlen >= (size_t)w->ts->total_size) {
+        memcpy(new_buf, old->value, w->ts->total_size);
+    } else {
+        memcpy(new_buf, old->value, old->vlen);
+        memset(new_buf + old->vlen, 0, (size_t)w->ts->total_size - old->vlen);
+    }
+    rec->vlen = (size_t)w->ts->total_size;
+
+    for (int fi = 0; fi < w->ts->nfields; fi++) {
+        if (ctx->field_vals[fi] && !w->ts->fields[fi].removed) {
+            encode_field(&w->ts->fields[fi], ctx->field_vals[fi],
+                          new_buf + w->ts->fields[fi].offset);
+        }
+    }
+    for (int fi = 0; fi < w->ts->nfields; fi++) {
+        if (w->ts->fields[fi].removed) continue;
+        if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+            char tbuf[20];
+            time_t now = time(NULL);
+            struct tm tm; localtime_r(&now, &tm);
+            if (w->ts->fields[fi].type == FT_DATE)
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+            encode_field(&w->ts->fields[fi], tbuf,
+                          new_buf + w->ts->fields[fi].offset);
+        }
+    }
+    return 0;
 }
 
-static int v2_bulk_upd_pre_commit(const SlotcaskOldRecord *old,
-                                    const uint8_t *new_value, size_t new_vlen,
-                                    int is_update, void *ctx_ptr) {
-    (void)new_vlen; (void)is_update;
-    V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)ctx_ptr;
+static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                        SlotcaskBulkRec *rec,
+                                        int is_update) {
+    (void)is_update;
+    V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)rec->user_ctx;
     BulkUpdShardWork *w = ctx->w;
-    BulkUpdRec       *rec = ctx->rec;
+    BulkUpdRec       *upd_rec = ctx->rec;
     if (w->nidx == 0 || !old) return 0;
 
+    const uint8_t *new_value = (const uint8_t *)rec->value;
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
@@ -2968,10 +3013,10 @@ static int v2_bulk_upd_pre_commit(const SlotcaskOldRecord *old,
         if (changed) {
             if (have_old)
                 delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, rec->hash);
+                                    w->sch->splits, old_buf, old_len, upd_rec->hash);
             if (have_new)
                 write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, rec->hash);
+                                   w->sch->splits, new_buf, new_len, upd_rec->hash);
         }
         free(old_buf); free(new_buf);
     }
@@ -2986,75 +3031,52 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
 
-    /* Pre-extract value_json field overrides once — same patch applies to
-       every record. */
+    /* Parse value_json once for the whole worker. */
     const char *field_names[MAX_FIELDS];
-    char *field_vals[MAX_FIELDS];
+    char       *field_vals[MAX_FIELDS];
     for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
     json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
 
+    SlotcaskBulkRec *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
+    uint8_t         *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
+    if (!batch || !ctxs || !scratch) {
+        free(batch); free(ctxs); free(scratch);
+        for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
+        w->skipped += w->count;
+        return NULL;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         BulkUpdRec *rec = &w->recs[ki];
-
-        /* Read existing value to base the patch off. */
-        void *old_val = NULL; size_t old_vlen = 0;
-        if (slotcask_get(sdb, rec->key, rec->klen, &old_val, &old_vlen) != 0) {
-            w->skipped++;
-            continue;
-        }
-
-        uint8_t *new_buf = malloc(w->ts->total_size);
-        if (!new_buf) { free(old_val); w->skipped++; continue; }
-        if (old_vlen >= (size_t)w->ts->total_size) {
-            memcpy(new_buf, old_val, w->ts->total_size);
-        } else {
-            memcpy(new_buf, old_val, old_vlen);
-            memset(new_buf + old_vlen, 0, (size_t)w->ts->total_size - old_vlen);
-        }
-
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (field_vals[fi] && !w->ts->fields[fi].removed) {
-                encode_field(&w->ts->fields[fi], field_vals[fi],
-                              new_buf + w->ts->fields[fi].offset);
-            }
-        }
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm; localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                              tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf,
-                              new_buf + w->ts->fields[fi].offset);
-            }
-        }
-
-        V2BulkUpdCtx hctx = { w, rec, NULL };
-        SlotcaskUpsertOpts opts = {
-            .require_existing = 1,
-            .check            = v2_bulk_upd_check,
-            .check_ctx        = &hctx,
-            .pre_commit       = v2_bulk_upd_pre_commit,
-            .pre_commit_ctx   = &hctx,
-        };
-        SlotcaskUpsertResult result = {0};
-        int rc = slotcask_upsert_with_hooks(sdb, -1, rec->key, rec->klen,
-                                             new_buf, w->ts->total_size,
-                                             &opts, &result);
-        if (rc == 0) w->updated++;
-        else { w->skipped++; free(result.current_value); }
-
-        free(new_buf);
-        free(old_val);
+        ctxs[ki].w          = w;
+        ctxs[ki].rec        = rec;
+        ctxs[ki].field_vals = field_vals;
+        batch[ki].key       = rec->key;
+        batch[ki].klen      = rec->klen;
+        batch[ki].value     = scratch + (size_t)ki * (size_t)w->ts->total_size;
+        batch[ki].vlen      = (size_t)w->ts->total_size;
+        batch[ki].user_ctx  = &ctxs[ki];
+        batch[ki].old_value = NULL;
+        batch[ki].old_vlen  = 0;
+        batch[ki].status    = 0;
+        batch[ki].was_update = 0;
     }
 
+    SlotcaskBulkOpts opts = {
+        .require_existing     = 1,
+        .pre_commit           = v2_bulk_upd_pre_commit_bulk,
+        .pre_commit_needs_old = w->nidx > 0,
+        .value_compute        = v2_bulk_upd_value_compute,
+    };
+    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
+                                           batch, (size_t)w->count, &opts);
+
+    for (int ki = 0; ki < w->count; ki++) {
+        if (batch[ki].status == 0) w->updated++;
+        else w->skipped++;
+    }
+
+    free(batch); free(ctxs); free(scratch);
     for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
     return NULL;
 }
@@ -3387,15 +3409,18 @@ typedef struct {
     BulkUpdDelimRec       *rec;
 } V2BulkUpdDelimCtx;
 
-static int v2_bulk_upd_delim_pre_commit(const SlotcaskOldRecord *old,
-                                         const uint8_t *new_value, size_t new_vlen,
-                                         int is_update, void *ctx_ptr) {
-    (void)new_vlen; (void)is_update;
-    V2BulkUpdDelimCtx *ctx = (V2BulkUpdDelimCtx *)ctx_ptr;
+/* Bulk-shaped pre_commit hook. ctx via rec->user_ctx; new value via
+   rec->value (already populated by value_compute). */
+static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                              SlotcaskBulkRec *rec,
+                                              int is_update) {
+    (void)is_update;
+    V2BulkUpdDelimCtx *ctx = (V2BulkUpdDelimCtx *)rec->user_ctx;
     BulkUpdDelimShardWork *w = ctx->w;
-    BulkUpdDelimRec       *rec = ctx->rec;
+    BulkUpdDelimRec       *delim_rec = ctx->rec;
     if (w->nidx == 0 || !old) return 0;
 
+    const uint8_t *new_value = (const uint8_t *)rec->value;
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
@@ -3415,12 +3440,75 @@ static int v2_bulk_upd_delim_pre_commit(const SlotcaskOldRecord *old,
         if (changed) {
             if (have_old)
                 delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, rec->hash);
+                                    w->sch->splits, old_buf, old_len, delim_rec->hash);
             if (have_new)
                 write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, rec->hash);
+                                   w->sch->splits, new_buf, new_len, delim_rec->hash);
         }
         free(old_buf); free(new_buf);
+    }
+    return 0;
+}
+
+/* value_compute hook: derive NEW from OLD by copying old into the worker-
+   allocated scratch slot, then applying CSV cells + auto_update. The
+   scratch slot location is rec->value (pre-pointed by the worker). */
+static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
+                                            SlotcaskBulkRec *rec) {
+    V2BulkUpdDelimCtx *ctx = (V2BulkUpdDelimCtx *)rec->user_ctx;
+    BulkUpdDelimShardWork *w = ctx->w;
+    BulkUpdDelimRec       *delim_rec = ctx->rec;
+    if (!old) return -1;     /* require_existing already filtered, defence in depth */
+
+    uint8_t *new_buf = (uint8_t *)rec->value;
+    if (old->vlen >= (size_t)w->ts->total_size) {
+        memcpy(new_buf, old->value, w->ts->total_size);
+    } else {
+        memcpy(new_buf, old->value, old->vlen);
+        memset(new_buf + old->vlen, 0, (size_t)w->ts->total_size - old->vlen);
+    }
+    rec->vlen = (size_t)w->ts->total_size;
+
+    /* Walk CSV row span — same as the old per-record path. */
+    const char *cp = delim_rec->body_start;
+    const char *line_end = delim_rec->line_end;
+    for (int ai = 0; ai < w->active_count && cp < line_end; ai++) {
+        const char *cell_start = cp;
+        const char *cell_end = cp;
+        while (cell_end < line_end && *cell_end != w->delimiter) cell_end++;
+        size_t cell_len = cell_end - cell_start;
+        if (cell_len > 0) {
+            int tidx = w->active_indices[ai];
+            if (!w->ts->fields[tidx].removed) {
+                char tmpcell[256];
+                char *cellbuf = (cell_len < sizeof(tmpcell))
+                    ? tmpcell : malloc(cell_len + 1);
+                memcpy(cellbuf, cell_start, cell_len);
+                cellbuf[cell_len] = '\0';
+                encode_field(&w->ts->fields[tidx], cellbuf,
+                              new_buf + w->ts->fields[tidx].offset);
+                if (cellbuf != tmpcell) free(cellbuf);
+            }
+        }
+        cp = cell_end < line_end ? cell_end + 1 : line_end;
+    }
+
+    for (int fi = 0; fi < w->ts->nfields; fi++) {
+        if (w->ts->fields[fi].removed) continue;
+        if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+            char tbuf[20];
+            time_t now = time(NULL);
+            struct tm tm; localtime_r(&now, &tm);
+            if (w->ts->fields[fi].type == FT_DATE)
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+            encode_field(&w->ts->fields[fi], tbuf,
+                          new_buf + w->ts->fields[fi].offset);
+        }
     }
     return 0;
 }
@@ -3433,84 +3521,46 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
 
+    /* Build batch + scratch slab. value_compute will write into the
+       slab; rec->value points at this worker's slot up front. */
+    SlotcaskBulkRec   *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    V2BulkUpdDelimCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdDelimCtx));
+    uint8_t           *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
+    if (!batch || !ctxs || !scratch) {
+        free(batch); free(ctxs); free(scratch);
+        w->skipped += w->count;
+        return NULL;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         BulkUpdDelimRec *rec = &w->recs[ki];
-
-        void *old_val = NULL; size_t old_vlen = 0;
-        if (slotcask_get(sdb, rec->key, rec->klen, &old_val, &old_vlen) != 0) {
-            w->skipped++;
-            continue;
-        }
-
-        uint8_t *new_buf = malloc(w->ts->total_size);
-        if (!new_buf) { free(old_val); w->skipped++; continue; }
-        if (old_vlen >= (size_t)w->ts->total_size) {
-            memcpy(new_buf, old_val, w->ts->total_size);
-        } else {
-            memcpy(new_buf, old_val, old_vlen);
-            memset(new_buf + old_vlen, 0, (size_t)w->ts->total_size - old_vlen);
-        }
-
-        /* Walk CSV row span; pos i in active_indices → active field i.
-           Empty cells leave the field untouched (per v1 semantics). */
-        const char *cp = rec->body_start;
-        const char *line_end = rec->line_end;
-        for (int ai = 0; ai < w->active_count && cp < line_end; ai++) {
-            const char *cell_start = cp;
-            const char *cell_end = cp;
-            while (cell_end < line_end && *cell_end != w->delimiter) cell_end++;
-            size_t cell_len = cell_end - cell_start;
-            if (cell_len > 0) {
-                int tidx = w->active_indices[ai];
-                if (!w->ts->fields[tidx].removed) {
-                    char tmpcell[256];
-                    char *cellbuf = (cell_len < sizeof(tmpcell))
-                        ? tmpcell : malloc(cell_len + 1);
-                    memcpy(cellbuf, cell_start, cell_len);
-                    cellbuf[cell_len] = '\0';
-                    encode_field(&w->ts->fields[tidx], cellbuf,
-                                  new_buf + w->ts->fields[tidx].offset);
-                    if (cellbuf != tmpcell) free(cellbuf);
-                }
-            }
-            cp = cell_end < line_end ? cell_end + 1 : line_end;
-        }
-
-        /* auto_update */
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm; localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                              tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf,
-                              new_buf + w->ts->fields[fi].offset);
-            }
-        }
-
-        V2BulkUpdDelimCtx ctx = { w, rec };
-        SlotcaskUpsertOpts opts = {
-            .require_existing = 1,
-            .pre_commit       = v2_bulk_upd_delim_pre_commit,
-            .pre_commit_ctx   = &ctx,
-        };
-        SlotcaskUpsertResult result = {0};
-        int rc = slotcask_upsert_with_hooks(sdb, -1, rec->key, rec->klen,
-                                             new_buf, w->ts->total_size,
-                                             &opts, &result);
-        if (rc == 0) w->updated++;
-        else { w->skipped++; free(result.current_value); }
-
-        free(new_buf);
-        free(old_val);
+        ctxs[ki].w   = w;
+        ctxs[ki].rec = rec;
+        batch[ki].key       = rec->key;
+        batch[ki].klen      = rec->klen;
+        batch[ki].value     = scratch + (size_t)ki * (size_t)w->ts->total_size;
+        batch[ki].vlen      = (size_t)w->ts->total_size;
+        batch[ki].user_ctx  = &ctxs[ki];
+        batch[ki].old_value = NULL;
+        batch[ki].old_vlen  = 0;
+        batch[ki].status    = 0;
+        batch[ki].was_update = 0;
     }
+
+    SlotcaskBulkOpts opts = {
+        .require_existing     = 1,
+        .pre_commit           = v2_bulk_upd_delim_pre_commit_bulk,
+        .pre_commit_needs_old = w->nidx > 0,
+        .value_compute        = v2_bulk_upd_delim_value_compute,
+    };
+    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
+                                           batch, (size_t)w->count, &opts);
+
+    for (int ki = 0; ki < w->count; ki++) {
+        if (batch[ki].status == 0) w->updated++;
+        else w->skipped++;
+    }
+
+    free(batch); free(ctxs); free(scratch);
     return NULL;
 }
 
@@ -3905,15 +3955,17 @@ typedef struct {
     BulkUpdJsonRec       *rec;
 } V2BulkUpdJsonCtx;
 
-static int v2_bulk_upd_json_pre_commit(const SlotcaskOldRecord *old,
-                                        const uint8_t *new_value, size_t new_vlen,
-                                        int is_update, void *ctx_ptr) {
-    (void)new_vlen; (void)is_update;
-    V2BulkUpdJsonCtx *ctx = (V2BulkUpdJsonCtx *)ctx_ptr;
+/* Bulk-shaped pre_commit; new value via rec->value (set by value_compute). */
+static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                             SlotcaskBulkRec *rec,
+                                             int is_update) {
+    (void)is_update;
+    V2BulkUpdJsonCtx *ctx = (V2BulkUpdJsonCtx *)rec->user_ctx;
     BulkUpdJsonShardWork *w = ctx->w;
-    BulkUpdJsonRec       *rec = ctx->rec;
+    BulkUpdJsonRec       *json_rec = ctx->rec;
     if (w->nidx == 0 || !old) return 0;
 
+    const uint8_t *new_value = (const uint8_t *)rec->value;
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
@@ -3933,12 +3985,57 @@ static int v2_bulk_upd_json_pre_commit(const SlotcaskOldRecord *old,
         if (changed) {
             if (have_old)
                 delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, rec->hash);
+                                    w->sch->splits, old_buf, old_len, json_rec->hash);
             if (have_new)
                 write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, rec->hash);
+                                   w->sch->splits, new_buf, new_len, json_rec->hash);
         }
         free(old_buf); free(new_buf);
+    }
+    return 0;
+}
+
+/* Compute NEW from OLD: copy old to scratch, patch JSON-named fields,
+   apply auto_update. Same logic the per-record path used to inline. */
+static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
+                                           SlotcaskBulkRec *rec) {
+    V2BulkUpdJsonCtx *ctx = (V2BulkUpdJsonCtx *)rec->user_ctx;
+    BulkUpdJsonShardWork *w = ctx->w;
+    BulkUpdJsonRec       *json_rec = ctx->rec;
+    if (!old) return -1;
+
+    uint8_t *new_buf = (uint8_t *)rec->value;
+    if (old->vlen >= (size_t)w->ts->total_size) {
+        memcpy(new_buf, old->value, w->ts->total_size);
+    } else {
+        memcpy(new_buf, old->value, old->vlen);
+        memset(new_buf + old->vlen, 0, (size_t)w->ts->total_size - old->vlen);
+    }
+    rec->vlen = (size_t)w->ts->total_size;
+
+    for (int i = 0; i < json_rec->n_fields; i++) {
+        int tidx = json_rec->field_indices[i];
+        if (tidx < 0 || tidx >= w->ts->nfields) continue;
+        if (w->ts->fields[tidx].removed) continue;
+        encode_field(&w->ts->fields[tidx], json_rec->field_values[i],
+                      new_buf + w->ts->fields[tidx].offset);
+    }
+    for (int fi = 0; fi < w->ts->nfields; fi++) {
+        if (w->ts->fields[fi].removed) continue;
+        if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
+            char tbuf[20];
+            time_t now = time(NULL);
+            struct tm tm; localtime_r(&now, &tm);
+            if (w->ts->fields[fi].type == FT_DATE)
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+            encode_field(&w->ts->fields[fi], tbuf,
+                          new_buf + w->ts->fields[fi].offset);
+        }
     }
     return 0;
 }
@@ -3963,70 +4060,44 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
 
+    SlotcaskBulkRec  *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    V2BulkUpdJsonCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdJsonCtx));
+    uint8_t          *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
+    if (!batch || !ctxs || !scratch) {
+        free(batch); free(ctxs); free(scratch);
+        w->skipped += w->count;
+        return NULL;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         BulkUpdJsonRec *rec = &w->recs[ki];
-
-        /* Read existing typed payload — must already exist (update-only). */
-        void *old_val = NULL; size_t old_vlen = 0;
-        if (slotcask_get(sdb, rec->key, rec->klen, &old_val, &old_vlen) != 0) {
-            w->skipped++;
-            continue;
-        }
-
-        uint8_t *new_buf = malloc(w->ts->total_size);
-        if (!new_buf) { free(old_val); w->skipped++; continue; }
-        if (old_vlen >= (size_t)w->ts->total_size) {
-            memcpy(new_buf, old_val, w->ts->total_size);
-        } else {
-            /* Defensive: schema growth between write and read. Zero-pad tail. */
-            memcpy(new_buf, old_val, old_vlen);
-            memset(new_buf + old_vlen, 0, (size_t)w->ts->total_size - old_vlen);
-        }
-
-        /* Patch touched fields. */
-        for (int i = 0; i < rec->n_fields; i++) {
-            int tidx = rec->field_indices[i];
-            if (tidx < 0 || tidx >= w->ts->nfields) continue;
-            if (w->ts->fields[tidx].removed) continue;
-            encode_field(&w->ts->fields[tidx], rec->field_values[i],
-                          new_buf + w->ts->fields[tidx].offset);
-        }
-
-        /* auto_update fields. */
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm; localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                              tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf,
-                              new_buf + w->ts->fields[fi].offset);
-            }
-        }
-
-        V2BulkUpdJsonCtx ctx = { w, rec };
-        SlotcaskUpsertOpts opts = {
-            .require_existing = 1,
-            .pre_commit       = v2_bulk_upd_json_pre_commit,
-            .pre_commit_ctx   = &ctx,
-        };
-        SlotcaskUpsertResult result = {0};
-        int rc = slotcask_upsert_with_hooks(sdb, -1, rec->key, rec->klen,
-                                             new_buf, w->ts->total_size,
-                                             &opts, &result);
-        if (rc == 0) w->updated++;
-        else { w->skipped++; free(result.current_value); }
-
-        free(new_buf);
-        free(old_val);
+        ctxs[ki].w   = w;
+        ctxs[ki].rec = rec;
+        batch[ki].key       = rec->key;
+        batch[ki].klen      = rec->klen;
+        batch[ki].value     = scratch + (size_t)ki * (size_t)w->ts->total_size;
+        batch[ki].vlen      = (size_t)w->ts->total_size;
+        batch[ki].user_ctx  = &ctxs[ki];
+        batch[ki].old_value = NULL;
+        batch[ki].old_vlen  = 0;
+        batch[ki].status    = 0;
+        batch[ki].was_update = 0;
     }
+
+    SlotcaskBulkOpts opts = {
+        .require_existing     = 1,
+        .pre_commit           = v2_bulk_upd_json_pre_commit_bulk,
+        .pre_commit_needs_old = w->nidx > 0,
+        .value_compute        = v2_bulk_upd_json_value_compute,
+    };
+    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
+                                           batch, (size_t)w->count, &opts);
+
+    for (int ki = 0; ki < w->count; ki++) {
+        if (batch[ki].status == 0) w->updated++;
+        else w->skipped++;
+    }
+
+    free(batch); free(ctxs); free(scratch);
     return NULL;
 }
 

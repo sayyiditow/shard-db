@@ -1788,8 +1788,10 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
        pre_commit_needs_old=0, so this whole phase is a no-op.
        Skips records whose caller already supplied recs[i].old_value —
        e.g. bulk-update workers, which read OLD to compute NEW and don't
-       want to re-read here. */
-    if (opts->pre_commit_needs_old) {
+       want to re-read here. value_compute also implies needs_old since
+       the callback derives NEW from OLD. */
+    int needs_old = opts->pre_commit_needs_old || opts->value_compute != NULL;
+    if (needs_old) {
         int *read_idx = malloc(n * sizeof(int));
         if (read_idx) {
             int rcount = 0;
@@ -1858,6 +1860,27 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 k = run_end;
             }
             free(read_idx);
+        }
+    }
+
+    /* ===== Phase 1c — per-record value_compute (NEW-from-OLD).
+       Bulk-update workers populate rec->value/vlen here from the OLD
+       record they just had read in Phase 1b. Non-zero return marks the
+       record skipped (e.g. CAS rejection) and excludes it from the
+       seg-write phase. */
+    if (opts->value_compute) {
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status != 0) continue;
+            if (!st[i].needs_write) continue;
+            const void *old_v = recs[i].old_value ? recs[i].old_value : st[i].old_buf;
+            size_t      old_l = recs[i].old_value ? recs[i].old_vlen  : st[i].old_vlen;
+            SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
+            int rc = opts->value_compute(st[i].old_found ? &old_rec : NULL,
+                                          &recs[i]);
+            if (rc != 0) {
+                recs[i].status = -2;
+                st[i].needs_write = 0;
+            }
         }
     }
 

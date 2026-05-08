@@ -291,6 +291,18 @@ typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
                                             SlotcaskBulkRec *rec,
                                             int is_update);
 
+/* Compute the NEW record value from the OLD record per-record. Fires
+   AFTER the batched OLD reads (Phase 1b) and BEFORE the seg writes
+   (Phase 3). Used by bulk-update workers that derive each record's new
+   value from its existing one (memcpy old → patch fields → return).
+   Must populate rec->value and rec->vlen with the new bytes — the
+   pointer must outlive the bulk call (typically a worker-allocated
+   scratch slab keyed off rec->user_ctx).
+   Return 0 to write, non-zero to skip (e.g. CAS rejection); skipped
+   records get rec.status=-2 and the seg slot is never written. */
+typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
+                                       SlotcaskBulkRec *rec);
+
 typedef struct {
     int                          if_not_exists;     /* skip if key exists */
     int                          require_existing;  /* skip if key missing (bulk-update use) */
@@ -299,8 +311,10 @@ typedef struct {
        arg. When 0 (e.g. non-indexed bulk-insert), the primitive skips the
        per-record read_record_value on UPDATE — that's the dominant per-
        record cost on update-heavy workloads. Hook still fires with
-       old=NULL. */
+       old=NULL. Forced to 1 internally when value_compute is set. */
     int                          pre_commit_needs_old;
+    /* Optional NEW-from-OLD compute hook — see slotcask_bulk_value_fn. */
+    slotcask_bulk_value_fn       value_compute;
 } SlotcaskBulkOpts;
 
 /* Returns 0 if the batch ran (per-record results in recs[].status), -1 on
