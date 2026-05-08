@@ -5026,8 +5026,11 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 /* Update the splits field for one object's line in $g_db_root/schema.conf.
    Format: dir:object:splits:max_key. Serialised by locking
    schema.conf itself via flock since this file is shared by all objects. */
-static int update_schema_conf_splits(const char *db_root, const char *object,
-                                     int new_splits) {
+/* Update the splits and/or streams field on the schema.conf line for
+   <dir>/<object>. Pass new_splits<=0 to keep existing splits;
+   new_streams<=0 to keep existing streams. */
+static int update_schema_conf_splits_streams(const char *db_root, const char *object,
+                                             int new_splits, int new_streams) {
     /* Derive dir name from db_root: db_root is $g_db_root/<dir> */
     const char *dir = db_root + strlen(g_db_root);
     if (*dir == '/') dir++;
@@ -5059,12 +5062,14 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
             int sv = 0, streams = 0;
             int n = sscanf(line + pfxlen, "%d:%d:%d:%d",
                             &cur_splits, &max_key, &sv, &streams);
+            int out_splits  = (new_splits  > 0) ? new_splits  : cur_splits;
+            int out_streams = (new_streams > 0) ? new_streams : streams;
             if (n >= 4)
-                fprintf(fout, "%s%d:%d:%d:%d\n", prefix, new_splits, max_key, sv, streams);
+                fprintf(fout, "%s%d:%d:%d:%d\n", prefix, out_splits, max_key, sv, out_streams);
             else if (n >= 3)
-                fprintf(fout, "%s%d:%d:%d\n", prefix, new_splits, max_key, sv);
+                fprintf(fout, "%s%d:%d:%d\n", prefix, out_splits, max_key, sv);
             else
-                fprintf(fout, "%s%d:%d\n", prefix, new_splits, max_key);
+                fprintf(fout, "%s%d:%d\n", prefix, out_splits, max_key);
             replaced = 1;
         } else {
             fputs(line, fout);
@@ -5075,6 +5080,11 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
     flock(lockfd, LOCK_UN);
     fclose(fin);
     return ok ? 0 : -1;
+}
+
+static int update_schema_conf_splits(const char *db_root, const char *object,
+                                     int new_splits) {
+    return update_schema_conf_splits_streams(db_root, object, new_splits, 0);
 }
 
 /* Parse a single fields.conf-style line "name:type[:param]" into a TypedField.
@@ -5286,8 +5296,11 @@ static int rebuild_object_v2(const char *db_root, const char *object,
         unlink(fpath_old);
     }
 
-    if (splits_changed)
-        update_schema_conf_splits(db_root, object, new_sch->splits);
+    int streams_changed = (new_sch->streams != old_sch->streams);
+    if (splits_changed || streams_changed)
+        update_schema_conf_splits_streams(db_root, object,
+                                           splits_changed  ? new_sch->splits  : 0,
+                                           streams_changed ? new_sch->streams : 0);
 
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
@@ -5302,18 +5315,20 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     int idx_rebuilt = 0;
     if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
 
-    log_msg(3, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+    log_msg(3, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
+            old_sch->streams, new_sch->streams,
             old_sch->slot_size, new_sch->slot_size, drop_tombstoned, idx_rebuilt);
-    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
-        live_count, new_sch->splits, new_sch->slot_size,
+    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"streams\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
+        live_count, new_sch->splits, new_sch->streams, new_sch->slot_size,
         drop_tombstoned ? "true" : "false", idx_rebuilt);
     return 0;
 }
 
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits_arg, int drop_tombstoned,
-                   char added_lines[][256], int n_added) {
+                   char added_lines[][256], int n_added,
+                   int new_streams_arg) {
     Schema old_sch = load_schema(db_root, object);
     if (old_sch.splits <= 0) {
         OUT("{\"error\":\"Object [%s] not found\"}\n", object);
@@ -5333,6 +5348,13 @@ int rebuild_object(const char *db_root, const char *object,
         return 1;
     }
     int splits_changed = (new_splits != old_splits);
+
+    /* streams change is a no-op for v1 (no streams concept). For v2, the
+       caller (typically vacuum) passes the desired stream count. 0 = keep. */
+    int old_streams = old_sch.streams;
+    int new_streams = (new_streams_arg > 0 && old_sch.storage_version == 2)
+                      ? new_streams_arg : old_streams;
+    int streams_changed = (new_streams != old_streams);
 
     /* Build new TypedSchema:
          1. Copy existing fields (skip tombstoned if drop_tombstoned).
@@ -5380,6 +5402,7 @@ int rebuild_object(const char *db_root, const char *object,
 
     Schema new_sch = old_sch;
     new_sch.splits = new_splits;
+    new_sch.streams = new_streams;
     new_sch.max_value = new_ts.total_size;
     /* slot_size depends on storage version — v2 includes a 24B inline
        per-record header, v1 doesn't (see load_schema commentary). */
@@ -5393,7 +5416,7 @@ int rebuild_object(const char *db_root, const char *object,
     int slot_changed = (new_sch.slot_size != old_sch.slot_size);
 
     /* Nothing to do — caller probably called rebuild without flags */
-    if (!splits_changed && !slot_changed && n_added == 0) {
+    if (!splits_changed && !slot_changed && !streams_changed && n_added == 0) {
         OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
         return 0;
     }
@@ -5653,22 +5676,35 @@ static void *vacuum_worker(void *arg) {
 
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits) {
-    /* Compact rewrite path: delegate to rebuild_object (task #4).
-       Triggered by --compact or --splits. rebuild_object dispatches on
-       storage_version internally. */
-    if (compact || new_splits > 0) {
-        return rebuild_object(db_root, object, new_splits, compact, NULL, 0);
+    Schema sch = load_schema(db_root, object);
+
+    /* v2 streams-mismatch detection: if the host's CPU count has changed
+       since create-object (e.g. machine upgraded, container resized, or
+       schema was hand-edited), the on-disk stream count diverges from
+       slotcask_streams_for_nproc(). The fix is a full rebuild — same
+       infrastructure as a splits change. The check folds into both flag
+       paths so a single `vacuum` invocation always converges streams. */
+    int new_streams = 0;
+    if (sch.storage_version == 2) {
+        int derived = slotcask_streams_for_nproc();
+        if (derived != sch.streams && derived > 0)
+            new_streams = derived;
     }
 
-    Schema sch = load_schema(db_root, object);
-    /* v2 no-arg vacuum: slotcask's snake-game pool already returns
-       tombstoned slots to writers as they're produced. There is no Zone A
-       flag-2 array to sweep. Per-segment "drop fully-tombstoned segments"
-       compaction is a future refinement; for now report 0 cleaned and
-       reset the `orphaned` metadata counter — for v2 the counter no
-       longer represents "live tombstones taking space" (they don't
-       persist), so leaving it stuck at the deletion total would
-       mislead operators reading vacuum-check / stats output. */
+    /* Heavy path: --compact, --splits, or streams mismatch — all converge
+       through rebuild_object. */
+    if (compact || new_splits > 0 || new_streams > 0) {
+        return rebuild_object(db_root, object, new_splits, compact,
+                               NULL, 0, new_streams);
+    }
+
+    /* v2 light path: streams already match, no flags. The snake-game pool
+       reuses tombstoned slots automatically as writers produce them; the
+       `deleted` metadata counter doesn't track on-disk waste in v2 (it's
+       just delete-call cumulative), so reset it. Direction-C seg
+       compaction (drain sparse non-active seg files into each other and
+       drop the empty donor) is the next compaction refinement; for now
+       this branch reports cleaned=0 unless that work has shipped. */
     if (sch.storage_version == 2) {
         reset_deleted_count(db_root, object);
         OUT("{\"status\":\"vacuumed\",\"cleaned\":0}\n");

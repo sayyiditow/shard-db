@@ -2005,7 +2005,7 @@ int cmd_add_fields(const char *db_root, const char *object,
     }
 
     /* rebuild_object appends lines to fields.conf and rewrites shards atomically. */
-    return rebuild_object(db_root, object, 0, 0, lines, nlines);
+    return rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
 }
 
 /* ========== remove-field ==========

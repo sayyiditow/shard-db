@@ -979,9 +979,12 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              int limit, int dry_run);
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits);
+/* new_streams_arg: 0 = keep current streams; >0 = rebuild with that count
+   (only meaningful for v2 storage). Used by vacuum's streams-mismatch path. */
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits, int drop_tombstoned,
-                   char added_lines[][256], int n_added);
+                   char added_lines[][256], int n_added,
+                   int new_streams_arg);
 int cmd_recount(const char *db_root, const char *object);
 int cmd_shard_stats(const char *db_root, const char *object, int as_table);
 int cmd_truncate(const char *db_root, const char *object);
