@@ -12335,10 +12335,11 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     int nrows = 0;
 
     if (sch.storage_version == 2) {
-        /* v2 layout: walk data/kf/NNN.kf. Each file is an array of 24-byte
-           SlotcaskKfEntry (hash16 + flag + stream + file_id + offset).
-           slots = file_bytes / 24; live records = count of entries with
-           flag==1 at stride 24. The walk is cheap (sequential mmap reads). */
+        /* v2 layout: walk data/kf/NNN.kf. Each file is [24B SlotcaskKfHeader]
+           [N × 24B SlotcaskKfEntry]. The header carries `total` (live +
+           tombstoned) and `deleted` (tombstones); live = total - deleted,
+           so we don't need to scan the entry array at all — one pread of
+           the header per shard is enough. */
         char kf_dir[PATH_MAX];
         snprintf(kf_dir, sizeof(kf_dir), "%s/kf", data_dir);
         DIR *d1 = opendir(kf_dir);
@@ -12353,15 +12354,14 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
             int fd = open(path, O_RDONLY);
             if (fd < 0) continue;
             struct stat st; if (fstat(fd, &st) < 0) { close(fd); continue; }
-            uint32_t slots = (uint32_t)(st.st_size / 24);
-            uint32_t live  = 0;
-            if (slots > 0) {
-                void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (m != MAP_FAILED) {
-                    const uint8_t *p = (const uint8_t *)m + 16;  /* flag byte */
-                    for (uint32_t k = 0; k < slots; k++, p += 24)
-                        if (*p == 1) live++;
-                    munmap(m, (size_t)st.st_size);
+            uint32_t slots = 0, live = 0;
+            if ((uint64_t)st.st_size >= SLOTCASK_KF_HDR_SIZE) {
+                slots = (uint32_t)(((uint64_t)st.st_size - SLOTCASK_KF_HDR_SIZE)
+                                   / sizeof(SlotcaskKfEntry));
+                SlotcaskKfHeader hdr;
+                if (pread(fd, &hdr, sizeof(hdr), 0) == (ssize_t)sizeof(hdr)
+                    && hdr.magic == SLOTCASK_KF_MAGIC) {
+                    live = (uint32_t)(hdr.total - hdr.deleted);
                 }
             }
             close(fd);
@@ -12416,7 +12416,6 @@ sort_and_emit:
 
     uint64_t total_records = 0, total_bytes = 0;
     uint32_t max_slots = 0, max_records = 0, min_records = UINT32_MAX;
-    int grows = 0;  /* max number of doublings observed = log2(slots/INITIAL) */
     for (int i = 0; i < nrows; i++) {
         total_records += rows[i].records;
         total_bytes += rows[i].file_bytes;
@@ -12424,13 +12423,19 @@ sort_and_emit:
         if (rows[i].records > max_records) max_records = rows[i].records;
         if (rows[i].records < min_records) min_records = rows[i].records;
     }
-    for (uint32_t s = max_slots; s > INITIAL_SLOTS; s >>= 1) grows++;
 
-    /* Hint: sizing is driven by records-per-shard, not by load factor or doublings.
-       Bench sweet spot ≈ 78K-200K rec/shard; acceptable up to ~500K; degradation
-       past ~1M. `grows` is informational only — every real workload doubles many
-       times past INITIAL_SLOTS to stay under the 50% growth threshold, so it
-       doesn't distinguish "optimal" from "overloaded". */
+    /* `grows` = log2(max_slots / initial). v1 uses INITIAL_SLOTS=256; v2 uses
+       the splits-tier initial from slotcask_default_slots_for_splits(). */
+    uint32_t initial = (sch.storage_version == 2)
+        ? (uint32_t)slotcask_default_slots_for_splits(sch.splits)
+        : (uint32_t)INITIAL_SLOTS;
+    int grows = 0;
+    for (uint32_t s = max_slots; initial > 0 && s > initial; s >>= 1) grows++;
+
+    /* Hint: in v1, sizing is driven by records-per-shard (sweet spot 78K-200K).
+       In v2 the kf auto-resplits, so high recs/shard ≠ broken — but it does mean
+       the kf paid inline doubling cost. Same advice ("vacuum --splits=N") fits
+       both: a higher `splits` up-front avoids resplit work. */
     const char *hint = NULL;
     double avg_load = 0.0;
     uint64_t rps = 0;
@@ -12448,14 +12453,22 @@ sort_and_emit:
         }
     }
 
+    /* v2 emits keyfile-flavored field names (kf shards aren't data shards);
+       v1 keeps `shard`/`shards_on_disk`/`shard_list` as those rows really are
+       data shards. */
+    int v2 = (sch.storage_version == 2);
+    const char *count_key = v2 ? "keyfiles"  : "shards_on_disk";
+    const char *list_key  = v2 ? "keyfiles"  : "shard_list";
+    const char *row_key   = v2 ? "keyfile"   : "shard";
+
     if (as_table) {
-        OUT("splits=%d shards_on_disk=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
-            sch.splits, nrows, (unsigned long)total_records, (unsigned long)total_bytes,
+        OUT("splits=%d %s=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
+            sch.splits, count_key, nrows, (unsigned long)total_records, (unsigned long)total_bytes,
             (unsigned long)rps, grows, avg_load);
         if (nrows != sch.splits)
-            OUT("warn: shards_on_disk (%d) ≠ splits (%d) — partial vacuum/reshard or missing shard files?\n",
-                nrows, sch.splits);
-        OUT("  %-8s %-10s %-10s %-8s %-14s\n", "shard", "slots", "records", "load", "bytes");
+            OUT("warn: %s (%d) ≠ splits (%d) — partial vacuum/reshard or missing %s files?\n",
+                count_key, nrows, sch.splits, v2 ? "kf" : "shard");
+        OUT("  %-8s %-10s %-10s %-8s %-14s\n", row_key, "slots", "records", "load", "bytes");
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
             OUT("  %-8d %-10u %-10u %-8.3f %-14lu\n",
@@ -12464,17 +12477,13 @@ sort_and_emit:
         }
         if (hint) OUT("hint: %s\n", hint);
     } else {
-        /* JSON: keep `splits` as the configured count from schema.conf and
-           rename the on-disk count to `shards_on_disk` so the two are
-           clearly distinct sources rather than identical-looking duplicates.
-           Drift between them signals a partial vacuum/reshard or missing
-           shard files — operators should investigate. */
-        OUT("{\"splits\":%d,\"shards_on_disk\":%d,\"total_records\":%lu,\"total_bytes\":%lu,\"shard_list\":[",
-            sch.splits, nrows, (unsigned long)total_records, (unsigned long)total_bytes);
+        OUT("{\"splits\":%d,\"%s\":%d,\"total_records\":%lu,\"total_bytes\":%lu,\"%s\":[",
+            sch.splits, count_key, nrows, (unsigned long)total_records,
+            (unsigned long)total_bytes, list_key);
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
-            OUT("%s{\"shard\":%d,\"slots\":%u,\"records\":%u,\"load\":%.3f,\"bytes\":%lu}",
-                i ? "," : "", rows[i].shard_id, rows[i].slots, rows[i].records,
+            OUT("%s{\"%s\":%d,\"slots\":%u,\"records\":%u,\"load\":%.3f,\"bytes\":%lu}",
+                i ? "," : "", row_key, rows[i].shard_id, rows[i].slots, rows[i].records,
                 load, (unsigned long)rows[i].file_bytes);
         }
         OUT("],\"avg_rec_per_shard\":%lu,\"max_grows\":%d", (unsigned long)rps, grows);

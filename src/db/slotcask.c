@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <dirent.h>
+#include <time.h>
 #include <pthread.h>
 
 /* Single source of truth for primary-key hashing — defined in util.c. We
@@ -786,6 +787,14 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
    Tombstones (flag=2) are dropped — the new kf is fully compacted
    (header.total == header.live, header.deleted = 0).
    On error, kh is unchanged (the old kf is the live file). */
+/* High-resolution monotonic timer in microseconds. Used by resplit
+   instrumentation to break down the cost of each phase. */
+static inline uint64_t kf_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
 static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (kh->slot < 0 || !kh->writer) return -1;
     if (new_cap <= kh->capacity) return -1;
@@ -794,7 +803,9 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     size_t old_cap = kh->capacity;
     size_t new_size = SLOTCASK_KF_HDR_SIZE + new_cap * sizeof(SlotcaskKfEntry);
 
-    /* Stage the new kf in $path.new. */
+    uint64_t t_start = kf_now_us();
+
+    /* === Phase A: open + ftruncate + mmap new file === */
     char new_path[PATH_MAX];
     snprintf(new_path, sizeof(new_path), "%s.new", e->path);
     int new_fd = open(new_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -802,13 +813,19 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (ftruncate(new_fd, (off_t)new_size) < 0) {
         close(new_fd); unlink(new_path); return -1;
     }
+    /* MAP_POPULATE prefaults every page of the new mapping in one syscall,
+       so the probe-rebuild loop below doesn't pay per-page faults inline.
+       Without it, each cache-cold write into the 12.6 MB sparse file
+       triggers a page allocation + dirty-tracking hook (~30-80 µs amortised).
+       With ~3,150 pages and uneven write order, that page-fault tax adds
+       up to 50-100 ms per resplit. MAP_POPULATE consolidates it into one
+       up-front cost the kernel can batch. */
     uint8_t *new_base = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                              MAP_SHARED, new_fd, 0);
+                              MAP_SHARED | MAP_POPULATE, new_fd, 0);
     if (new_base == MAP_FAILED) {
         close(new_fd); unlink(new_path); return -1;
     }
 
-    /* Initialise new header (counters get filled in below). */
     SlotcaskKfHeader *new_hdr = (SlotcaskKfHeader *)new_base;
     new_hdr->magic = SLOTCASK_KF_MAGIC;
     new_hdr->version = SLOTCASK_KF_VERSION;
@@ -816,15 +833,13 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     new_hdr->deleted = 0;
     SlotcaskKfEntry *new_entries =
         (SlotcaskKfEntry *)(new_base + SLOTCASK_KF_HDR_SIZE);
-    /* ftruncate of a fresh file gives zeroed pages, no memset needed. */
+    uint64_t t_after_setup = kf_now_us();
 
-    /* Stream the old kf: walk in order, place each flag=1 entry directly
-       into new_entries via linear probing. No big malloc — memory cost
-       stays flat regardless of shard size. */
+    /* === Phase B: probe-rebuild loop === */
     uint64_t live_copied = 0;
     for (size_t i = 0; i < old_cap; i++) {
         SlotcaskKfEntry *src = &kh->map[i];
-        if (src->flag != 1) continue;  /* skip flag=0 + flag=2 (tombstones reclaimed) */
+        if (src->flag != 1) continue;
         size_t start = kf_slot_for(src->hash, new_cap);
         for (size_t j = 0; j < new_cap; j++) {
             size_t s = (start + j) % new_cap;
@@ -837,12 +852,15 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     }
     new_hdr->total = live_copied;
     new_hdr->deleted = 0;
+    uint64_t t_after_rebuild = kf_now_us();
 
+    /* === Phase C: msync(MS_SYNC) === */
     msync(new_base, new_size, MS_SYNC);
     munmap(new_base, new_size);
     close(new_fd);
+    uint64_t t_after_msync = kf_now_us();
 
-    /* Atomic flip: kf.new → kf. */
+    /* === Phase D: rename + parent-dir fsync === */
     if (rename(new_path, e->path) != 0) {
         unlink(new_path);
         return -1;
@@ -855,9 +873,9 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
         int dfd = open(parent, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
+    uint64_t t_after_rename = kf_now_us();
 
-    /* Re-open the path (now points at the renamed file) and remap. We hold
-       the entry's wrlock so no concurrent reader is using e->base / e->fd. */
+    /* === Phase E: remap (close old, open new path, mmap fresh) === */
     int reopen_fd = open(e->path, O_RDWR);
     if (reopen_fd < 0) return -1;
     void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
@@ -878,6 +896,22 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     kh->map = (SlotcaskKfEntry *)(e->base + SLOTCASK_KF_HDR_SIZE);
     kh->map_size = new_size;
     kh->capacity = new_cap;
+    uint64_t t_end = kf_now_us();
+
+    /* Phase breakdown: setup / rebuild / msync / rename+fsync / remap.
+       `live` is records actually re-inserted at new capacity (= header.total
+       on the new kf). Goes to stderr so the daemon's log captures it; the
+       bench fixture's daemon log is at $DB_ROOT/logs/. */
+    fprintf(stderr,
+        "KF_RESPLIT path=%s old_cap=%zu new_cap=%zu live=%lu "
+        "total_us=%lu setup_us=%lu rebuild_us=%lu msync_us=%lu rename_us=%lu remap_us=%lu\n",
+        e->path, old_cap, new_cap, (unsigned long)live_copied,
+        (unsigned long)(t_end - t_start),
+        (unsigned long)(t_after_setup   - t_start),
+        (unsigned long)(t_after_rebuild - t_after_setup),
+        (unsigned long)(t_after_msync   - t_after_rebuild),
+        (unsigned long)(t_after_rename  - t_after_msync),
+        (unsigned long)(t_end           - t_after_rename));
     return 0;
 }
 
