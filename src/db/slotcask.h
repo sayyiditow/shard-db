@@ -522,6 +522,16 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    for its own synchronization. */
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 
+/* Per-shard walker, used by the engine to parallelise scans across kf
+   shards while keeping engine-side state (thread-local output streams,
+   etc.) under the engine's own per-worker control. `stop_flag` is a
+   shared int (caller's scope, atomic 0/1) that any worker can flip to
+   abort the run; pass NULL to disable. Returns 0 on success or normal
+   stop, -1 on bad args. */
+int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
+                             SlotcaskScanCb cb, void *ctx,
+                             int *stop_flag);
+
 /* Skip the first `skip_n` live records without loading their values.
    The cb fires only on records past the skip window. Used by
    cmd_fetch with offset/cursor — eliminates the per-skipped-record

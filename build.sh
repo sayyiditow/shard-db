@@ -171,6 +171,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/db/util.c \
     src/db/slotcask.c \
+    src/db/parallel.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test

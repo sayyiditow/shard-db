@@ -6,7 +6,8 @@ uint32_t g_timeout = 30;
 int g_port = 9199;
 int g_max_threads = 0;  /* 0 = auto (4× cores) — compute thread pool size */
 int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
-int g_pool_chunk = 0;   /* 0 = auto (cores) — parallel_for() submit batch */
+/* g_pool_chunk lives in parallel.c (so test/bench binaries that link
+   parallel.c without config.c don't get an undefined symbol). */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */

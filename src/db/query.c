@@ -150,10 +150,54 @@ static int v2_scan_wrap_cb(const uint8_t hash[16],
     return w->cb(&hdr, (const uint8_t *)key, w->ctx);
 }
 
+/* Per-shard worker: sets thread-local g_out (otherwise OUT() in the
+   callback writes to stdout instead of the connection's stream), then
+   calls the storage primitive for one kf shard. The shared stop_flag
+   lets one shard's "abort" return halt the rest. */
+typedef struct {
+    SlotcaskDb  *db;
+    int          kf_shard_id;
+    SlotcaskScanCb scb;
+    void        *sctx;
+    int         *stop_flag;
+    FILE        *parent_out;
+} V2ShardArg;
+
+static void *v2_shard_worker(void *raw) {
+    V2ShardArg *w = (V2ShardArg *)raw;
+    g_out = w->parent_out ? w->parent_out : stdout;
+    if (w->stop_flag &&
+        __atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
+    int rc = slotcask_walk_one_shard(w->db, w->kf_shard_id,
+                                      w->scb, w->sctx, w->stop_flag);
+    if (rc != 0 && w->stop_flag)
+        __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     g_scan_stop = 0;
     V2ScanWrap wrap = { cb, ctx };
-    slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
+    int n = db->num_shards;
+    if (n <= 0) return;
+    int stop_flag = 0;
+    V2ShardArg *args = malloc((size_t)n * sizeof(V2ShardArg));
+    if (!args) {
+        /* OOM fallback — sequential walk via the storage primitive. */
+        slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
+        return;
+    }
+    FILE *parent_out = g_out;
+    for (int s = 0; s < n; s++) {
+        args[s] = (V2ShardArg){
+            .db = db, .kf_shard_id = s,
+            .scb = v2_scan_wrap_cb, .sctx = &wrap,
+            .stop_flag = &stop_flag,
+            .parent_out = parent_out,
+        };
+    }
+    parallel_for(v2_shard_worker, args, n, sizeof(V2ShardArg));
+    free(args);
 }
 
 /* Dispatch helper: callers that have a Schema in scope use this to pick

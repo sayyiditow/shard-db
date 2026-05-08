@@ -68,6 +68,12 @@ static pthread_cond_t  g_q_not_full  = PTHREAD_COND_INITIALIZER;
 static pthread_t *g_pool_threads = NULL;
 static int        g_pool_nthreads = 0;
 
+/* Submit-batch size for parallel_for (POOL_CHUNK in db.env). 0 = auto
+   (= nproc). Defined here so the symbol travels with the rest of the
+   pool machinery — test/bench binaries link parallel.c without config.c
+   and the variable is then never written, leaving the auto-default. */
+int g_pool_chunk = 0;
+
 /* Per-thread flag: 1 while a pool worker is running a task, 0 otherwise.
    parallel_for uses this to decide between two wait strategies:
      - Top-level callers (TCP handler, CLI) → plain cond_wait. Pool

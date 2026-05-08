@@ -3208,8 +3208,39 @@ void slotcask_registry_shutdown(void) {
 
 /* Walk one keyfile shard. For each flag=1 entry, follow the pointer to the
    segment, hold the segcache rdlock, invoke cb. cb returning 1 stops. */
+/* Per-record reference used by walk_one_shard's batched scan. */
+typedef struct {
+    uint32_t kf_idx;     /* index into kf array (for hash + flag verify) */
+    uint8_t  sid;
+    uint16_t fid;
+    uint32_t offset;
+} WalkRecRef;
+
+static int walk_recref_cmp(const void *a, const void *b) {
+    const WalkRecRef *ra = a, *rb = b;
+    if (ra->sid != rb->sid) return (int)ra->sid - (int)rb->sid;
+    if (ra->fid != rb->fid) return (int)ra->fid - (int)rb->fid;
+    if (ra->offset < rb->offset) return -1;
+    if (ra->offset > rb->offset) return 1;
+    return 0;
+}
+
+static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
+                                 SlotcaskScanCb cb, void *ctx,
+                                 int *stop_flag);
+
 static int walk_one_shard(SlotcaskDb *db, int kf_shard_id,
                           SlotcaskScanCb cb, void *ctx) {
+    return walk_one_shard_inner(db, kf_shard_id, cb, ctx, NULL);
+}
+
+static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
+                                 SlotcaskScanCb cb, void *ctx,
+                                 int *stop_flag) {
+    /* Cheap stop check before any allocation — early-exit queries
+       (limit-bounded find, etc.) win the most from this. */
+    if (stop_flag && __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) return 0;
+
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, kf_shard_id);
     SlotcaskKfHandle kh;
@@ -3217,33 +3248,142 @@ static int walk_one_shard(SlotcaskDb *db, int kf_shard_id,
 
     size_t cap = kh.capacity;
     SlotcaskKfEntry *kf = kh.map;
-    int stop = 0;
-    for (size_t i = 0; i < cap && !stop; i++) {
+
+    /* Size the refs buffer by live count (= header.total - header.deleted),
+       not full slot capacity. For typical data the live count is tiny
+       compared to cap (e.g., 15K live in a 256K-slot shard at low load),
+       so this saves ~16× memory + the kernel page-fault tail. */
+    size_t alloc_n = cap;
+    if (kh.hdr) {
+        uint64_t live = kh.hdr->total > kh.hdr->deleted
+                          ? kh.hdr->total - kh.hdr->deleted : 0;
+        if (live > 0 && live < (uint64_t)cap) alloc_n = (size_t)live;
+    }
+
+    /* Pass 1: collect live entries' (sid, fid, offset) refs. */
+    WalkRecRef *refs = malloc(alloc_n * sizeof(WalkRecRef));
+    if (!refs) {
+        /* Allocation failure → fall back to per-record acquire. Slower
+           but correct. */
+        int stop = 0;
+        for (size_t i = 0; i < cap && !stop; i++) {
+            SlotcaskKfEntry *e = &kf[i];
+            uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+            if (flag != 1) continue;
+            char seg_path[PATH_MAX];
+            seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
+            SlotcaskSegHandle sh;
+            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+            const uint8_t *rec = sh.map + e->offset;
+            if (rec[18] == 1 && memcmp(rec, e->hash, 16) == 0) {
+                uint16_t klen; uint32_t vlen;
+                memcpy(&klen, rec + 16, 2);
+                memcpy(&vlen, rec + 20, 4);
+                if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+                    stop = 1;
+            }
+            segcache_release(&sh);
+        }
+        kfcache_release(&kh);
+        return stop;
+    }
+    size_t nrefs = 0;
+    int sf_check = 0;
+    for (size_t i = 0; i < cap; i++) {
+        /* Periodic stop_flag check so concurrent workers' early-exit
+           propagates: another shard finds enough matches and sets the
+           shared flag, this worker bails without finishing pass 1. */
+        if (stop_flag && (++sf_check & 0xFFF) == 0 &&
+            __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) {
+            free(refs);
+            kfcache_release(&kh);
+            return 0;
+        }
         SlotcaskKfEntry *e = &kf[i];
         uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
         if (flag != 1) continue;
+        /* live count is a stat snapshot; concurrent inserts can grow it
+           past alloc_n. Bound writes to alloc_n; surplus entries fall
+           back to the un-batched per-record acquire loop below. */
+        if (nrefs >= alloc_n) {
+            /* Edge case: more live entries than the header reported.
+               Walk the remaining slots inline (slow path) so correctness
+               isn't tied to the live-count snapshot. */
+            for (; i < cap; i++) {
+                e = &kf[i];
+                flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+                if (flag != 1) continue;
+                refs[nrefs].kf_idx = (uint32_t)i;
+                refs[nrefs].sid    = e->stream_id;
+                refs[nrefs].fid    = e->file_id;
+                refs[nrefs].offset = e->offset;
+                if (++nrefs >= alloc_n) {
+                    /* refs full — grow once via realloc to fit the rest. */
+                    size_t new_n = alloc_n + (cap - i);
+                    WalkRecRef *grown = realloc(refs, new_n * sizeof(WalkRecRef));
+                    if (!grown) goto done_collect;
+                    refs = grown;
+                    alloc_n = new_n;
+                }
+            }
+            break;
+        }
+        refs[nrefs].kf_idx = (uint32_t)i;
+        refs[nrefs].sid    = e->stream_id;
+        refs[nrefs].fid    = e->file_id;
+        refs[nrefs].offset = e->offset;
+        nrefs++;
+    }
+done_collect:
+    ;
 
-        char seg_path[PATH_MAX];
-        seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
-        SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+    /* Pass 2: sort by (sid, fid, offset). Same-segment entries become
+       consecutive so we acquire/release each segment once instead of N
+       times — replaces ~N calls into the segcache (each contending on
+       g_segcache_lock) with ~num_segments calls. The sort cost
+       (n log n × ~30 ns) is dwarfed by the lock-acquire savings. */
+    qsort(refs, nrefs, sizeof(WalkRecRef), walk_recref_cmp);
 
-        const uint8_t *rec = sh.map + e->offset;
+    /* Pass 3: walk sorted refs, holding one segment handle across runs
+       of records sharing (sid, fid). */
+    int stop = 0;
+    SlotcaskSegHandle sh = { .slot = -1 };
+    int held_sid = -1, held_fid = -1;
+    int sf_check2 = 0;
+    for (size_t i = 0; i < nrefs && !stop; i++) {
+        /* Periodic shared-stop check propagates one worker's early-exit
+           (e.g., limit-bounded find finding its 10th match) to siblings. */
+        if (stop_flag && (++sf_check2 & 0xFF) == 0 &&
+            __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) {
+            stop = 1; break;
+        }
+        WalkRecRef *r = &refs[i];
+        if ((int)r->sid != held_sid || (int)r->fid != held_fid) {
+            if (sh.slot >= 0 || sh.fd >= 0) segcache_release(&sh);
+            sh.slot = -1; sh.fd = -1;
+            char seg_path[PATH_MAX];
+            seg_path_for(seg_path, db->data_dir, r->sid, r->fid);
+            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) {
+                held_sid = held_fid = -1;
+                continue;
+            }
+            held_sid = r->sid;
+            held_fid = r->fid;
+        }
+        SlotcaskKfEntry *e = &kf[r->kf_idx];
+        const uint8_t *rec = sh.map + r->offset;
         if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
-            /* Stale-pointer race: another writer repointed mid-walk. Skip. */
-            segcache_release(&sh);
+            /* Stale-pointer race: another writer repointed mid-walk. */
             continue;
         }
-        uint16_t klen;
-        uint32_t vlen;
+        uint16_t klen; uint32_t vlen;
         memcpy(&klen, rec + 16, 2);
         memcpy(&vlen, rec + 20, 4);
-        const uint8_t *key   = rec + 24;
-        const uint8_t *value = rec + 24 + klen;
-
-        if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
-        segcache_release(&sh);
+        if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+            stop = 1;
     }
+    if (sh.slot >= 0 || sh.fd >= 0) segcache_release(&sh);
+    free(refs);
     kfcache_release(&kh);
     return stop;
 }
@@ -3266,8 +3406,11 @@ static void *walk_worker(void *arg) {
 
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
     if (!db || !cb) return -1;
-    /* Sequential walk for now — no engine-wide thread pool dep here.
-       Phase 3 perf can revisit using parallel_for from the engine. */
+    /* Sequential walk. Parallelism is the engine's job (it knows about
+       thread-local output streams and other engine-side state); the
+       storage primitive just exposes a per-shard walker. See
+       slotcask_walk_one_shard for the per-shard entry point used by the
+       engine's parallel scan_shards_v2. */
     int stop_flag = 0;
     for (int s = 0; s < db->num_shards; s++) {
         if (__atomic_load_n(&stop_flag, __ATOMIC_ACQUIRE)) break;
@@ -3279,6 +3422,19 @@ int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
         walk_worker(&arg);
     }
     return 0;
+}
+
+/* Walk one kf shard's live entries into `cb`. Same semantics as
+   slotcask_walk_live but scoped to a single shard so the engine can
+   parallelise across shards (with g_out propagation, etc.). The shared
+   `stop_flag` (uint8_t in caller's scope) preserves the early-cb-return
+   semantics across parallel workers. */
+int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
+                             SlotcaskScanCb cb, void *ctx,
+                             int *stop_flag) {
+    if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
+        return -1;
+    return walk_one_shard_inner(db, kf_shard_id, cb, ctx, stop_flag);
 }
 
 /* Count-only variant — sums live kf entries (flag=1) across every kf
