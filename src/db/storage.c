@@ -737,7 +737,7 @@ typedef struct {
     _Atomic int64_t  live;
     _Atomic int64_t  deleted;
     _Atomic uint64_t pending_writes;   /* atomic ops since last flush */
-    int              used;
+    _Atomic int      used;             /* atomic so the lookup hot path can be lock-free */
 } CountsCacheEntry;
 
 #define COUNTS_CACHE_BUCKETS 1024
@@ -752,6 +752,24 @@ static unsigned counts_hash_path(const char *p) {
     return h;
 }
 
+/* Lock-free lookup — entries are write-once after install (we never
+   evict). Read used with acquire ordering to pair with the
+   release-store at install time, then strcmp the path. Hot path on
+   bench-kv DELETE x10000: was 10K mutex_lock/unlock pairs, now zero. */
+static CountsCacheEntry *counts_cache_lookup_lockfree(const char *path) {
+    unsigned h = counts_hash_path(path);
+    for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
+        int idx = (int)((h + (unsigned)i) % COUNTS_CACHE_BUCKETS);
+        int u = atomic_load_explicit(&g_counts_cache[idx].used,
+                                       memory_order_acquire);
+        if (!u) return NULL;
+        if (strcmp(g_counts_cache[idx].path, path) == 0)
+            return &g_counts_cache[idx];
+    }
+    return NULL;
+}
+
+/* Slow path — used at install time only. Caller holds g_counts_lock. */
 static CountsCacheEntry *counts_cache_lookup_locked(const char *path) {
     unsigned h = counts_hash_path(path);
     for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
@@ -764,8 +782,13 @@ static CountsCacheEntry *counts_cache_lookup_locked(const char *path) {
 }
 
 static CountsCacheEntry *counts_cache_get(const char *path) {
+    /* Hot path: try lock-free lookup first. */
+    CountsCacheEntry *e = counts_cache_lookup_lockfree(path);
+    if (e) return e;
+
+    /* Slow path: take the mutex, install. */
     pthread_mutex_lock(&g_counts_lock);
-    CountsCacheEntry *e = counts_cache_lookup_locked(path);
+    e = counts_cache_lookup_locked(path);
     if (e) { pthread_mutex_unlock(&g_counts_lock); return e; }
 
     /* Install — find empty slot, init from disk. */
@@ -789,7 +812,9 @@ static CountsCacheEntry *counts_cache_get(const char *path) {
     atomic_init(&g_counts_cache[idx].live, (int64_t)live);
     atomic_init(&g_counts_cache[idx].deleted, (int64_t)del);
     atomic_init(&g_counts_cache[idx].pending_writes, 0);
-    g_counts_cache[idx].used = 1;
+    /* Release-store on used so the lock-free reader's acquire-load sees
+       the path + atomics fully initialised before observing used=1. */
+    atomic_store_explicit(&g_counts_cache[idx].used, 1, memory_order_release);
     pthread_mutex_unlock(&g_counts_lock);
     return &g_counts_cache[idx];
 }
@@ -828,7 +853,9 @@ void counts_invalidate(const char *db_root, const char *object) {
     pthread_mutex_lock(&g_counts_lock);
     CountsCacheEntry *e = counts_cache_lookup_locked(cpath);
     if (e) {
-        e->used = 0;
+        /* Atomic store so concurrent lock-free readers see used=0
+           promptly (and skip this entry on subsequent lookups). */
+        atomic_store_explicit(&e->used, 0, memory_order_release);
         e->path[0] = '\0';
         atomic_store_explicit(&e->live, 0, memory_order_relaxed);
         atomic_store_explicit(&e->deleted, 0, memory_order_relaxed);
@@ -842,7 +869,8 @@ void counts_invalidate(const char *db_root, const char *object) {
 void counts_flush_all(void) {
     pthread_mutex_lock(&g_counts_lock);
     for (int i = 0; i < COUNTS_CACHE_BUCKETS; i++) {
-        if (!g_counts_cache[i].used) continue;
+        if (!atomic_load_explicit(&g_counts_cache[i].used,
+                                    memory_order_relaxed)) continue;
         char lpath[PATH_MAX];
         snprintf(lpath, PATH_MAX, "%s.lock", g_counts_cache[i].path);
         counts_flush_entry(g_counts_cache[i].path, lpath, &g_counts_cache[i]);
