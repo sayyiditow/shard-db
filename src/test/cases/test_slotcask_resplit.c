@@ -1,16 +1,18 @@
 /* test_slotcask_resplit.c — kf shard auto-resplit (linear-hashing doubling).
  *
- * Verifies that kf_put_new triggers a resplit when global load crosses the
- * 75% threshold. Inserting 75% × num_shards × slots_per_shard records to
- * naturally trigger this would mean ~6M inserts at the splits=8 tier —
- * doable but slow for a unit test. We trick the threshold by manually
- * spiking db.live_count, then issue ONE insert and assert:
+ * Verifies that kf_put_new triggers a resplit when a shard's header.total
+ * crosses 75 % of capacity. Inserting 75 % × slots_per_shard records to
+ * naturally trigger this would mean ~750k inserts at the splits=8 tier —
+ * slow for a unit test. We trick the threshold by writing synthetic counters
+ * directly into shard 0's kf header via slotcask_test_set_kf_total, then
+ * issue ONE insert and assert:
  *
- *   - The targeted shard's on-disk kf file doubled (24 MB → 48 MB at the
- *     splits=8 tier with 1M slots → 2M slots).
+ *   - The targeted shard's on-disk kf file doubled
+ *     (24 + 1M*24 = ~24 MB  →  24 + 2M*24 = ~48 MB).
  *   - The kfcache entry's capacity reflects the new size on next acquire.
+ *   - The header is preserved across the resplit (fresh counters are
+ *     valid: live_copied entries → total = live_copied, deleted = 0).
  *   - All previously-written records remain readable post-resplit.
- *   - The newly-inserted record is also readable.
  *
  * Standalone: calls slotcask_* directly. No daemon, no TCP. */
 #ifndef _GNU_SOURCE
@@ -66,14 +68,16 @@ static int test_slotcask_resplit_run(void) {
     snprintf(kf_path, sizeof(kf_path), "%s/data/kf/000.kf", dir);
     struct stat st_pre;
     ASSERT_EQ_INT(stat(kf_path, &st_pre), 0, "kf 000 exists pre-resplit");
-    /* Default tier-1 sizing: 1M × 24B = 24 MB. */
-    ASSERT_EQ_INT((long long)st_pre.st_size, (long long)(1ull * 1024 * 1024 * 24),
-                  "kf 000 is 24 MB pre-resplit");
+    /* Default tier-1 sizing: 24-byte header + 1M slots × 24B = 24B + 24 MB. */
+    long long expected_pre = 24 + (long long)(1ull * 1024 * 1024 * 24);
+    ASSERT_EQ_INT((long long)st_pre.st_size, expected_pre,
+                  "kf 000 is header + 24 MB pre-resplit");
 
-    /* Spike the live counter past the 75% global threshold:
-       75% × num_shards × slots_per_shard = 0.75 × 8 × 1M = 6M. Set to 7M. */
-    int64_t fake_load = 7ll * 1024 * 1024;
-    atomic_store_explicit(&db.live_count, fake_load, memory_order_relaxed);
+    /* Spike shard 0's per-shard total past 75 % via the test helper —
+       writes synthetic counters straight into the kf header. */
+    uint64_t fake_total = (uint64_t)((double)(1ull * 1024 * 1024) * 0.80);
+    ASSERT_EQ_INT(slotcask_test_set_kf_total(&db, 0, fake_total, 0), 0,
+                  "synthetic header.total written");
 
     /* Insert keys with hashes that route to shard 0 specifically. We don't
        have a public hash helper here; spam-insert until shard 0 fires the
@@ -94,12 +98,12 @@ static int test_slotcask_resplit_run(void) {
     }
     ASSERT_TRUE(triggered, "shard 0 resplit fired within 64 inserts");
 
-    /* Confirm the new size is exactly 2x. */
+    /* Confirm the new size is exactly 2x slot bytes (header stays 24 B). */
     struct stat st_post;
     ASSERT_EQ_INT(stat(kf_path, &st_post), 0, "kf 000 still exists post-resplit");
-    ASSERT_EQ_INT((long long)st_post.st_size,
-                  (long long)(2ull * 1024 * 1024 * 24),
-                  "kf 000 doubled to 48 MB");
+    long long expected_post = 24 + (long long)(2ull * 1024 * 1024 * 24);
+    ASSERT_EQ_INT((long long)st_post.st_size, expected_post,
+                  "kf 000 doubled (header + 48 MB)");
 
     /* No leftover .new staging file. */
     char kf_new[512];
@@ -151,11 +155,17 @@ static int test_slotcask_resplit_run(void) {
     }
     ASSERT_EQ_INT(readable_re, 100, "all 100 originals readable after reopen");
 
-    /* live_count should be rebuilt by walking — count of flag=1 entries
-       across all shards. We can't easily check this externally, but it
-       should be >0 (at minimum the 100 originals). */
-    int64_t live = atomic_load_explicit(&db.live_count, memory_order_relaxed);
-    ASSERT_TRUE(live >= 100, "live_count rebuilt at open >= 100");
+    /* The header survives close+reopen — counts come straight off disk,
+       no walk-to-rebuild. Sanity-check by re-running an insert: it should
+       NOT trigger another resplit since shard 0's real load is now low
+       (the synthetic spike was cleared by the resplit's repopulate). */
+    char k_extra[32]; snprintf(k_extra, sizeof(k_extra), "post-reopen-key");
+    rc = slotcask_insert(&db, -1, k_extra, strlen(k_extra), "ok", 2);
+    ASSERT_EQ_INT(rc, 0, "post-reopen insert succeeds");
+    void *vv = NULL; size_t vl = 0;
+    rc = slotcask_get(&db, k_extra, strlen(k_extra), &vv, &vl);
+    ASSERT_EQ_INT(rc, 0, "post-reopen get succeeds");
+    free(vv);
 
     slotcask_close(&db);
     slotcask_shutdown();

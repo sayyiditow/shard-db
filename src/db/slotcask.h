@@ -42,11 +42,26 @@
 /* Keyfile shard count cap mirrors splits ceiling for the engine. */
 #define SLOTCASK_MAX_SHARDS      4096
 
-/* Per-shard kf capacity ceiling. When a shard's resplit would push it past
-   this, the put-new path returns -1 and the operator must reshard (more
-   shards via vacuum --splits=N). At 16M slots × 24B × 4096 shards =
-   1.5 TB of kf address space — well past any realistic dataset. */
-#define SLOTCASK_KF_MAX_SLOTS_PER_SHARD  (16u * 1024 * 1024)
+/* No per-shard slot ceiling. kf shards double via auto-resplit indefinitely;
+   shard-stats surfaces per-shard load to the operator, who reshards via
+   vacuum --splits=N if a single shard becomes operationally unwieldy. */
+
+/* On-disk kf header (24 bytes, prefixes every kf file). `total` counts
+   non-empty slots (live + tombstoned) — the resplit trigger metric, since
+   tombstones still create lookup probe-chain pressure. `deleted` counts
+   tombstones; live = total - deleted, computed when callers need it.
+   Updates happen under the kf shard's wrlock (acquired via kfcache_acquire(
+   writer=1)) — no atomics required. */
+#define SLOTCASK_KF_MAGIC      0x31464B53u  /* 'SKF1' little-endian */
+#define SLOTCASK_KF_VERSION    1u
+#define SLOTCASK_KF_HDR_SIZE   24
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;          /* SLOTCASK_KF_MAGIC */
+    uint32_t version;        /* SLOTCASK_KF_VERSION */
+    uint64_t total;          /* non-empty slots (live + tombstoned) */
+    uint64_t deleted;        /* tombstoned slots */
+} SlotcaskKfHeader;
 
 /* Per-shard slot count is chosen by tier, parameterised on `splits`:
      splits ≤ 16     → 1M  slots/shard   (24-48 MB total kf — small DBs)
@@ -88,9 +103,10 @@ typedef struct {
     int     slot;            /* cache slot index, or -1 if uncached fallback */
     int     writer;          /* 1 = held wrlock, 0 = held rdlock */
     int     fd;
-    SlotcaskKfEntry *map;
-    size_t  map_size;        /* bytes; map_size / 24 = capacity */
-    size_t  capacity;        /* slots in this shard */
+    SlotcaskKfHeader *hdr;   /* points at byte 0 of the mmap (24-byte header) */
+    SlotcaskKfEntry  *map;   /* points at byte 24 of the mmap (slot array) */
+    size_t  map_size;        /* total mmap bytes (header + slots) */
+    size_t  capacity;        /* slots in this shard = (map_size - 24) / 24 */
 } SlotcaskKfHandle;
 
 void kfcache_init(int cap);
@@ -160,18 +176,15 @@ typedef struct SlotcaskDb {
                                 shards may have grown larger via auto-resplit */
 
     SlotcaskStream *streams;
-
-    /* Live-key tally, mirrors what the engine's metadata/counts file
-       already tracks at the storage.c layer. Slotcask keeps its own
-       internal copy so the kf-resplit hot path can decide
-       "is this shard ~75 % full?" without crossing the storage.c
-       boundary (linker isolation: src/test/ links slotcask.c
-       without storage.c). Updated by kf_put_new on success and by
-       kf_tombstone on success; rebuilt at slotcask_open by walking
-       every kf shard's flag=1 entries (the same loop that already
-       reconstructs the per-stream free-pool from flag=2). */
-    _Atomic int64_t live_count;
 } SlotcaskDb;
+
+/* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
+   shard's header. Used by resplit tests to trip the 75 % trigger without
+   inserting millions of records. Must be called between slotcask_open and
+   the next kf-touching op; takes the kf wrlock internally. Returns 0 on
+   success. NOT for production use. */
+int slotcask_test_set_kf_total(SlotcaskDb *db, int shard_id,
+                               uint64_t total, uint64_t deleted);
 
 /* Initialize global caches. Call once at process startup, after db.env load. */
 void slotcask_init(int kfcache_cap, int segcache_cap);

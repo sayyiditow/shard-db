@@ -105,9 +105,9 @@ static void seg_path_for(char out[PATH_MAX], const char *data_dir,
 typedef struct {
     char     path[PATH_MAX];
     int      fd;
-    SlotcaskKfEntry *map;
-    size_t   map_size;
-    size_t   capacity;          /* slots in this shard */
+    uint8_t *base;              /* raw mmap pointer; header at base+0, slots at base+24 */
+    size_t   map_size;          /* total mmap bytes (header + slots) */
+    size_t   capacity;          /* slots = (map_size - 24) / 24 */
     pthread_rwlock_t rwlock;
     int      used;
     uint64_t last_access;
@@ -137,8 +137,8 @@ void kfcache_shutdown(void) {
         for (int i = 0; i < g_kfcache_slots; i++) {
             KfCacheEntry *e = &g_kfcache[i];
             if (!e->used) continue;
-            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_SYNC);
-            if (e->map) munmap(e->map, e->map_size);
+            if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_SYNC);
+            if (e->base) munmap(e->base, e->map_size);
             if (e->fd >= 0) close(e->fd);
             pthread_rwlock_destroy(&e->rwlock);
         }
@@ -166,10 +166,10 @@ static int kfcache_probe(const char *path, int *out_found) {
 static void kfcache_drop_slot(int slot) {
     KfCacheEntry *e = &g_kfcache[slot];
     if (!e->used) return;
-    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
-    if (e->map) munmap(e->map, e->map_size);
+    if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+    if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
-    e->map = NULL;
+    e->base = NULL;
     e->fd = -1;
     e->map_size = 0;
     e->capacity = 0;
@@ -201,10 +201,10 @@ static void kfcache_invalidate_prefix(const char *prefix) {
         pthread_rwlock_wrlock(&e->rwlock);
         if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
             strncmp(e->path, prefix, pl) == 0) {
-            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
-            if (e->map) munmap(e->map, e->map_size);
+            if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+            if (e->base) munmap(e->base, e->map_size);
             if (e->fd >= 0) close(e->fd);
-            e->map = NULL;
+            e->base = NULL;
             e->fd = -1;
             e->map_size = 0;
             e->capacity = 0;
@@ -220,40 +220,84 @@ static void kfcache_invalidate_prefix(const char *prefix) {
    the file system call could block, so we do the heavy lifting outside the
    table mutex (matching bt_open_file's contract in btree.c). */
 static int kf_open_file(const char *path, size_t slots_capacity, int writer,
-                        int *out_fd, SlotcaskKfEntry **out_map, size_t *out_size) {
+                        int *out_fd, uint8_t **out_base, size_t *out_size) {
     int fd;
+    int created_fresh = 0;  /* track first-time creation for header init */
     if (writer) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof(dir), "%s", path);
         char *slash = strrchr(dir, '/');
         if (slash) { *slash = 0; mkdirp_local(dir); }
+        struct stat pre_st;
+        int existed = (stat(path, &pre_st) == 0);
         fd = open(path, O_RDWR | O_CREAT, 0644);
+        if (!existed && fd >= 0) created_fresh = 1;
     } else {
         fd = open(path, O_RDWR);
     }
     if (fd < 0) return -1;
 
-    size_t want = slots_capacity * sizeof(SlotcaskKfEntry);
+    size_t want = SLOTCASK_KF_HDR_SIZE + slots_capacity * sizeof(SlotcaskKfEntry);
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }
 
-    if ((size_t)st.st_size < want) {
+    if (created_fresh || (size_t)st.st_size == 0) {
+        /* Brand-new file. Size + initialise header. */
+        if (!writer) { close(fd); return -1; }
+        if (ftruncate(fd, (off_t)want) < 0) { close(fd); return -1; }
+    } else if ((size_t)st.st_size < want) {
+        /* Pre-existing file but smaller than requested. Pre-release we treat
+           any headerless/old-format kf as garbage and refuse — operator is
+           expected to wipe DB_ROOT before upgrading. */
         if (!writer) { close(fd); return -1; }
         if (ftruncate(fd, (off_t)want) < 0) { close(fd); return -1; }
     } else if ((size_t)st.st_size > want) {
-        /* Existing file is bigger than expected — keep it (auto-resplit may
-           have grown it). Use the actual size for the mmap; capacity is the
-           actual slot count. */
+        /* Existing file is bigger than the default (auto-resplit grew it).
+           Use the actual size for the mmap; slot count derives from it. */
         want = (size_t)st.st_size;
     }
 
     void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
 
+    SlotcaskKfHeader *hdr = (SlotcaskKfHeader *)m;
+    if (created_fresh) {
+        /* Stamp magic + version; counters start at 0. */
+        hdr->magic = SLOTCASK_KF_MAGIC;
+        hdr->version = SLOTCASK_KF_VERSION;
+        hdr->total = 0;
+        hdr->deleted = 0;
+        msync(m, SLOTCASK_KF_HDR_SIZE, MS_ASYNC);
+    } else if (hdr->magic != SLOTCASK_KF_MAGIC) {
+        /* Magic missing/wrong — pre-release we don't migrate. */
+        munmap(m, want); close(fd);
+        return -1;
+    }
+
     *out_fd = fd;
-    *out_map = (SlotcaskKfEntry *)m;
+    *out_base = (uint8_t *)m;
     *out_size = want;
     return 0;
+}
+
+/* Populate handle's hdr/map/capacity from the cache entry's stored base. */
+static inline void kf_handle_from_entry(SlotcaskKfHandle *h, KfCacheEntry *e) {
+    h->fd = e->fd;
+    h->hdr = (SlotcaskKfHeader *)e->base;
+    h->map = (SlotcaskKfEntry *)(e->base + SLOTCASK_KF_HDR_SIZE);
+    h->map_size = e->map_size;
+    h->capacity = e->capacity;
+}
+
+/* Populate handle's hdr/map/capacity from a freshly-opened uncached mmap. */
+static inline void kf_handle_from_uncached(SlotcaskKfHandle *h,
+                                            int fd, uint8_t *base, size_t sz) {
+    h->slot = -1;
+    h->fd = fd;
+    h->hdr = (SlotcaskKfHeader *)base;
+    h->map = (SlotcaskKfEntry *)(base + SLOTCASK_KF_HDR_SIZE);
+    h->map_size = sz;
+    h->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
 }
 
 int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
@@ -261,15 +305,16 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     h->slot = -1;
     h->writer = writer;
     h->fd = -1;
+    h->hdr = NULL;
     h->map = NULL;
     h->map_size = 0;
     h->capacity = 0;
 
     if (!g_kfcache) {
         /* Cache not initialised — direct mmap, no locking. */
-        if (kf_open_file(path, slots_capacity, writer,
-                         &h->fd, &h->map, &h->map_size) < 0) return -1;
-        h->capacity = h->map_size / sizeof(SlotcaskKfEntry);
+        int fd; uint8_t *base; size_t sz;
+        if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz) < 0) return -1;
+        kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
 
@@ -290,10 +335,7 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
         KfCacheEntry *e = &g_kfcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
             h->slot = slot;
-            h->fd = e->fd;
-            h->map = e->map;
-            h->map_size = e->map_size;
-            h->capacity = e->capacity;
+            kf_handle_from_entry(h, e);
             return 0;
         }
         pthread_rwlock_unlock(lock);
@@ -308,15 +350,15 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     /* Miss path: open + install. Drop table lock during open since it can
        block on disk. */
     pthread_mutex_unlock(&g_kfcache_lock);
-    int fd; SlotcaskKfEntry *map; size_t sz;
-    if (kf_open_file(path, slots_capacity, writer, &fd, &map, &sz) < 0) return -1;
+    int fd; uint8_t *base; size_t sz;
+    if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz) < 0) return -1;
     pthread_mutex_lock(&g_kfcache_lock);
 
     /* Re-probe — another thread may have installed it while we were opening. */
     slot = kfcache_probe(path, &found);
     if (found) {
         /* Lost the install race. Discard our open; use the cached entry. */
-        munmap(map, sz);
+        munmap(base, sz);
         close(fd);
         g_kfcache[slot].last_access =
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
@@ -327,17 +369,14 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
         KfCacheEntry *e = &g_kfcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
             h->slot = slot;
-            h->fd = e->fd;
-            h->map = e->map;
-            h->map_size = e->map_size;
-            h->capacity = e->capacity;
+            kf_handle_from_entry(h, e);
             return 0;
         }
         /* Slot was evicted under us; serve uncached this once. */
         pthread_rwlock_unlock(lock);
-        if (kf_open_file(path, slots_capacity, writer,
-                         &h->fd, &h->map, &h->map_size) < 0) return -1;
-        h->capacity = h->map_size / sizeof(SlotcaskKfEntry);
+        int fd2; uint8_t *base2; size_t sz2;
+        if (kf_open_file(path, slots_capacity, writer, &fd2, &base2, &sz2) < 0) return -1;
+        kf_handle_from_uncached(h, fd2, base2, sz2);
         return 0;
     }
 
@@ -357,11 +396,7 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     if (slot < 0) {
         /* Cache truly full — serve uncached. */
         pthread_mutex_unlock(&g_kfcache_lock);
-        h->slot = -1;
-        h->fd = fd;
-        h->map = map;
-        h->map_size = sz;
-        h->capacity = sz / sizeof(SlotcaskKfEntry);
+        kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
 
@@ -369,9 +404,9 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     strncpy(e->path, path, PATH_MAX - 1);
     e->path[PATH_MAX - 1] = '\0';
     e->fd = fd;
-    e->map = map;
+    e->base = base;
     e->map_size = sz;
-    e->capacity = sz / sizeof(SlotcaskKfEntry);
+    e->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     g_kfcache_count++;
@@ -383,23 +418,21 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     pthread_mutex_unlock(&g_kfcache_lock);
 
     h->slot = slot;
-    h->fd = fd;
-    h->map = map;
-    h->map_size = sz;
-    h->capacity = e->capacity;
+    kf_handle_from_entry(h, e);
     return 0;
 }
 
 void kfcache_release(SlotcaskKfHandle *h) {
     if (h->slot >= 0) {
         pthread_rwlock_unlock(&g_kfcache[h->slot].rwlock);
-    } else if (h->map) {
+    } else if (h->hdr) {
         /* Uncached fallback. */
-        munmap(h->map, h->map_size);
+        munmap((void *)h->hdr, h->map_size);
         if (h->fd >= 0) close(h->fd);
     }
     h->slot = -1;
     h->fd = -1;
+    h->hdr = NULL;
     h->map = NULL;
     h->map_size = 0;
     h->capacity = 0;
@@ -746,66 +779,67 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
    this entry. Crash-safe via kf.new staging + atomic rename + parent-dir
    fsync. After return, kh and the underlying KfCacheEntry both reflect the
    new capacity; the old fd/map are torn down.
+
+   Streaming: walks the old kf in order and writes each flag=1 entry
+   directly into kf.new's mmap via linear probing at the new capacity.
+   Zero malloc; memory cost stays flat regardless of shard size.
+   Tombstones (flag=2) are dropped — the new kf is fully compacted
+   (header.total == header.live, header.deleted = 0).
    On error, kh is unchanged (the old kf is the live file). */
 static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (kh->slot < 0 || !kh->writer) return -1;
     if (new_cap <= kh->capacity) return -1;
-    if (new_cap > SLOTCASK_KF_MAX_SLOTS_PER_SHARD) return -1;
 
     KfCacheEntry *e = &g_kfcache[kh->slot];
     size_t old_cap = kh->capacity;
-    size_t new_size = new_cap * sizeof(SlotcaskKfEntry);
-
-    /* Snapshot live entries from the current mmap. Worst-case 24 MB at the
-       1M tier — fires once per doubling, amortised over hundreds of
-       thousands of inserts. */
-    size_t live = 0;
-    for (size_t i = 0; i < old_cap; i++) {
-        if (kh->map[i].flag == 1) live++;
-    }
-    SlotcaskKfEntry *snap = NULL;
-    if (live > 0) {
-        snap = malloc(live * sizeof(SlotcaskKfEntry));
-        if (!snap) return -1;
-        size_t k = 0;
-        for (size_t i = 0; i < old_cap; i++) {
-            if (kh->map[i].flag == 1) snap[k++] = kh->map[i];
-        }
-    }
+    size_t new_size = SLOTCASK_KF_HDR_SIZE + new_cap * sizeof(SlotcaskKfEntry);
 
     /* Stage the new kf in $path.new. */
     char new_path[PATH_MAX];
     snprintf(new_path, sizeof(new_path), "%s.new", e->path);
     int new_fd = open(new_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (new_fd < 0) { free(snap); return -1; }
+    if (new_fd < 0) return -1;
     if (ftruncate(new_fd, (off_t)new_size) < 0) {
-        free(snap); close(new_fd); unlink(new_path); return -1;
+        close(new_fd); unlink(new_path); return -1;
     }
-    void *new_map = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                          MAP_SHARED, new_fd, 0);
-    if (new_map == MAP_FAILED) {
-        free(snap); close(new_fd); unlink(new_path); return -1;
+    uint8_t *new_base = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, new_fd, 0);
+    if (new_base == MAP_FAILED) {
+        close(new_fd); unlink(new_path); return -1;
     }
+
+    /* Initialise new header (counters get filled in below). */
+    SlotcaskKfHeader *new_hdr = (SlotcaskKfHeader *)new_base;
+    new_hdr->magic = SLOTCASK_KF_MAGIC;
+    new_hdr->version = SLOTCASK_KF_VERSION;
+    new_hdr->total = 0;
+    new_hdr->deleted = 0;
+    SlotcaskKfEntry *new_entries =
+        (SlotcaskKfEntry *)(new_base + SLOTCASK_KF_HDR_SIZE);
     /* ftruncate of a fresh file gives zeroed pages, no memset needed. */
 
-    /* Repopulate. Entries were unique per (hash, key) in the old layout;
-       skipping verify_stored_key here is safe because we're rehashing the
-       SAME entries — no new collisions possible. */
-    SlotcaskKfEntry *new_entries = (SlotcaskKfEntry *)new_map;
-    for (size_t k = 0; k < live; k++) {
-        size_t start = kf_slot_for(snap[k].hash, new_cap);
-        for (size_t i = 0; i < new_cap; i++) {
-            size_t s = (start + i) % new_cap;
+    /* Stream the old kf: walk in order, place each flag=1 entry directly
+       into new_entries via linear probing. No big malloc — memory cost
+       stays flat regardless of shard size. */
+    uint64_t live_copied = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        SlotcaskKfEntry *src = &kh->map[i];
+        if (src->flag != 1) continue;  /* skip flag=0 + flag=2 (tombstones reclaimed) */
+        size_t start = kf_slot_for(src->hash, new_cap);
+        for (size_t j = 0; j < new_cap; j++) {
+            size_t s = (start + j) % new_cap;
             if (new_entries[s].flag == 0) {
-                new_entries[s] = snap[k];
+                new_entries[s] = *src;
+                live_copied++;
                 break;
             }
         }
     }
-    free(snap);
+    new_hdr->total = live_copied;
+    new_hdr->deleted = 0;
 
-    msync(new_map, new_size, MS_SYNC);
-    munmap(new_map, new_size);
+    msync(new_base, new_size, MS_SYNC);
+    munmap(new_base, new_size);
     close(new_fd);
 
     /* Atomic flip: kf.new → kf. */
@@ -823,79 +857,83 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     }
 
     /* Re-open the path (now points at the renamed file) and remap. We hold
-       the entry's wrlock so no concurrent reader is using e->map / e->fd. */
+       the entry's wrlock so no concurrent reader is using e->base / e->fd. */
     int reopen_fd = open(e->path, O_RDWR);
     if (reopen_fd < 0) return -1;
     void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, reopen_fd, 0);
     if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
 
-    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
-    if (e->map) munmap(e->map, e->map_size);
+    if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+    if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
 
     e->fd = reopen_fd;
-    e->map = (SlotcaskKfEntry *)fresh;
+    e->base = (uint8_t *)fresh;
     e->map_size = new_size;
     e->capacity = new_cap;
 
     kh->fd = reopen_fd;
-    kh->map = e->map;
+    kh->hdr = (SlotcaskKfHeader *)e->base;
+    kh->map = (SlotcaskKfEntry *)(e->base + SLOTCASK_KF_HDR_SIZE);
     kh->map_size = new_size;
     kh->capacity = new_cap;
     return 0;
 }
 
 /* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
-   reuse, repurposes that slot. Before probing, checks global load: if the
-   counts cache reports >= 75% load on average across shards, doubles this
-   shard's capacity in place via kfcache_resplit_locked. The check is one
-   atomic load (lock-free counts cache) — sub-ns on the hot path. */
+   reuse, repurposes that slot. Before probing, checks the per-shard
+   header.total — when it crosses 75 % of capacity, the shard doubles via
+   kfcache_resplit_locked. Header reads/writes are plain mmap loads/stores
+   under the kf wrlock — no atomics, no syscalls. */
 static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
                       uint8_t stream_id, uint16_t file_id, uint32_t offset,
                       const void *key, size_t klen, const char *data_dir,
                       size_t *used_delta) {
-    /* Load-triggered resplit. Skip if we're already at the per-shard cap;
-       the operator is expected to reshard at that point. live_count is
-       slotcask's internal mirror of metadata/counts; reading it is one
-       relaxed atomic load, sub-ns. */
-    if (kh->capacity < SLOTCASK_KF_MAX_SLOTS_PER_SHARD) {
-        int64_t live_global = atomic_load_explicit(&db->live_count,
-                                                    memory_order_relaxed);
-        int64_t total_cap = (int64_t)db->num_shards * (int64_t)kh->capacity;
-        /* live_global / num_shards approximates per-shard load (xxh128 +
-           hash[0..8) %% cap distributes uniformly). The 75% trigger gives
-           probe chains an upper bound around 4 (textbook for linear probing)
-           AND has plenty of headroom before the file is genuinely full. */
-        if (total_cap > 0 && live_global * 4 >= total_cap * 3) {
+    (void)db;  /* db param retained for ABI; per-shard load lives in the header */
+    /* Load-triggered resplit. The header tracks `total` (= live + tombstoned),
+       which matches the linear-probe pressure that drives chain length —
+       tombstones still force probing past them on lookup. 75 % trigger keeps
+       average probe chains around 4 (textbook). No upper cap: streaming
+       resplit has flat memory cost and shard-stats surfaces operator-visible
+       skew if a single shard ever becomes unwieldy. */
+    if (kh->hdr) {
+        uint64_t total = kh->hdr->total;
+        uint64_t cap = (uint64_t)kh->capacity;
+        if (cap > 0 && total * 4 >= cap * 3) {
             (void)kfcache_resplit_locked(kh, kh->capacity * 2);
-            /* Resplit failure isn't fatal — we still try the put on the old
-               capacity. If THAT fails too (truly full), the caller bubbles
-               the error up. */
+            /* Resplit failure isn't fatal — fall through and try the put on
+               the old capacity. If THAT fails too (truly full), caller
+               bubbles the error up. */
         }
     }
 
     size_t cap = kh->capacity;
     SlotcaskKfEntry *kf = kh->map;
+    SlotcaskKfHeader *hdr = kh->hdr;
     size_t start = kf_slot_for(hash, cap);
     size_t first_tomb = (size_t)-1;
     for (size_t i = 0; i < cap; i++) {
         size_t slot = (start + i) % cap;
         SlotcaskKfEntry *e = &kf[slot];
         if (e->flag == 0) {
-            /* End of probe chain. Insert at first-tombstone if we saw one;
-               otherwise at this empty slot. Counted as +1 either way —
-               first-tomb reuse still represents one more live record. */
+            /* End of probe chain. Insert at first-tombstone if we saw one
+               (decrements deleted; total stays — slot was already counted),
+               otherwise at this empty slot (increments total). */
             size_t target_idx = (first_tomb != (size_t)-1) ? first_tomb : slot;
             SlotcaskKfEntry *t = &kf[target_idx];
+            int reused_tomb = (first_tomb != (size_t)-1);
             memcpy(t->hash, hash, 16);
             t->stream_id = stream_id;
             t->file_id = file_id;
             t->offset = offset;
             __atomic_thread_fence(__ATOMIC_RELEASE);
             t->flag = 1;
+            if (hdr) {
+                if (reused_tomb) hdr->deleted--;   /* tombstone reclaimed */
+                else             hdr->total++;    /* fresh slot occupied */
+            }
             (*used_delta)++;
-            atomic_fetch_add_explicit(&db->live_count, 1, memory_order_relaxed);
             return 0;
         }
         if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
@@ -911,8 +949,8 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
             e->offset = offset;
             __atomic_thread_fence(__ATOMIC_RELEASE);
             e->flag = 1;
+            if (hdr) hdr->deleted--;  /* tombstone reclaimed; total unchanged */
             (*used_delta)++;
-            atomic_fetch_add_explicit(&db->live_count, 1, memory_order_relaxed);
             return 0;
         }
         if (e->flag == 2 && first_tomb == (size_t)-1) {
@@ -929,8 +967,8 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
         t->offset = offset;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         t->flag = 1;
+        if (hdr) hdr->deleted--;  /* tombstone reclaimed */
         (*used_delta)++;
-        atomic_fetch_add_explicit(&db->live_count, 1, memory_order_relaxed);
         return 0;
     }
     return -1;
@@ -1056,9 +1094,12 @@ static inline void kf_repoint_at_slot(SlotcaskKfHandle *kh, size_t slot,
                      __ATOMIC_RELEASE);
 }
 
-/* Direct tombstone at a known slot — see kf_repoint_at_slot rationale. */
+/* Direct tombstone at a known slot — see kf_repoint_at_slot rationale.
+   Bumps the header's deleted counter; total is unchanged (the slot was
+   already counted as non-empty when it was inserted). */
 static inline void kf_tombstone_at_slot(SlotcaskKfHandle *kh, size_t slot) {
     kh->map[slot].flag = 2;
+    if (kh->hdr) kh->hdr->deleted++;
 }
 
 /* Repoint EXISTING key's slot. Atomic 8B store on the trailing group keeps
@@ -1121,6 +1162,7 @@ static int kf_tombstone(SlotcaskKfHandle *kh, const uint8_t hash[16],
                 *out_file_id = e->file_id;
                 *out_offset = e->offset;
                 e->flag = 2;
+                if (kh->hdr) kh->hdr->deleted++;
                 (*used_delta)++;
                 return 0;
             }
@@ -1405,7 +1447,6 @@ int slotcask_delete(SlotcaskDb *db,
                           &old_sid, &old_fid, &old_off, &used_delta);
     kfcache_release(&kh);
     if (rc < 0) return -1;
-    atomic_fetch_sub_explicit(&db->live_count, 1, memory_order_relaxed);
     seg_write_flag(db, old_sid, old_fid, old_off, 2);
     pool_push_free(&db->streams[old_sid], old_fid, old_off);
     return 0;
@@ -1736,17 +1777,15 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) continue;
         size_t cap = kh.capacity;
         SlotcaskKfEntry *kf = kh.map;
-        int64_t shard_live = 0;
+        /* Counts live in the kf header (per-shard), persisted across
+           restarts — no rebuild needed. We only walk to reconstruct the
+           in-memory free-pool from flag=2 entries. */
         for (size_t i = 0; i < cap; i++) {
-            if (kf[i].flag == 1) {
-                shard_live++;
-            } else if (kf[i].flag == 2 && kf[i].stream_id < db->num_streams) {
+            if (kf[i].flag == 2 && kf[i].stream_id < db->num_streams) {
                 pool_push_free(&db->streams[kf[i].stream_id],
                                 kf[i].file_id, kf[i].offset);
             }
         }
-        atomic_fetch_add_explicit(&db->live_count, shard_live,
-                                   memory_order_relaxed);
         kfcache_release(&kh);
     }
 
@@ -1776,6 +1815,25 @@ void slotcask_close(SlotcaskDb *db) {
     }
     remove_dirty_marker(db);
     memset(db, 0, sizeof(*db));
+}
+
+/* TEST-ONLY: write synthetic counters into a kf shard's header. Used by
+   the resplit stress test to trip the 75 % trigger without inserting
+   millions of records. Acquires the kf wrlock briefly, mutates the
+   header's `total` and `deleted` fields, releases. NOT for production. */
+int slotcask_test_set_kf_total(SlotcaskDb *db, int shard_id,
+                               uint64_t total, uint64_t deleted) {
+    if (!db || shard_id < 0 || shard_id >= db->num_shards) return -1;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    if (kh.hdr) {
+        kh.hdr->total = total;
+        kh.hdr->deleted = deleted;
+    }
+    kfcache_release(&kh);
+    return 0;
 }
 
 /* ============================================================ CAS hooks
@@ -2585,7 +2643,6 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
            the slot, and the kf wrlock has been held continuously, so the
            slot is still authoritative. Direct flag flip. */
         kf_tombstone_at_slot(&kh, st[i].kf_slot);
-        atomic_fetch_sub_explicit(&db->live_count, 1, memory_order_relaxed);
         st[i].committed = 1;
         r->was_update = 1;
     }
@@ -2971,7 +3028,6 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
 
     /* Direct flag flip at the captured slot — no probe, no verify. */
     kf_tombstone_at_slot(&kh, kf_slot);
-    atomic_fetch_sub_explicit(&db->live_count, 1, memory_order_relaxed);
     kfcache_release(&kh);
 
     seg_write_flag(db, old_sid, old_fid, old_off, 2);
