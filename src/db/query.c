@@ -12441,25 +12441,20 @@ sort_and_emit:
 }
 
 /* v2 recount callback: increments a counter for every live record. */
-static int recount_v2_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
-    (void)hdr; (void)block;
-    int *total = (int *)ctx;
-    __sync_fetch_and_add(total, 1);
-    return 0;
-}
-
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
 
-    /* v2: walk the slotcask via scan_dispatch — slotcask_walk_live
-       visits every live (flag=1) entry across every kf shard. */
+    /* v2: count live kf entries directly — no seg reads. Was using
+       slotcask_walk_live which loaded every seg slot just to bump a
+       counter (~270ms at 1M records). slotcask_count_live walks the
+       24-byte kf entries only (~5ms). */
     if (sch.storage_version == 2) {
-        int total = 0;
-        char data_dir_unused[PATH_MAX];
-        snprintf(data_dir_unused, sizeof(data_dir_unused),
-                 "%s/%s/data", db_root, object);
-        scan_dispatch(db_root, object, &sch, data_dir_unused,
-                      recount_v2_cb, &total);
+        SlotcaskSchemaInfo info = {
+            .splits = sch.splits, .slot_size = sch.slot_size,
+            .streams = sch.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        int total = sdb ? (int)slotcask_count_live(sdb) : 0;
         set_count(db_root, object, total);
         OUT("{\"count\":%d}\n", total);
         return 0;
