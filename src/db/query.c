@@ -3728,13 +3728,20 @@ static void *bulk_upd_delim_shard_worker(void *arg) {
     return NULL;
 }
 
-int cmd_bulk_update_delimited(const char *db_root, const char *object,
-                               const char *filepath, char delimiter) {
-    if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
-
+/* Shared body for bulk-update-delimited (file + inline string entry points).
+   Caller owns `data`/`size` lifetime — this helper doesn't free them, just
+   parses and dispatches workers. Returns 0 on success / 1 on validation
+   error after writing the appropriate JSON response. */
+static int bulk_upd_delim_run(const char *db_root, const char *object,
+                               const char *data, size_t size,
+                               char delimiter) {
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
         OUT("{\"error\":\"Delimited update requires typed fields (fields.conf)\"}\n");
+        return 1;
+    }
+    if (!data || size == 0) {
+        OUT("{\"error\":\"Empty input\"}\n");
         return 1;
     }
 
@@ -3743,29 +3750,9 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
-    int ifd = open(filepath, O_RDONLY);
-    if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
-    struct stat st;
-    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
-    if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
-    const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
-    int data_mmaped = 1;
-    if (data == MAP_FAILED) {
-        char *buf = malloc(st.st_size);
-        if (!buf) { close(ifd); return 1; }
-        lseek(ifd, 0, SEEK_SET);
-        size_t rd = 0;
-        while (rd < (size_t)st.st_size) {
-            ssize_t n = read(ifd, buf + rd, st.st_size - rd);
-            if (n <= 0) break;
-            rd += n;
-        }
-        data = buf;
-        data_mmaped = 0;
-    } else {
-        madvise((void *)data, st.st_size, MADV_SEQUENTIAL);
-    }
-    close(ifd);
+    /* Synthesise the same struct fields the body used to expect. */
+    struct stat st = { .st_size = (off_t)size };
+    int data_mmaped = 0;  /* helper never owns; caller handles lifetime */
 
     /* Active-field mapping — same as bulk-insert-delimited. */
     int active_indices[MAX_FIELDS];
@@ -3910,13 +3897,57 @@ int cmd_bulk_update_delimited(const char *db_root, const char *object,
     }
     free(workers);
 
-    if (data_mmaped) munmap((void *)data, st.st_size);
-    else free((void *)data);
+    /* Caller owns `data`. */
+    (void)data_mmaped; (void)st;
 
     log_msg(3, "BULK-UPDATE-DELIM %s matched=%d updated=%d skipped=%d",
             object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
     return 0;
+}
+
+int cmd_bulk_update_delimited(const char *db_root, const char *object,
+                               const char *filepath, char delimiter) {
+    if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
+
+    int ifd = open(filepath, O_RDONLY);
+    if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
+    struct stat st;
+    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
+    if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
+    const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
+    int data_mmaped = 1;
+    if (data == MAP_FAILED) {
+        char *buf = malloc(st.st_size);
+        if (!buf) { close(ifd); return 1; }
+        lseek(ifd, 0, SEEK_SET);
+        size_t rd = 0;
+        while (rd < (size_t)st.st_size) {
+            ssize_t n = read(ifd, buf + rd, st.st_size - rd);
+            if (n <= 0) break;
+            rd += n;
+        }
+        data = buf;
+        data_mmaped = 0;
+    } else {
+        madvise((void *)data, st.st_size, MADV_SEQUENTIAL);
+    }
+    close(ifd);
+
+    int rc = bulk_upd_delim_run(db_root, object, data, (size_t)st.st_size, delimiter);
+
+    if (data_mmaped) munmap((void *)data, st.st_size);
+    else free((void *)data);
+    return rc;
+}
+
+/* In-memory variant — wire dispatch uses this for inline `data` so the
+   request body doesn't round-trip through /tmp. Caller (wire dispatch)
+   keeps ownership of `data` and frees it after this returns. */
+int cmd_bulk_update_delimited_string(const char *db_root, const char *object,
+                                       const char *data, size_t size,
+                                       char delimiter) {
+    return bulk_upd_delim_run(db_root, object, data, size, delimiter);
 }
 
 /* ===== bulk-update JSON form =====
@@ -4566,11 +4597,17 @@ int cmd_bulk_update_json_string(const char *db_root, const char *object, char *j
     return bulk_upd_json_run(db_root, object, json_str, 0);
 }
 
-/* === v2 hooks for cmd_bulk_delete_criteria ===
- * Hoisted to file scope (clang rejects nested functions). hctx carries the
- * criteria tree + CAS + idx fields + per-record hash so the slotcask
- * delete hook can re-verify under the kf wrlock and drop btree entries. */
+/* === v2 bulk-delete-criteria parallel-shard infrastructure ===
+ * The criteria scan in Phase 1 produces a flat list of matched keys.
+ * Phase 2 buckets them by their kf shard (slotcask byte order) and fans
+ * out one worker per bucket. Each worker calls
+ * slotcask_bulk_delete_in_kfshard with the bucket's records under one
+ * kf wrlock. The pre_commit hook fires per record under the wrlock and
+ * folds CAS re-verification + index drop into a single callback —
+ * non-zero return skips the record (CAS rejection) so the kf entry
+ * stays live. */
 typedef struct {
+    SlotcaskDb     *sdb;
     const char     *db_root;
     const char     *object;
     const Schema   *sch;
@@ -4581,31 +4618,87 @@ typedef struct {
     int             cas_ncrit;
     char          (*idx_fields)[256];
     int             nidx;
-    uint8_t         hash[16];
-} V2DelCritCtx;
+    /* per-shard records */
+    char          **keys;
+    uint8_t       (*hashes)[16];
+    int             count;
+    /* result */
+    int             deleted;
+    int             skipped;
+} BulkDelCritShardWork;
 
-static int v2_del_crit_check(const SlotcaskOldRecord *old, void *cp) {
-    V2DelCritCtx *c = (V2DelCritCtx *)cp;
-    if (!old) return 0;
-    if (!criteria_match_tree(old->value, c->tree, c->fs)) return 0;
-    if (c->cas_crit && c->cas_ncrit > 0 &&
-        !cas_check(c->ts, old->value, c->cas_crit, c->cas_ncrit)) return 0;
-    return 1;
-}
+typedef struct {
+    BulkDelCritShardWork *w;
+    int                    ki;
+} V2BulkDelCritCtx;
 
-static int v2_del_crit_pre_commit(const SlotcaskOldRecord *old, void *cp) {
-    V2DelCritCtx *c = (V2DelCritCtx *)cp;
-    if (!old || c->nidx == 0 || !c->ts) return 0;
-    for (int fi = 0; fi < c->nidx; fi++) {
-        uint8_t *buf = NULL; size_t blen = 0;
-        if (build_index_key_from_record(c->ts, old->value,
-                                          c->idx_fields[fi], &buf, &blen)) {
-            delete_index_entry(c->db_root, c->object, c->idx_fields[fi],
-                                c->sch->splits, buf, blen, c->hash);
-            free(buf);
+static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
+                                             SlotcaskBulkRec *rec) {
+    V2BulkDelCritCtx *ctx = (V2BulkDelCritCtx *)rec->user_ctx;
+    BulkDelCritShardWork *w = ctx->w;
+    int ki = ctx->ki;
+    if (!old) return -1;
+    if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
+    if (w->cas_crit && w->cas_ncrit > 0 &&
+        !cas_check(w->ts, old->value, w->cas_crit, w->cas_ncrit)) return -1;
+
+    if (w->nidx > 0 && w->ts) {
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *buf = NULL; size_t blen = 0;
+            if (build_index_key_from_record(w->ts, old->value,
+                                              w->idx_fields[fi], &buf, &blen)) {
+                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                    w->sch->splits, buf, blen, w->hashes[ki]);
+                free(buf);
+            }
         }
     }
     return 0;
+}
+
+static void *bulk_del_crit_shard_worker(void *arg) {
+    BulkDelCritShardWork *w = (BulkDelCritShardWork *)arg;
+    if (w->count == 0) return NULL;
+
+    /* All keys in this worker hash to the same kf shard (dispatcher
+       pre-sorted by compute_record_shard). */
+    int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits, 2);
+
+    SlotcaskBulkRec  *batch = malloc((size_t)w->count * sizeof(SlotcaskBulkRec));
+    V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
+    if (!batch || !ctxs) {
+        free(batch); free(ctxs);
+        w->skipped = w->count;
+        return NULL;
+    }
+    for (int i = 0; i < w->count; i++) {
+        ctxs[i].w  = w;
+        ctxs[i].ki = i;
+        batch[i].key       = w->keys[i];
+        batch[i].klen      = strlen(w->keys[i]);
+        batch[i].value     = NULL;
+        batch[i].vlen      = 0;
+        batch[i].user_ctx  = &ctxs[i];
+        batch[i].old_value = NULL;
+        batch[i].old_vlen  = 0;
+        batch[i].status    = 0;
+        batch[i].was_update = 0;
+    }
+    SlotcaskBulkDeleteOpts opts = {
+        .pre_commit           = v2_bulk_del_crit_pre_commit_bulk,
+        /* CAS re-verification needs OLD even if there are no indexes;
+           force the batched read regardless of nidx. */
+        .pre_commit_needs_old = 1,
+    };
+    (void)slotcask_bulk_delete_in_kfshard(w->sdb, kf_shard_id,
+                                           batch, (size_t)w->count, &opts);
+
+    for (int i = 0; i < w->count; i++) {
+        if (batch[i].status == 0) w->deleted++;
+        else w->skipped++;
+    }
+    free(batch); free(ctxs);
+    return NULL;
 }
 
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
@@ -4672,7 +4765,12 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     TypedSchema *ts = load_typed_schema(db_root, object);
     int deleted = 0, skipped = 0;
 
-    /* v2 fast path: re-verify + tombstone + drop indexes via slotcask hooks. */
+    /* v2 fast path: bucket matched keys by kf shard, then fan out one
+       worker per bucket. Each worker calls slotcask_bulk_delete_in_kfshard
+       once — same lock-amortisation pattern bulk-insert / bulk-update /
+       bulk-delete (key-list) all use. The pre_commit hook re-verifies
+       criteria + CAS under the kf wrlock (returning non-zero skips the
+       record) and drops index entries for the deleted record. */
     if (sch.storage_version == 2) {
         SlotcaskSchemaInfo info = {
             .splits = sch.splits, .slot_size = sch.slot_size,
@@ -4683,32 +4781,99 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
         for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
 
-        for (int i = 0; i < matched; i++) {
-            const char *key = ctx.keys[i];
-            size_t klen = strlen(key);
-
-            if (!sdb) { skipped++; continue; }
-
-            V2DelCritCtx hctx = {
-                .db_root = db_root, .object = object, .sch = &sch,
-                .ts = ts, .tree = tree, .fs = &fs,
-                .cas_crit = cas_crit, .cas_ncrit = cas_ncrit,
-                .idx_fields = idx_fields, .nidx = nidx,
-            };
-            compute_hash_raw(key, klen, hctx.hash);
-
-            SlotcaskDeleteOpts opts = {
-                .check          = v2_del_crit_check,
-                .check_ctx      = &hctx,
-                .pre_commit     = v2_del_crit_pre_commit,
-                .pre_commit_ctx = &hctx,
-            };
-            SlotcaskDeleteResult result = {0};
-            int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);
-            if (rc == 0) deleted++;
-            else skipped++;
-            free(result.current_value);
+        if (!sdb || matched == 0) {
+            log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
+                     object, matched, sdb ? 0 : matched);
+            OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":%d}\n",
+                matched, sdb ? 0 : matched);
+            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+            free(ctx.keys); free_criteria_tree(tree);
+            return 0;
         }
+
+        /* Compute hash + shard-id per matched key, bucket by kf shard. */
+        uint8_t (*hashes)[16] = malloc((size_t)matched * sizeof(uint8_t[16]));
+        int      *shard_ids   = malloc((size_t)matched * sizeof(int));
+        int      *order       = malloc((size_t)matched * sizeof(int));
+        if (!hashes || !shard_ids || !order) {
+            free(hashes); free(shard_ids); free(order);
+            OUT("{\"error\":\"oom: bulk_delete_criteria\"}\n");
+            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+            free(ctx.keys); free_criteria_tree(tree);
+            return 1;
+        }
+        for (int i = 0; i < matched; i++) {
+            compute_hash_raw(ctx.keys[i], strlen(ctx.keys[i]), hashes[i]);
+            shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
+            order[i] = i;
+        }
+        /* Insertion sort by shard_id — matched typically <= limit. */
+        for (int i = 1; i < matched; i++) {
+            int j = i;
+            while (j > 0 && shard_ids[order[j-1]] > shard_ids[order[j]]) {
+                int tmp = order[j]; order[j] = order[j-1]; order[j-1] = tmp;
+                j--;
+            }
+        }
+
+        /* Group into per-shard runs. */
+        int nshard_groups = 0;
+        int gstarts[4096], gcounts[4096], prev_sid = -1;
+        for (int i = 0; i < matched && nshard_groups < 4096; i++) {
+            int s = shard_ids[order[i]];
+            if (s != prev_sid) {
+                gstarts[nshard_groups] = i;
+                if (nshard_groups > 0) gcounts[nshard_groups-1] = i - gstarts[nshard_groups-1];
+                prev_sid = s; nshard_groups++;
+            }
+        }
+        if (nshard_groups > 0) gcounts[nshard_groups-1] = matched - gstarts[nshard_groups-1];
+
+        BulkDelCritShardWork *workers = nshard_groups > 0
+            ? calloc(nshard_groups, sizeof(BulkDelCritShardWork)) : NULL;
+        if (nshard_groups > 0 && !workers) {
+            free(hashes); free(shard_ids); free(order);
+            OUT("{\"error\":\"oom: bulk_delete_criteria workers\"}\n");
+            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+            free(ctx.keys); free_criteria_tree(tree);
+            return 1;
+        }
+        for (int g = 0; g < nshard_groups; g++) {
+            int cnt = gcounts[g];
+            workers[g].sdb = sdb;
+            workers[g].db_root = db_root;
+            workers[g].object  = object;
+            workers[g].sch     = &sch;
+            workers[g].ts      = ts;
+            workers[g].tree    = tree;
+            workers[g].fs      = &fs;
+            workers[g].cas_crit  = cas_crit;
+            workers[g].cas_ncrit = cas_ncrit;
+            workers[g].idx_fields = idx_fields;
+            workers[g].nidx       = nidx;
+            workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
+            workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
+            workers[g].count  = cnt;
+            for (int k = 0; k < cnt; k++) {
+                int oi = order[gstarts[g] + k];
+                workers[g].keys[k] = ctx.keys[oi];   /* shallow ref; freed once below */
+                memcpy(workers[g].hashes[k], hashes[oi], 16);
+            }
+        }
+
+        parallel_for(bulk_del_crit_shard_worker, workers, nshard_groups,
+                      sizeof(BulkDelCritShardWork));
+
+        for (int g = 0; g < nshard_groups; g++) {
+            deleted += workers[g].deleted;
+            skipped += workers[g].skipped;
+            free(workers[g].keys);
+            free(workers[g].hashes);
+        }
+        free(workers); free(hashes); free(shard_ids); free(order);
 
         if (deleted > 0) {
             update_count(db_root, object, -deleted);

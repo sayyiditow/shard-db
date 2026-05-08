@@ -1393,9 +1393,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "bulk-update-delimited") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
+        char *data  = json_obj_strdup_raw(&req, "data");
         char d = (delim && delim[0]) ? delim[0] : ',';
-        if (file) cmd_bulk_update_delimited(db_root, object, file, d);
-        else OUT("{\"error\":\"Missing file\"}\n");
+        if (data) {
+            cmd_bulk_update_delimited_string(db_root, object, data, strlen(data), d);
+            free(data);
+        } else if (file) {
+            cmd_bulk_update_delimited(db_root, object, file, d);
+        } else {
+            OUT("{\"error\":\"Missing file or data\"}\n");
+        }
         free(file); free(delim);
     } else if (strcmp(mode, "vacuum") == 0) {
         /* Optional flags: "compact":true and "splits":N route to rebuild_object;
