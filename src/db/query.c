@@ -2568,28 +2568,15 @@ static void *bulk_del_idx_worker(void *arg) {
     return NULL;
 }
 
-int cmd_bulk_delete(const char *db_root, const char *object, const char *input) {
-    size_t len;
-    char *raw;
-    if (input) {
-        raw = read_file(input, &len);
-    } else {
-        size_t cap = 65536, pos = 0;
-        raw = malloc(cap);
-        int c;
-        while ((c = fgetc(stdin)) != EOF) {
-            if (pos >= cap - 1) {
-                cap *= 2;
-                char *t = xrealloc_or_free(raw, cap);
-                if (!t) { raw = NULL; break; }
-                raw = t;
-            }
-            raw[pos++] = c;
-        }
-        if (!raw) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
-        raw[pos] = '\0'; len = pos;
-    }
+/* Internal: takes a malloc'd buffer of keys (JSON array OR newline-separated)
+   and runs the parse + parallel tombstone. Always frees `raw` before
+   returning. Both cmd_bulk_delete (file/stdin path) and
+   cmd_bulk_delete_string (in-memory path from wire dispatch) call this so
+   the inline path doesn't need a /tmp round-trip. */
+static int bulk_delete_run(const char *db_root, const char *object,
+                            char *raw, size_t len) {
     if (!raw) { fprintf(stderr, "Error: Cannot read input\n"); return 1; }
+    (void)len;
 
     /* Parse all keys */
     char **keys = NULL;
@@ -2798,6 +2785,41 @@ int cmd_bulk_delete(const char *db_root, const char *object, const char *input) 
     for (int i = 0; i < key_count; i++) free(keys[i]);
     free(keys); free(hashes); free(shard_ids); free(start_slots); free(order); free(raw);
     return 0;
+}
+
+int cmd_bulk_delete(const char *db_root, const char *object, const char *input) {
+    size_t len = 0;
+    char *raw = NULL;
+    if (input) {
+        raw = read_file(input, &len);
+    } else {
+        size_t cap = 65536, pos = 0;
+        raw = malloc(cap);
+        if (raw) {
+            int c;
+            while ((c = fgetc(stdin)) != EOF) {
+                if (pos >= cap - 1) {
+                    cap *= 2;
+                    char *t = xrealloc_or_free(raw, cap);
+                    if (!t) { raw = NULL; break; }
+                    raw = t;
+                }
+                raw[pos++] = c;
+            }
+            if (raw) { raw[pos] = '\0'; len = pos; }
+        }
+    }
+    return bulk_delete_run(db_root, object, raw, len);
+}
+
+/* In-memory variant — wire dispatch uses this for inline `keys` to avoid
+   the /tmp round-trip cmd_bulk_delete used to do. Mirrors
+   cmd_bulk_insert_string. Takes ownership of `keys_str` (frees inside
+   bulk_delete_run via free(raw)). */
+int cmd_bulk_delete_string(const char *db_root, const char *object,
+                            char *keys_str) {
+    size_t len = keys_str ? strlen(keys_str) : 0;
+    return bulk_delete_run(db_root, object, keys_str, len);
 }
 
 /* ========== BULK-UPDATE / BULK-DELETE WITH CRITERIA ========== */

@@ -1346,17 +1346,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_bulk_delete_criteria(db_root, object, crit_json, if_json, lim, dry);
             free(crit_json); free(lim_s); free(dry_s); free(if_json);
         } else {
-            /* Key-list bulk delete (existing path) */
+            /* Key-list bulk delete. Inline `keys` go straight through the
+               in-memory path — no /tmp round-trip. */
             char *file = json_obj_strdup(&req, "file");
             char *keys = json_obj_strdup_raw(&req, "keys");
             if (keys) {
-                char tmp[PATH_MAX];
-                snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bdel_%d.json", getpid());
-                FILE *tf = fopen(tmp, "w");
-                if (tf) { fputs(keys, tf); fclose(tf); }
-                cmd_bulk_delete(db_root, object, tmp);
-                unlink(tmp);
-                free(keys);
+                cmd_bulk_delete_string(db_root, object, keys);
+                /* keys ownership transferred — bulk_delete_run frees it. */
             } else {
                 cmd_bulk_delete(db_root, object, file);
             }
