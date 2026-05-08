@@ -1658,12 +1658,17 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
 
-    /* Lookup current state. */
+    /* Lookup current state. kf_lookup_with_slot captures the slot index
+       so the commit phase below can call kf_repoint_at_slot directly,
+       skipping the second probe + verify_stored_key under the held
+       wrlock. Same fix applied to the bulk_upsert primitive. */
     uint8_t old_flag = 0, old_sid = 0;
     uint16_t old_fid = 0;
     uint32_t old_off = 0;
-    int found = (kf_lookup(&kh, hash, key, klen, db->data_dir,
-                           &old_flag, &old_sid, &old_fid, &old_off) == 0);
+    size_t   kf_slot = 0;
+    int found = (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                       &old_flag, &old_sid, &old_fid, &old_off,
+                                       &kf_slot) == 0);
 
     /* Read OLD value bytes (only if present — we'll need them for check_fn /
        pre_commit / current_value-on-rejection). */
@@ -1749,11 +1754,12 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
     }
 
-    /* Commit point: kf_put_new for fresh inserts, kf_repoint for updates. */
+    /* Commit point: direct atomic store at the captured slot for updates
+       (no probe/verify), kf_put_new for fresh inserts. */
     int kf_rc;
     if (found) {
-        kf_rc = kf_repoint(&kh, hash, target_stream, target_fid, target_off,
-                           key, klen, db->data_dir);
+        kf_repoint_at_slot(&kh, kf_slot, target_stream, target_fid, target_off);
+        kf_rc = 0;
     } else {
         size_t used_delta = 0;
         kf_rc = kf_put_new(&kh, hash, target_stream, target_fid, target_off,
@@ -2701,11 +2707,18 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
 
+    /* kf_lookup_with_slot captures the kf entry's slot index so the
+       commit phase below can flip the flag directly via
+       kf_tombstone_at_slot — skips the second probe + verify_stored_key
+       that the original kf_tombstone call did under the same held
+       wrlock. Same fix already applied to the bulk primitive. */
     uint8_t old_flag = 0, old_sid = 0;
     uint16_t old_fid = 0;
     uint32_t old_off = 0;
-    int found = (kf_lookup(&kh, hash, key, klen, db->data_dir,
-                           &old_flag, &old_sid, &old_fid, &old_off) == 0);
+    size_t   kf_slot = 0;
+    int found = (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                       &old_flag, &old_sid, &old_fid, &old_off,
+                                       &kf_slot) == 0);
 
     if (!found) {
         kfcache_release(&kh);
@@ -2743,19 +2756,12 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         }
     }
 
-    /* Commit: tombstone the kf entry. */
-    size_t used_delta = 0;
-    uint8_t out_sid; uint16_t out_fid; uint32_t out_off;
-    int rc = kf_tombstone(&kh, hash, key, klen, db->data_dir,
-                          &out_sid, &out_fid, &out_off, &used_delta);
+    /* Direct flag flip at the captured slot — no probe, no verify. */
+    kf_tombstone_at_slot(&kh, kf_slot);
     kfcache_release(&kh);
-    if (rc < 0) {
-        free(old_buf);
-        return -1;
-    }
 
-    seg_write_flag(db, out_sid, out_fid, out_off, 2);
-    pool_push_free(&db->streams[out_sid], out_fid, out_off);
+    seg_write_flag(db, old_sid, old_fid, old_off, 2);
+    pool_push_free(&db->streams[old_sid], old_fid, old_off);
     free(old_buf);
     return 0;
 }
