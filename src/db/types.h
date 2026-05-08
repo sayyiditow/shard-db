@@ -939,6 +939,9 @@ int cmd_bulk_delete_string(const char *db_root, const char *object, char *keys_s
 int cmd_bulk_update_delimited_string(const char *db_root, const char *object,
                                        const char *data, size_t size,
                                        char delimiter);
+int cmd_bulk_insert_delimited_string(const char *db_root, const char *object,
+                                       const char *data, size_t size,
+                                       char delimiter, int if_not_exists);
 /* if_json (optional) is a JSON object {field:value,...} re-verified under
    the wrlock per record in phase 2 — same optimistic-concurrency semantics
    as single-op `if`. Records that match the criteria but fail the if are

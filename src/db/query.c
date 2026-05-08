@@ -1928,11 +1928,13 @@ int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_s
 
 /* ========== BULK INSERT (DELIMITED TEXT FILE) ========== */
 
-int cmd_bulk_insert_delimited(const char *db_root, const char *object,
-                               const char *filepath, char delimiter,
-                               int if_not_exists) {
-    if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
-
+/* Shared body for bulk-insert-delimited (file + inline string entry points).
+   Caller owns `data`/`size` lifetime — this helper doesn't free them, just
+   parses CSV/TSV rows and dispatches workers. Returns 0 on success, 1 on
+   error (after writing the appropriate JSON response). */
+static int bulk_ins_delim_run(const char *db_root, const char *object,
+                               const char *data, size_t size,
+                               char delimiter, int if_not_exists) {
     uint64_t t0 = now_ms_coarse();
 
     /* Must have typed schema — delimited values map to fields.conf order */
@@ -1941,41 +1943,24 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         OUT("{\"error\":\"Delimited import requires typed fields (fields.conf)\"}\n");
         return 1;
     }
+    if (!data || size == 0) {
+        OUT("{\"error\":\"Empty input\"}\n");
+        return 1;
+    }
 
     Schema sc = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
 
-    /* mmap the file */
-    int ifd = open(filepath, O_RDONLY);
-    if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
-    struct stat st;
-    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
-    if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
-    const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
-    int data_mmaped = 1;
-    if (data == MAP_FAILED) {
-        char *buf = malloc(st.st_size);
-        if (!buf) { close(ifd); return 1; }
-        lseek(ifd, 0, SEEK_SET);
-        size_t rd = 0;
-        while (rd < (size_t)st.st_size) {
-            ssize_t n = read(ifd, buf + rd, st.st_size - rd);
-            if (n <= 0) break;
-            rd += n;
-        }
-        data = buf;
-        data_mmaped = 0;
-    } else {
-        madvise((void *)data, st.st_size, MADV_SEQUENTIAL);
-    }
-    close(ifd);
+    /* Synthesise a stat-like view so the existing body that referred to
+       st.st_size continues to compile after the helper split. The helper
+       never owns data — caller frees. */
+    struct stat st = { .st_size = (off_t)size };
 
     /* Invariant check hoisted out of the per-record loop — ts->total_size
        and sc.max_value don't change during a bulk insert. */
     if (ts->total_size > sc.max_value) {
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
         OUT("{\"error\":\"typed record size exceeds max_value\"}\n");
         return 1;
     }
@@ -2148,7 +2133,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         arena_free(arena);
         for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
         OUT("{\"error\":\"query_timeout\"}\n");
         return 1;
     }
@@ -2162,7 +2147,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         arena_free(arena);
         for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
         OUT("{\"error\":\"oom: bulk_insert shard_counts\"}\n");
         return 1;
     }
@@ -2187,7 +2172,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         arena_free(arena);
         for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
         OUT("{\"error\":\"oom: bulk_insert workers\"}\n");
         return 1;
     }
@@ -2320,8 +2305,7 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
     }
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
-    if (data_mmaped) munmap((void *)data, st.st_size);
-    else free((void *)data);
+    /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
 
     /* Parallel index builds — one worker per field; the worker streams the
        per-shard merges sequentially. See cmd_bulk_insert (JSON path) above
@@ -2371,6 +2355,52 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
         OUT("{\"inserted\":%d}\n", count);
     }
     return errors > 0 ? 1 : 0;
+}
+
+int cmd_bulk_insert_delimited(const char *db_root, const char *object,
+                               const char *filepath, char delimiter,
+                               int if_not_exists) {
+    if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
+
+    int ifd = open(filepath, O_RDONLY);
+    if (ifd < 0) { OUT("{\"error\":\"Cannot open file\"}\n"); return 1; }
+    struct stat st;
+    if (fstat(ifd, &st) < 0) { close(ifd); OUT("{\"error\":\"Cannot stat file\"}\n"); return 1; }
+    if (st.st_size == 0) { close(ifd); OUT("{\"error\":\"Empty file\"}\n"); return 1; }
+    const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, ifd, 0);
+    int data_mmaped = 1;
+    if (data == MAP_FAILED) {
+        char *buf = malloc(st.st_size);
+        if (!buf) { close(ifd); return 1; }
+        lseek(ifd, 0, SEEK_SET);
+        size_t rd = 0;
+        while (rd < (size_t)st.st_size) {
+            ssize_t n = read(ifd, buf + rd, st.st_size - rd);
+            if (n <= 0) break;
+            rd += n;
+        }
+        data = buf;
+        data_mmaped = 0;
+    } else {
+        madvise((void *)data, st.st_size, MADV_SEQUENTIAL);
+    }
+    close(ifd);
+
+    int rc = bulk_ins_delim_run(db_root, object, data, (size_t)st.st_size,
+                                 delimiter, if_not_exists);
+
+    if (data_mmaped) munmap((void *)data, st.st_size);
+    else free((void *)data);
+    return rc;
+}
+
+/* In-memory variant — wire dispatch uses this for inline `data` so the
+   request body doesn't round-trip through /tmp. Caller (wire dispatch)
+   keeps ownership of the buffer and frees after this returns. */
+int cmd_bulk_insert_delimited_string(const char *db_root, const char *object,
+                                       const char *data, size_t size,
+                                       char delimiter, int if_not_exists) {
+    return bulk_ins_delim_run(db_root, object, data, size, delimiter, if_not_exists);
 }
 
 /* ========== BULK DELETE ========== */
@@ -3828,7 +3858,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     if (!shard_counts) {
         for (size_t i = 0; i < rec_count; i++) free(records[i].key);
         free(records);
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
         OUT("{\"error\":\"oom: bulk_update_delim shard_counts\"}\n");
         return 1;
     }
@@ -3843,7 +3873,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
         free(workers); free(shard_to_worker); free(shard_counts);
         for (size_t i = 0; i < rec_count; i++) free(records[i].key);
         free(records);
-        if (data_mmaped) munmap((void *)data, st.st_size); else free((void *)data);
+        /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
         OUT("{\"error\":\"oom: bulk_update_delim workers\"}\n");
         return 1;
     }
