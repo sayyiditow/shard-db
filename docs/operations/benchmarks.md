@@ -53,32 +53,123 @@ Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even di
 
 `shard-db-bench run bench-queries`.
 
-13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). Indexes on `username`, `email`, `age`, `active`, `birthday`. C-bench measurements; cache is hot from the same-process bulk insert that built the dataset.
+13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). 12 indexes (`username`, `email`, `age`, `active`, `birthday`, `user_id`, `rank`, `score`, `level`, `created_at`, `balance`, `hourly_rate`); `bio` left non-indexed to exercise full-scan paths. C-bench measurements; cache is hot from the same-process bulk insert.
 
-| Operation class | Latency band |
+**Insert** (1M records, 1 conn, JSON, 12 indexes built upfront): **0.24 M/sec** (4.12 s).
+
+### COUNT — point lookups & ranges by field type
+
+Indexed point lookups settle around **0.1–0.4 ms** regardless of field type; range scans run **0.4–9 ms** depending on selectivity. Set membership (IN/NOT_IN) of 2–4 values is sub-millisecond.
+
+| op | indexed | non-indexed |
+|---|---|---|
+| `eq` (typed point lookup) | **0.11–0.37 ms** | 50 ms (full scan) |
+| `neq` | 0.06–0.37 ms (negation shortcut: total − eq) | — |
+| Range single-bound (`gt` / `lt` / `gte` / `lte`) | 0.4–8.8 ms | — |
+| Range coalesced (`gt + lt` on same field) | 0.4–6.2 ms (planner merges into one btree range) | — |
+| `between` | 2.1–4.0 ms | — |
+| `in` / `not_in` (2–4 values) | 0.06–0.6 ms | — |
+
+### COUNT — string ops on indexed varchar
+
+Substring/suffix ops on indexed varchar walk the btree leaves once (no record fetch — the value lives in the leaf), so they're 10–20× faster than the same op on a non-indexed field even though both visit O(N) entries.
+
+| op | indexed varchar | non-indexed varchar (`bio`) |
+|---|---|---|
+| `starts` | 0.3–0.5 ms (prefix range scan) | **42–46 ms** (full record scan) |
+| `ends` | 21 ms (full leaf scan, leaf-byte suffix match) | **42 ms** |
+| `contains` | 17–23 ms (full leaf scan, leaf-byte memmem) | **52–54 ms** |
+| `not_contains` | 17 ms | 58 ms |
+| `like 'foo%'` | 1.1 ms (prefix range) | — |
+| `like '%foo%'` | — | 57 ms |
+| Case-insensitive variants (`istarts` / `icontains` / `iends` / `ilike`) | 12–29 ms | 51 ms |
+| `regex` | 28–42 ms | 63–175 ms |
+| `len_*` (length operators) | 12–18 ms | 49–64 ms |
+
+The non-indexed full-scan column tops out at **~50–60 ms** because the v2 record walk now runs **parallel across all 64 kf shards** (one worker per shard via `parallel_for`), and within each shard refs are pre-sorted by `(stream_id, file_id)` so each segment is acquired **once per shard** instead of per record. That replaces ~1M `g_segcache_lock` acquires with ~320 (5–6 unique segments × 64 shards), turning what used to be 330 ms into 50 ms.
+
+### COUNT — existence / OR / field-vs-field
+
+| op | latency |
 |---|---|
-| `count` metadata (no criteria) | **<1 ms** (O(1) counter file) |
-| `count` indexed eq / between / in / lt / gt / lte / gte | **<1–6 ms** |
-| `count` indexed `starts` | **<1 ms** |
-| `count` indexed `exists` (full-set traversal) | **19 ms** |
-| `count` indexed `contains` / `ends` / `ncontains` (leaf scan) | **7–8 ms** |
-| `count` full-scan (non-indexed field) | **4–6 ms** (scan-path is lock-free; each shard runs concurrently) |
-| `count` indexed + secondary filter | **22–64 ms** |
-| `find` limit 10 — any indexed op | **<1 ms** |
-| `find` limit 10 — full scan on non-indexed | **<1 ms** (Zone A probe + typed compare) |
-| `find` indexed + secondary filter | **<1 ms** |
-| `aggregate count` (metadata) | **<1 ms** |
-| `aggregate` where indexed-eq | **10–24 ms** |
-| `aggregate` where indexed range | **71–168 ms** |
-| `aggregate` full-scan (sum/avg/min/max) | **390 ms** |
-| `aggregate` group_by on full scan | **220–252 ms** |
-| `aggregate` group_by + having | **296 ms** |
-| `find` cursor page 1 (ASC/DESC, indexed `order_by`) | **<1 ms** |
-| `find` cursor continuation (mid-range seek) | **<1 ms** |
+| `exists` typed non-varchar (always true → live_count shortcut) | **0.03–0.09 ms** |
+| `exists` indexed varchar (btree size shortcut) | **9–11 ms** |
+| `not_exists` indexed varchar (= live_count − count(exists)) | **11 ms** |
+| `exists` non-indexed varchar | 67 ms (full scan) |
+| `OR` 2 leaves (same field, eq) | 45 ms |
+| `OR` 5 leaves | 105 ms (per-leaf btree walk + KeySet union, parallel across leaves but writes contend on shared KeySet) |
+| `OR` cross-field (one selective + one ~50% match) | 170 ms (dominated by the 500K KeySet inserts) |
+| `eq_field` / `neq_field` / `lt_field` / `gt_field` family | **33–44 ms** (always full scan — RHS is per-record) |
 
-All 38 search operators use indexes when available. Full scans stay fast because Zone A (24-byte metadata headers) remains resident in the page cache and typed binary records in Zone B are compared without JSON parsing.
+### FIND — limit-bound retrieval
 
-**On deep offset-based pagination:** `offset:50000 limit:100 order_by:age` (no cursor) hits the buffer-sort path which collects the full prefix into the per-query memory buffer; on a 1M dataset with `QUERY_BUFFER_MB=500` this aborts with `query memory buffer exceeded` instead of returning a (very slow) page. Use `cursor:null` + continuation tokens for deep pagination — the cursor path is O(log N) per page regardless of depth and stays sub-millisecond.
+Find-with-limit terminates as soon as the limit is reached; the parallel scan layer propagates an early-exit `stop_flag` so siblings bail without finishing their walks.
+
+| query | latency |
+|---|---|
+| Indexed eq / range / between / IN — `limit 10` | **0.3–0.7 ms** |
+| Indexed `starts` — `limit 10` | 0.7 ms |
+| Indexed `contains` — `limit 10` | 10 ms (leaf scan, no early exit until 10 matches) |
+| Indexed `regex` — `limit 10` | 28 ms |
+| Indexed `not_regex` — `limit 10` | 0.5 ms (rare-mismatch shortcut) |
+| Non-indexed `contains` / `starts` / `ends` on bio — `limit 10` | **27–34 ms** |
+| Indexed AND across 2–3 fields | 14–75 ms (intersect cost grows with leaf cardinality) |
+| Indexed + non-indexed AND (one selective indexed leaf) | 0.5 ms |
+
+### AGGREGATE — single-fn standalone (no criteria)
+
+Min/max are O(1) per shard (read the first/last leaf) — the btree being sorted by value gives them away for free. Sum/avg must visit every leaf (no algebraic shortcut), so they sit at 15–23 ms across types.
+
+| op | latency |
+|---|---|
+| `count` (metadata shortcut) | **0.13 ms** |
+| `min` / `max` on indexed (any type) | **0.04–0.31 ms** |
+| `sum` / `avg` on indexed (any numeric type) | **15–23 ms** |
+
+### AGGREGATE — with criteria (single-spec)
+
+Walk-fetch-check fast path tries the agg btree first for any single-spec MIN/MAX with criteria — when criteria selectivity is >~0.05% it finds the answer in single-digit ms by walking the agg btree in MIN/MAX order, fetching records, and stopping at the first match per shard. Falls through to keyset-build for low-selectivity cases.
+
+| query | latency |
+|---|---|
+| `min/max field where same_field op X` (same-field shortcut) | **0.08–0.51 ms** |
+| `min/max field1 where field2 op X` (cross-field, walk-fetch-check) | **0.1–0.5 ms** |
+| `min/max field1 where field2 AND field3 ...` (intersect path) | **0.15–0.51 ms** |
+| `agg(neq)` on small-domain field (NEQ shortcut: total − eq) | 0.5 ms |
+| `sum/avg field1 where field2 op X` (parallel agg-btree walk filtered by criteria KeySet) | **44–54 ms** |
+
+### AGGREGATE — bundled & grouped
+
+Indexed group_by walks the group field's btree once and looks up each entry's accumulator slot in a hash16→bucket map (built from the agg field's btree walk). For multi-spec sharing an agg field, that field's btree is walked once total. Multi-field group_by builds hash16→value maps for secondary group fields.
+
+| query | latency |
+|---|---|
+| `count(*)` + `sum/avg/min/max balance` (no group, multi-spec) | **27 ms** |
+| `group by active`, count + avg(balance) (low cardinality) | **123 ms** |
+| `group by age` top 5 by count | **17 ms** (group cardinality 100, early-cap) |
+| `group by age having n > 16k` | 17 ms |
+| `group by active`, sum(balance) | 123 ms |
+| `group by active`, min/max balance | 123 ms |
+| `group by birthday`, count | 18 ms |
+| `group by username`, count (varchar idx, ~1M unique buckets) | **360 ms** |
+| `group by email`, sum(balance) (varchar idx, ~1M buckets) | **645 ms** |
+| `group by F where indexed criterion` (criteria-filtered group_by) | 165–250 ms |
+| `group by F where AND of indexed leaves` | **6.7 ms** (intersect-on-indexed seeds tiny KeySet) |
+| `group by F1, F2` (multi-field) | 355–490 ms |
+
+For high-cardinality varchar group_by, the bucket creation cost dominates — each unique value allocates an `AggBucket` from the per-query arena (50 ns/bucket) and inserts into a dynamic hash table that doubles to keep load factor ≤ 1. At 1M unique varchar buckets, that's ~50 ms of bucket setup alone, then ~50 ms per agg field btree walk.
+
+### FIND — keyset cursor pagination
+
+| query | latency |
+|---|---|
+| ASC / DESC by indexed field, `limit 100` | **0.18–0.38 ms** |
+| Cursor continuation mid-range | 0.94 ms |
+| `offset 50000 limit 100` (buffered pre-skip) | 2.4 ms |
+
+The cursor path is O(log N) per page — staying sub-millisecond regardless of depth. **Use `cursor:null` continuation for deep pagination**, not `offset` (which collects the full prefix into the per-query buffer and aborts past `QUERY_BUFFER_MB`).
+
+All 38 search operators use indexes when available. Full scans (non-indexed fields, `_field` ops where RHS is per-record) parallelize across kf shards with per-segment batched cache acquire — the v2 record walk hits ~50 ms / 1M records on this hardware.
 
 ## 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes
 

@@ -260,6 +260,7 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
 
     void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
+    madvise(m, want, MADV_HUGEPAGE);  /* THP hint for kf mmap */
 
     SlotcaskKfHeader *hdr = (SlotcaskKfHeader *)m;
     if (created_fresh) {
@@ -569,6 +570,11 @@ static int seg_open_file(const char *path, int create,
     void *m = mmap(NULL, SLOTCASK_SEG_MAX_BYTES, PROT_READ | PROT_WRITE,
                    MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
+    /* Transparent huge pages hint — segments are 128 MB sparse files
+       walked sequentially during scans and randomly during point reads.
+       2 MB hugepages (vs 4 KB) cut TLB entries by 500× over the
+       working set. Kernel ignores if THP is off; no functional impact. */
+    madvise(m, SLOTCASK_SEG_MAX_BYTES, MADV_HUGEPAGE);
     *out_fd = fd;
     *out_map = (uint8_t *)m;
     *out_size = SLOTCASK_SEG_MAX_BYTES;
@@ -825,6 +831,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (new_base == MAP_FAILED) {
         close(new_fd); unlink(new_path); return -1;
     }
+    madvise(new_base, new_size, MADV_HUGEPAGE);  /* THP hint for kf rebuild */
 
     SlotcaskKfHeader *new_hdr = (SlotcaskKfHeader *)new_base;
     new_hdr->magic = SLOTCASK_KF_MAGIC;
@@ -881,6 +888,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, reopen_fd, 0);
     if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
+    madvise(fresh, new_size, MADV_HUGEPAGE);  /* THP hint for resplit remap */
 
     if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
     if (e->base) munmap(e->base, e->map_size);
