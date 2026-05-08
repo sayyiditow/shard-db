@@ -353,6 +353,25 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkDeleteOpts *opts);
 
+/* ============================================================ Bulk lookup
+ *
+ * For multi-exists / multi-get on slotcask. Same lock-amortisation
+ * pattern as bulk_upsert / bulk_delete: one kf rdlock per call (not per
+ * record), batched verify_stored_key sorted by (sid, fid) so the
+ * segcache rdlock is held once per unique seg file. Caller pre-buckets
+ * records so all hash to `kf_shard_id` (use compute_record_shard).
+ *
+ * bulk_lookup: rec.status = 0 (found+verified), -2 (not found / hash
+ * collision miss), -1 (hard error). Reads no value bytes.
+ *
+ * bulk_get: same status codes, plus out_values[i] / out_vlens[i] gets
+ * a malloc'd value buffer on found (caller frees), NULL on miss. */
+int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                      SlotcaskBulkRec *recs, size_t n);
+int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskBulkRec *recs, size_t n,
+                                   void **out_values, size_t *out_vlens);
+
 /* For shard-id mapping use compute_record_shard(hash, splits, 2) from
    types.h — the single version-aware helper that slotcask itself
    delegates to. */

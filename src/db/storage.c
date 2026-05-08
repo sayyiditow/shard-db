@@ -2082,9 +2082,11 @@ static void *multi_exists_shard_worker(void *arg) {
     MultiExistsShardWork *sw = (MultiExistsShardWork *)arg;
     if (sw->count == 0) return NULL;
 
-    /* v2 dispatch: call slotcask_exists per key. The shard-grouping the
-       caller did is harmless for v2 (slotcask routes per hash internally).
-       Doing it per-worker keeps the worker signature uniform. */
+    /* v2 dispatch: bulk_lookup_in_kfshard amortises kfcache_acquire +
+       segcache_acquire across the worker's records — vs the old per-
+       record slotcask_exists path that took both caches per call. The
+       dispatcher already aligned shard_id with compute_record_shard so
+       all entries here hash to the same kf shard. */
     if (sw->sch->storage_version == 2) {
         SlotcaskSchemaInfo info = {
             .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
@@ -2092,11 +2094,27 @@ static void *multi_exists_shard_worker(void *arg) {
         };
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
+
+        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        if (!batch) return NULL;
         for (int ei = 0; ei < sw->count; ei++) {
             MultiExistsEntry *e = &sw->entries[ei];
-            int rc = slotcask_exists(sdb, e->key, strlen(e->key));
-            e->found = (rc == 1) ? 1 : 0;
+            batch[ei].key       = e->key;
+            batch[ei].klen      = strlen(e->key);
+            batch[ei].value     = NULL;
+            batch[ei].vlen      = 0;
+            batch[ei].user_ctx  = NULL;
+            batch[ei].old_value = NULL;
+            batch[ei].old_vlen  = 0;
+            batch[ei].status    = 0;
+            batch[ei].was_update = 0;
         }
+        int kf_shard_id = sw->entries[0].shard_id;  /* aligned by dispatcher */
+        slotcask_bulk_lookup_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count);
+        for (int ei = 0; ei < sw->count; ei++) {
+            sw->entries[ei].found = (batch[ei].status == 0) ? 1 : 0;
+        }
+        free(batch);
         return NULL;
     }
 
@@ -2341,8 +2359,11 @@ static void *multi_get_shard_worker(void *arg) {
     MultiGetShardWork *sw = (MultiGetShardWork *)arg;
     if (sw->count == 0) return NULL;
 
-    /* v2 dispatch: slotcask_get per key, decode via the same TypedSchema.
-       Workers can share fs->ts because typed_decode is read-only. */
+    /* v2 dispatch: bulk_get_in_kfshard amortises kfcache + segcache
+       across the worker's records — vs the old per-record slotcask_get
+       which took both caches per call. typed_decode still happens per
+       record (it's per-record-shape work). The dispatcher already
+       aligned shard_id with compute_record_shard. */
     if (sw->sch->storage_version == 2) {
         SlotcaskSchemaInfo info = {
             .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
@@ -2350,17 +2371,40 @@ static void *multi_get_shard_worker(void *arg) {
         };
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
+
+        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        void **vals = calloc(sw->count, sizeof(void *));
+        size_t *vlens = calloc(sw->count, sizeof(size_t));
+        if (!batch || !vals || !vlens) {
+            free(batch); free(vals); free(vlens);
+            return NULL;
+        }
         for (int ei = 0; ei < sw->count; ei++) {
             MultiGetEntry *e = &sw->entries[ei];
-            void *val = NULL; size_t vlen = 0;
-            if (slotcask_get(sdb, e->key, strlen(e->key), &val, &vlen) == 0) {
+            batch[ei].key       = e->key;
+            batch[ei].klen      = strlen(e->key);
+            batch[ei].value     = NULL;
+            batch[ei].vlen      = 0;
+            batch[ei].user_ctx  = NULL;
+            batch[ei].old_value = NULL;
+            batch[ei].old_vlen  = 0;
+            batch[ei].status    = 0;
+            batch[ei].was_update = 0;
+        }
+        int kf_shard_id = sw->entries[0].shard_id;
+        slotcask_bulk_get_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count,
+                                       vals, vlens);
+        for (int ei = 0; ei < sw->count; ei++) {
+            MultiGetEntry *e = &sw->entries[ei];
+            if (batch[ei].status == 0 && vals[ei]) {
                 char *decoded = sw->fs ? typed_decode(sw->fs->ts,
-                                                       (const uint8_t *)val,
-                                                       (uint32_t)vlen) : NULL;
+                                                       (const uint8_t *)vals[ei],
+                                                       (uint32_t)vlens[ei]) : NULL;
                 e->result_json = decoded ? decoded : strdup("null");
-                free(val);
+                free(vals[ei]);
             }
         }
+        free(batch); free(vals); free(vlens);
         return NULL;
     }
 

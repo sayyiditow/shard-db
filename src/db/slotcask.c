@@ -799,6 +799,35 @@ static int kf_lookup(SlotcaskKfHandle *kh, const uint8_t hash[16],
     return -1;
 }
 
+/* Probe-only variant — returns the kf entry's location without calling
+   verify_stored_key. Used by bulk_lookup / bulk_get which defer the
+   verify to a batched seg-read phase keyed by (sid, fid). False
+   positives on raw hash match are filtered out by the batched verify;
+   on a true match the (sid, fid, off, slot) is authoritative. */
+static int kf_lookup_no_verify(SlotcaskKfHandle *kh, const uint8_t hash[16],
+                                uint8_t *flag_out, uint8_t *stream_id_out,
+                                uint16_t *file_id_out, uint32_t *offset_out,
+                                size_t *slot_out) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) return -1;
+        if (memcmp(e->hash, hash, 16) == 0) {
+            if (e->flag == 2) return -1;          /* tombstone */
+            *flag_out = e->flag;
+            *stream_id_out = e->stream_id;
+            *file_id_out = e->file_id;
+            *offset_out = e->offset;
+            *slot_out = slot;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* Variant of kf_lookup that ALSO returns the slot index it found the entry
    at. The bulk primitives use this so Phase 4 (kf_repoint) and Phase 2
    (kf_tombstone) can skip re-probing — under a held kf wrlock the slot
@@ -2412,6 +2441,239 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     }
 
     for (size_t i = 0; i < n; i++) free(st[i].old_buf);
+    free(st);
+    return 0;
+}
+
+/* ============================================================ Bulk lookup
+ *
+ * For multi-exists / multi-get on slotcask. Mirror of bulk_upsert /
+ * bulk_delete: one kf rdlock per call (vs per-record in
+ * slotcask_exists / slotcask_get), batched verify_stored_key sorted by
+ * (sid, fid) so the segcache rdlock is held once per unique seg file
+ * instead of once per record.
+ *
+ * Per-record state for both lookup and get phases. */
+typedef struct {
+    uint8_t  hash[16];
+    uint8_t  sid;
+    uint16_t fid;
+    uint32_t off;
+    uint8_t  kf_found;          /* 1 = kf_lookup_no_verify hit, 0 = miss */
+    uint8_t  verified;          /* 1 = batched verify confirmed */
+} SlotcaskBulkLookupState;
+
+/* For each rec: sets rec->status = 0 if found+verified, -2 if not found,
+   -1 on hard error. Reads no value bytes. */
+int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                      SlotcaskBulkRec *recs, size_t n) {
+    if (n == 0) return 0;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    /* Phase 1: probe-only lookup under one rdlock. */
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+        if (r->klen > UINT16_MAX) { r->status = -1; continue; }
+        compute_hash(r->key, r->klen, st[i].hash);
+        uint8_t flag = 0;
+        size_t slot;
+        int rc = kf_lookup_no_verify(&kh, st[i].hash, &flag,
+                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
+        if (rc < 0) { r->status = -2; continue; }
+        st[i].kf_found = 1;
+    }
+    kfcache_release(&kh);
+
+    /* Phase 2: batched verify_stored_key — sort kf-hits by (sid, fid),
+       take segcache rdlock once per unique file, verify each record
+       under the held handle. Records that fail verify (hash collision
+       on a different stored key) get status=-2. */
+    int *vidx = malloc(n * sizeof(int));
+    if (vidx) {
+        int vcount = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status == 0 && st[i].kf_found) vidx[vcount++] = (int)i;
+        }
+        for (int a = 1; a < vcount; a++) {
+            int tmp = vidx[a];
+            uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
+            int b = a - 1;
+            while (b >= 0) {
+                int bi = vidx[b];
+                if (st[bi].sid < ta_sid ||
+                    (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
+                vidx[b + 1] = vidx[b];
+                b--;
+            }
+            vidx[b + 1] = tmp;
+        }
+        int k = 0;
+        while (k < vcount) {
+            int run_end = k + 1;
+            uint8_t  sid = st[vidx[k]].sid;
+            uint16_t fid = st[vidx[k]].fid;
+            while (run_end < vcount &&
+                   st[vidx[run_end]].sid == sid &&
+                   st[vidx[run_end]].fid == fid)
+                run_end++;
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, sid, fid);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 0, 0) != 0) {
+                for (int j = k; j < run_end; j++) recs[vidx[j]].status = -1;
+                k = run_end;
+                continue;
+            }
+            for (int j = k; j < run_end; j++) {
+                int i = vidx[j];
+                SlotcaskBulkRec *r = &recs[i];
+                const uint8_t *rec = h.map + st[i].off;
+                if (rec[18] != 1) { r->status = -2; continue; }
+                uint16_t k_stored;
+                memcpy(&k_stored, rec + 16, 2);
+                if (k_stored != r->klen) { r->status = -2; continue; }
+                if (memcmp(rec + 24, r->key, r->klen) != 0) { r->status = -2; continue; }
+                st[i].verified = 1;
+            }
+            segcache_release(&h);
+            k = run_end;
+        }
+        free(vidx);
+    } else {
+        /* OOM fallback — per-record verify via the existing helper. */
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status != 0 || !st[i].kf_found) continue;
+            int km = verify_stored_key(db->data_dir, st[i].sid, st[i].fid,
+                                        st[i].off, recs[i].key, recs[i].klen);
+            if (km == 1) st[i].verified = 1;
+            else recs[i].status = -2;
+        }
+    }
+
+    free(st);
+    return 0;
+}
+
+/* For each rec: sets rec->status = 0 and out_values[i] / out_vlens[i]
+   to a malloc'd value buffer (caller frees) if found, status = -2 if
+   not. */
+int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskBulkRec *recs, size_t n,
+                                   void **out_values, size_t *out_vlens) {
+    if (n == 0) return 0;
+
+    for (size_t i = 0; i < n; i++) { out_values[i] = NULL; out_vlens[i] = 0; }
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+        if (r->klen > UINT16_MAX) { r->status = -1; continue; }
+        compute_hash(r->key, r->klen, st[i].hash);
+        uint8_t flag = 0;
+        size_t slot;
+        int rc = kf_lookup_no_verify(&kh, st[i].hash, &flag,
+                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
+        if (rc < 0) { r->status = -2; continue; }
+        st[i].kf_found = 1;
+    }
+    kfcache_release(&kh);
+
+    /* Batched verify + value-copy: one segcache rdlock per unique
+       (sid, fid). Records that fail verify get status=-2. */
+    int *gidx = malloc(n * sizeof(int));
+    if (gidx) {
+        int gcount = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status == 0 && st[i].kf_found) gidx[gcount++] = (int)i;
+        }
+        for (int a = 1; a < gcount; a++) {
+            int tmp = gidx[a];
+            uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
+            int b = a - 1;
+            while (b >= 0) {
+                int bi = gidx[b];
+                if (st[bi].sid < ta_sid ||
+                    (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
+                gidx[b + 1] = gidx[b];
+                b--;
+            }
+            gidx[b + 1] = tmp;
+        }
+        int k = 0;
+        while (k < gcount) {
+            int run_end = k + 1;
+            uint8_t  sid = st[gidx[k]].sid;
+            uint16_t fid = st[gidx[k]].fid;
+            while (run_end < gcount &&
+                   st[gidx[run_end]].sid == sid &&
+                   st[gidx[run_end]].fid == fid)
+                run_end++;
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, sid, fid);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 0, 0) != 0) {
+                for (int j = k; j < run_end; j++) recs[gidx[j]].status = -1;
+                k = run_end;
+                continue;
+            }
+            for (int j = k; j < run_end; j++) {
+                int i = gidx[j];
+                SlotcaskBulkRec *r = &recs[i];
+                const uint8_t *rec = h.map + st[i].off;
+                if (rec[18] != 1) { r->status = -2; continue; }
+                uint16_t k_stored;
+                uint32_t v_stored;
+                memcpy(&k_stored, rec + 16, 2);
+                memcpy(&v_stored, rec + 20, 4);
+                if (k_stored != r->klen ||
+                    memcmp(rec + 24, r->key, r->klen) != 0) {
+                    r->status = -2;
+                    continue;
+                }
+                void *buf = malloc(v_stored ? v_stored : 1);
+                if (!buf) { r->status = -1; continue; }
+                if (v_stored) memcpy(buf, rec + 24 + r->klen, v_stored);
+                out_values[i] = buf;
+                out_vlens[i]  = v_stored;
+            }
+            segcache_release(&h);
+            k = run_end;
+        }
+        free(gidx);
+    } else {
+        /* OOM fallback — per-record verify + read via the existing helper. */
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status != 0 || !st[i].kf_found) continue;
+            uint8_t *buf = NULL;
+            size_t vlen = 0;
+            if (read_record_value(db, st[i].sid, st[i].fid, st[i].off,
+                                    recs[i].key, recs[i].klen, &buf, &vlen) == 0) {
+                out_values[i] = buf;
+                out_vlens[i]  = vlen;
+            } else {
+                recs[i].status = -2;
+            }
+        }
+    }
+
     free(st);
     return 0;
 }
