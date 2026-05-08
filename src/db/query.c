@@ -2676,75 +2676,67 @@ static int bulk_delete_run(const char *db_root, const char *object,
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
     TypedSchema *ts = load_typed_schema(db_root, object);
 
-    /* Compute hashes and group by shard */
+    /* Compute hashes + shard_ids; bucket-sort into per-shard worker arrays.
+       Was insertion sort O(n²) — at 10K keys with random shard distribution
+       that's ~50M swaps before parallel_for even starts. Bucket-sort is
+       O(n + splits), matches the bulk-insert / bulk-update pattern. */
     uint8_t (*hashes)[16] = malloc(key_count * sizeof(uint8_t[16]));
     int *shard_ids = malloc(key_count * sizeof(int));
     int *start_slots = malloc(key_count * sizeof(int));
-    int *order = malloc(key_count * sizeof(int)); /* original index for regrouping */
 
     for (int i = 0; i < key_count; i++) {
         compute_addr(keys[i], strlen(keys[i]), sch.splits, hashes[i], &shard_ids[i], &start_slots[i]);
         /* v2 alignment — see cmd_bulk_insert for rationale. */
         if (sch.storage_version == 2)
             shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
-        order[i] = i;
     }
 
-    /* Sort by shard_id */
-    /* Simple insertion sort (stable, fine for <100K keys) */
-    for (int i = 1; i < key_count; i++) {
-        int j = i;
-        while (j > 0 && shard_ids[order[j-1]] > shard_ids[order[j]]) {
-            int tmp = order[j]; order[j] = order[j-1]; order[j-1] = tmp;
-            j--;
-        }
-    }
-
-    /* Group by shard */
+    int *shard_counts = calloc(sch.splits, sizeof(int));
+    int *shard_to_worker = malloc(sch.splits * sizeof(int));
+    for (int i = 0; i < key_count; i++) shard_counts[shard_ids[i]]++;
     int nshard_groups = 0;
-    int group_starts[4096], group_counts[4096]; /* max shard groups */
-    int prev_sid = -1;
-    for (int i = 0; i < key_count && nshard_groups < 4096; i++) {
-        int si = shard_ids[order[i]];
-        if (si != prev_sid) {
-            group_starts[nshard_groups] = i;
-            if (nshard_groups > 0) group_counts[nshard_groups-1] = i - group_starts[nshard_groups-1];
-            prev_sid = si;
-            nshard_groups++;
+    for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
+
+    BulkDelShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkDelShardWork)) : NULL;
+    {
+        int g = 0;
+        for (int s = 0; s < sch.splits; s++) {
+            if (shard_counts[s] > 0) {
+                int cnt = shard_counts[s];
+                workers[g].db_root = db_root;
+                workers[g].object = object;
+                workers[g].sch = &sch;
+                workers[g].keys = malloc(cnt * sizeof(char *));
+                workers[g].hashes = malloc(cnt * sizeof(uint8_t[16]));
+                workers[g].shard_slots = malloc(cnt * sizeof(int));
+                workers[g].key_count = 0;
+                workers[g].idx_fields = idx_fields;
+                workers[g].nidx = nidx;
+                workers[g].ts = ts;
+                workers[g].deleted = 0;
+                workers[g].idx_vals = calloc(nidx, sizeof(uint8_t **));
+                workers[g].idx_lens = calloc(nidx, sizeof(size_t *));
+                for (int fi = 0; fi < nidx; fi++) {
+                    workers[g].idx_vals[fi] = calloc(cnt, sizeof(uint8_t *));
+                    workers[g].idx_lens[fi] = calloc(cnt, sizeof(size_t));
+                }
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
+            }
         }
     }
-    if (nshard_groups > 0) group_counts[nshard_groups-1] = key_count - group_starts[nshard_groups-1];
-
-    /* Build per-shard workers */
-    BulkDelShardWork *workers = calloc(nshard_groups, sizeof(BulkDelShardWork));
-    for (int g = 0; g < nshard_groups; g++) {
-        int cnt = group_counts[g];
-        workers[g].db_root = db_root;
-        workers[g].object = object;
-        workers[g].sch = &sch;
-        workers[g].keys = malloc(cnt * sizeof(char *));
-        workers[g].hashes = malloc(cnt * sizeof(uint8_t[16]));
-        workers[g].shard_slots = malloc(cnt * sizeof(int));
-        workers[g].key_count = cnt;
-        workers[g].idx_fields = idx_fields;
-        workers[g].nidx = nidx;
-        workers[g].ts = ts;
-        workers[g].deleted = 0;
-        /* Allocate idx_vals + idx_lens (parallel arrays) */
-        workers[g].idx_vals = calloc(nidx, sizeof(uint8_t **));
-        workers[g].idx_lens = calloc(nidx, sizeof(size_t *));
-        for (int fi = 0; fi < nidx; fi++) {
-            workers[g].idx_vals[fi] = calloc(cnt, sizeof(uint8_t *));
-            workers[g].idx_lens[fi] = calloc(cnt, sizeof(size_t));
-        }
-
-        for (int i = 0; i < cnt; i++) {
-            int oi = order[group_starts[g] + i];
-            workers[g].keys[i] = keys[oi];
-            memcpy(workers[g].hashes[i], hashes[oi], 16);
-            workers[g].shard_slots[i] = start_slots[oi];
-        }
+    /* Single pass — place each record into its bucket's next slot. */
+    for (int i = 0; i < key_count; i++) {
+        int w = shard_to_worker[shard_ids[i]];
+        int slot = workers[w].key_count++;
+        workers[w].keys[slot] = keys[i];
+        memcpy(workers[w].hashes[slot], hashes[i], 16);
+        workers[w].shard_slots[slot] = start_slots[i];
     }
+    free(shard_counts); free(shard_to_worker);
 
     /* Phase 1: Parallel shard tombstoning */
     parallel_for(bulk_del_shard_worker, workers, nshard_groups, sizeof(BulkDelShardWork));
@@ -2813,7 +2805,7 @@ static int bulk_delete_run(const char *db_root, const char *object,
 
     OUT("{\"deleted\":%d}\n", total_deleted);
     for (int i = 0; i < key_count; i++) free(keys[i]);
-    free(keys); free(hashes); free(shard_ids); free(start_slots); free(order); free(raw);
+    free(keys); free(hashes); free(shard_ids); free(start_slots); free(raw);
     return 0;
 }
 
@@ -4822,12 +4814,13 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
             return 0;
         }
 
-        /* Compute hash + shard-id per matched key, bucket by kf shard. */
+        /* Compute hash + shard-id per matched key; bucket-sort into per-shard
+           workers. Same O(n + splits) pattern as cmd_bulk_insert and
+           cmd_bulk_delete (replaces the old O(n²) insertion sort). */
         uint8_t (*hashes)[16] = malloc((size_t)matched * sizeof(uint8_t[16]));
         int      *shard_ids   = malloc((size_t)matched * sizeof(int));
-        int      *order       = malloc((size_t)matched * sizeof(int));
-        if (!hashes || !shard_ids || !order) {
-            free(hashes); free(shard_ids); free(order);
+        if (!hashes || !shard_ids) {
+            free(hashes); free(shard_ids);
             OUT("{\"error\":\"oom: bulk_delete_criteria\"}\n");
             if (cas_crit) free_criteria(cas_crit, cas_ncrit);
             for (int i = 0; i < matched; i++) free(ctx.keys[i]);
@@ -4837,61 +4830,65 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         for (int i = 0; i < matched; i++) {
             compute_hash_raw(ctx.keys[i], strlen(ctx.keys[i]), hashes[i]);
             shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
-            order[i] = i;
-        }
-        /* Insertion sort by shard_id — matched typically <= limit. */
-        for (int i = 1; i < matched; i++) {
-            int j = i;
-            while (j > 0 && shard_ids[order[j-1]] > shard_ids[order[j]]) {
-                int tmp = order[j]; order[j] = order[j-1]; order[j-1] = tmp;
-                j--;
-            }
         }
 
-        /* Group into per-shard runs. */
-        int nshard_groups = 0;
-        int gstarts[4096], gcounts[4096], prev_sid = -1;
-        for (int i = 0; i < matched && nshard_groups < 4096; i++) {
-            int s = shard_ids[order[i]];
-            if (s != prev_sid) {
-                gstarts[nshard_groups] = i;
-                if (nshard_groups > 0) gcounts[nshard_groups-1] = i - gstarts[nshard_groups-1];
-                prev_sid = s; nshard_groups++;
-            }
+        int *shard_counts = calloc(sch.splits, sizeof(int));
+        int *shard_to_worker = malloc(sch.splits * sizeof(int));
+        if (!shard_counts || !shard_to_worker) {
+            free(shard_counts); free(shard_to_worker);
+            free(hashes); free(shard_ids);
+            OUT("{\"error\":\"oom: bulk_delete_criteria buckets\"}\n");
+            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+            free(ctx.keys); free_criteria_tree(tree);
+            return 1;
         }
-        if (nshard_groups > 0) gcounts[nshard_groups-1] = matched - gstarts[nshard_groups-1];
+        for (int i = 0; i < matched; i++) shard_counts[shard_ids[i]]++;
+        int nshard_groups = 0;
+        for (int s = 0; s < sch.splits; s++) if (shard_counts[s] > 0) nshard_groups++;
 
         BulkDelCritShardWork *workers = nshard_groups > 0
             ? calloc(nshard_groups, sizeof(BulkDelCritShardWork)) : NULL;
         if (nshard_groups > 0 && !workers) {
-            free(hashes); free(shard_ids); free(order);
+            free(shard_counts); free(shard_to_worker);
+            free(hashes); free(shard_ids);
             OUT("{\"error\":\"oom: bulk_delete_criteria workers\"}\n");
             if (cas_crit) free_criteria(cas_crit, cas_ncrit);
             for (int i = 0; i < matched; i++) free(ctx.keys[i]);
             free(ctx.keys); free_criteria_tree(tree);
             return 1;
         }
-        for (int g = 0; g < nshard_groups; g++) {
-            int cnt = gcounts[g];
-            workers[g].sdb = sdb;
-            workers[g].db_root = db_root;
-            workers[g].object  = object;
-            workers[g].sch     = &sch;
-            workers[g].ts      = ts;
-            workers[g].tree    = tree;
-            workers[g].fs      = &fs;
-            workers[g].cas_crit  = cas_crit;
-            workers[g].cas_ncrit = cas_ncrit;
-            workers[g].idx_fields = idx_fields;
-            workers[g].nidx       = nidx;
-            workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
-            workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
-            workers[g].count  = cnt;
-            for (int k = 0; k < cnt; k++) {
-                int oi = order[gstarts[g] + k];
-                workers[g].keys[k] = ctx.keys[oi];   /* shallow ref; freed once below */
-                memcpy(workers[g].hashes[k], hashes[oi], 16);
+        {
+            int g = 0;
+            for (int s = 0; s < sch.splits; s++) {
+                if (shard_counts[s] > 0) {
+                    int cnt = shard_counts[s];
+                    workers[g].sdb = sdb;
+                    workers[g].db_root = db_root;
+                    workers[g].object  = object;
+                    workers[g].sch     = &sch;
+                    workers[g].ts      = ts;
+                    workers[g].tree    = tree;
+                    workers[g].fs      = &fs;
+                    workers[g].cas_crit  = cas_crit;
+                    workers[g].cas_ncrit = cas_ncrit;
+                    workers[g].idx_fields = idx_fields;
+                    workers[g].nidx       = nidx;
+                    workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
+                    workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
+                    workers[g].count  = 0;
+                    shard_to_worker[s] = g;
+                    g++;
+                } else {
+                    shard_to_worker[s] = -1;
+                }
             }
+        }
+        for (int i = 0; i < matched; i++) {
+            int w = shard_to_worker[shard_ids[i]];
+            int slot = workers[w].count++;
+            workers[w].keys[slot] = ctx.keys[i];   /* shallow ref; freed once below */
+            memcpy(workers[w].hashes[slot], hashes[i], 16);
         }
 
         parallel_for(bulk_del_crit_shard_worker, workers, nshard_groups,
@@ -4903,7 +4900,8 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
             free(workers[g].keys);
             free(workers[g].hashes);
         }
-        free(workers); free(hashes); free(shard_ids); free(order);
+        free(workers); free(hashes); free(shard_ids);
+        free(shard_counts); free(shard_to_worker);
 
         if (deleted > 0) {
             update_count(db_root, object, -deleted);
