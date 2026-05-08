@@ -482,6 +482,13 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    for its own synchronization. */
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 
+/* Skip the first `skip_n` live records without loading their values.
+   The cb fires only on records past the skip window. Used by
+   cmd_fetch with offset/cursor — eliminates the per-skipped-record
+   segcache_acquire that walk_live would otherwise do. */
+int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
+                              SlotcaskScanCb cb, void *ctx);
+
 /* Look up by hash16 only (index-driven access). Walks the keyfile shard for
    `hash16`, invokes cb for each live entry whose hash matches. Almost
    always 0 or 1 invocation per call (hash collisions are rare). cb returning

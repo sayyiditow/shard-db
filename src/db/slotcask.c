@@ -2988,6 +2988,65 @@ int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
     return 0;
 }
 
+/* Skip-aware variant — walks all kf shards but skips the first `skip_n`
+   live entries WITHOUT touching the segcache. Used by cmd_fetch with
+   offset/cursor: we need to advance past N records before emitting, and
+   loading their value bytes just to throw them away is ~100ns of wasted
+   work per skipped record (segcache_acquire + 100B header read + release).
+   At offset=5000 that's ~500µs of pure overhead — was the headline
+   regression vs v1 fetch with offset.
+
+   Concurrent-writer caveat: a kf entry with flag=1 here could be racing a
+   repoint that hasn't yet flipped on the new seg. We count it as live
+   anyway (matches what walk_one_shard would have decided). For the
+   emit phase we still verify rec[18]==1 and hash match — concurrent
+   repoints get skipped correctly there. The skip count can be off by
+   a tiny amount under heavy concurrent writes; cursor pagination has
+   never promised exact resume across writes. */
+int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
+                              SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return -1;
+    int64_t remaining_skip = skip_n;
+    int stop = 0;
+    for (int s = 0; s < db->num_shards && !stop; s++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) continue;
+
+        size_t cap = kh.capacity;
+        SlotcaskKfEntry *kf = kh.map;
+        for (size_t i = 0; i < cap && !stop; i++) {
+            SlotcaskKfEntry *e = &kf[i];
+            uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+            if (flag != 1) continue;
+
+            /* Cheap skip: count this live entry, no segcache touch. */
+            if (remaining_skip > 0) { remaining_skip--; continue; }
+
+            /* Past the skip window — load the seg and emit. */
+            char seg_path[PATH_MAX];
+            seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
+            SlotcaskSegHandle sh;
+            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+            const uint8_t *rec = sh.map + e->offset;
+            if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
+                segcache_release(&sh);
+                continue;
+            }
+            uint16_t klen; uint32_t vlen;
+            memcpy(&klen, rec + 16, 2);
+            memcpy(&vlen, rec + 20, 4);
+            const uint8_t *key   = rec + 24;
+            const uint8_t *value = rec + 24 + klen;
+            if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
+            segcache_release(&sh);
+        }
+        kfcache_release(&kh);
+    }
+    return 0;
+}
+
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                             SlotcaskScanCb cb, void *ctx) {
     if (!db || !cb) return -1;

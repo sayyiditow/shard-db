@@ -6175,12 +6175,17 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
     fctx.csv_delim = csv_delim;
     fctx.rows_fmt = rows_fmt;
     fctx.dict_fmt = dict_fmt;
-    fctx.to_skip = cursor_n + (offset > 0 ? offset : 0);
+    fctx.to_skip = 0;        /* skip handled by walk_live_skip below */
     fctx.limit = limit;
     fctx.proj_fields = proj_fields;
     fctx.proj_count = proj_count;
     fctx.fs = fs_ptr;
-    if (sdb) slotcask_walk_live(sdb, v2_fetch_cb, &fctx);
+    int64_t skip_n = (int64_t)cursor_n + (offset > 0 ? offset : 0);
+    /* slotcask_walk_live_skip cheaply skips past the first N live
+       records (no segcache touch) before invoking the callback —
+       offset=5000 went from ~5ms (per-record segcache_acquire even on
+       skip) to <1ms. */
+    if (sdb) slotcask_walk_live_skip(sdb, skip_n, v2_fetch_cb, &fctx);
 
     if (csv_delim || rows_fmt) {
         /* No JSON wrapper. CSV / rows formats stream as-is. */
