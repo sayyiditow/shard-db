@@ -18,7 +18,7 @@ A high-performance file-based database in C. Single static binary, single proces
 
 ## Highlights
 
-- **~5M / ~7.5M K/V ops/sec** single-thread / 5-conn parallel bulk insert (CSV, 10M records); sub-5ms indexed find / count / aggregate at 1M rows
+- **~5M / ~8.4M K/V ops/sec** single-thread / 5-conn parallel bulk insert (CSV, 10M records); **5.7M / 1.9M / 1.4M / 822k op/s** bulk EXISTS / DELETE / GET / UPDATE (10K keys per TCP request); sub-5ms indexed find / count / aggregate at 1M rows
 - **38 search operators** (eq/neq/range, like/contains/starts/ends, in/not_in, regex, exists, len_*, ilike/icontains, eq_field…) — every one indexed when an index is available
 - **AND-intersection planner** + **lock-free OR-union KeySet** — 2+ indexed criteria intersect candidate sets without per-record fetch for `count`
 - **Joins** (inner, left), **aggregations** (count/sum/avg/min/max with group_by + having), **cursor pagination**, **CAS** (if/if_not_exists, dry-run bulk ops)
@@ -67,16 +67,20 @@ For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/f
 
 | Workload | Result |
 |---|---|
-| Bulk insert (CSV, 10M, 1 conn) | **4.96 M/sec** |
-| Bulk insert (CSV, 10M, 5 conns × 2M) | **7.55 M/sec** |
+| Bulk insert (CSV, 10M, 1 conn) | **4.94 M/sec** |
+| Bulk insert (CSV, 10M, 5 conns × 2M) | **8.42 M/sec** |
 | Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, no idx) | **2.48 M/sec** |
 | Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, 14 idx) | **435 k/sec** |
+| Bulk EXISTS (10K keys per request) | **5.69 M/sec** |
+| Bulk DELETE (10K keys per request) | **1.87 M/sec** |
+| Bulk GET (10K keys per request) | **1.26 M/sec** |
+| Bulk UPDATE (10K keys per request) | **822 k/sec** |
 | Indexed `find` (1M users, limit 10) | **<1 ms** |
 | Indexed `count` / `aggregate` (warm cache) | **<1–296 ms** |
-| GET ×10k (req-resp, 1 conn) | **35 k ops/sec** (28µs/op) |
-| Disk footprint (10M K/V records) | 2.3 GB |
+| Single-conn GET ×10k (req-resp, 1 conn) | **33 k ops/sec** (28µs/op) |
+| Disk footprint (10M K/V records) | 2.2 GB |
 
-Reads are measured strict request-response (no pipelining); pipelining client-side will push throughput higher. Bench harness: [`src/bench/`](src/bench/) (C-level timing).
+Reads are measured strict request-response (no pipelining); pipelining client-side will push throughput higher. The single-conn ceiling is dominated by TCP+JSON framing (~30 µs/op) — bulk paths bypass that and are the right tool for high-throughput multi-key workloads. Bench harness: [`src/bench/`](src/bench/) (C-level timing).
 
 Full breakdown across 5 workloads + tuning notes: [docs/operations/benchmarks.md](docs/operations/benchmarks.md).
 

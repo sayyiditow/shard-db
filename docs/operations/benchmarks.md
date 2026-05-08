@@ -12,16 +12,22 @@ Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape 
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **3.99 M inserts/sec** (2.51 s) |
-| Bulk insert (CSV, 10M in one request) | **4.96 M inserts/sec** (2.02 s) |
-| GET ×10,000 (req-resp, 1 conn) | **34.9 k ops/sec** (mean 28.2µs / p50 26.4µs / p99 51.1µs) |
-| EXISTS ×10,000 hits (req-resp) | **36.4 k ops/sec** (mean 27.1µs / p50 25.8µs / p99 49.7µs) |
-| EXISTS ×10,000 all-miss (cold probe) | **37.0 k ops/sec** (mean 26.8µs / p50 25.8µs / p99 43.6µs) |
-| UPDATE ×10,000 (req-resp) | **32.5 k ops/sec** (mean 30.4µs / p50 28.2µs / p99 62.2µs) |
-| DELETE ×10,000 (req-resp) | **17.9 k ops/sec** (mean 55.6µs / p50 51.4µs / p99 116.2µs) |
-| Parallel GET (5 conns × 10k) | **165.9 k ops/sec** (301 ms) |
-| Parallel UPDATE (5 conns × 10k) | **150.0 k ops/sec** (333 ms) |
-| Disk footprint | 2.3 GB |
+| Bulk insert (JSON, 10M in one request) | **3.46 M inserts/sec** (2.89 s) |
+| Bulk insert (CSV, 10M in one request) | **4.64 M inserts/sec** (2.15 s) |
+| **Bulk EXISTS (10K keys / request)** | **5.69 M ops/sec** (1.8 ms) |
+| **Bulk DELETE (10K keys / request)** | **1.87 M ops/sec** (5.3 ms) |
+| **Bulk GET (10K keys / request)** | **1.26 M ops/sec** (7.9 ms) |
+| **Bulk UPDATE (10K keys / request)** | **822 k ops/sec** (12.2 ms) |
+| GET ×10,000 (req-resp, 1 conn) | **33 k ops/sec** (mean 28µs / p50 28µs) |
+| EXISTS ×10,000 hits (req-resp) | **33 k ops/sec** (mean 29µs / p50 29µs) |
+| EXISTS ×10,000 all-miss (cold probe) | **35 k ops/sec** (mean 27µs / p50 27µs) |
+| UPDATE ×10,000 (req-resp) | **30 k ops/sec** (mean 31µs / p50 31µs) |
+| DELETE ×10,000 (req-resp) | **27 k ops/sec** (mean 35µs / p50 35µs) |
+| Parallel GET (5 conns × 10k) | **151 k ops/sec** (331 ms) |
+| Parallel UPDATE (5 conns × 10k) | **134 k ops/sec** (373 ms) |
+| Disk footprint | 2.2 GB |
+
+**Bulk multi-key paths are 30-170× faster than single-conn.** The single-conn req-resp ceiling is ~30 µs/op (dominated by TCP framing + JSON parse/encode). One bulk request handling 10K keys at a time hits 1.3M+/sec on every multi-key op — `bulk_lookup_in_kfshard` / `bulk_get_in_kfshard` / `bulk_upsert_in_kfshard` / `bulk_delete_in_kfshard` each acquire one kf wrlock per worker (vs per-record), batch seg I/O sorted by `(stream_id, file_id)`, and use parallel_for fan-out across kf shards. Use bulk wire shapes (`{"mode":"get","keys":[...]}`, `{"mode":"bulk-delete","keys":[...]}`) when you have multi-key workloads.
 
 ## 2. K/V multi-threaded — 10M records, scaling across connections
 
@@ -31,14 +37,14 @@ Same schema, bulk insert fanned out across TCP connections. `SPLITS=128` is the 
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 10M | 2.41 s | **4.15 M/sec** |
-| Single CSV, 10M | 1.87 s | **5.34 M/sec** |
-| **Parallel JSON, 5 conns × 2M** | **1.47 s** | **6.79 M/sec** (1.64× single) |
-| **Parallel CSV, 5 conns × 2M** | **1.32 s** | **7.55 M/sec** (1.41× single) ← fastest |
+| Single JSON, 10M | 2.80 s | **3.57 M/sec** |
+| Single CSV, 10M | 2.04 s | **4.91 M/sec** |
+| **Parallel JSON, 5 conns × 2M** | **1.37 s** | **7.29 M/sec** (2.04× single) |
+| **Parallel CSV, 5 conns × 2M** | **1.19 s** | **8.42 M/sec** (1.71× single) ← fastest |
 
-Shard load distribution (128 splits): avg 0.596, records stddev 1.6 %, 1 grow per shard (down from 9 pre-2026.05.x — see [pre-grow](#shard-grow-pre-sizing) below).
+Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even distribution (records stddev <1 %).
 
-**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **5.34 M/sec single-connection** (CSV) and scales to **7.55 M/sec at 5 connections × 2 M records each**, all over TCP with CSV parsing on the server. **Parallel still wins for max throughput** — pre-grow (2026.05.x+) made bulk-insert ~2× faster on every path; multiple connections amortize their per-call pipeline tail (parse, bucket, dispatch, activate per request) against the wider write fan-out, so parallel keeps a ~1.4–1.6× edge over single-conn at this scale. **Use single-connection for operational simplicity, parallel for headline throughput.**
+**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **4.91 M/sec single-connection** (CSV) and scales to **8.42 M/sec at 5 connections × 2 M records each**, all over TCP with CSV parsing on the server. **Parallel keeps a 1.7–2.0× edge over single-conn** at this scale — multiple connections amortize per-call pipeline tail (parse, bucket, dispatch) against wider write fan-out. The slotcask v2 storage engine (2026.06+) improved parallel throughput by ~12 % over the prior layout while keeping single-conn rates similar. **Use single-connection for operational simplicity, parallel for headline throughput.**
 
 <a id="shard-grow-pre-sizing"></a>
 **Pre-grow (2026.05.x):** when `bulk-insert` receives a batch, the dispatcher reads each shard's current `slots_per_shard` and live record count, computes the smallest power-of-2 that holds (live + incoming), and grows each shard to that target once before workers start. Pre-grows run in parallel via the worker pool. The previous behaviour (worker grew its shard every time it overflowed during the insert) caused 9 incremental grows per shard at SPLITS=128 / 10M records, each rebucketing the existing data; now that's 1 pre-grow per shard with zero rebucket (the shards are empty when pre-grow fires for a fresh load).
