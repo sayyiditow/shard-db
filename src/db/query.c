@@ -13903,6 +13903,22 @@ static void agg_arena_free(AggArena *a) {
     a->head = NULL;
 }
 
+/* Splice src arena's slab chain onto dst, leaving dst's head (active alloc
+   target) intact. Used by the parallel merge to transfer per-partition
+   arena ownership into main ctx so partition buckets stay valid until
+   agg_free time. */
+static void agg_arena_transfer(AggArena *dst, AggArena *src) {
+    if (!src->head) return;
+    if (!dst->head) {
+        dst->head = src->head;
+    } else {
+        AggArenaSlab *tail = dst->head;
+        while (tail->next) tail = tail->next;
+        tail->next = src->head;
+    }
+    src->head = NULL;
+}
+
 typedef struct {
     CriteriaNode *tree;
     FieldSchema *fs;
@@ -15319,6 +15335,190 @@ static void agg_ctx_free_local(AggCtx *ctx) {
     ctx->ht = NULL;
     ctx->ht_cap = ctx->ht_mask = 0;
     ctx->total_buckets = 0;
+}
+
+/* Per-shard worker for parallel indexed group_by Pass 1.
+
+   Each worker walks ONE btree shard of the primary group field, builds
+   buckets in its OWN cloned AggCtx (own arena, own ht), and populates
+   its own local hbk (when Pass 2 needs it). After all workers join,
+   the orchestrator merges each clone into the main ctx and translates
+   per-worker hbks into the global hbk by hijacking `group_key` (which
+   is unused post-Pass-1) as a src_bucket → main_bucket pointer slot. */
+typedef struct {
+    int                  shard_id;
+    const char          *db_root;
+    const char          *object;
+    const char          *gfield;       /* primary group field name */
+    const TypedField    *gtf;          /* primary group typed field */
+    int                  n_sec;        /* count of secondary group fields */
+    HashStrMap          *sec_maps;     /* shared read-only secondary maps */
+    KeySet              *crit_ks;      /* shared read-only criteria filter */
+    int                  hbk_needs;    /* allocate + populate local_hbk? */
+    int                  hbk_cap_hint; /* per-worker hbk capacity hint */
+    AggCtx               local;        /* clone of main */
+    HashBktMap           local_hbk;    /* valid only if hbk_needs */
+    int                  hbk_alloc_failed;
+    int                  aborted;
+    int                  dl_counter;
+} IgbPass1Worker;
+
+static void *igb_pass1_worker(void *arg) {
+    IgbPass1Worker *w = (IgbPass1Worker *)arg;
+    if (w->hbk_needs) {
+        if (hbk_init(&w->local_hbk, (size_t)w->hbk_cap_hint) != 0) {
+            w->hbk_alloc_failed = 1;
+            w->aborted = 1;
+            return NULL;
+        }
+    }
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path), w->db_root, w->object,
+                   w->gfield, w->shard_id);
+    BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
+                                             "\xff\xff\xff\xff", 4, 0, 0);
+    if (!it) return NULL;
+    char prev_enc[64]; size_t prev_enc_len = 0;
+    struct AggBucket *prev_bkt = NULL;
+    const char *val; size_t vlen; const uint8_t *hash16;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        if (query_deadline_tick(w->local.deadline, &w->dl_counter)) {
+            w->aborted = 1; break;
+        }
+        if (w->crit_ks && !keyset_contains(w->crit_ks, hash16)) continue;
+        struct AggBucket *bkt;
+        if (w->n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
+            memcmp(val, prev_enc, vlen) == 0) {
+            bkt = prev_bkt;
+        } else {
+            char gbufs[MAX_FIELDS][512];
+            char *gvals[MAX_FIELDS];
+            int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
+                                       vlen, gbufs[0], sizeof(gbufs[0]));
+            if (n <= 0) continue;
+            gvals[0] = gbufs[0];
+            int multi_skip = 0;
+            for (int g = 0; g < w->n_sec; g++) {
+                const char *sval; size_t slen;
+                if (!hsm_get(&w->sec_maps[g], hash16, &sval, &slen)) {
+                    multi_skip = 1; break;
+                }
+                size_t cl = slen < sizeof(gbufs[g + 1]) - 1
+                             ? slen : sizeof(gbufs[g + 1]) - 1;
+                memcpy(gbufs[g + 1], sval, cl);
+                gbufs[g + 1][cl] = '\0';
+                gvals[g + 1] = gbufs[g + 1];
+            }
+            if (multi_skip) continue;
+            bkt = (struct AggBucket *)agg_find_or_create(
+                                          &w->local, gvals, w->local.ngroups);
+            if (!bkt) { w->aborted = 1; break; }
+            if (w->n_sec == 0 && vlen <= sizeof(prev_enc)) {
+                memcpy(prev_enc, val, vlen);
+                prev_enc_len = vlen;
+                prev_bkt = bkt;
+            } else {
+                prev_bkt = NULL; prev_enc_len = 0;
+            }
+        }
+        AggBucket *ab = (AggBucket *)bkt;
+        for (int i = 0; i < w->local.nspecs; i++) {
+            if (w->local.specs[i].fn == AGG_COUNT) ab->accums[i].count++;
+        }
+        if (w->hbk_needs) hbk_insert(&w->local_hbk, hash16, bkt);
+    }
+    btree_range_iter_close(it);
+    return NULL;
+}
+
+/* Bucket pointer array used by parallel-merge scatter queues. Each
+   (Pass1 worker, partition) pair owns one BktArr; appends are single-
+   threaded since the scatter worker only writes to its own row. */
+typedef struct {
+    AggBucket **arr;
+    int         count;
+    int         cap;
+} BktArr;
+
+static int bktarr_push(BktArr *a, AggBucket *b) {
+    if (a->count >= a->cap) {
+        int new_cap = a->cap == 0 ? 64 : a->cap * 2;
+        AggBucket **nb = realloc(a->arr, (size_t)new_cap * sizeof(AggBucket *));
+        if (!nb) return -1;
+        a->arr = nb;
+        a->cap = new_cap;
+    }
+    a->arr[a->count++] = b;
+    return 0;
+}
+
+static void bktarr_free(BktArr *a) {
+    free(a->arr);
+    a->arr = NULL;
+    a->count = a->cap = 0;
+}
+
+/* Scatter src ctx's buckets across partitions by hash(group_key) % npart.
+   Each Pass1 worker owns one ScatterArg row containing npart queues. */
+typedef struct {
+    AggCtx *src;
+    int     npart;
+    BktArr *queues;        /* [npart] queues for this Pass1 worker */
+    int     alloc_failed;
+} ScatterArg;
+
+static void *scatter_worker(void *arg) {
+    ScatterArg *s = (ScatterArg *)arg;
+    if (!s->src->ht) return NULL;
+    for (size_t i = 0; i < s->src->ht_cap; i++) {
+        for (AggBucket *b = s->src->ht[i]; b; b = b->next) {
+            uint32_t h = agg_hash(b->group_key);
+            int p = (int)(h % (uint32_t)s->npart);
+            if (bktarr_push(&s->queues[p], b) != 0) {
+                s->alloc_failed = 1;
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Per-partition merge: each partition merger reads from npass1 scatter
+   queues (one per Pass1 worker, all routed to this partition) and folds
+   them into its own AggCtx clone. Partitions are disjoint by group_key
+   hash so workers don't contend on shared state. */
+typedef struct {
+    int       part_id;
+    int       npass1;
+    BktArr  **scatter_per_pass1;   /* [npass1] pointing into scatter[w][part_id] */
+    AggCtx    local;               /* partition's own ctx (own arena, own ht) */
+    int       nvals;
+    int       aborted;
+} PartMergeArg;
+
+static void *part_merge_worker(void *arg) {
+    PartMergeArg *p = (PartMergeArg *)arg;
+    for (int w = 0; w < p->npass1; w++) {
+        BktArr *q = p->scatter_per_pass1[w];
+        for (int i = 0; i < q->count; i++) {
+            AggBucket *src = q->arr[i];
+            AggBucket *mb = agg_find_or_create(&p->local, src->group_vals, p->nvals);
+            if (!mb) { p->aborted = 1; return NULL; }
+            for (int k = 0; k < p->local.nspecs; k++) {
+                AggAccum *sa = &src->accums[k], *da = &mb->accums[k];
+                da->sum += sa->sum;
+                da->count += sa->count;
+                if (sa->count > 0) {
+                    if (sa->min < da->min) da->min = sa->min;
+                    if (sa->max > da->max) da->max = sa->max;
+                }
+            }
+            /* Stash main bucket pointer in src->group_key for hbk translate
+               (same trick as the serial merge path). */
+            src->group_key = (char *)mb;
+        }
+    }
+    return NULL;
 }
 
 int cmd_aggregate(const char *db_root, const char *object,
@@ -16763,7 +16963,20 @@ int cmd_aggregate(const char *db_root, const char *object,
 
         /* Pass 1: walk group_by btree, find/create bucket per encoded
            value, increment any AGG_COUNT specs, and (for multi-spec)
-           record hash16 → bucket in hbk for pass 2.
+           record hash16 → bucket in hbk for Pass 2.
+
+           Two paths:
+
+             - Parallel: spawn one worker per btree shard, each with its
+               own AggCtx clone + own hbk; merge into main + translate
+               hbks afterwards. Wins big on high-cardinality varchar
+               group_by (8× wall on Pass 1 walk + bucket creation).
+
+             - Serial fallback: walks shards in order, writes directly
+               to main ctx + global hbk. Used when n_idx_g is small,
+               cardinality is low, or the per-worker hbk allocation
+               wouldn't fit in the QUERY_BUFFER_MB budget. Also kept
+               as the simple path for correctness diffing.
 
            Within a shard, btree iter is sorted ASC, so consecutive
            entries usually share the same encoded value — cache the
@@ -16771,73 +16984,309 @@ int cmd_aggregate(const char *db_root, const char *object,
            on each repeat. The cache only fires for ngroups==1 since the
            composite bucket key for multi-field includes secondaries that
            vary per record even when primary repeats. */
-        char prev_enc[64]; size_t prev_enc_len = 0;
-        struct AggBucket *prev_bkt = NULL;
-        int dl_counter = 0;
         int aborted = 0;
-        for (int s = 0; s < n_idx_g && !aborted; s++) {
-            char idx_path[PATH_MAX];
-            build_idx_path(idx_path, sizeof(idx_path), db_root,
-                           object, ctx.group_fields[0], s);
-            BtRangeIter *it = btree_range_iter_open(
-                idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
-            if (!it) continue;
-            const char *val; size_t vlen; const uint8_t *hash16;
-            prev_enc_len = 0; prev_bkt = NULL;
-            while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
-                /* Criteria filter: skip leaf entries whose record didn't
-                   match the criteria-derived KeySet. crit_ks NULL means
-                   no criteria, so every entry passes. */
-                if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
-                struct AggBucket *bkt;
-                if (n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
-                    memcmp(val, prev_enc, vlen) == 0) {
-                    bkt = prev_bkt;
-                } else {
-                    char gbufs[MAX_FIELDS][512];
-                    char *gvals[MAX_FIELDS];
-                    int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                              vlen, gbufs[0], sizeof(gbufs[0]));
-                    if (n <= 0) continue;
-                    gvals[0] = gbufs[0];
-                    /* Compose composite key for ngroups > 1 by looking up
-                       each secondary field's value via its hash16 map.
-                       A miss means the record doesn't have that field
-                       indexed (skip-zero rule) — skip the entry to match
-                       the per-record path's "missing field" semantics. */
-                    int multi_skip = 0;
-                    for (int g = 0; g < n_sec; g++) {
-                        const char *sval; size_t slen;
-                        if (!hsm_get(&sec_maps[g], hash16, &sval, &slen)) {
-                            multi_skip = 1;
-                            break;
-                        }
-                        size_t cl = slen < sizeof(gbufs[g + 1]) - 1
-                                     ? slen : sizeof(gbufs[g + 1]) - 1;
-                        memcpy(gbufs[g + 1], sval, cl);
-                        gbufs[g + 1][cl] = '\0';
-                        gvals[g + 1] = gbufs[g + 1];
-                    }
-                    if (multi_skip) continue;
-                    bkt = (struct AggBucket *)agg_find_or_create(
-                                                  &ctx, gvals, ctx.ngroups);
-                    if (!bkt) { aborted = 1; break; }
-                    if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
-                        memcpy(prev_enc, val, vlen);
-                        prev_enc_len = vlen;
-                        prev_bkt = bkt;
-                    } else {
-                        prev_bkt = NULL; prev_enc_len = 0;
-                    }
-                }
-                AggBucket *ab = (AggBucket *)bkt;
-                for (int i = 0; i < ctx.nspecs; i++) {
-                    if (ctx.specs[i].fn == AGG_COUNT) ab->accums[i].count++;
-                }
-                if (hbk_ready) hbk_insert(&hbk, hash16, bkt);
+        int run_serial = 1;
+        int dl_counter = 0;        /* shared by Pass 1 (serial fallback) + Pass 2 */
+        int live_for_pass1 = get_live_count(db_root, object);
+        if (live_for_pass1 <= 0) live_for_pass1 = 1024;
+        if (n_idx_g >= 4 && live_for_pass1 >= 100000) {
+            int per_worker_hint = (live_for_pass1 + n_idx_g - 1) / n_idx_g;
+            size_t per_worker_hbk_bytes = 0;
+            if (hbk_ready) {
+                size_t cap = 64;
+                while (cap * 3 < (size_t)per_worker_hint * 4) cap <<= 1;
+                per_worker_hbk_bytes = cap * sizeof(HashBktEntry);
             }
-            btree_range_iter_close(it);
+            size_t total_extra = (size_t)n_idx_g * per_worker_hbk_bytes;
+            /* Total per-worker hbk + global hbk must fit; the global
+               already used ≤ half the budget at hbk_init time, leaving
+               at most another half for per-worker shards. */
+            if (total_extra <= g_query_buffer_max_bytes / 2) {
+                IgbPass1Worker *workers = calloc((size_t)n_idx_g,
+                                                  sizeof(IgbPass1Worker));
+                if (workers) {
+                    for (int s = 0; s < n_idx_g; s++) {
+                        workers[s].shard_id = s;
+                        workers[s].db_root = db_root;
+                        workers[s].object = object;
+                        workers[s].gfield = ctx.group_fields[0];
+                        workers[s].gtf = gtf;
+                        workers[s].n_sec = n_sec;
+                        workers[s].sec_maps = sec_maps;
+                        workers[s].crit_ks = crit_ks;
+                        workers[s].hbk_needs = hbk_ready;
+                        workers[s].hbk_cap_hint = per_worker_hint;
+                        agg_ctx_clone_shared(&workers[s].local, &ctx);
+                    }
+
+                    parallel_for(igb_pass1_worker, workers, n_idx_g,
+                                 sizeof(IgbPass1Worker));
+
+                    int budget_exceeded = 0;
+                    for (int s = 0; s < n_idx_g; s++) {
+                        if (workers[s].aborted) aborted = 1;
+                        if (workers[s].local.budget_exceeded) budget_exceeded = 1;
+                    }
+
+                    /* Merge phase. Three sub-phases:
+
+                       1. Scatter (parallel): each Pass1 worker walks its
+                          local.ht and routes buckets into per-(worker,
+                          partition) queues by `agg_hash(group_key) % npart`.
+                          Each worker writes only to its own row, so no
+                          contention.
+
+                       2. Per-partition merge (parallel): each merger reads
+                          from all (Pass1 worker → partition) queues for
+                          its partition, calls agg_find_or_create on a
+                          per-partition AggCtx clone, copies accums.
+                          Partitions are disjoint by group_key hash so no
+                          contention on the merger ctxs.
+
+                       3. Union (serial, cheap): splice each partition_ctx's
+                          buckets into main->ht using main's hash mapping;
+                          transfer partition arenas into main's arena chain
+                          so partition-allocated bucket strings stay valid
+                          until agg_free.
+
+                       hbk translate stays serial — its work is < 25% of
+                       merge wall-time and parallelizing safely needs an
+                       atomic-CAS hbk variant we'd rather not add yet. */
+                    int npart = n_idx_g;
+                    BktArr **scatter = NULL;
+                    ScatterArg *scatter_args = NULL;
+                    PartMergeArg *merge_args = NULL;
+
+                    if (!aborted) {
+                        scatter = calloc((size_t)n_idx_g, sizeof(BktArr *));
+                        scatter_args = calloc((size_t)n_idx_g, sizeof(ScatterArg));
+                        merge_args = calloc((size_t)npart, sizeof(PartMergeArg));
+                        if (!scatter || !scatter_args || !merge_args) {
+                            aborted = 1;
+                            budget_exceeded = 1;
+                        } else {
+                            for (int w = 0; w < n_idx_g; w++) {
+                                scatter[w] = calloc((size_t)npart, sizeof(BktArr));
+                                if (!scatter[w]) { aborted = 1; budget_exceeded = 1; break; }
+                            }
+                        }
+                    }
+
+                    /* Phase 1: scatter (parallel) */
+                    if (!aborted) {
+                        for (int w = 0; w < n_idx_g; w++) {
+                            scatter_args[w].src = &workers[w].local;
+                            scatter_args[w].npart = npart;
+                            scatter_args[w].queues = scatter[w];
+                        }
+                        parallel_for(scatter_worker, scatter_args, n_idx_g,
+                                     sizeof(ScatterArg));
+                        for (int w = 0; w < n_idx_g; w++) {
+                            if (scatter_args[w].alloc_failed) {
+                                aborted = 1;
+                                budget_exceeded = 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Phase 2: per-partition merge (parallel) */
+                    if (!aborted) {
+                        int nvals = ctx.ngroups > 0 ? ctx.ngroups : 1;
+                        for (int p = 0; p < npart; p++) {
+                            merge_args[p].part_id = p;
+                            merge_args[p].npass1 = n_idx_g;
+                            merge_args[p].scatter_per_pass1 =
+                                malloc((size_t)n_idx_g * sizeof(BktArr *));
+                            if (!merge_args[p].scatter_per_pass1) {
+                                aborted = 1; budget_exceeded = 1; break;
+                            }
+                            for (int w = 0; w < n_idx_g; w++) {
+                                merge_args[p].scatter_per_pass1[w] = &scatter[w][p];
+                            }
+                            agg_ctx_clone_shared(&merge_args[p].local, &ctx);
+                            merge_args[p].nvals = nvals;
+                        }
+                        if (!aborted) {
+                            parallel_for(part_merge_worker, merge_args, npart,
+                                         sizeof(PartMergeArg));
+                            for (int p = 0; p < npart; p++) {
+                                if (merge_args[p].aborted) aborted = 1;
+                                if (merge_args[p].local.budget_exceeded) {
+                                    budget_exceeded = 1;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Phase 3: union partition_ctxs into main ctx (serial).
+                       Each partition has disjoint group_keys (by hash %
+                       npart) so we can splice buckets directly into
+                       main->ht via main's slot mapping without dedup.
+                       Partition arenas are transferred so their string
+                       allocations outlive the partition_ctx free. */
+                    if (!aborted) {
+                        int total_buckets = 0;
+                        for (int p = 0; p < npart; p++) {
+                            total_buckets += merge_args[p].local.total_buckets;
+                        }
+                        if (!ctx.ht && total_buckets > 0) {
+                            /* Load factor 1.0 to match the existing dynamic
+                               resize threshold (total > cap). Sizing once
+                               upfront avoids the O(N log N) doubling tax. */
+                            size_t new_cap = AGG_HT_INIT;
+                            while (new_cap < (size_t)total_buckets &&
+                                   new_cap < AGG_HT_MAX) {
+                                new_cap <<= 1;
+                            }
+                            ctx.ht = calloc(new_cap, sizeof(AggBucket *));
+                            if (!ctx.ht) {
+                                aborted = 1; budget_exceeded = 1;
+                            } else {
+                                ctx.ht_cap = new_cap;
+                                ctx.ht_mask = new_cap - 1;
+                            }
+                        }
+                        for (int p = 0; p < npart && !aborted; p++) {
+                            AggCtx *pc = &merge_args[p].local;
+                            if (pc->ht) {
+                                for (size_t i = 0; i < pc->ht_cap; i++) {
+                                    AggBucket *b = pc->ht[i];
+                                    while (b) {
+                                        AggBucket *next = b->next;
+                                        uint32_t h = agg_hash(b->group_key) &
+                                                     (uint32_t)ctx.ht_mask;
+                                        b->next = ctx.ht[h];
+                                        ctx.ht[h] = b;
+                                        ctx.total_buckets++;
+                                        b = next;
+                                    }
+                                }
+                            }
+                            agg_arena_transfer(&ctx.arena, &pc->arena);
+                        }
+                    }
+
+                    /* Phase 4: hbk translate (serial). Each Pass1 worker's
+                       local_hbk has src_bkt pointers; src_bkt->group_key was
+                       overwritten with the main bucket pointer in Phase 2. */
+                    if (!aborted && hbk_ready) {
+                        for (int w = 0; w < n_idx_g; w++) {
+                            HashBktMap *lhbk = &workers[w].local_hbk;
+                            if (!lhbk->entries) continue;
+                            for (size_t i = 0; i < lhbk->cap; i++) {
+                                AggBucket *src_bkt = lhbk->entries[i].val;
+                                if (!src_bkt) continue;
+                                AggBucket *main_bkt = (AggBucket *)src_bkt->group_key;
+                                if (main_bkt) {
+                                    hbk_insert(&hbk, lhbk->entries[i].hash,
+                                               main_bkt);
+                                }
+                            }
+                        }
+                    }
+
+                    if (budget_exceeded) ctx.budget_exceeded = 1;
+
+                    /* Cleanup. agg_ctx_free_local frees ht + arena; on the
+                       success path the arena was transferred to main so its
+                       head is NULL and the arena_free is a no-op. On the
+                       abort path the arena still holds slabs and gets freed. */
+                    if (merge_args) {
+                        for (int p = 0; p < npart; p++) {
+                            free(merge_args[p].scatter_per_pass1);
+                            agg_ctx_free_local(&merge_args[p].local);
+                        }
+                        free(merge_args);
+                    }
+                    if (scatter) {
+                        for (int w = 0; w < n_idx_g; w++) {
+                            if (scatter[w]) {
+                                for (int p = 0; p < npart; p++) bktarr_free(&scatter[w][p]);
+                                free(scatter[w]);
+                            }
+                        }
+                        free(scatter);
+                    }
+                    free(scatter_args);
+
+                    for (int s = 0; s < n_idx_g; s++) {
+                        if (hbk_ready) hbk_free(&workers[s].local_hbk);
+                        agg_ctx_free_local(&workers[s].local);
+                    }
+                    free(workers);
+                    run_serial = 0;
+                }
+            }
+        }
+
+        if (run_serial) {
+            char prev_enc[64]; size_t prev_enc_len = 0;
+            struct AggBucket *prev_bkt = NULL;
+            for (int s = 0; s < n_idx_g && !aborted; s++) {
+                char idx_path[PATH_MAX];
+                build_idx_path(idx_path, sizeof(idx_path), db_root,
+                               object, ctx.group_fields[0], s);
+                BtRangeIter *it = btree_range_iter_open(
+                    idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                if (!it) continue;
+                const char *val; size_t vlen; const uint8_t *hash16;
+                prev_enc_len = 0; prev_bkt = NULL;
+                while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                    if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                    /* Criteria filter: skip leaf entries whose record didn't
+                       match the criteria-derived KeySet. crit_ks NULL means
+                       no criteria, so every entry passes. */
+                    if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
+                    struct AggBucket *bkt;
+                    if (n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
+                        memcmp(val, prev_enc, vlen) == 0) {
+                        bkt = prev_bkt;
+                    } else {
+                        char gbufs[MAX_FIELDS][512];
+                        char *gvals[MAX_FIELDS];
+                        int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
+                                                  vlen, gbufs[0], sizeof(gbufs[0]));
+                        if (n <= 0) continue;
+                        gvals[0] = gbufs[0];
+                        /* Compose composite key for ngroups > 1 by looking up
+                           each secondary field's value via its hash16 map.
+                           A miss means the record doesn't have that field
+                           indexed (skip-zero rule) — skip the entry to match
+                           the per-record path's "missing field" semantics. */
+                        int multi_skip = 0;
+                        for (int g = 0; g < n_sec; g++) {
+                            const char *sval; size_t slen;
+                            if (!hsm_get(&sec_maps[g], hash16, &sval, &slen)) {
+                                multi_skip = 1;
+                                break;
+                            }
+                            size_t cl = slen < sizeof(gbufs[g + 1]) - 1
+                                         ? slen : sizeof(gbufs[g + 1]) - 1;
+                            memcpy(gbufs[g + 1], sval, cl);
+                            gbufs[g + 1][cl] = '\0';
+                            gvals[g + 1] = gbufs[g + 1];
+                        }
+                        if (multi_skip) continue;
+                        bkt = (struct AggBucket *)agg_find_or_create(
+                                                      &ctx, gvals, ctx.ngroups);
+                        if (!bkt) { aborted = 1; break; }
+                        if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
+                            memcpy(prev_enc, val, vlen);
+                            prev_enc_len = vlen;
+                            prev_bkt = bkt;
+                        } else {
+                            prev_bkt = NULL; prev_enc_len = 0;
+                        }
+                    }
+                    AggBucket *ab = (AggBucket *)bkt;
+                    for (int i = 0; i < ctx.nspecs; i++) {
+                        if (ctx.specs[i].fn == AGG_COUNT) ab->accums[i].count++;
+                    }
+                    if (hbk_ready) hbk_insert(&hbk, hash16, bkt);
+                }
+                btree_range_iter_close(it);
+            }
         }
         if (aborted) {
             if (hbk_ready) hbk_free(&hbk);
