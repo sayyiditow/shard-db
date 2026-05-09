@@ -245,18 +245,83 @@ static int bench_queries_run(void) {
         SPLITS = p;
     }
 
-    TestEnv env = {0};
-    if (test_env_start(&env) != 0) {
-        fprintf(stderr, "bench-queries: daemon spawn failed\n");
+    /* Persistent / skip-insert knobs.
+       SHARD_BENCH_DB_ROOT=<path>   use this DB_ROOT (must include /db
+                                    component, e.g. /tmp/qbench/db) instead
+                                    of an ephemeral tmpdir. Implies KEEP=1.
+       SHARD_BENCH_KEEP=1            don't delete db_root after the bench
+                                    (no-op for tmpdir mode anyway).
+       SHARD_BENCH_SKIP_INSERT=1    skip create-object + insert; assume the
+                                    schema and data are already there from
+                                    a previous run. Requires SHARD_BENCH_DB_ROOT.
+       SHARD_BENCH_PORT=<n>         pin the port (else: pick a free one).
+
+       Workflow: insert once with KEEP, then iterate query benches with
+       SKIP_INSERT to avoid re-paying the 200s+ insert cost at 25M scale. */
+    const char *db_root_env = getenv("SHARD_BENCH_DB_ROOT");
+    int bench_keep = getenv("SHARD_BENCH_KEEP") ? 1 : 0;
+    int bench_skip_insert = getenv("SHARD_BENCH_SKIP_INSERT") ? 1 : 0;
+    if (bench_skip_insert && !db_root_env) {
+        fprintf(stderr, "bench-queries: SHARD_BENCH_SKIP_INSERT requires SHARD_BENCH_DB_ROOT\n");
         return 1;
+    }
+    int persistent = db_root_env || bench_keep || bench_skip_insert;
+
+    TestEnv env = {0};
+    if (persistent) {
+        char default_root[256];
+        if (!db_root_env) {
+            snprintf(default_root, sizeof(default_root),
+                     "/tmp/shard-bench-queries/db");
+            db_root_env = default_root;
+        }
+        /* db_root must end in /<name> so test_env_start_at can derive base.
+           mkdir -p the full path (creates base + db_root). */
+        const char *slash = strrchr(db_root_env, '/');
+        if (!slash || slash == db_root_env) {
+            fprintf(stderr, "bench-queries: SHARD_BENCH_DB_ROOT must contain '/' "
+                            "(e.g. /tmp/qbench/db)\n");
+            return 1;
+        }
+        char mkdir_cmd[600];
+        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", db_root_env);
+        if (system(mkdir_cmd) != 0) {
+            fprintf(stderr, "bench-queries: mkdir failed for %s\n", db_root_env);
+            return 1;
+        }
+        int port;
+        const char *port_env = getenv("SHARD_BENCH_PORT");
+        if (port_env) port = atoi(port_env);
+        else port = test_pick_port();
+        if (port <= 0) {
+            fprintf(stderr, "bench-queries: port allocation failed\n");
+            return 1;
+        }
+        if (test_env_start_at(&env, db_root_env, port) != 0) {
+            fprintf(stderr, "bench-queries: daemon spawn at %s failed\n", db_root_env);
+            return 1;
+        }
+        printf("  persistent mode: DB_ROOT=%s port=%d skip_insert=%d\n\n",
+               db_root_env, port, bench_skip_insert);
+    } else {
+        if (test_env_start(&env) != 0) {
+            fprintf(stderr, "bench-queries: daemon spawn failed\n");
+            return 1;
+        }
     }
 
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
-    if (!tc) { test_env_stop(&env); return 1; }
+    if (!tc) {
+        if (persistent) test_env_kill(&env);
+        else test_env_stop(&env);
+        return 1;
+    }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    if (!bench_skip_insert) {
+        tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    }
 
     /* Schema: 13 fields, `bio` left non-indexed so we exercise full-scan
        paths. ALL 12 indexes created upfront — production workloads
@@ -264,21 +329,23 @@ static int bench_queries_run(void) {
        that even at high N. (If chunked-bulk-insert into a populated
        indexed table hits performance issues, the engine needs to fix
        it — not the bench's job to paper over it.) */
-    char create_obj[2048];
-    snprintf(create_obj, sizeof(create_obj),
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-        "\"splits\":%ld,\"max_key\":32,\"storage_version\":%d,"
-        "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                    "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                    "\"rank:short\",\"score:double\",\"active:bool\","
-                    "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                    "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
-        "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
-                     "\"score\",\"active\",\"level\",\"birthday\","
-                     "\"created_at\",\"balance\",\"hourly_rate\"]}",
-        SPLITS, bench_storage_version());
-    tc_request(tc, create_obj, &resp);
-    free(resp); resp = NULL;
+    if (!bench_skip_insert) {
+        char create_obj[2048];
+        snprintf(create_obj, sizeof(create_obj),
+            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+            "\"splits\":%ld,\"max_key\":32,\"storage_version\":%d,"
+            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                        "\"rank:short\",\"score:double\",\"active:bool\","
+                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
+            "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
+                         "\"score\",\"active\",\"level\",\"birthday\","
+                         "\"created_at\",\"balance\",\"hourly_rate\"]}",
+            SPLITS, bench_storage_version());
+        tc_request(tc, create_obj, &resp);
+        free(resp); resp = NULL;
+    }
 
     printf("======================================================================\n");
     printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
@@ -287,43 +354,53 @@ static int bench_queries_run(void) {
 
     /* Chunked insert. Build CHUNK_SIZE records at a time, push via memfd,
        free the buffer. Bounds peak memory regardless of total COUNT. */
-    long inserted = 0;
-    uint64_t insert_t0 = bench_now_ns();
-    while (inserted < COUNT) {
-        long remaining = COUNT - inserted;
-        int chunk = (remaining < CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
+    if (!bench_skip_insert) {
+        long inserted = 0;
+        uint64_t insert_t0 = bench_now_ns();
+        while (inserted < COUNT) {
+            long remaining = COUNT - inserted;
+            int chunk = (remaining < CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
 
-        printf("  chunk: rows %ld..%ld (%d records)…", inserted, inserted + chunk, chunk);
-        fflush(stdout);
+            printf("  chunk: rows %ld..%ld (%d records)…", inserted, inserted + chunk, chunk);
+            fflush(stdout);
 
-        char *buf = NULL; size_t sz = 0;
-        if (build_users_chunk_json((int)inserted, chunk, &buf, &sz) != 0) {
-            fprintf(stderr, "\nbench-queries: OOM building chunk at i=%ld\n", inserted);
-            tc_close(tc); test_env_stop(&env); return 1;
+            char *buf = NULL; size_t sz = 0;
+            if (build_users_chunk_json((int)inserted, chunk, &buf, &sz) != 0) {
+                fprintf(stderr, "\nbench-queries: OOM building chunk at i=%ld\n", inserted);
+                tc_close(tc);
+                if (persistent) test_env_kill(&env); else test_env_stop(&env);
+                return 1;
+            }
+
+            int data_fd = make_memfd("queries-users", buf, sz);
+            free(buf);
+            if (data_fd < 0) {
+                tc_close(tc);
+                if (persistent) test_env_kill(&env); else test_env_stop(&env);
+                return 1;
+            }
+
+            char ins_req[256];
+            snprintf(ins_req, sizeof(ins_req),
+                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"users\","
+                "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), data_fd);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, ins_req, &resp);
+            uint64_t t1 = bench_now_ns();
+            close(data_fd);
+            free(resp); resp = NULL;
+            printf(" %.2fs (%.2f M/sec)\n",
+                   (double)(t1 - t0) / 1e9,
+                   (double)chunk / 1e6 / ((double)(t1 - t0) / 1e9));
+            inserted += chunk;
         }
-
-        int data_fd = make_memfd("queries-users", buf, sz);
-        free(buf);
-        if (data_fd < 0) { tc_close(tc); test_env_stop(&env); return 1; }
-
-        char ins_req[256];
-        snprintf(ins_req, sizeof(ins_req),
-            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"users\","
-            "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), data_fd);
-        uint64_t t0 = bench_now_ns();
-        tc_request(tc, ins_req, &resp);
-        uint64_t t1 = bench_now_ns();
-        close(data_fd);
-        free(resp); resp = NULL;
-        printf(" %.2fs (%.2f M/sec)\n",
-               (double)(t1 - t0) / 1e9,
-               (double)chunk / 1e6 / ((double)(t1 - t0) / 1e9));
-        inserted += chunk;
+        uint64_t insert_t1 = bench_now_ns();
+        printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
+               (double)(insert_t1 - insert_t0) / 1e9,
+               (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
+    } else {
+        printf("  skipping insert (SHARD_BENCH_SKIP_INSERT=1)\n\n");
     }
-    uint64_t insert_t1 = bench_now_ns();
-    printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
-           (double)(insert_t1 - insert_t0) / 1e9,
-           (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
 
     /* ==================================================================
        Sections — every operator class on every applicable field type.
@@ -691,7 +768,8 @@ static int bench_queries_run(void) {
     printf("======================================================================\n");
 
     tc_close(tc);
-    test_env_stop(&env);
+    if (persistent) test_env_kill(&env);
+    else test_env_stop(&env);
     return 0;
 }
 
