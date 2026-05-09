@@ -923,14 +923,62 @@ static void update_counts(const char *db_root, const char *object, int live_delt
 }
 
 void update_count(const char *db_root, const char *object, int delta) {
+    /* v2: kf header is the source of truth; slotcask_put / slotcask_delete
+       have already updated it atomically under the kf wrlock. Skip the
+       legacy text-counts write to avoid a stale-on-crash divergence
+       between cache and kf. v1 still uses the text counts file. */
+    /* Same dual-form normalisation as resolve_counts. */
+    char eff_root[PATH_MAX]; const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    Schema sc = load_schema(eff_root, bare_obj);
+    if (sc.storage_version == 2) return;
     update_counts(db_root, object, delta, 0);
 }
 
 void update_deleted_count(const char *db_root, const char *object, int delta) {
+    /* Same dual-form normalisation as resolve_counts. */
+    char eff_root[PATH_MAX]; const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    Schema sc = load_schema(eff_root, bare_obj);
+    if (sc.storage_version == 2) return;
     update_counts(db_root, object, 0, delta);
 }
 
 void set_count(const char *db_root, const char *object, int count) {
+    /* v2: kf header is the source of truth; truncate / rebuild / vacuum
+       already update it atomically. Skip the legacy text-counts write. */
+    /* Same dual-form normalisation as resolve_counts. */
+    char eff_root[PATH_MAX]; const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    Schema sc = load_schema(eff_root, bare_obj);
+    if (sc.storage_version == 2) return;
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
     CountsCacheEntry *e = counts_cache_get(cpath);
@@ -951,6 +999,20 @@ void set_count(const char *db_root, const char *object, int count) {
 }
 
 void reset_deleted_count(const char *db_root, const char *object) {
+    /* Same dual-form normalisation as resolve_counts. */
+    char eff_root[PATH_MAX]; const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    Schema sc = load_schema(eff_root, bare_obj);
+    if (sc.storage_version == 2) return;
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
     CountsCacheEntry *e = counts_cache_get(cpath);
@@ -969,24 +1031,71 @@ void reset_deleted_count(const char *db_root, const char *object) {
     close(lockfd);
 }
 
-int get_deleted_count(const char *db_root, const char *object) {
+/* Resolve (live, deleted) for an object. v2 sums kf headers — the kf header
+   is updated atomically inside slotcask_put / slotcask_delete and is the
+   single source of truth for record counts (cannot go stale across daemon
+   crashes the way a separate counts file can). v1 falls back to the legacy
+   text counts file.
+
+   Callers pass `object` in two forms historically:
+     1. (db_root, "object")          — most call sites
+     2. (db_root, "dir/object")      — describe-object, list-objects, list-dirs
+   load_schema and slotcask_registry_get expect (effective_root, bare_object)
+   so we split joined form here. */
+static int resolve_counts(const char *db_root, const char *object,
+                          uint64_t *out_live, uint64_t *out_deleted) {
+    char eff_root[PATH_MAX];
+    const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    Schema sc = load_schema(eff_root, bare_obj);
+    if (sc.storage_version == 2) {
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size,
+            .streams = sc.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
+        if (!sdb) { *out_live = 0; *out_deleted = 0; return -1; }
+        uint64_t total = 0, deleted = 0;
+        slotcask_sum_kf_totals(sdb, &total, &deleted);
+        *out_live    = total > deleted ? total - deleted : 0;
+        *out_deleted = deleted;
+        return 0;
+    }
+    /* v1 fallback (legacy text counts file). */
     char cpath[PATH_MAX], lpath[PATH_MAX];
     counts_paths(cpath, lpath, db_root, object);
-    CountsCacheEntry *e = counts_cache_get(cpath);
-    if (e) return (int)atomic_load_explicit(&e->deleted, memory_order_relaxed);
     int live = 0, del = 0;
-    counts_read_locked(cpath, &live, &del);
-    return del;
+    CountsCacheEntry *e = counts_cache_get(cpath);
+    if (e) {
+        live = (int)atomic_load_explicit(&e->live, memory_order_relaxed);
+        del  = (int)atomic_load_explicit(&e->deleted, memory_order_relaxed);
+    } else {
+        counts_read_locked(cpath, &live, &del);
+    }
+    *out_live = (uint64_t)live;
+    *out_deleted = (uint64_t)del;
+    return 0;
+}
+
+int get_deleted_count(const char *db_root, const char *object) {
+    uint64_t live = 0, del = 0;
+    resolve_counts(db_root, object, &live, &del);
+    return (int)del;
 }
 
 int get_live_count(const char *db_root, const char *object) {
-    char cpath[PATH_MAX], lpath[PATH_MAX];
-    counts_paths(cpath, lpath, db_root, object);
-    CountsCacheEntry *e = counts_cache_get(cpath);
-    if (e) return (int)atomic_load_explicit(&e->live, memory_order_relaxed);
-    int live = 0, del = 0;
-    counts_read_locked(cpath, &live, &del);
-    return live;
+    uint64_t live = 0, del = 0;
+    resolve_counts(db_root, object, &live, &del);
+    return (int)live;
 }
 
 /* Forward declaration */
@@ -1127,6 +1236,32 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     return 1;
 }
 
+/* Per-field index update worker — fires from v2_insert_pre_commit's
+   parallel diff path. Either old_key or new_key may be NULL (pure
+   insert / pure delete of an indexed value); both NULL means no work. */
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const char    *field;
+    int            splits;
+    uint8_t       *new_key;
+    size_t         new_len;
+    uint8_t       *old_key;
+    size_t         old_len;
+    const uint8_t *hash;
+} UpdateIdxArg;
+
+static void *update_idx_fn(void *arg) {
+    UpdateIdxArg *a = (UpdateIdxArg *)arg;
+    if (a->old_key)
+        delete_index_entry(a->db_root, a->object, a->field, a->splits,
+                           a->old_key, a->old_len, a->hash);
+    if (a->new_key)
+        write_index_entry(a->db_root, a->object, a->field, a->splits,
+                          a->new_key, a->new_len, a->hash);
+    return NULL;
+}
+
 static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
                                 int is_update, void *ctx_ptr) {
@@ -1135,8 +1270,15 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
     if (c->nfields == 0) return 0;
 
     if (is_update && old) {
-        /* Per-field diff: write/delete only entries that changed. */
+        /* Per-field diff: write/delete only entries that changed.
+           Phase 1 (serial): build all (new_key, old_key) pairs, decide
+           which fields changed. Phase 2 (parallel): apply the changes
+           via parallel_for. For 12-index workloads with N changed fields,
+           this drops the index-update wall time from N×~1µs sequential
+           to ~1µs parallel (limited by core count). */
         char *old_json = typed_decode(c->idx_ts, old->value, (uint32_t)old->vlen);
+        UpdateIdxArg args[MAX_FIELDS];
+        int n_args = 0;
         for (int i = 0; i < c->nfields; i++) {
             uint8_t *new_key = NULL, *old_key = NULL;
             size_t new_len = 0, old_len = 0;
@@ -1153,14 +1295,27 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                     memcmp(new_key, old_key, new_len) != 0) changed = 1;
             }
             if (changed) {
-                if (have_old)
-                    delete_index_entry(c->db_root, c->object, c->fields[i],
-                                       c->splits, old_key, old_len, c->hash);
-                if (have_new)
-                    write_index_entry(c->db_root, c->object, c->fields[i],
-                                      c->splits, new_key, new_len, c->hash);
+                args[n_args].db_root = c->db_root;
+                args[n_args].object  = c->object;
+                args[n_args].field   = c->fields[i];
+                args[n_args].splits  = c->splits;
+                args[n_args].new_key = have_new ? new_key : NULL;
+                args[n_args].new_len = new_len;
+                args[n_args].old_key = have_old ? old_key : NULL;
+                args[n_args].old_len = old_len;
+                args[n_args].hash    = c->hash;
+                n_args++;
+            } else {
+                /* Unchanged — free immediately, nothing to dispatch. */
+                free(new_key); free(old_key);
             }
-            free(new_key); free(old_key);
+        }
+        if (n_args > 0) {
+            parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+            for (int i = 0; i < n_args; i++) {
+                free(args[i].new_key);
+                free(args[i].old_key);
+            }
         }
         free(old_json);
     } else {
@@ -1240,8 +1395,20 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .pre_commit_ctx = &ctx,
     };
     SlotcaskUpsertResult result = {0};
-    int rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
+    int rc;
+    /* Fast path: pure INSERT semantics (if_not_exists=true) without a CAS
+       criterion lets us skip the kf_lookup-with-verify pass that the upsert
+       path always pays. The duplicate detection still happens implicitly
+       inside kf_put_new — caller sees -2 with was_update=1 if a duplicate
+       is found. v2_insert_check_fn / v2_insert_pre_commit handle old=NULL
+       correctly (they only diff against old when is_update=1). */
+    if (if_not_exists && !if_json) {
+        rc = slotcask_insert_with_hooks(sdb, -1, key, klen,
                                         typed_buf, vlen, &opts, &result);
+    } else {
+        rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
+                                        typed_buf, vlen, &opts, &result);
+    }
 
     if (rc == -2) {
         char *cur = result.current_value

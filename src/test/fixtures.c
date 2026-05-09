@@ -209,6 +209,28 @@ void test_env_kill(TestEnv *env) {
     /* No db_root cleanup — caller controls persistent state. */
 }
 
+/* Graceful SIGTERM stop, NO cleanup of db_root. Used by bench when
+   persistent mode wants the daemon to flush counts/logs/etc to disk
+   before exit, but the data tree must survive the bench process. */
+void test_env_stop_keep(TestEnv *env) {
+    if (!env || env->daemon_pid <= 0) return;
+    kill(env->daemon_pid, SIGTERM);
+    int reaped = 0;
+    for (int i = 0; i < 50; i++) {
+        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
+            reaped = 1;
+            break;
+        }
+        sleep_ms(100);
+    }
+    if (!reaped) {
+        kill(env->daemon_pid, SIGKILL);
+        waitpid(env->daemon_pid, NULL, 0);
+    }
+    env->daemon_pid = -1;
+    /* No db_root cleanup. */
+}
+
 void test_env_stop(TestEnv *env) {
     if (!env || env->daemon_pid <= 0) return;
     kill(env->daemon_pid, SIGTERM);

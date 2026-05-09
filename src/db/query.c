@@ -5788,8 +5788,12 @@ int cmd_vacuum(const char *db_root, const char *object,
         int dropped = 0;
         if (sdb) {
             (void)slotcask_compact_segs(sdb, &dropped);
+            /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
+               returns to 0 (kf-derived counts model — there's no separate
+               counts file to lie via anymore). */
+            (void)slotcask_compact_kf(sdb);
         }
-        reset_deleted_count(db_root, object);
+        reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
         OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
         return 0;
     }

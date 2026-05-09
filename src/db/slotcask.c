@@ -803,7 +803,11 @@ static inline uint64_t kf_now_us(void) {
 
 static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (kh->slot < 0 || !kh->writer) return -1;
-    if (new_cap <= kh->capacity) return -1;
+    /* Allow same-cap rebuild: used by vacuum's kf-compaction path to
+       drop tombstones in place without changing capacity. The probe-
+       rebuild loop below copies only flag=1 (live) entries, so the
+       resulting kf has total = live, deleted = 0. */
+    if (new_cap < kh->capacity) return -1;
 
     KfCacheEntry *e = &g_kfcache[kh->slot];
     size_t old_cap = kh->capacity;
@@ -1914,6 +1918,45 @@ void slotcask_close(SlotcaskDb *db) {
     memset(db, 0, sizeof(*db));
 }
 
+/* Sum the per-shard kf headers into total/deleted. Single source of truth
+   for record counts — kf header is updated atomically inside slotcask_put /
+   slotcask_delete under the kf shard's wrlock, so it cannot go stale across
+   ungraceful shutdowns the way a separate text counts file can.
+
+   Reads the 24-byte header of each shard via direct pread() rather than
+   kfcache_acquire to avoid evicting hot shards from the kf cache when an
+   object has more shards than FCACHE_MAX/4 (e.g. splits=4096 against a
+   1024-entry cache would churn). The header is updated under the kf
+   wrlock and is a power-of-2 aligned 8-byte field — pread is not torn at
+   this granularity on x86_64. Worst case we read a slightly stale header
+   (off by an in-flight insert) which is fine for sizing decisions.
+
+   Cost at splits=4096: 4096 × pread(24B) ≈ 1-3ms cold, sub-ms warm.
+   Returns 0 on success. */
+int slotcask_sum_kf_totals(SlotcaskDb *db,
+                           uint64_t *out_total, uint64_t *out_deleted) {
+    if (out_total) *out_total = 0;
+    if (out_deleted) *out_deleted = 0;
+    if (!db || db->num_shards <= 0) return -1;
+    uint64_t total = 0, deleted = 0;
+    for (int s = 0; s < db->num_shards; s++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, s);
+        int fd = open(kf_path, O_RDONLY);
+        if (fd < 0) continue;
+        SlotcaskKfHeader hdr;
+        ssize_t n = pread(fd, &hdr, sizeof(hdr), 0);
+        close(fd);
+        if (n != (ssize_t)sizeof(hdr)) continue;
+        if (hdr.magic != SLOTCASK_KF_MAGIC) continue;
+        total   += hdr.total;
+        deleted += hdr.deleted;
+    }
+    if (out_total)   *out_total   = total;
+    if (out_deleted) *out_deleted = deleted;
+    return 0;
+}
+
 /* TEST-ONLY: write synthetic counters into a kf shard's header. Used by
    the resplit stress test to trip the 75 % trigger without inserting
    millions of records. Acquires the kf wrlock briefly, mutates the
@@ -2147,6 +2190,143 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->condition_not_met = 0;
     }
     free(old_buf);
+    return 0;
+}
+
+/* INSERT-only with hooks. See slotcask.h for semantics. The order
+   (seg write → kf_put_new → pre_commit) lets a duplicate rejection bail
+   cleanly without leaving stale index entries; pre_commit only runs
+   after kf is committed. */
+int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                const SlotcaskUpsertOpts *opts,
+                                SlotcaskUpsertResult *result) {
+    if (result) {
+        result->was_update = 0;
+        result->condition_not_met = 0;
+        result->current_value = NULL;
+        result->current_vlen = 0;
+    }
+    if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+    if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
+    SlotcaskUpsertOpts blank = {0};
+    if (!opts) opts = &blank;
+
+    /* require_existing is incompatible with INSERT-only semantics; the caller
+       should route through slotcask_upsert_with_hooks for that. */
+    if (opts->require_existing) return -1;
+
+    uint8_t hash[16];
+    compute_hash(key, klen, hash);
+    int sid_kf = shard_for_hash(hash, db->num_shards);
+
+    /* check hook fires with old=NULL on insert; gives the caller a chance
+       to reject before any work happens. */
+    if (opts->check) {
+        if (opts->check(NULL, opts->check_ctx) == 0) {
+            if (result) result->condition_not_met = 1;
+            return -2;
+        }
+    }
+
+    /* Reserve a target seg slot (free pool, else append). */
+    int sid_data = stream_id_hint;
+    if (sid_data < 0 || sid_data >= db->num_streams)
+        sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
+    SlotcaskStream *pool = &db->streams[sid_data];
+
+    SlotcaskFreeSlot fs;
+    uint8_t  target_stream = (uint8_t)sid_data;
+    uint16_t target_fid;
+    uint32_t target_off;
+    int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+    } else {
+        uint32_t fid, off;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+    }
+
+    /* Write seg with flag=1 set so kf can point to valid live data. */
+    if (seg_write_record(db, target_stream, target_fid, target_off,
+                         hash, key, klen, value, vlen) != 0) {
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    /* Acquire kf wrlock and attempt the insert. */
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    size_t used_delta = 0;
+    int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
+                            key, klen, db->data_dir, &used_delta);
+    if (put_rc != 0) {
+        if (put_rc == 1) {
+            /* Duplicate — read the existing record so the caller can
+               report it via result->current_value (matches the upsert
+               path's behavior for condition_not_met). The lookup pays
+               one extra probe + segment read here, but this branch
+               only fires on actual duplicates (rare); the common-case
+               new-key path stays single-probe. */
+            uint8_t  ex_flag = 0, ex_sid = 0;
+            uint16_t ex_fid = 0;
+            uint32_t ex_off = 0;
+            size_t   ex_slot = 0;
+            uint8_t *old_buf = NULL;
+            size_t   old_vlen = 0;
+            if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                     &ex_flag, &ex_sid, &ex_fid, &ex_off,
+                                     &ex_slot) == 0) {
+                (void)read_record_value(db, ex_sid, ex_fid, ex_off, key, klen,
+                                         &old_buf, &old_vlen);
+            }
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            if (result) {
+                result->was_update = 1;
+                result->condition_not_met = 1;
+                result->current_value = old_buf;     /* transfer ownership */
+                result->current_vlen = old_vlen;
+            } else {
+                free(old_buf);
+            }
+            return -2;
+        }
+        kfcache_release(&kh);
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    /* kf committed. Run pre_commit for index updates. If it fails AFTER kf
+       is committed, the kf entry is already live — best we can do is
+       tombstone the seg (so reads see the stale kf entry as a miss) and
+       return error. The orphan kf entry will be cleaned up by vacuum's
+       compact_kf pass. Same trade-off the existing upsert path makes for
+       pre_commit failure (just on the opposite side of kf commit). */
+    if (opts->pre_commit) {
+        int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
+        if (rc != 0) {
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            return -1;
+        }
+    }
+
+    kfcache_release(&kh);
     return 0;
 }
 
@@ -3967,6 +4147,27 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
         total += compact_one_stream(db, s);
     }
     if (out_dropped) *out_dropped = total;
+    return 0;
+}
+
+/* Rebuild every kf shard in place to drop tombstones (flag=2 entries).
+   Reuses the resplit machinery with new_cap = current_cap, so the rebuilt
+   kf has total = live count and deleted = 0. Holds each shard's wrlock
+   for the rebuild duration; bypassed (silently) for shards that fail to
+   acquire. Used by cmd_vacuum so the user-visible "orphaned" count drops
+   to 0 after vacuum (matching pre-kf-derived-counts behavior). */
+int slotcask_compact_kf(SlotcaskDb *db) {
+    if (!db || db->num_shards <= 0) return -1;
+    for (int s = 0; s < db->num_shards; s++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) continue;
+        if (kh.hdr && kh.hdr->deleted > 0) {
+            (void)kfcache_resplit_locked(&kh, kh.capacity);
+        }
+        kfcache_release(&kh);
+    }
     return 0;
 }
 

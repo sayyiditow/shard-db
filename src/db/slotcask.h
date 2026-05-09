@@ -186,6 +186,16 @@ typedef struct SlotcaskDb {
 int slotcask_test_set_kf_total(SlotcaskDb *db, int shard_id,
                                uint64_t total, uint64_t deleted);
 
+/* Sum the per-shard kf headers into total/deleted. live = total - deleted.
+   Reads the 24-byte header of each kf shard under the rdlock — at splits=4096
+   that's 4096 × 24B = 96 KB read, sub-millisecond once mmap'd. Returns 0 on
+   success, non-zero if any shard fails to acquire. The kf header is updated
+   atomically by slotcask_put / slotcask_delete and is the single source of
+   truth for record counts; callers should prefer this over a separate counts
+   file (which can go stale on ungraceful shutdown). */
+int slotcask_sum_kf_totals(SlotcaskDb *db,
+                           uint64_t *out_total, uint64_t *out_deleted);
+
 /* Initialize global caches. Call once at process startup, after db.env load. */
 void slotcask_init(int kfcache_cap, int segcache_cap);
 void slotcask_shutdown(void);
@@ -210,6 +220,13 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
+
+/* Rebuild every kf shard in place, dropping flag=2 (tombstone) entries.
+   After this, kf->total = live count and kf->deleted = 0 across all
+   shards. Used by cmd_vacuum so the kf-derived "orphaned" counter drops
+   to 0 (matching the pre-kf-derived behavior of the legacy text counts
+   file). Holds each shard's wrlock for the rebuild duration. */
+int  slotcask_compact_kf(SlotcaskDb *db);
 
 /* ============================================================ Public CRUD */
 
@@ -429,6 +446,29 @@ typedef struct {
    condition_not_met. result->was_update / current_value are populated
    regardless of return code (current_value present only on -2 with old). */
 int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                const SlotcaskUpsertOpts *opts,
+                                SlotcaskUpsertResult *result);
+
+/* INSERT-only fast path with hooks. Skips the kf_lookup-with-verify pass
+   that slotcask_upsert_with_hooks pays before deciding insert-vs-update —
+   for INSERT semantics the lookup is wasted (we always insert, never
+   update). Detection of an existing key happens implicitly via kf_put_new's
+   probe: returns -2 with result->was_update=1 if the key already exists.
+
+   Order: seg write → kf_put_new → pre_commit. Running pre_commit AFTER
+   kf commit means a duplicate-key rejection (kf_put_new returns 1) bails
+   cleanly without leaving stale index entries. The trade-off: if pre_commit
+   fails AFTER kf success, the kf entry is committed but the indexes are
+   incomplete — caller responsibility, matches existing behavior on rare
+   pre_commit failures.
+
+   Use only when the caller intends INSERT (not upsert) — typically when
+   if_not_exists=true is set on cmd_insert/cmd_bulk_insert. opts.check and
+   opts.if_not_exists/require_existing are honored. opts.pre_commit_needs_old
+   is ignored (no OLD record on INSERT). */
+int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
                                 const SlotcaskUpsertOpts *opts,

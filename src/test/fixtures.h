@@ -37,4 +37,10 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port);
    For regular teardown use test_env_stop instead. */
 void test_env_kill(TestEnv *env);
 
+/* SIGTERM (graceful) the daemon, wait up to 5s, then SIGKILL if it
+   didn't exit. Does NOT clean up db_root. Use this for persistent-data
+   teardown where you need the daemon to flush state (counts, logs,
+   sequences) but want to keep the on-disk tree. */
+void test_env_stop_keep(TestEnv *env);
+
 #endif
