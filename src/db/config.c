@@ -15,7 +15,10 @@ int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via F
                                    to one of {4096, 8192, 12288, 16384} */
 int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 4
                                    (derived, not separately configurable) */
-size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024; /* 500 MB per-query intermediate cap, configurable via QUERY_BUFFER_MB */
+/* 500 MB default keeps non-server callers (CLI, tests) safe. cmd_server
+   detects the unchanged-default case and auto-tunes to
+   min(25% of total RAM, 4 GB) for typical VPS shapes — see server.c. */
+size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024;
 int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
 _Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */

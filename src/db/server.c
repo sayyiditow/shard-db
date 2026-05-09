@@ -2459,6 +2459,27 @@ int cmd_server(const char *db_root, int daemonize) {
     write_pid_file(db_root, port);
     g_server_start_ms = now_ms();
     bt_page_size = g_index_page_size;
+    /* QUERY_BUFFER_MB auto-tune. config.c initialises to 500 MB; if the
+       value is still at that default after db.env load, the user didn't
+       override it and we auto-tune to min(25% of total RAM, 4 GB) so
+       index-walk paths (KeySet builds in agg-with-criteria, group_by,
+       intersect) get enough headroom on typical VPS shapes (4 GB /
+       8 GB) to avoid falling back to slower per-record scans. The 4 GB
+       ceiling prevents a single query monopolising big-RAM boxes. */
+    if (g_query_buffer_max_bytes == 500ULL * 1024 * 1024) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_sz = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && page_sz > 0) {
+            size_t total_ram = (size_t)pages * (size_t)page_sz;
+            size_t quarter = total_ram / 4;
+            size_t cap = 4ULL * 1024 * 1024 * 1024;  /* 4 GB ceiling */
+            if (quarter > cap) quarter = cap;
+            if (quarter > g_query_buffer_max_bytes)
+                g_query_buffer_max_bytes = quarter;
+        }
+        log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB",
+                g_query_buffer_max_bytes / (1024 * 1024));
+    }
     fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);
     /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
