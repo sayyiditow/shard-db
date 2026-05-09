@@ -522,6 +522,11 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    for its own synchronization. */
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 
+/* Pre-grow all kf shards to absorb `total_new` upcoming inserts without
+   triggering inline resplits mid-insert. Bulk-insert dispatchers should
+   call this once per request, before workers start writing segments. */
+int slotcask_pregrow_kf(SlotcaskDb *db, size_t total_new);
+
 /* Per-shard walker, used by the engine to parallelise scans across kf
    shards while keeping engine-side state (thread-local output streams,
    etc.) under the engine's own per-worker control. `stop_flag` is a

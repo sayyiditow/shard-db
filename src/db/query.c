@@ -984,7 +984,7 @@ static int pre_grow_shards_for_bulk_insert(const char *db_root,
         args[j].slot_size   = sc->slot_size;
         j++;
     }
-    parallel_for(pre_grow_shard_worker, args, n, sizeof(PreGrowArg));
+    parallel_for_io(pre_grow_shard_worker, args, n, sizeof(PreGrowArg));
     free(args);
     return 0;
 }
@@ -1726,9 +1726,24 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        over-allocating balloons the sparse mmap (page-fault tax > tighter
        probe chains). The pre-grow loop runs in parallel across shards.
        v2 (slotcask) keyfile shards are pre-sized at slotcask_open time and
-       resplit per-shard internally on load — no Zone A pre-grow applies. */
+       resplit per-shard internally on load — no Zone A pre-grow applies,
+       but slotcask_pregrow_kf below absorbs the same role for the kf. */
     if (sc.storage_version != 2) {
         pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
+    } else {
+        /* Pre-grow kf shards to fit the incoming records up-front. Without
+           this, kf resplits trigger inline during the bulk insert and
+           their msync(MS_SYNC) joins the segment writeback queue — a
+           12.6 MB kf flush balloons from ~50ms to 4-5 sec at 25M scale
+           because it's stuck behind hundreds of MB of concurrent segment
+           dirty pages. Doing it now (no inserter active yet) keeps each
+           per-shard resplit at its quiet-system cost. */
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size,
+            .streams = sc.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
     }
 
     int nshard_groups = 0;
@@ -1803,7 +1818,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        coordination needed. Batched pthread_create/join pattern matches
        bulk_del_shard_worker. Serial fallback when thread count ≤ 1 or workload
        is small enough that spawn/join overhead would dominate. */
-    parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
+    parallel_for_io(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
     uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
 
@@ -2209,6 +2224,14 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
        keyfile shards self-size at open + auto-resplit, no Zone A grow. */
     if (sc.storage_version != 2) {
         pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
+    } else {
+        /* See bulk-insert-JSON dispatch above for rationale. */
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size,
+            .streams = sc.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
     }
 
     int nshard_groups = 0;
@@ -2277,7 +2300,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     /* ===== Phase 2: parallel shard workers via shared pool.
        All concurrent callers share one pool sized to ~4× cores by default;
        oversubscription hides shard-rwlock stalls. */
-    parallel_for(bulk_insert_shard_worker, workers, nshard_groups,
+    parallel_for_io(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
     uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
 
@@ -2790,7 +2813,7 @@ static int bulk_delete_run(const char *db_root, const char *object,
     free(shard_counts); free(shard_to_worker);
 
     /* Phase 1: Parallel shard tombstoning */
-    parallel_for(bulk_del_shard_worker, workers, nshard_groups, sizeof(BulkDelShardWork));
+    parallel_for_io(bulk_del_shard_worker, workers, nshard_groups, sizeof(BulkDelShardWork));
 
     /* Phase 2: Parallel index cleanup — one thread per index. Skipped for
        v2: the per-record pre_commit hook in bulk_del_shard_worker_v2 already
@@ -2824,7 +2847,7 @@ static int bulk_delete_run(const char *db_root, const char *object,
             }
         }
 
-        parallel_for(bulk_del_idx_worker, idx_workers, nidx, sizeof(BulkDelIdxWork));
+        parallel_for_io(bulk_del_idx_worker, idx_workers, nidx, sizeof(BulkDelIdxWork));
 
         for (int fi = 0; fi < nidx; fi++) {
             for (int i = 0; i < idx_workers[fi].count; i++) free(idx_workers[fi].vals[i]);
@@ -3436,7 +3459,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].skipped = 0;
     }
 
-    parallel_for(bulk_upd_shard_worker, workers, nshard_groups, sizeof(BulkUpdShardWork));
+    parallel_for_io(bulk_upd_shard_worker, workers, nshard_groups, sizeof(BulkUpdShardWork));
 
     for (int wi = 0; wi < nshard_groups; wi++) {
         updated += workers[wi].updated;
@@ -3958,7 +3981,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     }
 
     /* ===== Phase 2: parallel shard workers. */
-    parallel_for(bulk_upd_delim_shard_worker, workers, nshard_groups,
+    parallel_for_io(bulk_upd_delim_shard_worker, workers, nshard_groups,
                  sizeof(BulkUpdDelimShardWork));
 
     int updated = 0;
@@ -4634,7 +4657,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     free(shard_counts);
 
     /* Phase 2: parallel shard workers. */
-    parallel_for(bulk_upd_json_shard_worker, workers, nshard_groups,
+    parallel_for_io(bulk_upd_json_shard_worker, workers, nshard_groups,
                  sizeof(BulkUpdJsonShardWork));
 
     int updated = 0;
@@ -9992,6 +10015,16 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
     size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
     int live = get_live_count(db_root, object);
     if (live > 0 && (size_t)live > hint) hint = (size_t)live;
+    /* Per-query budget guard: KeySet capacity is rounded up to ~2× hint
+       and each slot is `keys[16] + state[4]` = 20 B (with padding ≈ 24 B).
+       For a 25M-row table that's ~1.2 GB just for this one keyset —
+       blows past QUERY_BUFFER_MB (default 500) and triggers swap thrash
+       at the OS level. Return NULL when the projected footprint exceeds
+       the budget; callers already handle NULL by falling through to the
+       per-record scan path (slower but bounded memory, returns correct
+       results without OOM-ing the daemon). */
+    size_t ks_bytes_est = hint * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
     KeySet *ks = keyset_new(hint);
     if (!ks) return NULL;
     TypedSchema *ts = load_typed_schema(db_root, object);

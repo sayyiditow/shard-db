@@ -263,3 +263,61 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     pthread_mutex_destroy(&group.mu);
     pthread_cond_destroy(&group.cv);
 }
+
+/* I/O-heavy parallel dispatch — spawns one pthread per task, joins all
+   at end. Bypasses the bounded CPU pool because I/O-blocking workloads
+   (bulk-insert page faults on mmap MAP_SHARED writes, fsync waits)
+   benefit from oversubscription that pure-CPU work doesn't.
+
+   Why not just use parallel_for with a bigger pool? Because the pool is
+   shared across all callers; CPU-bound queries on the same pool would
+   then peg every core, killing interactive responsiveness. Splitting
+   I/O work onto dedicated per-call pthreads keeps the CPU pool free for
+   the read paths that actually need it bounded.
+
+   pthread_create cost is ~10-30 µs each — negligible vs the multi-ms
+   per-task work this is meant for. n is typically the per-object
+   shard/worker count (64-256) so total spawn cost stays well under 1ms.
+
+   Callers who'd rather use the bounded pool (CPU-bound, low task count)
+   should keep using parallel_for. */
+typedef struct {
+    void *(*fn)(void *);
+    void  *arg;
+} ParallelIoTask;
+
+static void *parallel_io_thread(void *raw) {
+    ParallelIoTask *t = (ParallelIoTask *)raw;
+    t->fn(t->arg);
+    return NULL;
+}
+
+void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
+    if (n <= 0) return;
+    if (n == 1) {
+        fn(args);
+        return;
+    }
+    pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
+    ParallelIoTask *tasks = malloc((size_t)n * sizeof(ParallelIoTask));
+    if (!threads || !tasks) {
+        /* OOM fallback — run sequentially. Slow but correct. */
+        free(threads); free(tasks);
+        for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
+        return;
+    }
+    int spawned = 0;
+    for (int i = 0; i < n; i++) {
+        tasks[i].fn = fn;
+        tasks[i].arg = (char *)args + (size_t)i * stride;
+        if (pthread_create(&threads[i], NULL, parallel_io_thread, &tasks[i]) == 0) {
+            spawned++;
+        } else {
+            /* Spawn failure (typically EAGAIN under thread limit) — run
+               this one inline so caller still sees correct semantics. */
+            fn(tasks[i].arg);
+        }
+    }
+    for (int i = 0; i < spawned; i++) pthread_join(threads[i], NULL);
+    free(threads); free(tasks);
+}

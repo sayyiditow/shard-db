@@ -481,6 +481,13 @@ void parallel_pool_init(int nthreads);
 void parallel_pool_shutdown(void);
 int  parallel_pool_size(void);
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
+
+/* I/O-heavy variant — spawns one dedicated pthread per task instead of
+   submitting to the bounded CPU pool. Use for bulk-insert / bulk-update /
+   bulk-delete worker dispatch and other write-heavy paths that benefit
+   from oversubscription (page faults on mmap MAP_SHARED writes,
+   fsync waits) without polluting the CPU pool that read paths share. */
+void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms);
 int ucache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);

@@ -923,6 +923,61 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     return 0;
 }
 
+/* Pre-grow worker: opens one kf shard with wrlock, projects post-insert
+   load, resplits in-place until projected load <= 75% (or hits the
+   per-shard cap). Called via parallel_for_io from slotcask_pregrow_kf
+   so all shards' resplits overlap with each other but not with any
+   concurrent inserter. */
+typedef struct {
+    SlotcaskDb *db;
+    int         kf_shard_id;
+    size_t      add_records;
+} SlotcaskPregrowArg;
+
+static void *slotcask_pregrow_worker(void *raw) {
+    SlotcaskPregrowArg *a = (SlotcaskPregrowArg *)raw;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, a->db->data_dir, a->kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 1) != 0)
+        return NULL;
+    if (kh.hdr) {
+        uint64_t cur_total = kh.hdr->total;
+        uint64_t projected = cur_total + (uint64_t)a->add_records;
+        /* 75% load trigger matches kf_put_new's inline check. Resplit in
+           a loop in case projected load exceeds even the doubled cap. */
+        while (kh.capacity < SLOTCASK_MAX_SLOTS_PER_SHARD &&
+               projected * 4 >= (uint64_t)kh.capacity * 3) {
+            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
+        }
+    }
+    kfcache_release(&kh);
+    return NULL;
+}
+
+/* Pre-grow every kf shard to absorb `total_new` upcoming inserts without
+   triggering inline resplits during the bulk path. Distributes the count
+   uniformly across shards (hash-routing assumption), then resplits each
+   shard in parallel. Pays the resplit cost once, up-front, in a "quiet"
+   moment — avoids the I/O queue contention we'd otherwise hit when
+   resplit msync collides with concurrent segment writes (4-5 sec per
+   resplit at 25M scale, vs ~50ms when run pre-insert). */
+int slotcask_pregrow_kf(SlotcaskDb *db, size_t total_new) {
+    if (!db || total_new == 0 || db->num_shards <= 0) return 0;
+    int n = db->num_shards;
+    size_t per_shard = (total_new + (size_t)n - 1) / (size_t)n;
+    SlotcaskPregrowArg *args = calloc((size_t)n, sizeof(SlotcaskPregrowArg));
+    if (!args) return -1;
+    for (int s = 0; s < n; s++) {
+        args[s].db = db;
+        args[s].kf_shard_id = s;
+        args[s].add_records = per_shard;
+    }
+    parallel_for_io(slotcask_pregrow_worker, args, n, sizeof(SlotcaskPregrowArg));
+    free(args);
+    return 0;
+}
+
 /* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
    reuse, repurposes that slot. Before probing, checks the per-shard
    header.total — when it crosses 75 % of capacity, the shard doubles via
@@ -3377,6 +3432,29 @@ done_collect:
             }
             held_sid = r->sid;
             held_fid = r->fid;
+            /* Prefetch hint for the run we're about to walk: refs are
+               sorted by (sid, fid, offset), so the next consecutive
+               refs with the same (sid, fid) cover a known byte range
+               in this segment. madvise(WILLNEED) tells the kernel to
+               start reading those pages from disk before we touch
+               them — turns synchronous page faults during the walk
+               into background prefetches. Cold-cache full scans at
+               25M+ benefit most (3-10× win in our bench when the
+               working set exceeds page cache). */
+            uint32_t lo = r->offset;
+            uint32_t hi = r->offset;
+            for (size_t j = i + 1; j < nrefs; j++) {
+                if (refs[j].sid != r->sid || refs[j].fid != r->fid) break;
+                if (refs[j].offset > hi) hi = refs[j].offset;
+            }
+            /* Round to page boundary at the low end; pad slot_size at
+               the high end so the last record's bytes are included. */
+            size_t pg = 4096;
+            uintptr_t lo_aligned = (uintptr_t)(sh.map + lo) & ~(uintptr_t)(pg - 1);
+            uintptr_t hi_aligned = ((uintptr_t)(sh.map + hi) + (size_t)db->slot_size + pg - 1)
+                                    & ~(uintptr_t)(pg - 1);
+            if (hi_aligned > lo_aligned)
+                madvise((void *)lo_aligned, hi_aligned - lo_aligned, MADV_WILLNEED);
         }
         SlotcaskKfEntry *e = &kf[r->kf_idx];
         const uint8_t *rec = sh.map + r->offset;

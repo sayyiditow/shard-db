@@ -2465,13 +2465,21 @@ int cmd_server(const char *db_root, int daemonize) {
        objects route reads/writes through these; v1 (legacy) objects continue
        to use ucache. Both engines coexist until migration. */
     slotcask_init(g_fcache_cap, g_fcache_cap);
-    /* Pool size: explicit THREADS wins; otherwise 4× cores.
-       Oversubscription hides shard-rwlock stalls that a thread-per-core
-       pool can't overlap — measured ~18% faster on parallel bulk-insert. */
+    /* CPU pool size: explicit THREADS wins; otherwise nproc - 2 (leaves
+       2 cores for the OS / interactive shell so long full-scan queries
+       don't peg every CPU and freeze the operator's session).
+       Pre-2026.06 this defaulted to 4× nproc to mask page-fault stalls
+       on bulk-insert hot paths; that I/O oversubscription now lives in
+       parallel_for_io (per-call dedicated pthreads) which the bulk-
+       insert / bulk-update / bulk-delete dispatchers route to. CPU-bound
+       paths (reads, scans, aggregates) keep using parallel_for and the
+       bounded CPU pool, so a long scan no longer takes every core. */
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc <= 0) nproc = 4;
     int pool_sz = g_max_threads > 0
                   ? g_max_threads
-                  : (int)sysconf(_SC_NPROCESSORS_ONLN) * 4;
-    if (pool_sz < 4) pool_sz = 4;
+                  : (int)(nproc > 2 ? nproc - 2 : nproc);
+    if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
