@@ -59,16 +59,28 @@ Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even di
 
 ### COUNT — point lookups & ranges by field type
 
-Indexed point lookups settle around **0.1–0.4 ms** regardless of field type; range scans run **0.4–9 ms** depending on selectivity. Set membership (IN/NOT_IN) of 2–4 values is sub-millisecond.
+`eq` cost scales with **match cardinality** — the planner walks one btree
+leaf entry per match. Point lookups (1 match) are sub-millisecond; large
+match sets (100K+ records) pay btree-leaf-walk cost (~10-25 ns per entry,
+parallel across idx shards). Cold-cache first reads add 1-3 ms one-time
+disk-load tax per indexed field.
 
-| op | indexed | non-indexed |
-|---|---|---|
-| `eq` (typed point lookup) | **0.11–0.37 ms** | 50 ms (full scan) |
-| `neq` | 0.06–0.37 ms (negation shortcut: total − eq) | — |
-| Range single-bound (`gt` / `lt` / `gte` / `lte`) | 0.4–8.8 ms | — |
-| Range coalesced (`gt + lt` on same field) | 0.4–6.2 ms (planner merges into one btree range) | — |
-| `between` | 2.1–4.0 ms | — |
-| `in` / `not_in` (2–4 values) | 0.06–0.6 ms | — |
+| op | matches | warm | cold (first query against this index) |
+|---|---|---|---|
+| `eq` point lookup (e.g. `user_id=N`) | 1 | **0.07-0.21 ms** | same |
+| `eq` mid-cardinality (e.g. `age=30`, ~17K) | 10K-100K | 0.2-0.5 ms | 0.5-1.5 ms |
+| `eq` low-cardinality (e.g. `active=false`, ~143K) | >100K | 0.5-2 ms | **2-4 ms** |
+| `eq` non-indexed (full scan) | — | 46 ms | 50 ms |
+| `neq` (negation shortcut: total − count(eq)) | inverted | 0.1-2 ms | 0.5-3 ms |
+| Range single-bound (`gt` / `lt` / `gte` / `lte`) | varies | **0.4-9 ms** | 1-12 ms |
+| Range coalesced (`gt + lt` on same field) | varies | **0.5-6 ms** (planner merges into one btree range) | 1-8 ms |
+| `between` | varies | 1.6-4 ms | 2-6 ms |
+| `in` / `not_in` (2-4 values) | small set | **0.08-1.0 ms** | 0.1-1.5 ms |
+
+**Note**: There is no count shortcut for low-cardinality `eq` (e.g.
+`active=false`) — every match increments a TLS-batched counter. For
+fields where `eq` matches >100K records, the cost is the btree leaf
+walk, not a metadata lookup.
 
 ### COUNT — string ops on indexed varchar
 

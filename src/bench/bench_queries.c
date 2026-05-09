@@ -217,23 +217,27 @@ static int bench_queries_run(void) {
     if (CHUNK_SIZE > COUNT) CHUNK_SIZE = COUNT;
 
     /* SHARD_BENCH_SPLITS overrides the create-object splits value. Default
-       picks the per-tier recommendation from docs/operations/tuning.md so
-       higher SHARD_BENCH_COUNT runs land in the 78K–200K rec/shard sweet
-       spot without manual tuning. Power-of-2 in [8, 4096]. */
+       targets the CLAUDE.md sweet-spot top of ~195K records/shard — each
+       tier doubles splits when the previous tier's record-cap is reached.
+       At splits ≤ 128 this also fits within the engine's 256K initial
+       slots/shard, so inserts at ≤ 24M records pay zero resplit cost.
+       Above splits=128 the engine's per-shard initial drops to 128K/64K
+       and resplits during bulk insert become unavoidable until the engine
+       tier table is bumped. Power-of-2 in [8, 4096]. */
     const char *splits_env = getenv("SHARD_BENCH_SPLITS");
     long SPLITS;
     if (splits_env) {
         SPLITS = atol(splits_env);
     } else {
-        if      (COUNT <=    1000000L) SPLITS = 8;
-        else if (COUNT <=    4000000L) SPLITS = 16;
-        else if (COUNT <=   10000000L) SPLITS = 32;
-        else if (COUNT <=   25000000L) SPLITS = 64;
-        else if (COUNT <=   60000000L) SPLITS = 128;
-        else if (COUNT <=  125000000L) SPLITS = 256;
-        else if (COUNT <=  250000000L) SPLITS = 512;
-        else if (COUNT <=  500000000L) SPLITS = 1024;
-        else if (COUNT <= 1000000000L) SPLITS = 2048;
+        if      (COUNT <=    1500000L) SPLITS = 8;
+        else if (COUNT <=    3000000L) SPLITS = 16;
+        else if (COUNT <=    6000000L) SPLITS = 32;
+        else if (COUNT <=   12000000L) SPLITS = 64;
+        else if (COUNT <=   24000000L) SPLITS = 128;
+        else if (COUNT <=   48000000L) SPLITS = 256;
+        else if (COUNT <=   96000000L) SPLITS = 512;
+        else if (COUNT <=  192000000L) SPLITS = 1024;
+        else if (COUNT <=  384000000L) SPLITS = 2048;
         else                           SPLITS = 4096;
     }
     if (SPLITS < 8) SPLITS = 8;
@@ -313,7 +317,7 @@ static int bench_queries_run(void) {
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) {
-        if (persistent) test_env_kill(&env);
+        if (persistent) test_env_stop_keep(&env);
         else test_env_stop(&env);
         return 1;
     }
@@ -368,7 +372,7 @@ static int bench_queries_run(void) {
             if (build_users_chunk_json((int)inserted, chunk, &buf, &sz) != 0) {
                 fprintf(stderr, "\nbench-queries: OOM building chunk at i=%ld\n", inserted);
                 tc_close(tc);
-                if (persistent) test_env_kill(&env); else test_env_stop(&env);
+                if (persistent) test_env_stop_keep(&env); else test_env_stop(&env);
                 return 1;
             }
 
@@ -376,7 +380,7 @@ static int bench_queries_run(void) {
             free(buf);
             if (data_fd < 0) {
                 tc_close(tc);
-                if (persistent) test_env_kill(&env); else test_env_stop(&env);
+                if (persistent) test_env_stop_keep(&env); else test_env_stop(&env);
                 return 1;
             }
 
@@ -768,7 +772,7 @@ static int bench_queries_run(void) {
     printf("======================================================================\n");
 
     tc_close(tc);
-    if (persistent) test_env_kill(&env);
+    if (persistent) test_env_stop_keep(&env);
     else test_env_stop(&env);
     return 0;
 }
