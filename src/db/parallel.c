@@ -310,25 +310,30 @@ void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
         return;
     }
     pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
+    char *valid = calloc((size_t)n, sizeof(char));
     ParallelIoTask *tasks = malloc((size_t)n * sizeof(ParallelIoTask));
-    if (!threads || !tasks) {
+    if (!threads || !valid || !tasks) {
         /* OOM fallback — run sequentially. Slow but correct. */
-        free(threads); free(tasks);
+        free(threads); free(valid); free(tasks);
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
-    int spawned = 0;
     for (int i = 0; i < n; i++) {
         tasks[i].fn = fn;
         tasks[i].arg = (char *)args + (size_t)i * stride;
         if (pthread_create(&threads[i], NULL, parallel_io_thread, &tasks[i]) == 0) {
-            spawned++;
+            valid[i] = 1;
         } else {
             /* Spawn failure (typically EAGAIN under thread limit) — run
-               this one inline so caller still sees correct semantics. */
+               this one inline so caller still sees correct semantics.
+               valid[i] stays 0 so the join loop skips this slot —
+               threads[i] would be uninitialised garbage and pthread_join
+               on garbage is undefined behaviour (can hang). */
             fn(tasks[i].arg);
         }
     }
-    for (int i = 0; i < spawned; i++) pthread_join(threads[i], NULL);
-    free(threads); free(tasks);
+    for (int i = 0; i < n; i++) {
+        if (valid[i]) pthread_join(threads[i], NULL);
+    }
+    free(threads); free(valid); free(tasks);
 }
