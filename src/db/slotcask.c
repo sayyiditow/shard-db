@@ -2594,6 +2594,23 @@ typedef struct {
     uint8_t  got_pool;      /* 1 = slot came from free pool (rollback path differs) */
 } SlotcaskBulkState;
 
+/* Slow bulk upsert: lookup → optional OLD read → seg write → kf commit.
+   Required when callers depend on OLD before commit (require_existing,
+   pre_commit_needs_old, value_compute). */
+static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                        SlotcaskBulkRec *recs, size_t n,
+                                        const SlotcaskBulkOpts *opts);
+
+/* Fast bulk upsert: skip Phase 1a's kf_lookup. For each record, attempt
+   kf_put_new in the commit phase; on duplicate, upgrade-to-update inline
+   (lookup + read OLD + pre_commit + kf_repoint). For pure-insert workloads
+   (the common bulk-insert case with all-new keys), this saves one probe
+   per record — at 200K records / kf shard, that's ~20-40ms of pure probe
+   cost per shard (~12-25% of bulk-insert wall time). */
+static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                        SlotcaskBulkRec *recs, size_t n,
+                                        const SlotcaskBulkOpts *opts);
+
 int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *opts) {
@@ -2601,6 +2618,20 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     SlotcaskBulkOpts blank = {0};
     if (!opts) opts = &blank;
 
+    /* Slow path required when caller needs OLD bytes before commit:
+       - require_existing: bulk-update gate, must reject missing keys
+       - pre_commit_needs_old: indexed update needs old value for diff
+       - value_compute: bulk-update derives NEW from OLD */
+    if (opts->require_existing || opts->pre_commit_needs_old ||
+        opts->value_compute != NULL) {
+        return bulk_upsert_slow_in_kfshard(db, kf_shard_id, recs, n, opts);
+    }
+    return bulk_upsert_fast_in_kfshard(db, kf_shard_id, recs, n, opts);
+}
+
+static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                        SlotcaskBulkRec *recs, size_t n,
+                                        const SlotcaskBulkOpts *opts) {
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, kf_shard_id);
     SlotcaskKfHandle kh;
@@ -2998,6 +3029,331 @@ oom:
     if (stream_idx) for (int s = 0; s < db->num_streams; s++) free(stream_idx[s]);
     free(stream_idx); free(stream_pos); free(stream_counts);
     for (size_t i = 0; i < n; i++) free(st[i].old_buf);
+    free(st);
+    return -1;
+}
+
+/* ============================================================ Bulk fast path
+ *
+ * Skip Phase 1a's kf_lookup. Pre-commit fires AFTER kf commit so a
+ * duplicate detected by kf_put_new can roll back without leaving stale
+ * index entries. For records that turn out to already exist (rare in
+ * pure-insert workloads), the upgrade-to-update path runs INLINE in
+ * Phase 4: kf_lookup + read OLD + pre_commit(old) + kf_repoint. Same
+ * total cost as slow path for that record; net win comes from new keys
+ * skipping the upfront probe. Gated to bulk-insert callers.
+ */
+static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
+                                        SlotcaskBulkRec *recs, size_t n,
+                                        const SlotcaskBulkOpts *opts) {
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    SlotcaskBulkState *st = calloc(n, sizeof(SlotcaskBulkState));
+    int *stream_counts = NULL;
+    int **stream_idx = NULL;
+    int *stream_pos = NULL;
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    /* Phase 1: validate, hash, route — NO kf lookup. */
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+        if (r->klen > UINT16_MAX || r->vlen > UINT32_MAX ||
+            (size_t)24 + r->klen + r->vlen > (size_t)db->slot_size) {
+            r->status = -1;
+            continue;
+        }
+        compute_hash(r->key, r->klen, st[i].hash);
+        st[i].target_stream = (uint8_t)((unsigned)st[i].hash[15] %
+                                         (unsigned)db->num_streams);
+        st[i].needs_write = 1;
+    }
+
+    /* Phase 2: bucket by stream. */
+    stream_counts = calloc(db->num_streams, sizeof(int));
+    stream_idx    = calloc(db->num_streams, sizeof(int *));
+    stream_pos    = calloc(db->num_streams, sizeof(int));
+    if (!stream_counts || !stream_idx || !stream_pos) goto fast_oom;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].needs_write) stream_counts[st[i].target_stream]++;
+    }
+    for (int s = 0; s < db->num_streams; s++) {
+        if (stream_counts[s] > 0) {
+            stream_idx[s] = malloc(stream_counts[s] * sizeof(int));
+            if (!stream_idx[s]) goto fast_oom;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].needs_write) {
+            int s = st[i].target_stream;
+            stream_idx[s][stream_pos[s]++] = (int)i;
+        }
+    }
+
+    /* Phase 3: per-stream batched reserve + seg write. Same as slow path. */
+    for (int s = 0; s < db->num_streams; s++) {
+        int cnt = stream_counts[s];
+        if (cnt == 0) continue;
+        SlotcaskStream *pool = &db->streams[s];
+
+        SlotcaskFreeSlot *fs = malloc((size_t)cnt * sizeof(SlotcaskFreeSlot));
+        if (!fs) {
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        int got_pool = (pool_try_pop_n(pool, (size_t)cnt, fs) == 0);
+
+        if (got_pool) {
+            typedef struct { uint16_t fid; uint32_t off; int rec_idx; } PoolItem;
+            PoolItem *items = malloc((size_t)cnt * sizeof(PoolItem));
+            if (!items) {
+                for (int k = 0; k < cnt; k++) {
+                    int i = stream_idx[s][k];
+                    pool_push_free(pool, fs[k].file_id, fs[k].offset);
+                    recs[i].status = -1;
+                }
+                free(fs);
+                continue;
+            }
+            for (int k = 0; k < cnt; k++) {
+                items[k].fid     = fs[k].file_id;
+                items[k].off     = fs[k].offset;
+                items[k].rec_idx = stream_idx[s][k];
+            }
+            free(fs);
+            for (int a = 1; a < cnt; a++) {
+                PoolItem tmp = items[a];
+                int b = a - 1;
+                while (b >= 0 && items[b].fid > tmp.fid) {
+                    items[b + 1] = items[b];
+                    b--;
+                }
+                items[b + 1] = tmp;
+            }
+            int k = 0;
+            while (k < cnt) {
+                int run_end = k + 1;
+                while (run_end < cnt && items[run_end].fid == items[k].fid)
+                    run_end++;
+                char path[PATH_MAX];
+                seg_path_for(path, db->data_dir, (uint8_t)s, items[k].fid);
+                SlotcaskSegHandle h;
+                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                    for (int j = k; j < run_end; j++) {
+                        int i = items[j].rec_idx;
+                        pool_push_free(pool, items[j].fid, items[j].off);
+                        recs[i].status = -1;
+                    }
+                    k = run_end;
+                    continue;
+                }
+                for (int j = k; j < run_end; j++) {
+                    int i = items[j].rec_idx;
+                    SlotcaskBulkRec *r = &recs[i];
+                    st[i].target_fid = items[j].fid;
+                    st[i].target_off = items[j].off;
+                    st[i].got_pool   = 1;
+                    uint8_t *dst = h.map + items[j].off;
+                    memcpy(dst, st[i].hash, 16);
+                    uint16_t k16 = (uint16_t)r->klen;
+                    memcpy(dst + 16, &k16, 2);
+                    dst[18] = 0;
+                    dst[19] = 0;
+                    uint32_t v32 = (uint32_t)r->vlen;
+                    memcpy(dst + 20, &v32, 4);
+                    memcpy(dst + 24, r->key, r->klen);
+                    memcpy(dst + 24 + r->klen, r->value, r->vlen);
+                    size_t used = 24 + r->klen + r->vlen;
+                    if (used < (size_t)db->slot_size) {
+                        memset(dst + used, 0, (size_t)db->slot_size - used);
+                    }
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
+                    dst[18] = 1;
+                }
+                segcache_release(&h);
+                k = run_end;
+            }
+            free(items);
+            continue;
+        }
+        free(fs);
+
+        uint32_t *offsets = malloc((size_t)cnt * sizeof(uint32_t));
+        if (!offsets) {
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        uint32_t base_fid = 0;
+        if (append_reserve_n(db, pool, (size_t)cnt, &base_fid, offsets) != 0) {
+            free(offsets);
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, (uint8_t)s, base_fid);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 1, 0) != 0) {
+            free(offsets);
+            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
+            continue;
+        }
+        for (int k = 0; k < cnt; k++) {
+            int i = stream_idx[s][k];
+            SlotcaskBulkRec *r = &recs[i];
+            st[i].target_fid = (uint16_t)base_fid;
+            st[i].target_off = offsets[k];
+            st[i].got_pool   = 0;
+            uint8_t *dst = h.map + offsets[k];
+            memcpy(dst, st[i].hash, 16);
+            uint16_t k16 = (uint16_t)r->klen;
+            memcpy(dst + 16, &k16, 2);
+            dst[18] = 0;
+            dst[19] = 0;
+            uint32_t v32 = (uint32_t)r->vlen;
+            memcpy(dst + 20, &v32, 4);
+            memcpy(dst + 24, r->key, r->klen);
+            memcpy(dst + 24 + r->klen, r->value, r->vlen);
+            size_t used = 24 + r->klen + r->vlen;
+            if (used < (size_t)db->slot_size) {
+                memset(dst + used, 0, (size_t)db->slot_size - used);
+            }
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            dst[18] = 1;
+        }
+        segcache_release(&h);
+        free(offsets);
+    }
+
+    /* Phase 4: kf commit + on-duplicate upgrade-to-update. */
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].status != 0) continue;
+        if (!st[i].needs_write) continue;
+        SlotcaskBulkRec *r = &recs[i];
+
+        size_t used_delta = 0;
+        int put_rc = kf_put_new(db, &kh, st[i].hash,
+                                 st[i].target_stream, st[i].target_fid,
+                                 st[i].target_off, r->key, r->klen,
+                                 db->data_dir, &used_delta);
+
+        if (put_rc == 0) {
+            /* New key. Run pre_commit (with old=NULL). */
+            if (opts->pre_commit) {
+                int rc = opts->pre_commit(NULL, r, 0);
+                if (rc != 0) {
+                    /* Rollback: tombstone seg + clear our just-inserted kf entry. */
+                    uint8_t  tmp_flag = 0, tmp_sid = 0;
+                    uint16_t tmp_fid = 0;
+                    uint32_t tmp_off = 0;
+                    size_t   tmp_slot = 0;
+                    if (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
+                                             db->data_dir, &tmp_flag, &tmp_sid,
+                                             &tmp_fid, &tmp_off, &tmp_slot) == 0) {
+                        kf_tombstone_at_slot(&kh, tmp_slot);
+                    }
+                    seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                    st[i].target_off, 2);
+                    pool_push_free(&db->streams[st[i].target_stream],
+                                    st[i].target_fid, st[i].target_off);
+                    r->status = -1;
+                }
+            }
+            r->was_update = 0;
+            continue;
+        }
+
+        if (put_rc == 1) {
+            if (opts->if_not_exists) {
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
+                r->status = -2;
+                r->was_update = 1;
+                continue;
+            }
+            /* Upgrade to update inline. */
+            uint8_t  ex_flag = 0, ex_sid = 0;
+            uint16_t ex_fid = 0;
+            uint32_t ex_off = 0;
+            size_t   ex_slot = 0;
+            if (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
+                                     db->data_dir, &ex_flag, &ex_sid, &ex_fid,
+                                     &ex_off, &ex_slot) != 0) {
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
+                r->status = -1;
+                continue;
+            }
+            uint8_t *old_buf = NULL;
+            size_t   old_vlen = 0;
+            if (read_record_value(db, ex_sid, ex_fid, ex_off, r->key, r->klen,
+                                   &old_buf, &old_vlen) != 0) {
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
+                r->status = -1;
+                continue;
+            }
+            SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+            if (opts->pre_commit) {
+                int rc = opts->pre_commit(&old_rec, r, 1);
+                if (rc != 0) {
+                    seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                    st[i].target_off, 2);
+                    pool_push_free(&db->streams[st[i].target_stream],
+                                    st[i].target_fid, st[i].target_off);
+                    free(old_buf);
+                    r->status = -1;
+                    continue;
+                }
+            }
+            kf_repoint_at_slot(&kh, ex_slot, st[i].target_stream,
+                                st[i].target_fid, st[i].target_off);
+            st[i].old_found = 1;
+            st[i].old_sid = ex_sid;
+            st[i].old_fid = ex_fid;
+            st[i].old_off = ex_off;
+            free(old_buf);
+            r->was_update = 1;
+            continue;
+        }
+
+        /* Other kf error. */
+        seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                        st[i].target_off, 2);
+        pool_push_free(&db->streams[st[i].target_stream],
+                        st[i].target_fid, st[i].target_off);
+        r->status = -1;
+    }
+
+    kfcache_release(&kh);
+
+    /* Phase 5: tombstone OLD seg slots for upgraded records (after wrlock). */
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].status != 0) continue;
+        if (!st[i].old_found) continue;
+        seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
+        pool_push_free(&db->streams[st[i].old_sid],
+                        st[i].old_fid, st[i].old_off);
+    }
+
+    if (stream_idx) for (int s = 0; s < db->num_streams; s++) free(stream_idx[s]);
+    free(stream_idx); free(stream_pos); free(stream_counts);
+    free(st);
+    return 0;
+
+fast_oom:
+    kfcache_release(&kh);
+    if (stream_idx) for (int s = 0; s < db->num_streams; s++) free(stream_idx[s]);
+    free(stream_idx); free(stream_pos); free(stream_counts);
     free(st);
     return -1;
 }
