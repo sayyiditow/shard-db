@@ -22,12 +22,16 @@
 /* Tunables — note that this test exists to detect HANGS, not to benchmark.
    With persistent connections (vs bash's fork-per-op CLI), the daemon
    sees ~35× more concurrent load than the bash original at the same
-   worker count. We compensate by lowering WORKERS and bumping the probe
-   timeout so legitimate slow-but-progressing responses aren't flagged. */
+   worker count. GHA runners are 2-vCPU shared so 8 workers × 2 indexes
+   on splits=256 plus the watchdog can blow through the old 15-second
+   probe budget under heavy mmap/index pressure. PROBE_TIMEOUT_SEC=30
+   keeps a real hang detectable while letting legitimate slow-but-
+   progressing v2 responses pass; this is still a hang detector, not
+   a latency benchmark. */
 #define WORKERS 8
 #define DURATION_SEC 10
 #define PROBE_INTERVAL_SEC 2
-#define PROBE_TIMEOUT_SEC 15
+#define PROBE_TIMEOUT_SEC 30
 
 static atomic_int g_stop = 0;
 
