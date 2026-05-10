@@ -22,12 +22,9 @@
 /* Tunables — note that this test exists to detect HANGS, not to benchmark.
    With persistent connections (vs bash's fork-per-op CLI), the daemon
    sees ~35× more concurrent load than the bash original at the same
-   worker count. GHA runners are 2-vCPU shared so 8 workers × 2 indexes
-   on splits=256 plus the watchdog can blow through the old 15-second
-   probe budget under heavy mmap/index pressure. PROBE_TIMEOUT_SEC=30
-   keeps a real hang detectable while letting legitimate slow-but-
-   progressing v2 responses pass; this is still a hang detector, not
-   a latency benchmark. */
+   worker count. PROBE_TIMEOUT_SEC=30 keeps a real hang detectable while
+   tolerating GHA-runner slowness; the test is a hang detector, not a
+   latency benchmark. */
 #define WORKERS 8
 #define DURATION_SEC 10
 #define PROBE_INTERVAL_SEC 2
@@ -155,7 +152,14 @@ static int test_stress_no_hang_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"stress\","
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:32\"],"
-        "\"indexes\":[\"status\",\"amount\"],\"splits\":256}", &resp); free(resp); resp = NULL;
+        /* splits=8 — the test inserts at most a few hundred records over
+           DURATION_SEC, well below the splits=8 sweet-spot range
+           (~78K-200K records/shard per CLAUDE.md sizing). The previous
+           splits=256 was over-provisioned for ~20-50M records and made
+           slotcask_open's eager kf-materialise loop dominate startup
+           on slow shared CI disks (256 × open+ftruncate+mmap+madvise
+           ≈ 30s on GHA SSD). Hang-detection semantics are unchanged. */
+        "\"indexes\":[\"status\",\"amount\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_close(tc); tc = NULL;
 
     /* Spawn workers + watchdog. */

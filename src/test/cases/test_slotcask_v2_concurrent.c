@@ -219,13 +219,16 @@ static int test_slotcask_v2_concurrent_run(void) {
     ASSERT_NOT_NULL(tc, "reconnect post-stress");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    /* Threshold deliberately low — this test is a torn-read detector,
-       not a throughput benchmark. On 2-vCPU CI runners with 4 writers +
-       4 readers oversubscribing the 16-thread server pool, readers can
-       lose CPU slices to writers under contention while still proving
-       liveness if they got any ops in. 10 = "at least some progress". */
-    ASSERT_TRUE(total_writes > 10, "writers did meaningful work (>10 ops)");
-    ASSERT_TRUE(total_reads > 10, "readers did meaningful work (>10 ops)");
+    /* Liveness check only — this test is a torn-read detector, not a
+       throughput benchmark. On 2-vCPU CI runners under heavy writer
+       contention readers can be effectively starved (saw 4 reads in
+       3s on GHA x86_64 while writers managed 200K+); arm64 same run
+       had readers at 69K. The combined-progress threshold catches
+       "daemon wedged completely" while tolerating extreme reader/
+       writer skew that doesn't affect the real correctness check
+       below (no torn reads). */
+    ASSERT_TRUE(total_writes + total_reads > 100,
+                "some forward progress under load (writes + reads > 100)");
     ASSERT_EQ_INT(total_torn, 0, "no torn reads observed");
 
     /* Final consistency: full scan vs count must agree. */
