@@ -27,11 +27,9 @@
 } while (0)
 
 /* True iff `s` contains only characters safe to embed in a shell command
-   without quoting (alnum, '/', '.', '_', '-'). Used to gate system()
-   calls in bench harnesses that take a path or identifier from env vars
-   or the test fixture — silences CodeQL "uncontrolled data in OS
-   command" findings AND defends against shell injection if the input
-   ever becomes user-controllable. NULL or empty string returns 0. */
+   without quoting (alnum, '/', '.', '_', '-'). NULL or empty returns 0.
+   Kept for legacy paths that still want a sanity gate even though
+   bench_safe_exec below is the preferred route for shell-free spawn. */
 static inline int bench_path_safe(const char *s) {
     if (!s || !*s) return 0;
     for (const char *p = s; *p; p++) {
@@ -40,6 +38,32 @@ static inline int bench_path_safe(const char *s) {
             return 0;
     }
     return 1;
+}
+
+/* fork+execvp wrapper: runs `argv` directly via exec, no shell — so
+   the per-arg bytes can never be interpreted as shell metacharacters.
+   This is what CodeQL recognises as the safe replacement for
+   system("cmd " + user_input) — the validator-then-system pattern
+   keeps the dataflow from input → system() that CodeQL flags as
+   "uncontrolled data in OS command".
+   argv must be NULL-terminated. Returns 0 on exit-zero, the child's
+   non-zero exit status, or -1 if fork/exec failed. */
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
+static inline int bench_safe_exec(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status;
+    pid_t r;
+    do { r = waitpid(pid, &status, 0); } while (r < 0 && errno == EINTR);
+    if (r < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 #include <stdint.h>
 #include <stdlib.h>

@@ -287,14 +287,10 @@ static int bench_queries_run(void) {
                             "(e.g. /tmp/qbench/db)\n");
             return 1;
         }
-        if (!bench_path_safe(db_root_env)) {
-            fprintf(stderr, "bench-queries: SHARD_BENCH_DB_ROOT contains "
-                            "shell-unsafe characters: %s\n", db_root_env);
-            return 1;
-        }
-        char mkdir_cmd[600];
-        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", db_root_env);
-        if (system(mkdir_cmd) != 0) {
+        char *mkdir_argv[] = {
+            (char *)"mkdir", (char *)"-p", (char *)db_root_env, NULL
+        };
+        if (bench_safe_exec(mkdir_argv) != 0) {
             fprintf(stderr, "bench-queries: mkdir failed for %s\n", db_root_env);
             return 1;
         }

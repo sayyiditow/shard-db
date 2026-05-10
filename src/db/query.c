@@ -12936,49 +12936,36 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
     char data_legacy[PATH_MAX];
     snprintf(data_legacy, sizeof(data_legacy), "%s/data.legacy", obj_dir);
 
-    /* Already-renamed legacy from a prior aborted migration → bail with
-       a clear error so the operator can investigate. We won't auto-restore.
-       Coverity CID 1693835 flags TOCTOU between these stat() calls and
-       the rename() below. Suppressed: cmd_migrate_storage_version is
-       gated by mode_is_schema → caller holds objlock_wrlock so no
-       concurrent in-process caller can race; cross-process concurrency
-       is excluded by the single-instance flock on $DB_ROOT/.shard-db.lock
-       (see cmd_server). The stat is informational; the actual atomic
-       step is the rename(data_dir, data_legacy) below, which fails
-       cleanly if the FS has changed under us. */
-    struct stat st;
-    /* coverity[toctou] guarded by objlock_wrlock + single-instance flock */
-    if (stat(data_legacy, &st) == 0) {
-        OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-            dir, object);
-        return 1;
-    }
-    /* coverity[toctou] guarded by objlock_wrlock + single-instance flock */
-    if (stat(data_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        OUT("{\"error\":\"data/ missing for v1 object [%s/%s]\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-            dir, object, dir, object);
-        return 1;
-    }
-
     /* v2 slot_size includes the 24B inline per-record header (see
        load_schema commentary). streams from nproc. */
     int streams = slotcask_streams_for_nproc();
     int new_slot_size = (24 + sc.max_key + sc.max_value + 7) & ~7;
     if (new_slot_size < 32) new_slot_size = 32;
 
-    /* Step 1: rename v1 data/ → data.legacy/ so the new slotcask can
-       create its own data/ subtree (kf/, streams/) without colliding
-       with the v1 NNN.bin files. */
+    /* Step 1: atomically rename v1 data/ → data.legacy/ so the new
+       slotcask can create its own data/ subtree (kf/, streams/) without
+       colliding with the v1 NNN.bin files.
+
+       Use renameat2(RENAME_NOREPLACE) — the rename succeeds only if
+       data.legacy doesn't already exist, in one atomic syscall. This
+       eliminates the stat-then-rename TOCTOU window that the previous
+       shape had (CodeQL CIDs flagged 12979 + 12992; Coverity CID
+       1693835 same root cause). errno mapping recovers the same three
+       error messages the old stats produced. */
     fcache_invalidate(data_dir);
-    /* CodeQL flagged TOCTOU race against the stat() above. Same gate as
-       the earlier suppression: cmd_migrate_storage_version is called
-       under objlock_wrlock (mode_is_schema) and the single-instance
-       flock on $DB_ROOT/.shard-db.lock prevents cross-process races.
-       The rename is the atomic step; if the FS shifted under us between
-       stat and rename, rename returns an error which we surface. */
-    if (rename(data_dir, data_legacy) != 0) {
-        OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
-            strerror(errno));
+    if (renameat2(AT_FDCWD, data_dir, AT_FDCWD, data_legacy,
+                   RENAME_NOREPLACE) != 0) {
+        int e = errno;
+        if (e == EEXIST) {
+            OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+                dir, object);
+        } else if (e == ENOENT) {
+            OUT("{\"error\":\"data/ missing for v1 object [%s/%s]\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
+                dir, object, dir, object);
+        } else {
+            OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
+                strerror(e));
+        }
         return 1;
     }
 
@@ -12986,10 +12973,12 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
        data/streams/ on the way in. */
     SlotcaskDb sdb;
     if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
-        /* Best-effort rollback of the rename. Same lock gating as the
-           forward rename above — if rollback also fails the operator
+        /* Best-effort rollback of the rename. data/ doesn't exist (we
+           just renamed it away) and data.legacy is ours — RENAME_NOREPLACE
+           keeps this race-free too. If rollback also fails the operator
            sees both error paths logged. */
-        if (rename(data_legacy, data_dir) != 0)
+        if (renameat2(AT_FDCWD, data_legacy, AT_FDCWD, data_dir,
+                       RENAME_NOREPLACE) != 0)
             log_msg(1, "migrate: rollback rename failed: %s", strerror(errno));
         OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
             dir, object);

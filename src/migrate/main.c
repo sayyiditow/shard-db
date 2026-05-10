@@ -26,8 +26,8 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
-#include <ctype.h>
 #include <linux/limits.h>
 
 #include "migrate.h"
@@ -136,35 +136,54 @@ static int migrate_v1_objects(const char *db_root) {
             continue;
         }
 
-        /* Validate dir/obj before embedding into a shell command — same
-           charset the daemon's valid_filename allows, but enforced here
-           too because migrate runs outside the daemon and reads
-           schema.conf directly. CodeQL flagged the system() call as
-           "uncontrolled data in OS command"; this gate is the safety
-           barrier (and a defense against a hand-edited schema.conf). */
-        int safe = 1;
+        /* Spawn ./shard-db via fork+execvp — no shell interpretation of
+           the dir/obj bytes embedded into the JSON arg. The validator
+           above is gone; argv arguments are passed verbatim by the OS,
+           so dir="foo;rm -rf /" can't escape into a second command.
+           Still validate the JSON character set (no embedded `"` or `\`)
+           since dir/obj go inside a JSON-quoted string and would
+           syntactically break the request — but that's data correctness,
+           not shell safety. */
+        int json_safe = 1;
         for (const char *p = dir; *p; p++) {
-            unsigned char c = (unsigned char)*p;
-            if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) { safe = 0; break; }
+            if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) {
+                json_safe = 0; break;
+            }
         }
-        for (const char *p = obj; safe && *p; p++) {
-            unsigned char c = (unsigned char)*p;
-            if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) { safe = 0; break; }
+        for (const char *p = obj; json_safe && *p; p++) {
+            if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) {
+                json_safe = 0; break;
+            }
         }
-        if (!safe) {
+        if (!json_safe) {
             fprintf(stderr,
-                "migrate: skipping %s/%s — name contains shell-unsafe characters\n",
+                "migrate: skipping %s/%s — name has chars that would break the JSON request\n",
                 dir, obj);
             failed++;
             continue;
         }
 
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd),
-            "./shard-db query "
-            "'{\"mode\":\"migrate-storage-version\",\"dir\":\"%s\",\"object\":\"%s\"}'",
+        char json[1024];
+        snprintf(json, sizeof(json),
+            "{\"mode\":\"migrate-storage-version\",\"dir\":\"%s\",\"object\":\"%s\"}",
             dir, obj);
-        int rc = system(cmd);
+        char *argv[] = {
+            (char *)"./shard-db", (char *)"query", json, NULL
+        };
+        pid_t pid = fork();
+        int rc;
+        if (pid < 0) {
+            rc = -1;
+        } else if (pid == 0) {
+            execvp(argv[0], argv);
+            _exit(127);
+        } else {
+            int status;
+            pid_t r;
+            do { r = waitpid(pid, &status, 0); } while (r < 0 && errno == EINTR);
+            rc = (r < 0) ? -1
+                : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
         if (rc != 0) {
             fprintf(stderr,
                 "migrate: per-object migration failed for %s/%s (rc=%d)\n",
