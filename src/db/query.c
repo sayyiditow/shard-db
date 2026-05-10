@@ -12822,6 +12822,9 @@ int cmd_truncate(const char *db_root, const char *object) {
 
 typedef struct {
     SlotcaskDb *sdb;
+    /* Updated from parallel scan_shards workers — must be atomic.
+       Plain int++ raced and undercounted on slower CPUs (CI ASan
+       reliably hit it; local rarely). */
     int         inserted;
     int         err;
 } MigrateWalkCtx;
@@ -12833,8 +12836,11 @@ static int migrate_walk_cb(const SlotHeader *hdr, const uint8_t *block, void *ct
     int rc = slotcask_insert(c->sdb, -1,
                               key, hdr->key_len,
                               value, hdr->value_len);
-    if (rc != 0) { c->err = 1; return 1; }  /* halt scan on insert failure */
-    c->inserted++;
+    if (rc != 0) {
+        __atomic_store_n(&c->err, 1, __ATOMIC_RELEASE);
+        return 1;  /* halt scan on insert failure */
+    }
+    __atomic_fetch_add(&c->inserted, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
