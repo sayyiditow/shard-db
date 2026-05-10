@@ -266,7 +266,7 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 | Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | **<1 ms warm** (was 64–65 ms in earlier docs — that was first-touch cold; the post-2026.05.1 batched seg-acquire makes warm-cache range cheap) |
 | Indexed `OR` (two statuses) | **3.6 ms** (was 23 ms — kf-derived counts let the OR keyset size correctly without falling through to per-record scan) |
 | Fetch page of 100 @ offset 5000 | <1 ms |
-| Keys (first 100) | **<1 ms** (with stop_flag check tightened to every 256 slots — was 6–9 ms when limit-bound queries waited up to 4096 wasted iterations for the global stop signal) |
+| Keys (first 100) | **6–9 ms** — `slotcask_walk_one_shard` collects all kf refs in a Pass-1 buffer before Pass-2 reads records, which optimises full scans (per-segment batched cache acquire) but is wasteful for limit-bound calls. A streaming walk path for limit-bound queries is on the backlog; KEYS is an admin/diagnostic command, not a hot-path query, so the regression vs the pre-v2 zone-A streaming path is acceptable. |
 | `count` full object | <1 ms |
 | **Single DELETE ×1000 (with 14 indexes)** | **15 k/sec** (mean 67µs / p50 63µs) |
 | **Bulk DELETE ×1000** | **143 k/sec** (7 ms) |
