@@ -948,6 +948,11 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     return 0;
 }
 
+/* Forward decl — defined further down with the rest of the free-pool
+   primitives. Needed here because the parallel_for workers below
+   (slotcask_pool_rebuild_worker) call it before its file position. */
+static int pool_push_free(SlotcaskStream *p, uint16_t file_id, uint32_t offset);
+
 /* Pre-grow worker: opens one kf shard with wrlock, projects post-insert
    load, resplits in-place until projected load <= 75% (or hits the
    per-shard cap). Called via parallel_for_io from slotcask_pregrow_kf
@@ -1001,6 +1006,57 @@ int slotcask_pregrow_kf(SlotcaskDb *db, size_t total_new) {
     parallel_for_io(slotcask_pregrow_worker, args, n, sizeof(SlotcaskPregrowArg));
     free(args);
     return 0;
+}
+
+/* Per-shard kf-materialise worker for slotcask_open's parallel init.
+   Cleans any leftover .new staging file from a prior crashed resplit,
+   then opens + mmaps the shard so subsequent accesses hit the cache. */
+typedef struct {
+    SlotcaskDb *db;
+    int         shard_id;
+    int         ok;          /* 1 = success, 0 = open failed (any error) */
+    int         needs_pool;  /* 1 if hdr->deleted > 0 (pool-rebuild required) */
+} SlotcaskOpenArg;
+
+static void *slotcask_open_kf_worker(void *raw) {
+    SlotcaskOpenArg *a = (SlotcaskOpenArg *)raw;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, a->db->data_dir, a->shard_id);
+    char kf_new[PATH_MAX];
+    snprintf(kf_new, sizeof(kf_new), "%s.new", kf_path);
+    (void)unlink(kf_new);  /* idempotent — ENOENT is fine */
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 1) != 0) {
+        a->ok = 0;
+        a->needs_pool = 0;
+        return NULL;
+    }
+    a->ok = 1;
+    a->needs_pool = (kh.hdr && kh.hdr->deleted > 0) ? 1 : 0;
+    kfcache_release(&kh);
+    return NULL;
+}
+
+/* Per-shard pool-rebuild worker. Walks the kf shard for flag=2 entries
+   and pushes each (file_id, offset) onto the right stream's free pool.
+   Only invoked for shards whose header reports deleted > 0; clean kf
+   shards skip this O(slots_per_shard) memory walk entirely. */
+static void *slotcask_pool_rebuild_worker(void *raw) {
+    SlotcaskOpenArg *a = (SlotcaskOpenArg *)raw;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, a->db->data_dir, a->shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 0) != 0) return NULL;
+    size_t cap = kh.capacity;
+    SlotcaskKfEntry *kf = kh.map;
+    for (size_t i = 0; i < cap; i++) {
+        if (kf[i].flag == 2 && kf[i].stream_id < a->db->num_streams) {
+            pool_push_free(&a->db->streams[kf[i].stream_id],
+                            kf[i].file_id, kf[i].offset);
+        }
+    }
+    kfcache_release(&kh);
+    return NULL;
 }
 
 /* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
@@ -1884,16 +1940,22 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
        after create-object. The mmaps drop out of memory under cache pressure
        just like any other kfcache entry.
        Also clean up any leftover .new staging files from a prior crashed
-       resplit — kf.new is only valid mid-rebuild, never persistent. */
+       resplit — kf.new is only valid mid-rebuild, never persistent.
+       Parallelised: at splits=256 on slow shared CI disks the serial
+       open + ftruncate + mmap + madvise(HUGEPAGE) loop ran 30+ s and
+       blocked every concurrent registry_get behind g_reg_lock. Per-shard
+       work is independent (distinct kf paths); kfcache's internal mutex
+       still serialises the actual cache-table install. */
+    SlotcaskOpenArg *open_args = calloc((size_t)num_shards, sizeof(SlotcaskOpenArg));
+    if (!open_args) goto fail;
     for (int i = 0; i < num_shards; i++) {
-        char kf_path[PATH_MAX];
-        kf_path_for(kf_path, data_dir, i);
-        char kf_new[PATH_MAX];
-        snprintf(kf_new, sizeof(kf_new), "%s.new", kf_path);
-        (void)unlink(kf_new);  /* idempotent — ENOENT is fine */
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) goto fail;
-        kfcache_release(&kh);
+        open_args[i].db = db;
+        open_args[i].shard_id = i;
+    }
+    parallel_for_io(slotcask_open_kf_worker, open_args, num_shards,
+                     sizeof(SlotcaskOpenArg));
+    for (int i = 0; i < num_shards; i++) {
+        if (!open_args[i].ok) { free(open_args); goto fail; }
     }
 
     /* Always run recover_streams — reserve_off / active_file_id aren't
@@ -1901,7 +1963,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
        at 0 and the next write would clobber a live record at the head
        of the active segment. No-op when the directory is empty. */
     (void)dirty_marker_exists;  /* silence unused warning */
-    if (recover_streams(db) != 0) goto fail;
+    if (recover_streams(db) != 0) { free(open_args); goto fail; }
     if (touch_dirty_marker(db) != 0) {
         /* Non-fatal — recovery will simply re-walk on the next open. */
     }
@@ -1911,26 +1973,31 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
        tombstoned seg slots, leaving them unreusable until the next
        vacuum compaction. Walking each kf shard's flag=2 entries and
        pushing (file_id, offset) to the right stream's pool restores the
-       snake-game property across restarts. ~24 MB of sequential mmap
-       reads for a 1M-record DB at default sizing. */
-    for (int s = 0; s < db->num_shards; s++) {
-        char kf_path[PATH_MAX];
-        kf_path_for(kf_path, db->data_dir, s);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) continue;
-        size_t cap = kh.capacity;
-        SlotcaskKfEntry *kf = kh.map;
-        /* Counts live in the kf header (per-shard), persisted across
-           restarts — no rebuild needed. We only walk to reconstruct the
-           in-memory free-pool from flag=2 entries. */
-        for (size_t i = 0; i < cap; i++) {
-            if (kf[i].flag == 2 && kf[i].stream_id < db->num_streams) {
-                pool_push_free(&db->streams[kf[i].stream_id],
-                                kf[i].file_id, kf[i].offset);
-            }
-        }
-        kfcache_release(&kh);
+       snake-game property across restarts.
+       Skip shards with hdr->deleted == 0 — clean kf shards have no
+       tombstones to harvest, so the O(slots_per_shard) walk is wasted.
+       Parallelise the rest using the same per-shard arg array as the
+       open loop above. */
+    int needs_pool_count = 0;
+    for (int s = 0; s < num_shards; s++) {
+        if (open_args[s].needs_pool) needs_pool_count++;
     }
+    if (needs_pool_count > 0) {
+        SlotcaskOpenArg *pool_args = calloc((size_t)needs_pool_count,
+                                              sizeof(SlotcaskOpenArg));
+        if (!pool_args) { free(open_args); goto fail; }
+        int p = 0;
+        for (int s = 0; s < num_shards; s++) {
+            if (!open_args[s].needs_pool) continue;
+            pool_args[p].db = db;
+            pool_args[p].shard_id = s;
+            p++;
+        }
+        parallel_for_io(slotcask_pool_rebuild_worker, pool_args,
+                         needs_pool_count, sizeof(SlotcaskOpenArg));
+        free(pool_args);
+    }
+    free(open_args);
 
     return 0;
 
