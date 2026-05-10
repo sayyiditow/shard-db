@@ -255,23 +255,24 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 | Operation | Result |
 |---|---|
 | Bulk insert (no indexes) | **357 k/sec** (2.80 s) |
-| Bulk insert (with 14 indexes) | **230 k/sec** (4.35 s) — 36% slowdown vs no-idx |
-| Add 14 indexes post-insert | **2.79 s** (per-shard parallel build — 14 × splits/4 workers) |
-| GET ×1000 (req-resp, 1 conn) | **30 k ops/sec** (mean 33µs / p50 31µs / p99 101µs) |
-| EXISTS ×1000 (req-resp) | **37 k ops/sec** (mean 26µs / p50 26µs / p99 43µs) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **1–2 ms** |
-| Indexed `contains` via leaf scan | 1–11 ms |
-| Indexed IN (2 values) | 1 ms |
-| Composite index eq / starts | 1–2 ms |
-| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | **64–65 ms** (cold-cache; the bench's pre-range battery never touches these btrees, so they're cold when range fires. Once warm — see §3's age-range numbers — these drop to <1 ms) |
-| Indexed `OR` (two statuses) | 23 ms |
-| Fetch page of 100 @ offset 5000 | 1 ms |
-| Keys (first 100) | <1 ms |
+| Bulk insert (with 14 indexes) | **216 k/sec** (4.63 s) — 46% slowdown vs no-idx |
+| Add 14 indexes post-insert | **2.70 s** (per-shard parallel build — 14 × splits/4 workers) |
+| GET ×1000 (req-resp, 1 conn) | **29 k ops/sec** (mean 34µs / p50 32µs) |
+| EXISTS ×1000 (req-resp) | **37 k ops/sec** (mean 27µs / p50 27µs) |
+| Indexed eq `find` (any of 14 indexes, limit 10) | **0.8–1.6 ms** |
+| Indexed `contains` via leaf scan | 0.8–10 ms |
+| Indexed IN (2 values) | <1 ms |
+| Composite index eq / starts | **0.5–0.9 ms** (composite index walk skips secondary post-filter) |
+| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | **<1 ms warm** (was 64–65 ms in earlier docs — that was first-touch cold; the post-2026.05.1 batched seg-acquire makes warm-cache range cheap) |
+| Indexed `OR` (two statuses) | **3.6 ms** (was 23 ms — kf-derived counts let the OR keyset size correctly without falling through to per-record scan) |
+| Fetch page of 100 @ offset 5000 | <1 ms |
+| Keys (first 100) | **<1 ms** (with stop_flag check tightened to every 256 slots — was 6–9 ms when limit-bound queries waited up to 4096 wasted iterations for the global stop signal) |
 | `count` full object | <1 ms |
-| **Single DELETE ×1000 (with 14 indexes)** | **10 k/sec** (mean 95µs / p50 91µs / p99 134µs) |
-| **Bulk DELETE ×1000** | **111 k/sec** (9 ms) |
-| VACUUM | 1 ms |
-| Disk footprint | 1.6 GB |
+| **Single DELETE ×1000 (with 14 indexes)** | **15 k/sec** (mean 67µs / p50 63µs) |
+| **Bulk DELETE ×1000** | **143 k/sec** (7 ms) |
+| VACUUM | **38 ms** (now actually rebuilds kf to drop tombstones — the previously-published 1 ms was the pre-2026.05.x reset_deleted_count path that lied about orphaned-count; the new vacuum is honest) |
+| RECOUNT | **<1 ms** (kf-header sum — was 13 ms walking kf entries) |
+| Disk footprint | 1.9 GB |
 
 The earlier-published indexed-range figure (3 ms) was borrowed from §3's narrow `between (age 25-35)` query on the user schema; the C bench's invoice range queries cover wider date spans (one-month and two-week windows on `invoiceDate`/`createdAt`) so the 65–79 ms numbers are honest cost for matching tens of thousands of records and returning the first 10 ordered by index leaf order.
 
@@ -283,13 +284,13 @@ The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths 
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 1M, no indexes | 2.67 s | 374 k/sec |
-| Single CSV, 1M, no indexes | 1.11 s | **903 k/sec** |
-| **Parallel JSON, 5 conns × 200K, no indexes** | **0.72 s** | **1.40 M/sec** (3.7× single JSON) |
-| Parallel JSON, 5 conns × 200K, pre-existing 14 indexes | 2.61 s | 384 k/sec |
-| **Parallel CSV, 5 conns × 200K, no indexes** | **0.40 s** | **2.48 M/sec** (2.7× single CSV) ← fastest |
-| **Parallel CSV, 5 conns × 200K, pre-existing 14 indexes** | **2.30 s** | **435 k/sec** |
-| Add 14 indexes after bulk insert | ~2.6 s | (per-shard parallel build) |
+| Single JSON, 1M, no indexes | 2.48 s | 400 k/sec |
+| Single CSV, 1M, no indexes | 1.05 s | **950 k/sec** |
+| **Parallel JSON, 5 conns × 200K, no indexes** | **0.65 s** | **1.54 M/sec** (3.9× single JSON) |
+| Parallel JSON, 5 conns × 200K, pre-existing 14 indexes | 2.81 s | 360 k/sec |
+| **Parallel CSV, 5 conns × 200K, no indexes** | **0.37 s** | **2.67 M/sec** (2.8× single CSV) ← fastest |
+| **Parallel CSV, 5 conns × 200K, pre-existing 14 indexes** | **2.40 s** | **420 k/sec** |
+| Add 14 indexes after bulk insert | ~2.7 s | (per-shard parallel build) |
 | Disk footprint (with 14 indexes) | 1.6 GB |
 
 **Parallel CSV no-idx hits 2.48 M/sec** — 2.7× single CSV's 903 k/sec, and roughly 5× the previously published bash-bench number for this scenario. Pre-grow contributes a ~2× win on every path; the parallel-vs-single benefit is on top of that and hasn't disappeared. **Use parallel for max throughput.**

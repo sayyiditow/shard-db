@@ -4121,8 +4121,13 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
     for (size_t i = 0; i < cap; i++) {
         /* Periodic stop_flag check so concurrent workers' early-exit
            propagates: another shard finds enough matches and sets the
-           shared flag, this worker bails without finishing pass 1. */
-        if (stop_flag && (++sf_check & 0xFFF) == 0 &&
+           shared flag, this worker bails without finishing pass 1.
+           Check every 256 iterations (was 4096) — at 256K-slot kf shards
+           the old cadence let a worker finish 4096 wasted slot-probes
+           after another shard already collected the limit, adding ~5-7ms
+           to limit-bound queries (KEYS first 100, FIND limit 10). The
+           atomic_load is cheap (~1ns) and amortised across 256 iters. */
+        if (stop_flag && (++sf_check & 0xFF) == 0 &&
             __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) {
             free(refs);
             kfcache_release(&kh);
