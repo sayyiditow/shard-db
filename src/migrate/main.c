@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <ctype.h>
 #include <linux/limits.h>
 
 #include "migrate.h"
@@ -132,6 +133,29 @@ static int migrate_v1_objects(const char *db_root) {
 
         if (n >= 5 && sv == 2) {
             already_v2++;
+            continue;
+        }
+
+        /* Validate dir/obj before embedding into a shell command — same
+           charset the daemon's valid_filename allows, but enforced here
+           too because migrate runs outside the daemon and reads
+           schema.conf directly. CodeQL flagged the system() call as
+           "uncontrolled data in OS command"; this gate is the safety
+           barrier (and a defense against a hand-edited schema.conf). */
+        int safe = 1;
+        for (const char *p = dir; *p; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) { safe = 0; break; }
+        }
+        for (const char *p = obj; safe && *p; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) { safe = 0; break; }
+        }
+        if (!safe) {
+            fprintf(stderr,
+                "migrate: skipping %s/%s — name contains shell-unsafe characters\n",
+                dir, obj);
+            failed++;
             continue;
         }
 

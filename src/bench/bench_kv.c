@@ -529,11 +529,11 @@ static int bench_kv_run(void)
         size_t key_buf_cap = (size_t)N * (size_t)(KEY_LEN + 4) + 64;
         char *key_arr = malloc(key_buf_cap);
         size_t kp = 0;
-        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "[");
+        BENCH_SB_APPEND(key_arr, kp, key_buf_cap, "[");
         for (int i = 0; i < N; i++)
-            kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp,
-                                    "%s\"%s\"", i ? "," : "", keys[START + i]);
-        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "]");
+            BENCH_SB_APPEND(key_arr, kp, key_buf_cap,
+                             "%s\"%s\"", i ? "," : "", keys[START + i]);
+        BENCH_SB_APPEND(key_arr, kp, key_buf_cap, "]");
 
         /* bulk-get */
         {
@@ -568,14 +568,14 @@ static int bench_kv_run(void)
             size_t cap = (size_t)N * (size_t)(KEY_LEN + 64) + 128;
             char *req = malloc(cap);
             size_t p = 0;
-            p += (size_t)snprintf(req + p, cap - p,
+            BENCH_SB_APPEND(req, p, cap,
                 "{\"mode\":\"bulk-update\",\"dir\":\"default\","
                 "\"object\":\"kvbench\",\"records\":[");
             for (int i = 0; i < N; i++)
-                p += (size_t)snprintf(req + p, cap - p,
+                BENCH_SB_APPEND(req, p, cap,
                     "%s{\"key\":\"%s\",\"value\":{\"v\":\"bulkupd_%d\"}}",
                     i ? "," : "", keys[START + i], i);
-            p += (size_t)snprintf(req + p, cap - p, "]}");
+            BENCH_SB_APPEND(req, p, cap, "]}");
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bupd_us = (long)((bench_now_ns() - t0) / 1000);
@@ -685,7 +685,7 @@ static int bench_kv_run(void)
     }
 
     /* ---- 16. Disk usage -------------------------------------------- */
-    {
+    if (bench_path_safe(env.db_root)) {
         char du_cmd[512];
         snprintf(du_cmd, sizeof(du_cmd), "du -sh \"%s/default/kvbench\"",
                  env.db_root);

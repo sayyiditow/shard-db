@@ -406,7 +406,7 @@ static int bench_kv_parallel_run(void)
     }
 
     /* Disk usage. */
-    {
+    if (bench_path_safe(env.db_root)) {
         char du_cmd[512];
         snprintf(du_cmd, sizeof(du_cmd), "du -sh \"%s/default/kvbench\"",
                  env.db_root);

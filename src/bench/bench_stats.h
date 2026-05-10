@@ -8,6 +8,39 @@
 #ifndef BENCH_STATS_H
 #define BENCH_STATS_H
 #include <stddef.h>
+#include <ctype.h>
+#include <stdio.h>
+
+/* Safe StringBuilder-style append. Mirrors the daemon-side SB_APPEND in
+   src/db/types.h — we don't include types.h from bench files to keep
+   the bench TU dep tree tiny. Replaces the unsafe
+   `off += (size_t)snprintf(buf + off, cap - off, ...)` idiom that
+   CodeQL flags as "potentially overflowing snprintf": snprintf returns
+   the would-have-written count, so on truncation `off` advances past
+   `cap` and subsequent writes hit OOB memory. */
+#define BENCH_SB_APPEND(buf, off, cap, ...) do {                          \
+    size_t _rem = (cap) > (off) ? (cap) - (off) : 0;                      \
+    if (_rem == 0) break;                                                 \
+    int _n = snprintf((buf) + (off), _rem, __VA_ARGS__);                  \
+    if (_n < 0) { (off) = (cap) - 1; break; }                             \
+    (off) += ((size_t)_n < _rem) ? (size_t)_n : (_rem - 1);               \
+} while (0)
+
+/* True iff `s` contains only characters safe to embed in a shell command
+   without quoting (alnum, '/', '.', '_', '-'). Used to gate system()
+   calls in bench harnesses that take a path or identifier from env vars
+   or the test fixture — silences CodeQL "uncontrolled data in OS
+   command" findings AND defends against shell injection if the input
+   ever becomes user-controllable. NULL or empty string returns 0. */
+static inline int bench_path_safe(const char *s) {
+    if (!s || !*s) return 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '/' || c == '.' || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
 #include <stdint.h>
 #include <stdlib.h>
 

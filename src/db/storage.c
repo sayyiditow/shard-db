@@ -2474,8 +2474,11 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                into our buffer via snprintf — replicate the no-quote-needed shape
                here to avoid re-implementing the quote logic. */
             memcpy(buf + pos, entries[i].key, klen); pos += klen;
-            pos += (size_t)snprintf(buf + pos, cap - pos, "%c%s\n",
-                                     csv_delim, entries[i].found ? "true" : "false");
+            /* Use SB_APPEND for bounded write — pre-grow above guarantees
+               room, but the macro silences the CodeQL "potentially
+               overflowing snprintf" finding by clamping to cap-1. */
+            SB_APPEND(buf, pos, cap, "%c%s\n",
+                       csv_delim, entries[i].found ? "true" : "false");
         }
         if (buf) {
             fwrite(buf, 1, pos, g_out ? g_out : stdout);

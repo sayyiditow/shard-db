@@ -12970,6 +12970,12 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
        create its own data/ subtree (kf/, streams/) without colliding
        with the v1 NNN.bin files. */
     fcache_invalidate(data_dir);
+    /* CodeQL flagged TOCTOU race against the stat() above. Same gate as
+       the earlier suppression: cmd_migrate_storage_version is called
+       under objlock_wrlock (mode_is_schema) and the single-instance
+       flock on $DB_ROOT/.shard-db.lock prevents cross-process races.
+       The rename is the atomic step; if the FS shifted under us between
+       stat and rename, rename returns an error which we surface. */
     if (rename(data_dir, data_legacy) != 0) {
         OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
             strerror(errno));
@@ -12980,7 +12986,9 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
        data/streams/ on the way in. */
     SlotcaskDb sdb;
     if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
-        /* Best-effort rollback of the rename. */
+        /* Best-effort rollback of the rename. Same lock gating as the
+           forward rename above — if rollback also fails the operator
+           sees both error paths logged. */
         if (rename(data_legacy, data_dir) != 0)
             log_msg(1, "migrate: rollback rename failed: %s", strerror(errno));
         OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",

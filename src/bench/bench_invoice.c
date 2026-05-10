@@ -464,13 +464,13 @@ static int bench_invoice_run(void)
         size_t key_buf_cap = (size_t)N * 24 + 64;
         char *key_arr = malloc(key_buf_cap);
         size_t kp = 0;
-        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "[");
+        BENCH_SB_APPEND(key_arr, kp, key_buf_cap, "[");
         for (int i = 0; i < N; i++) {
             char key[16]; make_inv_key(START + i, key);
-            kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp,
-                                    "%s\"%s\"", i ? "," : "", key);
+            BENCH_SB_APPEND(key_arr, kp, key_buf_cap,
+                             "%s\"%s\"", i ? "," : "", key);
         }
-        kp += (size_t)snprintf(key_arr + kp, key_buf_cap - kp, "]");
+        BENCH_SB_APPEND(key_arr, kp, key_buf_cap, "]");
 
         /* bulk-get */
         {
@@ -510,16 +510,16 @@ static int bench_invoice_run(void)
             size_t cap = (size_t)N * 96 + 256;
             char *req = malloc(cap);
             size_t p = 0;
-            p += (size_t)snprintf(req + p, cap - p,
+            BENCH_SB_APPEND(req, p, cap,
                 "{\"mode\":\"bulk-update\",\"dir\":\"default\","
                 "\"object\":\"bench\",\"records\":[");
             for (int i = 0; i < N; i++) {
                 char key[16]; make_inv_key(START + i, key);
-                p += (size_t)snprintf(req + p, cap - p,
+                BENCH_SB_APPEND(req, p, cap,
                     "%s{\"key\":\"%s\",\"value\":{\"status\":\"APPROVED\"}}",
                     i ? "," : "", key);
             }
-            p += (size_t)snprintf(req + p, cap - p, "]}");
+            BENCH_SB_APPEND(req, p, cap, "]}");
             uint64_t t0 = bench_now_ns();
             tc_request(tc, req, &resp);
             bupd_us = (long)((bench_now_ns() - t0) / 1000);
@@ -744,7 +744,7 @@ static int bench_invoice_run(void)
     }
 
     /* ---- 15. DISK USAGE --------------------------------------------------- */
-    {
+    if (bench_path_safe(env.db_root)) {
         char du_cmd[512];
         snprintf(du_cmd, sizeof(du_cmd), "du -sh \"%s/default/bench\"",
                  env.db_root);
