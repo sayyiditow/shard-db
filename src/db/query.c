@@ -12602,23 +12602,25 @@ sort_and_emit:
     return 0;
 }
 
-/* v2 recount callback: increments a counter for every live record. */
+/* recount: report current live-record count. For v2 this is kf-derived
+   (sum per-shard kf headers — total - deleted = live), so the result
+   matches what get_live_count returns and `set_count` is a no-op. The
+   command is functionally redundant on v2 since the kf headers are
+   already authoritative; kept as a fast diagnostic / parity wrapper.
+   v1 still has the full text-counts file write path below. */
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
 
-    /* v2: count live kf entries directly — no seg reads. Was using
-       slotcask_walk_live which loaded every seg slot just to bump a
-       counter (~270ms at 1M records). slotcask_count_live walks the
-       24-byte kf entries only (~5ms). */
     if (sch.storage_version == 2) {
         SlotcaskSchemaInfo info = {
             .splits = sch.splits, .slot_size = sch.slot_size,
             .streams = sch.streams, .storage_version = 2,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        int total = sdb ? (int)slotcask_count_live(sdb) : 0;
-        set_count(db_root, object, total);
-        OUT("{\"count\":%d}\n", total);
+        uint64_t total_hdr = 0, deleted_hdr = 0;
+        if (sdb) slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr);
+        int live = (int)(total_hdr > deleted_hdr ? total_hdr - deleted_hdr : 0);
+        OUT("{\"count\":%d}\n", live);
         return 0;
     }
 

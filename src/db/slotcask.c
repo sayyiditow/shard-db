@@ -913,17 +913,21 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     /* Phase breakdown: setup / rebuild / msync / rename+fsync / remap.
        `live` is records actually re-inserted at new capacity (= header.total
        on the new kf). Goes to stderr so the daemon's log captures it; the
-       bench fixture's daemon log is at $DB_ROOT/logs/. */
-    fprintf(stderr,
-        "KF_RESPLIT path=%s old_cap=%zu new_cap=%zu live=%lu "
-        "total_us=%lu setup_us=%lu rebuild_us=%lu msync_us=%lu rename_us=%lu remap_us=%lu\n",
-        e->path, old_cap, new_cap, (unsigned long)live_copied,
-        (unsigned long)(t_end - t_start),
-        (unsigned long)(t_after_setup   - t_start),
-        (unsigned long)(t_after_rebuild - t_after_setup),
-        (unsigned long)(t_after_msync   - t_after_rebuild),
-        (unsigned long)(t_after_rename  - t_after_msync),
-        (unsigned long)(t_end           - t_after_rename));
+       bench fixture's daemon log is at $DB_ROOT/logs/.
+       Suppressed for same-cap rebuilds (vacuum's tombstone-compaction path)
+       — those are routine maintenance, not a notable resize event. */
+    if (new_cap != old_cap) {
+        fprintf(stderr,
+            "KF_RESPLIT path=%s old_cap=%zu new_cap=%zu live=%lu "
+            "total_us=%lu setup_us=%lu rebuild_us=%lu msync_us=%lu rename_us=%lu remap_us=%lu\n",
+            e->path, old_cap, new_cap, (unsigned long)live_copied,
+            (unsigned long)(t_end - t_start),
+            (unsigned long)(t_after_setup   - t_start),
+            (unsigned long)(t_after_rebuild - t_after_setup),
+            (unsigned long)(t_after_msync   - t_after_rebuild),
+            (unsigned long)(t_after_rename  - t_after_msync),
+            (unsigned long)(t_end           - t_after_rename));
+    }
     return 0;
 }
 
