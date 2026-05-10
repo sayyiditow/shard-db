@@ -74,6 +74,17 @@ static int        g_pool_nthreads = 0;
    and the variable is then never written, leaving the auto-default. */
 int g_pool_chunk = 0;
 
+/* Compute thread-pool size knob (THREADS in db.env). 0 = auto (nproc).
+   Same rationale as g_pool_chunk — kept here so parallel.c links
+   standalone in test/bench builds. */
+int g_max_threads = 0;
+
+int parallel_threads(void) {
+    if (g_max_threads > 0) return g_max_threads;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 4;
+}
+
 /* Per-thread flag: 1 while a pool worker is running a task, 0 otherwise.
    parallel_for uses this to decide between two wait strategies:
      - Top-level callers (TCP handler, CLI) → plain cond_wait. Pool

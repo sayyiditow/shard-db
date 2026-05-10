@@ -4,10 +4,11 @@
 
 uint32_t g_timeout = 30;
 int g_port = 9199;
-int g_max_threads = 0;  /* 0 = auto (4× cores) — compute thread pool size */
 int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
-/* g_pool_chunk lives in parallel.c (so test/bench binaries that link
-   parallel.c without config.c don't get an undefined symbol). */
+/* g_max_threads (+ parallel_threads getter) and g_pool_chunk live in
+   parallel.c so test/bench binaries that link parallel.c without
+   config.c don't get an undefined symbol at link time. config.c still
+   writes g_max_threads when parsing db.env (extern). */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
@@ -55,12 +56,6 @@ int g_auto_vacuum_interval_sec = 3600;
 SlowQueryEntry g_slow_queries[SLOW_QUERY_RING] = {0};
 int g_slow_query_head = 0;
 pthread_mutex_t g_slow_query_lock = PTHREAD_MUTEX_INITIALIZER;
-
-int parallel_threads(void) {
-    if (g_max_threads > 0) return g_max_threads;
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (int)n : 4;
-}
 
 uint64_t now_ms(void) {
     struct timespec ts;
