@@ -12092,30 +12092,23 @@ int cmd_find(const char *db_root, const char *object,
         }
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
-    /* ===== Streaming fast path for limit-bound, post-filtered finds.
-       For small (offset + limit) where the tree has post-filter siblings
-       (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
-       walk the most-selective leaf's btree and emit-as-we-go via
-       criteria_match_tree. The collect-then-emit path's cap=offset+limit
-       under-collects when a sibling rejects most candidates; streaming
-       walks until enough records actually PASS, no over-fetch heuristic
-       needed.
-       Eligibility: no joins (join semantics need full materialise),
-       no rows_fmt envelope (also needs full collect for column ordering),
-       no order_by (would need sort across shards). */
-    int can_stream = (limit > 0 && (offset + limit) <= 1000 &&
-                       njoins == 0 && !rows_fmt &&
-                       (plan.kind == PRIMARY_INTERSECT ||
-                        (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF)));
-    if (can_stream) {
-        SearchCriterion *primary;
-        if (plan.kind == PRIMARY_INTERSECT) {
-            /* intersect_leaves[0] is already most-selective-first via
-               op_selectivity_rank — use it as the streaming primary. */
-            primary = plan.intersect_leaves[0];
-        } else {
-            primary = plan.primary_leaf;
-        }
+    } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
+               (plan.kind == PRIMARY_INTERSECT ||
+                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF))) {
+        /* ===== Streaming fast path for limit-bound, post-filtered finds.
+           For small (offset + limit) where the tree has post-filter siblings
+           (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
+           walk the most-selective leaf's btree and emit-as-we-go via
+           criteria_match_tree. The collect-then-emit path's cap=offset+limit
+           under-collects when a sibling rejects most candidates; streaming
+           walks until enough records actually PASS, no over-fetch heuristic
+           needed.
+           Eligibility: no joins (join semantics need full materialise),
+           no rows_fmt envelope (also needs full collect for column ordering),
+           no order_by (would need sort across shards). */
+        SearchCriterion *primary = (plan.kind == PRIMARY_INTERSECT)
+            ? plan.intersect_leaves[0]   /* already most-selective-first */
+            : plan.primary_leaf;
         int check_primary = op_needs_check_primary(primary->op);
         idx_find_streaming(db_root, object, &sch, primary, check_primary,
                            tree, &excluded, offset, limit,
