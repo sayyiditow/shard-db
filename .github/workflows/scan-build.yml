@@ -58,6 +58,7 @@ jobs:
               src/db/index.c src/db/query.c src/db/server.c \
               src/db/main.c src/db/btree.c src/db/objlock.c \
               src/db/keyset.c src/db/parallel.c src/db/tls.c \
+              src/db/slotcask.c src/db/simd.c \
               -Isrc/db -lpthread -lssl -lcrypto
 
       - name: scan-build the CLI (shard-cli)

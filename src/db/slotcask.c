@@ -4622,6 +4622,8 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
     }
     closedir(dh);
 
+    if (nfiles == 0) { free(files); return 0; }
+
     for (size_t i = 0; i < nfiles; i++) {
         if (seg_stat_one(db, stream_id, files[i].file_id,
                           &files[i].live_count, &files[i].total_slots) != 0) {
@@ -4632,7 +4634,6 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
     qsort(files, nfiles, sizeof(SegStat), seg_stat_cmp_live_asc);
 
     int dropped = 0;
-    if (nfiles == 0) { free(files); return 0; }
 
     /* Two-pointer pair-merge: i = sparsest donor, j = densest recipient.
        Skip empties first (drop unconditionally), then merge i→j when j
