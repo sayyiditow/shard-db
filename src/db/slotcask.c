@@ -2032,6 +2032,17 @@ int slotcask_exists(SlotcaskDb *db, const void *key, size_t klen) {
     return (rc == 0) ? 1 : 0;
 }
 
+/* Slow upsert path: lookup → check → reserve → seg-write → pre_commit →
+   kf commit. Required when the caller needs OLD before deciding to commit
+   (require_existing or check_needs_old) — the fast path can't satisfy CAS
+   semantics that depend on old. */
+static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
+                             const void *key, size_t klen,
+                             const void *value, size_t vlen,
+                             const SlotcaskUpsertOpts *opts,
+                             SlotcaskUpsertResult *result,
+                             const uint8_t hash[16], int sid_kf);
+
 int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
@@ -2051,6 +2062,221 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     uint8_t hash[16];
     compute_hash(key, klen, hash);
     int sid_kf = shard_for_hash(hash, db->num_shards);
+
+    /* Slow path is required when the caller's check fn needs OLD (CAS) or
+       when require_existing is set (must know existence to reject missing). */
+    if (opts->require_existing || opts->check_needs_old) {
+        return upsert_slow_path(db, stream_id_hint, key, klen, value, vlen,
+                                opts, result, hash, sid_kf);
+    }
+
+    /* ===== FAST PATH =====
+       Skip the up-front kf_lookup; let kf_put_new probe and decide.
+       For new keys: 1 probe (vs 2 in slow path). For existing keys:
+       upgrade-to-update branch loads OLD and runs the same diff path
+       the slow path would. Order: seg → kf → pre_commit so a duplicate
+       rejection bails cleanly without leaving stale index entries. */
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+
+    /* Reserve seg slot. */
+    int sid_data = stream_id_hint;
+    if (sid_data < 0 || sid_data >= db->num_streams)
+        sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
+    SlotcaskStream *pool = &db->streams[sid_data];
+
+    SlotcaskFreeSlot fs;
+    uint8_t  target_stream = (uint8_t)sid_data;
+    uint16_t target_fid;
+    uint32_t target_off;
+    int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+    } else {
+        uint32_t fid, off;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+    }
+
+    /* Write seg. */
+    if (seg_write_record(db, target_stream, target_fid, target_off,
+                         hash, key, klen, value, vlen) != 0) {
+        if (got_pool) pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    /* Acquire kf wrlock + commit attempt. */
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free(pool, target_fid, target_off);
+        return -1;
+    }
+
+    size_t used_delta = 0;
+    int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
+                            key, klen, db->data_dir, &used_delta);
+
+    if (put_rc == 0) {
+        /* NEW key path. Run check (with NULL old) and pre_commit. */
+        if (opts->check && opts->check(NULL, opts->check_ctx) == 0) {
+            /* Check rejected. Roll back: tombstone the seg + clear the
+               kf entry we just wrote. We need to find our slot to clear it. */
+            uint8_t  tmp_flag = 0, tmp_sid = 0;
+            uint16_t tmp_fid = 0;
+            uint32_t tmp_off = 0;
+            size_t   tmp_slot = 0;
+            if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                     &tmp_flag, &tmp_sid, &tmp_fid, &tmp_off,
+                                     &tmp_slot) == 0) {
+                kf_tombstone_at_slot(&kh, tmp_slot);
+            }
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            if (result) result->condition_not_met = 1;
+            return -2;
+        }
+        if (opts->pre_commit) {
+            int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
+            if (rc != 0) {
+                /* pre_commit failed AFTER kf commit. Best effort: tombstone
+                   our kf entry + seg. Indexes may be partially populated;
+                   matches the existing-path's pre_commit-failure behavior
+                   (just on the opposite side of kf). */
+                uint8_t  tmp_flag = 0, tmp_sid = 0;
+                uint16_t tmp_fid = 0;
+                uint32_t tmp_off = 0;
+                size_t   tmp_slot = 0;
+                if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                         &tmp_flag, &tmp_sid, &tmp_fid, &tmp_off,
+                                         &tmp_slot) == 0) {
+                    kf_tombstone_at_slot(&kh, tmp_slot);
+                }
+                kfcache_release(&kh);
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free(pool, target_fid, target_off);
+                return -1;
+            }
+        }
+        kfcache_release(&kh);
+        if (result) result->was_update = 0;
+        return 0;
+    }
+
+    if (put_rc == 1) {
+        /* EXISTING key path. Either the caller wanted insert-only
+           (if_not_exists) → reject; or this is an upsert → upgrade. */
+        if (opts->if_not_exists) {
+            /* Read existing record so caller sees current_value. */
+            uint8_t  ex_flag = 0, ex_sid = 0;
+            uint16_t ex_fid = 0;
+            uint32_t ex_off = 0;
+            size_t   ex_slot = 0;
+            uint8_t *old_buf = NULL;
+            size_t   old_vlen = 0;
+            if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                     &ex_flag, &ex_sid, &ex_fid, &ex_off,
+                                     &ex_slot) == 0) {
+                (void)read_record_value(db, ex_sid, ex_fid, ex_off, key, klen,
+                                         &old_buf, &old_vlen);
+            }
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            if (result) {
+                result->was_update = 1;
+                result->condition_not_met = 1;
+                result->current_value = old_buf;
+                result->current_vlen = old_vlen;
+            } else {
+                free(old_buf);
+            }
+            return -2;
+        }
+
+        /* UPGRADE TO UPDATE: load existing record, run pre_commit with
+           old, repoint kf to our new seg, tombstone OLD seg. */
+        uint8_t  ex_flag = 0, ex_sid = 0;
+        uint16_t ex_fid = 0;
+        uint32_t ex_off = 0;
+        size_t   ex_slot = 0;
+        if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                 &ex_flag, &ex_sid, &ex_fid, &ex_off,
+                                 &ex_slot) != 0) {
+            /* kf_put_new said it exists but lookup can't find it — race or
+               corruption. Bail safely. */
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            return -1;
+        }
+        uint8_t *old_buf = NULL;
+        size_t   old_vlen = 0;
+        if (read_record_value(db, ex_sid, ex_fid, ex_off, key, klen,
+                              &old_buf, &old_vlen) != 0) {
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            return -1;
+        }
+        SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+        /* check_fn might inspect old (CAS-style) even when check_needs_old
+           wasn't asserted — call it now that we have old loaded. If it
+           rejects, transfer current_value to caller and bail. */
+        if (opts->check && opts->check(&old_rec, opts->check_ctx) == 0) {
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free(pool, target_fid, target_off);
+            if (result) {
+                result->was_update = 1;
+                result->condition_not_met = 1;
+                result->current_value = old_buf;     /* transfer ownership */
+                result->current_vlen = old_vlen;
+            } else {
+                free(old_buf);
+            }
+            return -2;
+        }
+        if (opts->pre_commit) {
+            int rc = opts->pre_commit(&old_rec, value, vlen, 1, opts->pre_commit_ctx);
+            if (rc != 0) {
+                kfcache_release(&kh);
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free(pool, target_fid, target_off);
+                free(old_buf);
+                return -1;
+            }
+        }
+        /* Atomic 8B repoint of the existing kf entry to our new seg. */
+        kf_repoint_at_slot(&kh, ex_slot, target_stream, target_fid, target_off);
+        kfcache_release(&kh);
+        /* Tombstone the OLD seg (after dropping kf wrlock so segcache wrlock
+           doesn't compete with concurrent reads on the kf shard). */
+        seg_write_flag(db, ex_sid, ex_fid, ex_off, 2);
+        pool_push_free(&db->streams[ex_sid], ex_fid, ex_off);
+        if (result) result->was_update = 1;
+        free(old_buf);
+        return 0;
+    }
+
+    /* kf_put_new returned other error. */
+    kfcache_release(&kh);
+    seg_write_flag(db, target_stream, target_fid, target_off, 2);
+    pool_push_free(pool, target_fid, target_off);
+    return -1;
+}
+
+/* Original lookup-first path, kept for require_existing / check_needs_old
+   callers that can't take the fast path. */
+static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
+                             const void *key, size_t klen,
+                             const void *value, size_t vlen,
+                             const SlotcaskUpsertOpts *opts,
+                             SlotcaskUpsertResult *result,
+                             const uint8_t hash[16], int sid_kf) {
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
 

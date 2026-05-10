@@ -309,6 +309,13 @@ typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
 typedef struct {
     int                       if_not_exists;     /* fail if key exists (insert path) */
     int                       require_existing;  /* fail if key missing (update path) */
+    /* Set to 1 if `check` may inspect OLD even on the INSERT path (i.e. it
+       returns 0 when old is NULL — typical CAS-on-insert semantics). When
+       0 (default), the fast path calls check(NULL) for new keys; check
+       only sees OLD on the upgrade-to-update branch. When 1, the slow
+       path is forced so OLD is loaded before check is called for both
+       insert and update branches. */
+    int                       check_needs_old;
     slotcask_check_fn         check;
     void                     *check_ctx;
     slotcask_pre_commit_fn    pre_commit;
