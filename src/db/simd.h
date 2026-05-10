@@ -29,4 +29,16 @@ const void *simd_memmem(const void *haystack, size_t hlen,
 const void *simd_memmem_avx2(const void *haystack, size_t hlen,
                              const void *needle,   size_t nlen);
 
+/* Case-insensitive substring search for ASCII (A-Z folded to a-z). needle_lc
+   must already be lowercased by the caller (compile_one does this for
+   ICONTAINS/ILIKE). Returns pointer to first match or NULL. AVX2 path uses
+   the same first/last-byte filter as simd_memmem but lowercases each loaded
+   byte via vectorised ASCII fold. ~5-10× faster than the naive byte loop
+   for ASCII-heavy haystacks. */
+const void *simd_memcasemem(const void *haystack, size_t hlen,
+                            const void *needle_lc, size_t nlen);
+
+const void *simd_memcasemem_avx2(const void *haystack, size_t hlen,
+                                 const void *needle_lc, size_t nlen);
+
 #endif

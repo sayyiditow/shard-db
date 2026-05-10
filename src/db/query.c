@@ -6761,22 +6761,8 @@ static inline int varchar_eff_len(const uint8_t *p, int size) {
     return len;
 }
 
-/* Case-insensitive substring search. needle_lc must already be lowercase. */
-static const char *memcasemem(const char *h, size_t hl,
-                              const char *needle_lc, size_t nl) {
-    if (nl == 0) return h;
-    if (hl < nl) return NULL;
-    for (size_t i = 0; i + nl <= hl; i++) {
-        size_t j = 0;
-        for (; j < nl; j++) {
-            char c = h[i + j];
-            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-            if (c != needle_lc[j]) break;
-        }
-        if (j == nl) return h + i;
-    }
-    return NULL;
-}
+/* Case-insensitive substring search moved to src/db/simd.c (simd_memcasemem)
+   so the AVX2 path and the scalar fallback share one implementation. */
 
 /* Parse decimal date string "yyyyMMdd" (tolerant of separators) → int32. */
 static int32_t parse_date_i32(const char *s) {
@@ -7246,7 +7232,7 @@ static int match_typed_varchar(const uint8_t *p, int size,
             }
             return 1;
         case LK_CONTAINS:
-            return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
+            return simd_memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
         }
         return 0;
     case OP_INOT_LIKE: {
@@ -7254,9 +7240,9 @@ static int match_typed_varchar(const uint8_t *p, int size,
         return !match_typed_varchar(p, size, &tmp);
     }
     case OP_ICONTAINS:
-        return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
+        return simd_memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
     case OP_INOT_CONTAINS:
-        return memcasemem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
+        return simd_memcasemem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
     case OP_ISTARTS_WITH: {
         if (elen < (int)cc->needle_len) return 0;
         for (size_t i = 0; i < cc->needle_len; i++) {
