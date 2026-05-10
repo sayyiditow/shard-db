@@ -1079,30 +1079,62 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
     return -1;
 }
 
+/* Probe-chain iterator. Encapsulates the open-addressed walk so callers
+   only express their per-match action (verify + commit). Initialise via
+   kf_probe_init; each kf_probe_next call returns the slot index of the
+   next hash-matching entry along the chain, or (size_t)-1 when the chain
+   terminates (flag=0 sentinel hit) or the table is exhausted. Caller
+   inspects e->flag at each returned slot to discriminate live (1) vs
+   tombstone (2), and continues iterating to walk past true xxh128
+   collisions whose verify_stored_key fails. */
+typedef struct {
+    SlotcaskKfHandle *kh;
+    const uint8_t    *hash;
+    size_t            cap;
+    size_t            start;
+    size_t            i;
+} KfProbeIter;
+
+static inline void kf_probe_init(KfProbeIter *it, SlotcaskKfHandle *kh,
+                                  const uint8_t hash[16]) {
+    it->kh    = kh;
+    it->hash  = hash;
+    it->cap   = kh->capacity;
+    it->start = kf_slot_for(hash, it->cap);
+    it->i     = 0;
+}
+
+static size_t kf_probe_next(KfProbeIter *it) {
+    SlotcaskKfEntry *kf = it->kh->map;
+    while (it->i < it->cap) {
+        size_t slot = (it->start + it->i) % it->cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) { it->i = it->cap; return (size_t)-1; }
+        it->i++;
+        if (memcmp(e->hash, it->hash, 16) == 0) return slot;
+    }
+    return (size_t)-1;
+}
+
 /* Look up. Returns 0 found (writes outputs), -1 not present. */
 static int kf_lookup(SlotcaskKfHandle *kh, const uint8_t hash[16],
                      const void *key, size_t klen, const char *data_dir,
                      uint8_t *flag_out, uint8_t *stream_id_out,
                      uint16_t *file_id_out, uint32_t *offset_out) {
-    size_t cap = kh->capacity;
-    SlotcaskKfEntry *kf = kh->map;
-    size_t start = kf_slot_for(hash, cap);
-    for (size_t i = 0; i < cap; i++) {
-        size_t slot = (start + i) % cap;
-        SlotcaskKfEntry *e = &kf[slot];
-        if (e->flag == 0) return -1;
-        if (memcmp(e->hash, hash, 16) == 0) {
-            if (e->flag == 2) return -1;
-            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
-                                       e->offset, key, klen);
-            if (km < 0) return -1;
-            if (km == 1) {
-                *flag_out = e->flag;
-                *stream_id_out = e->stream_id;
-                *file_id_out = e->file_id;
-                *offset_out = e->offset;
-                return 0;
-            }
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    size_t slot;
+    while ((slot = kf_probe_next(&it)) != (size_t)-1) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag == 2) return -1;
+        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                   e->offset, key, klen);
+        if (km < 0) return -1;
+        if (km == 1) {
+            *flag_out = e->flag;
+            *stream_id_out = e->stream_id;
+            *file_id_out = e->file_id;
+            *offset_out = e->offset;
+            return 0;
         }
     }
     return -1;
@@ -1117,24 +1149,17 @@ static int kf_lookup_no_verify(SlotcaskKfHandle *kh, const uint8_t hash[16],
                                 uint8_t *flag_out, uint8_t *stream_id_out,
                                 uint16_t *file_id_out, uint32_t *offset_out,
                                 size_t *slot_out) {
-    size_t cap = kh->capacity;
-    SlotcaskKfEntry *kf = kh->map;
-    size_t start = kf_slot_for(hash, cap);
-    for (size_t i = 0; i < cap; i++) {
-        size_t slot = (start + i) % cap;
-        SlotcaskKfEntry *e = &kf[slot];
-        if (e->flag == 0) return -1;
-        if (memcmp(e->hash, hash, 16) == 0) {
-            if (e->flag == 2) return -1;          /* tombstone */
-            *flag_out = e->flag;
-            *stream_id_out = e->stream_id;
-            *file_id_out = e->file_id;
-            *offset_out = e->offset;
-            *slot_out = slot;
-            return 0;
-        }
-    }
-    return -1;
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    size_t slot = kf_probe_next(&it);
+    if (slot == (size_t)-1) return -1;
+    SlotcaskKfEntry *e = &kh->map[slot];
+    if (e->flag == 2) return -1;          /* tombstone */
+    *flag_out = e->flag;
+    *stream_id_out = e->stream_id;
+    *file_id_out = e->file_id;
+    *offset_out = e->offset;
+    *slot_out = slot;
+    return 0;
 }
 
 /* Variant of kf_lookup that ALSO returns the slot index it found the entry
@@ -1147,26 +1172,21 @@ static int kf_lookup_with_slot(SlotcaskKfHandle *kh, const uint8_t hash[16],
                                 uint8_t *flag_out, uint8_t *stream_id_out,
                                 uint16_t *file_id_out, uint32_t *offset_out,
                                 size_t *slot_out) {
-    size_t cap = kh->capacity;
-    SlotcaskKfEntry *kf = kh->map;
-    size_t start = kf_slot_for(hash, cap);
-    for (size_t i = 0; i < cap; i++) {
-        size_t slot = (start + i) % cap;
-        SlotcaskKfEntry *e = &kf[slot];
-        if (e->flag == 0) return -1;
-        if (memcmp(e->hash, hash, 16) == 0) {
-            if (e->flag == 2) return -1;
-            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
-                                       e->offset, key, klen);
-            if (km < 0) return -1;
-            if (km == 1) {
-                *flag_out = e->flag;
-                *stream_id_out = e->stream_id;
-                *file_id_out = e->file_id;
-                *offset_out = e->offset;
-                *slot_out = slot;
-                return 0;
-            }
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    size_t slot;
+    while ((slot = kf_probe_next(&it)) != (size_t)-1) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag == 2) return -1;
+        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                   e->offset, key, klen);
+        if (km < 0) return -1;
+        if (km == 1) {
+            *flag_out = e->flag;
+            *stream_id_out = e->stream_id;
+            *file_id_out = e->file_id;
+            *offset_out = e->offset;
+            *slot_out = slot;
+            return 0;
         }
     }
     return -1;
@@ -1213,35 +1233,31 @@ static int kf_repoint(SlotcaskKfHandle *kh, const uint8_t hash[16],
                       uint8_t new_stream_id, uint16_t new_file_id,
                       uint32_t new_offset, const void *key, size_t klen,
                       const char *data_dir) {
-    size_t cap = kh->capacity;
-    SlotcaskKfEntry *kf = kh->map;
-    size_t start = kf_slot_for(hash, cap);
-    for (size_t i = 0; i < cap; i++) {
-        size_t slot = (start + i) % cap;
-        SlotcaskKfEntry *e = &kf[slot];
-        if (e->flag == 0) return -1;
-        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
-            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
-                                       e->offset, key, klen);
-            if (km < 0) return -1;
-            if (km == 1) {
-                union {
-                    struct {
-                        uint8_t  flag;
-                        uint8_t  stream_id;
-                        uint16_t file_id;
-                        uint32_t offset;
-                    } parts;
-                    uint64_t u64;
-                } combo;
-                combo.parts.flag = 1;
-                combo.parts.stream_id = new_stream_id;
-                combo.parts.file_id = new_file_id;
-                combo.parts.offset = new_offset;
-                __atomic_store_n((uint64_t *)((uint8_t *)e + 16), combo.u64,
-                                 __ATOMIC_RELEASE);
-                return 0;
-            }
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    size_t slot;
+    while ((slot = kf_probe_next(&it)) != (size_t)-1) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag != 1) continue;       /* tombstone or other → keep walking */
+        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                   e->offset, key, klen);
+        if (km < 0) return -1;
+        if (km == 1) {
+            union {
+                struct {
+                    uint8_t  flag;
+                    uint8_t  stream_id;
+                    uint16_t file_id;
+                    uint32_t offset;
+                } parts;
+                uint64_t u64;
+            } combo;
+            combo.parts.flag = 1;
+            combo.parts.stream_id = new_stream_id;
+            combo.parts.file_id = new_file_id;
+            combo.parts.offset = new_offset;
+            __atomic_store_n((uint64_t *)((uint8_t *)e + 16), combo.u64,
+                             __ATOMIC_RELEASE);
+            return 0;
         }
     }
     return -1;
@@ -1251,26 +1267,22 @@ static int kf_tombstone(SlotcaskKfHandle *kh, const uint8_t hash[16],
                         const void *key, size_t klen, const char *data_dir,
                         uint8_t *out_stream_id, uint16_t *out_file_id,
                         uint32_t *out_offset, size_t *used_delta) {
-    size_t cap = kh->capacity;
-    SlotcaskKfEntry *kf = kh->map;
-    size_t start = kf_slot_for(hash, cap);
-    for (size_t i = 0; i < cap; i++) {
-        size_t slot = (start + i) % cap;
-        SlotcaskKfEntry *e = &kf[slot];
-        if (e->flag == 0) return -1;
-        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
-            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
-                                       e->offset, key, klen);
-            if (km < 0) return -1;
-            if (km == 1) {
-                *out_stream_id = e->stream_id;
-                *out_file_id = e->file_id;
-                *out_offset = e->offset;
-                e->flag = 2;
-                if (kh->hdr) kh->hdr->deleted++;
-                (*used_delta)++;
-                return 0;
-            }
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    size_t slot;
+    while ((slot = kf_probe_next(&it)) != (size_t)-1) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag != 1) continue;       /* tombstone or other → keep walking */
+        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                   e->offset, key, klen);
+        if (km < 0) return -1;
+        if (km == 1) {
+            *out_stream_id = e->stream_id;
+            *out_file_id = e->file_id;
+            *out_offset = e->offset;
+            e->flag = 2;
+            if (kh->hdr) kh->hdr->deleted++;
+            (*used_delta)++;
+            return 0;
         }
     }
     return -1;
