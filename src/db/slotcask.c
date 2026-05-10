@@ -1348,6 +1348,34 @@ static void build_record_buf(uint8_t *buf, int slot_size,
     memcpy(buf + 24 + klen, value, vlen);
 }
 
+/* Emit one record into a slot at `dst`: 24-B header (hash, klen, flag=0,
+   _, vlen) → key bytes → value bytes → zero pad to slot_size → release
+   fence → flag=1. Caller owns dst (a slot offset inside an mmap'd seg
+   file) and any lock needed against eviction (segcache rdlock or
+   vacuum's exclusive). The fence + flag-byte-last ordering is what
+   makes a mid-write crash safe — partial bytes stay flag=0 until the
+   final store. */
+static inline void seg_record_emit(uint8_t *dst, int slot_size,
+                                    const uint8_t hash[16],
+                                    const void *key, size_t klen,
+                                    const void *value, size_t vlen) {
+    memcpy(dst, hash, 16);
+    uint16_t k16 = (uint16_t)klen;
+    memcpy(dst + 16, &k16, 2);
+    dst[18] = 0;        /* flag stays 0 until payload is in place */
+    dst[19] = 0;
+    uint32_t v32 = (uint32_t)vlen;
+    memcpy(dst + 20, &v32, 4);
+    memcpy(dst + 24, key, klen);
+    memcpy(dst + 24 + klen, value, vlen);
+    size_t used = 24 + klen + vlen;
+    if (used < (size_t)slot_size) {
+        memset(dst + used, 0, (size_t)slot_size - used);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    dst[18] = 1;
+}
+
 /* Memcpy a complete record (key+value already concatenated) into the segment
    mmap with crash-safe ordering: payload first, fence, flag byte last. */
 static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
@@ -1365,25 +1393,7 @@ static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
        create=1: first writer to a freshly-rotated segment file
        materialises it (open O_CREAT + ftruncate to max). */
     if (segcache_acquire(&h, path, 1, 0) != 0) return -1;
-
-    uint8_t *dst = h.map + offset;
-    /* Header without flag set yet. */
-    memcpy(dst, hash, 16);
-    uint16_t k16 = (uint16_t)klen;
-    memcpy(dst + 16, &k16, 2);
-    dst[18] = 0;          /* flag stays 0 until payload is in place */
-    dst[19] = 0;
-    uint32_t v32 = (uint32_t)vlen;
-    memcpy(dst + 20, &v32, 4);
-    memcpy(dst + 24, key, klen);
-    memcpy(dst + 24 + klen, value, vlen);
-    /* Zero pad up to slot_size — keeps recovery scans deterministic. */
-    size_t used = 24 + klen + vlen;
-    if (used < (size_t)db->slot_size) {
-        memset(dst + used, 0, (size_t)db->slot_size - used);
-    }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    dst[18] = 1;
+    seg_record_emit(h.map + offset, db->slot_size, hash, key, klen, value, vlen);
     segcache_release(&h);
     return 0;
 }
@@ -2736,23 +2746,9 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                     st[i].target_fid = items[j].fid;
                     st[i].target_off = items[j].off;
                     st[i].got_pool   = 1;
-
-                    uint8_t *dst = h.map + items[j].off;
-                    memcpy(dst, st[i].hash, 16);
-                    uint16_t k16 = (uint16_t)r->klen;
-                    memcpy(dst + 16, &k16, 2);
-                    dst[18] = 0;
-                    dst[19] = 0;
-                    uint32_t v32 = (uint32_t)r->vlen;
-                    memcpy(dst + 20, &v32, 4);
-                    memcpy(dst + 24, r->key, r->klen);
-                    memcpy(dst + 24 + r->klen, r->value, r->vlen);
-                    size_t used = 24 + r->klen + r->vlen;
-                    if (used < (size_t)db->slot_size) {
-                        memset(dst + used, 0, (size_t)db->slot_size - used);
-                    }
-                    __atomic_thread_fence(__ATOMIC_RELEASE);
-                    dst[18] = 1;
+                    seg_record_emit(h.map + items[j].off, db->slot_size,
+                                     st[i].hash, r->key, r->klen,
+                                     r->value, r->vlen);
                 }
                 segcache_release(&h);
                 k = run_end;
@@ -2791,23 +2787,9 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
             st[i].target_fid = (uint16_t)base_fid;
             st[i].target_off = offsets[k];
             st[i].got_pool   = 0;
-
-            uint8_t *dst = h.map + offsets[k];
-            memcpy(dst, st[i].hash, 16);
-            uint16_t k16 = (uint16_t)r->klen;
-            memcpy(dst + 16, &k16, 2);
-            dst[18] = 0;        /* flag stays 0 until payload is in place */
-            dst[19] = 0;
-            uint32_t v32 = (uint32_t)r->vlen;
-            memcpy(dst + 20, &v32, 4);
-            memcpy(dst + 24, r->key, r->klen);
-            memcpy(dst + 24 + r->klen, r->value, r->vlen);
-            size_t used = 24 + r->klen + r->vlen;
-            if (used < (size_t)db->slot_size) {
-                memset(dst + used, 0, (size_t)db->slot_size - used);
-            }
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            dst[18] = 1;
+            seg_record_emit(h.map + offsets[k], db->slot_size,
+                             st[i].hash, r->key, r->klen,
+                             r->value, r->vlen);
         }
         segcache_release(&h);
         free(offsets);
@@ -4516,22 +4498,9 @@ static int compact_migrate_records(SlotcaskDb *db, int stream_id,
         uint32_t target_off = free_offs[free_idx];
 
         /* Step 1: write recipient slot. Vacuum holds objlock_wrlock so no
-           concurrent writer can race on this offset. The flag-byte-last
-           ordering is what makes a mid-write crash safe — partial bytes
-           stay flag=0 until the fence + final store. */
-        uint8_t *dst = rh.map + target_off;
-        memcpy(dst, hash, 16);
-        memcpy(dst + 16, &klen, 2);
-        dst[18] = 0;
-        dst[19] = 0;
-        memcpy(dst + 20, &vlen, 4);
-        memcpy(dst + 24, key, klen);
-        memcpy(dst + 24 + (size_t)klen, value, vlen);
-        size_t used = 24 + (size_t)klen + (size_t)vlen;
-        if (used < (size_t)slot_size)
-            memset(dst + used, 0, (size_t)slot_size - used);
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        dst[18] = 1;
+           concurrent writer can race on this offset. */
+        seg_record_emit(rh.map + target_off, slot_size, hash,
+                         key, (size_t)klen, value, (size_t)vlen);
 
         /* Step 2-4: repoint kf entry under the kf shard's wrlock. */
         int kfshard = shard_for_hash(hash, db->num_shards);
