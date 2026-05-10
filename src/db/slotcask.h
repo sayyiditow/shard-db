@@ -584,6 +584,18 @@ int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
                              SlotcaskScanCb cb, void *ctx,
                              int *stop_flag);
 
+/* Per-shard streaming walker — fires cb() per record as the kf shard
+   is scanned, with no Pass-1 ref-buffer. Trades the per-segment-batched
+   acquire optimisation for immediate cb response. Right choice for
+   limit-bound queries (KEYS first 100, FIND limit 10) where the caller
+   sets stop_flag as soon as enough records have been collected and the
+   batched-acquire savings on the rest of the shard would never be
+   realised. cb returning non-zero stops this shard's walk; stop_flag
+   propagates that to the other shard workers. Returns 0 on success/stop. */
+int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
+                                       SlotcaskScanCb cb, void *ctx,
+                                       int *stop_flag);
+
 /* Skip the first `skip_n` live records without loading their values.
    The cb fires only on records past the skip window. Used by
    cmd_fetch with offset/cursor — eliminates the per-skipped-record

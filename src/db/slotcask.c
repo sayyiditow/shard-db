@@ -4294,6 +4294,63 @@ int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
     return walk_one_shard_inner(db, kf_shard_id, cb, ctx, stop_flag);
 }
 
+/* Streaming per-shard walker — fires cb() per record as kf is scanned, no
+   Pass-1 ref-buffer. Better than slotcask_walk_one_shard for limit-bound
+   queries: cb's stop signal propagates immediately (next iteration), so
+   workers don't waste time collecting refs that Pass 2 would never read.
+
+   Trades the per-segment-batched acquire optimisation (sort refs by
+   sid+fid + acquire each seg once per shard) for per-record acquire
+   (~50ns extra per record). For a 100-record limit across 64 shards
+   that's ~150K records skipped × 0ns saved (we never read them) vs
+   the full-scan path's ~15K records read × ~50ns saved per shard. */
+int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
+                                       SlotcaskScanCb cb, void *ctx,
+                                       int *stop_flag) {
+    if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
+        return -1;
+
+    /* Cheap stop-flag check before any allocation. */
+    if (stop_flag && __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) return 0;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return 0;
+
+    size_t cap = kh.capacity;
+    SlotcaskKfEntry *kf = kh.map;
+    int stop = 0;
+    int sf_check = 0;
+    for (size_t i = 0; i < cap && !stop; i++) {
+        /* Stop-flag check every 256 iterations — same cadence as the
+           buffered walker's Pass-1 stop check. */
+        if (stop_flag && (++sf_check & 0xFF) == 0 &&
+            __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+        SlotcaskKfEntry *e = &kf[i];
+        uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+        if (flag != 1) continue;
+
+        char seg_path[PATH_MAX];
+        seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle sh;
+        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+        const uint8_t *rec = sh.map + e->offset;
+        if (rec[18] == 1 && memcmp(rec, e->hash, 16) == 0) {
+            uint16_t klen; uint32_t vlen;
+            memcpy(&klen, rec + 16, 2);
+            memcpy(&vlen, rec + 20, 4);
+            if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+                stop = 1;
+        }
+        segcache_release(&sh);
+    }
+    kfcache_release(&kh);
+    return 0;
+}
+
 /* Count-only variant — sums live kf entries (flag=1) across every kf
    shard without touching the segcache. Pure mmap reads of 24-byte kf
    entries. Used by cmd_recount on v2 — was paying full segcache_acquire

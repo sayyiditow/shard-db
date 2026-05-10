@@ -176,6 +176,21 @@ static void *v2_shard_worker(void *raw) {
     return NULL;
 }
 
+/* Streaming variant of v2_shard_worker — uses slotcask_walk_one_shard_streaming
+   so cb response is per-record, not deferred to Pass 2. Right path for
+   limit-bound scans (cmd_keys, FIND limit-N, etc). */
+static void *v2_shard_worker_streaming(void *raw) {
+    V2ShardArg *w = (V2ShardArg *)raw;
+    g_out = w->parent_out ? w->parent_out : stdout;
+    if (w->stop_flag &&
+        __atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
+    int rc = slotcask_walk_one_shard_streaming(w->db, w->kf_shard_id,
+                                                w->scb, w->sctx, w->stop_flag);
+    if (rc != 0 && w->stop_flag)
+        __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     g_scan_stop = 0;
     V2ScanWrap wrap = { cb, ctx };
@@ -198,6 +213,34 @@ void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
         };
     }
     parallel_for(v2_shard_worker, args, n, sizeof(V2ShardArg));
+    free(args);
+}
+
+/* Streaming variant of scan_shards_v2 — uses the streaming per-shard
+   walker so cb stop response is per-record. Use for limit-bound queries
+   (cmd_keys, FIND-with-limit, etc.) where the buffered walker's Pass 1
+   would collect refs the caller would never read after the limit fires. */
+void scan_shards_v2_streaming(SlotcaskDb *db, scan_callback cb, void *ctx) {
+    g_scan_stop = 0;
+    V2ScanWrap wrap = { cb, ctx };
+    int n = db->num_shards;
+    if (n <= 0) return;
+    int stop_flag = 0;
+    V2ShardArg *args = malloc((size_t)n * sizeof(V2ShardArg));
+    if (!args) {
+        slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
+        return;
+    }
+    FILE *parent_out = g_out;
+    for (int s = 0; s < n; s++) {
+        args[s] = (V2ShardArg){
+            .db = db, .kf_shard_id = s,
+            .scb = v2_scan_wrap_cb, .sctx = &wrap,
+            .stop_flag = &stop_flag,
+            .parent_out = parent_out,
+        };
+    }
+    parallel_for(v2_shard_worker_streaming, args, n, sizeof(V2ShardArg));
     free(args);
 }
 
@@ -5954,7 +5997,24 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
     KeysCtx ctx = { offset, limit, 0, 0, csv_delim, PTHREAD_MUTEX_INITIALIZER };
     if (csv_delim) OUT("key\n");  /* header */
     else OUT("[");
-    scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
+    /* For v2 with a small caller-set limit, route through the streaming
+       per-shard walker — Pass-1 ref-buffering wastes time collecting refs
+       a limit-bound caller never reads. The threshold (1000) is well below
+       typical full-scan workloads but covers the common KEYS first N case
+       and admin previews. */
+    int use_streaming = (sch.storage_version == 2 &&
+                          limit > 0 && limit <= 1000);
+    if (use_streaming) {
+        SlotcaskSchemaInfo info = {
+            .splits = sch.splits, .slot_size = sch.slot_size,
+            .streams = sch.streams, .storage_version = 2,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (sdb) scan_shards_v2_streaming(sdb, keys_cb, &ctx);
+        else     scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
+    } else {
+        scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
+    }
     pthread_mutex_destroy(&ctx.lock);
     if (!csv_delim) OUT("]\n");
     return 0;
@@ -11886,7 +11946,23 @@ int cmd_find(const char *db_root, const char *object,
                              rows_fmt, dict_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0,
                              PTHREAD_MUTEX_INITIALIZER };
-        scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
+        /* Limit-bound full scan? Use the streaming walker so cb's stop
+           response is per-record. Otherwise the buffered Pass-1 path
+           collects refs the limit will never read. Same threshold + form
+           as cmd_keys; see scan_shards_v2_streaming. */
+        int use_streaming = (sch.storage_version == 2 &&
+                              limit > 0 && limit <= 1000);
+        if (use_streaming) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams, .storage_version = 2,
+            };
+            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+            if (sdb) scan_shards_v2_streaming(sdb, adv_search_cb, &ctx);
+            else     scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
+        } else {
+            scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
+        }
         pthread_mutex_destroy(&ctx.lock);
     }
 
