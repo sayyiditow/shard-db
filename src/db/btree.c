@@ -20,6 +20,7 @@ extern uint64_t g_bt_cache_misses;
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <pthread.h>
+#include <errno.h>
 #include <limits.h>
 
 /* Defined in util.c — forward-declared here to avoid pulling all of types.h
@@ -651,7 +652,16 @@ static uint32_t bt_alloc_page(BtFile *bt) {
             new_size = bt->map_size + 1024 * 1024;
         if (new_size < needed) new_size = needed;
         munmap(bt->map, bt->map_size);
-        ftruncate(bt->fd, new_size);
+        /* Coverity CID 1693852: bt_alloc_page returns uint32_t with no
+           error sentinel, and 8 callers don't check. Adding error
+           propagation here is a wider refactor; for now log loudly
+           on ftruncate failure (disk full / quota) — the subsequent
+           write to the over-claimed mmap will SIGBUS, which is at
+           least a hard fail rather than silent corruption. */
+        if (ftruncate(bt->fd, (off_t)new_size) < 0) {
+            fprintf(stderr, "btree: ftruncate(grow %zu→%zu) failed: %s\n",
+                    bt->map_size, new_size, strerror(errno));
+        }
         bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
         bt->map_size = new_size;
         fh = (BtFileHeader *)bt->map;

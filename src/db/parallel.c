@@ -251,6 +251,12 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
                 continue;
             }
             pthread_mutex_lock(&group.mu);
+            /* coverity[wait_not_in_locked_loop] outer while-loop at line
+               above already re-checks `remaining` after wake, which is
+               what Coverity's rule asks for. Looping cond_timedwait
+               directly here would be wrong — we want a wake to fall back
+               out so try_pop_task gets re-tried (the queue may have
+               filled meanwhile), not to keep sleeping. */
             if (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);

@@ -1294,11 +1294,23 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 if (new_len != old_len ||
                     memcmp(new_key, old_key, new_len) != 0) changed = 1;
             }
+            else if (!have_new && have_old) {
+                /* Field cleared on update — the old btree entry must be
+                   removed or it leaks a stale (key → record_hash) edge.
+                   update_idx_fn already handles new_key=NULL as a
+                   delete-only operation. */
+                changed = 1;
+            }
             if (changed) {
                 args[n_args].db_root = c->db_root;
                 args[n_args].object  = c->object;
                 args[n_args].field   = c->fields[i];
                 args[n_args].splits  = c->splits;
+                /* update_idx_fn treats NULL keys as "skip" — so a
+                   delete-only op (have_old, !have_new) gets new_key=NULL
+                   and old_key=old_key, an insert-only op (have_new,
+                   !have_old) gets new_key=new_key and old_key=NULL,
+                   and a real update gets both. */
                 args[n_args].new_key = have_new ? new_key : NULL;
                 args[n_args].new_len = new_len;
                 args[n_args].old_key = have_old ? old_key : NULL;
@@ -2375,7 +2387,16 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             if (key_count >= key_cap) {
                 key_cap *= 2;
                 MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
-                if (!t) { entries = NULL; break; }
+                if (!t) {
+                    /* xrealloc_or_free freed the old buffer; per-key
+                       strings inside it are leaked (no double-free,
+                       since the array holding their pointers is gone)
+                       — acceptable on OOM. Coverity CID 1693843: the
+                       previous "entries=NULL; break" left key_count>0
+                       and the loop below would deref NULL. */
+                    OUT("{\"error\":\"oom: bulk_exists keys\"}\n");
+                    return 1;
+                }
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
@@ -2522,7 +2543,12 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             if (key_count >= key_cap) {
                 key_cap *= 2;
                 MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
-                if (!t) { entries = NULL; break; }
+                if (!t) {
+                    /* See cmd_exists_multi above for rationale (Coverity
+                       CID 1693844). */
+                    OUT("{\"error\":\"oom: bulk_get keys\"}\n");
+                    return 1;
+                }
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];

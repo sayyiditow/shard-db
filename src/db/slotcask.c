@@ -229,10 +229,18 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
         snprintf(dir, sizeof(dir), "%s", path);
         char *slash = strrchr(dir, '/');
         if (slash) { *slash = 0; mkdirp_local(dir); }
-        struct stat pre_st;
-        int existed = (stat(path, &pre_st) == 0);
-        fd = open(path, O_RDWR | O_CREAT, 0644);
-        if (!existed && fd >= 0) created_fresh = 1;
+        /* Race-free first-create detection via O_EXCL: try to create
+           exclusively first; on EEXIST the file already existed and we
+           reopen without O_CREAT. The previous stat()-then-open()
+           pattern had a TOCTOU window (Coverity CID 1693847) where a
+           concurrent creator between the two calls would leave us
+           treating an existing file as fresh and zeroing its header. */
+        fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
+            created_fresh = 1;
+        } else if (errno == EEXIST) {
+            fd = open(path, O_RDWR);
+        }
     } else {
         fd = open(path, O_RDWR);
     }
@@ -334,15 +342,23 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
 
+        /* coverity[atomicity] CID 1693850: `slot` came from the prior
+           locked section, but we re-verify identity below
+           (e->used && strcmp(e->path, path) == 0). On mismatch we
+           drop the rwlock and retry — the verify is the consistency
+           barrier the analyzer can't see. */
         KfCacheEntry *e = &g_kfcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
             h->slot = slot;
             kf_handle_from_entry(h, e);
+            /* coverity[missing_unlock] intentional: returning with the
+               per-slot rwlock held; caller releases via kfcache_release. */
             return 0;
         }
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
-            slot = -1; found = 0;
+            /* slot/found get re-set by the kfcache_probe call below
+               in the install path (Coverity CID 1693833). */
             pthread_mutex_lock(&g_kfcache_lock);
             break;
         }
@@ -372,6 +388,8 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
         if (e->used && strcmp(e->path, path) == 0) {
             h->slot = slot;
             kf_handle_from_entry(h, e);
+            /* coverity[missing_unlock] intentional: returning with the
+               per-slot rwlock held; caller releases via kfcache_release. */
             return 0;
         }
         /* Slot was evicted under us; serve uncached this once. */
@@ -607,17 +625,25 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
 
+        /* coverity[atomicity] CID 1693837: `slot` came from the prior
+           locked section, but we re-verify identity below
+           (e->used && strcmp(e->path, path) == 0). On mismatch we
+           drop the rwlock and retry — the verify is the consistency
+           barrier the analyzer can't see. */
         SegCacheEntry *e = &g_segcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
             h->slot = slot;
             h->fd = e->fd;
             h->map = e->map;
             h->map_size = e->map_size;
+            /* coverity[missing_unlock] intentional: returning with the
+               per-slot rwlock held; caller releases via segcache_release. */
             return 0;
         }
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
-            slot = -1; found = 0;
+            /* slot/found get re-set by the segcache_probe call below
+               in the install path (Coverity CID 1693845). */
             pthread_mutex_lock(&g_segcache_lock);
             break;
         }
@@ -645,6 +671,8 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
             h->fd = e->fd;
             h->map = e->map;
             h->map_size = e->map_size;
+            /* coverity[missing_unlock] intentional: returning with the
+               per-slot rwlock held; caller releases via segcache_release. */
             return 0;
         }
         pthread_rwlock_unlock(lock);
@@ -1087,6 +1115,12 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
     }
 
     size_t cap = kh->capacity;
+    /* Defensive: kfcache_resplit_locked never sets capacity to 0 on
+       failure (success path is the only writer), but Coverity can't
+       trace that across the call (CID 1693834: divide-by-zero in
+       kf_slot_for below). Bail explicitly so a future regression in
+       resplit can't silently turn into UB. */
+    if (cap == 0) return -1;
     SlotcaskKfEntry *kf = kh->map;
     SlotcaskKfHeader *hdr = kh->hdr;
     size_t start = kf_slot_for(hash, cap);
@@ -4114,18 +4148,25 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
                 e = &kf[i];
                 flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
                 if (flag != 1) continue;
-                refs[nrefs].kf_idx = (uint32_t)i;
-                refs[nrefs].sid    = e->stream_id;
-                refs[nrefs].fid    = e->file_id;
-                refs[nrefs].offset = e->offset;
-                if (++nrefs >= alloc_n) {
-                    /* refs full — grow once via realloc to fit the rest. */
-                    size_t new_n = alloc_n + (cap - i);
+                /* Grow BEFORE writing — entering this slow path means
+                   nrefs == alloc_n already, so the previous "write
+                   then check" order overran refs[alloc_n] by one
+                   element on the first iteration (Coverity CID 1693842).
+                   Bound = max(nrefs+1, alloc_n + remaining slots) so
+                   we can comfortably hold every remaining live entry
+                   without re-growing. */
+                if (nrefs >= alloc_n) {
+                    size_t new_n = alloc_n + (cap - i) + 1;
                     WalkRecRef *grown = realloc(refs, new_n * sizeof(WalkRecRef));
                     if (!grown) goto done_collect;
                     refs = grown;
                     alloc_n = new_n;
                 }
+                refs[nrefs].kf_idx = (uint32_t)i;
+                refs[nrefs].sid    = e->stream_id;
+                refs[nrefs].fid    = e->file_id;
+                refs[nrefs].offset = e->offset;
+                nrefs++;
             }
             break;
         }

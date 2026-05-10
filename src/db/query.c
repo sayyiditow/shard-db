@@ -1101,6 +1101,13 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
     uint8_t *old_idx_bufs[MAX_FIELDS];
     size_t   old_idx_lens[MAX_FIELDS];
     int      old_idx_have[MAX_FIELDS];
+    /* Zero-init bufs + lens too — Coverity CIDs 1693836/1693840 flagged
+       reads of old_idx_bufs[fi]/old_idx_lens[fi] inside an
+       old_idx_have[fi]-guarded condition. The short-circuit means the
+       read is functionally safe, but the analyzer can't track the
+       array-element relationship. Cheap defense (~2 KB stack). */
+    memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+    memset(old_idx_lens, 0, sizeof(old_idx_lens));
     memset(old_idx_have, 0, sizeof(old_idx_have));
     if (is_update && old) {
         for (int fi = 0; fi < sw->nidx; fi++) {
@@ -2049,8 +2056,20 @@ int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_s
         unlink(tmp);
         return r;
     }
-    ftruncate(memfd, slen);
-    write(memfd, json_str, slen);
+    /* Coverity CID 1693846: check ftruncate + write returns. Silent
+       failure here would feed an empty file to cmd_bulk_insert and
+       silently process zero records. */
+    if (ftruncate(memfd, (off_t)slen) < 0) {
+        close(memfd);
+        OUT("{\"error\":\"memfd ftruncate failed: %s\"}\n", strerror(errno));
+        return 1;
+    }
+    ssize_t wrote = write(memfd, json_str, slen);
+    if (wrote != (ssize_t)slen) {
+        close(memfd);
+        OUT("{\"error\":\"memfd short write: %zd of %zu\"}\n", wrote, slen);
+        return 1;
+    }
     char fdpath[64];
     snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", memfd);
     int r = cmd_bulk_insert(db_root, object, fdpath, if_not_exists);
@@ -10068,6 +10087,8 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
        results without OOM-ing the daemon). */
     size_t ks_bytes_est = hint * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
     if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
+    /* coverity[tainted_data] CID 1693849: hint is bounded above by the
+       explicit g_query_buffer_max_bytes check immediately above. */
     KeySet *ks = keyset_new(hint);
     if (!ks) return NULL;
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -10409,6 +10430,8 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
         return NULL;
     }
 
+    /* coverity[tainted_data] CID 1693838: est_total is bounded above by
+       the explicit g_query_buffer_max_bytes check immediately above. */
     KeySet *ks = keyset_new(est_total);
     if (!ks) return NULL;
 
@@ -12914,13 +12937,23 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
     snprintf(data_legacy, sizeof(data_legacy), "%s/data.legacy", obj_dir);
 
     /* Already-renamed legacy from a prior aborted migration → bail with
-       a clear error so the operator can investigate. We won't auto-restore. */
+       a clear error so the operator can investigate. We won't auto-restore.
+       Coverity CID 1693835 flags TOCTOU between these stat() calls and
+       the rename() below. Suppressed: cmd_migrate_storage_version is
+       gated by mode_is_schema → caller holds objlock_wrlock so no
+       concurrent in-process caller can race; cross-process concurrency
+       is excluded by the single-instance flock on $DB_ROOT/.shard-db.lock
+       (see cmd_server). The stat is informational; the actual atomic
+       step is the rename(data_dir, data_legacy) below, which fails
+       cleanly if the FS has changed under us. */
     struct stat st;
+    /* coverity[toctou] guarded by objlock_wrlock + single-instance flock */
     if (stat(data_legacy, &st) == 0) {
         OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
             dir, object);
         return 1;
     }
+    /* coverity[toctou] guarded by objlock_wrlock + single-instance flock */
     if (stat(data_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         OUT("{\"error\":\"data/ missing for v1 object [%s/%s]\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
             dir, object, dir, object);
@@ -16661,6 +16694,12 @@ int cmd_aggregate(const char *db_root, const char *object,
                     if (processed[i] || specs[i].fn == AGG_COUNT) continue;
                     const char *fld = specs[i].field;
                     int fi = typed_field_index(fs.ts, fld);
+                    /* typed_field_index returns -1 when the field name
+                       isn't in the schema. Skip — callers above have
+                       already validated specs against the schema, but
+                       Coverity CID 1693851 can't see that, and a real
+                       runtime mismatch shouldn't deref fields[-1]. */
+                    if (fi < 0) { processed[i] = 1; continue; }
                     const TypedField *tf = &fs.ts->fields[fi];
                     int sibs[MAX_AGG_SPECS]; int nsibs = 0;
                     for (int j = i; j < nspecs; j++) {
