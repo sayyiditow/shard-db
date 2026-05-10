@@ -29,7 +29,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#define SPLITS 64
+/* SPLITS is now derived per-run from SHARD_BENCH_COUNT (or overridden via
+   SHARD_BENCH_SPLITS); see bench_queries_run() for the tier table. */
 
 /* Mirrors the python lists in insert-users.sh — 30 first names, 30
    last names, 7 domains, 15 bios — so that username/email/bio
@@ -198,8 +199,6 @@ static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t
 
 /* ---------------------------------------------------------------- main bench */
 
-#define CHUNK_SIZE 10000000  /* records per bulk-insert call */
-
 #define BR(label, json) bench_table_run(tc, (label), (json))
 
 static int bench_queries_run(void) {
@@ -207,79 +206,205 @@ static int bench_queries_run(void) {
     long COUNT = count_env ? atol(count_env) : 1000000L;
     if (COUNT <= 0) COUNT = 1000000;
 
-    TestEnv env = {0};
-    if (test_env_start(&env) != 0) {
-        fprintf(stderr, "bench-queries: daemon spawn failed\n");
+    /* SHARD_BENCH_CHUNK controls records-per-bulk-insert call. Default
+       1M — small enough for prompt progress on disk-backed runs, big
+       enough that per-chunk overhead stays sub-1% of insert wall time.
+       (10M chunks were silently slow on /tmp tmpfs; on real disk they
+       hide progress for ~1+ min per chunk.) */
+    const char *chunk_env = getenv("SHARD_BENCH_CHUNK");
+    long CHUNK_SIZE = chunk_env ? atol(chunk_env) : 1000000L;
+    if (CHUNK_SIZE <= 0) CHUNK_SIZE = 1000000;
+    if (CHUNK_SIZE > COUNT) CHUNK_SIZE = COUNT;
+
+    /* SHARD_BENCH_SPLITS overrides the create-object splits value. Default
+       targets the CLAUDE.md sweet-spot top of ~195K records/shard — each
+       tier doubles splits when the previous tier's record-cap is reached.
+       At splits ≤ 128 this also fits within the engine's 256K initial
+       slots/shard, so inserts at ≤ 24M records pay zero resplit cost.
+       Above splits=128 the engine's per-shard initial drops to 128K/64K
+       and resplits during bulk insert become unavoidable until the engine
+       tier table is bumped. Power-of-2 in [8, 4096]. */
+    const char *splits_env = getenv("SHARD_BENCH_SPLITS");
+    long SPLITS;
+    if (splits_env) {
+        SPLITS = atol(splits_env);
+    } else {
+        if      (COUNT <=    1500000L) SPLITS = 8;
+        else if (COUNT <=    3000000L) SPLITS = 16;
+        else if (COUNT <=    6000000L) SPLITS = 32;
+        else if (COUNT <=   12000000L) SPLITS = 64;
+        else if (COUNT <=   24000000L) SPLITS = 128;
+        else if (COUNT <=   48000000L) SPLITS = 256;
+        else if (COUNT <=   96000000L) SPLITS = 512;
+        else if (COUNT <=  192000000L) SPLITS = 1024;
+        else if (COUNT <=  384000000L) SPLITS = 2048;
+        else                           SPLITS = 4096;
+    }
+    if (SPLITS < 8) SPLITS = 8;
+    if (SPLITS > 4096) SPLITS = 4096;
+    /* Round to power of two if needed. */
+    {
+        long p = 8;
+        while (p < SPLITS) p <<= 1;
+        SPLITS = p;
+    }
+
+    /* Persistent / skip-insert knobs.
+       SHARD_BENCH_DB_ROOT=<path>   use this DB_ROOT (must include /db
+                                    component, e.g. /tmp/qbench/db) instead
+                                    of an ephemeral tmpdir. Implies KEEP=1.
+       SHARD_BENCH_KEEP=1            don't delete db_root after the bench
+                                    (no-op for tmpdir mode anyway).
+       SHARD_BENCH_SKIP_INSERT=1    skip create-object + insert; assume the
+                                    schema and data are already there from
+                                    a previous run. Requires SHARD_BENCH_DB_ROOT.
+       SHARD_BENCH_PORT=<n>         pin the port (else: pick a free one).
+
+       Workflow: insert once with KEEP, then iterate query benches with
+       SKIP_INSERT to avoid re-paying the 200s+ insert cost at 25M scale. */
+    const char *db_root_env = getenv("SHARD_BENCH_DB_ROOT");
+    int bench_keep = getenv("SHARD_BENCH_KEEP") ? 1 : 0;
+    int bench_skip_insert = getenv("SHARD_BENCH_SKIP_INSERT") ? 1 : 0;
+    if (bench_skip_insert && !db_root_env) {
+        fprintf(stderr, "bench-queries: SHARD_BENCH_SKIP_INSERT requires SHARD_BENCH_DB_ROOT\n");
         return 1;
+    }
+    int persistent = db_root_env || bench_keep || bench_skip_insert;
+
+    TestEnv env = {0};
+    if (persistent) {
+        char default_root[256];
+        if (!db_root_env) {
+            snprintf(default_root, sizeof(default_root),
+                     "/tmp/shard-bench-queries/db");
+            db_root_env = default_root;
+        }
+        /* db_root must end in /<name> so test_env_start_at can derive base.
+           mkdir -p the full path (creates base + db_root). */
+        const char *slash = strrchr(db_root_env, '/');
+        if (!slash || slash == db_root_env) {
+            fprintf(stderr, "bench-queries: SHARD_BENCH_DB_ROOT must contain '/' "
+                            "(e.g. /tmp/qbench/db)\n");
+            return 1;
+        }
+        char mkdir_cmd[600];
+        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", db_root_env);
+        if (system(mkdir_cmd) != 0) {
+            fprintf(stderr, "bench-queries: mkdir failed for %s\n", db_root_env);
+            return 1;
+        }
+        int port;
+        const char *port_env = getenv("SHARD_BENCH_PORT");
+        if (port_env) port = atoi(port_env);
+        else port = test_pick_port();
+        if (port <= 0) {
+            fprintf(stderr, "bench-queries: port allocation failed\n");
+            return 1;
+        }
+        if (test_env_start_at(&env, db_root_env, port) != 0) {
+            fprintf(stderr, "bench-queries: daemon spawn at %s failed\n", db_root_env);
+            return 1;
+        }
+        printf("  persistent mode: DB_ROOT=%s port=%d skip_insert=%d\n\n",
+               db_root_env, port, bench_skip_insert);
+    } else {
+        if (test_env_start(&env) != 0) {
+            fprintf(stderr, "bench-queries: daemon spawn failed\n");
+            return 1;
+        }
     }
 
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
-    if (!tc) { test_env_stop(&env); return 1; }
+    if (!tc) {
+        if (persistent) test_env_stop_keep(&env);
+        else test_env_stop(&env);
+        return 1;
+    }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    if (!bench_skip_insert) {
+        tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    }
 
-    /* Schema indexes every typed field except `bio` (left non-indexed
-       so we can exercise full-scan paths). 13 fields, 12 indexes. */
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-        "\"splits\":64,\"max_key\":32,"
-        "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                    "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                    "\"rank:short\",\"score:double\",\"active:bool\","
-                    "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                    "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
-        "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
-                     "\"score\",\"active\",\"level\",\"birthday\","
-                     "\"created_at\",\"balance\",\"hourly_rate\"]}",
-        &resp);
-    free(resp); resp = NULL;
+    /* Schema: 13 fields, `bio` left non-indexed so we exercise full-scan
+       paths. ALL 12 indexes created upfront — production workloads
+       always have their indexes from the start, so the bench mirrors
+       that even at high N. (If chunked-bulk-insert into a populated
+       indexed table hits performance issues, the engine needs to fix
+       it — not the bench's job to paper over it.) */
+    if (!bench_skip_insert) {
+        char create_obj[2048];
+        snprintf(create_obj, sizeof(create_obj),
+            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+            "\"splits\":%ld,\"max_key\":32,\"storage_version\":%d,"
+            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                        "\"rank:short\",\"score:double\",\"active:bool\","
+                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
+            "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
+                         "\"score\",\"active\",\"level\",\"birthday\","
+                         "\"created_at\",\"balance\",\"hourly_rate\"]}",
+            SPLITS, bench_storage_version());
+        tc_request(tc, create_obj, &resp);
+        free(resp); resp = NULL;
+    }
 
     printf("======================================================================\n");
-    printf("  shard-db QUERY benchmark — %ld users  (chunk = %d)\n",
-           COUNT, CHUNK_SIZE);
+    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
+           COUNT, SPLITS, CHUNK_SIZE);
     printf("======================================================================\n\n");
 
     /* Chunked insert. Build CHUNK_SIZE records at a time, push via memfd,
        free the buffer. Bounds peak memory regardless of total COUNT. */
-    long inserted = 0;
-    uint64_t insert_t0 = bench_now_ns();
-    while (inserted < COUNT) {
-        long remaining = COUNT - inserted;
-        int chunk = (remaining < CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
+    if (!bench_skip_insert) {
+        long inserted = 0;
+        uint64_t insert_t0 = bench_now_ns();
+        while (inserted < COUNT) {
+            long remaining = COUNT - inserted;
+            int chunk = (remaining < CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
 
-        printf("  chunk: rows %ld..%ld (%d records)…", inserted, inserted + chunk, chunk);
-        fflush(stdout);
+            printf("  chunk: rows %ld..%ld (%d records)…", inserted, inserted + chunk, chunk);
+            fflush(stdout);
 
-        char *buf = NULL; size_t sz = 0;
-        if (build_users_chunk_json((int)inserted, chunk, &buf, &sz) != 0) {
-            fprintf(stderr, "\nbench-queries: OOM building chunk at i=%ld\n", inserted);
-            tc_close(tc); test_env_stop(&env); return 1;
+            char *buf = NULL; size_t sz = 0;
+            if (build_users_chunk_json((int)inserted, chunk, &buf, &sz) != 0) {
+                fprintf(stderr, "\nbench-queries: OOM building chunk at i=%ld\n", inserted);
+                tc_close(tc);
+                if (persistent) test_env_stop_keep(&env); else test_env_stop(&env);
+                return 1;
+            }
+
+            int data_fd = make_memfd("queries-users", buf, sz);
+            free(buf);
+            if (data_fd < 0) {
+                tc_close(tc);
+                if (persistent) test_env_stop_keep(&env); else test_env_stop(&env);
+                return 1;
+            }
+
+            char ins_req[256];
+            snprintf(ins_req, sizeof(ins_req),
+                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"users\","
+                "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), data_fd);
+            uint64_t t0 = bench_now_ns();
+            tc_request(tc, ins_req, &resp);
+            uint64_t t1 = bench_now_ns();
+            close(data_fd);
+            free(resp); resp = NULL;
+            printf(" %.2fs (%.2f M/sec)\n",
+                   (double)(t1 - t0) / 1e9,
+                   (double)chunk / 1e6 / ((double)(t1 - t0) / 1e9));
+            inserted += chunk;
         }
-
-        int data_fd = make_memfd("queries-users", buf, sz);
-        free(buf);
-        if (data_fd < 0) { tc_close(tc); test_env_stop(&env); return 1; }
-
-        char ins_req[256];
-        snprintf(ins_req, sizeof(ins_req),
-            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"users\","
-            "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), data_fd);
-        uint64_t t0 = bench_now_ns();
-        tc_request(tc, ins_req, &resp);
-        uint64_t t1 = bench_now_ns();
-        close(data_fd);
-        free(resp); resp = NULL;
-        printf(" %.2fs (%.2f M/sec)\n",
-               (double)(t1 - t0) / 1e9,
-               (double)chunk / 1e6 / ((double)(t1 - t0) / 1e9));
-        inserted += chunk;
+        uint64_t insert_t1 = bench_now_ns();
+        printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
+               (double)(insert_t1 - insert_t0) / 1e9,
+               (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
+    } else {
+        printf("  skipping insert (SHARD_BENCH_SKIP_INSERT=1)\n\n");
     }
-    uint64_t insert_t1 = bench_now_ns();
-    printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
-           (double)(insert_t1 - insert_t0) / 1e9,
-           (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
 
     /* ==================================================================
        Sections — every operator class on every applicable field type.
@@ -568,6 +693,20 @@ static int bench_queries_run(void) {
     BR("min age birthday 1990..2000",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"19900101\"},{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"20000101\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
     BR("agg where active=false (count+avg)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"age\"}]}");
     BR("agg age neq 30 (NEQ short)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"neq\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Same-field min/max — criterion field == agg field. Should hit the
+       btree-only shortcut: walk the agg btree within criterion bounds, take
+       first leaf entry per shard. No KeySet, no record fetch. */
+    BR("min age where age>30 (same)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
+    BR("max age where age<60 (same)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"lt\",\"value\":\"60\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"age\"}]}");
+    BR("min birthday in 1990..2000 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"19900101\"},{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"20000101\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\"}]}");
+    BR("max balance where balance>0 (same)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"gt\",\"value\":\"0\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    /* Multi-leaf AND min/max — 2+ indexed leaves, intersect-eligible ops.
+       Should hit the new PRIMARY_INTERSECT-aware shortcut: build candidate
+       KeySet via intersect_indexed_leaves, walk agg btree, first in-set
+       hash per shard wins. No record fetches. */
+    BR("min age where active=true AND score>50",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
+    BR("max balance where active=true AND age>30","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    BR("min score where age 25..50 AND active=true","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gte\",\"value\":\"25\"},{\"field\":\"age\",\"op\":\"lte\",\"value\":\"50\"},{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"aggregates\":[{\"fn\":\"min\",\"field\":\"score\"}]}");
     bench_table_section_end();
 
     /* ---------- AGGREGATE — bundled + group_by + having ---------- */
@@ -576,6 +715,41 @@ static int bench_queries_run(void) {
     BR("group by active",              "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"balance\"}]}");
     BR("group by age top 5",           "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}");
     BR("group by age having n>16k",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"having\":[{\"field\":\"n\",\"op\":\"gt\",\"value\":\"16000\"}]}");
+    /* Indexed group_by fast path — group_by field has btree, every spec is
+       count(*) or sum/avg/min/max on an indexed non-varchar field. Walks
+       group_by btree once + each agg field's btree once via a hash16 →
+       bucket map; skips per-record decode. Should drop bundled+grouped
+       cases from ~250-400ms to tens of ms. */
+    BR("group by active, sum(balance)",       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by active, min/max balance",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"aggregates\":[{\"fn\":\"min\",\"field\":\"balance\"},{\"fn\":\"max\",\"field\":\"balance\"}]}");
+    BR("group by age, avg(score)",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"score\"}]}");
+    BR("group by birthday, count",            "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"birthday\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Varchar group_by — exercises the post-2026.05.x indexed-path
+       extension that decodes raw varchar leaf bytes into bucket keys. */
+    BR("group by username, count             (varchar idx)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"username\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],\"limit\":10}");
+    BR("group by email, sum(balance)         (varchar idx)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"email\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}],\"limit\":10}");
+    /* group_by + criteria — indexed-path extension that builds a candidate
+       KeySet from the criteria's index, then filters the group_by walk by
+       it. Was a record-scan path before this fix. */
+    BR("group by active where age>30",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"avg\",\"field\":\"balance\"}]}");
+    BR("group by age where active=true       (eq crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    BR("group by active where age 25..50 AND score>50  (AND crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\"],\"criteria\":[{\"field\":\"age\",\"op\":\"between\",\"value\":[\"25\",\"50\"]},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by age where active=true OR score>80    (OR crit)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\"],\"criteria\":[{\"or\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},{\"field\":\"score\",\"op\":\"gt\",\"value\":\"80\"}]}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    /* Multi-field group_by — composite bucket key built by walking the
+       primary group field's btree and resolving each secondary field's
+       value via a hash16 → encoded-value map. */
+    BR("group by active, age                  (2-field)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\",\"age\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    BR("group by active, age, sum(balance)    (2-field + agg)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\",\"age\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
+    BR("group by age, level                   (2-field, both int)",
+       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\",\"level\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
     bench_table_section_end();
 
     /* ---------- CURSOR — keyset pagination by various indexed types ---------- */
@@ -598,7 +772,8 @@ static int bench_queries_run(void) {
     printf("======================================================================\n");
 
     tc_close(tc);
-    test_env_stop(&env);
+    if (persistent) test_env_stop_keep(&env);
+    else test_env_stop(&env);
     return 0;
 }
 

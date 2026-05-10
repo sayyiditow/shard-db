@@ -198,6 +198,18 @@ typedef struct {
     int max_key;
     int max_value;
     int slot_size;        /* = payload_size per slot (max_key + max_value), 8-aligned */
+    /* Storage engine version. 1 = legacy probe-into-slot (Zone A/B + ucache).
+       2 = slotcask (keyfile shards + append-only data segments + per-stream
+       free-slot pool). Defaults to 1 for objects created before 2026.06 — the
+       schema.conf line format `dir:object:splits:max_key` produces 1 because
+       the trailing fields are absent. v2 objects write the extended form
+       `dir:object:splits:max_key:2:streams` at create time. */
+    int storage_version;
+    /* Slotcask streams count, only meaningful when storage_version=2. The
+       value is hardcoded by nproc at create time (see slotcask_streams_for_nproc)
+       and persisted in schema.conf so subsequent opens use the same count —
+       stream_id is on-disk in keyfile entries, so changing it would orphan data. */
+    int streams;
 } Schema;
 
 /* Shard file layout:
@@ -469,6 +481,13 @@ void parallel_pool_init(int nthreads);
 void parallel_pool_shutdown(void);
 int  parallel_pool_size(void);
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
+
+/* I/O-heavy variant — spawns one dedicated pthread per task instead of
+   submitting to the bounded CPU pool. Use for bulk-insert / bulk-update /
+   bulk-delete worker dispatch and other write-heavy paths that benefit
+   from oversubscription (page faults on mmap MAP_SHARED writes,
+   fsync waits) without polluting the CPU pool that read paths share. */
+void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms);
 int ucache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
@@ -631,6 +650,24 @@ void parse_field_type(const char *spec, TypedField *f);
 /* storage.c */
 void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]);
 void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot);
+
+/* Single source of truth for hash → shard_id, version-aware.
+   storage_version=1 → v1 big-endian (legacy zone-A layout).
+   storage_version=2 → v2 little-endian (slotcask kf layout).
+   addr_from_hash and slotcask's shard_for_hash both delegate to this;
+   cross-version callers (bulk-insert / multi-get / multi-exists
+   dispatchers) call this directly. static inline so every TU
+   (including shard-db-test/bench which don't link storage.c) sees
+   the definition without an extra link target. */
+static inline int compute_record_shard(const uint8_t hash[16], int splits,
+                                        int storage_version) {
+    if (storage_version == 2) {
+        uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
+        return (int)(v % (uint16_t)splits);
+    }
+    unsigned int h4 = ((unsigned)hash[0] << 8) | hash[1];
+    return (int)(h4 % (unsigned int)splits);
+}
 void compute_addr(const char *key, size_t key_len, int splits, uint8_t hash_out[16], int *shard_id, int *slot);
 void build_shard_path(char *buf, size_t buflen, const char *db_root, const char *object, int shard_id);
 void build_shard_filename(char *buf, size_t buflen, const char *data_dir, int shard_id);
@@ -720,6 +757,16 @@ void update_deleted_count(const char *db_root, const char *object, int delta);
 void reset_deleted_count(const char *db_root, const char *object);
 int get_deleted_count(const char *db_root, const char *object);
 int get_live_count(const char *db_root, const char *object);
+/* Persist any in-memory counts cache for the object back to disk. Called
+   from vacuum / recount / shutdown so cmd_size on the next process boot
+   reflects recent updates. */
+void counts_flush(const char *db_root, const char *object);
+void counts_flush_all(void);
+
+/* Drop the cached counters for an object — used after drop-object /
+   create-object / truncate so a fresh object reads its starting count
+   from disk (typically 0) instead of the stale cache. */
+void counts_invalidate(const char *db_root, const char *object);
 int cmd_get(const char *db_root, const char *object, const char *key);
 int cmd_insert(const char *db_root, const char *object, const char *key, const char *value,
                const char *if_json, int if_not_exists);
@@ -803,6 +850,15 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *max_val, size_t max_len, int max_exclusive,
                             int desc, bt_result_cb cb, void *ctx);
 
+/* Flush any thread-local accumulator populated by callbacks during the
+   current btree per-shard walk. Defined in query.c (where idx_count_cb
+   lives); shard_walk_worker (index.c) calls it after each per-shard
+   btree_search/btree_range/btree_range_ex returns so the orchestrator's
+   post-parallel_for read of the shared count sees every worker's
+   contribution. Currently only idx_count_cb uses TLS; if more callbacks
+   adopt the pattern, fan out from this single hook. */
+void idx_count_cb_flush_thread(void);
+
 /* Drop every shard file for an index and the parent directory. */
 void btree_idx_unlink_all(const char *db_root, const char *object,
                           const char *field, int splits);
@@ -848,6 +904,35 @@ int  match_criterion(const char *val_str, const SearchCriterion *c);
 extern volatile int g_scan_stop; /* set to 1 to abort all in-flight shard scans */
 typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *ctx); /* return 0=continue, 1=stop */
 void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
+/* v2 scan bridge — adapts slotcask_walk_live to the SlotHeader-shaped
+   scan_callback so existing callbacks work unchanged. */
+struct SlotcaskDb;
+void scan_shards_v2(struct SlotcaskDb *db, scan_callback cb, void *ctx);
+/* Storage-version-aware scan dispatch. v2 objects route through the
+   slotcask registry; v1 fall through to scan_shards. Returns -1 only
+   when v2 dispatch fails (open-time error). */
+int  scan_dispatch(const char *db_root, const char *object,
+                   const Schema *sc, const char *data_dir,
+                   scan_callback cb, void *ctx);
+
+/* Indexed record fetch: layout-agnostic dispatch for hash-based lookups.
+   v1 path holds an FcacheRead handle; v2 holds a malloc'd copy of the
+   record. Either way, key + val point into a contiguous buffer with
+   layout `[key bytes][val bytes]`, matching v1 Zone B. Caller must
+   call release_record_ref to free both lifetimes. */
+typedef struct {
+    FcacheRead     fc;        /* v1: kept open to keep mmap alive; .map=NULL on v2 */
+    uint8_t       *v2_buf;    /* v2: malloc'd; NULL on v1 */
+    const uint8_t *key;
+    size_t         klen;
+    const uint8_t *val;
+    size_t         vlen;
+} RecordRef;
+
+int  read_record_ref(const char *db_root, const char *object,
+                     const Schema *sch, const uint8_t hash[16],
+                     RecordRef *out);
+void release_record_ref(RecordRef *r);
 int fetch_record_by_hash(const char *db_root, const char *object, const Schema *sch, const uint8_t hash16[16], int *printed, void *fs);
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);
@@ -867,6 +952,13 @@ int cmd_bulk_insert_delimited(const char *db_root, const char *object,
                               const char *filepath, char delimiter,
                               int if_not_exists);
 int cmd_bulk_delete(const char *db_root, const char *object, const char *input);
+int cmd_bulk_delete_string(const char *db_root, const char *object, char *keys_str);
+int cmd_bulk_update_delimited_string(const char *db_root, const char *object,
+                                       const char *data, size_t size,
+                                       char delimiter);
+int cmd_bulk_insert_delimited_string(const char *db_root, const char *object,
+                                       const char *data, size_t size,
+                                       char delimiter, int if_not_exists);
 /* if_json (optional) is a JSON object {field:value,...} re-verified under
    the wrlock per record in phase 2 — same optimistic-concurrency semantics
    as single-op `if`. Records that match the criteria but fail the if are
@@ -894,9 +986,12 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              int limit, int dry_run);
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits);
+/* new_streams_arg: 0 = keep current streams; >0 = rebuild with that count
+   (only meaningful for v2 storage). Used by vacuum's streams-mismatch path. */
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits, int drop_tombstoned,
-                   char added_lines[][256], int n_added);
+                   char added_lines[][256], int n_added,
+                   int new_streams_arg);
 int cmd_recount(const char *db_root, const char *object);
 int cmd_shard_stats(const char *db_root, const char *object, int as_table);
 int cmd_truncate(const char *db_root, const char *object);
@@ -933,12 +1028,22 @@ int cmd_list_files(const char *db_root, const char *object,
                    int offset, int limit);
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
-                      int splits, int max_key, int if_not_exists);
+                      int splits, int max_key, int if_not_exists,
+                      int storage_version);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */
 int cmd_drop_object(const char *db_root, const char *dir, const char *object,
                     int if_exists);
+
+/* One-shot upgrade of a v1 object to the v2 (slotcask) layout. Walks the
+   object's existing v1 shard data, writes every live record into a new
+   slotcask in the obj root, atomic-renames data/ to data.legacy/, and
+   updates the schema.conf line to append :2:streams. Idempotent —
+   already-v2 objects return status=already_v2. Caller holds
+   objlock_wrlock. */
+int cmd_migrate_storage_version(const char *db_root, const char *dir,
+                                 const char *object);
 
 /* Object discovery — used by shard-cli to populate menus. Both are read-level
    operations: list-objects needs tenant scope (or broader); describe-object

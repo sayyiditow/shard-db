@@ -181,29 +181,39 @@ static int bench_joins_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
 
+    int sv = bench_storage_version();
+
     /* users object — same schema as bench-queries / bench/create-user-object.sh */
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-        "\"splits\":64,\"max_key\":32,"
-        "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                    "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                    "\"rank:short\",\"score:double\",\"active:bool\","
-                    "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                    "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
-        "\"indexes\":[\"username\",\"email\",\"age\",\"active\",\"birthday\"]}",
-        &resp);
-    free(resp); resp = NULL;
+    {
+        char create[2048];
+        snprintf(create, sizeof(create),
+            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+            "\"splits\":64,\"max_key\":32,\"storage_version\":%d,"
+            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                        "\"rank:short\",\"score:double\",\"active:bool\","
+                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
+            "\"indexes\":[\"username\",\"email\",\"age\",\"active\",\"birthday\"]}",
+            sv);
+        tc_request(tc, create, &resp);
+        free(resp); resp = NULL;
+    }
 
     /* orders object — same as bench-joins.sh */
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"orders\","
-        "\"splits\":32,\"max_key\":32,"
-        "\"fields\":[\"order_num:long\",\"amount:numeric:12,2\","
-                    "\"status:varchar:16\",\"user_id:varchar:32\","
-                    "\"product_sku:varchar:12\",\"created_at:datetime\"],"
-        "\"indexes\":[\"status\",\"user_id\",\"product_sku\"]}",
-        &resp);
-    free(resp); resp = NULL;
+    {
+        char create[2048];
+        snprintf(create, sizeof(create),
+            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"orders\","
+            "\"splits\":32,\"max_key\":32,\"storage_version\":%d,"
+            "\"fields\":[\"order_num:long\",\"amount:numeric:12,2\","
+                        "\"status:varchar:16\",\"user_id:varchar:32\","
+                        "\"product_sku:varchar:12\",\"created_at:datetime\"],"
+            "\"indexes\":[\"status\",\"user_id\",\"product_sku\"]}",
+            sv);
+        tc_request(tc, create, &resp);
+        free(resp); resp = NULL;
+    }
 
     printf("======================================\n");
     printf("  shard-db JOIN benchmark — orders=%d users=%d\n",

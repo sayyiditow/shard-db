@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
 
 ## Overview
 
-shard-db is a high-performance file-based database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64; macOS port planned for 2026.05.2.
+shard-db is a high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64; macOS port planned for 2026.05.2.
 
 ## Build & test
 
@@ -67,6 +67,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
 - **Concurrency**: per-ucache-entry rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
 - **Index layout**: each indexed field shards into `index_splits_for(splits)` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`. The `index_splits_for` curve caps idx fan-out at high split counts: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128` (see `src/db/types.h` for the rationale).
+- **Record counts (v2)**: per-shard kf header (24 B at byte 0 of every kf shard) carries `total` (live + tombstoned) and `deleted`. `live = total − deleted`. Updated atomically inside `slotcask_put` / `slotcask_delete` under the kf wrlock — single source of truth, durable to mmap writeback (and so survives SIGKILL/OOM/crash without a flush window). `get_live_count` / `get_deleted_count` sum the kf headers via `slotcask_sum_kf_totals` (`pread` per shard, ~1ms cold even at splits=4096). The legacy `metadata/counts` text file is no longer written for v2; `recount` is unnecessary post-crash. v1 falls back to the text file.
 
 Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [docs/concepts/indexes.md](docs/concepts/indexes.md), [docs/concepts/concurrency.md](docs/concepts/concurrency.md).
 

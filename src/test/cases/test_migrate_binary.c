@@ -136,7 +136,7 @@ static int test_migrate_binary_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mft\","
-        "\"fields\":[\"k:varchar:32\"]}", &resp); free(resp); resp = NULL;
+        "\"storage_version\":1,\"fields\":[\"k:varchar:32\"]}", &resp); free(resp); resp = NULL;
     tc_close(tc); tc = NULL;
 
     /* Stop test daemon gracefully WITHOUT wiping db_root (test_env_stop wipes,
@@ -180,8 +180,9 @@ static int test_migrate_binary_run(void) {
     ASSERT_EQ_INT(json_int(fl, "files_moved"), 4, "files_moved=4");
     ASSERT_TRUE(json_int(fl, "objects_migrated") >= 1, "objects_migrated >= 1");
     ASSERT_EQ_INT(json_int(fl, "conflicts"), 0, "conflicts=0");
-    ASSERT_CONTAINS(out, "phase 1/2", "phase 1 banner");
-    ASSERT_CONTAINS(out, "phase 2/2", "phase 2 banner");
+    ASSERT_CONTAINS(out, "phase 1/3", "phase 1 banner");
+    ASSERT_CONTAINS(out, "phase 2/3", "phase 2 banner");
+    ASSERT_CONTAINS(out, "phase 3/3", "phase 3 banner");
     ASSERT_CONTAINS(out, "migrate: complete", "complete banner");
     free(out);
 

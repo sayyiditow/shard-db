@@ -195,8 +195,9 @@ static void reset_object(TestClient *tc)
     char req[256];
     snprintf(req, sizeof(req),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
-        "\"splits\":%d,\"max_key\":%d,\"fields\":[\"v:varchar:%d\"]}",
-        SPLITS, KEY_LEN, VAL_LEN);
+        "\"splits\":%d,\"max_key\":%d,\"storage_version\":%d,"
+        "\"fields\":[\"v:varchar:%d\"]}",
+        SPLITS, KEY_LEN, bench_storage_version(), VAL_LEN);
     tc_request(tc, req, &resp);
     free(resp);
 }
@@ -276,8 +277,9 @@ static int bench_kv_parallel_run(void)
     char req[256];
     snprintf(req, sizeof(req),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
-        "\"splits\":%d,\"max_key\":%d,\"fields\":[\"v:varchar:%d\"]}",
-        SPLITS, KEY_LEN, VAL_LEN);
+        "\"splits\":%d,\"max_key\":%d,\"storage_version\":%d,"
+        "\"fields\":[\"v:varchar:%d\"]}",
+        SPLITS, KEY_LEN, bench_storage_version(), VAL_LEN);
     tc_request(tc, req, &resp); free(resp); resp = NULL;
 
     printf("======================================\n");

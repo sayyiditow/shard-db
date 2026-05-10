@@ -9,6 +9,7 @@
 #define BENCH_STATS_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 typedef struct {
     uint64_t *samples_ns;   /* caller-owned buffer of length cap */
@@ -17,6 +18,17 @@ typedef struct {
 } BenchHist;
 
 uint64_t bench_now_ns(void);  /* CLOCK_MONOTONIC */
+
+/* Storage version every bench's create-object sends. Defaults to 2
+   (slotcask) so a plain `./bench` run exercises the 2026.06 engine.
+   Set SHARD_BENCH_STORAGE_VERSION=1 in the environment to compare
+   against the legacy probe-into-slot path (apples-vs-oranges, but
+   useful for changelog regression checks). Returns 1 or 2 only. */
+static inline int bench_storage_version(void) {
+    const char *v = getenv("SHARD_BENCH_STORAGE_VERSION");
+    if (v && (*v == '1')) return 1;
+    return 2;
+}
 
 static inline void bench_hist_init(BenchHist *h, uint64_t *buf, size_t cap) {
     h->samples_ns = buf; h->cap = cap; h->count = 0;

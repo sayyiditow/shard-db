@@ -101,6 +101,62 @@ static int wait_daemon_ready(int timeout_sec) {
     return -1;
 }
 
+/* Walk schema.conf, dispatch migrate-storage-version for every line whose
+   storage_version is missing or 1. The daemon must be running when this
+   is called (caller-managed). Returns the number of objects upgraded; -1
+   on a hard error (cannot read schema.conf). already-v2 lines are
+   counted as skipped, not upgraded. */
+static int migrate_v1_objects(const char *db_root) {
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    FILE *f = fopen(schema_path, "r");
+    if (!f) {
+        /* Fresh DB with no objects — nothing to migrate. */
+        return 0;
+    }
+
+    int upgraded = 0;
+    int already_v2 = 0;
+    int failed = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        line[strcspn(line, "\r\n")] = '\0';
+
+        /* Parse `dir:object:splits:max_key[:storage_version[:streams]]`. */
+        char dir[128], obj[128];
+        int splits = 0, max_key = 0, sv = 0, streams = 0;
+        int n = sscanf(line, "%127[^:]:%127[^:]:%d:%d:%d:%d",
+                        dir, obj, &splits, &max_key, &sv, &streams);
+        if (n < 4) continue;
+
+        if (n >= 5 && sv == 2) {
+            already_v2++;
+            continue;
+        }
+
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+            "./shard-db query "
+            "'{\"mode\":\"migrate-storage-version\",\"dir\":\"%s\",\"object\":\"%s\"}'",
+            dir, obj);
+        int rc = system(cmd);
+        if (rc != 0) {
+            fprintf(stderr,
+                "migrate: per-object migration failed for %s/%s (rc=%d)\n",
+                dir, obj, rc);
+            failed++;
+            continue;
+        }
+        upgraded++;
+    }
+    fclose(f);
+
+    fprintf(stdout, "migrate: phase 3 summary — upgraded=%d already_v2=%d failed=%d\n",
+            upgraded, already_v2, failed);
+    return failed > 0 ? -1 : upgraded;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
@@ -111,7 +167,7 @@ int main(int argc, char **argv) {
     int lock_fd = -1;
 
     /* Phase 1 — migrate-files (FS-direct, no daemon needed). */
-    fprintf(stdout, "migrate: phase 1/2 — migrate-files (lift XX/XX hash buckets to flat)\n");
+    fprintf(stdout, "migrate: phase 1/3 — migrate-files (lift XX/XX hash buckets to flat)\n");
     if (lock_db_root(db_root, &lock_fd) < 0) return 1;
     int rc = migrate_files(db_root);
     unlock_db_root(lock_fd);
@@ -120,8 +176,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Phase 2 — reindex. Spawn the daemon, run reindex, stop. */
-    fprintf(stdout, "migrate: phase 2/2 — reindex (rebuild B+ trees under per-shard layout)\n");
+    /* Phase 2 — reindex (legacy 2026.05.1 per-shard B+ tree migration).
+       Phase 3 — v1 → v2 storage_version migration (2026.06).
+       Both need a running daemon; share the same start/stop window. */
+    fprintf(stdout, "migrate: phase 2/3 — reindex (rebuild B+ trees under per-shard layout)\n");
     if (system("./shard-db start") != 0) {
         fprintf(stderr, "migrate: ./shard-db start failed\n");
         return 1;
@@ -133,10 +191,19 @@ int main(int argc, char **argv) {
     }
 
     int reindex_rc = system("./shard-db reindex");
+    int phase3_upgraded = -1;
+    if (reindex_rc == 0) {
+        fprintf(stdout, "migrate: phase 3/3 — storage_version v1 → v2 (slotcask)\n");
+        phase3_upgraded = migrate_v1_objects(db_root);
+    }
     int stop_rc = system("./shard-db stop");
 
     if (reindex_rc != 0) {
         fprintf(stderr, "migrate: reindex failed (rc=%d)\n", reindex_rc);
+        return 1;
+    }
+    if (phase3_upgraded < 0) {
+        fprintf(stderr, "migrate: phase 3 had per-object failures; see log above\n");
         return 1;
     }
     if (stop_rc != 0) {
@@ -144,6 +211,7 @@ int main(int argc, char **argv) {
                 stop_rc);
     }
 
-    fprintf(stdout, "migrate: complete\n");
+    fprintf(stdout, "migrate: complete (phase 3 upgraded %d objects)\n",
+            phase3_upgraded);
     return 0;
 }

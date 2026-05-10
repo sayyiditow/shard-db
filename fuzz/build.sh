@@ -37,9 +37,11 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #       linked but never executed because the harness only calls the
 #       parser entry point. Their globals are zero-initialised which is
 #       fine for our use.
-# objlock.c, parallel.c, server.c, tls.c are NOT linked: the parser
-# never reaches them; trying to link tls.c without OpenSSL would fail
-# the cleaner subset.
+#   slotcask.c, simd.c — added 2026.06: query.c and storage.c now have
+#       v2-engine call sites and SIMD scan helpers. Linker needs the
+#       symbol bodies even though the fuzzer never enters those paths.
+# server.c, tls.c are NOT linked: the parser never reaches them; trying
+# to link tls.c without OpenSSL would fail the cleaner subset.
 echo "==> fuzz_criteria"
 # -latomic: storage.c does sub-word atomics on packed-struct members, which
 # clang emits as a libcall instead of an inline op (gcc inlines it). The
@@ -48,7 +50,7 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     fuzz/fuzz_criteria.c \
     src/db/util.c src/db/keyset.c src/db/query.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
-    src/db/objlock.c src/db/parallel.c \
+    src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
     -lpthread -latomic
 
 echo

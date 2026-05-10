@@ -4,9 +4,11 @@
 
 uint32_t g_timeout = 30;
 int g_port = 9199;
-int g_max_threads = 0;  /* 0 = auto (4× cores) — compute thread pool size */
 int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
-int g_pool_chunk = 0;   /* 0 = auto (cores) — parallel_for() submit batch */
+/* g_max_threads (+ parallel_threads getter) and g_pool_chunk live in
+   parallel.c so test/bench binaries that link parallel.c without
+   config.c don't get an undefined symbol at link time. config.c still
+   writes g_max_threads when parsing db.env (extern). */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
@@ -14,7 +16,10 @@ int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via F
                                    to one of {4096, 8192, 12288, 16384} */
 int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 4
                                    (derived, not separately configurable) */
-size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024; /* 500 MB per-query intermediate cap, configurable via QUERY_BUFFER_MB */
+/* 500 MB default keeps non-server callers (CLI, tests) safe. cmd_server
+   detects the unchanged-default case and auto-tunes to
+   min(25% of total RAM, 4 GB) for typical VPS shapes — see server.c. */
+size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024;
 int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
 _Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */
@@ -51,12 +56,6 @@ int g_auto_vacuum_interval_sec = 3600;
 SlowQueryEntry g_slow_queries[SLOW_QUERY_RING] = {0};
 int g_slow_query_head = 0;
 pthread_mutex_t g_slow_query_lock = PTHREAD_MUTEX_INITIALIZER;
-
-int parallel_threads(void) {
-    if (g_max_threads > 0) return g_max_threads;
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (int)n : 4;
-}
 
 uint64_t now_ms(void) {
     struct timespec ts;
@@ -585,11 +584,24 @@ Schema load_schema(const char *effective_root, const char *object) {
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, prefix, pfxlen) == 0) {
+            /* Strip trailing newline so atoi on the last field doesn't blow up. */
+            line[strcspn(line, "\r\n")] = '\0';
             char *p = line + pfxlen;
             s.splits = atoi(p);
             if (s.splits <= 0) s.splits = 64;
             char *p2 = strchr(p, ':');
-            if (p2) s.max_key = atoi(p2 + 1);
+            if (p2) {
+                s.max_key = atoi(p2 + 1);
+                /* Optional trailing fields (added in 2026.06 for slotcask v2):
+                   :storage_version:streams. Absent → defaults: version=1, streams=0. */
+                char *p3 = strchr(p2 + 1, ':');
+                if (p3) {
+                    s.storage_version = atoi(p3 + 1);
+                    char *p4 = strchr(p3 + 1, ':');
+                    if (p4) s.streams = atoi(p4 + 1);
+                }
+            }
+            if (s.storage_version <= 0) s.storage_version = 1;
             break;
         }
     }
@@ -600,8 +612,24 @@ Schema load_schema(const char *effective_root, const char *object) {
     if (ts && ts->total_size > 0) {
         s.max_value = ts->total_size;
     }
-    s.slot_size = s.max_key + s.max_value;
-    s.slot_size = (s.slot_size + 7) & ~7;
+    /* slot_size meaning differs by storage version:
+       v1: width of one Zone B slot, header lives separately in Zone A.
+           formula: max_key + max_value, rounded to 8.
+       v2: width of one slotcask segment slot, header is INLINE
+           (24 bytes: hash + klen + flag + reserved + vlen).
+           formula: 24 + max_key + max_value, rounded to 8, floor 32.
+       Mixing the two semantics — i.e., feeding a v1 slot_size to
+       slotcask_open — silently fails inserts when klen+vlen approaches
+       max because slotcask_insert's "24 + klen + vlen <= slot_size"
+       guard rejects records that should fit. */
+    if (s.storage_version == 2) {
+        s.slot_size = 24 + s.max_key + s.max_value;
+        s.slot_size = (s.slot_size + 7) & ~7;
+        if (s.slot_size < 32) s.slot_size = 32;
+    } else {
+        s.slot_size = s.max_key + s.max_value;
+        s.slot_size = (s.slot_size + 7) & ~7;
+    }
 
     pthread_mutex_lock(&g_schema_lock);
     uint32_t sidx = str_hash(cache_key) % SCHEMA_BUCKETS;
@@ -1976,7 +2004,7 @@ int cmd_add_fields(const char *db_root, const char *object,
     }
 
     /* rebuild_object appends lines to fields.conf and rewrites shards atomically. */
-    return rebuild_object(db_root, object, 0, 0, lines, nlines);
+    return rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
 }
 
 /* ========== remove-field ==========

@@ -1,5 +1,25 @@
 #include "types.h"
 
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
+/* ========== Hashing ==========
+ * Single source of truth for the engine's primary-key hash. Used by:
+ *   - storage.c (cmd_insert/get/delete probe-into-slot addressing)
+ *   - query.c (compute_addr, btree index entries, RecordRef hash lookups)
+ *   - slotcask.c (keyfile entry hash, slotcask_lookup_by_hash)
+ * The canonical (big-endian) form makes the hash byte layout host-endian-
+ * independent, so identical bytes appear in btree index entries and
+ * slotcask keyfile entries on every architecture. Drift here corrupts
+ * cross-component lookups silently — all callers MUST go through this
+ * function, not roll their own. */
+void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]) {
+    XXH128_hash_t h = XXH3_128bits(key, key_len);
+    XXH128_canonical_t c;
+    XXH128_canonicalFromHash(&c, h);
+    memcpy(hash_out, c.digest, 16);
+}
+
 /* ========== Utilities ========== */
 
 void mkdirp(const char *path) {

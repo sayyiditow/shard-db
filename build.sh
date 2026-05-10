@@ -89,7 +89,7 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/db/index.c src/db/query.c src/db/server.c src/db/main.c src/db/btree.c src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/config.c src/db/storage.c src/db/index.c src/db/query.c src/db/server.c src/db/main.c src/db/btree.c src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c src/db/slotcask.c src/db/simd.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -134,6 +134,11 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_parallel_index_integrity.c \
     src/test/cases/test_cli_shortcuts.c \
     src/test/cases/test_agg_neq_shortcut.c \
+    src/test/cases/test_agg_indexed_groupby.c \
+    src/test/cases/test_find_indexed_orderby.c \
+    src/test/cases/test_or_keyset_cap.c \
+    src/test/cases/test_agg_walk_fetch_check.c \
+    src/test/cases/test_regex_anchor_prefilter.c \
     src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \
@@ -142,6 +147,8 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_token_perms.c \
     src/test/cases/test_csv_export.c \
     src/test/cases/test_vacuum_addfield.c \
+    src/test/cases/test_vacuum_streams_mismatch.c \
+    src/test/cases/test_slotcask_resplit.c \
     src/test/cases/test_per_tenant_auth.c \
     src/test/cases/test_stress_no_hang.c \
     src/test/cases/test_tls.c \
@@ -151,7 +158,20 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_index_splits_curve.c \
     src/test/cases/test_range_coalesce.c \
     src/test/cases/test_count_varchar_field.c \
+    src/test/cases/test_slotcask_basic.c \
+    src/test/cases/test_slotcask_v2_object.c \
+    src/test/cases/test_slotcask_cas.c \
+    src/test/cases/test_slotcask_v2_wire.c \
+    src/test/cases/test_slotcask_v2_query.c \
+    src/test/cases/test_slotcask_v2_bulk.c \
+    src/test/cases/test_slotcask_v2_parity.c \
+    src/test/cases/test_slotcask_v2_schema.c \
+    src/test/cases/test_slotcask_v2_migrate.c \
+    src/test/cases/test_slotcask_v2_crash.c \
+    src/test/cases/test_slotcask_v2_concurrent.c \
     src/db/util.c \
+    src/db/slotcask.c \
+    src/db/parallel.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test

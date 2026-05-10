@@ -67,12 +67,20 @@ static int run_cmd(const char *fmt, ...) {
 int test_env_start(TestEnv *env) {
     if (!env) return -1;
 
-    /* Unique DB_ROOT under /tmp/shard-db-test-<pid>-<idx>/db */
+    /* Unique DB_ROOT under <dir>/shard-db-test-<pid>-<idx>/db. Default
+       <dir> is /tmp (fast, RAM-backed on Linux), but tmpfs is typically
+       sized at ~50% of RAM — not enough for high-scale benches (25M+
+       records). Override via SHARD_TEST_TMPDIR to point at a disk-backed
+       path (e.g. /var/tmp, $HOME) when running large benches. */
     static int counter = 0;
     int idx = __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
 
-    char base[256];
-    snprintf(base, sizeof(base), "/tmp/shard-db-test-%d-%d", (int)getpid(), idx);
+    const char *tmpdir = getenv("SHARD_TEST_TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+
+    char base[512];
+    snprintf(base, sizeof(base), "%s/shard-db-test-%d-%d",
+             tmpdir, (int)getpid(), idx);
     snprintf(env->db_root, sizeof(env->db_root), "%s/db", base);
 
     /* Wipe + recreate the directory tree. */
@@ -117,6 +125,10 @@ int test_env_start(TestEnv *env) {
         /* Child: cd to base/ so daemon picks up the db.env we wrote there,
            then exec daemon in foreground mode. */
         chdir(base);
+        /* Test-only env propagation: lets the migrate tests stage v1
+           objects via create-object. Production daemons don't have
+           this set and refuse storage_version=1. */
+        setenv("SHARD_ALLOW_V1_CREATE", "1", 1);
         execl(binary_abs, binary_abs, "server", (char *)NULL);
         _exit(127);
     }
@@ -175,6 +187,7 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     if (pid < 0) return -1;
     if (pid == 0) {
         chdir(base);
+        setenv("SHARD_ALLOW_V1_CREATE", "1", 1);  /* test-only opt-in */
         execl(binary_abs, binary_abs, "server", (char *)NULL);
         _exit(127);
     }
@@ -194,6 +207,28 @@ void test_env_kill(TestEnv *env) {
     waitpid(env->daemon_pid, NULL, 0);
     env->daemon_pid = -1;
     /* No db_root cleanup — caller controls persistent state. */
+}
+
+/* Graceful SIGTERM stop, NO cleanup of db_root. Used by bench when
+   persistent mode wants the daemon to flush counts/logs/etc to disk
+   before exit, but the data tree must survive the bench process. */
+void test_env_stop_keep(TestEnv *env) {
+    if (!env || env->daemon_pid <= 0) return;
+    kill(env->daemon_pid, SIGTERM);
+    int reaped = 0;
+    for (int i = 0; i < 50; i++) {
+        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
+            reaped = 1;
+            break;
+        }
+        sleep_ms(100);
+    }
+    if (!reaped) {
+        kill(env->daemon_pid, SIGKILL);
+        waitpid(env->daemon_pid, NULL, 0);
+    }
+    env->daemon_pid = -1;
+    /* No db_root cleanup. */
 }
 
 void test_env_stop(TestEnv *env) {

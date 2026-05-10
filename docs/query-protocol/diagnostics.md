@@ -91,7 +91,7 @@ Wire it into Prometheus with a small textfile-exporter cron, or expose `/metrics
 
 ## shard-stats
 
-Per-shard load factor and slot count.
+Per-keyfile (v2) or per-shard (v1) load factor and slot count.
 
 ```json
 {"mode":"shard-stats","dir":"<dir>","object":"<obj>"}
@@ -100,23 +100,41 @@ Per-shard load factor and slot count.
 {"mode":"shard-stats"}                            // all objects everywhere
 ```
 
-### Response
+### Response (v2)
 
 ```json
 {
-  "dir":"default","object":"users","splits":16,
-  "shards": [
-    {"id":"000","slots":256,"active":110,"tombstoned":3,"load_pct":43},
-    {"id":"001","slots":256,"active":134,"tombstoned":2,"load_pct":52}
-  ]
+  "splits":128, "keyfiles":128,
+  "total_records":25000000, "total_bytes":1610612736,
+  "keyfiles": [
+    {"keyfile":0,"slots":524289,"records":202573,"load":0.386,"bytes":12582936},
+    {"keyfile":1,"slots":524289,"records":203451,"load":0.388,"bytes":12582936}
+  ],
+  "avg_rec_per_shard":195312, "max_grows":1
+}
+```
+
+In v2 each row describes one keyfile shard (`data/kf/NNN.kf`) — the key→location index. Data segments under `data/streams/NNN/*.dat` are not surfaced here. `slots` is kf entry capacity; `records` is live entries (= live record count); `load` is `records/slots`; the kf auto-resplits when `load` crosses 0.75. `max_grows` is doublings observed past the splits-tier initial capacity.
+
+### Response (v1, legacy)
+
+```json
+{
+  "splits":16, "shards_on_disk":16,
+  "total_records":244,"total_bytes":1048576,
+  "shard_list": [
+    {"shard":0,"slots":256,"records":110,"load":0.430,"bytes":65536}
+  ],
+  "avg_rec_per_shard":15, "max_grows":0
 }
 ```
 
 ### What to watch
 
-- **Load factor over 50%** — about to grow (next write doubles `slots_per_shard`).
-- **Large skew across shards** — hash isn't evenly distributing. Usually a sign of an adversarial key distribution; `vacuum --splits N` can rebalance by resharding.
-- **High tombstoned %** — run `vacuum` to reclaim.
+- **Load over 0.5** (v1) — about to double `slots_per_shard`.
+- **Load over 0.75** (v2) — kf shard about to resplit; doubling cost is paid inline by the next writer.
+- **Large skew across rows** — hash isn't evenly distributing. Usually a sign of an adversarial key distribution; `vacuum --splits N` can rebalance.
+- **`avg_rec_per_shard` past 200K (v1) or steadily climbing (v2)** — re-split with `vacuum --splits=N`.
 
 CLI:
 

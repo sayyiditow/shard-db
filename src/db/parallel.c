@@ -18,21 +18,33 @@
  *         complete. Mirrors the existing "spawn + join" idiom at the call
  *         site, but cooperates with other concurrent callers via the pool.
  *
- * Deadlock note: tasks submitted via parallel_for() must NOT themselves call
- * parallel_for() (could deadlock if the pool is already saturated by the
- * parent call's sibling tasks). Current call sites are all leaf workers —
- * safe. Worth a comment on any new task function added.
+ * Nesting: parallel_for is structurally safe under nesting (a parallel_for
+ * task can itself call parallel_for) AND under concurrent callers. While
+ * the caller waits for its task group to finish, it doesn't passively
+ * block — it pops tasks from the global queue and runs them itself
+ * (work-stealing). Every blocked thread is therefore an active drain on
+ * the queue, so the queue can never stall: there's always at least one
+ * runner per pending task. This holds regardless of pool_size vs
+ * outer-task-count, so callers don't need any guard like `n < pool_size`.
+ *
+ * The fallback when the queue is momentarily empty but our group still has
+ * tasks in flight (running on other workers) is a 1ms timed cond_wait on
+ * the group's cv, which naturally re-checks the queue on wake-up.
  */
 
 #include "types.h"
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    int remaining;
+    /* _Atomic so help-drain loops can read remaining lock-free between
+       wait-checks; the mutex still gates the cond_broadcast on completion
+       to prevent the classic check-then-wait lost-wakeup race. */
+    _Atomic int remaining;
 } PoolGroup;
 
 typedef struct {
@@ -55,12 +67,74 @@ static pthread_cond_t  g_q_not_full  = PTHREAD_COND_INITIALIZER;
 
 static pthread_t *g_pool_threads = NULL;
 static int        g_pool_nthreads = 0;
+
+/* Submit-batch size for parallel_for (POOL_CHUNK in db.env). 0 = auto
+   (= nproc). Defined here so the symbol travels with the rest of the
+   pool machinery — test/bench binaries link parallel.c without config.c
+   and the variable is then never written, leaving the auto-default. */
+int g_pool_chunk = 0;
+
+/* Compute thread-pool size knob (THREADS in db.env). 0 = auto (nproc).
+   Same rationale as g_pool_chunk — kept here so parallel.c links
+   standalone in test/bench builds. */
+int g_max_threads = 0;
+
+int parallel_threads(void) {
+    if (g_max_threads > 0) return g_max_threads;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 4;
+}
+
+/* Per-thread flag: 1 while a pool worker is running a task, 0 otherwise.
+   parallel_for uses this to decide between two wait strategies:
+     - Top-level callers (TCP handler, CLI) → plain cond_wait. Pool
+       workers grab and run tasks in parallel; the caller doesn't
+       compete for them, which gives full pool parallelism on the
+       common single-level case.
+     - Nested callers (already inside a pool task) → help-drain. The
+       caller pops tasks from the queue and runs them itself while
+       waiting, so the pool can never starve when (concurrent_outer ×
+       inner_count) >= pool_size. This is the deadlock-prevention path. */
+static __thread int t_in_pool_task = 0;
 /* Read lock-free at parallel_pool_init/shutdown entry, parallel_pool_size,
    and parallel_for; written under g_q_lock at parallel_pool_shutdown and
    lock-free at parallel_pool_init. _Atomic gives correct cross-thread
    visibility regardless of which writer-lock was held. (Was volatile —
    volatile is for memory-mapped IO, not thread synchronization.) */
 static _Atomic int g_pool_running = 0;
+
+/* Pop one task from the head of the global queue if non-empty. Returns 1
+   on success (caller owns *out and must run it), 0 if queue is empty.
+   Used by both pool_worker and the help-drain loop in parallel_for. */
+static int try_pop_task(PoolTask *out) {
+    pthread_mutex_lock(&g_q_lock);
+    if (g_q_count == 0) {
+        pthread_mutex_unlock(&g_q_lock);
+        return 0;
+    }
+    *out = g_queue[g_q_head];
+    g_q_head = (g_q_head + 1) % POOL_QUEUE_CAP;
+    g_q_count--;
+    pthread_cond_signal(&g_q_not_full);
+    pthread_mutex_unlock(&g_q_lock);
+    return 1;
+}
+
+/* Run a task, then atomically decrement its group's remaining counter.
+   Broadcast the group's cv when remaining hits zero so the parallel_for
+   waiter (and any help-draining sibling) wakes promptly. The mutex
+   bracket around the broadcast prevents the lost-wakeup race against
+   waiters that just read remaining > 0 and are about to cond_wait. */
+static void run_task_finish(PoolTask t) {
+    t.fn(t.arg);
+    int prev = atomic_fetch_sub_explicit(&t.group->remaining, 1,
+                                         memory_order_acq_rel);
+    if (prev == 1) {
+        pthread_mutex_lock(&t.group->mu);
+        pthread_cond_broadcast(&t.group->cv);
+        pthread_mutex_unlock(&t.group->mu);
+    }
+}
 
 static void *pool_worker(void *arg) {
     (void)arg;
@@ -75,12 +149,9 @@ static void *pool_worker(void *arg) {
         pthread_cond_signal(&g_q_not_full);
         pthread_mutex_unlock(&g_q_lock);
 
-        t.fn(t.arg);
-
-        pthread_mutex_lock(&t.group->mu);
-        if (--t.group->remaining == 0)
-            pthread_cond_broadcast(&t.group->cv);
-        pthread_mutex_unlock(&t.group->mu);
+        t_in_pool_task = 1;
+        run_task_finish(t);
+        t_in_pool_task = 0;
     }
 }
 
@@ -135,7 +206,7 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     PoolGroup group;
     pthread_mutex_init(&group.mu, NULL);
     pthread_cond_init(&group.cv, NULL);
-    group.remaining = n;
+    atomic_init(&group.remaining, n);
 
     /* Enqueue in small chunks, releasing the queue lock between chunks so
        concurrent callers' tasks interleave in the FIFO queue (rather than
@@ -164,11 +235,105 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
         pthread_mutex_unlock(&g_q_lock);
     }
 
-    pthread_mutex_lock(&group.mu);
-    while (group.remaining > 0)
-        pthread_cond_wait(&group.cv, &group.mu);
-    pthread_mutex_unlock(&group.mu);
+    if (t_in_pool_task) {
+        /* Nested call (we're already running inside a pool task). If we
+           cond_wait passively, all pool workers could end up blocked on
+           their own outer tasks waiting for inner tasks that no one is
+           draining → deadlock. Help-drain instead: while our group has
+           tasks remaining, pop and run any task from the global queue.
+           When the queue is momentarily empty but our group still has
+           tasks running on other workers, fall back to a 1ms timed
+           cond_wait that re-checks both queue and group state on wake. */
+        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
+            PoolTask t;
+            if (try_pop_task(&t)) {
+                run_task_finish(t);
+                continue;
+            }
+            pthread_mutex_lock(&group.mu);
+            if (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 1000000;  /* 1ms re-check cadence */
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&group.cv, &group.mu, &ts);
+            }
+            pthread_mutex_unlock(&group.mu);
+        }
+    } else {
+        /* Top-level call (TCP handler / CLI thread). Plain cond_wait
+           lets pool workers run the tasks in parallel without the
+           caller competing for them — the common case where the pool
+           is otherwise idle. */
+        pthread_mutex_lock(&group.mu);
+        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
+            pthread_cond_wait(&group.cv, &group.mu);
+        pthread_mutex_unlock(&group.mu);
+    }
 
     pthread_mutex_destroy(&group.mu);
     pthread_cond_destroy(&group.cv);
+}
+
+/* I/O-heavy parallel dispatch — spawns one pthread per task, joins all
+   at end. Bypasses the bounded CPU pool because I/O-blocking workloads
+   (bulk-insert page faults on mmap MAP_SHARED writes, fsync waits)
+   benefit from oversubscription that pure-CPU work doesn't.
+
+   Why not just use parallel_for with a bigger pool? Because the pool is
+   shared across all callers; CPU-bound queries on the same pool would
+   then peg every core, killing interactive responsiveness. Splitting
+   I/O work onto dedicated per-call pthreads keeps the CPU pool free for
+   the read paths that actually need it bounded.
+
+   pthread_create cost is ~10-30 µs each — negligible vs the multi-ms
+   per-task work this is meant for. n is typically the per-object
+   shard/worker count (64-256) so total spawn cost stays well under 1ms.
+
+   Callers who'd rather use the bounded pool (CPU-bound, low task count)
+   should keep using parallel_for. */
+typedef struct {
+    void *(*fn)(void *);
+    void  *arg;
+} ParallelIoTask;
+
+static void *parallel_io_thread(void *raw) {
+    ParallelIoTask *t = (ParallelIoTask *)raw;
+    t->fn(t->arg);
+    return NULL;
+}
+
+void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
+    if (n <= 0) return;
+    if (n == 1) {
+        fn(args);
+        return;
+    }
+    pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
+    char *valid = calloc((size_t)n, sizeof(char));
+    ParallelIoTask *tasks = malloc((size_t)n * sizeof(ParallelIoTask));
+    if (!threads || !valid || !tasks) {
+        /* OOM fallback — run sequentially. Slow but correct. */
+        free(threads); free(valid); free(tasks);
+        for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        tasks[i].fn = fn;
+        tasks[i].arg = (char *)args + (size_t)i * stride;
+        if (pthread_create(&threads[i], NULL, parallel_io_thread, &tasks[i]) == 0) {
+            valid[i] = 1;
+        } else {
+            /* Spawn failure (typically EAGAIN under thread limit) — run
+               this one inline so caller still sees correct semantics.
+               valid[i] stays 0 so the join loop skips this slot —
+               threads[i] would be uninitialised garbage and pthread_join
+               on garbage is undefined behaviour (can hang). */
+            fn(tasks[i].arg);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (valid[i]) pthread_join(threads[i], NULL);
+    }
+    free(threads); free(valid); free(tasks);
 }

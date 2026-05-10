@@ -93,6 +93,12 @@ static void *shard_walk_worker(void *arg) {
                                sw->max_val, sw->max_len, sw->max_exclusive,
                                sw->cb, sw->ctx); break;
     }
+    /* Flush any thread-local accumulator the callback populated while
+       walking this shard. Today only idx_count_cb batches (it amortises
+       per-match atomic-adds into one per-shard-worker atomic-add); if
+       more callbacks adopt the same pattern, hook them in this single
+       cleanup point. No-op for callbacks that don't use TLS. */
+    idx_count_cb_flush_thread();
     return NULL;
 }
 
@@ -863,10 +869,11 @@ int cmd_add_index(const char *db_root, const char *object,
         ic.field_index_count = 1;
     }
 
-    /* Parallel shard scan — collects all (value, hash) pairs */
+    /* Parallel shard scan — collects all (value, hash) pairs.
+       scan_dispatch routes v1 vs v2 (Phase 3B). */
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    scan_shards(data_dir, sch.slot_size, index_scan_cb, &ic);
+    scan_dispatch(db_root, object, &sch, data_dir, index_scan_cb, &ic);
 
     /* Partition by idx_shard, then sort+build per shard in parallel. */
     if (ic.pair_count > 0) {
@@ -1068,10 +1075,13 @@ int cmd_add_indexes(const char *db_root, const char *object,
         }
     }
 
-    /* Single parallel shard scan — extracts ALL index fields per record */
+    /* Single parallel shard scan — extracts ALL index fields per record.
+       scan_dispatch (Phase 3B) routes to scan_shards on v1 and to
+       slotcask_walk_live on v2; using it directly keeps reindex correct
+       across storage versions. */
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    scan_shards(data_dir, sch.slot_size, multi_index_scan_cb, &mc);
+    scan_dispatch(db_root, object, &sch, data_dir, multi_index_scan_cb, &mc);
     for (int fi = 0; fi < actual_count; fi++) pthread_mutex_destroy(&mc.lock[fi]);
 
     /* Parallel sort + build — partition each field's pairs by idx_shard,
@@ -1087,12 +1097,17 @@ int cmd_add_indexes(const char *db_root, const char *object,
     size_t  **counts_per_field  = calloc((size_t)actual_count, sizeof(size_t *));
 
     for (int fi = 0; fi < actual_count; fi++) {
-        if (mc.pair_count[fi] == 0) { free(mc.pairs[fi]); continue; }
+        /* Skip empty / partition-failed fields; the cleanup loop below
+           frees mc.pairs[fi] unconditionally, so we must NOT free it
+           here too — that's a double-free that only surfaced once
+           reindex_object ran on a v2 object (where the legacy v1 scan
+           found no records and every field had pair_count = 0). */
+        if (mc.pair_count[fi] == 0) continue;
         size_t *offsets = NULL, *counts = NULL;
         BtEntry *parted = partition_by_shard(mc.pairs[fi], mc.pair_count[fi],
                                              sch.splits, idx_n,
                                              &offsets, &counts);
-        if (!parted) { free(mc.pairs[fi]); continue; }
+        if (!parted) continue;
         parted_per_field[fi] = parted;
         offsets_per_field[fi] = offsets;
         counts_per_field[fi] = counts;

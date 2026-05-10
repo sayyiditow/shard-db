@@ -4,6 +4,29 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased — slotcask-engine branch
+
+### kf shard auto-resplit — unbounded inserts, no per-shard cap
+
+Each kf shard now grows in place by doubling whenever its load crosses 75 %. No global ceiling; shards keep doubling indefinitely. If a single shard ever becomes operationally unwieldy, `shard-stats` surfaces it and the operator reshards via `vacuum --splits=N`.
+
+Mechanics:
+- **24-byte header** prefixes every kf file: `[magic 'SKF1'][version][total uint64][deleted uint64]`. `total` counts non-empty slots (live + tombstoned) — the resplit trigger metric, since tombstones still create lookup probe-chain pressure. `deleted` counts tombstones; live = total − deleted, computed only when callers need it. Updates happen under the kf wrlock, no atomics.
+- **Streaming resplit:** walk old kf in order, write each flag=1 entry directly into `kf.new`'s mmap'd region via linear-probe at the new capacity. Zero malloc — memory cost stays flat regardless of shard size. Tombstones are dropped during resplit (`new.total = live_copied`, `new.deleted = 0`), so resplit also reclaims tombstone space.
+- **Crash safety:** `kf.new` is staged-then-renamed; old kf stays live until the atomic rename. `slotcask_open` unlinks leftover `kf.new` files at startup — idempotent recovery.
+- **Trigger:** `header.total * 4 >= capacity * 3` checked once per `kf_put_new`. One mmap load on the hot path.
+
+Closes the gap where the engine had a hard insert cap based on `splits × slots_per_shard`. The cap is gone; doubling is bounded only by disk space.
+
+### v2 default vacuum — Direction-C seg compaction + streams-mismatch self-heal
+
+Default `{"mode":"vacuum"}` (no flags) on a v2 object used to be a no-op besides resetting the `deleted` counter. It now does two things:
+
+1. **Direction-C seg compaction.** Per stream, every non-active seg file is stat'd for live count. The sparsest are pair-merged into denser ones — donor's live records are migrated into recipient's tombstone holes via `kf_repoint_at_slot`, then the donor file is unlinked (segcache wrlock drains in-flight readers, `msync + munmap + close + unlink + fsync(parent)`). The active seg of each stream is never touched, so concurrent appends after vacuum return are unaffected. Reclaims disk for delete-heavy / no-write workloads where the snake-game pool can't reuse tombstones inline.
+2. **Streams-mismatch self-heal.** If `slotcask_streams_for_nproc()` no longer matches `schema.streams` (CPU upgrade, container resize, hand-edited schema), the call promotes to a full rebuild that re-routes records into the new stream layout. `vacuum --splits=N` folds in the same check on the same rebuild.
+
+`./shard-db vacuum <dir> <obj>` and the auto-vacuum thread both pick this up. Response shape: `{"status":"vacuumed","cleaned":<files-dropped>}` for the light path; `{"status":"rebuilt", ...,"streams":N,...}` for the heavy path.
+
 ## 2026.05.2 — 2026-05-05
 
 ### Performance — aggregate fast paths (sum/avg/min/max + NEQ + EXISTS)

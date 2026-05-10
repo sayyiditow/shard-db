@@ -1,5 +1,6 @@
 #include "types.h"
 #include "tls.h"
+#include "slotcask.h"
 
 /* Forward decls for monitoring counters (defined lower in this file). */
 extern volatile int active_threads;
@@ -23,7 +24,8 @@ static int mode_is_schema(const char *m) {
     if (!m) return 0;
     return strcasecmp(m, "rename-field") == 0 || strcasecmp(m, "remove-field") == 0 ||
            strcasecmp(m, "add-field") == 0 || strcasecmp(m, "vacuum") == 0 ||
-           strcasecmp(m, "truncate") == 0;
+           strcasecmp(m, "truncate") == 0 ||
+           strcasecmp(m, "migrate-storage-version") == 0;
 }
 
 /* ========== Auth: IP allowlist + token set ========== */
@@ -1042,14 +1044,30 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *splits_s = json_obj_strdup(&req, "splits");
         char *max_key_s = json_obj_strdup(&req, "max_key");
         char *ine_s = json_obj_strdup(&req, "if_not_exists");
+        char *sv_s = json_obj_strdup(&req, "storage_version");
         int if_not_exists = ine_s && (strcmp(ine_s, "true") == 0 || strcmp(ine_s, "1") == 0);
+
+        /* storage_version is no longer part of the public create-object
+           API. Every new object is v2 (slotcask). The field is rejected
+           outright unless the daemon is running with SHARD_ALLOW_V1_CREATE=1
+           (test-fixture-only opt-in for the migrate runner's setup). */
+        const char *allow = getenv("SHARD_ALLOW_V1_CREATE");
+        int test_legacy = (allow && allow[0] == '1');
+        if (sv_s && !test_legacy) {
+            OUT("{\"error\":\"storage_version is not configurable; objects are always v2 (slotcask)\"}\n");
+            free(fields_j); free(indexes_j);
+            free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
+            free(mode); free(dir); free(object);
+            return;
+        }
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
                           max_key_s ? atoi(max_key_s) : 0,
-                          if_not_exists);
+                          if_not_exists,
+                          sv_s ? atoi(sv_s) : 0);
         free(fields_j); free(indexes_j);
-        free(splits_s); free(max_key_s); free(ine_s);
+        free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
         free(mode); free(dir); free(object);
         return;
     }
@@ -1309,12 +1327,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         }
         free(file); free(ifne_s);
     } else if (strcmp(mode, "bulk-insert-delimited") == 0) {
-        char *file = json_obj_strdup(&req, "file");
+        char *file  = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
+        char *data  = json_obj_strdup_raw(&req, "data");
         char *ifne_s = json_obj_strdup(&req, "if_not_exists");
         int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
         char d = (delim && delim[0]) ? delim[0] : ',';
-        cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
+        if (data) {
+            cmd_bulk_insert_delimited_string(db_root, object, data, strlen(data), d, ifne);
+            free(data);
+        } else if (file) {
+            cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
+        } else {
+            OUT("{\"error\":\"Missing file or data\"}\n");
+        }
         free(file); free(delim); free(ifne_s);
     } else if (strcmp(mode, "bulk-delete") == 0) {
         char *crit_json = json_obj_strdup_raw(&req, "criteria");
@@ -1328,17 +1354,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_bulk_delete_criteria(db_root, object, crit_json, if_json, lim, dry);
             free(crit_json); free(lim_s); free(dry_s); free(if_json);
         } else {
-            /* Key-list bulk delete (existing path) */
+            /* Key-list bulk delete. Inline `keys` go straight through the
+               in-memory path — no /tmp round-trip. */
             char *file = json_obj_strdup(&req, "file");
             char *keys = json_obj_strdup_raw(&req, "keys");
             if (keys) {
-                char tmp[PATH_MAX];
-                snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bdel_%d.json", getpid());
-                FILE *tf = fopen(tmp, "w");
-                if (tf) { fputs(keys, tf); fclose(tf); }
-                cmd_bulk_delete(db_root, object, tmp);
-                unlink(tmp);
-                free(keys);
+                cmd_bulk_delete_string(db_root, object, keys);
+                /* keys ownership transferred — bulk_delete_run frees it. */
             } else {
                 cmd_bulk_delete(db_root, object, file);
             }
@@ -1379,9 +1401,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "bulk-update-delimited") == 0) {
         char *file = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
+        char *data  = json_obj_strdup_raw(&req, "data");
         char d = (delim && delim[0]) ? delim[0] : ',';
-        if (file) cmd_bulk_update_delimited(db_root, object, file, d);
-        else OUT("{\"error\":\"Missing file\"}\n");
+        if (data) {
+            cmd_bulk_update_delimited_string(db_root, object, data, strlen(data), d);
+            free(data);
+        } else if (file) {
+            cmd_bulk_update_delimited(db_root, object, file, d);
+        } else {
+            OUT("{\"error\":\"Missing file or data\"}\n");
+        }
         free(file); free(delim);
     } else if (strcmp(mode, "vacuum") == 0) {
         /* Optional flags: "compact":true and "splits":N route to rebuild_object;
@@ -1462,6 +1491,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(fmt);
     } else if (strcmp(mode, "truncate") == 0) {
         cmd_truncate(db_root, object);
+    } else if (strcmp(mode, "migrate-storage-version") == 0) {
+        cmd_migrate_storage_version(db_root, dir, object);
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
     } else if (strcmp(mode, "put-file") == 0) {
@@ -2202,13 +2233,17 @@ static int validate_metadata(const char *db_root) {
         struct dirent *oe;
         while ((oe = readdir(dd))) {
             if (oe->d_name[0] == '.') continue;
+            /* Object is "real" (worth validating) iff data/ exists.
+               Both v1 (data/NNN.bin) and v2 (data/kf/, data/streams/)
+               share the data/ umbrella, so a single stat() covers
+               both layouts. */
             char data_check[PATH_MAX];
             snprintf(data_check, sizeof(data_check),
                      "%s/%s/data", dir_path, oe->d_name);
             struct stat ost;
-            /* Only check objects that have on-disk data — pre-create-object
-               work-in-progress dirs without data/ are uninteresting. */
             if (stat(data_check, &ost) != 0 || !S_ISDIR(ost.st_mode)) continue;
+
+            const char *layout_marker = "data/";
 
             /* Rule 2: fields.conf must exist. */
             char fields_check[PATH_MAX];
@@ -2217,11 +2252,11 @@ static int validate_metadata(const char *db_root) {
             struct stat fst;
             if (stat(fields_check, &fst) != 0) {
                 fprintf(stderr,
-                    "validate: object [%s/%s] has data/ but missing fields.conf\n",
-                    de->d_name, oe->d_name);
+                    "validate: object [%s/%s] has %s but missing fields.conf\n",
+                    de->d_name, oe->d_name, layout_marker);
                 log_msg(1,
-                    "VALIDATE %s/%s has data/ but no fields.conf",
-                    de->d_name, oe->d_name);
+                    "VALIDATE %s/%s has %s but no fields.conf",
+                    de->d_name, oe->d_name, layout_marker);
                 errors++;
             }
 
@@ -2235,11 +2270,11 @@ static int validate_metadata(const char *db_root) {
             }
             if (!found) {
                 fprintf(stderr,
-                    "validate: object [%s/%s] has data/ but missing schema.conf line\n",
-                    de->d_name, oe->d_name);
+                    "validate: object [%s/%s] has %s but missing schema.conf line\n",
+                    de->d_name, oe->d_name, layout_marker);
                 log_msg(1,
-                    "VALIDATE %s/%s has data/ but no schema.conf line",
-                    de->d_name, oe->d_name);
+                    "VALIDATE %s/%s has %s but no schema.conf line",
+                    de->d_name, oe->d_name, layout_marker);
                 errors++;
             }
         }
@@ -2424,15 +2459,48 @@ int cmd_server(const char *db_root, int daemonize) {
     write_pid_file(db_root, port);
     g_server_start_ms = now_ms();
     bt_page_size = g_index_page_size;
+    /* QUERY_BUFFER_MB auto-tune. config.c initialises to 500 MB; if the
+       value is still at that default after db.env load, the user didn't
+       override it and we auto-tune to min(25% of total RAM, 4 GB) so
+       index-walk paths (KeySet builds in agg-with-criteria, group_by,
+       intersect) get enough headroom on typical VPS shapes (4 GB /
+       8 GB) to avoid falling back to slower per-record scans. The 4 GB
+       ceiling prevents a single query monopolising big-RAM boxes. */
+    if (g_query_buffer_max_bytes == 500ULL * 1024 * 1024) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long page_sz = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && page_sz > 0) {
+            size_t total_ram = (size_t)pages * (size_t)page_sz;
+            size_t quarter = total_ram / 4;
+            size_t cap = 4ULL * 1024 * 1024 * 1024;  /* 4 GB ceiling */
+            if (quarter > cap) quarter = cap;
+            if (quarter > g_query_buffer_max_bytes)
+                g_query_buffer_max_bytes = quarter;
+        }
+        log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB",
+                g_query_buffer_max_bytes / (1024 * 1024));
+    }
     fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);
-    /* Pool size: explicit THREADS wins; otherwise 4× cores.
-       Oversubscription hides shard-rwlock stalls that a thread-per-core
-       pool can't overlap — measured ~18% faster on parallel bulk-insert. */
+    /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
+       objects route reads/writes through these; v1 (legacy) objects continue
+       to use ucache. Both engines coexist until migration. */
+    slotcask_init(g_fcache_cap, g_fcache_cap);
+    /* CPU pool size: explicit THREADS wins; otherwise nproc - 2 (leaves
+       2 cores for the OS / interactive shell so long full-scan queries
+       don't peg every CPU and freeze the operator's session).
+       Pre-2026.06 this defaulted to 4× nproc to mask page-fault stalls
+       on bulk-insert hot paths; that I/O oversubscription now lives in
+       parallel_for_io (per-call dedicated pthreads) which the bulk-
+       insert / bulk-update / bulk-delete dispatchers route to. CPU-bound
+       paths (reads, scans, aggregates) keep using parallel_for and the
+       bounded CPU pool, so a long scan no longer takes every core. */
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc <= 0) nproc = 4;
     int pool_sz = g_max_threads > 0
                   ? g_max_threads
-                  : (int)sysconf(_SC_NPROCESSORS_ONLN) * 4;
-    if (pool_sz < 4) pool_sz = 4;
+                  : (int)(nproc > 2 ? nproc - 2 : nproc);
+    if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
@@ -2527,8 +2595,10 @@ int cmd_server(const char *db_root, int daemonize) {
 
     remove_pid_file(db_root);
     parallel_pool_shutdown();
+    counts_flush_all();        /* persist in-memory atomic counts → disk */
     fcache_shutdown();
     bt_cache_shutdown();
+    slotcask_shutdown();
     tls_shutdown();
     log_msg(3, "SERVER STOP pid=%d", getpid());
     log_shutdown();

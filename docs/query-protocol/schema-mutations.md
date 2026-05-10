@@ -132,9 +132,9 @@ Maintenance — reclaim deleted-record slots, drop tombstoned fields, or reshard
 
 | Call | What it does |
 |---|---|
-| `{"mode":"vacuum",...}` | Fast in-place tombstone reclaim. Rewrites slots with `flag=2` (deleted) back to `flag=0` (empty). No schema change. |
+| `{"mode":"vacuum",...}` | **v1**: in-place tombstone reclaim — slots with `flag=2` are zeroed back to `flag=0`. **v2**: Direction-C seg compaction — sparse non-active seg files are pair-merged into denser ones via kf-repoint, then unlinked. Active seg of each stream is never touched. *Also*: if the host's CPU count has changed since `create-object` and `slotcask_streams_for_nproc()` no longer matches `schema.streams`, the call automatically promotes to a full rebuild that re-routes records into the new stream layout. Idempotent. |
 | `{"mode":"vacuum","compact":true}` | Full rebuild. Drops tombstoned fields, shrinks `slot_size`. Indexes preserved. |
-| `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes data; hash routing identity is preserved. **Triggers a full reindex** — see below. |
+| `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes data; hash routing identity is preserved. **Triggers a full reindex** — see below. Also folds in the streams-mismatch check on the same rebuild, so you never need a second call. |
 | `{"mode":"vacuum","compact":true,"splits":N}` | Both — compact schema and reshard in one pass. |
 
 ### Why `splits` triggers reindex (2026.05.1+)
@@ -152,12 +152,14 @@ Plain `vacuum --compact` (no `splits`) leaves indexes alone — the per-field sh
 - Many deletes → `vacuum-check` flags objects where tombstoned ≥10% and total ≥1000.
 - Removed fields → `compact` to reclaim their bytes.
 - Shard skew from growth → `splits:N` to even out load. See [`shard-stats`](diagnostics.md).
+- **CPU upgrade or container resize** (v2) → the next default `vacuum` self-heals: it detects `slotcask_streams_for_nproc() ≠ schema.streams` and dispatches to the rebuild path, after which records route by the new stream count. The auto-vacuum thread picks this up automatically once any object also crosses the deletion-pct threshold; for an explicit fix, run `./shard-db vacuum <dir> <obj>`.
 
 ### Locks
 
 All vacuum flavors take the object's write lock. Normal ops block for the duration of the rebuild.
 
-Response: `{"status":"vacuumed","object":"...","compact":true|false,"splits":N}`.
+Response (v2 light path): `{"status":"vacuumed","cleaned":<seg-files-dropped>}`.
+Response (heavy path — `compact`, `splits`, or streams-mismatch): `{"status":"rebuilt","live":N,"splits":N,"streams":N,"slot_size":N,"compact":true|false,"indexes_rebuilt":N}`.
 
 ## truncate
 
