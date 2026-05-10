@@ -9161,6 +9161,191 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     return printed;
 }
 
+/* ============================================================
+   Streaming indexed find — fetch + post-filter + emit per btree match.
+   Replaces collect-then-emit for the limit-bound case where post-filter
+   siblings make the collect cap (= offset+limit) under-collect.
+
+   Walk the primary leaf's btree (parallel across idx shards). For each
+   btree match: the cb fetches the record, runs criteria_match_tree
+   against the FULL tree (so post-filter siblings get applied), and
+   emits if the record passes. Stops parallel walks via an atomic flag
+   when emit count hits offset+limit. Concurrent shard workers
+   serialise emit through an internal mutex so JSON rows don't
+   interleave.
+
+   Restrictions: no joins, no rows_fmt table envelope, no order_by
+   (caller routes those to the collect-then-emit path which can sort
+   the materialised batch). Supports csv_delim, dict_fmt, projections,
+   excluded keys. v2 storage only (v1 emit shape stays in the older
+   fcache-handle path; we only route v2 here).
+   ============================================================ */
+typedef struct {
+    /* Inputs (immutable across cb invocations). */
+    const char       *db_root;
+    const char       *object;
+    const Schema     *sch;
+    SearchCriterion  *primary_crit;
+    int               check_primary;
+    CriteriaNode     *tree;
+    FieldSchema      *fs;
+    ExcludedKeys     *excluded;
+    const char      **proj_fields;
+    int               proj_count;
+    int               rows_fmt;
+    int               dict_fmt;
+    char              csv_delim;
+    int               offset;
+    int               limit;
+    QueryDeadline    *deadline;
+    FILE             *parent_out;
+
+    /* Mutable shared state. */
+    pthread_mutex_t   lock;
+    int               passed;     /* records that passed both filters */
+    int               printed;    /* records actually emitted */
+    int               stop;       /* atomic — set when printed >= limit */
+} StreamFindCtx;
+
+static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw_ctx) {
+    StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
+
+    /* Worker thread inherits the caller's output stream. */
+    if (!g_out) g_out = sc->parent_out;
+
+    /* Primary check (LEN_*, like patterns where check_primary == 1). */
+    if (sc->primary_crit && op_is_length(sc->primary_crit->op)) {
+        if (!match_length_vlen(vlen, sc->primary_crit)) return 0;
+    } else if (sc->check_primary && sc->primary_crit) {
+        char tmp[1028];
+        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+        memcpy(tmp, val, cl); tmp[cl] = '\0';
+        if (!match_criterion(tmp, sc->primary_crit)) return 0;
+    }
+
+    /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
+    RecordRef rr;
+    if (read_record_ref(sc->db_root, sc->object, sc->sch, hash16, &rr) != 0) return 0;
+
+    char keybuf[1024];
+    size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+    memcpy(keybuf, rr.key, kl);
+    keybuf[kl] = '\0';
+
+    if (is_excluded(sc->excluded, keybuf)) { release_record_ref(&rr); return 0; }
+
+    /* Full-tree post-filter — this is where the sibling criteria get
+       applied. The collect-then-emit path applied this AFTER materialising
+       offset+limit candidates from the btree walk; we apply it inline so
+       the btree walk only needs to run until enough records PASS. */
+    if (!criteria_match_tree(rr.val, sc->tree, sc->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    pthread_mutex_lock(&sc->lock);
+    int my_seq = ++sc->passed;
+    int will_emit = (my_seq > sc->offset &&
+                     (sc->limit <= 0 || sc->printed < sc->limit));
+    if (will_emit) {
+        const uint8_t *raw = rr.val;
+        uint32_t value_len = (uint32_t)rr.vlen;
+        if (sc->csv_delim) {
+            csv_emit_row(keybuf, raw, value_len,
+                          sc->proj_count > 0 ? sc->proj_fields : NULL,
+                          sc->proj_count, sc->fs, sc->csv_delim);
+        } else if (sc->dict_fmt) {
+            OUT("%s\"%s\":", sc->printed ? "," : "", keybuf);
+            if (sc->proj_count > 0) {
+                OUT("{");
+                int first = 1;
+                for (int j = 0; j < sc->proj_count; j++) {
+                    char *pv = decode_field((const char *)raw, value_len,
+                                             sc->proj_fields[j], sc->fs);
+                    if (!pv) continue;
+                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                    first = 0;
+                    free(pv);
+                }
+                OUT("}");
+            } else {
+                char *v = decode_value((const char *)raw, value_len, sc->fs);
+                OUT("%s", v);
+                free(v);
+            }
+        } else if (sc->proj_count > 0) {
+            OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
+            int first = 1;
+            for (int j = 0; j < sc->proj_count; j++) {
+                char *pv = decode_field((const char *)raw, value_len,
+                                         sc->proj_fields[j], sc->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}}");
+        } else {
+            char *v = decode_value((const char *)raw, value_len, sc->fs);
+            OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", keybuf, v);
+            free(v);
+        }
+        sc->printed++;
+    }
+    int done = (sc->limit > 0 && sc->printed >= sc->limit);
+    pthread_mutex_unlock(&sc->lock);
+
+    release_record_ref(&rr);
+    if (done) {
+        __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
+        return -1;
+    }
+    return 0;
+}
+
+/* Returns number of rows printed, or -2 on per-query buffer cap overrun
+   (currently unused — streaming has no buffer growth). Caller has
+   already emitted the JSON envelope opener (`[`) before calling. */
+static int idx_find_streaming(const char *db_root, const char *object,
+                               const Schema *sch,
+                               SearchCriterion *primary_crit, int check_primary,
+                               CriteriaNode *tree,
+                               ExcludedKeys *excluded,
+                               int offset, int limit,
+                               const char **proj_fields, int proj_count,
+                               FieldSchema *fs,
+                               int rows_fmt, int dict_fmt, char csv_delim,
+                               QueryDeadline *dl) {
+    StreamFindCtx sc = {0};
+    sc.db_root = db_root;
+    sc.object = object;
+    sc.sch = sch;
+    sc.primary_crit = primary_crit;
+    sc.check_primary = check_primary;
+    sc.tree = tree;
+    sc.fs = fs;
+    sc.excluded = excluded;
+    sc.proj_fields = proj_fields;
+    sc.proj_count = proj_count;
+    sc.rows_fmt = rows_fmt;
+    sc.dict_fmt = dict_fmt;
+    sc.csv_delim = csv_delim;
+    sc.offset = offset;
+    sc.limit = limit;
+    sc.deadline = dl;
+    sc.parent_out = g_out;
+    pthread_mutex_init(&sc.lock, NULL);
+
+    btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+                    primary_crit,
+                    resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
+                    stream_find_cb, &sc);
+
+    pthread_mutex_destroy(&sc.lock);
+    return sc.printed;
+}
+
 enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "eq") == 0 || strcmp(s, "equal") == 0) return OP_EQUAL;
     if (strcmp(s, "neq") == 0 || strcmp(s, "not_equal") == 0) return OP_NOT_EQUAL;
@@ -11907,6 +12092,36 @@ int cmd_find(const char *db_root, const char *object,
         }
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
+    /* ===== Streaming fast path for limit-bound, post-filtered finds.
+       For small (offset + limit) where the tree has post-filter siblings
+       (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
+       walk the most-selective leaf's btree and emit-as-we-go via
+       criteria_match_tree. The collect-then-emit path's cap=offset+limit
+       under-collects when a sibling rejects most candidates; streaming
+       walks until enough records actually PASS, no over-fetch heuristic
+       needed.
+       Eligibility: no joins (join semantics need full materialise),
+       no rows_fmt envelope (also needs full collect for column ordering),
+       no order_by (would need sort across shards). */
+    int can_stream = (limit > 0 && (offset + limit) <= 1000 &&
+                       njoins == 0 && !rows_fmt &&
+                       (plan.kind == PRIMARY_INTERSECT ||
+                        (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF)));
+    if (can_stream) {
+        SearchCriterion *primary;
+        if (plan.kind == PRIMARY_INTERSECT) {
+            /* intersect_leaves[0] is already most-selective-first via
+               op_selectivity_rank — use it as the streaming primary. */
+            primary = plan.intersect_leaves[0];
+        } else {
+            primary = plan.primary_leaf;
+        }
+        int check_primary = op_needs_check_primary(primary->op);
+        idx_find_streaming(db_root, object, &sch, primary, check_primary,
+                           tree, &excluded, offset, limit,
+                           proj_fields, proj_count,
+                           (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                           rows_fmt, dict_fmt, csv_delim, &dl);
     } else if (plan.kind == PRIMARY_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
         keyset_find_from_intersect(db_root, object, &sch, &plan, tree,
