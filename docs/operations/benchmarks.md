@@ -183,6 +183,69 @@ The cursor path is O(log N) per page — staying sub-millisecond regardless of d
 
 All 38 search operators use indexes when available. Full scans (non-indexed fields, `_field` ops where RHS is per-record) parallelize across kf shards with per-segment batched cache acquire — the v2 record walk hits ~50 ms / 1M records on this hardware.
 
+## 3a. Queries on 25M users — scaling characteristics
+
+`shard-db-bench run bench-queries` with `SHARD_BENCH_COUNT=25000000`. Same 13-field schema and 12 indexes as §3; the bench's auto-tuned tier picker selects `splits=128` (195K records/shard, fits the engine's 256K initial slots — no resplit during the 25M insert).
+
+**Insert** (25M records, parallel, 12 indexes built upfront, disk-backed): **~120 k/sec** single-conn, **~430 k/sec** parallel × 5 conns (CSV form). 25M chunked in 1M batches.
+
+These numbers assume **warm cache** (kernel page cache holds the relevant kf + segment pages). First-touch queries against an indexed field's btree pay a one-time disk-read cost (1-10 ms cold, sub-ms warm). The `cold` column shows the worst-case first-query latency after a cold daemon start; `warm` is what subsequent queries see.
+
+### COUNT — selectivity scaling
+
+| query | warm | cold (first-touch on this index) |
+|---|---|---|
+| `eq username` (point lookup, varchar idx) | **0.1 ms** | 1-2 ms |
+| `eq active=false` (~3.5M matches, bool) | 15-30 ms | 200-400 ms |
+| `eq age=30` (~417K matches, int) | 1-3 ms | 50-150 ms |
+| `eq bio` (full scan, ~25M records) | 800-1500 ms | 6-9 s |
+| `gt user_id>500000` (range, ~12.5M matches) | 200-400 ms | 1-2.5 s |
+| `between age 30..40` | 30-50 ms | 300-500 ms |
+| `contains bio 'DevOps'` (full scan + simd memmem) | 800-1000 ms | 1-3 s |
+| `icontains bio 'devops'` (full scan + simd memcasemem) | 800-1000 ms | 1-3 s |
+| `OR 5 leaves on age` | 2-3 s | 9-12 s |
+| `OR cross-field` (age=30 OR active=false) | 4-5 s | 14-15 s |
+| `eq_field age == rank` (always full scan) | 590-700 ms | 600-700 ms (CPU-bound) |
+
+### AGGREGATE — single-fn standalone
+
+| query | warm | cold |
+|---|---|---|
+| `count all` (metadata) | **0.6 ms** | 0.6 ms |
+| `min/max` on indexed (int/long/etc.) | 0.1-30 ms | 0.5-200 ms |
+| `sum age` | 500-700 ms | 9-11 s |
+| `sum balance` (numeric) | 1.5-2 s | 13-16 s |
+| `max created_at` (date) | 1-1.5 s | 13-15 s |
+| `avg score` | 600-800 ms | 0.5-2 s |
+
+### AGGREGATE — bundled & grouped
+
+The parallel Pass 1 + parallel merge wins are most visible at this scale:
+
+| query | warm |
+|---|---|
+| `group by active` (count + avg) | 3-5 s |
+| **`group by username, count` (varchar idx, ~12.5M unique)** | **4-5 s** (was 13-22s pre-parallel) |
+| **`group by email, sum(balance)` (varchar idx)** | **5-8 s** (was 22s pre-parallel) |
+| `group by birthday, count` (low cardinality) | 90-110 ms |
+| `group by F where AND-of-indexed` | 30-50 ms |
+| `group by F1, F2` (multi-field, low cardinality) | 6-9 s |
+
+### CURSOR pagination
+
+| query | warm |
+|---|---|
+| ASC by indexed field, `limit 100` | 0.2-15 ms |
+| **DESC by age** (currently walks full forward leaf chain to collect IDs) | **18-30 ms** warm, 1-10 s cold (architectural — `prev_leaf` pointer is on the backlog) |
+| ASC + criteria, continuation | 1-3 ms |
+| `offset 50000 limit 100` | 4-5 ms |
+
+### Cold-cache caveat
+
+Aggregate full-btree walks (sum/avg/max with no criteria) and OR-cross-field queries pay 5-15× cold-vs-warm penalty at 25M scale. First query against each indexed field reads ~750 MB of btree pages from disk; subsequent queries within the same daemon lifetime hit the OS page cache. **Production deployments with steady query patterns hit warm numbers**; a fresh daemon's first query against any large index pays the cold cost once.
+
+For workloads that genuinely need fast cold-start (e.g. on-demand analytics) the kf header + segment data are mmap'd `MAP_SHARED` with `MADV_HUGEPAGE` — `posix_fadvise(POSIX_FADV_WILLNEED)` on startup would prefetch but isn't done today.
+
 ## 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes
 
 `shard-db-bench run bench-invoice`, `SPLITS=64`.
