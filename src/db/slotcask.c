@@ -751,6 +751,24 @@ size_t slotcask_default_slots_for_splits(int splits) {
  * file_id + offset) 8-byte aligned, so kf_repoint commits via a single
  * __atomic_store_n on that uint64. */
 
+/* Slot-header field accessors — the on-disk slot layout is:
+   [0..16) hash  [16..18) klen u16  [18] flag  [19] reserved  [20..24) vlen u32
+   [24..24+klen) key bytes  [24+klen..) value bytes.
+   These wrappers keep the magic numbers in one place and document intent
+   at the read sites. Writes still go through seg_record_emit. */
+static inline uint16_t seg_rec_klen(const uint8_t *rec) {
+    uint16_t k; memcpy(&k, rec + 16, 2); return k;
+}
+static inline uint32_t seg_rec_vlen(const uint8_t *rec) {
+    uint32_t v; memcpy(&v, rec + 20, 4); return v;
+}
+/* True iff the slot is live (flag=1) and its 16B hash matches `hash`.
+   Common pattern for fast-pruning a probe-walk hit before key-byte verify. */
+static inline int seg_rec_live_with_hash(const uint8_t *rec,
+                                          const uint8_t hash[16]) {
+    return rec[18] == 1 && memcmp(rec, hash, 16) == 0;
+}
+
 /* Verify the on-disk record's stored key matches `key`. Returns 1 if match,
    0 if different (hash collision), -1 on I/O error. */
 static int verify_stored_key(const char *data_dir, uint8_t stream_id,
@@ -761,8 +779,7 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
     SlotcaskSegHandle h;
     if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
-    uint16_t k_stored;
-    memcpy(&k_stored, rec + 16, 2);
+    uint16_t k_stored = seg_rec_klen(rec);
     if (k_stored != klen) { segcache_release(&h); return 0; }
     int match = (memcmp(rec + 24, key, klen) == 0);
     segcache_release(&h);
@@ -1343,6 +1360,7 @@ static int append_reserve_n(SlotcaskDb *db, SlotcaskStream *p,
 
 /* ============================================================ Record I/O */
 
+
 /* Build a slot record in `buf` (caller-allocated, slot_size bytes). */
 static void build_record_buf(uint8_t *buf, int slot_size,
                              const uint8_t hash[16], uint8_t flag,
@@ -1607,14 +1625,12 @@ int slotcask_get(SlotcaskDb *db,
         if (segcache_acquire(&sh, path, 0, 0) != 0) return -1;
 
         const uint8_t *rec = sh.map + offset;
-        if (rec[18] != 1 || memcmp(rec, hash, 16) != 0) {
+        if (!seg_rec_live_with_hash(rec, hash)) {
             segcache_release(&sh);
             continue;
         }
-        uint16_t k_stored;
-        uint32_t v_stored;
-        memcpy(&k_stored, rec + 16, 2);
-        memcpy(&v_stored, rec + 20, 4);
+        uint16_t k_stored = seg_rec_klen(rec);
+        uint32_t v_stored = seg_rec_vlen(rec);
         if (k_stored != klen || memcmp(rec + 24, key, klen) != 0) {
             segcache_release(&sh);
             continue;
@@ -2023,10 +2039,8 @@ static int read_record_value(const SlotcaskDb *db, uint8_t stream_id,
     if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
     if (rec[18] != 1) { segcache_release(&h); return -1; }
-    uint16_t k_stored;
-    uint32_t v_stored;
-    memcpy(&k_stored, rec + 16, 2);
-    memcpy(&v_stored, rec + 20, 4);
+    uint16_t k_stored = seg_rec_klen(rec);
+    uint32_t v_stored = seg_rec_vlen(rec);
     if (k_stored != klen || memcmp(rec + 24, key, klen) != 0) {
         segcache_release(&h);
         return -1;
@@ -2971,10 +2985,8 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     SlotcaskBulkRec *r = &recs[i];
                     const uint8_t *rec = h.map + st[i].old_off;
                     if (rec[18] != 1) { r->status = -1; continue; }
-                    uint16_t k_stored;
-                    uint32_t v_stored;
-                    memcpy(&k_stored, rec + 16, 2);
-                    memcpy(&v_stored, rec + 20, 4);
+                    uint16_t k_stored = seg_rec_klen(rec);
+                    uint32_t v_stored = seg_rec_vlen(rec);
                     if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
                         r->status = -1;
                         continue;
@@ -3363,10 +3375,8 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     SlotcaskBulkRec *r = &recs[i];
                     const uint8_t *rec = h.map + st[i].old_off;
                     if (rec[18] != 1) { r->status = -1; continue; }
-                    uint16_t k_stored;
-                    uint32_t v_stored;
-                    memcpy(&k_stored, rec + 16, 2);
-                    memcpy(&v_stored, rec + 20, 4);
+                    uint16_t k_stored = seg_rec_klen(rec);
+                    uint32_t v_stored = seg_rec_vlen(rec);
                     if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
                         r->status = -1;
                         continue;
@@ -3560,8 +3570,7 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 SlotcaskBulkRec *r = &recs[i];
                 const uint8_t *rec = h.map + st[i].off;
                 if (rec[18] != 1) { r->status = -2; continue; }
-                uint16_t k_stored;
-                memcpy(&k_stored, rec + 16, 2);
+                uint16_t k_stored = seg_rec_klen(rec);
                 if (k_stored != r->klen) { r->status = -2; continue; }
                 if (memcmp(rec + 24, r->key, r->klen) != 0) { r->status = -2; continue; }
                 st[i].verified = 1;
@@ -3661,10 +3670,8 @@ int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 SlotcaskBulkRec *r = &recs[i];
                 const uint8_t *rec = h.map + st[i].off;
                 if (rec[18] != 1) { r->status = -2; continue; }
-                uint16_t k_stored;
-                uint32_t v_stored;
-                memcpy(&k_stored, rec + 16, 2);
-                memcpy(&v_stored, rec + 20, 4);
+                uint16_t k_stored = seg_rec_klen(rec);
+                uint32_t v_stored = seg_rec_vlen(rec);
                 if (k_stored != r->klen ||
                     memcmp(rec + 24, r->key, r->klen) != 0) {
                     r->status = -2;
@@ -3998,10 +4005,9 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
             SlotcaskSegHandle sh;
             if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
             const uint8_t *rec = sh.map + e->offset;
-            if (rec[18] == 1 && memcmp(rec, e->hash, 16) == 0) {
-                uint16_t klen; uint32_t vlen;
-                memcpy(&klen, rec + 16, 2);
-                memcpy(&vlen, rec + 20, 4);
+            if (seg_rec_live_with_hash(rec, e->hash)) {
+                uint16_t klen = seg_rec_klen(rec);
+                uint32_t vlen = seg_rec_vlen(rec);
                 if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
                     stop = 1;
             }
@@ -4123,13 +4129,12 @@ done_collect:
         }
         SlotcaskKfEntry *e = &kf[r->kf_idx];
         const uint8_t *rec = sh.map + r->offset;
-        if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
+        if (!seg_rec_live_with_hash(rec, e->hash)) {
             /* Stale-pointer race: another writer repointed mid-walk. */
             continue;
         }
-        uint16_t klen; uint32_t vlen;
-        memcpy(&klen, rec + 16, 2);
-        memcpy(&vlen, rec + 20, 4);
+        uint16_t klen = seg_rec_klen(rec);
+        uint32_t vlen = seg_rec_vlen(rec);
         if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
             stop = 1;
     }
@@ -4232,10 +4237,9 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
         SlotcaskSegHandle sh;
         if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
         const uint8_t *rec = sh.map + e->offset;
-        if (rec[18] == 1 && memcmp(rec, e->hash, 16) == 0) {
-            uint16_t klen; uint32_t vlen;
-            memcpy(&klen, rec + 16, 2);
-            memcpy(&vlen, rec + 20, 4);
+        if (seg_rec_live_with_hash(rec, e->hash)) {
+            uint16_t klen = seg_rec_klen(rec);
+            uint32_t vlen = seg_rec_vlen(rec);
             if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
                 stop = 1;
         }
@@ -4311,13 +4315,12 @@ int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
             SlotcaskSegHandle sh;
             if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
             const uint8_t *rec = sh.map + e->offset;
-            if (rec[18] != 1 || memcmp(rec, e->hash, 16) != 0) {
+            if (!seg_rec_live_with_hash(rec, e->hash)) {
                 segcache_release(&sh);
                 continue;
             }
-            uint16_t klen; uint32_t vlen;
-            memcpy(&klen, rec + 16, 2);
-            memcpy(&vlen, rec + 20, 4);
+            uint16_t klen = seg_rec_klen(rec);
+            uint32_t vlen = seg_rec_vlen(rec);
             const uint8_t *key   = rec + 24;
             const uint8_t *value = rec + 24 + klen;
             if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
@@ -4354,14 +4357,12 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
         SlotcaskSegHandle sh;
         if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
         const uint8_t *rec = sh.map + e->offset;
-        if (rec[18] != 1 || memcmp(rec, hash16, 16) != 0) {
+        if (!seg_rec_live_with_hash(rec, hash16)) {
             segcache_release(&sh);
             continue;
         }
-        uint16_t klen;
-        uint32_t vlen;
-        memcpy(&klen, rec + 16, 2);
-        memcpy(&vlen, rec + 20, 4);
+        uint16_t klen = seg_rec_klen(rec);
+        uint32_t vlen = seg_rec_vlen(rec);
         const uint8_t *key   = rec + 24;
         const uint8_t *value = rec + 24 + klen;
         if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
