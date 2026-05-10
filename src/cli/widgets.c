@@ -5,10 +5,17 @@
 #include "cli.h"
 
 #include <stdarg.h>
+#include <locale.h>
 
 static char g_status_buf[256] = "ready";
 
 void tui_init(void) {
+    /* Inherit the user's locale so ncurses renders UTF-8 correctly.
+       Without this, multi-byte characters (e.g. `→`, `↑`, `↓`) come
+       through as `~X~Y~Z` — ncurses's caret-style fallback for
+       high-bit bytes, which surfaced as the "[N items, ~F~R drill]"
+       garbage in describe-object views. */
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
