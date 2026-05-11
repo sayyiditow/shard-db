@@ -23,11 +23,14 @@
 #define BT_HASH_SIZE    16      /* raw xxh128 bytes */
 #define BT_MAX_VAL_LEN  512    /* max value length */
 
-/* File magic. "BTRF" (v2) = binary-native keys with per-type sign flip.
-   The v1 "BTRE" magic (0x42545245) is rejected on open — run
-   ./shard-db reindex to rebuild. */
+/* File magic. "BTRG" (v3) = adds last_leaf_page in header + prev_leaf per
+   leaf page → O(num_shards) max & O(1)-leaf-step DESC iteration without
+   the forward-walk-then-reverse on the entire leaf chain. The v1 "BTRE"
+   and v2 "BTRF" magics are rejected on open — run ./shard-db reindex
+   (or ./migrate, which calls it) to rebuild. */
 #define BT_MAGIC_V1  0x42545245u  /* legacy string-keyed format */
-#define BT_MAGIC     0x42545246u  /* current: binary-native keys */
+#define BT_MAGIC_V2  0x42545246u  /* binary-native keys, no prev_leaf */
+#define BT_MAGIC     0x42545247u  /* current: prev_leaf + last_leaf_page */
 
 /* Configurable page size — set before first use */
 extern int bt_page_size; /* default 4096, set from db.env INDEX_PAGE_SIZE */
@@ -42,14 +45,18 @@ typedef struct __attribute__((packed)) {
     uint8_t  key_type;      /* FT_* of indexed field (FT_VARCHAR for composite) */
     uint8_t  key_signed;    /* 1 if sign-flip applied at encode, 0 for raw-bytes */
     uint8_t  _pad[2];
-    uint8_t  reserved[4096 - 28]; /* header always occupies first page */
+    uint32_t last_leaf_page;/* rightmost leaf in chain — DESC iter starts here.
+                               Maintained on split (when the rightmost leaf
+                               splits, the new right half becomes the last). */
+    uint8_t  reserved[4096 - 32]; /* header always occupies first page */
 } BtFileHeader;
 
-/* Page header (first 20 bytes of every page) */
+/* Page header (first 24 bytes of every page) */
 typedef struct __attribute__((packed)) {
     uint32_t page_type;     /* 0=internal, 1=leaf */
     uint32_t count;         /* number of entries */
     uint32_t next_leaf;     /* next leaf page id (0=none) / leftmost child for internal */
+    uint32_t prev_leaf;     /* previous leaf page id (0=none); 0 for internal nodes */
     uint32_t data_end;      /* byte offset where entry data ends (grows from end of page) */
     uint32_t _pad;
 } BtPageHeader;

@@ -378,12 +378,14 @@ static void bt_init_file(uint8_t *map) {
     fh->entry_count = 0;
     fh->key_type = 0;
     fh->key_signed = 0;
+    fh->last_leaf_page = 1;     /* the lone leaf is rightmost */
     uint8_t *leaf = map + bt_page_size;
     memset(leaf, 0, bt_page_size);
     BtPageHeader *lh = (BtPageHeader *)leaf;
     lh->page_type = 1;
     lh->count = 0;
     lh->next_leaf = 0;
+    lh->prev_leaf = 0;
     lh->data_end = bt_page_size;
 }
 
@@ -422,6 +424,23 @@ static int bt_open_file(const char *path, int writer,
     madvise(map, sz, MADV_RANDOM);
 
     if (fresh) bt_init_file(map);
+    else {
+        /* Reject older btree formats. V1 was string-keyed; V2 lacked
+           prev_leaf + last_leaf_page. Both require a reindex to upgrade
+           to V3 (current). */
+        BtFileHeader *fh = (BtFileHeader *)map;
+        if (fh->magic != BT_MAGIC) {
+            const char *which = (fh->magic == BT_MAGIC_V1) ? "V1 (string-keyed)"
+                              : (fh->magic == BT_MAGIC_V2) ? "V2 (no prev_leaf)"
+                              : "unknown";
+            fprintf(stderr,
+                "btree: rejecting %s format at %s — run ./shard-db reindex (or ./migrate)\n",
+                which, path);
+            munmap(map, sz);
+            close(fd);
+            return -1;
+        }
+    }
 
     *out_fd = fd;
     *out_map = map;
@@ -689,11 +708,12 @@ typedef struct {
 } LeafRec;
 
 /* Rewrite a leaf page in place from a materialized record array.
-   Preserves page_type=leaf and next_leaf; resets count/data_end/slots.
-   Returns 0 on success, -1 if the records don't fit. */
+   Preserves page_type=leaf, next_leaf, and prev_leaf; resets count/
+   data_end/slots. Returns 0 on success, -1 if the records don't fit. */
 static int leaf_rebuild(uint8_t *page, LeafRec *recs, int count) {
     BtPageHeader *ph = (BtPageHeader *)page;
     uint32_t next_leaf = ph->next_leaf;
+    uint32_t prev_leaf = ph->prev_leaf;
     int K = BT_LEAF_RESTART_K;
 
     /* Pre-compute encoded size to validate fit. */
@@ -715,6 +735,7 @@ static int leaf_rebuild(uint8_t *page, LeafRec *recs, int count) {
     ph->page_type = 1;
     ph->count = 0;
     ph->next_leaf = next_leaf;
+    ph->prev_leaf = prev_leaf;
     ph->data_end = bt_page_size;
 
     uint16_t *slots = page_slots(page);
@@ -887,12 +908,28 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
     BtPageHeader *old_h = (BtPageHeader *)old_pg;
     int total = old_h->count;
 
-    /* Init new page as leaf; inherits old's next_leaf. */
+    /* Init new page as leaf; inherits old's next_leaf and gets old as
+       prev_leaf. The leaf chain becomes: old → new → (old's old next).
+       prev_leaf maintenance: new->prev = page_id (old).
+                              (old's old next)->prev = new_id (if exists).
+       last_leaf_page maintenance: if old WAS the rightmost leaf,
+                                   new becomes the rightmost. */
     BtPageHeader *new_h = (BtPageHeader *)new_pg;
     new_h->page_type = 1;
     new_h->count = 0;
     new_h->next_leaf = old_h->next_leaf;
+    new_h->prev_leaf = page_id;
     new_h->data_end = bt_page_size;
+
+    /* If old had a successor, fix that successor's prev_leaf to point at new. */
+    if (old_h->next_leaf != 0) {
+        BtPageHeader *succ_h = (BtPageHeader *)bt_page(bt, old_h->next_leaf);
+        succ_h->prev_leaf = new_id;
+    } else {
+        /* Old was the last leaf; new takes over that role. */
+        BtFileHeader *fh = (BtFileHeader *)bt->map;
+        fh->last_leaf_page = new_id;
+    }
 
     /* Decode all non-tombstoned entries. Worst-case buffer: total * BT_MAX_VAL_LEN. */
     LeafRec *recs = malloc((size_t)total * sizeof(LeafRec));
@@ -1487,62 +1524,51 @@ static int iter_next_fwd(BtRangeIter *it) {
 
 static int iter_load_desc_snap(BtRangeIter *it);
 
-/* Pre-collect the leaf-chain page IDs for DESC walks. Mirrors the prologue
-   of btree_range_desc_ex. */
+/* Initialise DESC walk by seeking to the rightmost leaf via the file
+   header's last_leaf_page (BT_MAGIC v3+). The actual leftward walk
+   happens in iter_load_desc_snap which follows ph->prev_leaf — no
+   per-leaf array, no forward-walk-then-reverse, O(1) start. */
 static int iter_init_desc_leaves(BtRangeIter *it) {
     BtFileHeader *fh = (BtFileHeader *)it->bt.map;
-    uint32_t page_id = fh->root_page;
-    while (1) {
-        uint8_t *page = bt_page(&it->bt, page_id);
-        BtPageHeader *ph = (BtPageHeader *)page;
-        if (ph->page_type == 1) break;
-        page_id = ph->next_leaf;
-    }
-    size_t cap = 0;
-    while (page_id != 0) {
-        if (it->desc_leaf_count >= cap) {
-            cap = cap ? cap * 2 : 1024;
-            /* Explicit malloc-on-first / realloc-on-grow: realloc(NULL, sz) is
-               equivalent to malloc(sz) per the C standard, but Coverity's
-               flow analysis treats the NULL→realloc transition as a deref of
-               null. Splitting the cases keeps the static analyzer happy
-               without changing semantics. */
-            uint32_t *nl = it->desc_leaves
-                ? realloc(it->desc_leaves, cap * sizeof(uint32_t))
-                : malloc(cap * sizeof(uint32_t));
-            if (!nl) return -1;
-            it->desc_leaves = nl;
-        }
-        it->desc_leaves[it->desc_leaf_count++] = page_id;
-        BtPageHeader *ph = (BtPageHeader *)bt_page(&it->bt, page_id);
-        page_id = ph->next_leaf;
-    }
-    /* Pre-load the rightmost leaf's snapshot so the first iter_next_desc call
-       has a valid in-leaf cursor; subsequent calls advance leftward. If the
-       rightmost leaf is empty / beyond max, iter_load_desc_snap walks left
-       internally until it finds a usable one or the iterator drains. */
+    /* desc_leaves repurposed as a single-slot cursor holding the
+       page id of the leaf to load next. desc_leaf_count == 1 means
+       the cursor is armed; desc_li == 0 keeps the existing
+       "armed" sentinel logic in iter_next_desc satisfied. */
+    it->desc_leaves = malloc(sizeof(uint32_t));
+    if (!it->desc_leaves) return -1;
+    it->desc_leaves[0] = fh->last_leaf_page;
+    it->desc_leaf_count = (fh->last_leaf_page != 0) ? 1 : 0;
     it->desc_li = (int)it->desc_leaf_count - 1;
     it->desc_snap_i = -1;
     if (it->desc_li >= 0) iter_load_desc_snap(it);
     return 0;
 }
 
-/* Decode the current desc_li leaf into desc_snaps and reset desc_snap_i to
-   the rightmost entry. Returns 0 if there's no more snapshot data possible. */
+/* Load one leaf snapshot and advance the cursor leftward via ph->prev_leaf.
+   Skips empty leaves and leaves entirely past max bound by repeating the
+   step-left. Returns 1 on a successful load (snap is ready), 0 when the
+   chain is drained. */
 static int iter_load_desc_snap(BtRangeIter *it) {
-    while (it->desc_li >= 0) {
-        uint8_t *page = bt_page(&it->bt, it->desc_leaves[it->desc_li]);
+    while (it->desc_leaves[0] != 0) {
+        uint32_t cur_id = it->desc_leaves[0];
+        uint8_t *page = bt_page(&it->bt, cur_id);
         BtPageHeader *ph = (BtPageHeader *)page;
-        if (ph->count == 0) { it->desc_li--; continue; }
+        uint32_t prev_id = ph->prev_leaf;
+
+        /* Always advance the cursor BEFORE deciding to skip/load — the
+           cursor must point at "next leaf to consider" on return. */
+        it->desc_leaves[0] = prev_id;
+
+        if (ph->count == 0) continue;
 
         /* Cheap left-bound check: anchor at slot 0 carries the leaf's first
            full key. If first_key > max_val every entry here is past max — skip. */
         LeafIter peek;
         leaf_iter_init(&peek, page);
-        if (!leaf_iter_next(&peek)) { it->desc_li--; continue; }
+        if (!leaf_iter_next(&peek)) continue;
         int peek_vs_max = val_cmp(peek.key_buf, peek.key_len, it->max_val, it->max_len);
-        if (peek_vs_max > 0) { it->desc_li--; continue; }
-        if (it->max_exclusive && peek_vs_max == 0 && ph->count == 1) { it->desc_li--; continue; }
+        if (peek_vs_max > 0) continue;
+        if (it->max_exclusive && peek_vs_max == 0 && ph->count == 1) continue;
 
         free(it->desc_snaps);
         it->desc_snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
@@ -1578,8 +1604,10 @@ static int iter_next_desc(BtRangeIter *it) {
 
     while (1) {
         if (it->desc_snap_i < 0) {
-            it->desc_li--;
-            if (it->desc_li < 0) return 0;
+            /* Current snap drained — try to load the next leaf leftward.
+               iter_load_desc_snap follows ph->prev_leaf via the
+               single-slot cursor desc_leaves[0]; returns 0 when chain
+               exhausts. */
             if (!iter_load_desc_snap(it)) return 0;
             continue;
         }
@@ -1684,6 +1712,7 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
             nh->page_type = 1;
             nh->count = 0;
             nh->next_leaf = 0;
+            nh->prev_leaf = cur_leaf;   /* link backward */
             nh->data_end = bt_page_size;
 
             cur_leaf = new_leaf;
@@ -1775,6 +1804,10 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     fh = (BtFileHeader *)bt.map;
     fh->root_page = child_ids[0];
     fh->entry_count = count;
+    /* leaf_ids[leaf_count - 1] is the rightmost leaf in the chain we
+       just built (loop appends leaves in order); record it for O(1)
+       DESC iteration start. */
+    if (leaf_count > 0) fh->last_leaf_page = leaf_ids[leaf_count - 1];
 
     /* Count height */
     uint32_t pg = fh->root_page;
