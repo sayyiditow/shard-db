@@ -25,7 +25,60 @@ struct CliConn {
     SSL *ssl;
 };
 
+/* Parse ./db.env directly so users don't have to `source db.env` before
+   running shard-cli. Matches the daemon's behaviour — db.env is the
+   canonical source of truth. Env vars set in the shell override the file
+   values via the getenv block below (explicit beats implicit). Silently
+   skips if db.env isn't in CWD (env-vars-only mode still works). */
+static void parse_db_env_file(void) {
+    FILE *f = fopen("db.env", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "export ", 7) == 0) p += 7;
+        char *nl = p + strcspn(p, "\n");
+        *nl = '\0';
+        if (*p == '#' || *p == '\0') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        size_t vlen = strlen(val);
+        if (vlen >= 2 &&
+            ((val[0] == '"'  && val[vlen-1] == '"') ||
+             (val[0] == '\'' && val[vlen-1] == '\''))) {
+            val[vlen-1] = '\0';
+            val++;
+        }
+        if (strcmp(key, "HOST") == 0) {
+            strncpy(g_cli_host, val, sizeof(g_cli_host) - 1);
+            g_cli_host[sizeof(g_cli_host) - 1] = '\0';
+        } else if (strcmp(key, "PORT") == 0) {
+            int n = atoi(val);
+            if (n > 0) g_cli_port = n;
+        } else if (strcmp(key, "TLS_ENABLE") == 0) {
+            g_cli_tls_enable = atoi(val);
+        } else if (strcmp(key, "TOKEN") == 0) {
+            strncpy(g_cli_token, val, sizeof(g_cli_token) - 1);
+            g_cli_token[sizeof(g_cli_token) - 1] = '\0';
+        }
+        /* TLS_CA / TLS_SKIP_VERIFY / TLS_SERVER_NAME stay env-only —
+           they're read directly via getenv() in ensure_ssl_ctx() /
+           cli_connect(). Reaching into setenv() from here would
+           leak file-derived state into subprocesses (e.g. ./shard-db
+           status spawned from the Server menu). */
+    }
+    fclose(f);
+}
+
 void cli_load_env(void) {
+    /* db.env first (matches daemon — db.env is the canonical source). */
+    parse_db_env_file();
+
+    /* Shell-set env vars override file values. Explicit beats implicit. */
     const char *host = getenv("HOST");
     if (host && *host) {
         strncpy(g_cli_host, host, sizeof(g_cli_host) - 1);
