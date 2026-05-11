@@ -437,6 +437,8 @@ struct CompiledCriterion {
                                    DATE: 4-byte BE int32 date value.
                                    DATETIME: i1=date int32, i2=unused */
     double   d1, d2;            /* DOUBLE */
+    uint8_t  uuid_bytes[16];    /* UUID: for eq/neq */
+    uint8_t  uuid_bytes2[16];   /* UUID: for between */
     uint16_t t1, t2;            /* DATETIME packed time seconds */
     uint8_t  b1;                /* BOOL/BYTE */
 
@@ -452,6 +454,7 @@ struct CompiledCriterion {
     /* IN/NOT_IN lists (pre-parsed for numeric types) */
     int64_t  *in_i64;
     double   *in_f64;
+    uint8_t (*in_uuid)[16];   /* UUID: array of 16-byte binary values */
     int       in_count;
 
     /* OP_REGEX / OP_NOT_REGEX: pre-compiled POSIX extended regex.
@@ -6865,6 +6868,26 @@ static int64_t parse_numeric_i64(const char *s, int scale) {
     return (int64_t)(dv * mul + (dv >= 0 ? 0.5 : -0.5));
 }
 
+/* Parse UUID string (32 hex digits, with or without hyphens) → 16 bytes.
+   On malformed input, output is all zeros. */
+static void parse_uuid(const char *s, uint8_t out[16]) {
+    memset(out, 0, 16);
+    if (!s) return;
+    int pos = 0;
+    for (const char *c = s; *c && pos < 32; c++) {
+        if (*c == '-') continue;
+        int nibble = -1;
+        if (*c >= '0' && *c <= '9') nibble = *c - '0';
+        else if (*c >= 'a' && *c <= 'f') nibble = *c - 'a' + 10;
+        else if (*c >= 'A' && *c <= 'F') nibble = *c - 'A' + 10;
+        if (nibble < 0) { memset(out, 0, 16); return; }
+        if (pos % 2 == 0) out[pos / 2] = nibble << 4;
+        else out[pos / 2] |= nibble;
+        pos++;
+    }
+    if (pos != 32) { memset(out, 0, 16); }
+}
+
 /* Lowercase duplicate (ASCII). Caller frees. */
 static char *strdup_lower(const char *s, size_t len) {
     char *r = malloc(len + 1);
@@ -7104,6 +7127,16 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         parse_datetime(c->value2, &d, &t); cc->i2 = d; cc->t2 = t;
         break;
     }
+    case FT_UUID: {
+        /* Parse canonical UUID string to 16 bytes */
+        if (c->value && c->value[0]) {
+            parse_uuid(c->value, cc->uuid_bytes);
+        }
+        if (c->value2 && c->value2[0]) {
+            parse_uuid(c->value2, cc->uuid_bytes2);
+        }
+        break;
+    }
     case FT_VARCHAR:
     default:
         break;
@@ -7185,6 +7218,11 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)parse_date_i32(c->in_values[i]);
+            break;
+        case FT_UUID:
+            cc->in_uuid = malloc(sizeof(uint8_t[16]) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                parse_uuid(c->in_values[i], cc->in_uuid[i]);
             break;
         default:
             /* VARCHAR, DATETIME, BOOL, BYTE: use raw strings via c->in_values */
@@ -7481,6 +7519,8 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
         int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u16(b + 4);
         return va < vb ? -1 : (va > vb ? 1 : 0);
     }
+    case FT_UUID:
+        return memcmp(a, b, 16);
     default: return 0;
     }
 }
@@ -7589,6 +7629,39 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         default:
             if (d == 0 && t == 0) return 0;
             return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
+        }
+    }
+    case FT_UUID: {
+        int exists = !(p[0]==0 && p[1]==0 && p[2]==0 && p[3]==0 &&
+                       p[4]==0 && p[5]==0 && p[6]==0 && p[7]==0 &&
+                       p[8]==0 && p[9]==0 && p[10]==0 && p[11]==0 &&
+                       p[12]==0 && p[13]==0 && p[14]==0 && p[15]==0);
+        switch (cc->op) {
+        case OP_EXISTS: return exists;
+        case OP_NOT_EXISTS: return !exists;
+        case OP_EQUAL: return exists && memcmp(p, cc->uuid_bytes, 16) == 0;
+        case OP_NOT_EQUAL: return !exists || memcmp(p, cc->uuid_bytes, 16) != 0;
+        case OP_LESS: return exists && memcmp(p, cc->uuid_bytes, 16) < 0;
+        case OP_GREATER: return exists && memcmp(p, cc->uuid_bytes, 16) > 0;
+        case OP_LESS_EQ: return !exists || memcmp(p, cc->uuid_bytes, 16) <= 0;
+        case OP_GREATER_EQ: return exists && memcmp(p, cc->uuid_bytes, 16) >= 0;
+        case OP_BETWEEN: {
+            if (!exists) return 0;
+            int lo = cc->i1;  /* using i1 as between flag */
+            int hi = cc->i2;  /* using i2 as between flag */
+            if (lo && memcmp(p, cc->uuid_bytes, 16) < 0) return 0;
+            if (hi && memcmp(p, cc->uuid_bytes2, 16) > 0) return 0;
+            return 1;
+        }
+        case OP_IN: case OP_NOT_IN: {
+            if (!exists) return cc->op == OP_NOT_IN;
+            int found = 0;
+            for (int i = 0; i < cc->in_count; i++) {
+                if (memcmp(p, cc->in_uuid[i], 16) == 0) { found = 1; break; }
+            }
+            return cc->op == OP_IN ? found : !found;
+        }
+        default: return 0;
         }
     }
     }
@@ -14068,6 +14141,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_NUMERIC:  return "numeric";
         case FT_DATE:     return "date";
         case FT_DATETIME: return "datetime";
+        case FT_UUID:     return "uuid";
         default:          return "unknown";
     }
 }
@@ -14375,6 +14449,17 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
     }
+    case FT_UUID: {
+        /* Same as decode_field_to_buf - canonical form */
+        const uint8_t *b = (const uint8_t *)p;
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    }
     default:
         return 0;
     }
@@ -14484,6 +14569,9 @@ static int decode_index_key_to_double(const TypedField *f,
         for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
         *out = (double)v / (double)scale; return 1;
     }
+    case FT_UUID:
+        /* UUIDs aren't summable */
+        return 0;
     default: return 0;
     }
 }
@@ -14570,6 +14658,19 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
+    }
+    case FT_UUID: {
+        /* Index stores raw 16 bytes - decode to canonical form */
+        if (plen < 16) return 0;
+        const uint8_t *b = p;
+        /* Check if all zeros */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
     case FT_NUMERIC: {
         if (plen < 8) return 0;
