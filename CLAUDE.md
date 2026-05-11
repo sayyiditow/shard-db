@@ -47,7 +47,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 
 ## Configuration files
 
-- `db.env` — `DB_ROOT`, `PORT`, `TIMEOUT`, `LOG_*`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX = FCACHE_MAX/4`, `QUERY_BUFFER_MB`, `DISABLE_LOCALHOST_TRUST`, `TOKEN_CAP`, `SLOW_QUERY_MS`, TLS knobs (`TLS_ENABLE`, `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`). Full reference: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
+- `db.env` — `DB_ROOT`, `PORT`, `TIMEOUT`, `LOG_*`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX = FCACHE_MAX/4`, `QUERY_BUFFER_MB`, `INDEX_BUILD_BUDGET_MB`, `DISABLE_LOCALHOST_TRUST`, `TOKEN_CAP`, `SLOW_QUERY_MS`, TLS knobs (`TLS_ENABLE`, `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`). Full reference: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
 - `$DB_ROOT/tokens.conf` — global tokens. Line format `token[:perm]`, `perm ∈ {r, rw, rwx}`, no suffix = `rwx`.
 - `$DB_ROOT/<dir>/tokens.conf` — per-tenant tokens (same format).
 - `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).

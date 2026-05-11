@@ -12,6 +12,7 @@ export FCACHE_MAX=4096      # raise if shard-mmap cache hit rate < 90%; allow-li
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX/4 (2026.05.1+)
 export MAX_REQUEST_SIZE=33554432   # 32 MB; per-connection read buffer (memory planning!)
 export QUERY_BUFFER_MB=500         # per-query intermediate buffer cap (collect-hash, KeySet, etc.)
+export INDEX_BUILD_BUDGET_MB=1024   # reindex/add-indexes peak memory per pass (default 1 GiB)
 export GLOBAL_LIMIT=100000         # soft result-set cap
 export SLOW_QUERY_MS=500           # slow query threshold (floor 100 ms)
 export TIMEOUT=0                   # statement timeout (seconds, 0=off; per-request `timeout_ms` overrides)
@@ -117,6 +118,31 @@ Upper bound on intermediate buffers any single query can hold — collect-hash a
 - Peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10–15% higher from malloc overhead).
 
 When to care: heavy ad-hoc analytics that legitimately need bigger working sets. Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, `ulimit -v`) as a backstop.
+
+## INDEX_BUILD_BUDGET_MB — reindex peak memory cap
+
+Caps peak memory of multi-field index builds (`./shard-db reindex`, `./shard-db add-index` with multiple fields, `./migrate` phase 2). The plural `cmd_add_indexes` extracts every indexed field's keys during one parallel scan of storage; without a budget that's `O(nfields × records)` resident, which OOMs hosts on big-record + many-index schemas.
+
+- **Default 1024 MB**.
+- **Floor 64 MB**. Below this, even single-field passes can't fit reasonable working sets.
+- No upper bound from the parser; cap yourself based on host RAM.
+
+How the cap is honoured:
+
+- The builder estimates per-field bytes from `get_live_count() × (BtEntry + partition copy + per-key malloc + glibc chunk overhead)`. Estimation knows each field's typed encoding (varchar 50 % fill, fixed types from the schema, composites by summing child ASCII widths).
+- Fields are grouped into passes whose summed estimate fits the budget. Each pass keeps the existing parallel scan + parallel build machinery; only the *fields-per-pass* concurrency is bounded.
+- A single field that alone exceeds the budget still runs alone (always-include-at-least-one rule) — the budget never blocks a reindex, just paces it.
+
+When to raise:
+
+- **Big-RAM dedicated hosts (>16 GB).** Bump to `4096` or `8192` to fit more fields per pass. **Diminishing returns:** the scan cost per record scales with `nfields_in_batch`, not the number of passes, so the saving is mostly the per-pass setup overhead (a few seconds). Validation on 25M users × 12 indexed fields: `1024 → 105 s`, `8192 → 92.7 s` (only ~13 % faster despite 8× the budget). Raise for memory headroom, not speed.
+
+When to lower:
+
+- **Small VPS shapes (2–4 GB total RAM).** Drop to `256` or `128` if you index varchar-heavy schemas where the default 1 GiB plus the operating daemon's working set squeezes the host. The reindex will run more passes but won't trigger swap.
+- **Containers with hard memory caps** (`cgroup memory.max`). Set the budget to ~50 % of the cap so the daemon can keep serving reads with comfortable headroom during the rebuild.
+
+Mid-rebuild crash safety is unchanged — each pass force-rebuilds its fields from scratch via `btree_idx_unlink_all`, so an interrupted reindex resumes cleanly on rerun.
 
 ## INDEX_PAGE_SIZE — B+ tree page size
 

@@ -23,6 +23,7 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `FCACHE_MAX` | `4096` | Unified shard-mmap cache capacity (entries). **Strict allow-list:** `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning. See [Tuning](../operations/tuning.md). |
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
 | `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap. Protects the daemon from one bad query monopolising RAM. The collect-hash buffer is a single mmap MAP_NORESERVE reservation up to this cap; pages lazy-commit on write. |
+| `INDEX_BUILD_BUDGET_MB` | `1024` | Peak per-pass memory budget for `reindex` / multi-field `add-index` / `migrate`'s phase-2 rebuild. Floor 64 MB. Multi-field builds group fields into passes that fit this cap; an oversized single field still runs alone. See [Tuning → INDEX_BUILD_BUDGET_MB](../operations/tuning.md). |
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
 | `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
 | `SLOW_QUERY_MS` | `500` | Log queries slower than N ms to `slow-*.log` and the in-memory ring (`stats` endpoint). `0` = disable. Minimum 100 ms. |
@@ -53,6 +54,7 @@ export MAX_REQUEST_SIZE=33554432
 export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
 export QUERY_BUFFER_MB=500
+export INDEX_BUILD_BUDGET_MB=1024
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500

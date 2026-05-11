@@ -4,7 +4,66 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased — slotcask-engine branch
+## Unreleased — 2026.05.3
+
+### Reindex memory safety — adaptive batching + pre-sized pairs + exact-key malloc
+
+`./shard-db reindex` on big-record schemas could OOM the host. On a 25M-row, 12-indexed-field schema, peak RSS hit ~25 GB and froze a 29 GB / 0-swap desktop into kernel direct-reclaim spin. Three compounding causes — all fixed:
+
+1. **Scan callbacks malloc'd `f->size` per record per field** — a `varchar:100` reserved 100 B for a 12-character email. Peek the varchar length prefix and malloc exact size in both `index_scan_cb` and `multi_index_scan_cb`. On varchar-heavy schemas this alone trims gigabytes of fragmentation at 25M scale.
+2. **Pair arrays doubled exponentially from 4096.** Pre-size from `get_live_count()` with a 4096 floor and 1 Gi BtEntry cap; the doubling path stays as a fallback for concurrent inserts that push past the estimate. Eliminates the 2× transient peak from realloc holding old + new buffers.
+3. **`cmd_add_indexes` held every field's `pairs[]` + `parted_per_field[]` alive simultaneously** for the fused single-scan optimisation — peak = `O(nfields × records)`. New adaptive batching estimates per-field bytes from `live_count × (BtEntry + partition copy + per-key malloc + glibc chunk overhead)` and groups fields into passes that fit `INDEX_BUILD_BUDGET_MB` (default **1024 MB**, floor 64). Each pass keeps the existing parallel scan + parallel build; only fields-per-pass concurrency is bounded. An oversized single field still runs alone via always-include-at-least-one.
+
+Estimator knows each field's typed encoding (varchar 50 % fill, fixed types from the schema, composites by summing child ASCII widths — `status+invoiceDate` is ~18 B per key, not the previous flat 64 B).
+
+Validation on 25M × 12 fields:
+- Before: ~25 GB peak, host froze, hard reset required.
+- After: ~2 GB peak per pass, reindex completes in **105 s**.
+
+Tuning rule: budget is a **memory cap, not a speed knob**. At this scale, `1024 → 105 s` and `8192 → 92.7 s` — only ~13 % saved by 8× the budget because the per-record callback work scales with `nfields × records` regardless of batching, and qsort + `btree_bulk_build` dominate. Raise for memory headroom (and to keep peak under cgroup limits), not throughput.
+
+`./migrate`'s phase-2 reindex picks this up automatically — operators upgrading from 2026.05.2 do nothing extra; large-object reindex during upgrade is now bounded and won't freeze the host.
+
+### B+ tree v3 — O(1)-step DESC iteration via `prev_leaf` + `last_leaf_page`
+
+File magic bumped: `BT_MAGIC = 0x42545247` ("BTRG"). Two header changes:
+
+- `BtFileHeader.last_leaf_page` — rightmost leaf in the chain. DESC iterator starts here in O(1).
+- `BtPageHeader.prev_leaf` — backward link. DESC iterator steps left via `ph->prev_leaf` instead of indexing into a precomputed array.
+
+Old DESC walks did `root → leftmost leaf → forward-walk the entire leaf chain into a `desc_leaves[]` array → iterate right-to-left`. That malloc'd a buffer proportional to leaf count for the iterator's lifetime and added forward-walk latency to cursor start. V3 replaces the array with a 1-slot cursor.
+
+Split-path maintenance: on `bt_split_leaf`, the new right half's `prev_leaf` is the old page; the old next leaf's `prev_leaf` becomes the new id; if the old leaf was the rightmost, `last_leaf_page` advances to the new id. `leaf_rebuild` preserves `prev_leaf`.
+
+Older formats are rejected at open with a clear error: **V1 (string-keyed, `BTRE`)** and **V2 (binary keys, no `prev_leaf`, `BTRF`)** require a reindex. `./migrate` phase 2 handles this automatically — operators upgrading from 2026.05.2 see no extra steps; existing v2 `.idx` files are wiped and rebuilt as v3 during migrate's reindex.
+
+### Performance — parallel single-spec aggregate fast path
+
+`cmd_aggregate`'s sum/avg/min/max fast path (single indexed numeric field, no criteria, no group_by) used to walk the field's idx shards sequentially. On 25M records × 16 idx shards that serialised 16 cold leaf scans for a 9-15 s total. New `agg_single_shard_worker` + `AggSingleArg` fan out per-shard accumulation via `parallel_for_io`; cold reads overlap on the I/O queue, then a single reducer merges. Sequential calloc-OOM fallback preserves correctness on tight hosts.
+
+Bench wins on 25M users (single-conn): `sum age` ~9 s → ~190 ms range; `sum balance` similar. MIN/MAX already short-circuited after one leaf entry — they pick up the parallelism but the savings are smaller in absolute terms.
+
+### Fixed — pure-OR count missed single-child AND wrapper
+
+`keyset_count_from_or` detected "pure OR" (no AND siblings, no per-record re-match needed) with:
+
+```
+tree == or_node || tree->kind == CNODE_OR
+```
+
+The common shape `criteria: [{"or":[...]}]` parses as `CNODE_AND { n_children=1, children[0] = or_node }`, which the guard classified as hybrid. Pure-OR counts ran a per-record re-match they didn't need. Added the third case — single-child AND wrapping the OR returns `|KeySet|` directly.
+
+### Fixed — bench harness clobbered the operator's `db.env`
+
+`test_env_start_at` (used by every C bench's persistent mode) wrote a fresh minimal 8-line `db.env` at `<base>/db.env` on every run. With `SHARD_BENCH_DB_ROOT=./db` (the documented way to run `bench-queries` against operator data) base resolves to `.`, so the bench silently nuked the repo-root `db.env` — losing `INDEX_BUILD_BUDGET_MB`, `QUERY_BUFFER_MB`, `AUTO_VACUUM_*`, and everything else the operator had configured. Fix: skip the write when `<base>/db.env` already exists, and parse `PORT=` out of the existing file so the bench client connects where the daemon actually binds.
+
+### Tooling — `bench-queries` persistent-mode header reports actual on-disk size
+
+Header used to print `COUNT` (the env target) regardless of skip-insert state, so a persistent run against a 25M dataset showed `— 1000000 users`. Now queries `size` and substitutes the live count; tags the line `persistent` and drops the chunk= field (no inserts happen).
+
+### New env knob — `INDEX_BUILD_BUDGET_MB`
+
+Peak per-pass memory budget for `cmd_add_indexes` / `reindex` / `./migrate` phase 2. Default `1024` (1 GiB), floor 64. See [Tuning → INDEX_BUILD_BUDGET_MB](../operations/tuning.md) and [Configuration](../getting-started/configuration.md).
 
 ### kf shard auto-resplit — unbounded inserts, no per-shard cap
 
