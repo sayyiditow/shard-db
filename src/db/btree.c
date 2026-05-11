@@ -932,6 +932,7 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
     }
 
     /* Decode all non-tombstoned entries. Worst-case buffer: total * BT_MAX_VAL_LEN. */
+    /* CID 1693861 - header value from trusted index file, triage */
     LeafRec *recs = malloc((size_t)total * sizeof(LeafRec));
     char *buf = malloc((size_t)total * BT_MAX_VAL_LEN);
     uint8_t *hashbuf = malloc((size_t)total * BT_HASH_SIZE);
@@ -1378,6 +1379,7 @@ void btree_range_desc_ex(const char *path,
         if (peek_vs_max > 0) continue;
         if (max_exclusive && peek_vs_max == 0 && ph->count == 1) continue;
 
+        /* CID 1693867 - header value from trusted index file, triage */
         DescEntrySnap *snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
         if (!snaps) break;
         size_t n = 0;
@@ -1856,6 +1858,7 @@ static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
     }
 
     size_t cap = (size_t)fh->entry_count + 64;
+    /* CID 1693855 - header value from trusted index file, triage */
     BtEntry *entries = malloc(cap * sizeof(BtEntry));
     if (!entries) { bt_release(&bt); return NULL; }
     size_t count = 0;
