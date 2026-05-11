@@ -4,6 +4,7 @@
 #endif
 #include "fixtures.h"
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -162,12 +163,17 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
        env_path="./db.env"), where a pre-existing operator-managed db.env
        must be preserved — otherwise the bench silently nukes its full
        contents on every run. If db.env exists, honour its PORT so the
-       bench client connects where the daemon will actually listen. */
+       bench client connects where the daemon will actually listen.
+
+       Atomic via open(O_CREAT|O_EXCL) — no TOCTOU window between the
+       check and the create. CodeQL flagged the earlier access()-then-
+       fopen() pattern (CWE-367); this is the prescribed fix. */
     char env_path[300];
     snprintf(env_path, sizeof(env_path), "%s/db.env", base);
-    if (access(env_path, F_OK) != 0) {
-        FILE *f = fopen(env_path, "w");
-        if (!f) return -1;
+    int wfd = open(env_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (wfd >= 0) {
+        FILE *f = fdopen(wfd, "w");
+        if (!f) { close(wfd); return -1; }
         fprintf(f,
             "export DB_ROOT=\"%s\"\n"
             "export PORT=%d\n"
@@ -179,25 +185,34 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
             "export TLS_ENABLE=0\n",
             env->db_root, env->port, base);
         fclose(f);
-    } else {
-        /* Parse PORT= from the existing db.env so env->port matches what
-           the spawned daemon will bind to. Anything else we'd want to
-           override (DB_ROOT, LOG_DIR) is already user-owned in this path. */
-        FILE *fr = fopen(env_path, "r");
-        if (fr) {
-            char line[512];
-            while (fgets(line, sizeof(line), fr)) {
-                const char *p = line;
-                while (*p == ' ' || *p == '\t') p++;
-                if (strncmp(p, "export ", 7) == 0) p += 7;
-                if (strncmp(p, "PORT=", 5) == 0) {
-                    int parsed = atoi(p + 5);
-                    if (parsed > 0) env->port = parsed;
-                    break;
+    } else if (errno == EEXIST) {
+        /* Existing file — parse PORT= so env->port matches what the
+           spawned daemon will bind to. Anything else we'd want to
+           override (DB_ROOT, LOG_DIR) is already user-owned in this
+           path. open(O_RDONLY) directly so there's no second stat. */
+        int rfd = open(env_path, O_RDONLY);
+        if (rfd >= 0) {
+            FILE *fr = fdopen(rfd, "r");
+            if (fr) {
+                char line[512];
+                while (fgets(line, sizeof(line), fr)) {
+                    const char *p = line;
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (strncmp(p, "export ", 7) == 0) p += 7;
+                    if (strncmp(p, "PORT=", 5) == 0) {
+                        int parsed = atoi(p + 5);
+                        if (parsed > 0) env->port = parsed;
+                        break;
+                    }
                 }
+                fclose(fr);
+            } else {
+                close(rfd);
             }
-            fclose(fr);
         }
+    } else {
+        /* open() failed for some other reason (EACCES, ENOSPC, etc.). */
+        return -1;
     }
     char logs_dir[400];
     snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
