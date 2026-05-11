@@ -11013,8 +11013,14 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
-    /* Pure-OR (root is the OR itself) — no AND siblings, no re-match needed. */
-    if (tree == or_node || tree->kind == CNODE_OR) {
+    /* Pure-OR (root IS the OR, OR root is a single-child AND wrapping
+       the OR — common shape from `criteria:[{"or":[...]}]` parsed as
+       AND-of-one). No AND siblings → no per-record re-match needed,
+       just return the keyset size. */
+    int is_pure_or = (tree == or_node || tree->kind == CNODE_OR ||
+                       (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                        tree->children[0] == or_node));
+    if (is_pure_or) {
         size_t n = keyset_size(ks);
         keyset_free(ks);
         return n;
@@ -15826,6 +15832,55 @@ static void *part_merge_worker(void *arg) {
     return NULL;
 }
 
+/* Per-shard accumulator + worker for the single-spec SUM/AVG/MIN/MAX
+   fast path inside cmd_aggregate. Each shard's btree leaf walk is
+   independent, so parallel_for_io fans them out — at 25M records the
+   sequential walk took 9-15 s cold (idx shards × ~30 MB sequential
+   reads serialised); parallel cuts that close to single-shard cost. */
+typedef struct {
+    const char       *db_root, *object, *field;
+    int               shard_id;
+    const TypedField *tf;
+    enum AggFn        fn;
+    int               min_or_max, desc;
+    /* Outputs. */
+    double  accum;
+    int64_t count;
+    int     have;
+} AggSingleArg;
+
+static void *agg_single_shard_worker(void *raw) {
+    AggSingleArg *a = (AggSingleArg *)raw;
+    a->accum = 0; a->count = 0; a->have = 0;
+
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object,
+                    a->field, a->shard_id);
+    BtRangeIter *it = btree_range_iter_open(
+        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, a->desc);
+    if (!it) return NULL;
+
+    const char *val; size_t vlen; const uint8_t *hash16;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        double v;
+        if (!decode_index_key_to_double(a->tf, (const uint8_t *)val, vlen, &v))
+            continue;
+        if (!a->have) { a->accum = v; a->have = 1; a->count = 1; }
+        else {
+            switch (a->fn) {
+                case AGG_SUM:
+                case AGG_AVG: a->accum += v; a->count++; break;
+                case AGG_MIN: if (v < a->accum) a->accum = v; a->count++; break;
+                case AGG_MAX: if (v > a->accum) a->accum = v; a->count++; break;
+                default: break;
+            }
+        }
+        if (a->min_or_max) break;   /* one leaf entry suffices per shard */
+    }
+    btree_range_iter_close(it);
+    return NULL;
+}
+
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
@@ -15916,32 +15971,74 @@ int cmd_aggregate(const char *db_root, const char *object,
             double accum = 0.0;       /* sum, or running min/max */
             int64_t count = 0;
             int have = 0;
-            for (int s = 0; s < n_idx; s++) {
-                char idx_path[PATH_MAX];
-                build_idx_path(idx_path, sizeof(idx_path), db_root, object,
-                               specs[0].field, s);
-                BtRangeIter *it = btree_range_iter_open(
-                    idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, desc);
-                if (!it) continue;
-                const char *val; size_t vlen; const uint8_t *hash16;
-                while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                    double v;
-                    if (decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                   vlen, &v)) {
-                        if (!have) { accum = v; have = 1; count = 1; }
-                        else {
-                            switch (fn) {
-                                case AGG_SUM:
-                                case AGG_AVG: accum += v; count++; break;
-                                case AGG_MIN: if (v < accum) accum = v; count++; break;
-                                case AGG_MAX: if (v > accum) accum = v; count++; break;
-                                default: break;
-                            }
+
+            /* Parallelise per-shard btree walks. Each shard's worker
+               accumulates locally; merge after. At 25M records with
+               16 idx shards this drops sum/avg from a sequential
+               9-15 s cold to ~2-3 s as the shards' cold reads
+               overlap on the I/O queue. */
+            AggSingleArg *args = calloc((size_t)n_idx, sizeof(AggSingleArg));
+            if (args) {
+                for (int s = 0; s < n_idx; s++) {
+                    args[s].db_root    = db_root;
+                    args[s].object     = object;
+                    args[s].field      = specs[0].field;
+                    args[s].shard_id   = s;
+                    args[s].tf         = tf;
+                    args[s].fn         = fn;
+                    args[s].min_or_max = min_or_max;
+                    args[s].desc       = desc;
+                }
+                parallel_for_io(agg_single_shard_worker, args, n_idx,
+                                 sizeof(AggSingleArg));
+                for (int s = 0; s < n_idx; s++) {
+                    if (!args[s].have) continue;
+                    if (!have) {
+                        accum = args[s].accum;
+                        count = args[s].count;
+                        have  = 1;
+                    } else {
+                        switch (fn) {
+                            case AGG_SUM:
+                            case AGG_AVG: accum += args[s].accum; count += args[s].count; break;
+                            case AGG_MIN: if (args[s].accum < accum) accum = args[s].accum;
+                                          count += args[s].count; break;
+                            case AGG_MAX: if (args[s].accum > accum) accum = args[s].accum;
+                                          count += args[s].count; break;
+                            default: break;
                         }
                     }
-                    if (min_or_max) break;   /* one leaf entry suffices */
                 }
-                btree_range_iter_close(it);
+                free(args);
+            } else {
+                /* Sequential fallback on calloc OOM. */
+                for (int s = 0; s < n_idx; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root, object,
+                                   specs[0].field, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, desc);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        double v;
+                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
+                                                       vlen, &v)) {
+                            if (!have) { accum = v; have = 1; count = 1; }
+                            else {
+                                switch (fn) {
+                                    case AGG_SUM:
+                                    case AGG_AVG: accum += v; count++; break;
+                                    case AGG_MIN: if (v < accum) accum = v; count++; break;
+                                    case AGG_MAX: if (v > accum) accum = v; count++; break;
+                                    default: break;
+                                }
+                            }
+                        }
+                        if (min_or_max) break;
+                    }
+                    btree_range_iter_close(it);
+                }
             }
             double result = 0.0;
             switch (fn) {
