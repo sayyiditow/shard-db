@@ -851,6 +851,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "datetime") == 0) {
         f->type = FT_DATETIME;
         f->size = 6;
+    } else if (strcmp(spec, "uuid") == 0) {
+        f->type = FT_UUID;
+        f->size = 16;
     } else if (strcmp(spec, "currency") == 0) {
         f->type = FT_NUMERIC;
         f->size = 8;
@@ -1144,6 +1147,27 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
         break;
     }
+    case FT_UUID: {
+        /* Parse 32 hex digits (skip hyphens), pack into 16 bytes BE.
+           On malformed input (not exactly 32 hex digits), zero the field. */
+        uint8_t buf[16] = {0};
+        int pos = 0;
+        for (size_t i = 0; i < vlen && pos < 32; i++) {
+            char c = val[i];
+            if (c == '-') continue;
+            int nibble = -1;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            if (nibble < 0) { pos = 0; break; }
+            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
+            else buf[pos / 2] |= nibble;
+            pos++;
+        }
+        if (pos != 32) memset(buf, 0, 16);
+        memcpy(out, buf, 16);
+        break;
+    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -1306,6 +1330,27 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 6;
         break;
     }
+    case FT_UUID: {
+        /* Same as encode_field_len - parse 32 hex digits to 16 bytes BE */
+        uint8_t buf[16] = {0};
+        int pos = 0;
+        for (size_t i = 0; i < vlen && pos < 32; i++) {
+            char c = val[i];
+            if (c == '-') continue;
+            int nibble = -1;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            if (nibble < 0) { pos = 0; break; }
+            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
+            else buf[pos / 2] |= nibble;
+            pos++;
+        }
+        if (pos != 32) memset(buf, 0, 16);
+        memcpy(out, buf, 16);
+        *out_len = 16;
+        break;
+    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -1372,6 +1417,12 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         memcpy(out, src, 6);
         out[0] ^= 0x80;
         *out_len = 6;
+        break;
+    }
+    case FT_UUID: {
+        /* Raw 16 bytes - memcmp natural, no flip needed */
+        memcpy(out, src, 16);
+        *out_len = 16;
         break;
     }
     case FT_DOUBLE: {
@@ -1718,6 +1769,18 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int ss = t % 60;
         return snprintf(buf, buflen, "\"%08d%02d%02d%02d\"", d, hh, mm, ss); /* "yyyyMMddHHmmss" */
     }
+    case FT_UUID: {
+        /* Emit canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+        const uint8_t *b = data;
+        /* Check if all zeros - skip empty */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, buflen, "\"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\"",
+                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    }
     default:
         return 0;
     }
@@ -1814,6 +1877,19 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
+        return out;
+    }
+    case FT_UUID: {
+        const uint8_t *b = data + f->offset;
+        /* Check if all zeros - skip empty */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return NULL;
+        char *out = malloc(37);
+        snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
         return out;
     }
     default:
