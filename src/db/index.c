@@ -737,10 +737,27 @@ static int index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx)
         int fidx = ic->field_indices[0];
         if (fidx >= 0) {
             const TypedField *f = &ic->ts->fields[fidx];
-            size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-            key_buf = malloc(cap);
-            typed_field_to_index_key(ic->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
-            if (key_len == 0) { free(key_buf); key_buf = NULL; }
+            /* Allocate exactly what the index key needs. For varchar peek
+               the length prefix so a varchar:500 with "hi" reserves 2 bytes
+               not 500 — at 25M records the over-allocation is gigabytes. */
+            size_t cap;
+            if (f->type == FT_VARCHAR) {
+                const uint8_t *src = (const uint8_t *)raw + f->offset;
+                int content_max = f->size - 2;
+                if (content_max < 0) content_max = 0;
+                int len = ((int)src[0] << 8) | (int)src[1];
+                if (len < 0) len = 0;
+                if (len > content_max) len = content_max;
+                cap = (size_t)len;
+            } else {
+                cap = (size_t)f->size;
+                if (cap == 0) cap = 8;
+            }
+            if (cap > 0) {
+                key_buf = malloc(cap);
+                typed_field_to_index_key(ic->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
+                if (key_len == 0) { free(key_buf); key_buf = NULL; }
+            }
         }
     }
 
@@ -852,8 +869,23 @@ int cmd_add_index(const char *db_root, const char *object,
     memset(&ic, 0, sizeof(ic));
     ic.field = field;
     ic.ts = ts;
-    ic.pair_cap = 4096;
-    ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
+    /* Pre-size from live_count to skip exponential doubling on big objects.
+       4096 floor for small / empty objects; 1 Gi cap so a corrupted count
+       can't request an absurd allocation. Scan cb's xrealloc fallback still
+       handles concurrent inserts that push past the estimate. */
+    {
+        int live = get_live_count(db_root, object);
+        if (live < 0) live = 0;
+        size_t initial = (size_t)live + 4096;
+        if (initial < 4096) initial = 4096;
+        if (initial > (1ULL << 30)) initial = (1ULL << 30);
+        ic.pair_cap = initial;
+        ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
+        if (!ic.pairs) {
+            ic.pair_cap = 4096;
+            ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
+        }
+    }
     ic.is_composite = (strchr(field, '+') != NULL);
     pthread_mutex_init(&ic.lock, NULL);
 
@@ -969,10 +1001,27 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
             int fidx = mc->field_indices[fi][0];
             if (fidx >= 0) {
                 const TypedField *f = &mc->ts->fields[fidx];
-                size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-                key_buf = malloc(cap);
-                typed_field_to_index_key(mc->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
-                if (key_len == 0) { free(key_buf); key_buf = NULL; }
+                /* Allocate exactly what the index key needs. See index_scan_cb
+                   for the rationale — varchar over-allocation dominates peak
+                   memory at scale (×nfields here). */
+                size_t cap;
+                if (f->type == FT_VARCHAR) {
+                    const uint8_t *src = (const uint8_t *)raw + f->offset;
+                    int content_max = f->size - 2;
+                    if (content_max < 0) content_max = 0;
+                    int len = ((int)src[0] << 8) | (int)src[1];
+                    if (len < 0) len = 0;
+                    if (len > content_max) len = content_max;
+                    cap = (size_t)len;
+                } else {
+                    cap = (size_t)f->size;
+                    if (cap == 0) cap = 8;
+                }
+                if (cap > 0) {
+                    key_buf = malloc(cap);
+                    typed_field_to_index_key(mc->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
+                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
+                }
             }
         }
 
@@ -1002,6 +1051,143 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
         }
     }
     return 0;
+}
+
+/* Estimate the peak per-field memory cost of a single batch pass in bytes.
+   The build pipeline keeps three things alive per field while building:
+     - pairs[]: BtEntry array, 32 B per live record
+     - parted_per_field[]: partition copy of the BtEntry array (also 32 B/rec)
+     - key value buffers: one malloc per record sized to the encoded key
+   This estimate is conservative — better to overshoot and run more (smaller)
+   batches than to undershoot and OOM. The doubling fallback in the scan cb
+   handles concurrent inserts that push live_count over the estimate. */
+static size_t estimate_field_build_bytes(const TypedSchema *ts,
+                                         const char *field, size_t live_count) {
+    size_t key_avg;
+    if (strchr(field, '+')) {
+        /* Composite key — ASCII concat of child field values. Be conservative. */
+        key_avg = 64;
+    } else {
+        key_avg = 16;
+        int fidx = typed_field_index(ts, field);
+        if (fidx >= 0) {
+            const TypedField *f = &ts->fields[fidx];
+            if (f->type == FT_VARCHAR) {
+                /* varchar:N stores [u16 len][content], max content = size-2.
+                   Assume 50% fill on average; floor at 8 B for glibc small-bin
+                   overhead so we don't undershoot on near-empty strings. */
+                size_t content_max = (size_t)f->size > 2 ? (size_t)f->size - 2 : 0;
+                key_avg = content_max / 2;
+                if (key_avg < 8) key_avg = 8;
+            } else {
+                key_avg = (size_t)f->size;
+                if (key_avg < 8) key_avg = 8;
+            }
+        }
+    }
+    /* +24 B for glibc per-allocation overhead (chunk header). */
+    size_t per_record = 32 + 32 + key_avg + 24;
+    return per_record * (live_count == 0 ? 1 : live_count);
+}
+
+/* One batch of cmd_add_indexes: scan storage once, accumulate per-field
+   BtEntry arrays, partition by idx_shard, parallel-build the (field, shard)
+   btree files. Memory peak ≈ Σ estimate_field_build_bytes(field, live).
+   Called from cmd_add_indexes per batch so we can bound that peak. */
+static void build_indexes_pass(const char *db_root, const char *object,
+                               const Schema *sch, TypedSchema *ts,
+                               char fields[][256], int start, int n,
+                               size_t live_count) {
+    int idx_n = index_splits_for(sch->splits);
+
+    MultiIndexCtx mc;
+    memset(&mc, 0, sizeof(mc));
+    mc.nfields = n;
+    mc.ts = ts;
+
+    /* Pre-size pair arrays from live_count + small slack for concurrent
+       inserts during the scan. Eliminates exponential doubling (and its
+       2× transient peak from the old buffer hanging around during realloc).
+       If pre-size malloc fails, fall back to the original 4096 + doubling
+       path — the scan cb's xrealloc_or_free still handles growth. */
+    size_t initial = live_count + 4096;
+    if (initial < 4096) initial = 4096;
+    if (initial > (1ULL << 30)) initial = (1ULL << 30);  /* 1 Gi BtEntries hard cap */
+
+    for (int fi = 0; fi < n; fi++) {
+        memcpy(mc.fields[fi], fields[start + fi], 256);
+        mc.is_composite[fi] = (strchr(fields[start + fi], '+') != NULL);
+        mc.pair_cap[fi] = initial;
+        mc.pairs[fi] = malloc(initial * sizeof(BtEntry));
+        if (!mc.pairs[fi]) {
+            mc.pair_cap[fi] = 4096;
+            mc.pairs[fi] = malloc(mc.pair_cap[fi] * sizeof(BtEntry));
+        }
+        pthread_mutex_init(&mc.lock[fi], NULL);
+
+        if (mc.is_composite[fi]) {
+            char fb[256]; strncpy(fb, fields[start + fi], 255); fb[255] = '\0';
+            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+            while (tok && mc.field_index_count[fi] < 16) {
+                mc.field_indices[fi][mc.field_index_count[fi]++] = typed_field_index(ts, tok);
+                tok = strtok_r(NULL, "+", &_tok_save);
+            }
+        } else {
+            mc.field_indices[fi][0] = typed_field_index(ts, fields[start + fi]);
+            mc.field_index_count[fi] = 1;
+        }
+    }
+
+    char data_dir[PATH_MAX];
+    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
+    scan_dispatch(db_root, object, sch, data_dir, multi_index_scan_cb, &mc);
+    for (int fi = 0; fi < n; fi++) pthread_mutex_destroy(&mc.lock[fi]);
+
+    ShardBuildArg *sb = malloc((size_t)n * idx_n * sizeof(ShardBuildArg));
+    int sb_count = 0;
+    BtEntry **parted_per_field = calloc((size_t)n, sizeof(BtEntry *));
+    size_t  **offsets_per_field = calloc((size_t)n, sizeof(size_t *));
+    size_t  **counts_per_field  = calloc((size_t)n, sizeof(size_t *));
+
+    for (int fi = 0; fi < n; fi++) {
+        /* Skip empty / partition-failed fields; the cleanup loop below frees
+           mc.pairs[fi] unconditionally, so we must NOT free it here too —
+           that's a double-free that only surfaced once reindex_object ran
+           on a v2 object (where the legacy v1 scan found no records and
+           every field had pair_count = 0). */
+        if (mc.pair_count[fi] == 0) continue;
+        size_t *offsets = NULL, *counts = NULL;
+        BtEntry *parted = partition_by_shard(mc.pairs[fi], mc.pair_count[fi],
+                                             sch->splits, idx_n,
+                                             &offsets, &counts);
+        if (!parted) continue;
+        parted_per_field[fi] = parted;
+        offsets_per_field[fi] = offsets;
+        counts_per_field[fi] = counts;
+        for (int s = 0; s < idx_n; s++) {
+            if (counts[s] == 0) continue;
+            build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
+                           db_root, object, mc.fields[fi], s);
+            sb[sb_count].pairs = parted + offsets[s];
+            sb[sb_count].pair_count = counts[s];
+            sb_count++;
+        }
+    }
+
+    parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
+    free(sb);
+
+    for (int fi = 0; fi < n; fi++) {
+        for (size_t ei = 0; ei < mc.pair_count[fi]; ei++)
+            free((char *)mc.pairs[fi][ei].value);
+        free(mc.pairs[fi]);
+        free(parted_per_field[fi]);
+        free(offsets_per_field[fi]);
+        free(counts_per_field[fi]);
+    }
+    free(parted_per_field);
+    free(offsets_per_field);
+    free(counts_per_field);
 }
 
 int cmd_add_indexes(const char *db_root, const char *object,
@@ -1050,93 +1236,42 @@ int cmd_add_indexes(const char *db_root, const char *object,
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
-    MultiIndexCtx mc;
-    memset(&mc, 0, sizeof(mc));
-    mc.nfields = actual_count;
-    mc.ts = ts;
+    /* Adaptive batching: group fields into passes whose combined estimated
+       memory fits g_index_build_budget_bytes. Each pass keeps the existing
+       parallel scan + parallel build machinery — we just bound peak memory
+       so reindex on 25 M× 12-field schemas doesn't OOM the host. A single
+       field that alone exceeds the budget is still processed alone (the
+       "always include at least one" rule below). */
+    int live_count = get_live_count(db_root, object);
+    if (live_count < 0) live_count = 0;
+    size_t budget = g_index_build_budget_bytes;
+    if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
 
-    for (int fi = 0; fi < actual_count; fi++) {
-        memcpy(mc.fields[fi], actual_fields[fi], 256);
-        mc.is_composite[fi] = (strchr(actual_fields[fi], '+') != NULL);
-        mc.pair_cap[fi] = 4096;
-        mc.pairs[fi] = malloc(mc.pair_cap[fi] * sizeof(BtEntry));
-        pthread_mutex_init(&mc.lock[fi], NULL);
+    size_t per_field_bytes[MAX_FIELDS];
+    for (int i = 0; i < actual_count; i++)
+        per_field_bytes[i] = estimate_field_build_bytes(ts, actual_fields[i],
+                                                        (size_t)live_count);
 
-        if (mc.is_composite[fi]) {
-            char fb[256]; strncpy(fb, actual_fields[fi], 255); fb[255] = '\0';
-            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-            while (tok && mc.field_index_count[fi] < 16) {
-                mc.field_indices[fi][mc.field_index_count[fi]++] = typed_field_index(ts, tok);
-                tok = strtok_r(NULL, "+", &_tok_save);
-            }
-        } else {
-            mc.field_indices[fi][0] = typed_field_index(ts, actual_fields[fi]);
-            mc.field_index_count[fi] = 1;
+    int n_batches = 0;
+    int batch_start = 0;
+    while (batch_start < actual_count) {
+        size_t batch_bytes = 0;
+        int batch_end = batch_start;
+        while (batch_end < actual_count) {
+            size_t next = per_field_bytes[batch_end];
+            if (batch_end > batch_start && batch_bytes + next > budget) break;
+            batch_bytes += next;
+            batch_end++;
         }
+        build_indexes_pass(db_root, object, &sch, ts, actual_fields,
+                           batch_start, batch_end - batch_start,
+                           (size_t)live_count);
+        n_batches++;
+        batch_start = batch_end;
     }
-
-    /* Single parallel shard scan — extracts ALL index fields per record.
-       scan_dispatch (Phase 3B) routes to scan_shards on v1 and to
-       slotcask_walk_live on v2; using it directly keeps reindex correct
-       across storage versions. */
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    scan_dispatch(db_root, object, &sch, data_dir, multi_index_scan_cb, &mc);
-    for (int fi = 0; fi < actual_count; fi++) pthread_mutex_destroy(&mc.lock[fi]);
-
-    /* Parallel sort + build — partition each field's pairs by idx_shard,
-       then dispatch one worker per (field, shard) pair. Workers across
-       different fields share the thread pool. */
-    int idx_n = index_splits_for(sch.splits);
-    /* Worst case: every field × every shard. */
-    ShardBuildArg *sb = malloc((size_t)actual_count * idx_n * sizeof(ShardBuildArg));
-    int sb_count = 0;
-    /* parted_per_field[i] holds the partitioned BtEntry array; freed after build. */
-    BtEntry **parted_per_field = calloc((size_t)actual_count, sizeof(BtEntry *));
-    size_t  **offsets_per_field = calloc((size_t)actual_count, sizeof(size_t *));
-    size_t  **counts_per_field  = calloc((size_t)actual_count, sizeof(size_t *));
-
-    for (int fi = 0; fi < actual_count; fi++) {
-        /* Skip empty / partition-failed fields; the cleanup loop below
-           frees mc.pairs[fi] unconditionally, so we must NOT free it
-           here too — that's a double-free that only surfaced once
-           reindex_object ran on a v2 object (where the legacy v1 scan
-           found no records and every field had pair_count = 0). */
-        if (mc.pair_count[fi] == 0) continue;
-        size_t *offsets = NULL, *counts = NULL;
-        BtEntry *parted = partition_by_shard(mc.pairs[fi], mc.pair_count[fi],
-                                             sch.splits, idx_n,
-                                             &offsets, &counts);
-        if (!parted) continue;
-        parted_per_field[fi] = parted;
-        offsets_per_field[fi] = offsets;
-        counts_per_field[fi] = counts;
-        for (int s = 0; s < idx_n; s++) {
-            if (counts[s] == 0) continue;
-            build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
-                           db_root, object, mc.fields[fi], s);
-            sb[sb_count].pairs = parted + offsets[s];
-            sb[sb_count].pair_count = counts[s];
-            sb_count++;
-        }
-    }
-
-    parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
-    free(sb);
-
-    /* Free pair value strings (originally allocated in multi_index_scan_cb)
-       and the partition + scan arrays. */
-    for (int fi = 0; fi < actual_count; fi++) {
-        for (size_t ei = 0; ei < mc.pair_count[fi]; ei++)
-            free((char *)mc.pairs[fi][ei].value);
-        free(mc.pairs[fi]);
-        free(parted_per_field[fi]);
-        free(offsets_per_field[fi]);
-        free(counts_per_field[fi]);
-    }
-    free(parted_per_field);
-    free(offsets_per_field);
-    free(counts_per_field);
+    log_msg(2, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
+            object, actual_count, n_batches, live_count,
+            budget / (1024 * 1024));
 
     /* Add to index.conf */
     mkdirp(dirname_of(conf_path));

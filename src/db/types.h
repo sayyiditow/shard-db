@@ -340,6 +340,11 @@ extern int g_pool_chunk;
 extern int g_index_page_size;
 extern int g_global_limit;
 extern size_t g_query_buffer_max_bytes;
+/* Peak per-pass memory budget for cmd_add_indexes / reindex. Multi-field
+   builds estimate per-field cost (BtEntry arrays + partition copy + key
+   buffers) from live_count and group fields into passes that fit under
+   this budget. Default 1 GiB; tune via INDEX_BUILD_BUDGET_MB in db.env. */
+extern size_t g_index_build_budget_bytes;
 extern int g_disable_localhost_trust;
 extern int g_token_cap;
 

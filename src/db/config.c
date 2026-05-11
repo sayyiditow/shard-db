@@ -20,6 +20,10 @@ int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 
    detects the unchanged-default case and auto-tunes to
    min(25% of total RAM, 4 GB) for typical VPS shapes — see server.c. */
 size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024;
+/* 1 GiB default keeps reindex memory bounded on modest VPS shapes. Big
+   prod servers with lots of indexed fields can raise this to fit more
+   fields per scan pass (INDEX_BUILD_BUDGET_MB in db.env). */
+size_t g_index_build_budget_bytes = 1024ULL * 1024 * 1024;
 int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
 int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
 _Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */
@@ -297,6 +301,10 @@ int load_db_root(char *out, size_t outlen) {
             long mb = atol(p + 16);
             if (mb >= 1 && mb <= 1048576)  /* 1 MB floor, 1 TB ceiling */
                 g_query_buffer_max_bytes = (size_t)mb * 1024 * 1024;
+        } else if (strncmp(p, "INDEX_BUILD_BUDGET_MB=", 22) == 0) {
+            long mb = atol(p + 22);
+            if (mb >= 64 && mb <= 1048576)  /* 64 MB floor, 1 TB ceiling */
+                g_index_build_budget_bytes = (size_t)mb * 1024 * 1024;
         } else if (strncmp(p, "DISABLE_LOCALHOST_TRUST=", 24) == 0) {
             g_disable_localhost_trust = (atoi(p + 24) != 0);
         } else if (strncmp(p, "TOKEN_CAP=", 10) == 0) {
