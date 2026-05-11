@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "simd.h"
 #include <fnmatch.h>
+#include <math.h>
 
 /* ========== Probing helpers ========== */
 
@@ -7629,7 +7630,31 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_FLOAT: {
         float v; memcpy(&v, p, 4);
-        return cmp_op_f64((double)v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count, cc);
+        double vd = (double)v;
+        double q1 = cc->d1;
+        double q2 = cc->d2;
+        switch (cc->op) {
+        case OP_EQUAL: return fabs(vd - q1) < 1e-6;
+        case OP_NOT_EQUAL: return fabs(vd - q1) >= 1e-6;
+        case OP_LESS: return vd < q1;
+        case OP_GREATER: return vd > q1;
+        case OP_LESS_EQ: return vd <= q1;
+        case OP_GREATER_EQ: return vd >= q1;
+        case OP_BETWEEN: {
+            int lo = (cc && cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
+            int hi = (cc && cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
+            return lo && hi;
+        }
+        case OP_IN: {
+            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 1;
+            return 0;
+        }
+        case OP_NOT_IN: {
+            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 0;
+            return 1;
+        }
+        default: return 0;
+        }
     }
     case FT_BOOL: case FT_BYTE: {
         int64_t v = (int64_t)p[0];
@@ -13768,10 +13793,13 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "int") == 0)    return 4;
     if (strcmp(type, "short") == 0)  return 2;
     if (strcmp(type, "double") == 0) return 8;
+    if (strcmp(type, "float") == 0)  return 4;
     if (strcmp(type, "bool") == 0)   return 1;
     if (strcmp(type, "byte") == 0)   return 1;
     if (strcmp(type, "date") == 0)   return 4;
     if (strcmp(type, "datetime") == 0) return 6;
+    if (strcmp(type, "time") == 0)    return 3;
+    if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
     return 0;
@@ -13853,7 +13881,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, bool, byte, date, datetime, currency, numeric:P,S\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, uuid, currency, numeric:P,S\"}\n",
                    field_specs[nfields]);
             return 1;
         }
