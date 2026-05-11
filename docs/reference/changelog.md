@@ -4,7 +4,7 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased — 2026.05.3
+## 2026.05.3
 
 ### Reindex memory safety — adaptive batching + pre-sized pairs + exact-key malloc
 
