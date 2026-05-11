@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "simd.h"
 #include <fnmatch.h>
+#include <math.h>
 
 /* ========== Probing helpers ========== */
 
@@ -437,6 +438,10 @@ struct CompiledCriterion {
                                    DATE: 4-byte BE int32 date value.
                                    DATETIME: i1=date int32, i2=unused */
     double   d1, d2;            /* DOUBLE */
+    uint8_t  uuid_bytes[16];    /* UUID: for eq/neq */
+    uint8_t  uuid_bytes2[16];   /* UUID: for between */
+    uint8_t  time_val[3];       /* TIME: for eq/neq (seconds since midnight, BE) */
+    uint8_t  time_val2[3];      /* TIME: for between */
     uint16_t t1, t2;            /* DATETIME packed time seconds */
     uint8_t  b1;                /* BOOL/BYTE */
 
@@ -452,6 +457,8 @@ struct CompiledCriterion {
     /* IN/NOT_IN lists (pre-parsed for numeric types) */
     int64_t  *in_i64;
     double   *in_f64;
+    uint8_t (*in_uuid)[16];   /* UUID: array of 16-byte binary values */
+    uint8_t (*in_time)[3];    /* TIME: array of 3-byte values */
     int       in_count;
 
     /* OP_REGEX / OP_NOT_REGEX: pre-compiled POSIX extended regex.
@@ -6865,6 +6872,42 @@ static int64_t parse_numeric_i64(const char *s, int scale) {
     return (int64_t)(dv * mul + (dv >= 0 ? 0.5 : -0.5));
 }
 
+/* Parse UUID string (32 hex digits, with or without hyphens) → 16 bytes.
+   On malformed input, output is all zeros. */
+static void parse_uuid(const char *s, uint8_t out[16]) {
+    memset(out, 0, 16);
+    if (!s) return;
+    int pos = 0;
+    for (const char *c = s; *c && pos < 32; c++) {
+        if (*c == '-') continue;
+        int nibble = -1;
+        if (*c >= '0' && *c <= '9') nibble = *c - '0';
+        else if (*c >= 'a' && *c <= 'f') nibble = *c - 'a' + 10;
+        else if (*c >= 'A' && *c <= 'F') nibble = *c - 'A' + 10;
+        if (nibble < 0) { memset(out, 0, 16); return; }
+        if (pos % 2 == 0) out[pos / 2] = nibble << 4;
+        else out[pos / 2] |= nibble;
+        pos++;
+    }
+    if (pos != 32) { memset(out, 0, 16); }
+}
+
+/* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
+static void parse_time(const char *s, uint8_t out[3]) {
+    memset(out, 0, 3);
+    if (!s) return;
+    int hh = 0, mm = 0, ss = 0;
+    if (strlen(s) >= 8) {
+        hh = (s[0]-'0')*10 + (s[1]-'0');
+        mm = (s[3]-'0')*10 + (s[4]-'0');
+        ss = (s[6]-'0')*10 + (s[7]-'0');
+    }
+    uint32_t secs = hh * 3600 + mm * 60 + ss;
+    out[0] = (secs >> 16) & 0xFF;
+    out[1] = (secs >> 8) & 0xFF;
+    out[2] = secs & 0xFF;
+}
+
 /* Lowercase duplicate (ASCII). Caller frees. */
 static char *strdup_lower(const char *s, size_t len) {
     char *r = malloc(len + 1);
@@ -7084,6 +7127,10 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->d1 = atof(c->value);
         cc->d2 = atof(c->value2);
         break;
+    case FT_FLOAT:
+        cc->d1 = atof(c->value);
+        cc->d2 = atof(c->value2);
+        break;
     case FT_BOOL:
         cc->b1 = (c->value[0] == 't' || c->value[0] == 'T' || c->value[0] == '1') ? 1 : 0;
         break;
@@ -7098,6 +7145,25 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         int32_t d; uint16_t t;
         parse_datetime(c->value, &d, &t); cc->i1 = d; cc->t1 = t;
         parse_datetime(c->value2, &d, &t); cc->i2 = d; cc->t2 = t;
+        break;
+    }
+    case FT_TIME: {
+        if (c->value && c->value[0]) {
+            parse_time(c->value, cc->time_val);
+        }
+        if (c->value2 && c->value2[0]) {
+            parse_time(c->value2, cc->time_val2);
+        }
+        break;
+    }
+    case FT_UUID: {
+        /* Parse canonical UUID string to 16 bytes */
+        if (c->value && c->value[0]) {
+            parse_uuid(c->value, cc->uuid_bytes);
+        }
+        if (c->value2 && c->value2[0]) {
+            parse_uuid(c->value2, cc->uuid_bytes2);
+        }
         break;
     }
     case FT_VARCHAR:
@@ -7172,10 +7238,25 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             for (int i = 0; i < c->in_count; i++)
                 cc->in_f64[i] = atof(c->in_values[i]);
             break;
+        case FT_FLOAT:
+            cc->in_f64 = malloc(sizeof(double) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                cc->in_f64[i] = atof(c->in_values[i]);
+            break;
         case FT_DATE:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)parse_date_i32(c->in_values[i]);
+            break;
+        case FT_TIME:
+            cc->in_time = malloc(sizeof(uint8_t[3]) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                parse_time(c->in_values[i], cc->in_time[i]);
+            break;
+        case FT_UUID:
+            cc->in_uuid = malloc(sizeof(uint8_t[16]) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                parse_uuid(c->in_values[i], cc->in_uuid[i]);
             break;
         default:
             /* VARCHAR, DATETIME, BOOL, BYTE: use raw strings via c->in_values */
@@ -7461,6 +7542,8 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
                        return va < vb ? -1 : (va > vb ? 1 : 0); }
     case FT_DOUBLE:  { double va, vb; memcpy(&va, a, 8); memcpy(&vb, b, 8);
                        return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_FLOAT:   { float va, vb; memcpy(&va, a, 4); memcpy(&vb, b, 4);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
     case FT_BOOL:
     case FT_BYTE:    return (int)a[0] - (int)b[0];
     case FT_DATE:    { int32_t va = ld_be_i32(a), vb = ld_be_i32(b);
@@ -7470,6 +7553,13 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
         int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u16(b + 4);
         return va < vb ? -1 : (va > vb ? 1 : 0);
     }
+    case FT_TIME: {
+        uint32_t va = ((uint32_t)a[0] << 16) | ((uint32_t)a[1] << 8) | a[2];
+        uint32_t vb = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    case FT_UUID:
+        return memcmp(a, b, 16);
     default: return 0;
     }
 }
@@ -7538,6 +7628,34 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         double v; memcpy(&v, p, 8);
         return cmp_op_f64(v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count, cc);
     }
+    case FT_FLOAT: {
+        float v; memcpy(&v, p, 4);
+        double vd = (double)v;
+        double q1 = cc->d1;
+        double q2 = cc->d2;
+        switch (cc->op) {
+        case OP_EQUAL: return fabs(vd - q1) < 1e-6;
+        case OP_NOT_EQUAL: return fabs(vd - q1) >= 1e-6;
+        case OP_LESS: return vd < q1;
+        case OP_GREATER: return vd > q1;
+        case OP_LESS_EQ: return vd <= q1;
+        case OP_GREATER_EQ: return vd >= q1;
+        case OP_BETWEEN: {
+            int lo = (cc && cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
+            int hi = (cc && cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
+            return lo && hi;
+        }
+        case OP_IN: {
+            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 1;
+            return 0;
+        }
+        case OP_NOT_IN: {
+            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 0;
+            return 1;
+        }
+        default: return 0;
+        }
+    }
     case FT_BOOL: case FT_BYTE: {
         int64_t v = (int64_t)p[0];
         int64_t q = (int64_t)cc->b1;
@@ -7574,6 +7692,73 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         default:
             if (d == 0 && t == 0) return 0;
             return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
+        }
+    }
+    case FT_TIME: {
+        uint32_t secs = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+        uint32_t q1 = ((uint32_t)cc->time_val[0] << 16) | ((uint32_t)cc->time_val[1] << 8) | cc->time_val[2];
+        uint32_t q2 = ((uint32_t)cc->time_val2[0] << 16) | ((uint32_t)cc->time_val2[1] << 8) | cc->time_val2[2];
+        int exists = !(secs == 0 && p[0]==0 && p[1]==0 && p[2]==0);
+        switch (cc->op) {
+        case OP_EXISTS: return exists;
+        case OP_NOT_EXISTS: return !exists;
+        case OP_EQUAL: return exists && secs == q1;
+        case OP_NOT_EQUAL: return !exists || secs != q1;
+        case OP_LESS: return exists && secs < q1;
+        case OP_GREATER: return exists && secs > q1;
+        case OP_LESS_EQ: return !exists || secs <= q1;
+        case OP_GREATER_EQ: return exists && secs >= q1;
+        case OP_BETWEEN: {
+            if (!exists) return 0;
+            int lo = cc->i1;
+            int hi = cc->i2;
+            if (lo && secs < q1) return 0;
+            if (hi && secs > q2) return 0;
+            return 1;
+        }
+        case OP_IN: case OP_NOT_IN: {
+            if (!exists) return cc->op == OP_NOT_IN;
+            int found = 0;
+            for (int i = 0; i < cc->in_count; i++) {
+                uint32_t in_val = ((uint32_t)cc->in_time[i][0] << 16) | ((uint32_t)cc->in_time[i][1] << 8) | cc->in_time[i][2];
+                if (secs == in_val) { found = 1; break; }
+            }
+            return cc->op == OP_IN ? found : !found;
+        }
+        default: return 0;
+        }
+    }
+    case FT_UUID: {
+        int exists = !(p[0]==0 && p[1]==0 && p[2]==0 && p[3]==0 &&
+                       p[4]==0 && p[5]==0 && p[6]==0 && p[7]==0 &&
+                       p[8]==0 && p[9]==0 && p[10]==0 && p[11]==0 &&
+                       p[12]==0 && p[13]==0 && p[14]==0 && p[15]==0);
+        switch (cc->op) {
+        case OP_EXISTS: return exists;
+        case OP_NOT_EXISTS: return !exists;
+        case OP_EQUAL: return exists && memcmp(p, cc->uuid_bytes, 16) == 0;
+        case OP_NOT_EQUAL: return !exists || memcmp(p, cc->uuid_bytes, 16) != 0;
+        case OP_LESS: return exists && memcmp(p, cc->uuid_bytes, 16) < 0;
+        case OP_GREATER: return exists && memcmp(p, cc->uuid_bytes, 16) > 0;
+        case OP_LESS_EQ: return !exists || memcmp(p, cc->uuid_bytes, 16) <= 0;
+        case OP_GREATER_EQ: return exists && memcmp(p, cc->uuid_bytes, 16) >= 0;
+        case OP_BETWEEN: {
+            if (!exists) return 0;
+            int lo = cc->i1;  /* using i1 as between flag */
+            int hi = cc->i2;  /* using i2 as between flag */
+            if (lo && memcmp(p, cc->uuid_bytes, 16) < 0) return 0;
+            if (hi && memcmp(p, cc->uuid_bytes2, 16) > 0) return 0;
+            return 1;
+        }
+        case OP_IN: case OP_NOT_IN: {
+            if (!exists) return cc->op == OP_NOT_IN;
+            int found = 0;
+            for (int i = 0; i < cc->in_count; i++) {
+                if (memcmp(p, cc->in_uuid[i], 16) == 0) { found = 1; break; }
+            }
+            return cc->op == OP_IN ? found : !found;
+        }
+        default: return 0;
         }
     }
     }
@@ -13608,10 +13793,13 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "int") == 0)    return 4;
     if (strcmp(type, "short") == 0)  return 2;
     if (strcmp(type, "double") == 0) return 8;
+    if (strcmp(type, "float") == 0)  return 4;
     if (strcmp(type, "bool") == 0)   return 1;
     if (strcmp(type, "byte") == 0)   return 1;
     if (strcmp(type, "date") == 0)   return 4;
     if (strcmp(type, "datetime") == 0) return 6;
+    if (strcmp(type, "time") == 0)    return 3;
+    if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
     return 0;
@@ -13693,7 +13881,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, bool, byte, date, datetime, currency, numeric:P,S\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, uuid, currency, numeric:P,S\"}\n",
                    field_specs[nfields]);
             return 1;
         }
@@ -14047,11 +14235,14 @@ static const char *field_type_str(enum FieldType t) {
         case FT_INT:      return "int";
         case FT_SHORT:    return "short";
         case FT_DOUBLE:   return "double";
+        case FT_FLOAT:   return "float";
         case FT_BOOL:     return "bool";
         case FT_BYTE:     return "byte";
         case FT_NUMERIC:  return "numeric";
         case FT_DATE:     return "date";
         case FT_DATETIME: return "datetime";
+        case FT_TIME:     return "time";
+        case FT_UUID:     return "uuid";
         default:          return "unknown";
     }
 }
@@ -14323,6 +14514,11 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         if (v == 0.0) return 0;
         return snprintf(buf, bufsz, "%g", v);
     }
+    case FT_FLOAT: {
+        float v; memcpy(&v, p, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, bufsz, "%g", (double)v);
+    }
     case FT_BOOL:
         return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
     case FT_BYTE:
@@ -14353,6 +14549,23 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
+    }
+    case FT_TIME: {
+        uint32_t secs = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+        if (secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
+        int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+        return snprintf(buf, bufsz, "%02d:%02d:%02d", hh, mm, ss);
+    }
+    case FT_UUID: {
+        /* Same as decode_field_to_buf - canonical form */
+        const uint8_t *b = (const uint8_t *)p;
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
     default:
         return 0;
@@ -14419,6 +14632,16 @@ static int decode_index_key_to_double(const TypedField *f,
         if (v == 0.0) return 0;
         *out = v; return 1;
     }
+    case FT_FLOAT: {
+        if (plen < 4) return 0;
+        uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        if (bits & 0x80000000u) bits ^= 0x80000000u;
+        else bits = ~bits;
+        float v; memcpy(&v, &bits, 4);
+        if (v == 0.0f) return 0;
+        *out = (double)v; return 1;
+    }
     case FT_BOOL:
         if (plen < 1) return 0;
         *out = (double)(p[0] ? 1 : 0); return 1;
@@ -14442,6 +14665,7 @@ static int decode_index_key_to_double(const TypedField *f,
         if (d == 0 && t == 0) return 0;
         *out = (double)d * 1000000.0 + (double)t; return 1;
     }
+    case FT_TIME: return 0;  /* not summable */
     case FT_NUMERIC: {
         if (plen < 8) return 0;
         uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
@@ -14453,6 +14677,9 @@ static int decode_index_key_to_double(const TypedField *f,
         for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
         *out = (double)v / (double)scale; return 1;
     }
+    case FT_UUID:
+        /* UUIDs aren't summable */
+        return 0;
     default: return 0;
     }
 }
@@ -14506,6 +14733,16 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (v == 0.0) return 0;
         return snprintf(buf, bufsz, "%g", v);
     }
+    case FT_FLOAT: {
+        if (plen < 4) return 0;
+        uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        if (bits & 0x80000000u) bits ^= 0x80000000u;
+        else bits = ~bits;
+        float v; memcpy(&v, &bits, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, bufsz, "%g", (double)v);
+    }
     case FT_BOOL:
         if (plen < 1) return 0;
         return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
@@ -14529,6 +14766,28 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
+    }
+    case FT_TIME: {
+        /* Index stores 3 bytes with top-bit flip - undo flip and format */
+        if (plen < 3) return 0;
+        uint32_t u = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+        uint32_t secs = u ^ 0x800000u;
+        if (secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
+        int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+        return snprintf(buf, bufsz, "%02d:%02d:%02d", hh, mm, ss);
+    }
+    case FT_UUID: {
+        /* Index stores raw 16 bytes - decode to canonical form */
+        if (plen < 16) return 0;
+        const uint8_t *b = p;
+        /* Check if all zeros */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
     case FT_NUMERIC: {
         if (plen < 8) return 0;
@@ -14907,6 +15166,8 @@ static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *
         if (d == 0 && t == 0) return 0;
         *out = (double)d * 1000000.0 + (double)t; return 1;
     }
+    case FT_TIME: return 0;  /* not summable */
+    case FT_UUID: return 0;  /* not summable */
     case FT_VARCHAR: {
         int len = varchar_eff_len(p, f->size);
         if (len == 0) return 0;

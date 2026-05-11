@@ -836,6 +836,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "double") == 0) {
         f->type = FT_DOUBLE;
         f->size = 8;
+    } else if (strcmp(spec, "float") == 0) {
+        f->type = FT_FLOAT;
+        f->size = 4;
     } else if (strcmp(spec, "bool") == 0) {
         f->type = FT_BOOL;
         f->size = 1;
@@ -848,6 +851,12 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "datetime") == 0) {
         f->type = FT_DATETIME;
         f->size = 6;
+    } else if (strcmp(spec, "time") == 0) {
+        f->type = FT_TIME;
+        f->size = 3;
+    } else if (strcmp(spec, "uuid") == 0) {
+        f->type = FT_UUID;
+        f->size = 16;
     } else if (strcmp(spec, "currency") == 0) {
         f->type = FT_NUMERIC;
         f->size = 8;
@@ -1098,6 +1107,12 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         memcpy(out, &v, 8);
         break;
     }
+    case FT_FLOAT: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        float v = (float)atof(cbuf);
+        memcpy(out, &v, 4);
+        break;
+    }
     case FT_BOOL: {
         out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
         break;
@@ -1133,6 +1148,41 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         int ss = (clean[12]-'0')*10 + (clean[13]-'0');
         uint16_t t = (uint16_t)(hh * 3600 + mm * 60 + ss);
         out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
+        break;
+    }
+    case FT_TIME: {
+        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
+        int hh = 0, mm = 0, ss = 0;
+        if (vlen >= 8) {
+            hh = (val[0]-'0')*10 + (val[1]-'0');
+            mm = (val[3]-'0')*10 + (val[4]-'0');
+            ss = (val[6]-'0')*10 + (val[7]-'0');
+        }
+        uint32_t secs = hh * 3600 + mm * 60 + ss;
+        out[0] = (secs >> 16) & 0xFF;
+        out[1] = (secs >> 8) & 0xFF;
+        out[2] = secs & 0xFF;
+        break;
+    }
+    case FT_UUID: {
+        /* Parse 32 hex digits (skip hyphens), pack into 16 bytes BE.
+           On malformed input (not exactly 32 hex digits), zero the field. */
+        uint8_t buf[16] = {0};
+        int pos = 0;
+        for (size_t i = 0; i < vlen && pos < 32; i++) {
+            char c = val[i];
+            if (c == '-') continue;
+            int nibble = -1;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            if (nibble < 0) { pos = 0; break; }
+            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
+            else buf[pos / 2] |= nibble;
+            pos++;
+        }
+        if (pos != 32) memset(buf, 0, 16);
+        memcpy(out, buf, 16);
         break;
     }
     case FT_NUMERIC: {
@@ -1240,6 +1290,21 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 8;
         break;
     }
+    case FT_FLOAT: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        float v = (float)atof(cbuf);
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        /* IEEE-754 total order: if sign bit set (negative), flip all bits;
+           else flip just the sign bit. Maps all floats to a monotonic
+           unsigned key under memcmp. */
+        if (bits & 0x80000000u) bits = ~bits;
+        else bits ^= 0x80000000u;
+        out[0] = (bits >> 24) & 0xFF; out[1] = (bits >> 16) & 0xFF;
+        out[2] = (bits >> 8) & 0xFF;  out[3] = bits & 0xFF;
+        *out_len = 4;
+        break;
+    }
     case FT_BOOL: {
         out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
         *out_len = 1;
@@ -1280,6 +1345,43 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         uint16_t t = (uint16_t)(hh * 3600 + mm * 60 + ss);
         out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
         *out_len = 6;
+        break;
+    }
+    case FT_TIME: {
+        /* Parse "HH:MM:SS" into 3 bytes, top-bit flip for sorted index */
+        int hh = 0, mm = 0, ss = 0;
+        if (vlen >= 8) {
+            hh = (val[0]-'0')*10 + (val[1]-'0');
+            mm = (val[3]-'0')*10 + (val[4]-'0');
+            ss = (val[6]-'0')*10 + (val[7]-'0');
+        }
+        uint32_t secs = hh * 3600 + mm * 60 + ss;
+        uint32_t u = secs ^ 0x800000u;  /* top-bit flip to sort correctly */
+        out[0] = (u >> 16) & 0xFF;
+        out[1] = (u >> 8) & 0xFF;
+        out[2] = u & 0xFF;
+        *out_len = 3;
+        break;
+    }
+    case FT_UUID: {
+        /* Same as encode_field_len - parse 32 hex digits to 16 bytes BE */
+        uint8_t buf[16] = {0};
+        int pos = 0;
+        for (size_t i = 0; i < vlen && pos < 32; i++) {
+            char c = val[i];
+            if (c == '-') continue;
+            int nibble = -1;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            if (nibble < 0) { pos = 0; break; }
+            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
+            else buf[pos / 2] |= nibble;
+            pos++;
+        }
+        if (pos != 32) memset(buf, 0, 16);
+        memcpy(out, buf, 16);
+        *out_len = 16;
         break;
     }
     case FT_NUMERIC: {
@@ -1350,6 +1452,19 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         *out_len = 6;
         break;
     }
+    case FT_TIME: {
+        /* 3 bytes, flip top bit for sorted index */
+        memcpy(out, src, 3);
+        out[0] ^= 0x80;
+        *out_len = 3;
+        break;
+    }
+    case FT_UUID: {
+        /* Raw 16 bytes - memcmp natural, no flip needed */
+        memcpy(out, src, 16);
+        *out_len = 16;
+        break;
+    }
     case FT_DOUBLE: {
         /* Stored as host-byte-order memcpy of the double (see encode_field_len).
            For index: reinterpret as uint64, apply IEEE-754 total-order flip,
@@ -1365,6 +1480,21 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         out[4] = (bits >> 24) & 0xFF; out[5] = (bits >> 16) & 0xFF;
         out[6] = (bits >> 8) & 0xFF;  out[7] = bits & 0xFF;
         *out_len = 8;
+        break;
+    }
+    case FT_FLOAT: {
+        /* Stored as host-byte-order memcpy of the float (see encode_field_len).
+           For index: reinterpret as uint32, apply IEEE-754 total-order flip,
+           emit big-endian. */
+        float v;
+        memcpy(&v, src, 4);
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        if (bits & 0x80000000u) bits = ~bits;
+        else bits ^= 0x80000000u;
+        out[0] = (bits >> 24) & 0xFF; out[1] = (bits >> 16) & 0xFF;
+        out[2] = (bits >> 8) & 0xFF;  out[3] = bits & 0xFF;
+        *out_len = 4;
         break;
     }
     case FT_BOOL:
@@ -1633,6 +1763,12 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         if (v == 0.0) return 0;
         return snprintf(buf, buflen, "%g", v);
     }
+    case FT_FLOAT: {
+        float v;
+        memcpy(&v, data, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, buflen, "%g", (double)v);
+    }
     case FT_BOOL: {
         return snprintf(buf, buflen, "%s", data[0] ? "true" : "false");
     }
@@ -1672,6 +1808,26 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int mm = (t % 3600) / 60;
         int ss = t % 60;
         return snprintf(buf, buflen, "\"%08d%02d%02d%02d\"", d, hh, mm, ss); /* "yyyyMMddHHmmss" */
+    }
+    case FT_TIME: {
+        uint32_t secs = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
+        if (secs == 0 && data[0]==0 && data[1]==0 && data[2]==0) return 0;
+        int hh = secs / 3600;
+        int mm = (secs % 3600) / 60;
+        int ss = secs % 60;
+        return snprintf(buf, buflen, "\"%02d:%02d:%02d\"", hh, mm, ss); /* "HH:MM:SS" */
+    }
+    case FT_UUID: {
+        /* Emit canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+        const uint8_t *b = data;
+        /* Check if all zeros - skip empty */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
+        return snprintf(buf, buflen, "\"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\"",
+                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
     default:
         return 0;
@@ -1769,6 +1925,28 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
+        return out;
+    }
+    case FT_TIME: {
+        const uint8_t *d = data + f->offset;
+        uint32_t secs = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
+        if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0) return NULL;
+        int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+        char *out = malloc(9);
+        snprintf(out, 9, "%02d:%02d:%02d", hh, mm, ss);
+        return out;
+    }
+    case FT_UUID: {
+        const uint8_t *b = data + f->offset;
+        /* Check if all zeros - skip empty */
+        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
+            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
+            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
+            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return NULL;
+        char *out = malloc(37);
+        snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
         return out;
     }
     default:

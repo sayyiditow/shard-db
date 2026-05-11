@@ -143,11 +143,14 @@ enum FieldType {
     FT_INT,         /* int — 4 bytes int32 big-endian */
     FT_SHORT,       /* short — 2 bytes int16 big-endian */
     FT_DOUBLE,      /* double — 8 bytes IEEE 754 */
+    FT_FLOAT,       /* float — 4 bytes IEEE 754 */
     FT_BOOL,        /* bool — 1 byte (0/1) */
     FT_BYTE,        /* byte — 1 byte uint8 */
     FT_NUMERIC,     /* numeric:P,S — 8 bytes int64 × 10^S */
     FT_DATE,        /* date — 4 bytes int32 yyyyMMdd big-endian */
-    FT_DATETIME     /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
+    FT_DATETIME,    /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
+    FT_TIME,        /* time — 3 bytes uint24 big-endian (seconds since midnight) */
+    FT_UUID         /* uuid — 16 bytes binary */
 };
 
 enum DefaultKind {
