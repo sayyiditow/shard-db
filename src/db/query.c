@@ -7084,6 +7084,10 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->d1 = atof(c->value);
         cc->d2 = atof(c->value2);
         break;
+    case FT_FLOAT:
+        cc->d1 = atof(c->value);
+        cc->d2 = atof(c->value2);
+        break;
     case FT_BOOL:
         cc->b1 = (c->value[0] == 't' || c->value[0] == 'T' || c->value[0] == '1') ? 1 : 0;
         break;
@@ -7168,6 +7172,11 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                 cc->in_i64[i] = parse_numeric_i64(c->in_values[i], cc->tf->numeric_scale);
             break;
         case FT_DOUBLE:
+            cc->in_f64 = malloc(sizeof(double) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                cc->in_f64[i] = atof(c->in_values[i]);
+            break;
+        case FT_FLOAT:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 cc->in_f64[i] = atof(c->in_values[i]);
@@ -7461,6 +7470,8 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
                        return va < vb ? -1 : (va > vb ? 1 : 0); }
     case FT_DOUBLE:  { double va, vb; memcpy(&va, a, 8); memcpy(&vb, b, 8);
                        return va < vb ? -1 : (va > vb ? 1 : 0); }
+    case FT_FLOAT:   { float va, vb; memcpy(&va, a, 4); memcpy(&vb, b, 4);
+                       return va < vb ? -1 : (va > vb ? 1 : 0); }
     case FT_BOOL:
     case FT_BYTE:    return (int)a[0] - (int)b[0];
     case FT_DATE:    { int32_t va = ld_be_i32(a), vb = ld_be_i32(b);
@@ -7537,6 +7548,10 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
         return cmp_op_f64(v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count, cc);
+    }
+    case FT_FLOAT: {
+        float v; memcpy(&v, p, 4);
+        return cmp_op_f64((double)v, cc->d1, cc->d2, cc->op, cc->in_f64, cc->in_count, cc);
     }
     case FT_BOOL: case FT_BYTE: {
         int64_t v = (int64_t)p[0];
@@ -14029,6 +14044,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_INT:      return "int";
         case FT_SHORT:    return "short";
         case FT_DOUBLE:   return "double";
+        case FT_FLOAT:   return "float";
         case FT_BOOL:     return "bool";
         case FT_BYTE:     return "byte";
         case FT_NUMERIC:  return "numeric";
@@ -14305,6 +14321,11 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         if (v == 0.0) return 0;
         return snprintf(buf, bufsz, "%g", v);
     }
+    case FT_FLOAT: {
+        float v; memcpy(&v, p, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, bufsz, "%g", (double)v);
+    }
     case FT_BOOL:
         return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
     case FT_BYTE:
@@ -14401,6 +14422,16 @@ static int decode_index_key_to_double(const TypedField *f,
         if (v == 0.0) return 0;
         *out = v; return 1;
     }
+    case FT_FLOAT: {
+        if (plen < 4) return 0;
+        uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+        if (bits & 0x80000000u) bits ^= 0x80000000u;
+        else bits = ~bits;
+        float v; memcpy(&v, &bits, 4);
+        if (v == 0.0f) return 0;
+        *out = (double)v; return 1;
+    }
     case FT_BOOL:
         if (plen < 1) return 0;
         *out = (double)(p[0] ? 1 : 0); return 1;
@@ -14487,6 +14518,16 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         double v; memcpy(&v, &bits, 8);
         if (v == 0.0) return 0;
         return snprintf(buf, bufsz, "%g", v);
+    }
+    case FT_FLOAT: {
+        if (plen < 4) return 0;
+        uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        if (bits & 0x80000000u) bits ^= 0x80000000u;
+        else bits = ~bits;
+        float v; memcpy(&v, &bits, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, bufsz, "%g", (double)v);
     }
     case FT_BOOL:
         if (plen < 1) return 0;

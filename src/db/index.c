@@ -1073,6 +1073,7 @@ static size_t typed_field_str_avg(const TypedField *f) {
     case FT_INT:      return 11;  /* up to "-2147483648" */
     case FT_LONG:     return 20;  /* up to "-9223372036854775808" */
     case FT_DOUBLE:   return 15;  /* typical %g */
+    case FT_FLOAT:   return 12;  /* typical %g */
     case FT_NUMERIC:  return 16;  /* sign + 12 digits + dot + scale */
     case FT_DATE:     return 8;   /* YYYYMMDD via %08d */
     case FT_DATETIME: return 14;  /* YYYYMMDDHHmmss */
