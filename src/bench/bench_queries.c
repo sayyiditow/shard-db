@@ -352,9 +352,26 @@ static int bench_queries_run(void) {
         free(resp); resp = NULL;
     }
 
+    /* For skip-insert mode COUNT is the env target, not what's on disk —
+       query the actual object size so the header reflects reality. */
+    long display_count = COUNT;
+    if (bench_skip_insert) {
+        if (tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"users\"}",
+                       &resp) == 0 && resp) {
+            long parsed = atol(resp);
+            if (parsed > 0) display_count = parsed;
+            free(resp); resp = NULL;
+        }
+    }
+
     printf("======================================================================\n");
-    printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
-           COUNT, SPLITS, CHUNK_SIZE);
+    if (bench_skip_insert) {
+        printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, persistent)\n",
+               display_count, SPLITS);
+    } else {
+        printf("  shard-db QUERY benchmark — %ld users  (splits=%ld, chunk = %ld)\n",
+               display_count, SPLITS, CHUNK_SIZE);
+    }
     printf("======================================================================\n\n");
 
     /* Chunked insert. Build CHUNK_SIZE records at a time, push via memfd,
@@ -605,10 +622,10 @@ static int bench_queries_run(void) {
 
     /* ---------- COUNT — OR widths (tests OR limit pushdown sensitivity) ---------- */
     bench_table_section_begin("COUNT — OR with various leaf counts");
-    BR("OR 2 leaves (statuses)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"}]}]}");
-    BR("OR 3 leaves (ages)",        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"40\"}]}]}");
-    BR("OR 5 leaves (ages)",        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"40\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"50\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"60\"}]}]}");
-    BR("OR cross-field (age=30 OR active=false)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}]}]}");
+    BR("OR 2 leaves (statuses)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"}]}],\"timeout_ms\":60000}");
+    BR("OR 3 leaves (ages)",        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"40\"}]}],\"timeout_ms\":60000}");
+    BR("OR 5 leaves (ages)",        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"20\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"40\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"50\"},{\"field\":\"age\",\"op\":\"eq\",\"value\":\"60\"}]}],\"timeout_ms\":60000}");
+    BR("OR cross-field (age=30 OR active=false)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"or\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"30\"},{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}]}],\"timeout_ms\":60000}");
     bench_table_section_end();
 
     /* ---------- FIND — paired ranges (limit 10) — confirms range coalesce wins on find too ---------- */
