@@ -836,6 +836,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "double") == 0) {
         f->type = FT_DOUBLE;
         f->size = 8;
+    } else if (strcmp(spec, "float") == 0) {
+        f->type = FT_FLOAT;
+        f->size = 4;
     } else if (strcmp(spec, "bool") == 0) {
         f->type = FT_BOOL;
         f->size = 1;
@@ -1098,6 +1101,12 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         memcpy(out, &v, 8);
         break;
     }
+    case FT_FLOAT: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        float v = (float)atof(cbuf);
+        memcpy(out, &v, 4);
+        break;
+    }
     case FT_BOOL: {
         out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
         break;
@@ -1240,6 +1249,21 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 8;
         break;
     }
+    case FT_FLOAT: {
+        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
+        float v = (float)atof(cbuf);
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        /* IEEE-754 total order: if sign bit set (negative), flip all bits;
+           else flip just the sign bit. Maps all floats to a monotonic
+           unsigned key under memcmp. */
+        if (bits & 0x80000000u) bits = ~bits;
+        else bits ^= 0x80000000u;
+        out[0] = (bits >> 24) & 0xFF; out[1] = (bits >> 16) & 0xFF;
+        out[2] = (bits >> 8) & 0xFF;  out[3] = bits & 0xFF;
+        *out_len = 4;
+        break;
+    }
     case FT_BOOL: {
         out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
         *out_len = 1;
@@ -1365,6 +1389,21 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         out[4] = (bits >> 24) & 0xFF; out[5] = (bits >> 16) & 0xFF;
         out[6] = (bits >> 8) & 0xFF;  out[7] = bits & 0xFF;
         *out_len = 8;
+        break;
+    }
+    case FT_FLOAT: {
+        /* Stored as host-byte-order memcpy of the float (see encode_field_len).
+           For index: reinterpret as uint32, apply IEEE-754 total-order flip,
+           emit big-endian. */
+        float v;
+        memcpy(&v, src, 4);
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        if (bits & 0x80000000u) bits = ~bits;
+        else bits ^= 0x80000000u;
+        out[0] = (bits >> 24) & 0xFF; out[1] = (bits >> 16) & 0xFF;
+        out[2] = (bits >> 8) & 0xFF;  out[3] = bits & 0xFF;
+        *out_len = 4;
         break;
     }
     case FT_BOOL:
@@ -1632,6 +1671,12 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         memcpy(&v, data, 8);
         if (v == 0.0) return 0;
         return snprintf(buf, buflen, "%g", v);
+    }
+    case FT_FLOAT: {
+        float v;
+        memcpy(&v, data, 4);
+        if (v == 0.0f) return 0;
+        return snprintf(buf, buflen, "%g", (double)v);
     }
     case FT_BOOL: {
         return snprintf(buf, buflen, "%s", data[0] ? "true" : "false");
