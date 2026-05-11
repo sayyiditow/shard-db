@@ -8304,6 +8304,7 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
        limit → bail; the buffer is mmap'd up to the per-query cap so the
        former realloc-with-mutex path is gone. */
     size_t idx = __atomic_fetch_add(&cc->count, 1, __ATOMIC_RELAXED);
+    
     if (cc->collect_cap > 0 && idx >= (size_t)cc->collect_cap) return -1;
     if (idx >= cc->cap) {
         __atomic_store_n(&cc->budget_exceeded, 1, __ATOMIC_RELAXED);
@@ -9421,6 +9422,7 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
             c->in_cap = 64;
             c->in_values = malloc(c->in_cap * sizeof(char *));
             const char *ap = v_raw ? v_raw : v;
+            if (*ap == '"') ap++;
             if (*ap == '[') {
                 ap++;
                 while (*ap) {
@@ -9450,7 +9452,23 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         memcpy(val, start, len); val[len] = '\0';
                         c->in_values[c->in_count++] = val;
                         if (*ap == '"') ap++;
-                    } else ap++;
+                    } else {
+                        const char *start = ap;
+                        while (*ap && *ap != ',' && *ap != ']' && *ap != ' ') ap++;
+                        size_t len = ap - start;
+                        if (len > 0) {
+                            if (c->in_count >= c->in_cap) {
+                                int new_cap = c->in_cap * 2;
+                                char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
+                                if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+                                c->in_values = t;
+                                c->in_cap = new_cap;
+                            }
+                            char *val = malloc(len + 1);
+                            memcpy(val, start, len); val[len] = '\0';
+                            c->in_values[c->in_count++] = val;
+                        }
+                    }
                 }
             } else {
                 char *iv = strdup(v);
