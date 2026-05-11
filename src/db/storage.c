@@ -2470,6 +2470,13 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 if (!t) { free(buf); buf = NULL; break; }
                 buf = t;
             }
+            /* Coverity: re-assert the post-grow invariant in subtractive
+               form (no addition-overflow path). The pre-grow above already
+               guarantees this — the check is dead code on the happy path
+               and the compiler DCEs it — but Coverity's flow analysis
+               loses the size-aliasing through the realloc→t→buf chain
+               and flags the memcpy below as OVERRUN. CID 1693857/1693869. */
+            if (cap < pos || cap - pos < klen) { free(buf); buf = NULL; break; }
             /* csv_emit_cell quotes if needed; do it via the existing helper but
                into our buffer via snprintf — replicate the no-quote-needed shape
                here to avoid re-implementing the quote logic. */
@@ -2498,6 +2505,10 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                     if (!t) { free(buf); buf = NULL; break; }
                     buf = t;
                 }
+                /* Coverity: subtractive re-assertion of the post-grow
+                   invariant — see the equivalent comment in the CSV branch
+                   above for rationale. Tautological on the happy path. */
+                if (cap < pos || cap - pos < klen + 16) { free(buf); buf = NULL; break; }
                 if (i) buf[pos++] = ',';
                 buf[pos++] = '"';
                 memcpy(buf + pos, entries[i].key, klen); pos += klen;
@@ -2619,6 +2630,8 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 if (!t) { free(buf); buf = NULL; break; }
                 buf = t;
             }
+            /* Coverity: subtractive re-assertion of the post-grow invariant. */
+            if (cap < pos || cap - pos < klen + 8) { free(buf); buf = NULL; break; }
             if (!first) buf[pos++] = ',';
             buf[pos++] = '"';
             memcpy(buf + pos, entries[i].key, klen); pos += klen;
@@ -2876,6 +2889,8 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                     if (!t) { free(buf); buf = NULL; break; }
                     buf = t;
                 }
+                /* Coverity: subtractive re-assertion of the post-grow invariant. */
+                if (cap < pos || cap - pos < klen + vlen + 16) { free(buf); buf = NULL; break; }
                 if (!first) buf[pos++] = ',';
                 first = 0;
                 buf[pos++] = '"';
