@@ -231,6 +231,11 @@ export MAX_REQUEST_SIZE=33554432
 export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX/4 since 2026.05.1.
 export QUERY_BUFFER_MB=500
+# Per-pass memory budget for cmd_add_indexes / reindex. Multi-field builds
+# group fields into passes that fit under this budget; an oversized single
+# field still runs alone. Crank up on big-RAM hosts to fit more fields per
+# pass (faster) or down on small VPS to cap peak.
+export INDEX_BUILD_BUDGET_MB=1024
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500
