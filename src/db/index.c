@@ -1053,6 +1053,33 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
     return 0;
 }
 
+/* Average ASCII width of typed_get_field_str(f) — used for composite keys,
+   which are built as ASCII concatenation of each child field's stringified
+   value (see multi_index_scan_cb's composite branch). Numbers come from
+   typed_get_field_str in config.c (FT_DATE → "%08d", FT_DATETIME → 14 chars,
+   FT_BOOL → "true"/"false", others via decode_field_to_buf). varchars use
+   50% fill of f->size-2, same as the single-field estimator. */
+static size_t typed_field_str_avg(const TypedField *f) {
+    switch (f->type) {
+    case FT_NONE:     return 16;  /* unassigned — conservative fallback */
+    case FT_VARCHAR: {
+        size_t content_max = (size_t)f->size > 2 ? (size_t)f->size - 2 : 0;
+        size_t avg = content_max / 2;
+        return avg < 1 ? 1 : avg;
+    }
+    case FT_BOOL:     return 5;   /* "true" / "false" */
+    case FT_BYTE:     return 3;   /* up to "255" */
+    case FT_SHORT:    return 6;   /* up to "-32768" */
+    case FT_INT:      return 11;  /* up to "-2147483648" */
+    case FT_LONG:     return 20;  /* up to "-9223372036854775808" */
+    case FT_DOUBLE:   return 15;  /* typical %g */
+    case FT_NUMERIC:  return 16;  /* sign + 12 digits + dot + scale */
+    case FT_DATE:     return 8;   /* YYYYMMDD via %08d */
+    case FT_DATETIME: return 14;  /* YYYYMMDDHHmmss */
+    }
+    return 16;
+}
+
 /* Estimate the peak per-field memory cost of a single batch pass in bytes.
    The build pipeline keeps three things alive per field while building:
      - pairs[]: BtEntry array, 32 B per live record
@@ -1063,12 +1090,26 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
    handles concurrent inserts that push live_count over the estimate. */
 static size_t estimate_field_build_bytes(const TypedSchema *ts,
                                          const char *field, size_t live_count) {
-    size_t key_avg;
+    size_t key_avg = 16;
+
     if (strchr(field, '+')) {
-        /* Composite key — ASCII concat of child field values. Be conservative. */
-        key_avg = 64;
+        /* Composite key — sum each child field's ASCII width. Composite keys
+           are built by concatenating typed_get_field_str(child) per child, so
+           the right estimate is the sum of typed_field_str_avg over children,
+           NOT a flat constant. status+invoiceDate is ~18 B, not 64. */
+        char fb[256]; strncpy(fb, field, 255); fb[255] = '\0';
+        size_t sum = 0;
+        char *save = NULL;
+        char *tok = strtok_r(fb, "+", &save);
+        while (tok) {
+            int fidx = typed_field_index(ts, tok);
+            if (fidx >= 0) sum += typed_field_str_avg(&ts->fields[fidx]);
+            else sum += 16;  /* unknown child — conservative fallback */
+            tok = strtok_r(NULL, "+", &save);
+        }
+        if (sum < 8) sum = 8;
+        key_avg = sum;
     } else {
-        key_avg = 16;
         int fidx = typed_field_index(ts, field);
         if (fidx >= 0) {
             const TypedField *f = &ts->fields[fidx];
@@ -1080,6 +1121,8 @@ static size_t estimate_field_build_bytes(const TypedSchema *ts,
                 key_avg = content_max / 2;
                 if (key_avg < 8) key_avg = 8;
             } else {
+                /* Fixed-width types: typed_field_to_index_key writes exactly
+                   f->size bytes (binary, total-order encoded). */
                 key_avg = (size_t)f->size;
                 if (key_avg < 8) key_avg = 8;
             }
