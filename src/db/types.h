@@ -149,6 +149,7 @@ enum FieldType {
     FT_NUMERIC,     /* numeric:P,S — 8 bytes int64 × 10^S */
     FT_DATE,        /* date — 4 bytes int32 yyyyMMdd big-endian */
     FT_DATETIME,    /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
+    FT_TIME,        /* time — 3 bytes uint24 big-endian (seconds since midnight) */
     FT_UUID         /* uuid — 16 bytes binary */
 };
 

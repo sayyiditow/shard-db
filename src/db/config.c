@@ -851,6 +851,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "datetime") == 0) {
         f->type = FT_DATETIME;
         f->size = 6;
+    } else if (strcmp(spec, "time") == 0) {
+        f->type = FT_TIME;
+        f->size = 3;
     } else if (strcmp(spec, "uuid") == 0) {
         f->type = FT_UUID;
         f->size = 16;
@@ -1147,6 +1150,20 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
         break;
     }
+    case FT_TIME: {
+        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
+        int hh = 0, mm = 0, ss = 0;
+        if (vlen >= 8) {
+            hh = (val[0]-'0')*10 + (val[1]-'0');
+            mm = (val[3]-'0')*10 + (val[4]-'0');
+            ss = (val[6]-'0')*10 + (val[7]-'0');
+        }
+        uint32_t secs = hh * 3600 + mm * 60 + ss;
+        out[0] = (secs >> 16) & 0xFF;
+        out[1] = (secs >> 8) & 0xFF;
+        out[2] = secs & 0xFF;
+        break;
+    }
     case FT_UUID: {
         /* Parse 32 hex digits (skip hyphens), pack into 16 bytes BE.
            On malformed input (not exactly 32 hex digits), zero the field. */
@@ -1330,6 +1347,22 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 6;
         break;
     }
+    case FT_TIME: {
+        /* Parse "HH:MM:SS" into 3 bytes, top-bit flip for sorted index */
+        int hh = 0, mm = 0, ss = 0;
+        if (vlen >= 8) {
+            hh = (val[0]-'0')*10 + (val[1]-'0');
+            mm = (val[3]-'0')*10 + (val[4]-'0');
+            ss = (val[6]-'0')*10 + (val[7]-'0');
+        }
+        uint32_t secs = hh * 3600 + mm * 60 + ss;
+        uint32_t u = secs ^ 0x800000u;  /* top-bit flip to sort correctly */
+        out[0] = (u >> 16) & 0xFF;
+        out[1] = (u >> 8) & 0xFF;
+        out[2] = u & 0xFF;
+        *out_len = 3;
+        break;
+    }
     case FT_UUID: {
         /* Same as encode_field_len - parse 32 hex digits to 16 bytes BE */
         uint8_t buf[16] = {0};
@@ -1417,6 +1450,13 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         memcpy(out, src, 6);
         out[0] ^= 0x80;
         *out_len = 6;
+        break;
+    }
+    case FT_TIME: {
+        /* 3 bytes, flip top bit for sorted index */
+        memcpy(out, src, 3);
+        out[0] ^= 0x80;
+        *out_len = 3;
         break;
     }
     case FT_UUID: {
@@ -1769,6 +1809,14 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int ss = t % 60;
         return snprintf(buf, buflen, "\"%08d%02d%02d%02d\"", d, hh, mm, ss); /* "yyyyMMddHHmmss" */
     }
+    case FT_TIME: {
+        uint32_t secs = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
+        if (secs == 0 && data[0]==0 && data[1]==0 && data[2]==0) return 0;
+        int hh = secs / 3600;
+        int mm = (secs % 3600) / 60;
+        int ss = secs % 60;
+        return snprintf(buf, buflen, "\"%02d:%02d:%02d\"", hh, mm, ss); /* "HH:MM:SS" */
+    }
     case FT_UUID: {
         /* Emit canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
         const uint8_t *b = data;
@@ -1877,6 +1925,15 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
+        return out;
+    }
+    case FT_TIME: {
+        const uint8_t *d = data + f->offset;
+        uint32_t secs = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
+        if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0) return NULL;
+        int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
+        char *out = malloc(9);
+        snprintf(out, 9, "%02d:%02d:%02d", hh, mm, ss);
         return out;
     }
     case FT_UUID: {
