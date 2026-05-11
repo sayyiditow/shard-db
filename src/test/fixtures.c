@@ -157,23 +157,48 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     snprintf(env->db_root, sizeof(env->db_root), "%s", db_root);
     env->port = port;
 
-    /* (Re)write db.env. Idempotent — overwrites any existing file from a
-       previous run with the same base. */
+    /* Write db.env at <base>/ ONLY if no existing one is there. Persistent
+       bench mode is often pointed at the user's working repo (base=".",
+       env_path="./db.env"), where a pre-existing operator-managed db.env
+       must be preserved — otherwise the bench silently nukes its full
+       contents on every run. If db.env exists, honour its PORT so the
+       bench client connects where the daemon will actually listen. */
     char env_path[300];
     snprintf(env_path, sizeof(env_path), "%s/db.env", base);
-    FILE *f = fopen(env_path, "w");
-    if (!f) return -1;
-    fprintf(f,
-        "export DB_ROOT=\"%s\"\n"
-        "export PORT=%d\n"
-        "export TIMEOUT=0\n"
-        "export LOG_DIR=\"%s/logs\"\n"
-        "export LOG_LEVEL=2\n"
-        "export THREADS=0\n"
-        "export FCACHE_MAX=4096\n"
-        "export TLS_ENABLE=0\n",
-        env->db_root, env->port, base);
-    fclose(f);
+    if (access(env_path, F_OK) != 0) {
+        FILE *f = fopen(env_path, "w");
+        if (!f) return -1;
+        fprintf(f,
+            "export DB_ROOT=\"%s\"\n"
+            "export PORT=%d\n"
+            "export TIMEOUT=0\n"
+            "export LOG_DIR=\"%s/logs\"\n"
+            "export LOG_LEVEL=2\n"
+            "export THREADS=0\n"
+            "export FCACHE_MAX=4096\n"
+            "export TLS_ENABLE=0\n",
+            env->db_root, env->port, base);
+        fclose(f);
+    } else {
+        /* Parse PORT= from the existing db.env so env->port matches what
+           the spawned daemon will bind to. Anything else we'd want to
+           override (DB_ROOT, LOG_DIR) is already user-owned in this path. */
+        FILE *fr = fopen(env_path, "r");
+        if (fr) {
+            char line[512];
+            while (fgets(line, sizeof(line), fr)) {
+                const char *p = line;
+                while (*p == ' ' || *p == '\t') p++;
+                if (strncmp(p, "export ", 7) == 0) p += 7;
+                if (strncmp(p, "PORT=", 5) == 0) {
+                    int parsed = atoi(p + 5);
+                    if (parsed > 0) env->port = parsed;
+                    break;
+                }
+            }
+            fclose(fr);
+        }
+    }
     char logs_dir[400];
     snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
     mkdir(logs_dir, 0755);
