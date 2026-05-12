@@ -670,18 +670,24 @@ static uint32_t bt_alloc_page(BtFile *bt) {
         if (new_size < bt->map_size + 1024 * 1024)
             new_size = bt->map_size + 1024 * 1024;
         if (new_size < needed) new_size = needed;
+        /* Use mremap on Linux for O(1) page-table remap (vs munmap+mmap
+           which is O(virtual address range) — matters at 500MB+ file sizes).
+           Fall back to munmap+mmap on non-Linux (macOS, *BSD). */
+#ifdef __linux__
+        bt->map = mremap(bt->map, bt->map_size, new_size, MREMAP_MAYMOVE);
+        if (bt->map == MAP_FAILED) {
+            fprintf(stderr, "btree: mremap(grow %zu→%zu) failed: %s\n",
+                    bt->map_size, new_size, strerror(errno));
+            bt->map = NULL; /* force SIGBUS on subsequent write */
+        }
+#else
         munmap(bt->map, bt->map_size);
-        /* Coverity CID 1693852: bt_alloc_page returns uint32_t with no
-           error sentinel, and 8 callers don't check. Adding error
-           propagation here is a wider refactor; for now log loudly
-           on ftruncate failure (disk full / quota) — the subsequent
-           write to the over-claimed mmap will SIGBUS, which is at
-           least a hard fail rather than silent corruption. */
+        bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
+#endif
         if (ftruncate(bt->fd, (off_t)new_size) < 0) {
             fprintf(stderr, "btree: ftruncate(grow %zu→%zu) failed: %s\n",
                     bt->map_size, new_size, strerror(errno));
         }
-        bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
         bt->map_size = new_size;
         fh = (BtFileHeader *)bt->map;
         if (bt->slot >= 0) {
@@ -804,16 +810,13 @@ static int leaf_append(uint8_t *page, const char *value, size_t vlen,
    tombstones, inserts new entry, rebuilds. */
 static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t vlen,
                                const uint8_t *hash) {
-    BtPageHeader *ph = (BtPageHeader *)page;
-    int old_count = ph->count;
-    int cap = old_count + 1;
-
-    /* Worst-case size: every entry up to BT_MAX_VAL_LEN after decompression. */
-    size_t bufsz = (size_t)cap * BT_MAX_VAL_LEN + vlen;
-    LeafRec *recs = malloc((size_t)cap * sizeof(LeafRec));
-    char *buf = malloc(bufsz);
-    uint8_t *hashbuf = malloc((size_t)cap * BT_HASH_SIZE);
-    if (!recs || !buf || !hashbuf) { free(recs); free(buf); free(hashbuf); return -1; }
+    /* Stack-allocate worst-case buffers: max ~256 entries on a 4KB page
+       when fully packed with tiny keys. 256 entries * 512 bytes = 128KB
+       worst-case decoded data — comfortable for 8MB Linux stack limit. */
+#define PI_MAX_ENTRIES 256
+    LeafRec  recs[PI_MAX_ENTRIES];
+    char     buf[PI_MAX_ENTRIES * BT_MAX_VAL_LEN];
+    uint8_t  hashbuf[PI_MAX_ENTRIES * BT_HASH_SIZE];
 
     LeafIter it;
     leaf_iter_init(&it, page);
@@ -821,7 +824,7 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
     uint8_t *h = hashbuf;
     int dst = 0;
     int inserted = 0;
-    while (leaf_iter_next(&it)) {
+    while (leaf_iter_next(&it) && dst < PI_MAX_ENTRIES - 1) {
         if (!inserted && it.slot_idx >= pos) {
             memcpy(p, value, vlen);
             memcpy(h, hash, BT_HASH_SIZE);
@@ -834,7 +837,7 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
         recs[dst].value = p; recs[dst].vlen = it.key_len; recs[dst].hash = h;
         p += it.key_len; h += BT_HASH_SIZE; dst++;
     }
-    if (!inserted) {
+    if (!inserted && dst < PI_MAX_ENTRIES) {
         memcpy(p, value, vlen);
         memcpy(h, hash, BT_HASH_SIZE);
         recs[dst].value = p; recs[dst].vlen = vlen; recs[dst].hash = h;
@@ -842,8 +845,8 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
     }
 
     int rc = leaf_rebuild(page, recs, dst);
-    free(recs); free(buf); free(hashbuf);
     return rc;
+#undef PI_MAX_ENTRIES
 }
 
 /* Insert entry into an INTERNAL page at position pos. Returns 0 on success,
@@ -906,7 +909,6 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
     uint8_t *new_pg = bt_page(bt, new_id);
 
     BtPageHeader *old_h = (BtPageHeader *)old_pg;
-    int total = old_h->count;
 
     /* Init new page as leaf; inherits old's next_leaf and gets old as
        prev_leaf. The leaf chain becomes: old → new → (old's old next).
@@ -931,22 +933,22 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
         fh->last_leaf_page = new_id;
     }
 
-    /* Decode all non-tombstoned entries. Worst-case buffer: total * BT_MAX_VAL_LEN. */
-    /* CID 1693861 - header value from trusted index file, triage */
-    LeafRec *recs = malloc((size_t)total * sizeof(LeafRec));
-    char *buf = malloc((size_t)total * BT_MAX_VAL_LEN);
-    uint8_t *hashbuf = malloc((size_t)total * BT_HASH_SIZE);
-    if (!recs || !buf || !hashbuf) {
-        free(recs); free(buf); free(hashbuf);
-        return page_id; /* fatal; caller treats as no-split */
-    }
+    /* Decode all non-tombstoned entries into stack buffers.
+       Worst case: a 4KB page holds ~195 entries (minimum-size keys);
+       each decoded key is up to BT_MAX_VAL_LEN (512), giving ~100KB
+       decoded data. Stack-allocate to avoid 3 malloc/free per split.
+       256KB total is well within the 8MB default Linux stack limit. */
+#define BT_SPLIT_MAX_ENTRIES 256
+    LeafRec  recs[BT_SPLIT_MAX_ENTRIES];
+    char     buf[BT_SPLIT_MAX_ENTRIES * BT_MAX_VAL_LEN];
+    uint8_t  hashbuf[BT_SPLIT_MAX_ENTRIES * BT_HASH_SIZE];
 
     LeafIter it;
     leaf_iter_init(&it, old_pg);
     char *p = buf;
     uint8_t *h = hashbuf;
     int live = 0;
-    while (leaf_iter_next(&it)) {
+    while (leaf_iter_next(&it) && live < BT_SPLIT_MAX_ENTRIES) {
         memcpy(p, it.key_buf, it.key_len);
         memcpy(h, it.hash, BT_HASH_SIZE);
         recs[live].value = p; recs[live].vlen = it.key_len; recs[live].hash = h;
@@ -965,8 +967,8 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
     old_h->next_leaf = new_id;
     leaf_rebuild(old_pg, recs, split_at);
 
-    free(recs); free(buf); free(hashbuf);
     return new_id;
+#undef BT_SPLIT_MAX_ENTRIES
 }
 
 /* Split an internal page. Similar to leaf split. */
@@ -1038,11 +1040,14 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         /* For simplicity: split first, then insert into correct half */
         *new_child = bt_split_leaf(bt, page_id, promote_val, promote_vlen);
 
-        /* Determine which page to insert into */
-        page = bt_page(bt, page_id); /* re-fetch */
+        /* Determine which page to insert into. Use val_cmp (length-tiebreak)
+           instead of raw memcmp — the old code had a length-bound bug where
+           value could be longer than promote_val and the wrong comparison
+           length was used. This also makes the decision consistent with
+           page_bsearch's ordering across the file. */
+        page = bt_page(bt, page_id);
         uint8_t *new_pg = bt_page(bt, *new_child);
-        if (memcmp(value, promote_val, vlen < *promote_vlen ? vlen : *promote_vlen) >= 0 ||
-            (vlen >= *promote_vlen && memcmp(value, promote_val, *promote_vlen) >= 0)) {
+        if (val_cmp(value, vlen, promote_val, *promote_vlen) >= 0) {
             pos = page_bsearch(new_pg, value, vlen);
             page_insert_at_leaf(new_pg, pos, value, vlen, hash);
         } else {
@@ -1088,8 +1093,7 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
 
         page = bt_page(bt, page_id);
         uint8_t *new_pg = bt_page(bt, *new_child);
-        if (memcmp(sub_promote, promote_val,
-                   sub_promote_len < *promote_vlen ? sub_promote_len : *promote_vlen) >= 0) {
+        if (val_cmp(sub_promote, sub_promote_len, promote_val, *promote_vlen) >= 0) {
             ipos = page_bsearch(new_pg, sub_promote, sub_promote_len);
             page_insert_at_internal(new_pg, ipos, sub_promote, sub_promote_len, sub_new_child);
         } else {
