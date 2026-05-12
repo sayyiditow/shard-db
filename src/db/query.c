@@ -7148,20 +7148,20 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         break;
     }
     case FT_TIME: {
-        if (c->value && c->value[0]) {
+        if (c->value[0]) {
             parse_time(c->value, cc->time_val);
         }
-        if (c->value2 && c->value2[0]) {
+        if (c->value2[0]) {
             parse_time(c->value2, cc->time_val2);
         }
         break;
     }
     case FT_UUID: {
         /* Parse canonical UUID string to 16 bytes */
-        if (c->value && c->value[0]) {
+        if (c->value[0]) {
             parse_uuid(c->value, cc->uuid_bytes);
         }
-        if (c->value2 && c->value2[0]) {
+        if (c->value2[0]) {
             parse_uuid(c->value2, cc->uuid_bytes2);
         }
         break;
