@@ -2480,6 +2480,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
             /* csv_emit_cell quotes if needed; do it via the existing helper but
                into our buffer via snprintf — replicate the no-quote-needed shape
                here to avoid re-implementing the quote logic. */
+            /* CID 1693857/1693869 - bounds checked above, triage */
             memcpy(buf + pos, entries[i].key, klen); pos += klen;
             /* Use SB_APPEND for bounded write — pre-grow above guarantees
                room, but the macro silences the CodeQL "potentially
@@ -2630,10 +2631,11 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 if (!t) { free(buf); buf = NULL; break; }
                 buf = t;
             }
-            /* Coverity: subtractive re-assertion of the post-grow invariant. */
+            /* Coverity: subtractive re-assertion of the post-grow invariant. CID 1693871 */
             if (cap < pos || cap - pos < klen + 8) { free(buf); buf = NULL; break; }
             if (!first) buf[pos++] = ',';
             buf[pos++] = '"';
+            /* CID 1693871 - bounds checked above, triage */
             memcpy(buf + pos, entries[i].key, klen); pos += klen;
             buf[pos++] = '"';
             first = 0;
@@ -2889,14 +2891,16 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                     if (!t) { free(buf); buf = NULL; break; }
                     buf = t;
                 }
-                /* Coverity: subtractive re-assertion of the post-grow invariant. */
+                /* Coverity: subtractive re-assertion of the post-grow invariant. CID 1693870 */
                 if (cap < pos || cap - pos < klen + vlen + 16) { free(buf); buf = NULL; break; }
                 if (!first) buf[pos++] = ',';
                 first = 0;
                 buf[pos++] = '"';
+                /* CID 1693870 - bounds checked above, triage */
                 memcpy(buf + pos, entries[i].key, klen); pos += klen;
                 buf[pos++] = '"'; buf[pos++] = ':';
                 if (entries[i].result_json) {
+                    /* CID 1693872 - bounds checked above, triage */
                     memcpy(buf + pos, entries[i].result_json, vlen); pos += vlen;
                     free(entries[i].result_json);
                 } else {
