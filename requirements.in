@@ -3,3 +3,8 @@
 # upstream release silently shipping into our build. Bump this when you mean
 # to bump it; Dependabot can also be wired up for python/pip later.
 mkdocs-material==9.7.6
+
+# Pin urllib3 to fix CodeQL vulnerabilities:
+# - Decompression-bomb safeguards bypassed in streaming API
+# - Sensitive headers forwarded across origins in proxied redirects
+urllib3>=2.7.0
