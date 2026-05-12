@@ -172,9 +172,27 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_v2_crash.c \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/test/cases/test_v2_index_leak_on_clear.c \
+    src/test/cases/test_btree.c \
+    src/test/cases/test_config_encode.c \
+    src/test/cases/test_error_paths.c \
+    src/test/cases/test_keyset.c \
+    src/test/cases/test_objlock_unit.c \
+    src/test/cases/test_parallel.c \
+    src/test/cases/test_planner_edge_cases.c \
+    src/test/cases/test_signal_handling.c \
+    src/test/cases/test_simd.c \
+    src/test/cases/test_slotcask_api.c \
+    src/test/cases/test_tls_unit.c \
+    src/test/cases/test_util.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \
+    src/db/objlock.c \
+    src/db/config.c \
+    src/db/keyset.c \
+    src/db/simd.c \
+    src/db/tls.c \
+    src/db/btree.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test
