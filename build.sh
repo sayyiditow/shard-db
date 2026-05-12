@@ -193,6 +193,9 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/db/simd.c \
     src/db/tls.c \
     src/db/btree.c \
+    src/db/storage.c \
+    src/db/index.c \
+    src/db/query.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test
