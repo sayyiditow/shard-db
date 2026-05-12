@@ -877,7 +877,6 @@ int cmd_add_index(const char *db_root, const char *object,
         int live = get_live_count(db_root, object);
         if (live < 0) live = 0;
         size_t initial = (size_t)live + 4096;
-        if (initial < 4096) initial = 4096;
         if (initial > (1ULL << 30)) initial = (1ULL << 30);
         ic.pair_cap = initial;
         ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
