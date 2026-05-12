@@ -7641,8 +7641,8 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         case OP_LESS_EQ: return vd <= q1;
         case OP_GREATER_EQ: return vd >= q1;
         case OP_BETWEEN: {
-            int lo = (cc && cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
-            int hi = (cc && cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
+            int lo = (cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
+            int hi = (cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
             return lo && hi;
         }
         case OP_IN: {
