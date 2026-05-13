@@ -14347,7 +14347,10 @@ typedef struct AggBucket {
     char *group_key;            /* concatenated group values separated by \x1F */
     char **group_vals;          /* individual group values for output */
     AggAccum *accums;           /* one per aggregate */
-    struct AggBucket *next;     /* hash chain */
+    struct AggBucket *next;    /* hash chain */
+    /* Integer key optimization: raw bytes for fast hash/compare */
+    uint8_t raw_key[16];        /* raw bytes for integer group keys */
+    uint8_t raw_key_len;        /* length of raw key (0 = string key) */
 } AggBucket;
 
 /* Bump-allocator arena for AggBucket and its strings. The pre-arena path
@@ -14470,6 +14473,8 @@ typedef struct {
        copies what it needs into the destination's arena and frees the
        source's arena en masse. */
     AggArena arena;
+    /* Integer group key optimization: 1 if all group fields are integer types */
+    int use_int_keys;
 } AggCtx;
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
@@ -15172,6 +15177,80 @@ static uint32_t agg_hash(const char *s) {
     return h;
 }
 
+/* Integer hash - hash raw bytes using Golden Ratio multiplier.
+   Works for any size: 2, 4, or 8 bytes. */
+static uint32_t agg_hash_int(const void *key, size_t len) {
+    uint64_t h = 0;
+    const uint8_t *p = (const uint8_t *)key;
+    for (size_t i = 0; i < len; i++) {
+        h = h * 0x9E3779B9 + p[i];
+    }
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+/* Compare raw integer keys (memcmp but returns bool). */
+static int agg_key_eq_int(const void *a, size_t alen, const void *b, size_t blen) {
+    if (alen != blen) return 0;
+    return memcmp(a, b, alen) == 0;
+}
+
+/* Extract raw bytes from integer fields for fast hashing.
+   Returns length of extracted bytes, 0 if empty/zero.
+   Stores raw bytes in buf (up to 16 bytes). */
+static int typed_field_to_raw(const TypedField *f, const uint8_t *p, uint8_t *buf, size_t bufsz) {
+    switch (f->type) {
+    case FT_INT: {
+        int32_t v = ld_be_i32(p);
+        if (v == 0) return 0;
+        if (bufsz < 4) return 0;
+        buf[0] = (uint8_t)(v >> 24);
+        buf[1] = (uint8_t)(v >> 16);
+        buf[2] = (uint8_t)(v >> 8);
+        buf[3] = (uint8_t)v;
+        return 4;
+    }
+    case FT_LONG: {
+        int64_t v = ld_be_i64(p);
+        if (v == 0) return 0;
+        if (bufsz < 8) return 0;
+        for (int i = 0; i < 8; i++) buf[7 - i] = (uint8_t)(v >> (i * 8));
+        return 8;
+    }
+    case FT_SHORT: {
+        int16_t v = ld_be_i16(p);
+        if (v == 0) return 0;
+        if (bufsz < 2) return 0;
+        buf[0] = (uint8_t)(v >> 8);
+        buf[1] = (uint8_t)v;
+        return 2;
+    }
+    case FT_BYTE: {
+        if (bufsz < 1) return 0;
+        buf[0] = p[0];
+        return 1;
+    }
+    case FT_NUMERIC: {
+        int64_t v = ld_be_i64(p);
+        if (v == 0) return 0;
+        if (bufsz < 8) return 0;
+        for (int i = 0; i < 8; i++) buf[7 - i] = (uint8_t)(v >> (i * 8));
+        return 8;
+    }
+    case FT_DATE: {
+        int32_t v = ld_be_i32(p);
+        if (v == 0) return 0;
+        if (bufsz < 4) return 0;
+        buf[0] = (uint8_t)(v >> 24);
+        buf[1] = (uint8_t)(v >> 16);
+        buf[2] = (uint8_t)(v >> 8);
+        buf[3] = (uint8_t)v;
+        return 4;
+    }
+    default:
+        return -1;  /* not an integer type */
+    }
+}
+
 /* Lazy-allocate the AggCtx hash table on first insert. Starting size
    AGG_HT_INIT (256 slots, 2 KB) — typical low-cardinality group_by
    queries fit comfortably without ever resizing. Returns 0 on success,
@@ -15213,7 +15292,11 @@ static int agg_ht_resize(AggCtx *ctx) {
     return 0;
 }
 
-static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
+/* Find or create aggregate bucket. For integer group keys (use_int_keys),
+   raw_key/len provides the raw bytes for fast hash/compare, while vals
+   still provides strings for output. For string keys, raw_key_len=0. */
+static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
+                                      const uint8_t *raw_key, int raw_key_len) {
     /* Build composite key */
     char key[4096];
     int kp = 0;
@@ -15231,10 +15314,26 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
         ctx->budget_exceeded = 1;
         return NULL;
     }
-    uint32_t khash = agg_hash(key);
-    uint32_t h = khash & (uint32_t)ctx->ht_mask;
-    for (AggBucket *b = ctx->ht[h]; b; b = b->next) {
-        if (strcmp(b->group_key, key) == 0) return b;
+
+    /* Hash: use integer hash for integer keys, djb2 for string keys */
+    uint32_t khash;
+    uint32_t h;
+    if (ctx->use_int_keys && raw_key_len > 0) {
+        khash = agg_hash_int(raw_key, (size_t)raw_key_len);
+        h = khash & (uint32_t)ctx->ht_mask;
+        for (AggBucket *b = ctx->ht[h]; b; b = b->next) {
+            if (b->raw_key_len > 0 &&
+                agg_key_eq_int(raw_key, (size_t)raw_key_len,
+                               b->raw_key, b->raw_key_len)) {
+                return b;
+            }
+        }
+    } else {
+        khash = agg_hash(key);
+        h = khash & (uint32_t)ctx->ht_mask;
+        for (AggBucket *b = ctx->ht[h]; b; b = b->next) {
+            if (strcmp(b->group_key, key) == 0) return b;
+        }
     }
 
     /* New bucket: charge against the shared budget before allocating. */
@@ -15257,11 +15356,17 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals) {
        is O(slabs) not O(buckets). */
     AggBucket *b = agg_arena_alloc(&ctx->arena, sizeof(AggBucket));
     if (!b) { ctx->budget_exceeded = 1; return NULL; }
+    memset(b, 0, sizeof(AggBucket));
     b->group_key = agg_arena_strdup(&ctx->arena, key, (size_t)kp);
     b->group_vals = agg_arena_alloc(&ctx->arena, (size_t)nvals * sizeof(char *));
     if (!b->group_key || !b->group_vals) {
         ctx->budget_exceeded = 1;
         return NULL;
+    }
+    /* Store raw key for integer optimization */
+    if (ctx->use_int_keys && raw_key_len > 0 && raw_key_len <= 16) {
+        memcpy(b->raw_key, raw_key, (size_t)raw_key_len);
+        b->raw_key_len = (uint8_t)raw_key_len;
     }
     for (int i = 0; i < nvals; i++) {
         size_t sl = strlen(vals[i]);
@@ -15324,16 +15429,32 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         gvals[i] = gbuf[i];
     }
 
+    /* Extract raw bytes for integer group keys (fast hash path) */
+    uint8_t raw_key[16];
+    int raw_key_len = 0;
+    if (ctx->use_int_keys) {
+        int kp = 0;
+        for (int i = 0; i < ctx->ngroups && kp < 16; i++) {
+            if (ctx->group_tfs[i]) {
+                int len = typed_field_to_raw(ctx->group_tfs[i],
+                                             raw + ctx->group_tfs[i]->offset,
+                                             raw_key + kp, (size_t)(16 - kp));
+                if (len > 0) kp += len;
+            }
+        }
+        raw_key_len = kp;
+    }
+
     /* Find or create bucket + accumulate. Every parallel path now gives
        each worker its own cloned AggCtx (fresh hash table + arena), so
        hashtable insert and accumulator updates are worker-local — no
        mutex needed. */
     AggBucket *bkt;
     if (ctx->ngroups > 0) {
-        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups);
+        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups, raw_key, raw_key_len);
     } else {
         char *empty = "";
-        bkt = agg_find_or_create(ctx, &empty, 1);
+        bkt = agg_find_or_create(ctx, &empty, 1, NULL, 0);
     }
     if (!bkt) return 1;  /* budget exceeded — stop scan */
 
@@ -15516,7 +15637,8 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     if (!src->ht) { src->total_buckets = 0; return; }
     for (size_t i = 0; i < src->ht_cap; i++) {
         for (AggBucket *b = src->ht[i]; b; b = b->next) {
-            AggBucket *dbkt = agg_find_or_create(dst, b->group_vals, nvals);
+            AggBucket *dbkt = agg_find_or_create(dst, b->group_vals, nvals,
+                                                  b->raw_key, b->raw_key_len);
             if (!dbkt) continue;  /* dst budget exhausted — caller checks flag */
             for (int k = 0; k < src->nspecs; k++) {
                 AggAccum *sa = &b->accums[k], *da = &dbkt->accums[k];
@@ -16013,10 +16135,26 @@ static void *igb_pass1_worker(void *arg) {
         } else {
             char gbufs[MAX_FIELDS][512];
             char *gvals[MAX_FIELDS];
-            int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
-                                       vlen, gbufs[0], sizeof(gbufs[0]));
-            if (n <= 0) continue;
-            gvals[0] = gbufs[0];
+            uint8_t raw_key[16];
+            int raw_key_len = 0;
+
+            /* Check if we can use raw integer key */
+            int use_raw = w->local.use_int_keys && w->n_sec == 0 && vlen <= 16;
+            if (use_raw) {
+                memcpy(raw_key, val, vlen > 16 ? 16 : vlen);
+                raw_key_len = (int)vlen;
+                /* For output, still need string */
+                int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
+                                           vlen, gbufs[0], sizeof(gbufs[0]));
+                if (n <= 0) continue;
+                gvals[0] = gbufs[0];
+            } else {
+                int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
+                                           vlen, gbufs[0], sizeof(gbufs[0]));
+                if (n <= 0) continue;
+                gvals[0] = gbufs[0];
+            }
+
             int multi_skip = 0;
             for (int g = 0; g < w->n_sec; g++) {
                 const char *sval; size_t slen;
@@ -16031,7 +16169,7 @@ static void *igb_pass1_worker(void *arg) {
             }
             if (multi_skip) continue;
             bkt = (struct AggBucket *)agg_find_or_create(
-                                          &w->local, gvals, w->local.ngroups);
+                    &w->local, gvals, w->local.ngroups, raw_key, raw_key_len);
             if (!bkt) { w->aborted = 1; break; }
             if (w->n_sec == 0 && vlen <= sizeof(prev_enc)) {
                 memcpy(prev_enc, val, vlen);
@@ -16122,7 +16260,8 @@ static void *part_merge_worker(void *arg) {
         BktArr *q = p->scatter_per_pass1[w];
         for (int i = 0; i < q->count; i++) {
             AggBucket *src = q->arr[i];
-            AggBucket *mb = agg_find_or_create(&p->local, src->group_vals, p->nvals);
+            AggBucket *mb = agg_find_or_create(&p->local, src->group_vals, p->nvals,
+                                                src->raw_key, src->raw_key_len);
             if (!mb) { p->aborted = 1; return NULL; }
             for (int k = 0; k < p->local.nspecs; k++) {
                 AggAccum *sa = &src->accums[k], *da = &mb->accums[k];
@@ -16547,6 +16686,23 @@ int cmd_aggregate(const char *db_root, const char *object,
             if (idx >= 0) ctx.group_tfs[i] = &fs.ts->fields[idx];
         }
     }
+
+    /* Check if all group fields are integer types (fast integer hash path) */
+    ctx.use_int_keys = 0;
+    if (ctx.ngroups > 0) {
+        int all_int = 1;
+        for (int i = 0; i < ctx.ngroups; i++) {
+            if (!ctx.group_tfs[i]) { all_int = 0; break; }
+            int ft = ctx.group_tfs[i]->type;
+            if (ft != FT_INT && ft != FT_LONG && ft != FT_SHORT &&
+                ft != FT_BYTE && ft != FT_NUMERIC && ft != FT_DATE) {
+                all_int = 0;
+                break;
+            }
+        }
+        ctx.use_int_keys = all_int;
+    }
+
     for (int i = 0; i < ctx.nspecs && i < MAX_AGG_SPECS; i++) {
         ctx.spec_tfs[i] = NULL;
         /* Resolve TypedField for COUNT specs too — agg_scan_cb's
@@ -17961,10 +18117,24 @@ int cmd_aggregate(const char *db_root, const char *object,
                     } else {
                         char gbufs[MAX_FIELDS][512];
                         char *gvals[MAX_FIELDS];
-                        int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                                  vlen, gbufs[0], sizeof(gbufs[0]));
-                        if (n <= 0) continue;
-                        gvals[0] = gbufs[0];
+                        uint8_t raw_key[16];
+                        int raw_key_len = 0;
+
+                        /* Check if we can use raw integer key */
+                        int use_raw = ctx.use_int_keys && n_sec == 0 && vlen <= 16;
+                        if (use_raw) {
+                            memcpy(raw_key, val, vlen > 16 ? 16 : vlen);
+                            raw_key_len = (int)vlen;
+                            int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
+                                                      vlen, gbufs[0], sizeof(gbufs[0]));
+                            if (n <= 0) continue;
+                            gvals[0] = gbufs[0];
+                        } else {
+                            int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
+                                                      vlen, gbufs[0], sizeof(gbufs[0]));
+                            if (n <= 0) continue;
+                            gvals[0] = gbufs[0];
+                        }
                         /* Compose composite key for ngroups > 1 by looking up
                            each secondary field's value via its hash16 map.
                            A miss means the record doesn't have that field
@@ -17985,7 +18155,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                         }
                         if (multi_skip) continue;
                         bkt = (struct AggBucket *)agg_find_or_create(
-                                                      &ctx, gvals, ctx.ngroups);
+                                &ctx, gvals, ctx.ngroups, raw_key, raw_key_len);
                         if (!bkt) { aborted = 1; break; }
                         if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
                             memcpy(prev_enc, val, vlen);
