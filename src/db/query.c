@@ -6865,10 +6865,8 @@ static void parse_datetime(const char *s, int32_t *out_date, uint16_t *out_time)
 }
 
 /* Parse decimal string → int64 scaled by 10^scale (matches encode_field FT_NUMERIC). */
-static int64_t parse_numeric_i64(const char *s, int scale) {
+static int64_t parse_numeric_i64(const char *s, int64_t mul) {
     double dv = atof(s);
-    int64_t mul = 1;
-    for (int i = 0; i < scale; i++) mul *= 10;
     return (int64_t)(dv * mul + (dv >= 0 ? 0.5 : -0.5));
 }
 
@@ -7120,8 +7118,8 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
         break;
     case FT_NUMERIC:
-        cc->i1 = parse_numeric_i64(c->value, cc->tf->numeric_scale);
-        cc->i2 = parse_numeric_i64(c->value2, cc->tf->numeric_scale);
+        cc->i1 = parse_numeric_i64(c->value, cc->tf->numeric_scale_mult);
+        cc->i2 = parse_numeric_i64(c->value2, cc->tf->numeric_scale_mult);
         break;
     case FT_DOUBLE:
         cc->d1 = atof(c->value);
@@ -7231,7 +7229,7 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         case FT_NUMERIC:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
-                cc->in_i64[i] = parse_numeric_i64(c->in_values[i], cc->tf->numeric_scale);
+                cc->in_i64[i] = parse_numeric_i64(c->in_values[i], cc->tf->numeric_scale_mult);
             break;
         case FT_DOUBLE:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
@@ -14526,8 +14524,7 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
         if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
+        int64_t scale = f->numeric_scale_mult;
         int64_t whole = v / scale;
         int64_t frac = v % scale;
         int neg = (v < 0);
@@ -14673,9 +14670,7 @@ static int decode_index_key_to_double(const TypedField *f,
                      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
-        *out = (double)v / (double)scale; return 1;
+        *out = (double)v / (double)f->numeric_scale_mult; return 1;
     }
     case FT_UUID:
         /* UUIDs aren't summable */
@@ -14797,8 +14792,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
         if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
+        int64_t scale = f->numeric_scale_mult;
         int64_t whole = v / scale;
         int64_t frac = v % scale;
         int neg = (v < 0);
@@ -15149,9 +15143,7 @@ static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *
     }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
-        *out = (double)v / (double)scale; return 1;  /* 0 is a valid numeric value */
+        *out = (double)v / (double)f->numeric_scale_mult; return 1;
     }
     case FT_BOOL: *out = (double)(p[0] ? 1 : 0); return 1;
     case FT_BYTE: *out = (double)p[0]; return 1;

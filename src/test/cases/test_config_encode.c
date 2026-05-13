@@ -8,6 +8,11 @@
 static TypedField make_f(enum FieldType type, int size, int scale) {
     TypedField f; memset(&f, 0, sizeof(f));
     f.type = type; f.size = size; f.numeric_scale = scale;
+    if (type == FT_NUMERIC) {
+        int64_t mult = 1;
+        for (int i = 0; i < scale; i++) mult *= 10;
+        f.numeric_scale_mult = mult;
+    }
     return f;
 }
 

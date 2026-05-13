@@ -63,3 +63,4 @@ timeout-*
 
 # Internal planning docs — kept local, never published.
 docs/superpowers/
+test-htest
