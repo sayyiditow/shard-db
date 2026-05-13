@@ -187,14 +187,14 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \
-    src/db/objlock.c \
-    src/db/config.c \
+    src/db/storage.c \
+    src/db/index.c \
     src/db/keyset.c \
     src/db/simd.c \
     src/db/tls.c \
     src/db/btree.c \
-    src/db/storage.c \
-    src/db/index.c \
+    src/db/objlock.c \
+    src/db/config.c \
     src/db/query.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
