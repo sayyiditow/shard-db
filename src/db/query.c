@@ -14463,11 +14463,6 @@ typedef struct {
        plain size_t. budget_exceeded flips per-ctx once the cap is hit. */
     _Atomic size_t *shared_buffer_bytes;
     int budget_exceeded;
-    /* Coarse mutex for hashtable + bucket accumulator updates when the scan
-       runs callbacks concurrently (scan_shards path). parallel_indexed_agg
-       pre-existed this and uses per-worker ctxs merged later, so the lock is
-       harmless there (no contention). */
-    pthread_mutex_t lock;
     /* Slab arena for AggBucket + group_key + group_vals + accums. All
        per-bucket allocations live here so teardown is O(slabs) not
        O(buckets) and bucket creation skips ~5 malloc/strdup calls. Per-
@@ -15329,11 +15324,10 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         gvals[i] = gbuf[i];
     }
 
-    /* Find or create bucket + accumulate under internal mutex.
-       criteria_match_tree + group extraction above are thread-local /
-       read-only; only hashtable insert and accumulator updates need
-       serialization. Mutex stays cheap because the sections are tiny. */
-    pthread_mutex_lock(&ctx->lock);
+    /* Find or create bucket + accumulate. Every parallel path now gives
+       each worker its own cloned AggCtx (fresh hash table + arena), so
+       hashtable insert and accumulator updates are worker-local — no
+       mutex needed. */
     AggBucket *bkt;
     if (ctx->ngroups > 0) {
         bkt = agg_find_or_create(ctx, gvals, ctx->ngroups);
@@ -15341,10 +15335,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         char *empty = "";
         bkt = agg_find_or_create(ctx, &empty, 1);
     }
-    if (!bkt) {
-        pthread_mutex_unlock(&ctx->lock);
-        return 1;  /* budget exceeded — stop scan */
-    }
+    if (!bkt) return 1;  /* budget exceeded — stop scan */
 
     for (int i = 0; i < ctx->nspecs; i++) {
         AggAccum *a = &bkt->accums[i];
@@ -15382,7 +15373,6 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
             if (v > a->max) a->max = v;
         }
     }
-    pthread_mutex_unlock(&ctx->lock);
     return 0;
 }
 
@@ -15543,6 +15533,59 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     src->total_buckets = 0;
 }
 
+/* Per-kf-shard aggregate worker for v2 full scan. Each worker gets its
+   own cloned AggCtx (own hash table + arena), so agg_scan_cb runs
+   lock-free. Replaces scan_shards_v2's shared-ctx parallel fan-out. */
+typedef struct {
+    V2ScanWrap   wrap;
+    V2ShardArg   arg;
+    AggCtx       local;
+} AggV2ScanWork;
+
+static void *agg_v2_scan_worker(void *arg) {
+    AggV2ScanWork *w = (AggV2ScanWork *)arg;
+    g_out = w->arg.parent_out ? w->arg.parent_out : stdout;
+    if (w->arg.stop_flag &&
+        __atomic_load_n(w->arg.stop_flag, __ATOMIC_ACQUIRE)) return NULL;
+    int rc = slotcask_walk_one_shard(w->arg.db, w->arg.kf_shard_id,
+                                      w->arg.scb, w->arg.sctx,
+                                      w->arg.stop_flag);
+    if (rc != 0 && w->arg.stop_flag)
+        __atomic_store_n(w->arg.stop_flag, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
+    int n = sdb->num_shards;
+    if (n <= 0) return;
+    AggV2ScanWork *workers = calloc((size_t)n, sizeof(AggV2ScanWork));
+    if (!workers) {
+        /* Fallback: sequential scan on shared ctx (same as old path). */
+        scan_shards_v2(sdb, agg_scan_cb, main_ctx);
+        return;
+    }
+    int stop_flag = 0;
+    FILE *parent_out = g_out;
+    for (int s = 0; s < n; s++) {
+        agg_ctx_clone_shared(&workers[s].local, main_ctx);
+        workers[s].wrap.cb = agg_scan_cb;
+        workers[s].wrap.ctx = &workers[s].local;
+        workers[s].arg = (V2ShardArg){
+            .db = sdb, .kf_shard_id = s,
+            .scb = v2_scan_wrap_cb, .sctx = &workers[s].wrap,
+            .stop_flag = &stop_flag,
+            .parent_out = parent_out,
+        };
+    }
+    g_scan_stop = 0;
+    parallel_for(agg_v2_scan_worker, workers, n, sizeof(AggV2ScanWork));
+    for (int s = 0; s < n; s++) {
+        if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
+        agg_ctx_merge(main_ctx, &workers[s].local);
+    }
+    free(workers);
+}
+
 /* Per-shard aggregate worker: own AggCtx, processes this shard's hashes. */
 typedef struct {
     const char *db_root;
@@ -15653,15 +15696,9 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
 
 /* ========== PRIMARY_NONE aggregate via per-worker scan ==========
 
-   The original PRIMARY_NONE path passed the shared main_ctx to
-   scan_shards(agg_scan_cb, main_ctx); agg_scan_cb takes ctx->lock per
-   record, so all 8 shard workers serialised on a single mutex —
-   `group by active count(*) + avg(balance)` ran 200-300ms even though
-   the per-record CPU work is ~50ns.
-
-   This orchestrator spawns one scan worker per data shard, each with
-   its OWN cloned AggCtx (own hash table, own accumulators), so the
-   per-record callback runs lock-uncontested. After all workers finish,
+   v1 data-shard path: spawns one scan worker per data shard, each with
+   its own cloned AggCtx (own hash table, own accumulators), so the
+   per-record callback runs lock-free. After all workers finish,
    merge their local hash tables into main_ctx via agg_ctx_merge.
 
    Memory: per worker the local hash table holds ≤ records_per_shard
@@ -15677,9 +15714,8 @@ typedef struct {
 
 static void *scan_agg_worker(void *arg) {
     ScanAggWork *w = (ScanAggWork *)arg;
-    /* scan_one_shard will call agg_scan_cb per record on &w->local. The
-       callback's ctx->lock mutex stays in place but is uncontested
-       within a single worker's serialised iteration. */
+    /* scan_one_shard calls agg_scan_cb per record on &w->local. Since
+       each worker has its own cloned AggCtx, no mutex needed. */
     scan_one_shard(w->path, w->slot_size, agg_scan_cb, &w->local);
     return NULL;
 }
@@ -15787,7 +15823,6 @@ static void agg_free(AggCtx *ctx) {
     ctx->ht_cap = ctx->ht_mask = 0;
     ctx->total_buckets = 0;
     free(ctx->specs);
-    pthread_mutex_destroy(&ctx->lock);
 }
 
 /* Format a double, removing trailing zeros */
@@ -15888,14 +15923,17 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
            scan_shards(agg_scan_cb, ctx) path that serialised every
            record through ctx->lock. */
         if (sch->storage_version == 2) {
-            /* v2: sequential walk via slotcask_walk_live + agg_scan_cb on
-               the main ctx. Phase 8 perf can parallelise across kf shards. */
+            /* v2: parallel kf shard scan with per-worker cloned AggCtx
+               (own hash table per kf shard), merged at end. The old path
+               passed the shared ctx through scan_shards_v2 which fanned
+               out internally via parallel_for — all workers shared the
+               same AggCtx, requiring the per-record mutex in agg_scan_cb. */
             SlotcaskSchemaInfo info = {
                 .splits = sch->splits, .slot_size = sch->slot_size,
                 .streams = sch->streams, .storage_version = 2,
             };
             SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-            if (sdb) scan_shards_v2(sdb, agg_scan_cb, ctx);
+            if (sdb) parallel_agg_scan_shards_v2(ctx, sdb);
         } else {
             parallel_agg_scan_shards(ctx, data_dir, sch->slot_size);
         }
@@ -16490,7 +16528,6 @@ int cmd_aggregate(const char *db_root, const char *object,
     ctx.fs = &fs;
     ctx.specs = specs;
     ctx.nspecs = nspecs;
-    pthread_mutex_init(&ctx.lock, NULL);
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     ctx.deadline = &dl;
     _Atomic size_t agg_budget_bytes = 0;
