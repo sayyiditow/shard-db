@@ -869,6 +869,14 @@ void parse_field_type(const char *spec, TypedField *f) {
         if (comma) f->numeric_scale = atoi(comma + 1);
         else f->numeric_scale = 2; /* default 2 decimal places */
     }
+    /* Precompute 10^scale so decode-hot paths don't recompute per record */
+    if (f->type == FT_NUMERIC) {
+        int64_t mult = 1;
+        for (int i = 0; i < f->numeric_scale; i++) mult *= 10;
+        f->numeric_scale_mult = mult;
+    } else {
+        f->numeric_scale_mult = 0;
+    }
 }
 
 /* Cache for typed schemas */
@@ -1188,9 +1196,7 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
-        int64_t v = (int64_t)(dv * scale + (dv >= 0 ? 0.5 : -0.5));
+        int64_t v = (int64_t)(dv * f->numeric_scale_mult + (dv >= 0 ? 0.5 : -0.5));
         out[0] = (v >> 56) & 0xFF; out[1] = (v >> 48) & 0xFF;
         out[2] = (v >> 40) & 0xFF; out[3] = (v >> 32) & 0xFF;
         out[4] = (v >> 24) & 0xFF; out[5] = (v >> 16) & 0xFF;
@@ -1387,9 +1393,7 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
-        int64_t v = (int64_t)(dv * scale + (dv >= 0 ? 0.5 : -0.5));
+        int64_t v = (int64_t)(dv * f->numeric_scale_mult + (dv >= 0 ? 0.5 : -0.5));
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
         out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
         out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
@@ -1781,8 +1785,7 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
                     ((int64_t)data[4] << 24) | ((int64_t)data[5] << 16) |
                     ((int64_t)data[6] << 8) | data[7];
         if (v == 0) return snprintf(buf, buflen, "0");
-        int64_t scale = 1;
-        for (int s = 0; s < f->numeric_scale; s++) scale *= 10;
+        int64_t scale = f->numeric_scale_mult;
         int64_t whole = v / scale;
         int64_t frac = v % scale;
         int neg = (v < 0);

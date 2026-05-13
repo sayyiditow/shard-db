@@ -171,6 +171,7 @@ typedef struct {
     int size;           /* storage bytes for this field */
     int offset;         /* byte offset within value region */
     int numeric_scale;  /* S for numeric:P,S (decimal places) */
+    int64_t numeric_scale_mult; /* precomputed 10^numeric_scale (0 if not FT_NUMERIC) */
     int removed;        /* 1 if tombstoned (fields.conf line ends with :removed);
                            its bytes stay reserved until vacuum compacts them out */
     enum DefaultKind default_kind;

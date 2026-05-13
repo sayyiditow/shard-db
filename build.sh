@@ -46,7 +46,7 @@ WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter -Wno-add
 BUILD_MODE="${BUILD_MODE:-release}"
 case "$BUILD_MODE" in
     release)
-        MODE_CFLAGS="-O2 -flto=auto $WARN_CFLAGS"
+        MODE_CFLAGS="-O2 -flto=auto -march=native $WARN_CFLAGS"
         MODE_LDFLAGS="-flto=auto"
         DO_STRIP=1
         ;;
