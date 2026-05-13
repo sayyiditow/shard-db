@@ -1159,14 +1159,25 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_TIME: {
-        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
-        int hh = 0, mm = 0, ss = 0;
-        if (vlen >= 8) {
-            hh = (val[0]-'0')*10 + (val[1]-'0');
-            mm = (val[3]-'0')*10 + (val[4]-'0');
-            ss = (val[6]-'0')*10 + (val[7]-'0');
+        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian).
+           Validate strictly: 8 chars, digits at 0/1/3/4/6/7, ':' at 2 and 5,
+           hh ≤ 23, mm ≤ 59, ss ≤ 59. Malformed → encode 0 (matches the UUID
+           "garbage in → zeroed" convention). */
+        uint32_t secs = 0;
+        if (vlen >= 8 && val[2] == ':' && val[5] == ':') {
+            int ok = 1;
+            for (int i = 0; i < 8 && ok; i++) {
+                if (i == 2 || i == 5) continue;
+                if (val[i] < '0' || val[i] > '9') ok = 0;
+            }
+            if (ok) {
+                int hh = (val[0]-'0')*10 + (val[1]-'0');
+                int mm = (val[3]-'0')*10 + (val[4]-'0');
+                int ss = (val[6]-'0')*10 + (val[7]-'0');
+                if (hh <= 23 && mm <= 59 && ss <= 59)
+                    secs = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
+            }
         }
-        uint32_t secs = hh * 3600 + mm * 60 + ss;
         out[0] = (secs >> 16) & 0xFF;
         out[1] = (secs >> 8) & 0xFF;
         out[2] = secs & 0xFF;

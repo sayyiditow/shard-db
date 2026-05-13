@@ -86,6 +86,17 @@ static int test_config_encode_run(void) {
     memset(out, 0, 64); encode_field_len(&f_time, "12:30:00", 8, out);
     ASSERT_EQ_INT(out[0], 0, "time hi");
     ASSERT_EQ_INT(out[1], 0xAF, "time mid");
+    /* malformed FT_TIME inputs must encode 0 (matches FT_UUID convention) */
+    memset(out, 0xAA, 64); encode_field_len(&f_time, "12-30-00", 8, out);
+    ASSERT_EQ_INT(out[0] | out[1] | out[2], 0, "time wrong separator → 0");
+    memset(out, 0xAA, 64); encode_field_len(&f_time, "25:00:00", 8, out);
+    ASSERT_EQ_INT(out[0] | out[1] | out[2], 0, "time hour out of range → 0");
+    memset(out, 0xAA, 64); encode_field_len(&f_time, "12:60:00", 8, out);
+    ASSERT_EQ_INT(out[0] | out[1] | out[2], 0, "time minute out of range → 0");
+    memset(out, 0xAA, 64); encode_field_len(&f_time, "1a:30:00", 8, out);
+    ASSERT_EQ_INT(out[0] | out[1] | out[2], 0, "time non-digit → 0");
+    memset(out, 0xAA, 64); encode_field_len(&f_time, "12:30", 5, out);
+    ASSERT_EQ_INT(out[0] | out[1] | out[2], 0, "time too short → 0");
 
     TypedField f_num = make_f(FT_NUMERIC, 8, 2);
     memset(out, 0, 64); encode_field_len(&f_num, "123.45", 6, out);
