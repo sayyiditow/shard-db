@@ -41,7 +41,7 @@ esac
 # safely and we never act on the truncated result. The CodeQL +
 # scan-build + cppcheck CI workflows catch real format-string issues
 # more reliably than -Wformat-truncation does.
-WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter -Wno-address-of-packed-member"
+WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter -Wno-address-of-packed-member -Wno-unused-result"
 
 BUILD_MODE="${BUILD_MODE:-release}"
 case "$BUILD_MODE" in
@@ -51,18 +51,18 @@ case "$BUILD_MODE" in
         DO_STRIP=1
         ;;
     asan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined $WARN_CFLAGS"
-        MODE_LDFLAGS="-fsanitize=address,undefined"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_LDFLAGS="-fsanitize=address,undefined -no-pie"
         DO_STRIP=0
         ;;
     tsan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread $WARN_CFLAGS"
-        MODE_LDFLAGS="-fsanitize=thread"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_LDFLAGS="-fsanitize=thread -no-pie"
         DO_STRIP=0
         ;;
     debug)
-        MODE_CFLAGS="-O0 -g $WARN_CFLAGS"
-        MODE_LDFLAGS=""
+        MODE_CFLAGS="-O0 -g -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_LDFLAGS="-no-pie"
         DO_STRIP=0
         ;;
     coverage)
@@ -89,7 +89,7 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/query.c src/db/config.c src/db/server.c src/db/main.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -195,6 +195,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/db/btree.c \
     src/db/objlock.c \
     src/db/query.c \
+    src/db/server.c \
     src/db/config.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
@@ -220,8 +221,17 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/test/test_runner.c \
     src/test/fixtures.c \
     src/db/util.c \
-    src/db/config.c \
+    src/db/parallel.c \
+    src/db/storage.c \
+    src/db/index.c \
+    src/db/keyset.c \
     src/db/btree.c \
+    src/db/objlock.c \
+    src/db/tls.c \
+    src/db/slotcask.c \
+    src/db/simd.c \
+    src/db/query.c \
+    src/db/config.c \
     -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
