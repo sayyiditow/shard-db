@@ -44,9 +44,16 @@ esac
 WARN_CFLAGS="-Wall -Wextra -Wno-format-truncation -Wno-unused-parameter -Wno-address-of-packed-member -Wno-unused-result"
 
 BUILD_MODE="${BUILD_MODE:-release}"
+# BUILD_MARCH (opt-in): pass through as -march=$BUILD_MARCH. Defaults to
+# unset (portable baseline) so prebuilt binaries shipped from CI run on
+# any x86-64 / aarch64 host. Self-built deployments can set
+# BUILD_MARCH=native (or e.g. x86-64-v3) for MOVBE/BMI2/AVX2 codegen at
+# the cost of CPU-microarchitecture portability.
+MARCH_CFLAGS=""
+[ -n "$BUILD_MARCH" ] && MARCH_CFLAGS="-march=$BUILD_MARCH"
 case "$BUILD_MODE" in
     release)
-        MODE_CFLAGS="-O2 -flto=auto -march=native $WARN_CFLAGS"
+        MODE_CFLAGS="-O2 -flto=auto $MARCH_CFLAGS $WARN_CFLAGS"
         MODE_LDFLAGS="-flto=auto"
         DO_STRIP=1
         ;;
