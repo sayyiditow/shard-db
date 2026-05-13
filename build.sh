@@ -215,10 +215,13 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_queries.c \
     src/bench/bench_joins.c \
     src/bench/bench_incremental.c \
+    src/bench/bench_btree.c \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
     src/db/util.c \
+    src/db/config.c \
+    src/db/btree.c \
     -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
