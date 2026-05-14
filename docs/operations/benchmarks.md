@@ -209,24 +209,28 @@ These numbers assume **warm cache** (kernel page cache holds the relevant kf + s
 
 ### AGGREGATE — single-fn standalone
 
-| query | warm | cold |
-|---|---|---|
-| `count all` (metadata) | **0.6 ms** | 0.6 ms |
-| `min/max` on indexed (int/long/etc.) | 0.1-30 ms | 0.5-200 ms |
-| `sum age` | 500-700 ms | 9-11 s |
-| `sum balance` (numeric) | 1.5-2 s | 13-16 s |
-| `max created_at` (date) | 1-1.5 s | 13-15 s |
-| `avg score` | 600-800 ms | 0.5-2 s |
+The leaf-only walker + MADV_SEQUENTIAL combo shipped in 2026.05.4 brings cold sum/avg from multi-second to a few hundred ms — disc reads coalesce into 128 KB+ I/Os instead of 4 KB-per-page faults under the default `MADV_RANDOM`.
+
+| query | warm | cold (2026.05.4) | cold (2026.05.3) |
+|---|---|---|---|
+| `count all` (metadata) | **0.6 ms** | 0.6 ms | 0.6 ms |
+| `min/max` on indexed (int/long/etc.) | 0.1-1 ms | 0.2-1 ms | 0.5-200 ms |
+| `sum age` (int) | 20-30 ms | **~180 ms** | 9-11 s |
+| `sum user_id` (long) | similar | **~220 ms** | similar to int |
+| `sum balance` (numeric) | 40-50 ms | **~210 ms** | 13-16 s |
+| `avg score` (double) | 40-50 ms | **~40 ms** (warm path) | 0.5-2 s |
 
 ### AGGREGATE — bundled & grouped
 
-The parallel Pass 1 + parallel merge wins are most visible at this scale:
+The parallel Pass 1 + parallel merge wins are most visible at this scale. 2026.05.4 added two streaming-distinct fast paths gated on `single varchar group_by + finite limit + no criteria/having/order_by` — for queries that match the shape, the wins are dramatic:
 
 | query | warm |
 |---|---|
 | `group by active` (count + avg) | 3-5 s |
-| **`group by username, count` (varchar idx, ~12.5M unique)** | **4-5 s** (was 13-22s pre-parallel) |
-| **`group by email, sum(balance)` (varchar idx)** | **5-8 s** (was 22s pre-parallel) |
+| **`group by username, count limit 10` (varchar idx, high-card)** | **~3 ms cold** (was 4-5 s — streaming k-way merge, 2026.05.4) |
+| **`group by email, sum(balance) limit 10` (varchar idx + indexed numeric agg)** | **~4 ms cold** (was 5-8 s — streaming k-way merge + per-emit lookup, 2026.05.4) |
+| `group by username, count` (no limit, full enumeration) | 4-5 s |
+| `group by email, sum(balance)` (no limit) | 5-8 s |
 | `group by birthday, count` (low cardinality) | 90-110 ms |
 | `group by F where AND-of-indexed` | 30-50 ms |
 | `group by F1, F2` (multi-field, low cardinality) | 6-9 s |

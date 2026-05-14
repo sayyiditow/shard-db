@@ -4,6 +4,83 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.4
+
+This release is a query-performance and concurrency-safety push, focused on the 25M-row bench profile we've been running. No protocol changes, no schema changes, no migration step — drop in the new binaries and restart.
+
+### Query performance — five fast-path landings
+
+Headline cold-bench movements at 25M users (post `sync && drop_caches`):
+
+| Query shape | Before | After | Speedup |
+|---|---|---|---|
+| `sum X` single-spec, indexed numeric (int/long/short/numeric/date) | ~2 s each | ~200 ms each | **~10×** |
+| `group by username, count limit 10` (high-card varchar idx) | 5.6 s | **3.6 ms** | **~1570×** |
+| `group by email, sum(balance) limit 10` (varchar idx + indexed numeric agg) | 7.5 s | **4.1 ms** | **~1800×** |
+| First cold full-scan `count starts bio 'Software'` (non-idx varchar) | 1.3 s | ~800 ms | ~1.6× |
+| `agg WHERE active=false (count+avg)` | 2.7 s | 1.1 s | ~2.5× |
+
+Implementation: five PRs (#33-#36 plus the perf branch in this release):
+
+- **Leaf-only walker for single-spec SUM/AVG.** New `btree_walk_all_values` in btree.c — a tight forward leaf-chain walk that bypasses `BtRangeIter`'s per-entry overhead (no hash memcpy, no bound check, no yield-buffer copy). Per-entry CPU drops from ~145 ns to ~50 ns. Routed from `agg_single_shard_worker` for SUM/AVG; MIN/MAX keep the iter path (they short-circuit on the first leaf entry anyway).
+
+- **`MADV_SEQUENTIAL` on btree leaf walks.** The per-btree mmap is set to `MADV_RANDOM` at acquire time (correct for point lookups; suppresses readahead). Sum/avg full walks under that hint page-fault 4 KB at a time. `MADV_SEQUENTIAL` for the walk duration coalesces into 128 KB+ readahead I/Os; restored to `MADV_RANDOM` at all exit paths so concurrent point lookups keep their no-wasted-readahead behaviour. `POSIX_FADV_WILLNEED` was tried first and didn't move cold sums — async prefetch races the walk's faults.
+
+- **`MADV_SEQUENTIAL` on slotcask kf during full-shard walks.** Same pattern applied to the kf walk that drives every PRIMARY_NONE full-scan query (`find/count/aggregate` with non-indexed criteria, regex bio, field-vs-field). The matching extension to seg files was tried and reverted — the shared-segment files plus `MADV_SEQUENTIAL`'s "free after use" semantic caused cross-query cache eviction that regressed unrelated queries.
+
+- **Streaming k-way merge for varchar `group_by` + count + limit.** The IGB fast path builds a full N-bucket hash table even when `limit=10`. New path walks each idx_shard's btree leaves via `BtRangeIter`, runs a k-way merge to dedup the same varchar across shards (idx_shards are hash16-routed, so the same value can land in multiple shards), emits `(key, count)` directly into `ctx.ht`, stops at `limit`. Gates strictly on single varchar group_by + COUNT-only + finite limit + no criteria / having / order_by.
+
+- **Streaming-distinct extended to SUM/AVG/MIN/MAX.** Same k-way merge, plus a per-emit `VSStaged` slot that aggregates SUM/AVG/MIN/MAX values via `slotcask_lookup_by_hash` of each contributing record's hash16. Gates on indexed non-varchar agg field; per-run cap (16384 records) aborts cleanly to IGB on low-cardinality data so ctx.ht stays untouched.
+
+### Concurrency audit — TSan + ASan clean (full suite)
+
+Triggered by a TSan flake on PR #35's CI. We did a systematic pass under both sanitizers across all 76 test cases.
+
+**Real bugs fixed:**
+
+- **`parallel_for` help-drain race.** Caller's nested-path acquire-read of `remaining` could see 0 and proceed to `pthread_mutex_destroy` while the last worker was still between `fetch_sub` and the post-broadcast unlock. Real crash potential under nested parallel calls. Added `_Atomic int finishing` to `PoolGroup` — workers bump before fetch_sub, decrement after the broadcast; caller waits for both `remaining==0` AND `finishing==0` before destroying. `sched_yield` spin; window is microseconds.
+
+- **`objlock.c` fast-path probe race.** The lockless probe of `(used, name)` raced with the slow-path install. In theory this could allow two threads to install entries for the same object in different slots — and then a concurrent vacuum/rebuild + insert might end up using different rwlocks for the same object → data corruption. Made `used` `_Atomic` with release-store after `strncpy`; acquire-load in fast path guarantees `strcmp` sees a coherent name snapshot.
+
+- **Memory leak in parallel aggregate paths.** `parallel_agg_scan_shards_v2`, `parallel_indexed_agg`, and `parallel_agg_scan_shards` called `agg_ctx_merge` per worker but never freed the per-worker arenas. ASan flagged 12 MB+ leak per `group by X count+avg(Y)` query at 25M. Added `agg_ctx_free_local` after each merge.
+
+**Stop flags and stats counters made atomic** (benign data races, now silent under TSan): `g_log_running`, `server_running`, `active_threads`, `in_flight_writes`, `g_scan_stop`, `QueryDeadline.timed_out`, `CountCtx.dl_counter`, `JoinBtHit.found`, `parallel_for`'s `SUBMIT_CHUNK` init-once. Two test-only races also fixed.
+
+**`localtime` → `localtime_r`** in config.c and query.c — libc's non-reentrant `localtime` returned a shared static buffer, racing across concurrent log calls. Logged-timestamp-only impact, but cleared the warning.
+
+**Suppressions for known-correct-under-C11-but-TSan-blind patterns.** Two `.tsan.supp` entries: the `bt_acquire / segcache_acquire / kfcache_acquire` verify-retry lock-order false positive (release happens between acquires; TSan tracks cycles without modeling unlocks), and the `seg_record_emit / seg_rec_*` byte-level races where the byte-18 flag is the release-store/acquire-load synchronisation point for the full record (C11 guarantees coherency after observing `flag==1`; TSan tracks each byte independently). Both documented inline in `.tsan.supp`. The `slotcask_registry_invalidate` use-after-free is suppressed and tracked as a backlog item (needs SlotcaskDb refcounting; in practice the invalidate only fires from drop-object during quiet periods).
+
+**ASan suppression** (`.lsan.supp`): match_criterion's thread-local `regex_t` cache leaks ~8 KB total at process exit (one per pool worker). Future fix is `pthread_key_create` destructor.
+
+### Multi-field int group_by — silent bucket collisions fixed
+
+PR #32 shipped an integer-hash fast path for `group_by` on int/long/short/numeric/date fields. A multi-field full-scan path had three compounding bugs:
+
+- `typed_field_to_raw` emitted 0 bytes when `v==0` for INT/LONG/SHORT/NUMERIC/DATE → zero values silently collapsed in the raw key, so e.g. `(a=0,b=5)` and `(a=5,b=0)` hashed identically.
+- 16-byte inline raw_key cap silently dropped trailing fields when ngroups summed to >16 B → `(1,1,1)` and `(1,1,2)` could collide on 3-long groupings.
+- `agg_ctx_clone_shared` didn't propagate `use_int_keys` to parallel workers, so the integer fast path was effectively unused under parallel scan.
+- `agg_scan_cb`'s stack `gbuf` wasn't NUL-initialised, so prior-record bytes leaked into the next record's group_vals on the string fallback path when `typed_field_to_buf_raw` returned 0 for v=0.
+
+Fix: `typed_field_to_raw` now always emits the full natural byte width; `AGG_INT_KEY_CAP` bumped to 32 bytes; `cmd_aggregate` gates `use_int_keys` on total width fitting the cap; `agg_ctx_clone_shared` propagates the flag; `gbuf[i][0]` NUL-init'd before each decode. Pinned in `test_agg_int_groupby_multi`.
+
+### FT_TIME parser — strict validation
+
+The `time` field encode + criterion parse both blindly indexed `val[0..7]` without validating that positions 2/5 were `:`, that the digit positions held digits, or that hh/mm/ss were in range. Garbage input silently encoded to incorrect seconds-of-day. Now both paths require all eight chars to be well-formed `HH:MM:SS`; malformed encodes 0, matching the FT_UUID convention. Pinned in `test_config_encode`.
+
+### `-march=native` is now opt-in via `BUILD_MARCH`
+
+Previous release builds hard-coded `-march=native`, tying any CI-shipped binary to the build host's microarchitecture. Default release is now `-O2 -flto=auto` (portable across x86-64 + ARM64). Self-built deployments opt in:
+
+```bash
+./build.sh                          # portable (default)
+BUILD_MARCH=native ./build.sh       # self-built, full local codegen
+BUILD_MARCH=x86-64-v3 ./build.sh    # portable-but-modern (BMI2 / AVX2)
+```
+
+### Branch protection
+
+Classic branch protection enabled on `main` (mirror of the existing ruleset). Closes the Scorecard Branch-Protection finding without changing the existing PR-required workflow (admin bypass preserved for solo-OSS dev ergonomics).
+
 ## 2026.05.3
 
 ### Reindex memory safety — adaptive batching + pre-sized pairs + exact-key malloc
