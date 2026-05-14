@@ -13353,6 +13353,27 @@ static int update_schema_conf_to_v2(const char *db_root, const char *object,
     return ok ? 0 : -1;
 }
 
+/* Atomic rename `src` → `dst` that FAILS with EEXIST if `dst` already
+   exists. Linux: renameat2(RENAME_NOREPLACE). macOS: renamex_np with
+   RENAME_EXCL (10.12+). Anywhere else: stat-then-rename with a small
+   TOCTOU window — only used by the operator-driven migrate path, which
+   doesn't run concurrent renames. */
+static int rename_noreplace(const char *src, const char *dst) {
+#if defined(__linux__) && defined(RENAME_NOREPLACE)
+    return renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE);
+#elif defined(__APPLE__)
+    extern int renamex_np(const char *, const char *, unsigned int);
+    /* RENAME_EXCL is the macOS analogue (sys/stdio.h, 10.12+).
+       Hardcoded value to avoid depending on _DARWIN_C_SOURCE feature
+       test gating the constant — it's a stable kernel ABI. */
+    return renamex_np(src, dst, /* RENAME_EXCL */ 0x4);
+#else
+    struct stat st;
+    if (stat(dst, &st) == 0) { errno = EEXIST; return -1; }
+    return rename(src, dst);
+#endif
+}
+
 int cmd_migrate_storage_version(const char *db_root, const char *dir,
                                  const char *object) {
     Schema sc = load_schema(db_root, object);
@@ -13390,8 +13411,7 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
        1693835 same root cause). errno mapping recovers the same three
        error messages the old stats produced. */
     fcache_invalidate(data_dir);
-    if (renameat2(AT_FDCWD, data_dir, AT_FDCWD, data_legacy,
-                   RENAME_NOREPLACE) != 0) {
+    if (rename_noreplace(data_dir, data_legacy) != 0) {
         int e = errno;
         if (e == EEXIST) {
             OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
@@ -13414,8 +13434,7 @@ int cmd_migrate_storage_version(const char *db_root, const char *dir,
            just renamed it away) and data.legacy is ours — RENAME_NOREPLACE
            keeps this race-free too. If rollback also fails the operator
            sees both error paths logged. */
-        if (renameat2(AT_FDCWD, data_legacy, AT_FDCWD, data_dir,
-                       RENAME_NOREPLACE) != 0)
+        if (rename_noreplace(data_legacy, data_dir) != 0)
             log_msg(1, "migrate: rollback rename failed: %s", strerror(errno));
         OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
             dir, object);
