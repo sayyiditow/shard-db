@@ -101,7 +101,13 @@ gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c sr
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
 # pthread/daemon code. Self-contained connection helper in src/cli/conn.c.
-gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lncursesw -lssl -lcrypto
+# ncurses lib name: Linux has libncursesw (wide-char); macOS's bundled
+# ncurses is built with wide-char baked into -lncurses, no -w suffix.
+NCURSES_LDFLAGS="-lncursesw"
+case "$(uname)" in
+    Darwin) NCURSES_LDFLAGS="-lncurses" ;;
+esac
+gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS $NCURSES_LDFLAGS -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-cli
 
 # migrate — one-shot per-release upgrade runner. Pure FS ops + system()

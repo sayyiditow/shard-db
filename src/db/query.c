@@ -2047,14 +2047,22 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     return errors > 0 ? 1 : 0;
 }
 
-/* Bulk insert from a string already in memory — no temp file needed */
+/* Bulk insert from a string already in memory — no temp file needed.
+   On Linux the fast path uses memfd_create + /proc/self/fd/N so the
+   downstream mmap reader is page-cache only with no real filesystem
+   round-trip. macOS has neither memfd_create nor /proc/self/fd/N, so
+   it takes the /tmp fallback unconditionally (same code path that
+   already handles memfd_create failure on Linux). */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str,
                            int if_not_exists) {
-    /* Write to a memfd (in-memory file) so cmd_bulk_insert can mmap it */
     size_t slen = strlen(json_str);
+#ifdef __linux__
     int memfd = memfd_create("shard-db_bulk", 0);
+#else
+    int memfd = -1;  /* macOS / non-Linux: skip straight to /tmp fallback */
+#endif
     if (memfd < 0) {
-        /* Fallback: temp file */
+        /* Fallback: temp file. Also the macOS path. */
         char tmp[PATH_MAX];
         snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bulk_%d_%d.json", getpid(), (int)pthread_self());
         FILE *tf = fopen(tmp, "w");

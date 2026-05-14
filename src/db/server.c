@@ -1582,12 +1582,17 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     free(mode); free(dir); free(object);
 }
 
-/* ========== SERVER MODE (epoll + thread pool) ========== */
+/* ========== SERVER MODE (poll + thread pool) ========== */
+
+/* Accept loop uses poll() instead of epoll for portability with macOS.
+   Single listening fd + 500ms shutdown-check timeout — no benefit from
+   epoll's selectivity here, and poll() is in the POSIX baseline so the
+   same code runs on Linux and macOS without #ifdefs. */
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <sys/epoll.h>
+#include <poll.h>
 
 /* _Atomic for both: shutdown sets server_running=0 from the signal-handler
    thread while worker threads loop on it; the stats handlers also read
@@ -2554,37 +2559,44 @@ int cmd_server(const char *db_root, int daemonize) {
         }
     }
 
-    /* epoll-based accept loop */
-    int epfd = epoll_create1(0);
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = sfd };
-    epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
-
-    while (server_running) {
-        struct epoll_event events[16];
-        int n = epoll_wait(epfd, events, 16, 500); /* 500ms timeout for shutdown check */
+    /* poll-based accept loop. Single fd (the listen socket), so poll()
+       is as cheap as epoll here — no edge-triggered / EPOLLET advantage
+       to lose. The 500ms timeout doubles as the shutdown-check cadence.
+       One accept() per poll() return matches the previous epoll path
+       (which set n=16 max but a single listen socket only emits one
+       readiness event per drain). The listen socket stays blocking, so
+       a spurious POLLIN with no pending connection would block accept()
+       — protect with EWOULDBLOCK / EAGAIN handling. */
+    struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+    while (atomic_load_explicit(&server_running, memory_order_acquire)) {
+        pfd.revents = 0;
+        int n = poll(&pfd, 1, 500);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        for (int i = 0; i < n; i++) {
-            struct sockaddr_in caddr;
-            socklen_t clen = sizeof(caddr);
-            int cfd = accept(sfd, (struct sockaddr *)&caddr, &clen);
-            if (cfd < 0) continue;
+        if (n == 0 || !(pfd.revents & POLLIN)) continue;
 
-            /* TCP_NODELAY — reduce latency for small responses. Best-effort:
-               failure means slightly higher latency under Nagle's, not a
-               correctness issue, so we don't propagate the error. */
-            int flag = 1;
-            (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-            wq_push(&g_work_queue, cfd);
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int cfd = accept(sfd, (struct sockaddr *)&caddr, &clen);
+        if (cfd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            continue;
         }
+
+        /* TCP_NODELAY — reduce latency for small responses. Best-effort:
+           failure means slightly higher latency under Nagle's, not a
+           correctness issue, so we don't propagate the error. */
+        int flag = 1;
+        (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+        wq_push(&g_work_queue, cfd);
     }
 
     /* Graceful shutdown */
     close(sfd);
-    close(epfd);
     log_msg(3, "SHUTDOWN: waiting for %d in-flight writes, %d active connections",
             in_flight_writes, active_threads);
 

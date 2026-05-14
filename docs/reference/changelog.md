@@ -6,7 +6,21 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.05.4
 
-This release is a query-performance and concurrency-safety push, focused on the 25M-row bench profile we've been running. No protocol changes, no schema changes, no migration step — drop in the new binaries and restart.
+Query performance, concurrency-safety, **and macOS support**. No protocol changes, no schema changes, no migration step — drop in the new binaries and restart.
+
+### macOS (Apple Silicon) now supported
+
+Linux-isms swapped for portable equivalents:
+
+- `epoll_create1`/`epoll_wait` → `poll()` in the server accept loop (`src/db/server.c`). Single listen fd; no `epoll` selectivity to lose.
+- `memfd_create` + `/proc/self/fd/N` in `cmd_bulk_insert_string` guarded by `#ifdef __linux__`; macOS uses the existing `/tmp` fallback (same code path that already covered `memfd_create` failure on Linux).
+- `<linux/limits.h>` → `<limits.h>` + `<sys/param.h>` for `PATH_MAX` in 3 files.
+- `-lncursesw` → `-lncurses` on Darwin in `build.sh` (macOS's bundled ncurses is built with wide-char baked in, no `-w` suffix).
+- CI: new `macos-latest` runner added to `.github/workflows/ci.yml` matrix; full 77-case suite runs on Apple Silicon too. Artifact `shard-db-macos-arm64.tar.gz` joins the existing `linux-x86_64` + `linux-arm64` tarballs.
+
+Pre-existing Darwin work (`#ifdef __APPLE__` for `funopen` vs `fopencookie` in TLS, `mremap` fall-back to munmap+mmap in btree, `sync_file_range` already gated to Linux in storage) all stayed as-is and works.
+
+### Query performance — five fast-path landings
 
 ### Query performance — five fast-path landings
 

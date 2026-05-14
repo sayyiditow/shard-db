@@ -28,7 +28,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
-#include <linux/limits.h>
+/* PATH_MAX: portable across Linux + macOS via <limits.h> + <sys/param.h>. */
+#include <limits.h>
+#include <sys/param.h>
 
 #include "migrate.h"
 
