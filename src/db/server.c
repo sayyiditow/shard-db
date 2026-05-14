@@ -2297,6 +2297,7 @@ static int validate_metadata(const char *db_root) {
 }
 
 int cmd_server(const char *db_root, int daemonize) {
+    fprintf(stderr, "CK-A cmd_server entry\n"); fflush(stderr); fsync(2);
     int port = g_port;
 
     /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
@@ -2376,7 +2377,9 @@ int cmd_server(const char *db_root, int daemonize) {
        redirect, leaving the parent's "shard-db started (pid N)" message
        and a stale pid file with no listener — operators saw "started"
        then immediate "stopped" with no diagnostic outside error.log. */
+    fprintf(stderr, "CK-B flock acquired\n"); fflush(stderr); fsync(2);
     load_dirs();
+    fprintf(stderr, "CK-C load_dirs\n"); fflush(stderr); fsync(2);
     {
         int validate_errors = validate_metadata(db_root);
         if (validate_errors > 0) {
@@ -2490,12 +2493,19 @@ int cmd_server(const char *db_root, int daemonize) {
         log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB",
                 g_query_buffer_max_bytes / (1024 * 1024));
     }
+    /* macOS-port startup trace — remove once daemon spawn is stable.
+       Each step prints + fflushes + fsyncs so SIGBUS at any phase leaves
+       the last-reached checkpoint in daemon.log. */
+    fprintf(stderr, "CK0 enter init\n"); fflush(stderr); fsync(2);
     fcache_init(g_fcache_cap);
+    fprintf(stderr, "CK1 fcache\n"); fflush(stderr); fsync(2);
     bt_cache_init(g_btcache_cap);
+    fprintf(stderr, "CK2 bt_cache\n"); fflush(stderr); fsync(2);
     /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
        objects route reads/writes through these; v1 (legacy) objects continue
        to use ucache. Both engines coexist until migration. */
     slotcask_init(g_fcache_cap, g_fcache_cap);
+    fprintf(stderr, "CK3 slotcask\n"); fflush(stderr); fsync(2);
     /* CPU pool size: explicit THREADS wins; otherwise nproc - 2 (leaves
        2 cores for the OS / interactive shell so long full-scan queries
        don't peg every CPU and freeze the operator's session).
@@ -2512,12 +2522,18 @@ int cmd_server(const char *db_root, int daemonize) {
                   : (int)(nproc > 2 ? nproc - 2 : nproc);
     if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
+    fprintf(stderr, "CK4 parallel_pool\n"); fflush(stderr); fsync(2);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
+    fprintf(stderr, "CK5 tokens\n"); fflush(stderr); fsync(2);
     load_allowed_ips_conf(db_root);
+    fprintf(stderr, "CK6 ips\n"); fflush(stderr); fsync(2);
     objlock_init();
+    fprintf(stderr, "CK7 objlock\n"); fflush(stderr); fsync(2);
     rebuild_recovery(db_root);
+    fprintf(stderr, "CK8 rebuild_recovery\n"); fflush(stderr); fsync(2);
     grow_recovery(db_root);
+    fprintf(stderr, "CK9 grow_recovery\n"); fflush(stderr); fsync(2);
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
@@ -2525,6 +2541,7 @@ int cmd_server(const char *db_root, int daemonize) {
 
     /* Init work queue and thread pool */
     wq_init(&g_work_queue, nthreads * 64);
+    fprintf(stderr, "CK10 wq_init\n"); fflush(stderr); fsync(2);
     /* Per-worker active-cfd table for SIGTERM-time shutdown(SHUT_RDWR).
        Allocate before threads spawn so worker_thread can safely write to it
        and handle_shutdown can safely read. */
