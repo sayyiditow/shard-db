@@ -1905,6 +1905,7 @@ typedef struct {
 
 void *worker_thread(void *arg) {
     WorkerArg *wa = (WorkerArg *)arg;
+    fprintf(stderr, "CK-W%d worker enter\n", wa->id); fflush(stderr); fsync(2);
 
     while (server_running) {
         int cfd = wq_pop(&g_work_queue);
@@ -2546,15 +2547,20 @@ int cmd_server(const char *db_root, int daemonize) {
        Allocate before threads spawn so worker_thread can safely write to it
        and handle_shutdown can safely read. */
     g_worker_cfds = malloc(nthreads * sizeof(int));
+    fprintf(stderr, "CK11 g_worker_cfds malloc\n"); fflush(stderr); fsync(2);
     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
     g_worker_cfds_n = nthreads;
+    fprintf(stderr, "CK12 g_worker_cfds init nthreads=%d\n", nthreads); fflush(stderr); fsync(2);
     pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
+    fprintf(stderr, "CK13 pool malloc\n"); fflush(stderr); fsync(2);
     for (int i = 0; i < nthreads; i++) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
         strncpy(wa->db_root, db_root, PATH_MAX - 1);
         wa->id = i;
-        pthread_create(&pool[i], NULL, worker_thread, wa);
+        int rc = pthread_create(&pool[i], NULL, worker_thread, wa);
+        fprintf(stderr, "CK14.%d pthread_create rc=%d\n", i, rc); fflush(stderr); fsync(2);
     }
+    fprintf(stderr, "CK15 about to print listening\n"); fflush(stderr); fsync(2);
 
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",
             port, getpid(), nthreads, g_timeout, g_tls_enable ? "on" : "off");
