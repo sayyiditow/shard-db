@@ -145,6 +145,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_agg_neq_shortcut.c \
     src/test/cases/test_agg_indexed_groupby.c \
     src/test/cases/test_agg_int_groupby_multi.c \
+    src/test/cases/test_agg_leaf_only_walk.c \
     src/test/cases/test_find_indexed_orderby.c \
     src/test/cases/test_or_keyset_cap.c \
     src/test/cases/test_agg_walk_fetch_check.c \
