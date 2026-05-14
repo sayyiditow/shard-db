@@ -17631,6 +17631,118 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    int igb_done = 0;
+
+    /* Fast path: varchar group_by + AGG_COUNT + finite limit, no criteria /
+       having / order_by. The IGB path below would walk every leaf entry,
+       hash each into a per-shard table, scatter+merge, then truncate to
+       limit — wasting nearly all the work for high-cardinality varchars
+       (e.g., `group by username count limit 10` over 25M unique usernames
+       runs 5-7 s building a 25M-entry hash table just to keep 10 rows).
+
+       idx_shards are hash16-routed (per-record), so the SAME varchar value
+       can appear across multiple shards. Each shard's btree is sorted ASC
+       by key. K-way merge: keep one cursor per shard pointing at its
+       current key; the global next distinct key is min(active cursors);
+       sum the run lengths of that key across all shards holding it.
+       Emit (key, total_count), advance contributing cursors past the
+       consumed key, repeat until limit emits or all shards drain.
+       Populates ctx.ht with at most `limit` buckets, then falls through
+       to the shared collect / sort / limit / emit pipeline. */
+    int vs_eligible = (tree == NULL && no_having &&
+                       (!order_by || !order_by[0]) &&
+                       limit > 0 && limit <= 100000 &&
+                       ctx.ngroups == 1 && ctx.group_tfs[0] &&
+                       ctx.group_tfs[0]->type == FT_VARCHAR &&
+                       !strchr(ctx.group_fields[0], '+') &&
+                       nspecs == 1 && specs[0].fn == AGG_COUNT &&
+                       (specs[0].field[0] == '\0' ||
+                        strcmp(specs[0].field, ctx.group_fields[0]) == 0) &&
+                       btree_idx_exists(db_root, object,
+                                        ctx.group_fields[0], sch.splits));
+    if (vs_eligible) {
+        int n_idx_g = index_splits_for(sch.splits);
+        BtRangeIter **iters  = calloc((size_t)n_idx_g, sizeof(BtRangeIter *));
+        char       (*cur_keys)[BT_MAX_VAL_LEN + 1] =
+            calloc((size_t)n_idx_g, sizeof(*cur_keys));
+        size_t      *cur_klens = calloc((size_t)n_idx_g, sizeof(size_t));
+        int         *has_cur   = calloc((size_t)n_idx_g, sizeof(int));
+        if (!iters || !cur_keys || !cur_klens || !has_cur) {
+            free(iters); free(cur_keys); free(cur_klens); free(has_cur);
+            goto vs_skip;
+        }
+        for (int s = 0; s < n_idx_g; s++) {
+            char idx_path[PATH_MAX];
+            build_idx_path(idx_path, sizeof(idx_path), db_root, object,
+                            ctx.group_fields[0], s);
+            iters[s] = btree_range_iter_open(
+                idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+            if (!iters[s]) { has_cur[s] = 0; continue; }
+            const char *v; size_t vl; const uint8_t *h;
+            if (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+                size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
+                memcpy(cur_keys[s], v, cap);
+                cur_klens[s] = cap;
+                has_cur[s] = 1;
+            }
+        }
+
+        int emitted = 0;
+        while (emitted < limit) {
+            /* Find the active cursor with the lexicographically smallest
+               current key. */
+            int min_s = -1;
+            for (int s = 0; s < n_idx_g; s++) {
+                if (!has_cur[s]) continue;
+                if (min_s < 0) { min_s = s; continue; }
+                size_t mn = cur_klens[s] < cur_klens[min_s]
+                            ? cur_klens[s] : cur_klens[min_s];
+                int c = memcmp(cur_keys[s], cur_keys[min_s], mn);
+                if (c < 0 || (c == 0 && cur_klens[s] < cur_klens[min_s]))
+                    min_s = s;
+            }
+            if (min_s < 0) break;  /* all cursors drained */
+
+            /* Snapshot the winning key before advancing any cursor (some
+               cursors share its memory via cur_keys[]). */
+            char min_key[BT_MAX_VAL_LEN + 1];
+            size_t min_klen = cur_klens[min_s];
+            memcpy(min_key, cur_keys[min_s], min_klen);
+
+            /* Sum the run of equal keys across every shard that's
+               currently sitting on this key, advancing each past the run. */
+            int64_t total_count = 0;
+            for (int s = 0; s < n_idx_g; s++) {
+                while (has_cur[s] && cur_klens[s] == min_klen &&
+                       memcmp(cur_keys[s], min_key, min_klen) == 0) {
+                    total_count++;
+                    const char *v; size_t vl; const uint8_t *h;
+                    if (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+                        size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
+                        memcpy(cur_keys[s], v, cap);
+                        cur_klens[s] = cap;
+                    } else {
+                        has_cur[s] = 0;
+                    }
+                }
+            }
+
+            min_key[min_klen] = '\0';
+            char *kvp[1] = { min_key };
+            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+            if (b) b->accums[0].count = total_count;
+            emitted++;
+        }
+
+        for (int s = 0; s < n_idx_g; s++)
+            if (iters[s]) btree_range_iter_close(iters[s]);
+        free(iters); free(cur_keys); free(cur_klens); free(has_cur);
+
+        igb_done = 1;  /* ctx populated — skip the IGB block, emit below. */
+        goto igb_skip;
+    }
+vs_skip:
+
     /* Fast path: indexed group_by (single field, btree exists). Walks the
        group_by btree directly to bucket per encoded value; for any
        sum/avg/min/max specs whose target field is also indexed and
@@ -17708,7 +17820,6 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (crit_plan.kind == PRIMARY_NONE) igb_eligible = 0;
     }
 
-    int igb_done = 0;
     if (igb_eligible) {
         const TypedField *gtf = ctx.group_tfs[0];
         int n_idx_g = index_splits_for(sch.splits);
