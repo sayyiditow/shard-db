@@ -4077,6 +4077,17 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
 
+    /* Cold-walk readahead hint: pass 1 reads the entire kf shard
+       sequentially (slot 0..cap). The default kernel heuristic faults
+       4-8 KB at a time; MADV_SEQUENTIAL switches to 128 KB+ readahead
+       I/Os so a cold 100-300 MB kf shard streams in instead of stalling
+       on per-page disk seeks. Restored to MADV_NORMAL on every exit so
+       concurrent point lookups against the same cached kf (via the kf
+       cache LRU) don't pay readahead they don't want. Mirrors the btree
+       MADV_SEQUENTIAL fix that won 10× cold on sum/avg in PR #33. */
+    int kf_set_seq = (kh.hdr && kh.map_size > 0 &&
+                      madvise(kh.hdr, kh.map_size, MADV_SEQUENTIAL) == 0);
+
     size_t cap = kh.capacity;
     SlotcaskKfEntry *kf = kh.map;
 
@@ -4114,6 +4125,7 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
             }
             segcache_release(&sh);
         }
+        if (kf_set_seq) madvise(kh.hdr, kh.map_size, MADV_NORMAL);
         kfcache_release(&kh);
         return stop;
     }
@@ -4131,6 +4143,7 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
         if (stop_flag && (++sf_check & 0xFF) == 0 &&
             __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE)) {
             free(refs);
+            if (kf_set_seq) madvise(kh.hdr, kh.map_size, MADV_NORMAL);
             kfcache_release(&kh);
             return 0;
         }
@@ -4248,6 +4261,7 @@ done_collect:
     }
     if (sh.slot >= 0 || sh.fd >= 0) segcache_release(&sh);
     free(refs);
+    if (kf_set_seq) madvise(kh.hdr, kh.map_size, MADV_NORMAL);
     kfcache_release(&kh);
     return stop;
 }
@@ -4325,6 +4339,11 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return 0;
 
+    /* Same cold-walk readahead hint as the buffered walker — see
+       walk_one_shard_inner for the rationale. */
+    int kf_set_seq = (kh.hdr && kh.map_size > 0 &&
+                      madvise(kh.hdr, kh.map_size, MADV_SEQUENTIAL) == 0);
+
     size_t cap = kh.capacity;
     SlotcaskKfEntry *kf = kh.map;
     int stop = 0;
@@ -4353,6 +4372,7 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
         }
         segcache_release(&sh);
     }
+    if (kf_set_seq) madvise(kh.hdr, kh.map_size, MADV_NORMAL);
     kfcache_release(&kh);
     return 0;
 }
