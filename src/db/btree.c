@@ -1677,6 +1677,92 @@ void btree_range_iter_close(BtRangeIter *it) {
     free(it);
 }
 
+/* Tight full-leaf walker for the agg single-spec SUM/AVG fast path.
+   Bypasses BtRangeIter: no hash memcpy (16B/entry saved), no per-entry
+   range bound check, no yield-buffer copy. For 25M-entry walks on
+   numeric indexes this cuts per-entry CPU from ~145ns (iter path) to
+   ~50ns (~3× faster on the cold-disk-bound `sum X` queries). */
+int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
+    BtFile bt;
+    if (bt_acquire(&bt, path, 0) != 0) return 0;
+
+    /* Cold-walk readahead hint. The mmap is set to MADV_RANDOM at acquire
+       time — correct for the dominant point-lookup workload, but it
+       suppresses readahead on page faults. A sum/avg walk over a 100-300
+       MB btree under RANDOM page-faults 4 KB at a time and stalls on
+       disk regardless of how cheap the per-entry CPU work is. MADV_
+       SEQUENTIAL switches the kernel to aggressive readahead (128 KB+
+       per disk I/O) for the duration of the walk, then we restore RANDOM
+       before release so concurrent point lookups (which share the cached
+       mmap via bt_cache) get back the no-wasted-readahead behaviour they
+       expect. POSIX_FADV_WILLNEED was tried first and didn't move cold
+       sums — it races the walk's fault stream and MADV_RANDOM defeats
+       the queued readahead. */
+    int set_seq = (bt.map && bt.map_size > 0 &&
+                   madvise(bt.map, bt.map_size, MADV_SEQUENTIAL) == 0);
+
+    BtFileHeader *fh = (BtFileHeader *)bt.map;
+    if (fh->entry_count == 0) {
+        if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+        bt_release(&bt); return 0;
+    }
+
+    /* Walk leftmost-child path from root down to the first leaf. For
+       internal pages, ph->next_leaf doubles as the leftmost-child
+       pointer (matches what iter_seek_fwd uses when bsearch returns 0). */
+    uint32_t page_id = fh->root_page;
+    while (1) {
+        uint8_t *page = bt_page(&bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->page_type == 1) break;
+        page_id = ph->next_leaf;
+        if (page_id == 0) {
+            if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+            bt_release(&bt); return 0;
+        }
+    }
+
+    char key_buf[BT_MAX_VAL_LEN];
+    size_t key_len = 0;
+    int rc = 0;
+
+    while (page_id != 0) {
+        uint8_t *page = bt_page(&bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        int cnt = ph->count;
+        for (int slot = 0; slot < cnt; slot++) {
+            uint8_t *e = page_entry(page, slot);
+            uint8_t plen = leaf_entry_prefix_len(e);
+            size_t slen = leaf_entry_suffix_len(e);
+            if ((slot & (BT_LEAF_RESTART_K - 1)) == 0) {
+                /* Anchor — full key in suffix bytes. */
+                key_len = slen;
+                if (key_len > BT_MAX_VAL_LEN) key_len = BT_MAX_VAL_LEN;
+                memcpy(key_buf, leaf_entry_suffix(e), key_len);
+            } else {
+                /* Prefix-compressed: keep first plen bytes of previous
+                   key, append this slot's suffix. */
+                /* plen ≤ 255 (uint8_t) and BT_MAX_VAL_LEN is 512, so
+                   key_buf + plen is always in-range; only clamp the
+                   total length. */
+                size_t klen = (size_t)plen + slen;
+                if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
+                size_t take = (klen > (size_t)plen) ? (klen - (size_t)plen) : 0;
+                memcpy(key_buf + plen, leaf_entry_suffix(e), take);
+                key_len = klen;
+            }
+            if (leaf_entry_is_tomb(e)) continue;
+            rc = cb(key_buf, key_len, ctx);
+            if (rc != 0) goto done;
+        }
+        page_id = ph->next_leaf;
+    }
+done:
+    if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+    bt_release(&bt);
+    return rc;
+}
+
 void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     /* Drop the cached fd/mapping before unlink — otherwise the cache holds
        the orphaned inode alive and the next acquire opens the new file via

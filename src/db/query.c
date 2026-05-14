@@ -16294,6 +16294,25 @@ typedef struct {
     int     have;
 } AggSingleArg;
 
+/* Per-entry callback for the SUM/AVG fast walk. Decodes the leaf key
+   bytes to a double via the indexed-numeric inverse, then accumulates
+   into the worker's local sum + count. Returns 0 to keep iterating. */
+typedef struct {
+    const TypedField *tf;
+    double            sum;
+    int64_t           count;
+} AggLeafSumCtx;
+
+static int agg_leaf_sum_cb(const char *val, size_t vlen, void *raw) {
+    AggLeafSumCtx *c = (AggLeafSumCtx *)raw;
+    double v;
+    if (decode_index_key_to_double(c->tf, (const uint8_t *)val, vlen, &v)) {
+        c->sum += v;
+        c->count++;
+    }
+    return 0;
+}
+
 static void *agg_single_shard_worker(void *raw) {
     AggSingleArg *a = (AggSingleArg *)raw;
     a->accum = 0; a->count = 0; a->have = 0;
@@ -16301,6 +16320,23 @@ static void *agg_single_shard_worker(void *raw) {
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object,
                     a->field, a->shard_id);
+
+    /* SUM/AVG walk every leaf entry — take the bound-free, hash-free
+       fast path that bypasses BtRangeIter's per-entry overhead. */
+    if (a->fn == AGG_SUM || a->fn == AGG_AVG) {
+        AggLeafSumCtx c = { a->tf, 0.0, 0 };
+        btree_walk_all_values(idx_path, agg_leaf_sum_cb, &c);
+        if (c.count > 0) {
+            a->accum = c.sum;
+            a->count = c.count;
+            a->have  = 1;
+        }
+        return NULL;
+    }
+
+    /* MIN/MAX read one leaf entry per shard (ASC for MIN, DESC for MAX)
+       so iter's break-after-first is already optimal — keep the iter
+       path here to reuse its DESC handling via v3 last_leaf_page. */
     BtRangeIter *it = btree_range_iter_open(
         idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, a->desc);
     if (!it) return NULL;
@@ -16313,14 +16349,12 @@ static void *agg_single_shard_worker(void *raw) {
         if (!a->have) { a->accum = v; a->have = 1; a->count = 1; }
         else {
             switch (a->fn) {
-                case AGG_SUM:
-                case AGG_AVG: a->accum += v; a->count++; break;
                 case AGG_MIN: if (v < a->accum) a->accum = v; a->count++; break;
                 case AGG_MAX: if (v > a->accum) a->accum = v; a->count++; break;
                 default: break;
             }
         }
-        if (a->min_or_max) break;   /* one leaf entry suffices per shard */
+        break;   /* one leaf entry suffices per shard for min/max */
     }
     btree_range_iter_close(it);
     return NULL;
