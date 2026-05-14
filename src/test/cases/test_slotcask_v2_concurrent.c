@@ -39,7 +39,7 @@
 
 typedef struct {
     int port;
-    volatile int *stop;
+    _Atomic int *stop;
     int writer_id;
     /* Each writer cycles a private "version" counter into the value.
        The reader can then verify any value it reads is one of the
@@ -49,7 +49,7 @@ typedef struct {
 
 typedef struct {
     int port;
-    volatile int *stop;
+    _Atomic int *stop;
     int reader_id;
     int ops;
     int torn_reads;
@@ -178,7 +178,7 @@ static int test_slotcask_v2_concurrent_run(void) {
     tc_close(tc); tc = NULL;
 
     /* Spawn writers + readers. */
-    volatile int stop = 0;
+    _Atomic int stop = 0;
     pthread_t writers[NUM_WRITERS], readers[NUM_READERS];
     WriterCtx wctxs[NUM_WRITERS] = {0};
     ReaderCtx rctxs[NUM_READERS] = {0};

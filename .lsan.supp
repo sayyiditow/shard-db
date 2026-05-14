@@ -1,0 +1,13 @@
+# LeakSanitizer suppressions.
+#
+# match_criterion / parse_one_criterion cache a compiled regex_t in a
+# thread-local across calls so OP_REGEX scans don't pay regcomp() per
+# record. The pthreads pool workers live until process shutdown and
+# we don't currently install a thread-exit destructor to regfree() the
+# cache — so on process exit ASan sees the regex_t's internal mallocs
+# as leaked. Bounded total: one regex_t per pool worker × ~512 bytes
+# ≈ 8 KB on a default 16-worker pool; OS reclaims at exit. To remove
+# this suppression, install a pthread_key_create destructor that
+# regfree's the cache on thread exit (~20 LOC) — tracked as future work.
+leak:match_criterion
+leak:parse_one_criterion

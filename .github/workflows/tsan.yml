@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 30
     env:
       BUILD_MODE: tsan
-      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0"
+      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

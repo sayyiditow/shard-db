@@ -11,7 +11,7 @@
    0 = empty slot (can write here)
   -1 = tombstone (deleted, can write here on insert, skip on get)
   -2 = occupied by different key (continue probing) */
-volatile int g_scan_stop = 0; /* shared stop flag for parallel scan */
+_Atomic int g_scan_stop = 0; /* shared stop flag for parallel scan */
 
 void scan_one_shard(const char *binpath, int slot_size,
                            scan_callback cb, void *ctx) {
@@ -7993,14 +7993,21 @@ static int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
 /* Forward decl — definition lives near btree_dispatch below. */
 static const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field);
 
-/* Btree search callback — captures the first hash hit. */
-typedef struct { uint8_t hash[16]; int found; } JoinBtHit;
+/* Btree search callback — captures the first hash hit. _Atomic on `found`
+   because btree_idx_search fans out across idx_shards in parallel and
+   multiple shard workers can race to invoke this cb on the shared hit
+   struct. Compare-exchange ensures exactly one winner records its hash. */
+typedef struct { uint8_t hash[16]; _Atomic int found; } JoinBtHit;
 static int join_bt_first_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     JoinBtHit *h = (JoinBtHit *)ctx;
-    if (h->found) return -1;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &h->found, &expected, 1,
+            memory_order_acq_rel, memory_order_relaxed)) {
+        return -1;  /* another worker already recorded the hash */
+    }
     memcpy(h->hash, hash16, 16);
-    h->found = 1;
     return -1;  /* stop after first match */
 }
 
@@ -8032,7 +8039,7 @@ static int lookup_remote(const JoinSpec *j, const char *db_root,
             btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
                              local_key, local_len, join_bt_first_cb, &hit);
         }
-        if (!hit.found) return 0;
+        if (!atomic_load_explicit(&hit.found, memory_order_acquire)) return 0;
         memcpy(hash, hit.hash, 16);
     }
 
@@ -12581,7 +12588,7 @@ int cmd_backup(const char *db_root, const char *object) {
 
     /* Create timestamped backup directory */
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", t);
     snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
@@ -15625,6 +15632,11 @@ static void agg_ctx_clone_shared(AggCtx *dst, const AggCtx *src) {
     /* dl_counter stays 0 (per-worker local) */
 }
 
+/* Forward decl — definition lives further down near agg_free. Callers
+   in parallel_agg_scan_shards_v2 / parallel_indexed_agg / parallel_agg_scan_shards
+   need this to release per-worker arenas after merging into main. */
+static void agg_ctx_free_local(AggCtx *ctx);
+
 /* Merge src's hash table into dst. Buckets in src live in src->arena
    so we don't free them individually — agg_find_or_create copies the
    group_vals strings into dst->arena, then the caller (or
@@ -15701,6 +15713,10 @@ static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
     for (int s = 0; s < n; s++) {
         if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[s].local);
+        /* merge strdup's bucket strings into main's arena; src's arena
+           can now be released. Without this every parallel agg over a
+           v2 PRIMARY_NONE shard leaks the per-worker bucket arena. */
+        agg_ctx_free_local(&workers[s].local);
     }
     free(workers);
 }
@@ -15809,6 +15825,7 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
     for (int g = 0; g < nshard_groups; g++) {
         if (workers[g].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[g].local);
+        agg_ctx_free_local(&workers[g].local);
     }
     free(workers);
 }
@@ -15893,6 +15910,7 @@ static int parallel_agg_scan_shards(AggCtx *main_ctx, const char *data_dir,
     for (int i = 0; i < path_count; i++) {
         if (workers[i].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[i].local);
+        agg_ctx_free_local(&workers[i].local);
     }
 
     free(workers);

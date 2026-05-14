@@ -791,10 +791,15 @@ static inline uint32_t seg_rec_vlen(const uint8_t *rec) {
     uint32_t v; memcpy(&v, rec + 20, 4); return v;
 }
 /* True iff the slot is live (flag=1) and its 16B hash matches `hash`.
-   Common pattern for fast-pruning a probe-walk hit before key-byte verify. */
+   Common pattern for fast-pruning a probe-walk hit before key-byte verify.
+   The flag byte read uses acquire ordering to pair with the writer's
+   release-store in seg_record_emit / seg_write_flag — that's what
+   makes the rest of the record (hash, key, value) safe to read after
+   seeing flag==1. */
 static inline int seg_rec_live_with_hash(const uint8_t *rec,
                                           const uint8_t hash[16]) {
-    return rec[18] == 1 && memcmp(rec, hash, 16) == 0;
+    return __atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) == 1 &&
+           memcmp(rec, hash, 16) == 0;
 }
 
 /* Verify the on-disk record's stored key matches `key`. Returns 1 if match,
@@ -1482,7 +1487,10 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
     memcpy(dst, hash, 16);
     uint16_t k16 = (uint16_t)klen;
     memcpy(dst + 16, &k16, 2);
-    dst[18] = 0;        /* flag stays 0 until payload is in place */
+    /* Flag stays 0 until payload is fully in place. Use atomic_store with
+       relaxed ordering for the initial 0 — readers that see 0 simply skip
+       the record (no acquire needed). */
+    __atomic_store_n(&dst[18], 0, __ATOMIC_RELAXED);
     dst[19] = 0;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
@@ -1492,8 +1500,10 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
     if (used < (size_t)slot_size) {
         memset(dst + used, 0, (size_t)slot_size - used);
     }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    dst[18] = 1;
+    /* Release-store on the flag commits all the payload writes above.
+       Any reader doing acquire-load on flag==1 (seg_rec_live_with_hash)
+       will see the full hash/key/value as a coherent snapshot. */
+    __atomic_store_n(&dst[18], 1, __ATOMIC_RELEASE);
 }
 
 /* Memcpy a complete record (key+value already concatenated) into the segment
@@ -1529,7 +1539,10 @@ static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
        file always exists (we're tombstoning a previously-written
        record), so create=0. */
     if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
-    h.map[offset + 18] = flag;
+    /* Release-store: tombstones flip flag 1→2 (deleted). Concurrent
+       readers doing acquire-load on the flag byte either still see 1
+       (and proceed with the live record) or see 2 (and skip). */
+    __atomic_store_n(&h.map[offset + 18], flag, __ATOMIC_RELEASE);
     segcache_release(&h);
     return 0;
 }
@@ -1907,7 +1920,7 @@ static int recover_streams(SlotcaskDb *db) {
             off_t pos = 0;
             off_t lim = (off_t)h.map_size;
             while (pos + db->slot_size <= lim) {
-                uint8_t flag = h.map[pos + 18];
+                uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
                 if (flag == 2) {
                     pool_push_free(&db->streams[sid], (uint16_t)file_id,
                                    (uint32_t)pos);
@@ -2139,7 +2152,7 @@ static int read_record_value(const SlotcaskDb *db, uint8_t stream_id,
     SlotcaskSegHandle h;
     if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
-    if (rec[18] != 1) { segcache_release(&h); return -1; }
+    if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { segcache_release(&h); return -1; }
     uint16_t k_stored = seg_rec_klen(rec);
     uint32_t v_stored = seg_rec_vlen(rec);
     if (k_stored != klen || memcmp(rec + 24, key, klen) != 0) {
@@ -3085,7 +3098,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     int i = read_idx[j];
                     SlotcaskBulkRec *r = &recs[i];
                     const uint8_t *rec = h.map + st[i].old_off;
-                    if (rec[18] != 1) { r->status = -1; continue; }
+                    if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -1; continue; }
                     uint16_t k_stored = seg_rec_klen(rec);
                     uint32_t v_stored = seg_rec_vlen(rec);
                     if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
@@ -3475,7 +3488,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     int i = read_idx[j];
                     SlotcaskBulkRec *r = &recs[i];
                     const uint8_t *rec = h.map + st[i].old_off;
-                    if (rec[18] != 1) { r->status = -1; continue; }
+                    if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -1; continue; }
                     uint16_t k_stored = seg_rec_klen(rec);
                     uint32_t v_stored = seg_rec_vlen(rec);
                     if (k_stored != r->klen || memcmp(rec + 24, r->key, r->klen) != 0) {
@@ -3556,7 +3569,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             if (segcache_acquire(&h, path, 0, 0) != 0) { k = run_end; continue; }
             for (int j = k; j < run_end; j++) {
                 int i = tomb_idx[j];
-                h.map[st[i].old_off + 18] = 2;
+                __atomic_store_n(&h.map[st[i].old_off + 18], 2, __ATOMIC_RELEASE);
                 pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off);
             }
             segcache_release(&h);
@@ -3670,7 +3683,7 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 int i = vidx[j];
                 SlotcaskBulkRec *r = &recs[i];
                 const uint8_t *rec = h.map + st[i].off;
-                if (rec[18] != 1) { r->status = -2; continue; }
+                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -2; continue; }
                 uint16_t k_stored = seg_rec_klen(rec);
                 if (k_stored != r->klen) { r->status = -2; continue; }
                 if (memcmp(rec + 24, r->key, r->klen) != 0) { r->status = -2; continue; }
@@ -3770,7 +3783,7 @@ int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 int i = gidx[j];
                 SlotcaskBulkRec *r = &recs[i];
                 const uint8_t *rec = h.map + st[i].off;
-                if (rec[18] != 1) { r->status = -2; continue; }
+                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -2; continue; }
                 uint16_t k_stored = seg_rec_klen(rec);
                 uint32_t v_stored = seg_rec_vlen(rec);
                 if (k_stored != r->klen ||
@@ -4553,7 +4566,7 @@ static int seg_stat_one(SlotcaskDb *db, int stream_id, uint32_t file_id,
     uint32_t live = 0;
     for (size_t s = 0; s < total; s++) {
         const uint8_t *rec = h.map + s * (size_t)db->slot_size;
-        if (rec[18] == 1) live++;
+        if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) == 1) live++;
     }
     segcache_release(&h);
     *out_live = live;
@@ -4602,7 +4615,7 @@ static int compact_migrate_records(SlotcaskDb *db, int stream_id,
     size_t free_count = 0, free_cap = 0;
     for (size_t s = 0; s < total; s++) {
         const uint8_t *rec = rh.map + s * (size_t)slot_size;
-        if (rec[18] == 1) continue;
+        if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) == 1) continue;
         if (free_count == free_cap) {
             size_t nc = free_cap ? free_cap * 2 : 256;
             uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
@@ -4622,7 +4635,7 @@ static int compact_migrate_records(SlotcaskDb *db, int stream_id,
     size_t free_idx = 0;
     for (size_t s = 0; s < total && rc == 0; s++) {
         const uint8_t *drec = dh.map + s * (size_t)slot_size;
-        if (drec[18] != 1) continue;
+        if (__atomic_load_n(&drec[18], __ATOMIC_ACQUIRE) != 1) continue;
 
         if (free_idx >= free_count) { rc = -1; break; }
 

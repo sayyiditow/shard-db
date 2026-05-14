@@ -90,7 +90,7 @@ void log_slow_query(const char *mode, const char *dir, const char *object, uint3
     pthread_mutex_unlock(&g_slow_query_lock);
     /* Dated slow log file, same rotation as info/error */
     time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
+    struct tm tmbuf; struct tm *tm = localtime_r(&t, &tmbuf);
     char date[16], path[PATH_MAX];
     strftime(date, sizeof(date), "%Y-%m-%d", tm);
     snprintf(path, sizeof(path), "%s/slow-%s.log", g_log_dir, date);
@@ -127,12 +127,17 @@ volatile int g_log_tail = 0;
 pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_log_cond = PTHREAD_COND_INITIALIZER;
 pthread_t g_log_thread;
-volatile int g_log_running = 0;
+/* _Atomic so log_shutdown's set-to-0 and the writer/log_msg reads don't
+   race. Previously volatile-int — benign data race, but TSan flagged it
+   on the same runs where the parallel.c help-drain race tripped. Plain
+   relaxed ops everywhere except the start/stop transitions where we
+   want a release/acquire pair so the writer wakes promptly. */
+_Atomic int g_log_running = 0;
 char g_log_dir[PATH_MAX];
 
 FILE *open_log_for_level(int level) {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char date[16], path[PATH_MAX];
     strftime(date, sizeof(date), "%Y-%m-%d", t);
     /* Level 1 = ERROR → error log. Everything else (WARN, INFO, DEBUG) → info log. */
@@ -164,9 +169,11 @@ void purge_old_logs(void) {
 void *log_writer_thread(void *arg) {
     (void)arg;
     int flush_counter = 0;
-    while (g_log_running || g_log_head != g_log_tail) {
+    while (atomic_load_explicit(&g_log_running, memory_order_acquire) ||
+           g_log_head != g_log_tail) {
         pthread_mutex_lock(&g_log_lock);
-        while (g_log_head == g_log_tail && g_log_running)
+        while (g_log_head == g_log_tail &&
+               atomic_load_explicit(&g_log_running, memory_order_relaxed))
             pthread_cond_wait(&g_log_cond, &g_log_lock);
 
         /* Batch flush */
@@ -194,22 +201,23 @@ void log_init(const char *db_root) {
     if (g_log_dir[0] == '\0')
         snprintf(g_log_dir, sizeof(g_log_dir), "%s/logs", db_root);
     mkdirp(g_log_dir);
-    g_log_running = 1;
+    atomic_store_explicit(&g_log_running, 1, memory_order_release);
     pthread_create(&g_log_thread, NULL, log_writer_thread, NULL);
     purge_old_logs();
 }
 
 void log_shutdown(void) {
-    g_log_running = 0;
+    atomic_store_explicit(&g_log_running, 0, memory_order_release);
     pthread_cond_signal(&g_log_cond);
     pthread_join(g_log_thread, NULL);
 }
 
 void log_msg(int level, const char *fmt, ...) {
-    if (level > g_log_level || !g_log_running) return;
+    if (level > g_log_level ||
+        !atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
 

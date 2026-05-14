@@ -3,8 +3,8 @@
 #include "slotcask.h"
 
 /* Forward decls for monitoring counters (defined lower in this file). */
-extern volatile int active_threads;
-extern volatile int in_flight_writes;
+extern _Atomic int active_threads;
+extern _Atomic int in_flight_writes;
 
 /* Commands that mutate data (insert/delete/update/bulk/add-index/put-file/sequence).
    Take per-object rdlock during dispatch so rebuild (wrlock) blocks them briefly. */
@@ -1589,9 +1589,14 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 
-volatile int server_running = 1;
-volatile int active_threads = 0;
-volatile int in_flight_writes = 0;    /* write/schema modes; shutdown waits for these */
+/* _Atomic for both: shutdown sets server_running=0 from the signal-handler
+   thread while worker threads loop on it; the stats handlers also read
+   active_threads from the request thread while workers increment/decrement
+   it. TSan flagged both as plain-volatile data races; relaxed everywhere
+   except the stop transition where we want a release/acquire pair. */
+_Atomic int server_running = 1;
+_Atomic int active_threads = 0;
+_Atomic int in_flight_writes = 0;    /* write/schema modes; shutdown waits for these */
 pthread_mutex_t thread_count_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Per-worker active client fd (indexed by worker id; -1 = idle). On SIGTERM
