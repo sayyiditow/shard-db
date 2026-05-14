@@ -17,6 +17,12 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+/* macOS needs _DARWIN_C_SOURCE to expose BSD extensions like flock()
+   (declared in <sys/file.h> only when _POSIX_C_SOURCE doesn't suppress
+   it). Linux libc exposes flock() under _POSIX_C_SOURCE already. */
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
