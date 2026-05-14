@@ -18,7 +18,13 @@
 typedef struct {
     char name[512];          /* "db_root:object" */
     pthread_rwlock_t rwlock;
-    int used;
+    /* _Atomic: the fast-path lockless probe reads `used` without holding
+       the table mutex. Slow-path publication does strncpy(name) +
+       rwlock_init then atomic_store_release(used,1); fast-path
+       atomic_load_acquire(used)==1 synchronises-with that store, so
+       strcmp on `name` sees the fully-written bytes. Without this, TSan
+       flags both used and name as racy. */
+    _Atomic int used;
 } ObjLockEntry;
 
 static ObjLockEntry g_objlocks[OBJLOCK_BUCKETS];
@@ -30,7 +36,7 @@ static uint32_t obj_str_hash(const char *s) {
 
 void objlock_init(void) {
     for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
-        g_objlocks[i].used = 0;
+        atomic_init(&g_objlocks[i].used, 0);
         g_objlocks[i].name[0] = '\0';
     }
 }
@@ -43,10 +49,13 @@ static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
     snprintf(key, sizeof(key), "%s:%s", db_root, object);
     uint32_t idx = obj_str_hash(key) % OBJLOCK_BUCKETS;
 
-    /* Fast path: lockless probe for existing entry */
+    /* Fast path: lockless probe for existing entry. acquire-load on
+       `used` pairs with the slow-path release-store so strcmp on
+       `name` reads a coherent snapshot. */
     for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
         int slot = (idx + i) % OBJLOCK_BUCKETS;
-        if (!g_objlocks[slot].used) break;
+        if (!atomic_load_explicit(&g_objlocks[slot].used, memory_order_acquire))
+            break;
         if (strcmp(g_objlocks[slot].name, key) == 0)
             return &g_objlocks[slot].rwlock;
     }
@@ -55,15 +64,19 @@ static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
     pthread_mutex_lock(&g_objlock_table_lock);
     for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
         int slot = (idx + i) % OBJLOCK_BUCKETS;
-        if (g_objlocks[slot].used && strcmp(g_objlocks[slot].name, key) == 0) {
+        int u = atomic_load_explicit(&g_objlocks[slot].used,
+                                      memory_order_relaxed);
+        if (u && strcmp(g_objlocks[slot].name, key) == 0) {
             pthread_mutex_unlock(&g_objlock_table_lock);
             return &g_objlocks[slot].rwlock;
         }
-        if (!g_objlocks[slot].used) {
+        if (!u) {
             strncpy(g_objlocks[slot].name, key, sizeof(g_objlocks[slot].name) - 1);
             g_objlocks[slot].name[sizeof(g_objlocks[slot].name) - 1] = '\0';
             pthread_rwlock_init(&g_objlocks[slot].rwlock, NULL);
-            g_objlocks[slot].used = 1;
+            /* Release ordering: name + rwlock_init complete before
+               any concurrent fast-path acquire-load sees used==1. */
+            atomic_store_explicit(&g_objlocks[slot].used, 1, memory_order_release);
             pthread_mutex_unlock(&g_objlock_table_lock);
             return &g_objlocks[slot].rwlock;
         }

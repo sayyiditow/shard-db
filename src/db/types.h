@@ -469,18 +469,24 @@ uint64_t now_ms_coarse(void);
 typedef struct {
     uint64_t t0_ms;
     uint32_t timeout_ms;
-    volatile int timed_out;
+    _Atomic int timed_out;
 } QueryDeadline;
 
-/* Inline check used in scan loops. Counter is caller-local; the real clock
-   read only fires every 1024 calls → essentially free on the fast path. */
+/* Inline check used in scan loops. The counter may be a per-worker local
+   OR a shared CountCtx field (multiple parallel workers all hit it via
+   their shared cb ctx). Use atomic-fetch-add so the shared case is safe;
+   the per-worker-local case pays one atomic-fetch-add per call but
+   that's ~5ns on x86, well under the 1024-call amortisation period.
+   The clock read only fires every 1024 calls → essentially free on
+   the fast path. */
 static inline int query_deadline_tick(QueryDeadline *d, int *counter) {
     if (!d || d->timeout_ms == 0) return 0;
-    if (__atomic_load_n(&d->timed_out, __ATOMIC_RELAXED)) return 1;
-    if ((++(*counter) & 0x3FF) != 0) return 0;
+    if (atomic_load_explicit(&d->timed_out, memory_order_relaxed)) return 1;
+    int prev = __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+    if (((prev + 1) & 0x3FF) != 0) return 0;
     uint64_t now = now_ms_coarse();
     if (now - d->t0_ms > (uint64_t)d->timeout_ms) {
-        __atomic_store_n(&d->timed_out, 1, __ATOMIC_RELAXED);
+        atomic_store_explicit(&d->timed_out, 1, memory_order_relaxed);
         return 1;
     }
     return 0;
@@ -910,7 +916,7 @@ int  match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *f
 int  match_criterion(const char *val_str, const SearchCriterion *c);
 
 /* query.c */
-extern volatile int g_scan_stop; /* set to 1 to abort all in-flight shard scans */
+extern _Atomic int g_scan_stop; /* set to 1 to abort all in-flight shard scans */
 typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *ctx); /* return 0=continue, 1=stop */
 void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
 /* v2 scan bridge — adapts slotcask_walk_live to the SlotHeader-shaped

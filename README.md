@@ -80,6 +80,20 @@ For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/f
 | Single-conn GET ×10k (req-resp, 1 conn) | **33 k ops/sec** (28µs/op) |
 | Disk footprint (10M K/V records) | 2.2 GB |
 
+### 25M cold-bench highlights (2026.05.4)
+
+Same hardware, post `sync && drop_caches` between runs. Query patterns that exercise the new fast paths landed this release:
+
+| Cold query (25M users) | Result |
+|---|---|
+| `sum X` single-spec on indexed int/long/short/numeric (each) | **~200 ms** (~10× vs 2026.05.3) |
+| `group by username, count limit 10` (high-card varchar idx) | **3.6 ms** (~1570× vs 2026.05.3) |
+| `group by email, sum(balance) limit 10` (varchar + indexed numeric agg) | **4.1 ms** (~1800× vs 2026.05.3) |
+| First-cold full-scan `count starts bio 'Software'` (non-idx varchar) | ~800 ms (~1.6× vs 2026.05.3) |
+| `agg WHERE active=false (count+avg)` | 1.1 s (~2.5× vs 2026.05.3) |
+
+The 1500-1800× wins on the group_by limit shape come from the new streaming k-way merge — earlier paths built a 25M-entry hash table just to truncate to `limit=10`. The 10× wins on single-spec sum come from a tight leaf walker that bypasses `BtRangeIter`'s per-entry overhead plus `MADV_SEQUENTIAL` on the btree mmap during the walk (the per-btree default `MADV_RANDOM` is right for point lookups but suppresses readahead on sequential scans).
+
 Reads are measured strict request-response (no pipelining); pipelining client-side will push throughput higher. The single-conn ceiling is dominated by TCP+JSON framing (~30 µs/op) — bulk paths bypass that and are the right tool for high-throughput multi-key workloads. Bench harness: [`src/bench/`](src/bench/) (C-level timing).
 
 Full breakdown across 5 workloads + tuning notes: [docs/operations/benchmarks.md](docs/operations/benchmarks.md).

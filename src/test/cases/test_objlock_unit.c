@@ -6,7 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
-static int g_rd_count;
+static _Atomic int g_rd_count;
 static pthread_mutex_t g_rd_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void *rd_worker(void *arg) {

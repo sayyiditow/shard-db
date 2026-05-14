@@ -34,6 +34,7 @@
 
 #include "types.h"
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +46,17 @@ typedef struct {
        wait-checks; the mutex still gates the cond_broadcast on completion
        to prevent the classic check-then-wait lost-wakeup race. */
     _Atomic int remaining;
+    /* Number of workers currently inside the post-fn body of
+       run_task_finish (the window that touches group->mu / group->cv).
+       Bumped before fetch_sub on remaining, decremented after the
+       broadcast unlock. Without this, the help-drain path can read
+       remaining==0 via acquire (after fetch_sub release-publishes it),
+       exit its wait loop, and proceed to pthread_mutex_destroy while
+       the last worker is still between fetch_sub and the
+       lock+broadcast+unlock at run_task_finish — TSan trips, and on
+       hardware that destroys the mutex bytes (glibc does) the worker
+       can deadlock or trash a reused slot. */
+    _Atomic int finishing;
 } PoolGroup;
 
 typedef struct {
@@ -127,6 +139,12 @@ static int try_pop_task(PoolTask *out) {
    waiters that just read remaining > 0 and are about to cond_wait. */
 static void run_task_finish(PoolTask t) {
     t.fn(t.arg);
+    /* Mark ourselves as "in the post-fn body" before publishing the
+       decrement so the caller's finishing-wait covers the entire window
+       through the cond_broadcast unlock. Relaxed is fine here: the
+       acq_rel fetch_sub below is the synchronisation point against the
+       caller's remaining-read. */
+    atomic_fetch_add_explicit(&t.group->finishing, 1, memory_order_relaxed);
     int prev = atomic_fetch_sub_explicit(&t.group->remaining, 1,
                                          memory_order_acq_rel);
     if (prev == 1) {
@@ -134,6 +152,9 @@ static void run_task_finish(PoolTask t) {
         pthread_cond_broadcast(&t.group->cv);
         pthread_mutex_unlock(&t.group->mu);
     }
+    /* Release-ordered so the caller's acquire-load of finishing==0
+       happens-after this decrement (and the unlock above). */
+    atomic_fetch_sub_explicit(&t.group->finishing, 1, memory_order_release);
 }
 
 static void *pool_worker(void *arg) {
@@ -207,6 +228,7 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     pthread_mutex_init(&group.mu, NULL);
     pthread_cond_init(&group.cv, NULL);
     atomic_init(&group.remaining, n);
+    atomic_init(&group.finishing, 0);
 
     /* Enqueue in small chunks, releasing the queue lock between chunks so
        concurrent callers' tasks interleave in the FIFO queue (rather than
@@ -215,17 +237,23 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
        very large chunks re-serialize callers. Core-count is a decent
        middle ground (one chunk ≈ one worker-cycle). Configurable via
        POOL_CHUNK in db.env. */
-    static int SUBMIT_CHUNK = 0;
-    if (SUBMIT_CHUNK == 0) {
+    /* Init-once chunk size. _Atomic + relaxed because the value is
+       deterministic from g_pool_chunk / nproc; concurrent first-callers
+       compute the same value and the write race is idempotent — but
+       plain int still trips TSan, so use atomic_load/store relaxed. */
+    static _Atomic int SUBMIT_CHUNK = 0;
+    int submit_chunk = atomic_load_explicit(&SUBMIT_CHUNK, memory_order_relaxed);
+    if (submit_chunk == 0) {
         if (g_pool_chunk > 0) {
-            SUBMIT_CHUNK = g_pool_chunk;
+            submit_chunk = g_pool_chunk;
         } else {
             long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-            SUBMIT_CHUNK = (nproc > 0) ? (int)nproc : 16;
+            submit_chunk = (nproc > 0) ? (int)nproc : 16;
         }
+        atomic_store_explicit(&SUBMIT_CHUNK, submit_chunk, memory_order_relaxed);
     }
-    for (int i = 0; i < n; i += SUBMIT_CHUNK) {
-        int end = i + SUBMIT_CHUNK;
+    for (int i = 0; i < n; i += submit_chunk) {
+        int end = i + submit_chunk;
         if (end > n) end = n;
         pthread_mutex_lock(&g_q_lock);
         for (int j = i; j < end; j++) {
@@ -276,6 +304,14 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
             pthread_cond_wait(&group.cv, &group.mu);
         pthread_mutex_unlock(&group.mu);
     }
+
+    /* All tasks complete (remaining==0) but the last worker may still
+       be between fetch_sub and the broadcast unlock — wait for finishing
+       to drain before destroying mu/cv. Spinning is fine: the window is
+       a few instructions and bounded; sched_yield avoids burning a core
+       under load. */
+    while (atomic_load_explicit(&group.finishing, memory_order_acquire) > 0)
+        sched_yield();
 
     pthread_mutex_destroy(&group.mu);
     pthread_cond_destroy(&group.cv);
