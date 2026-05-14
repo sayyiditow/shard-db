@@ -39,22 +39,47 @@ static int sleep_ms(int ms) {
     return nanosleep(&ts, NULL);
 }
 
+/* Diagnostic state: when wait_daemon_ready times out, the test fixture
+   prints why. Filled by the last failed step. */
+static __thread int g_wait_last_step = 0;   /* 1=connect 2=request */
+static __thread int g_wait_last_errno = 0;
+
 static int wait_daemon_ready(int port, int timeout_ms) {
     int waited = 0;
+    int last_step = 0, last_errno = 0;
     while (waited < timeout_ms) {
         TestClientCfg cfg = { .port = port, .connect_timeout_ms = 200 };
         TestClient *tc = tc_connect(&cfg);
-        if (tc) {
+        if (!tc) {
+            last_step = 1; last_errno = errno;
+        } else {
             char *resp = NULL;
             if (tc_request(tc, "{\"mode\":\"db-dirs\"}", &resp) == 0) {
                 free(resp); tc_close(tc); return 0;
             }
+            last_step = 2; last_errno = errno;
             tc_close(tc);
         }
         sleep_ms(50);
         waited += 50;
     }
+    g_wait_last_step = last_step;
+    g_wait_last_errno = last_errno;
     return -1;
+}
+
+/* Dump the captured daemon log file to stderr, then unlink. Called on
+   daemon spawn failure so CI logs show the actual error. */
+static void dump_daemon_log(const char *log_path) {
+    FILE *f = fopen(log_path, "r");
+    if (!f) return;
+    fprintf(stderr, "\n--- daemon log (%s) ---\n", log_path);
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        fwrite(buf, 1, n, stderr);
+    fprintf(stderr, "--- end daemon log ---\n");
+    fclose(f);
 }
 
 static int run_cmd(const char *fmt, ...) {
@@ -120,12 +145,27 @@ int test_env_start(TestEnv *env) {
         return -1;
     }
 
+    /* Capture daemon stdout+stderr to a log file so spawn failures can be
+       diagnosed in CI (where each test's "daemon spawn" fails as a bare
+       assertion otherwise). Path lives under base/, so test_env_stop's
+       rm -rf cleans it up. */
+    char dlog[400];
+    snprintf(dlog, sizeof(dlog), "%s/daemon.log", base);
+
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         /* Child: cd to base/ so daemon picks up the db.env we wrote there,
-           then exec daemon in foreground mode. */
+           then exec daemon in foreground mode. Redirect stdout+stderr to
+           daemon.log so wait_daemon_ready failures can dump the actual
+           error reason. */
         chdir(base);
+        int lfd = open(dlog, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
         /* Test-only env propagation: lets the migrate tests stage v1
            objects via create-object. Production daemons don't have
            this set and refuse storage_version=1. */
@@ -136,6 +176,22 @@ int test_env_start(TestEnv *env) {
     env->daemon_pid = pid;
 
     if (wait_daemon_ready(env->port, 5000) != 0) {
+        fprintf(stderr,
+            "wait_daemon_ready: timeout on port %d (last_step=%d errno=%d %s)\n",
+            env->port, g_wait_last_step, g_wait_last_errno,
+            strerror(g_wait_last_errno));
+        /* Check whether daemon process is still alive — if it crashed,
+           waitpid(WNOHANG) returns >0; if alive, returns 0. */
+        int wstatus = 0;
+        pid_t r = waitpid(pid, &wstatus, WNOHANG);
+        if (r == pid) {
+            fprintf(stderr, "daemon pid=%d exited before ready: status=0x%x\n",
+                    (int)pid, wstatus);
+        } else {
+            fprintf(stderr, "daemon pid=%d still running but not responsive\n",
+                    (int)pid);
+        }
+        dump_daemon_log(dlog);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         return -1;
