@@ -16360,6 +16360,69 @@ static void *agg_single_shard_worker(void *raw) {
     return NULL;
 }
 
+/* Per-emit staging slot for the varchar-streaming fast path. Holds
+   tentative aggregate state for one distinct group key; only committed
+   into ctx.ht once every emit's lookups have succeeded (or we abort
+   cleanly to IGB if a run is too long). */
+typedef struct {
+    char    key[BT_MAX_VAL_LEN + 1];
+    size_t  klen;
+    int64_t total_count;                  /* AGG_COUNT total for this key */
+    double  spec_sum[MAX_AGG_SPECS];      /* AGG_SUM / AGG_AVG running sum */
+    double  spec_min[MAX_AGG_SPECS];      /* AGG_MIN running min */
+    double  spec_max[MAX_AGG_SPECS];      /* AGG_MAX running max */
+    int64_t spec_count[MAX_AGG_SPECS];    /* live-value count per spec */
+} VSStaged;
+
+typedef struct {
+    VSStaged              *cur;
+    const AggSpec         *specs;
+    const TypedField     **spec_tfs;
+    int                    nspecs;
+} VSLookupCtx;
+
+/* slotcask_lookup_by_hash callback for the varchar-streaming fast path.
+   Decodes every SUM/AVG/MIN/MAX spec's field from the typed record bytes
+   in one pass and accumulates into the per-emit staging slot. Returns 1
+   to stop probing after the first match — hash16 collisions are rare and
+   the iter's caller already attributed this exact entry to the run, so
+   probing further could miscount. */
+static int vs_lookup_cb(const uint8_t hash16[16],
+                        const void *key, size_t klen,
+                        const void *value, size_t vlen,
+                        void *raw) {
+    (void)hash16; (void)key; (void)klen; (void)vlen;
+    VSLookupCtx *c = (VSLookupCtx *)raw;
+    const uint8_t *rec = (const uint8_t *)value;
+    for (int i = 0; i < c->nspecs; i++) {
+        enum AggFn fn = c->specs[i].fn;
+        if (fn == AGG_COUNT) continue;
+        const TypedField *tf = c->spec_tfs[i];
+        if (!tf) continue;
+        double v;
+        if (!typed_field_to_double(tf, rec + tf->offset, &v)) continue;
+        switch (fn) {
+        case AGG_SUM:
+        case AGG_AVG:
+            c->cur->spec_sum[i] += v;
+            c->cur->spec_count[i]++;
+            break;
+        case AGG_MIN:
+            if (c->cur->spec_count[i] == 0 || v < c->cur->spec_min[i])
+                c->cur->spec_min[i] = v;
+            c->cur->spec_count[i]++;
+            break;
+        case AGG_MAX:
+            if (c->cur->spec_count[i] == 0 || v > c->cur->spec_max[i])
+                c->cur->spec_max[i] = v;
+            c->cur->spec_count[i]++;
+            break;
+        default: break;
+        }
+    }
+    return 1;
+}
+
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
@@ -17633,33 +17696,76 @@ int cmd_aggregate(const char *db_root, const char *object,
 
     int igb_done = 0;
 
-    /* Fast path: varchar group_by + AGG_COUNT + finite limit, no criteria /
-       having / order_by. The IGB path below would walk every leaf entry,
-       hash each into a per-shard table, scatter+merge, then truncate to
-       limit — wasting nearly all the work for high-cardinality varchars
-       (e.g., `group by username count limit 10` over 25M unique usernames
-       runs 5-7 s building a 25M-entry hash table just to keep 10 rows).
+    /* Fast path: varchar group_by + COUNT / SUM / AVG / MIN / MAX + finite
+       limit, no criteria / having / order_by. The IGB path below would walk
+       every leaf entry, hash each into a per-shard table, scatter+merge,
+       then truncate to limit — wasting nearly all the work for high-
+       cardinality varchars (e.g., `group by username count limit 10` over
+       25M unique usernames runs 5-7 s building a 25M-entry hash table just
+       to keep 10 rows).
 
        idx_shards are hash16-routed (per-record), so the SAME varchar value
        can appear across multiple shards. Each shard's btree is sorted ASC
        by key. K-way merge: keep one cursor per shard pointing at its
-       current key; the global next distinct key is min(active cursors);
-       sum the run lengths of that key across all shards holding it.
-       Emit (key, total_count), advance contributing cursors past the
-       consumed key, repeat until limit emits or all shards drain.
-       Populates ctx.ht with at most `limit` buckets, then falls through
-       to the shared collect / sort / limit / emit pipeline. */
+       current key; the global next distinct key is min(active cursors).
+       For COUNT, simply sum the run lengths. For SUM/AVG/MIN/MAX, also
+       collect the run's hash16s and fetch each record via
+       slotcask_lookup_by_hash to decode the agg field values into a
+       per-emit staging slot. Commit staging to ctx.ht at the end so the
+       standard collect / sort / limit / emit pipeline applies.
+
+       Per-run hash16 cap (VS_RUN_HASH_CAP): runs longer than this signal a
+       low-cardinality dataset where IGB's hbk-driven Pass-2 walk is
+       cheaper than millions of per-record lookups. Abort and fall
+       through to IGB cleanly — nothing has been written to ctx.ht yet. */
+#define VS_RUN_HASH_CAP 16384
     int vs_eligible = (tree == NULL && no_having &&
                        (!order_by || !order_by[0]) &&
                        limit > 0 && limit <= 100000 &&
                        ctx.ngroups == 1 && ctx.group_tfs[0] &&
                        ctx.group_tfs[0]->type == FT_VARCHAR &&
                        !strchr(ctx.group_fields[0], '+') &&
-                       nspecs == 1 && specs[0].fn == AGG_COUNT &&
-                       (specs[0].field[0] == '\0' ||
-                        strcmp(specs[0].field, ctx.group_fields[0]) == 0) &&
                        btree_idx_exists(db_root, object,
                                         ctx.group_fields[0], sch.splits));
+    /* Per-spec eligibility:
+        - COUNT(*) or COUNT(group_field) — no lookup needed
+        - SUM/AVG/MIN/MAX on an indexed non-varchar non-composite field
+          (record fetch by hash16 + typed_field_to_double). */
+    int vs_need_lookup = 0;
+    if (vs_eligible) {
+        for (int i = 0; i < nspecs; i++) {
+            AggSpec *sp = &specs[i];
+            if (sp->fn == AGG_COUNT) {
+                if (sp->field[0] && strcmp(sp->field, ctx.group_fields[0]) != 0) {
+                    vs_eligible = 0; break;
+                }
+                continue;
+            }
+            if (sp->fn != AGG_SUM && sp->fn != AGG_AVG &&
+                sp->fn != AGG_MIN && sp->fn != AGG_MAX) {
+                vs_eligible = 0; break;
+            }
+            if (!ctx.spec_tfs[i] || ctx.spec_tfs[i]->type == FT_VARCHAR ||
+                strchr(sp->field, '+') ||
+                !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
+                vs_eligible = 0; break;
+            }
+            vs_need_lookup = 1;
+        }
+    }
+    /* v2 storage required for slotcask_lookup_by_hash (v1 falls through). */
+    SlotcaskDb *vs_sdb = NULL;
+    if (vs_eligible && vs_need_lookup) {
+        if (sch.storage_version != 2) { vs_eligible = 0; }
+        else {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams, .storage_version = 2,
+            };
+            vs_sdb = slotcask_registry_get(db_root, object, &info);
+            if (!vs_sdb) vs_eligible = 0;
+        }
+    }
     if (vs_eligible) {
         int n_idx_g = index_splits_for(sch.splits);
         BtRangeIter **iters  = calloc((size_t)n_idx_g, sizeof(BtRangeIter *));
@@ -17667,8 +17773,17 @@ int cmd_aggregate(const char *db_root, const char *object,
             calloc((size_t)n_idx_g, sizeof(*cur_keys));
         size_t      *cur_klens = calloc((size_t)n_idx_g, sizeof(size_t));
         int         *has_cur   = calloc((size_t)n_idx_g, sizeof(int));
-        if (!iters || !cur_keys || !cur_klens || !has_cur) {
-            free(iters); free(cur_keys); free(cur_klens); free(has_cur);
+        uint8_t    (*cur_hash16)[16] =
+            calloc((size_t)n_idx_g, sizeof(*cur_hash16));
+        /* Per-emit staging — accumulators built up via lookups, committed
+           to ctx.ht only after every emit completes. Lets us cleanly
+           abort and fall through to IGB if a run exceeds the cap without
+           leaving partial buckets in ctx.ht. */
+        VSStaged *staged = calloc((size_t)limit, sizeof(VSStaged));
+        if (!iters || !cur_keys || !cur_klens || !has_cur || !cur_hash16 ||
+            !staged) {
+            free(iters); free(cur_keys); free(cur_klens);
+            free(has_cur); free(cur_hash16); free(staged);
             goto vs_skip;
         }
         for (int s = 0; s < n_idx_g; s++) {
@@ -17683,12 +17798,18 @@ int cmd_aggregate(const char *db_root, const char *object,
                 size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
                 memcpy(cur_keys[s], v, cap);
                 cur_klens[s] = cap;
+                memcpy(cur_hash16[s], h, 16);
                 has_cur[s] = 1;
             }
         }
 
+        /* Reusable per-run hash16 buffer. Stack frame is ~256 KB which is
+           well under the 8 MB default thread stack; bench / TCP worker
+           threads use the default. */
+        uint8_t run_hashes[VS_RUN_HASH_CAP][16];
         int emitted = 0;
-        while (emitted < limit) {
+        int aborted = 0;
+        while (emitted < limit && !aborted) {
             /* Find the active cursor with the lexicographically smallest
                current key. */
             int min_s = -1;
@@ -17710,33 +17831,104 @@ int cmd_aggregate(const char *db_root, const char *object,
             memcpy(min_key, cur_keys[min_s], min_klen);
 
             /* Sum the run of equal keys across every shard that's
-               currently sitting on this key, advancing each past the run. */
+               currently sitting on this key. Collect hash16s for the
+               record fetches if any spec needs lookup. */
             int64_t total_count = 0;
+            int hash_count = 0;
             for (int s = 0; s < n_idx_g; s++) {
                 while (has_cur[s] && cur_klens[s] == min_klen &&
                        memcmp(cur_keys[s], min_key, min_klen) == 0) {
+                    if (vs_need_lookup) {
+                        if (hash_count >= VS_RUN_HASH_CAP) {
+                            aborted = 1;
+                            break;
+                        }
+                        memcpy(run_hashes[hash_count++], cur_hash16[s], 16);
+                    }
                     total_count++;
                     const char *v; size_t vl; const uint8_t *h;
                     if (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
                         size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
                         memcpy(cur_keys[s], v, cap);
                         cur_klens[s] = cap;
+                        memcpy(cur_hash16[s], h, 16);
                     } else {
                         has_cur[s] = 0;
                     }
                 }
+                if (aborted) break;
+            }
+            if (aborted) break;
+
+            VSStaged *cur = &staged[emitted];
+            memcpy(cur->key, min_key, min_klen);
+            cur->key[min_klen] = '\0';
+            cur->klen = min_klen;
+            cur->total_count = total_count;
+            for (int i = 0; i < nspecs; i++) {
+                cur->spec_sum[i] = 0.0;
+                cur->spec_min[i] = 0.0;
+                cur->spec_max[i] = 0.0;
+                cur->spec_count[i] = 0;
             }
 
-            min_key[min_klen] = '\0';
-            char *kvp[1] = { min_key };
-            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
-            if (b) b->accums[0].count = total_count;
+            /* Lookup each hash16, decode all SUM/AVG/MIN/MAX specs from
+               the typed record in one cb invocation per record. */
+            if (vs_need_lookup) {
+                VSLookupCtx lc = {
+                    .cur     = cur,
+                    .specs   = specs,
+                    .spec_tfs = ctx.spec_tfs,
+                    .nspecs  = nspecs,
+                };
+                for (int j = 0; j < hash_count; j++) {
+                    slotcask_lookup_by_hash(vs_sdb, run_hashes[j],
+                                             vs_lookup_cb, &lc);
+                }
+            }
             emitted++;
         }
 
         for (int s = 0; s < n_idx_g; s++)
             if (iters[s]) btree_range_iter_close(iters[s]);
-        free(iters); free(cur_keys); free(cur_klens); free(has_cur);
+        free(iters); free(cur_keys); free(cur_klens);
+        free(has_cur); free(cur_hash16);
+
+        if (aborted) {
+            /* Low-cardinality data — let IGB handle it. ctx.ht hasn't
+               been touched yet because we staged everything. */
+            free(staged);
+            goto vs_skip;
+        }
+
+        /* Commit staging to ctx.ht — one bucket per emitted distinct key,
+           with accums populated for each spec. */
+        for (int i = 0; i < emitted; i++) {
+            char *kvp[1] = { staged[i].key };
+            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+            if (!b) continue;
+            for (int j = 0; j < nspecs; j++) {
+                switch (specs[j].fn) {
+                case AGG_COUNT:
+                    b->accums[j].count = staged[i].total_count;
+                    break;
+                case AGG_SUM:
+                case AGG_AVG:
+                    b->accums[j].sum   = staged[i].spec_sum[j];
+                    b->accums[j].count = staged[i].spec_count[j];
+                    break;
+                case AGG_MIN:
+                    b->accums[j].min   = staged[i].spec_min[j];
+                    b->accums[j].count = staged[i].spec_count[j];
+                    break;
+                case AGG_MAX:
+                    b->accums[j].max   = staged[i].spec_max[j];
+                    b->accums[j].count = staged[i].spec_count[j];
+                    break;
+                }
+            }
+        }
+        free(staged);
 
         igb_done = 1;  /* ctx populated — skip the IGB block, emit below. */
         goto igb_skip;
