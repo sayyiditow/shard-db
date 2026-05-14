@@ -1686,8 +1686,26 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
     BtFile bt;
     if (bt_acquire(&bt, path, 0) != 0) return 0;
 
+    /* Cold-walk readahead hint. The mmap is set to MADV_RANDOM at acquire
+       time — correct for the dominant point-lookup workload, but it
+       suppresses readahead on page faults. A sum/avg walk over a 100-300
+       MB btree under RANDOM page-faults 4 KB at a time and stalls on
+       disk regardless of how cheap the per-entry CPU work is. MADV_
+       SEQUENTIAL switches the kernel to aggressive readahead (128 KB+
+       per disk I/O) for the duration of the walk, then we restore RANDOM
+       before release so concurrent point lookups (which share the cached
+       mmap via bt_cache) get back the no-wasted-readahead behaviour they
+       expect. POSIX_FADV_WILLNEED was tried first and didn't move cold
+       sums — it races the walk's fault stream and MADV_RANDOM defeats
+       the queued readahead. */
+    int set_seq = (bt.map && bt.map_size > 0 &&
+                   madvise(bt.map, bt.map_size, MADV_SEQUENTIAL) == 0);
+
     BtFileHeader *fh = (BtFileHeader *)bt.map;
-    if (fh->entry_count == 0) { bt_release(&bt); return 0; }
+    if (fh->entry_count == 0) {
+        if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+        bt_release(&bt); return 0;
+    }
 
     /* Walk leftmost-child path from root down to the first leaf. For
        internal pages, ph->next_leaf doubles as the leftmost-child
@@ -1698,7 +1716,10 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
         BtPageHeader *ph = (BtPageHeader *)page;
         if (ph->page_type == 1) break;
         page_id = ph->next_leaf;
-        if (page_id == 0) { bt_release(&bt); return 0; }
+        if (page_id == 0) {
+            if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+            bt_release(&bt); return 0;
+        }
     }
 
     char key_buf[BT_MAX_VAL_LEN];
@@ -1721,12 +1742,13 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
             } else {
                 /* Prefix-compressed: keep first plen bytes of previous
                    key, append this slot's suffix. */
+                /* plen ≤ 255 (uint8_t) and BT_MAX_VAL_LEN is 512, so
+                   key_buf + plen is always in-range; only clamp the
+                   total length. */
                 size_t klen = (size_t)plen + slen;
                 if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
-                if ((size_t)plen < BT_MAX_VAL_LEN) {
-                    size_t take = (klen > (size_t)plen) ? (klen - (size_t)plen) : 0;
-                    memcpy(key_buf + plen, leaf_entry_suffix(e), take);
-                }
+                size_t take = (klen > (size_t)plen) ? (klen - (size_t)plen) : 0;
+                memcpy(key_buf + plen, leaf_entry_suffix(e), take);
                 key_len = klen;
             }
             if (leaf_entry_is_tomb(e)) continue;
@@ -1736,6 +1758,7 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
         page_id = ph->next_leaf;
     }
 done:
+    if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
     bt_release(&bt);
     return rc;
 }
