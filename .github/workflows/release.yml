@@ -2,9 +2,11 @@ name: Release
 
 # Builds, signs, and publishes release artifacts on every tag push.
 # Per-tag GitHub Release contains:
-#   - shard-db-<tag>-source.tar.gz       (architecture-independent;
+#   - shard-db-<tag>-source.tar.gz        (architecture-independent;
 #                                          users build from source)
 #   - shard-db-<tag>-linux-x86_64.tar.gz  (compiled binaries)
+#   - shard-db-<tag>-linux-arm64.tar.gz   (compiled binaries)
+#   - shard-db-<tag>-darwin-arm64.tar.gz  (compiled binaries, Apple Silicon)
 #   - <each-of-above>.bundle              (cosign sigstore bundle —
 #                                          signature + cert + tlog entry
 #                                          in one file, new format)
@@ -18,10 +20,9 @@ name: Release
 #     --bundle shard-db-<tag>-linux-x86_64.tar.gz.bundle \
 #     shard-db-<tag>-linux-x86_64.tar.gz
 #
-# To extend to more targets (linux-arm64, darwin-x86_64, darwin-arm64),
-# uncomment the matrix rows in `binary-build` and the runner labels.
-# No other changes are needed — the combine-hashes / provenance /
-# sign-and-attach jobs all walk every uploaded tarball.
+# To extend to more targets (darwin-x86_64, freebsd, etc.), add a row
+# to the matrix in `binary-build`. The combine-hashes / provenance /
+# sign-and-attach jobs all walk every uploaded tarball automatically.
 
 on:
   push:
@@ -64,9 +65,9 @@ jobs:
         target:
           - { name: linux-x86_64, runner: ubuntu-latest }
           - { name: linux-arm64,  runner: ubuntu-22.04-arm }
-          # Uncomment when macOS port lands (2026.05.2):
-          # - { name: darwin-x86_64, runner: macos-13 }
-          # - { name: darwin-arm64,  runner: macos-latest }
+          # macOS Apple Silicon shipped in 2026.05.4. Intel macs are not
+          # supported (would require a separate macos-13 runner; no demand).
+          - { name: darwin-arm64, runner: macos-latest }
     runs-on: ${{ matrix.target.runner }}
     permissions:
       contents: read
