@@ -224,18 +224,18 @@ static int test_tls_run(void) {
 
     /* TLS 1.2 ClientHello must be rejected. We use openssl s_client
        (system call) since shaping a raw 1.2 ClientHello in C is overkill. */
-    /* Invert the check: instead of grepping for one of many possible
-       rejection wordings (OpenSSL vs LibreSSL differ), look for the
-       single robust marker of a SUCCESSFUL TLS 1.2 negotiation and
-       assert it isn't present. openssl s_client always prints
-       'Protocol  : TLSv1.2' on a clean 1.2 handshake; if that line is
-       absent, 1.2 was rejected, period. */
+    /* Skip the regex entirely — openssl s_client's exit code is the
+       cleanest signal across both OpenSSL (Linux) and LibreSSL (macOS).
+       Exit 0 = handshake completed; non-zero = TLS error. The 3-second
+       timeout never trips on a fast LAN connection, so 124 is not in
+       play. (Earlier regex attempts kept matching false-positive
+       strings like 'Protocol  : TLSv1.2', which openssl prints based on
+       the REQUESTED protocol whether or not the handshake succeeded.) */
     rc = run_cmd(
         "echo QUIT | timeout 3 openssl s_client -connect 127.0.0.1:%d "
-        "-tls1_2 -CAfile '%s' -servername localhost 2>&1 | "
-        "grep -qE 'Protocol *: *TLSv1\\.2'",
+        "-tls1_2 -CAfile '%s' -servername localhost > /dev/null 2>&1",
         port, cert);
-    ASSERT_TRUE(rc != 0, "TLS 1.2 negotiation did NOT succeed (server enforces 1.3+)");
+    ASSERT_TRUE(rc != 0, "openssl s_client -tls1_2 exited non-zero (handshake refused)");
 
     /* Plain TCP write to TLS port — server should drop. */
     {
