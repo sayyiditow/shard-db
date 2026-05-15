@@ -2560,13 +2560,24 @@ int cmd_server(const char *db_root, int daemonize) {
         int rc = pthread_create(&pool[i], NULL, worker_thread, wa);
         fprintf(stderr, "CK14.%d pthread_create rc=%d\n", i, rc); fflush(stderr); fsync(2);
     }
-    fprintf(stderr, "CK15 about to print listening\n"); fflush(stderr); fsync(2);
+    fprintf(stderr, "CK15 about to print listening port=%d pid=%d nthreads=%d g_timeout=%u tls=%d\n",
+            port, getpid(), nthreads, g_timeout, g_tls_enable); fflush(stderr); fsync(2);
+
+    /* Mirror to stderr first (bypasses stdout entirely) so we know whether
+       the crash is in stdout's FILE* or somewhere downstream. */
+    fprintf(stderr, "STDERR-LISTENING port=%d pid=%d workers=%d tls=%s\n",
+            port, getpid(), nthreads, g_tls_enable ? "on" : "off");
+    fflush(stderr); fsync(2);
+    fprintf(stderr, "CK15a stderr listening done\n"); fflush(stderr); fsync(2);
 
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",
             port, getpid(), nthreads, g_timeout, g_tls_enable ? "on" : "off");
+    fprintf(stderr, "CK15b fprintf stdout returned\n"); fflush(stderr); fsync(2);
     fflush(stdout);
+    fprintf(stderr, "CK15c fflush stdout done\n"); fflush(stderr); fsync(2);
     log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
+    fprintf(stderr, "CK15d log_msg done\n"); fflush(stderr); fsync(2);
 
     /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
     if (g_auto_vacuum_enable) {
