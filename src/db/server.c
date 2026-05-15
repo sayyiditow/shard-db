@@ -2577,7 +2577,7 @@ int cmd_server(const char *db_root, int daemonize) {
     fprintf(stderr, "CK15c fflush stdout done\n"); fflush(stderr); fsync(2);
     log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
-    fprintf(stderr, "CK15d log_msg done\n"); fflush(stderr); fsync(2);
+    fprintf(stderr, "CK15d log_msg done g_auto_vacuum_enable=%d\n", g_auto_vacuum_enable); fflush(stderr); fsync(2);
 
     /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
     if (g_auto_vacuum_enable) {
@@ -2592,6 +2592,7 @@ int cmd_server(const char *db_root, int daemonize) {
                 free(av);
         }
     }
+    fprintf(stderr, "CK16 past auto-vacuum block\n"); fflush(stderr); fsync(2);
 
     /* poll-based accept loop. Single fd (the listen socket), so poll()
        is as cheap as epoll here — no edge-triggered / EPOLLET advantage
@@ -2602,9 +2603,18 @@ int cmd_server(const char *db_root, int daemonize) {
        a spurious POLLIN with no pending connection would block accept()
        — protect with EWOULDBLOCK / EAGAIN handling. */
     struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+    fprintf(stderr, "CK17 pfd setup sfd=%d\n", sfd); fflush(stderr); fsync(2);
+    int loop_cnt = 0;
     while (atomic_load_explicit(&server_running, memory_order_acquire)) {
+        if (loop_cnt < 3) {
+            fprintf(stderr, "CK18.%d top of accept loop\n", loop_cnt); fflush(stderr); fsync(2);
+        }
         pfd.revents = 0;
         int n = poll(&pfd, 1, 500);
+        if (loop_cnt < 3) {
+            fprintf(stderr, "CK19.%d poll returned n=%d revents=%d\n", loop_cnt, n, pfd.revents); fflush(stderr); fsync(2);
+        }
+        loop_cnt++;
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
