@@ -1905,22 +1905,18 @@ typedef struct {
 
 void *worker_thread(void *arg) {
     WorkerArg *wa = (WorkerArg *)arg;
-    fprintf(stderr, "CK-W%d worker enter\n", wa->id); fflush(stderr); fsync(2);
 
     while (server_running) {
         int cfd = wq_pop(&g_work_queue);
         if (cfd < 0) break;
-        fprintf(stderr, "CK-W%d.a got cfd=%d\n", wa->id, cfd); fflush(stderr); fsync(2);
 
         /* Register so handle_shutdown can shutdown(SHUT_RDWR) this fd on
            SIGTERM, unblocking our fgets if the client is idle. */
         __atomic_store_n(&g_worker_cfds[wa->id], cfd, __ATOMIC_RELEASE);
-        fprintf(stderr, "CK-W%d.b atomic_store ok\n", wa->id); fflush(stderr); fsync(2);
 
         pthread_mutex_lock(&thread_count_lock);
         active_threads++;
         pthread_mutex_unlock(&thread_count_lock);
-        fprintf(stderr, "CK-W%d.c lock+inc ok\n", wa->id); fflush(stderr); fsync(2);
 
         /* Get client IP for auth decisions */
         struct sockaddr_in peer_addr;
@@ -1928,7 +1924,6 @@ void *worker_thread(void *arg) {
         char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
         if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) == 0)
             inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip));
-        fprintf(stderr, "CK-W%d.d getpeername ok ip=%s\n", wa->id, client_ip); fflush(stderr); fsync(2);
 
         /* Per-connection streams — TLS wraps SSL via tls_fopen (one FILE*
            in r+ mode; reads and writes share the same SSL session); plain
@@ -1958,19 +1953,14 @@ void *worker_thread(void *arg) {
             out = cf;  /* same handle for both directions */
         } else {
             out_fd = dup(cfd);  /* separate fd for writing */
-            fprintf(stderr, "CK-W%d.e dup cfd=%d -> out_fd=%d\n", wa->id, cfd, out_fd); fflush(stderr); fsync(2);
             out = (out_fd >= 0) ? fdopen(out_fd, "w") : NULL;
-            fprintf(stderr, "CK-W%d.f fdopen out=%p\n", wa->id, (void *)out); fflush(stderr); fsync(2);
             cf = fdopen(cfd, "r");
-            fprintf(stderr, "CK-W%d.g fdopen cf=%p\n", wa->id, (void *)cf); fflush(stderr); fsync(2);
         }
         if (cf && out) {
-            fprintf(stderr, "CK-W%d.h entering fgets loop\n", wa->id); fflush(stderr); fsync(2);
             g_out = out;  /* thread-local: all OUT()/fprintf(g_out,...) goes to this client */
             int buf_size = g_max_request_size > 0 ? g_max_request_size : MAX_LINE;
             char *line = malloc(buf_size);
             while (line && fgets(line, buf_size, cf)) {
-                fprintf(stderr, "CK-W%d.i fgets line len=%d\n", wa->id, (int)strlen(line)); fflush(stderr); fsync(2);
                 /* Check for oversized request: fgets filled buffer without finding newline */
                 int len = strlen(line);
                 if (len > 0 && line[len - 1] != '\n' && len >= buf_size - 1) {
@@ -1996,9 +1986,7 @@ void *worker_thread(void *arg) {
                     break;
                 }
 
-                fprintf(stderr, "CK-W%d.j before server_process_fast\n", wa->id); fflush(stderr); fsync(2);
                 server_process_fast(wa->db_root, line, client_ip);
-                fprintf(stderr, "CK-W%d.k after server_process_fast\n", wa->id); fflush(stderr); fsync(2);
 
                 /* Single fflush per response: the response body, the \0
                    terminator, and the \n separator all share the FILE*
@@ -2309,7 +2297,6 @@ static int validate_metadata(const char *db_root) {
 }
 
 int cmd_server(const char *db_root, int daemonize) {
-    fprintf(stderr, "CK-A cmd_server entry\n"); fflush(stderr); fsync(2);
     int port = g_port;
 
     /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
@@ -2389,9 +2376,7 @@ int cmd_server(const char *db_root, int daemonize) {
        redirect, leaving the parent's "shard-db started (pid N)" message
        and a stale pid file with no listener — operators saw "started"
        then immediate "stopped" with no diagnostic outside error.log. */
-    fprintf(stderr, "CK-B flock acquired\n"); fflush(stderr); fsync(2);
     load_dirs();
-    fprintf(stderr, "CK-C load_dirs\n"); fflush(stderr); fsync(2);
     {
         int validate_errors = validate_metadata(db_root);
         if (validate_errors > 0) {
@@ -2505,19 +2490,12 @@ int cmd_server(const char *db_root, int daemonize) {
         log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB",
                 g_query_buffer_max_bytes / (1024 * 1024));
     }
-    /* macOS-port startup trace — remove once daemon spawn is stable.
-       Each step prints + fflushes + fsyncs so SIGBUS at any phase leaves
-       the last-reached checkpoint in daemon.log. */
-    fprintf(stderr, "CK0 enter init\n"); fflush(stderr); fsync(2);
     fcache_init(g_fcache_cap);
-    fprintf(stderr, "CK1 fcache\n"); fflush(stderr); fsync(2);
     bt_cache_init(g_btcache_cap);
-    fprintf(stderr, "CK2 bt_cache\n"); fflush(stderr); fsync(2);
     /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
        objects route reads/writes through these; v1 (legacy) objects continue
        to use ucache. Both engines coexist until migration. */
     slotcask_init(g_fcache_cap, g_fcache_cap);
-    fprintf(stderr, "CK3 slotcask\n"); fflush(stderr); fsync(2);
     /* CPU pool size: explicit THREADS wins; otherwise nproc - 2 (leaves
        2 cores for the OS / interactive shell so long full-scan queries
        don't peg every CPU and freeze the operator's session).
@@ -2534,18 +2512,12 @@ int cmd_server(const char *db_root, int daemonize) {
                   : (int)(nproc > 2 ? nproc - 2 : nproc);
     if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
-    fprintf(stderr, "CK4 parallel_pool\n"); fflush(stderr); fsync(2);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
-    fprintf(stderr, "CK5 tokens\n"); fflush(stderr); fsync(2);
     load_allowed_ips_conf(db_root);
-    fprintf(stderr, "CK6 ips\n"); fflush(stderr); fsync(2);
     objlock_init();
-    fprintf(stderr, "CK7 objlock\n"); fflush(stderr); fsync(2);
     rebuild_recovery(db_root);
-    fprintf(stderr, "CK8 rebuild_recovery\n"); fflush(stderr); fsync(2);
     grow_recovery(db_root);
-    fprintf(stderr, "CK9 grow_recovery\n"); fflush(stderr); fsync(2);
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
@@ -2553,42 +2525,25 @@ int cmd_server(const char *db_root, int daemonize) {
 
     /* Init work queue and thread pool */
     wq_init(&g_work_queue, nthreads * 64);
-    fprintf(stderr, "CK10 wq_init\n"); fflush(stderr); fsync(2);
     /* Per-worker active-cfd table for SIGTERM-time shutdown(SHUT_RDWR).
        Allocate before threads spawn so worker_thread can safely write to it
        and handle_shutdown can safely read. */
     g_worker_cfds = malloc(nthreads * sizeof(int));
-    fprintf(stderr, "CK11 g_worker_cfds malloc\n"); fflush(stderr); fsync(2);
     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
     g_worker_cfds_n = nthreads;
-    fprintf(stderr, "CK12 g_worker_cfds init nthreads=%d\n", nthreads); fflush(stderr); fsync(2);
     pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
-    fprintf(stderr, "CK13 pool malloc\n"); fflush(stderr); fsync(2);
     for (int i = 0; i < nthreads; i++) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
         strncpy(wa->db_root, db_root, PATH_MAX - 1);
         wa->id = i;
-        int rc = db_thread_create(&pool[i], worker_thread, wa);
-        fprintf(stderr, "CK14.%d db_thread_create rc=%d\n", i, rc); fflush(stderr); fsync(2);
+        db_thread_create(&pool[i], worker_thread, wa);
     }
-    fprintf(stderr, "CK15 about to print listening port=%d pid=%d nthreads=%d g_timeout=%u tls=%d\n",
-            port, getpid(), nthreads, g_timeout, g_tls_enable); fflush(stderr); fsync(2);
-
-    /* Mirror to stderr first (bypasses stdout entirely) so we know whether
-       the crash is in stdout's FILE* or somewhere downstream. */
-    fprintf(stderr, "STDERR-LISTENING port=%d pid=%d workers=%d tls=%s\n",
-            port, getpid(), nthreads, g_tls_enable ? "on" : "off");
-    fflush(stderr); fsync(2);
-    fprintf(stderr, "CK15a stderr listening done\n"); fflush(stderr); fsync(2);
 
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",
             port, getpid(), nthreads, g_timeout, g_tls_enable ? "on" : "off");
-    fprintf(stderr, "CK15b fprintf stdout returned\n"); fflush(stderr); fsync(2);
     fflush(stdout);
-    fprintf(stderr, "CK15c fflush stdout done\n"); fflush(stderr); fsync(2);
     log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
-    fprintf(stderr, "CK15d log_msg done g_auto_vacuum_enable=%d\n", g_auto_vacuum_enable); fflush(stderr); fsync(2);
 
     /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
     if (g_auto_vacuum_enable) {
@@ -2603,7 +2558,6 @@ int cmd_server(const char *db_root, int daemonize) {
                 free(av);
         }
     }
-    fprintf(stderr, "CK16 past auto-vacuum block\n"); fflush(stderr); fsync(2);
 
     /* poll-based accept loop. Single fd (the listen socket), so poll()
        is as cheap as epoll here — no edge-triggered / EPOLLET advantage
@@ -2614,18 +2568,9 @@ int cmd_server(const char *db_root, int daemonize) {
        a spurious POLLIN with no pending connection would block accept()
        — protect with EWOULDBLOCK / EAGAIN handling. */
     struct pollfd pfd = { .fd = sfd, .events = POLLIN };
-    fprintf(stderr, "CK17 pfd setup sfd=%d\n", sfd); fflush(stderr); fsync(2);
-    int loop_cnt = 0;
     while (atomic_load_explicit(&server_running, memory_order_acquire)) {
-        if (loop_cnt < 3) {
-            fprintf(stderr, "CK18.%d top of accept loop\n", loop_cnt); fflush(stderr); fsync(2);
-        }
         pfd.revents = 0;
         int n = poll(&pfd, 1, 500);
-        if (loop_cnt < 3) {
-            fprintf(stderr, "CK19.%d poll returned n=%d revents=%d\n", loop_cnt, n, pfd.revents); fflush(stderr); fsync(2);
-        }
-        loop_cnt++;
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
