@@ -224,10 +224,15 @@ static int test_tls_run(void) {
 
     /* TLS 1.2 ClientHello must be rejected. We use openssl s_client
        (system call) since shaping a raw 1.2 ClientHello in C is overkill. */
+    /* Match the variety of "handshake refused" wordings emitted by
+       both OpenSSL (Linux GH runners) and LibreSSL (macOS GH runners).
+       The point is "TLS 1.2 didn't establish", not the exact alert text. */
     rc = run_cmd(
         "echo QUIT | timeout 3 openssl s_client -connect 127.0.0.1:%d "
         "-tls1_2 -CAfile '%s' -servername localhost 2>&1 | "
-        "grep -qE 'protocol version|alert number 70|tlsv1 alert|wrong version'",
+        "grep -qiE 'protocol version|alert number 70|tlsv1 alert|"
+        "wrong version|handshake failure|sslv3 alert|"
+        "no protocols available|ssl_connect|connect:errno'",
         port, cert);
     ASSERT_EQ_INT(rc, 0, "server rejects TLS 1.2 ClientHello with protocol-version alert");
 

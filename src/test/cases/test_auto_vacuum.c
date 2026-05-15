@@ -205,14 +205,17 @@ static int test_auto_vacuum_run(void) {
        object cleans correctly. The thread itself is verified by the LOG
        line further below.
 
-       Actually, the cleanest verification: we wait 65s for the thread to
-       fire. That's slow but conclusive. Skip if SHARD_TEST_FAST=1. */
+       Actually, the cleanest verification: we wait 90s for the thread to
+       fire. That's slow but conclusive. (Bumped from 65s — macOS GH
+       runners run hot enough that the thread can miss the 60-65s window
+       under load. The interval floor is 60s; 30s slack is enough for
+       both runners to settle.) Skip if SHARD_TEST_FAST=1. */
     if (getenv("SHARD_TEST_FAST")) {
-        printf("# auto-vacuum: SHARD_TEST_FAST set, skipping the 65s wake test\n");
+        printf("# auto-vacuum: SHARD_TEST_FAST set, skipping the 90s wake test\n");
     } else {
-        printf("# auto-vacuum: sleeping 65s for the first thread tick…\n");
+        printf("# auto-vacuum: sleeping 90s for the first thread tick…\n");
         fflush(stdout);
-        sleep(65);
+        sleep(90);
 
         tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
         int orphaned_after = parse_count(resp);
