@@ -1910,14 +1910,17 @@ void *worker_thread(void *arg) {
     while (server_running) {
         int cfd = wq_pop(&g_work_queue);
         if (cfd < 0) break;
+        fprintf(stderr, "CK-W%d.a got cfd=%d\n", wa->id, cfd); fflush(stderr); fsync(2);
 
         /* Register so handle_shutdown can shutdown(SHUT_RDWR) this fd on
            SIGTERM, unblocking our fgets if the client is idle. */
         __atomic_store_n(&g_worker_cfds[wa->id], cfd, __ATOMIC_RELEASE);
+        fprintf(stderr, "CK-W%d.b atomic_store ok\n", wa->id); fflush(stderr); fsync(2);
 
         pthread_mutex_lock(&thread_count_lock);
         active_threads++;
         pthread_mutex_unlock(&thread_count_lock);
+        fprintf(stderr, "CK-W%d.c lock+inc ok\n", wa->id); fflush(stderr); fsync(2);
 
         /* Get client IP for auth decisions */
         struct sockaddr_in peer_addr;
@@ -1925,6 +1928,7 @@ void *worker_thread(void *arg) {
         char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
         if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) == 0)
             inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip));
+        fprintf(stderr, "CK-W%d.d getpeername ok ip=%s\n", wa->id, client_ip); fflush(stderr); fsync(2);
 
         /* Per-connection streams — TLS wraps SSL via tls_fopen (one FILE*
            in r+ mode; reads and writes share the same SSL session); plain
@@ -1954,14 +1958,19 @@ void *worker_thread(void *arg) {
             out = cf;  /* same handle for both directions */
         } else {
             out_fd = dup(cfd);  /* separate fd for writing */
+            fprintf(stderr, "CK-W%d.e dup cfd=%d -> out_fd=%d\n", wa->id, cfd, out_fd); fflush(stderr); fsync(2);
             out = (out_fd >= 0) ? fdopen(out_fd, "w") : NULL;
+            fprintf(stderr, "CK-W%d.f fdopen out=%p\n", wa->id, (void *)out); fflush(stderr); fsync(2);
             cf = fdopen(cfd, "r");
+            fprintf(stderr, "CK-W%d.g fdopen cf=%p\n", wa->id, (void *)cf); fflush(stderr); fsync(2);
         }
         if (cf && out) {
+            fprintf(stderr, "CK-W%d.h entering fgets loop\n", wa->id); fflush(stderr); fsync(2);
             g_out = out;  /* thread-local: all OUT()/fprintf(g_out,...) goes to this client */
             int buf_size = g_max_request_size > 0 ? g_max_request_size : MAX_LINE;
             char *line = malloc(buf_size);
             while (line && fgets(line, buf_size, cf)) {
+                fprintf(stderr, "CK-W%d.i fgets line len=%d\n", wa->id, (int)strlen(line)); fflush(stderr); fsync(2);
                 /* Check for oversized request: fgets filled buffer without finding newline */
                 int len = strlen(line);
                 if (len > 0 && line[len - 1] != '\n' && len >= buf_size - 1) {
@@ -1987,7 +1996,9 @@ void *worker_thread(void *arg) {
                     break;
                 }
 
+                fprintf(stderr, "CK-W%d.j before server_process_fast\n", wa->id); fflush(stderr); fsync(2);
                 server_process_fast(wa->db_root, line, client_ip);
+                fprintf(stderr, "CK-W%d.k after server_process_fast\n", wa->id); fflush(stderr); fsync(2);
 
                 /* Single fflush per response: the response body, the \0
                    terminator, and the \n separator all share the FILE*
