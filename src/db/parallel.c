@@ -184,7 +184,7 @@ void parallel_pool_init(int nthreads) {
     g_pool_threads = malloc((size_t)nthreads * sizeof(pthread_t));
     g_pool_running = 1;
     for (int i = 0; i < nthreads; i++)
-        pthread_create(&g_pool_threads[i], NULL, pool_worker, NULL);
+        db_thread_create(&g_pool_threads[i], pool_worker, NULL);
 }
 
 void parallel_pool_shutdown(void) {
@@ -363,7 +363,7 @@ void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     for (int i = 0; i < n; i++) {
         tasks[i].fn = fn;
         tasks[i].arg = (char *)args + (size_t)i * stride;
-        if (pthread_create(&threads[i], NULL, parallel_io_thread, &tasks[i]) == 0) {
+        if (db_thread_create(&threads[i], parallel_io_thread, &tasks[i]) == 0) {
             valid[i] = 1;
         } else {
             /* Spawn failure (typically EAGAIN under thread limit) — run

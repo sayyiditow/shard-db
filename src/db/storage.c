@@ -522,7 +522,7 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
     } else {
         pthread_t *tids = malloc((size_t)ng_threads * sizeof(pthread_t));
         for (int t = 0; t < ng_threads; t++)
-            pthread_create(&tids[t], NULL, grow_rehash_worker, &gargs[t]);
+            db_thread_create(&tids[t], grow_rehash_worker, &gargs[t]);
         for (int t = 0; t < ng_threads; t++)
             pthread_join(tids[t], NULL);
         free(tids);

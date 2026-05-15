@@ -2568,8 +2568,8 @@ int cmd_server(const char *db_root, int daemonize) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
         strncpy(wa->db_root, db_root, PATH_MAX - 1);
         wa->id = i;
-        int rc = pthread_create(&pool[i], NULL, worker_thread, wa);
-        fprintf(stderr, "CK14.%d pthread_create rc=%d\n", i, rc); fflush(stderr); fsync(2);
+        int rc = db_thread_create(&pool[i], worker_thread, wa);
+        fprintf(stderr, "CK14.%d db_thread_create rc=%d\n", i, rc); fflush(stderr); fsync(2);
     }
     fprintf(stderr, "CK15 about to print listening port=%d pid=%d nthreads=%d g_timeout=%u tls=%d\n",
             port, getpid(), nthreads, g_timeout, g_tls_enable); fflush(stderr); fsync(2);
@@ -2597,7 +2597,7 @@ int cmd_server(const char *db_root, int daemonize) {
         if (av) {
             strncpy(av->db_root, db_root, PATH_MAX - 1);
             av->db_root[PATH_MAX - 1] = '\0';
-            if (pthread_create(&auto_vac_tid, NULL, auto_vacuum_thread, av) == 0)
+            if (db_thread_create(&auto_vac_tid, auto_vacuum_thread, av) == 0)
                 pthread_detach(auto_vac_tid);
             else
                 free(av);

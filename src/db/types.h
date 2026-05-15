@@ -1093,6 +1093,13 @@ void log_init(const char *db_root);
 void log_shutdown(void);
 void log_msg(int level, const char *fmt, ...);
 
+/* pthread_create wrapper that pre-sets stack size to 8 MB. macOS default
+   thread stack is 512 KB (Linux is 8 MB) — too small for our deepest
+   stack frames (db-dirs handler alone allocates 512 KB of `dirs_copy`
+   on the stack). All daemon thread spawns should go through this. Returns
+   pthread_create's rc. */
+int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg);
+
 /* match / criteria / CAS */
 int match_criterion(const char *val_str, const SearchCriterion *c);
 enum SearchOp parse_op(const char *s);
