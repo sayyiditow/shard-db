@@ -54,7 +54,10 @@ static int test_objlock_unit_run(void) {
     g_rd_count = 0;
     pthread_create(&t1, NULL, rd_worker, (void *)"shared");
     pthread_create(&t2, NULL, rd_worker, (void *)"shared");
-    usleep(5000);
+    /* Poll up to 500ms for both readers to register — bare 5 ms sleep was
+       fine on Linux but flaky on macOS-arm64 GH runners where thread
+       scheduling can take 10-50 ms before both workers run. */
+    for (int i = 0; i < 100 && g_rd_count < 2; i++) usleep(5000);
     ASSERT_EQ_INT(g_rd_count, 2, "two concurrent readers");
     objlock_rdlock("root", "shared");
     objlock_rdunlock("root", "shared");
@@ -64,7 +67,9 @@ static int test_objlock_unit_run(void) {
     pthread_t wt;
     g_rd_count = 0;
     pthread_create(&wt, NULL, rd_wait_worker, (void *)"wr_test");
-    usleep(5000);
+    /* Wait for the reader to actually acquire its rdlock before we
+       contend with wrlock — see comment above on macOS scheduling. */
+    for (int i = 0; i < 100 && g_rd_count < 1; i++) usleep(5000);
     objlock_wrlock("root", "wr_test");
     ASSERT_EQ_INT(g_rd_count, 1, "wrlock held while reader active");
     objlock_wrunlock("root", "wr_test");

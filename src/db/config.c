@@ -67,11 +67,18 @@ uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-/* Coarse clock: ~1-4ms granularity, essentially free (vDSO, no syscall).
-   Used by hot-loop timeout checks where ms precision is plenty. */
+/* Coarse clock: ~1-4ms granularity, essentially free (vDSO, no syscall)
+   on Linux via CLOCK_MONOTONIC_COARSE. macOS has no equivalent — it
+   falls back to plain CLOCK_MONOTONIC which is still cheap (~50 ns).
+   Either way, ms precision is fine for the hot-loop timeout checks
+   that call this. */
 uint64_t now_ms_coarse(void) {
     struct timespec ts;
+#ifdef CLOCK_MONOTONIC_COARSE
     clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
@@ -202,7 +209,7 @@ void log_init(const char *db_root) {
         snprintf(g_log_dir, sizeof(g_log_dir), "%s/logs", db_root);
     mkdirp(g_log_dir);
     atomic_store_explicit(&g_log_running, 1, memory_order_release);
-    pthread_create(&g_log_thread, NULL, log_writer_thread, NULL);
+    db_thread_create(&g_log_thread, log_writer_thread, NULL);
     purge_old_logs();
 }
 
@@ -210,6 +217,22 @@ void log_shutdown(void) {
     atomic_store_explicit(&g_log_running, 0, memory_order_release);
     pthread_cond_signal(&g_log_cond);
     pthread_join(g_log_thread, NULL);
+}
+
+/* pthread_create with 8 MB stack — Linux default size, matches what
+   our daemon code paths assume. macOS default is 512 KB which is below
+   the db-dirs handler's 512 KB `dirs_copy` stack array alone. Failing
+   over to plain pthread_create on attr_init/setstacksize errors keeps
+   us correct on exotic platforms; the only known case where 8 MB is
+   insufficient is intentional deep recursion (we have none). */
+int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0)
+        return pthread_create(tid, NULL, fn, arg);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    int rc = pthread_create(tid, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
 }
 
 void log_msg(int level, const char *fmt, ...) {

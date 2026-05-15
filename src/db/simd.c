@@ -107,6 +107,9 @@ const void *simd_memmem_avx2(const void *haystack, size_t hlen,
 
 const void *simd_memmem(const void *haystack, size_t hlen,
                         const void *needle,   size_t nlen) {
+    /* glibc memmem returns haystack on empty needle; macOS libc returns
+       NULL. Normalise so callers (and tests) see one behaviour. */
+    if (nlen == 0) return haystack;
     if (have_avx2()) return simd_memmem_avx2(haystack, hlen, needle, nlen);
     return memmem(haystack, hlen, needle, nlen);
 }

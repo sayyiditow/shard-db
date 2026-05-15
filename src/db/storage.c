@@ -82,7 +82,10 @@ uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, of
         /* Hint kernel to back with 2MB huge pages — 512× fewer page table
            entries and first-touch faults for a given data region. Harmless
            if the kernel can't satisfy the hint. */
+#ifdef MADV_HUGEPAGE
+        /* Linux only; macOS lacks transparent hugepage hints. */
         madvise(p, len, MADV_HUGEPAGE);
+#endif
     }
     return p;
 }
@@ -471,7 +474,9 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
 
     uint8_t *nmap = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
     if (nmap == MAP_FAILED) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+#ifdef MADV_HUGEPAGE
     madvise(nmap, new_size, MADV_HUGEPAGE);
+#endif
 
     ShardHeader *nhdr = (ShardHeader *)nmap;
     nhdr->magic = SHARD_MAGIC;
@@ -517,7 +522,7 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
     } else {
         pthread_t *tids = malloc((size_t)ng_threads * sizeof(pthread_t));
         for (int t = 0; t < ng_threads; t++)
-            pthread_create(&tids[t], NULL, grow_rehash_worker, &gargs[t]);
+            db_thread_create(&tids[t], grow_rehash_worker, &gargs[t]);
         for (int t = 0; t < ng_threads; t++)
             pthread_join(tids[t], NULL);
         free(tids);

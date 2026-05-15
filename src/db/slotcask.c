@@ -38,6 +38,20 @@
 extern void compute_hash_raw(const char *key, size_t key_len,
                               uint8_t hash_out[16]);
 
+/* Linux-only mmap hints — collapse to no-ops on macOS. MADV_HUGEPAGE is
+   the transparent-hugepage opt-in (kernel still ignores if THP is off, so
+   missing it is purely a perf hint, not a correctness one). MAP_POPULATE
+   prefaults pages at mmap time; without it the kernel faults on demand,
+   which we already handle. */
+#ifdef MADV_HUGEPAGE
+#define SHARD_MADV_HUGEPAGE(p, sz) madvise((p), (sz), MADV_HUGEPAGE)
+#else
+#define SHARD_MADV_HUGEPAGE(p, sz) ((void)0)
+#endif
+#ifndef MAP_POPULATE
+#define MAP_POPULATE 0
+#endif
+
 /* ============================================================ Helpers */
 
 static int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
@@ -268,7 +282,7 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
 
     void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
-    madvise(m, want, MADV_HUGEPAGE);  /* THP hint for kf mmap */
+    SHARD_MADV_HUGEPAGE(m, want);  /* THP hint for kf mmap */
 
     SlotcaskKfHeader *hdr = (SlotcaskKfHeader *)m;
     if (created_fresh) {
@@ -592,7 +606,7 @@ static int seg_open_file(const char *path, int create,
        walked sequentially during scans and randomly during point reads.
        2 MB hugepages (vs 4 KB) cut TLB entries by 500× over the
        working set. Kernel ignores if THP is off; no functional impact. */
-    madvise(m, SLOTCASK_SEG_MAX_BYTES, MADV_HUGEPAGE);
+    SHARD_MADV_HUGEPAGE(m, SLOTCASK_SEG_MAX_BYTES);
     *out_fd = fd;
     *out_map = (uint8_t *)m;
     *out_size = SLOTCASK_SEG_MAX_BYTES;
@@ -885,7 +899,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (new_base == MAP_FAILED) {
         close(new_fd); unlink(new_path); return -1;
     }
-    madvise(new_base, new_size, MADV_HUGEPAGE);  /* THP hint for kf rebuild */
+    SHARD_MADV_HUGEPAGE(new_base, new_size);  /* THP hint for kf rebuild */
 
     SlotcaskKfHeader *new_hdr = (SlotcaskKfHeader *)new_base;
     new_hdr->magic = SLOTCASK_KF_MAGIC;
@@ -942,7 +956,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, reopen_fd, 0);
     if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
-    madvise(fresh, new_size, MADV_HUGEPAGE);  /* THP hint for resplit remap */
+    SHARD_MADV_HUGEPAGE(fresh, new_size);  /* THP hint for resplit remap */
 
     if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
     if (e->base) munmap(e->base, e->map_size);

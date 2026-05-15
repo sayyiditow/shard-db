@@ -38,8 +38,8 @@ drdb-setup.sh
 *.swo
 *~
 
-# Local Claude Code settings
-.claude/settings.local.json
+# Local Claude Code state — settings, scheduled tasks, etc.
+.claude/
 
 # OS junk
 .DS_Store

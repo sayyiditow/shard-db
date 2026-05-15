@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & test (Linux ${{ matrix.arch }})
+    name: Build & test (${{ matrix.os }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 25
     strategy:
@@ -23,16 +23,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - os: linux
+            arch: x86_64
             runs-on: ubuntu-latest
-          - arch: arm64
+          - os: linux
+            arch: arm64
             # GitHub-hosted ARM64 runner; free for public repos.
             runs-on: ubuntu-22.04-arm
+          - os: macos
+            arch: arm64
+            # GitHub-hosted macOS runner; Apple silicon on macos-latest.
+            runs-on: macos-latest
     steps:
       # Pin actions by full commit SHA (Scorecard "Pinned-Dependencies"):
       # tags are mutable, SHAs are not. # vX.Y.Z comment kept so Dependabot
       # can bump it.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install macOS deps
+        if: matrix.os == 'macos'
+        run: |
+          # Runner image already has Homebrew + openssl@3 + ncurses.
+          # Just print versions for the log.
+          brew --version | head -1
+          brew --prefix openssl@3
+          uname -a
 
       - name: Build
         # build.sh produces shard-db, shard-cli, migrate, shard-db-test, and
@@ -48,15 +63,16 @@ jobs:
         run: ./build/bin/shard-db-test run-all
 
       - name: Package binary
-        # Tag artifact uploads by arch so both binaries can coexist.
+        # Tag artifact uploads by os+arch so binaries from different
+        # matrix legs (linux-x86_64, linux-arm64, macos-arm64) coexist.
         run: |
-          tarball="shard-db-${{ matrix.arch }}.tar.gz"
+          tarball="shard-db-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           tar -C build/bin -czf "$tarball" shard-db shard-cli migrate
           ls -l "$tarball"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: shard-db-${{ matrix.arch }}
-          path: shard-db-${{ matrix.arch }}.tar.gz
+          name: shard-db-${{ matrix.os }}-${{ matrix.arch }}
+          path: shard-db-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
           retention-days: 14

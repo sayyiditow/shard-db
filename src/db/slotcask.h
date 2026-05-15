@@ -24,7 +24,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <linux/limits.h>
+/* PATH_MAX: portable across Linux + macOS via <limits.h> + <sys/param.h>. */
+#include <limits.h>
+#include <sys/param.h>
 
 /* ============================================================ Tunables */
 

@@ -14,7 +14,7 @@
 
 A high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3.
 
-**Platform:** Linux x86_64 / ARM64. macOS port planned for 2026.05.3. License: **MIT**.
+**Platform:** Linux x86_64 / ARM64 + macOS (Apple Silicon). License: **MIT**.
 
 ## Highlights
 

@@ -17,7 +17,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
-#include <linux/limits.h>
+/* PATH_MAX: portable across Linux + macOS via <limits.h> + <sys/param.h>. */
+#include <limits.h>
+#include <sys/param.h>
 
 #include "migrate.h"
 
@@ -25,6 +27,22 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+/* Atomic rename `src` → `dst` that FAILS with EEXIST if `dst` exists.
+   Mirrors the helper in src/db/query.c — duplicated here because the
+   migrate binary links independently from the daemon. */
+static int rename_noreplace(const char *src, const char *dst) {
+#if defined(__linux__) && defined(RENAME_NOREPLACE)
+    return renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE);
+#elif defined(__APPLE__)
+    extern int renamex_np(const char *, const char *, unsigned int);
+    return renamex_np(src, dst, /* RENAME_EXCL */ 0x4);
+#else
+    struct stat st;
+    if (stat(dst, &st) == 0) { errno = EEXIST; return -1; }
+    return rename(src, dst);
+#endif
 }
 
 static int hex2_name(const char *s) {
@@ -71,7 +89,7 @@ static int migrate_object_files(const char *db_root, const char *dir,
                    race is benign in practice, renameat2 with the
                    RENAME_NOREPLACE flag does the same thing in one
                    syscall and lets the kernel enforce exclusivity. */
-                if (renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE) != 0) {
+                if (rename_noreplace(src, dst) != 0) {
                     if (errno == EEXIST) {
                         fprintf(stderr,
                             "migrate-files: skip %s/%s/%s (flat target exists at %s)\n",
