@@ -18,14 +18,16 @@ Or via JSON:
 
 ### What it copies
 
-Everything for that object: `data/`, `indexes/`, `metadata/`, `files/`, and `fields.conf`. Destination is a timestamped sibling directory under `$DB_ROOT/<dir>/`:
+Everything for that object: `data/` (kf + streams), `indexes/`, `files/`, `fields.conf`, and an `object.json` manifest carrying the splits/max_key/storage_version/streams the operator would need to recreate the object from scratch. Destination is a timestamped subdirectory under the object's own `backup/` directory:
 
 ```
-$DB_ROOT/<dir>/<obj>.backup-20260418T153012/
+$DB_ROOT/<dir>/<obj>/backup/20260418-153012/
+  object.json          # schema manifest (splits, max_key, storage_version, streams, fields)
   fields.conf
   data/
+    kf/
+    streams/
   indexes/
-  metadata/
   files/
 ```
 
@@ -41,14 +43,34 @@ Copy happens under a read lock, so concurrent reads see a consistent view. Write
 
 ### Restore
 
-No automatic restore command. To restore:
+Use the `restore` mode (shipped 2026.05.1):
 
-1. Stop the server.
-2. Remove or rename the current `<obj>/` directory.
-3. `mv <obj>.backup-TIMESTAMP <obj>`.
-4. Start the server.
+```bash
+./shard-db query '{
+  "mode":"restore",
+  "dir":"<dir>",
+  "object":"<obj>",
+  "from":"20260418-153012",
+  "force":true
+}'
+```
 
-The timestamped directory is a drop-in replacement — same layout.
+- `from` is the timestamp directory name under `<obj>/backup/`.
+- `force:true` is required if the live object isn't empty — without it `restore` refuses to overwrite live data and tells you to pass `force=true` to proceed.
+- The schema in the backup's `object.json` is reconciled with `schema.conf` and `fields.conf`. If the live versions were deleted (operator wiped metadata), restore recreates them from the backup manifest.
+- Caches are invalidated post-restore so subsequent reads see the restored state — no daemon restart required.
+
+Listed backup directories:
+
+```bash
+ls $DB_ROOT/<dir>/<obj>/backup/
+```
+
+Errors you might see:
+
+- `{"error":"backup not found ..."}` — bad `from` value.
+- `{"error":"invalid from ..."}` — `from` contained `/`, `..`, or other unsafe characters.
+- `{"error":"refusing to overwrite non-empty live object; pass force=true to proceed"}` — exactly that.
 
 ## 2. Filesystem snapshots
 
@@ -102,7 +124,7 @@ rsync -aAX --delete \
 
 Run nightly from cron. `-aAX` preserves permissions, ACLs, xattrs. `--delete` prunes removed objects on the destination.
 
-Caveat: `rsync` during active writes can race with shard growth (`.new` files mid-rename). Either pause writes, run on a filesystem snapshot, or accept occasional `.new` artifacts on the destination (they get swept on server startup).
+Caveat: `rsync` during active writes can race with kf resplits or vacuum (`.new` staging files mid-rename). Either pause writes, run on a filesystem snapshot, or accept occasional `.new` artifacts on the destination (they get swept on server startup).
 
 ### Option B — block-level replication
 
@@ -134,8 +156,8 @@ A backup you haven't restored is not a backup.
 
 ## What shard-db already does on its own
 
-- **Atomic writes** — every slot flip is two-phase (write payload → flip flag).
-- **Atomic rebuilds** — `.new` + `rename()` for growth, vacuum, schema mutations.
-- **Startup sweep** — stale `.new`/`.old` artifacts are removed before accepting connections.
+- **Atomic writes (v2)** — value bytes land in the segment file first, then a single atomic 8-byte store on the keyfile slot publishes the record. A crash before the store orphans the segment bytes but never leaves a torn record visible to readers.
+- **Atomic rebuilds** — `.new` + `rename()` for kf resplits, vacuum, and schema mutations.
+- **Startup sweep** — stale `.new` artifacts (interrupted resplits, abandoned vacuum runs) are removed before accepting connections.
 
 These protect against single-process crashes. They do **not** protect against disk failure, data center loss, or administrator error — hence the need for explicit backups above.

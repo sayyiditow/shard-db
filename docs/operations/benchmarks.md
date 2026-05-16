@@ -260,7 +260,7 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 |---|---|
 | Bulk insert (no indexes) | **357 k/sec** (2.80 s) |
 | Bulk insert (with 14 indexes) | **216 k/sec** (4.63 s) — 46% slowdown vs no-idx |
-| Add 14 indexes post-insert | **2.70 s** (per-shard parallel build — 14 × splits/4 workers) |
+| Add 14 indexes post-insert | **2.70 s** (per-shard parallel build — 14 workers × `index_splits_for(splits)` files each) |
 | GET ×1000 (req-resp, 1 conn) | **29 k ops/sec** (mean 34µs / p50 32µs) |
 | EXISTS ×1000 (req-resp) | **37 k ops/sec** (mean 27µs / p50 27µs) |
 | Indexed eq `find` (any of 14 indexes, limit 10) | **0.8–1.6 ms** |

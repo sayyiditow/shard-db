@@ -134,7 +134,7 @@ The planner selects automatically:
 
 Hybrid (non-indexed AND + fully-indexed OR sub-tree) uses the KeySet as primary-candidate source and applies the AND siblings as a post-filter.
 
-Per-shard btree layout: each indexed field is sharded into `splits/4` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Reads fan out across all shards via the parallel-for pool; writes route by record hash to one shard.
+Per-shard btree layout: each indexed field is sharded into `index_splits_for(splits)` btree files at `<obj>/indexes/<field>/<NNN>.idx` (non-linear curve: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`). Reads fan out across all idx-shards via the parallel-for pool; writes route by record hash to one shard.
 
 ## Operators
 
@@ -275,7 +275,7 @@ Rules:
 The planner picks an index automatically. Rules of thumb:
 
 - **Indexed path** — used when any criterion's field has a matching index (single-field or the leading component of a composite). B+ tree scan + record re-filter. 1–3 ms on 1 M records.
-- **Full scan** — used when no criterion is indexed. Parallel per-shard walk over Zone A + Zone B for candidates. 2–3 ms on 1 M records because Zone A stays in page cache.
+- **Full scan** — used when no criterion is indexed. Parallel per-kf-shard slot walk; each live slot's segment payload is fetched only when the in-kf hash + `match_typed()` agree on a candidate. The kf slot array stays in page cache so the bulk of the scan is hash-rejection without touching segments.
 
 See [Concepts → Indexes](../concepts/indexes.md) for the selection logic.
 

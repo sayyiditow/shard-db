@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{#
+  Theme override: emit a full favicon link set so browsers pick the
+  best-fit size instead of falling back to the 32x32 PNG that mkdocs
+  emits by default. Tab strips and bookmark bars typically render at
+  16-20 CSS pixels (so 32-40 device pixels on 2x displays) — without
+  the 48/96 sizes, browsers upscale the 32px image and the result
+  looks small/blurry next to sites that ship multiple sizes.
+#}
+{% block site_meta %}
+  {{ super() }}
+  <link rel="icon" type="image/svg+xml" href="{{ 'assets/favicon.svg' | url }}">
+  <link rel="icon" type="image/png" sizes="16x16"  href="{{ 'assets/favicon-16.png'  | url }}">
+  <link rel="icon" type="image/png" sizes="32x32"  href="{{ 'assets/favicon-32.png'  | url }}">
+  <link rel="icon" type="image/png" sizes="48x48"  href="{{ 'assets/favicon-48.png'  | url }}">
+  <link rel="icon" type="image/png" sizes="96x96"  href="{{ 'assets/favicon-96.png'  | url }}">
+  <link rel="icon" type="image/png" sizes="192x192" href="{{ 'assets/favicon-192.png' | url }}">
+  <link rel="apple-touch-icon" sizes="192x192" href="{{ 'assets/favicon-192.png' | url }}">
+  <link rel="apple-touch-icon" sizes="512x512" href="{{ 'assets/favicon-512.png' | url }}">
+{% endblock %}

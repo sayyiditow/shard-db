@@ -50,14 +50,14 @@ Capacity (in entries, not bytes) of the shared shard mmap cache (`ucache`). Ever
 
 - **Default 4096** (so `bt_cache` capacity = 1024).
 - Strict allow-list: `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning.
-- Each object has `splits` shards in `ucache`, plus `splits/4` per-field idx files in `bt_cache` (per-shard btree layout).
+- Each v2 object has `splits` kf shards in `kfcache` (plus its seg files in `segcache`); each indexed field has `index_splits_for(splits)` files in `bt_cache`. Legacy v1 objects use `ucache` instead of kfcache+segcache. All four caches share the same `FCACHE_MAX` budget.
 - Raise if either `ucache.hits / (hits + misses) < 90%` (read-heavy) **or** `bt_cache.hits / (hits + misses) < 90%` (indexed-query heavy).
 - Lower not possible — `4096` is the floor of the allow-list.
 
 When to care:
 - Many objects × many splits, with query latency higher than expected.
-- Sum `objects × avg(splits)` for ucache sizing; `objects × avg(indexes) × avg(splits/4)` for bt_cache sizing.
-- Bumping `FCACHE_MAX` from 4096 → 8192 doubles both caches. With 100 objects × 64 splits × 14 indexes, the per-shard layout creates 100 × 64 + 100 × 14 × 16 = 28 800 mmap entries — comfortably above 4096; bump to 16384 for full residency.
+- Sum `objects × avg(splits)` for kfcache (or ucache, on v1) sizing; `objects × avg(indexes) × avg(index_splits_for(splits))` for bt_cache sizing.
+- Bumping `FCACHE_MAX` from 4096 → 8192 doubles both caches. With 100 objects × 64 splits × 14 indexes, the per-shard layout creates 100 × 64 + 100 × 14 × 8 = 17 600 mmap entries — bump to 16384 for full residency.
 
 `BT_CACHE_MAX` set in db.env is **ignored** with a stderr warning.
 

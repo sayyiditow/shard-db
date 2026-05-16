@@ -31,7 +31,7 @@ Create a new typed object. See [Quick start](../getting-started/quickstart.md) f
 | `max_key` | no | `64` | Max key length in bytes. Hard ceiling 1024 (`MAX_KEY_CEILING`). |
 | `fields` | yes | — | Array of typed field specs. See [Concepts → Typed records](../concepts/typed-records.md). |
 
-`max_value` (the Zone B record size) is **always computed** as the sum of typed-field sizes — not user-configurable. Stored in `schema.conf` for persistence only.
+`value_size` (the per-record payload size, stored in segment files) is **always computed** as the sum of typed-field sizes — not user-configurable. Returned in `create-object` and `describe-object` responses; recorded internally for slot-size accounting.
 | `indexes` | no | `[]` | Fields to index at creation. Single or composite (`"a+b"`). |
 
 Response: `{"status":"created","object":"...","splits":N,"max_key":N,"value_size":N,"fields":N}`.
@@ -94,7 +94,7 @@ Response: `{"status":"renamed","old":"...","new":"..."}`.
 
 ## remove-field
 
-Tombstones one or more fields. Bytes stay reserved in Zone B until [`vacuum --compact`](#vacuum) runs.
+Tombstones one or more fields. Bytes stay reserved in every record's payload until [`vacuum --compact`](#vacuum) runs.
 
 ```json
 {
@@ -139,10 +139,10 @@ Maintenance — reclaim deleted-record slots, drop tombstoned fields, or reshard
 
 ### Why `splits` triggers reindex (2026.05.1+)
 
-Each indexed field is now sharded into `splits/4` btree files (`<obj>/indexes/<field>/<NNN>.idx`). Changing `splits` changes the per-field shard count, so the on-disk `NNN.idx` files for the old layout become unreachable orphans. `vacuum --splits` calls `reindex_object()` after the data rebuild, which:
+Each indexed field is sharded into `index_splits_for(splits)` btree files (`<obj>/indexes/<field>/<NNN>.idx`). Changing `splits` changes the per-field shard count, so the on-disk `NNN.idx` files for the old layout become unreachable orphans. `vacuum --splits` calls `reindex_object()` after the data rebuild, which:
 
 1. Wipes every per-field idx directory (`indexes/<field>/`).
-2. Rebuilds each indexed field at the new `splits/4` shard count.
+2. Rebuilds each indexed field at the new `index_splits_for(splits)` shard count.
 3. Preserves the index list (`index.conf`) — same indexes, fresh layout.
 
 Plain `vacuum --compact` (no `splits`) leaves indexes alone — the per-field shard count doesn't change.
@@ -169,7 +169,7 @@ Delete all records; schema and indexes survive.
 {"mode":"truncate","dir":"<dir>","object":"<obj>"}
 ```
 
-- Fast: zeroes out every shard's Zone A + Zone B metadata, resets counts to 0.
+- Fast: zeroes out every kf shard (slot array + header counters) and drops every seg file; resets total/deleted to 0. Schema and `fields.conf` stay intact.
 - Indexes are emptied.
 - Field schema (including tombstones) stays intact.
 

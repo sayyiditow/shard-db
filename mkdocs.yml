@@ -7,6 +7,7 @@ edit_uri: edit/main/docs/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   language: en
   features:
     - navigation.tabs
@@ -39,8 +40,12 @@ theme:
   font:
     text: Inter
     code: JetBrains Mono
-  logo: assets/logo.svg
-  favicon: assets/favicon-32.png
+  # Tight-cropped variants for in-browser rendering. Original
+  # assets/logo.svg keeps its decorative 128x128 viewBox for PNG exports
+  # / branding lockups; the site uses the cropped version so the hex
+  # fills its slot in the header and in the tab/bookmark favicon.
+  logo: assets/favicon.svg
+  favicon: assets/favicon.svg
 
 markdown_extensions:
   - admonition

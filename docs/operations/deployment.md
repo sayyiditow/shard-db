@@ -4,9 +4,9 @@ Getting shard-db into a real environment. Covers systemd, native TLS (built in) 
 
 ## Prerequisites
 
-- Linux x86_64 or ARM64 (see [Install](../getting-started/install.md)).
+- Linux x86_64 / ARM64 or macOS Apple Silicon (see [Install](../getting-started/install.md)).
 - A non-root user to run the daemon.
-- Sufficient disk — plan for `record_count × value_size × 2` as a rough envelope (includes indexes).
+- Sufficient disk — plan for `record_count × value_size × 2` as a rough envelope (includes indexes). With slotcask (v2) you'll also accumulate seg-file slack as tombstones build up; either run `vacuum` periodically (or enable `AUTO_VACUUM=1`) or add headroom for the slack.
 
 ## Directory layout
 
@@ -252,12 +252,24 @@ See [Operations → Backup](backup.md).
 
 ## Upgrades
 
-- Stop the server (`systemctl stop shard-db` — calls graceful shutdown).
-- Replace the binary.
-- Start (`systemctl start shard-db`).
-- On startup, any stale `.new`/`.old` rebuild files from the previous run are swept.
+Standard upgrade flow:
 
-No DB migration step — schemas are per-object and live in `fields.conf`; the binary format is stable within a major version.
+```bash
+systemctl stop shard-db
+# replace /opt/shard-db/shard-db, /opt/shard-db/shard-cli, /opt/shard-db/migrate
+sudo -u shard-db /opt/shard-db/migrate   # idempotent; runs per-release migrations
+systemctl start shard-db
+```
+
+The `./migrate` binary (shipped alongside the daemon and TUI client) runs every required migration for the version you're upgrading to, then exits. For 2026.05.1+ it does:
+
+1. **migrate-files** — lifts pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to flat layout.
+2. **reindex** — rebuilds every B+ tree under the per-shard v3 layout.
+3. **migrate-storage-version** — rebuilds any remaining storage_version=1 objects under the v2 slotcask engine.
+
+Re-running `./migrate` after a successful pass is a no-op. On startup the daemon also sweeps any stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
+
+For point releases that don't add new migrations (e.g. 2026.05.3 → 2026.05.4), `./migrate` runs the no-op phases instantly. No protocol or schema changes between point releases.
 
 ## Resource sizing
 

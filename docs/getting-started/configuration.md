@@ -128,7 +128,7 @@ Both lists live under `$DB_ROOT` so they travel with the data root.
 
 ## Schema — `schema.conf` and per-object `fields.conf`
 
-- `$DB_ROOT/schema.conf` — one line per object: `dir:object:splits:max_key:max_value:prealloc_mb`. Auto-managed by `create-object` — don't edit by hand.
+- `$DB_ROOT/schema.conf` — one line per object: `dir:object:splits:max_key:storage_version:streams`. Auto-managed by `create-object` (and `migrate-storage-version` during v1→v2 upgrade) — don't edit by hand. `storage_version=2` is the slotcask engine; `streams` is the number of seg-write streams (derived from nproc at create time, immutable for the object's life unless `vacuum` self-heals a streams-mismatch).
 - `$DB_ROOT/<dir>/<object>/fields.conf` — typed field definitions, one per line: `name:type[:size|P,S][:default=...]`. Also auto-managed (via `create-object`, `add-field`, `remove-field`, `rename-field`).
 
 See [Concepts → Typed records](../concepts/typed-records.md) for the on-disk layout and all type definitions.
@@ -137,24 +137,33 @@ See [Concepts → Typed records](../concepts/typed-records.md) for the on-disk l
 
 ```
 $DB_ROOT/
-  tokens.conf                      # API tokens
+  .shard-db.lock                   # flock guard — prevents two daemons sharing this root
+  tokens.conf                      # Global API tokens
   allowed_ips.conf                 # Trusted IPs
   dirs.conf                        # Allowed tenant directories
-  schema.conf                      # Object catalog
+  schema.conf                      # Object catalog (one line per object)
   <dir>/                           # Per-tenant directory
+    tokens.conf                    # Per-tenant tokens (optional)
     <object>/
+      tokens.conf                  # Per-object tokens (optional)
       fields.conf                  # Typed field schema
       metadata/
-        counts                     # "<live> <deleted>\n"
         sequences/                 # Per-named-sequence counter files
-      data/
-        NNN.bin                    # Shard files (3 hex digits, max 0fff)
+      data/                        # v2 slotcask engine — see Concepts → Storage model
+        kf/
+          NNN.kf                   # Keyfile shards (24B header + 24B slot array)
+        streams/
+          NNN/                     # One subdir per write stream (nproc-derived)
+            NNNNNN.dat             # Append-only segment files (128 MB rotation)
       indexes/
         index.conf                          # List of indexed fields
         <field>/                            # Per-field directory (per-shard btree layout)
-          NNN.idx                           #   Sharded B+ tree files, splits/4 of them
+          NNN.idx                           # Sharded B+ tree files, index_splits_for(splits) of them
         <a>+<b>/                            # Composite index — '+' joined name
           NNN.idx
+      backup/
+        <YYYYMMDD-HHMMSS>/                  # Per-backup snapshots created by `backup` mode
+          ...
       files/                       # Stored files (put-file)
         <filename>                 # Flat — basename is the lookup key
   logs/
@@ -163,7 +172,14 @@ $DB_ROOT/
     slow-YYYY-MM-DD.log
 ```
 
-Each indexed field is split into `splits/4` btree files (e.g., `splits=64` → 16 idx-shards under `indexes/<field>/000.idx`..`00f.idx`). Writes route by record hash to a single shard; reads fan out across all shards in parallel.
+The v2 engine (`storage_version=2`, the default since 2026.05.1) separates **keys** from **values**:
+
+- `data/kf/NNN.kf` — keyfile shards. Each is a 24-byte file header (`SKF1` magic + version + live count + tombstone count) followed by a packed array of 24-byte slot headers. Slot count per shard is tiered on `splits` — 1M at `splits ≤ 16`, 256K at `splits ≤ 128`, 128K at `splits ≤ 1024`, 64K at `splits ≤ 4096`. Shards auto-resplit in-place (doubling capacity) at 75 % fill, up to a per-shard ceiling of 16M slots.
+- `data/streams/NNN/NNNNNN.dat` — append-only segment files. Each stream has its own subdirectory; segments rotate at 128 MB. Writers in different streams don't contend. The number of streams is fixed at `create-object` time from `nproc` (≤ 8 → nproc; ≤ 16 → 8; else 16).
+
+Each indexed field is split into `index_splits_for(splits)` btree files — non-linear curve in `src/db/types.h`: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`. Writes route by record hash to a single idx-shard; reads fan out across all shards in parallel.
+
+Legacy v1 objects (storage_version=1, pre-2026.05) use a different layout: `data/NNN.bin` shard files with Zone A (24-byte slot headers) + Zone B (record payloads) interleaved per shard, no kf/streams split. The `./migrate` binary rebuilds them as v2 on upgrade.
 
 ## Next
 
