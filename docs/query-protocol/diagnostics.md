@@ -34,8 +34,8 @@ Human-readable block with the same numbers. Use `format:"table"` from the CLI; J
 
 ### What to watch
 
-- **`ucache` hit rate** — below 90% on a read-heavy workload = `FCACHE_MAX` too low.
-- **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived).
+- **`ucache` hit rate** — below 90% on a read-heavy workload = `FCACHE_MAX` too low. Tracks **v1 (storage_version=1)** objects only — v2 slotcask objects route through `kfcache` + `segcache`, which sit behind the same `FCACHE_MAX` budget but aren't surfaced as separate JSON fields yet. For v2-only deployments, watch `bt_cache` instead.
+- **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived). Both engines route index reads through bt_cache, so this is the universal read-cache metric.
 - **`in_flight_writes`** — should drain quickly. Sustained high = bottleneck (disk, lock contention).
 - **`slow_queries` ring** — the last 64 queries exceeding `SLOW_QUERY_MS`. See also `slow-*.log` for history.
 

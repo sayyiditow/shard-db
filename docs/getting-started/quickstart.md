@@ -14,7 +14,7 @@ You should see `running (pid ..., port 9199)`.
 
 ## 2. Create an object
 
-An **object** is shard-db's equivalent of a table: a typed schema (from `fields.conf`), one or more shard files under `data/`, and optional indexes.
+An **object** is shard-db's equivalent of a table: a typed schema (from `fields.conf`), per-object keyfile shards under `data/kf/`, append-only segment files under `data/streams/`, and optional indexes.
 
 ```bash
 ./shard-db query '{
@@ -37,12 +37,14 @@ An **object** is shard-db's equivalent of a table: a typed schema (from `fields.
 
 Returns:
 ```json
-{"status":"created","object":"users","dir":"default","splits":16,"max_key":128,"value_size":..., "fields":6}
+{"status":"created","object":"users","dir":"default","splits":16,"max_key":128,"storage_version":2,"streams":8,"value_size":...,"fields":6}
 ```
 
-- `splits: 16` → 16 shard files (`data/000.bin`..`00f.bin`).
-- `max_key: 128` → keys up to 128 bytes. Keys larger than this bloat slot size; UUIDs fit in 36 bytes.
-- `indexes: ["email","age"]` → two B+ tree indexes built on first insert.
+- `splits: 16` → 16 keyfile shards (`data/kf/000.kf`..`00f.kf`). Each holds a packed array of 24-byte slot headers; the values live separately in `data/streams/`.
+- `streams: 8` → derived from `nproc` (≤ 8 → nproc; ≤ 16 → 8; else 16). Inserts hash to one stream and append to its active segment file — parallel writers contend per stream, not per shard.
+- `max_key: 128` → keys up to 128 bytes. Stored inline with the value record in the segment file. UUIDs fit in 36 bytes.
+- `storage_version: 2` → slotcask engine (v2). New objects always land on v2; v1 is legacy and only accessible by migrating an existing 1.x install.
+- `indexes: ["email","age"]` → two B+ tree indexes built on first insert. Each indexed field is split into `index_splits_for(splits)` files under `data/indexes/<field>/` — for `splits=16` that's 4 idx-shard files per field.
 - `created:datetime:auto_create` → server fills in the current datetime on every INSERT.
 
 See [Concepts → Storage model](../concepts/storage-model.md) for what's actually on disk.
@@ -96,15 +98,17 @@ Returns a JSON array of matching records. Because `age` is indexed, this is a 1�
 ```bash
 cat > /tmp/users.json <<'EOF'
 [
-  {"id":"u2","data":{"name":"Bob","email":"b@x.com","age":22,"balance":"10.00","active":true}},
-  {"id":"u3","data":{"name":"Carol","email":"c@x.com","age":45,"balance":"999.99","active":false}}
+  {"key":"u2","value":{"name":"Bob","email":"b@x.com","age":22,"balance":"10.00","active":true}},
+  {"key":"u3","value":{"name":"Carol","email":"c@x.com","age":45,"balance":"999.99","active":false}}
 ]
 EOF
 
 ./shard-db bulk-insert default users /tmp/users.json
 ```
 
-Indexes on `email` and `age` are built in parallel. Expect ~130 k inserts/sec for single-request bulk loads on a typical laptop.
+Indexes on `email` and `age` are maintained inline by the pre-commit hook (no separate "build" step). Bulk-insert is an upsert — overwriting an existing key drops its stale index entries before writing the new value. Pass `if_not_exists:true` to keep the old idempotent behaviour. Throughput on a modern laptop tops 5 M rows/sec single-connection, 7.5 M/sec at 5 parallel connections (key/value workload); the wide-record invoice schema with 14 indexes lands in the 300–500 k rows/sec band.
+
+The dict form `{"u2":{...},"u3":{...}}` is equivalent — round-trips with `get-multi` and `bulk-update`.
 
 ## 8. Upload a file
 
@@ -121,7 +125,7 @@ Files ride the same TCP socket as queries — no separate upload protocol. See [
 ./shard-db stop
 ```
 
-`stop` waits for in-flight writes to drain before exiting. Crash-safe: any `.new` / `.old` rebuild artifacts get swept on the next start.
+`stop` waits for in-flight writes to drain before exiting. Crash-safe: each write commits via an atomic 8-byte store into the keyfile only *after* the value has been written to the active segment file, so a crash mid-write leaves the segment slot orphaned (reclaimed on next vacuum) — never a torn record. Any `.new` rebuild artifacts from interrupted resplits or vacuum runs get swept on the next start.
 
 ## Where to go next
 

@@ -80,7 +80,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `shard-stats` | `[dir] [obj]` | Per-shard load table. Without args, shows all objects; with one arg, all objects in that dir; with both, just that object. |
 | `db-dirs` | — | List registered tenant directories (from `dirs.conf`). |
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
-| `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `splits/4` shard count. No args = all tenants. |
+| `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `index_splits_for(splits)` shard count. No args = all tenants. |
 | `orphaned` | `<dir> <obj>` | Bare integer count of tombstoned-but-not-vacuumed slots. O(1) metadata read. New in 2026.05.1. |
 | `(./migrate)` | — | Per-release one-shot upgrade runner — separate binary at `build/bin/migrate`. Stops the daemon, runs every required migration for the release, restarts the daemon, exits. For 2026.05.1: `migrate-files` (lift pre-2026.05.2 `XX/XX/<filename>` to flat) + `reindex` (per-shard btree rebuild). |
 

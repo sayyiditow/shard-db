@@ -36,9 +36,9 @@ Admin commands themselves have a scope. A token needs `rwx` AND scope at least a
 
 | Command | Admin scope | Who can run it |
 |---|---|---|
-| `stats`, `stats-prom`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens`, `add-dir`/`remove-dir` | server | global `rwx` or trusted IP only |
-| `create-object` | tenant | global `rwx` or tenant `rwx` on that dir |
-| `truncate`, `vacuum`, `backup`, `recount`, `add-field`, `remove-field`, `rename-field`, `add-index`, `remove-index` | object | any `rwx` whose scope covers that object |
+| `stats`, `stats-prom`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens`, `add-dir`/`remove-dir`, `reindex` (all-tenants form), `migrate-storage-version` | server | global `rwx` or trusted IP only |
+| `create-object`, `drop-object`, `list-objects`, `describe-object` | tenant | global `rwx` or tenant `rwx` on that dir |
+| `truncate`, `vacuum`, `backup`, `restore`, `recount`, `add-field`, `remove-field`, `rename-field`, `add-index`, `remove-index`, `reindex` (per-object form) | object | any `rwx` whose scope covers that object |
 
 **Token management is always server-admin** — tenant admins cannot issue new tokens. The platform operator owns all credential issuance.
 
@@ -93,7 +93,11 @@ $DB_ROOT/
     users/
       tokens.conf                      # per-object tokens (optional)
       fields.conf
-      data/ ...
+      data/                            # v2 slotcask: kf/ + streams/
+        kf/...
+        streams/...
+      indexes/...
+      files/...
     products/ ...
   acme/
     tokens.conf

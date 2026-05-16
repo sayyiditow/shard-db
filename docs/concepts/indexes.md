@@ -1,6 +1,6 @@
 # Indexes
 
-shard-db indexes are **B+ trees with prefix-compressed leaves**, stored per-object under `<object>/indexes/<field>/<NNN>.idx` — each field's btree is split into `splits/4` shards (the **per-shard btree layout**, 2026.05.1+). Reads fan out across all shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every one of the 38 search operators uses an index when one is available (with a few intentional full-scan exceptions noted in [find → Operators](../query-protocol/find.md#operators)).
+shard-db indexes are **B+ trees with prefix-compressed leaves**, stored per-object under `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every one of the 38 search operators uses an index when one is available (with a few intentional full-scan exceptions noted in [find → Operators](../query-protocol/find.md#operators)).
 
 ## When to add an index
 
@@ -19,7 +19,7 @@ Don't bother for tiny objects or fields with very low cardinality (`bool`, `acti
 {"mode":"add-index","dir":"acme","object":"invoices","field":"customer"}
 ```
 
-Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`splits/4` shards). For `splits=64`, that's 16 idx-shard files; for `splits=128`, 32 files; etc.
+Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`index_splits_for(splits)` shards). For `splits=64`, that's 8 idx-shard files; for `splits=128`, 16 files; for `splits=4096`, 128 files. See the curve table above.
 
 ### Composite
 
@@ -56,29 +56,33 @@ Safe to call on a non-existent index — returns `{"status":"not_indexed",...}` 
 
 ## How queries pick an index
 
-Given a `criteria` array, the planner:
+Given a `criteria` array, the planner picks one of five paths:
 
-1. Finds any criterion where the field is indexed and the operator is selective enough (anything other than pure `exists`/`not_exists`).
-2. Uses that index as the **primary filter** — the B+ tree yields candidate hashes.
-3. Runs the remaining criteria against each candidate record using `match_typed()` (zero-malloc byte compares).
+- **`PRIMARY_LEAF`** — single indexed AND leaf drives the candidate set; remaining criteria are post-filtered on the records via `match_typed()` (zero-malloc byte compares).
+- **`PRIMARY_INTERSECT`** — pure AND of 2+ indexed leaves on rangeable operators (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf's btree into a lock-free hash KeySet, intersects the sets, and skips per-record fetch entirely for `count` and AND-only `aggregate`. Capped at `MAX_INTERSECT_LEAVES = 8` indexed leaves — past that the planner falls back to `PRIMARY_LEAF`.
+- **`PRIMARY_KEYSET`** — pure OR (every child indexed) unions candidate hashes into a KeySet; pure-OR `count` returns `|KeySet|` directly.
+- **Hybrid AND+OR** — indexed AND leaf as primary, OR sub-tree as per-record post-filter.
+- **`PRIMARY_NONE`** — no indexable leaf; parallel scan across every kf shard. Each worker probes its shard's slot array, follows live slots into the segcache, runs `match_typed()` on the payload.
 
 For **composite** indexes, the planner matches against the leading-prefix pattern: `status="paid"` uses `status+created`, but `created > X` alone does not.
 
-For **multi-criterion** queries where several fields are indexed, the single most selective index wins (roughly: the one with the most-equal-style operators on the leading field). A future optimization could intersect multiple indexes; today it picks one.
+Selectivity rank for intersect ordering: `eq < starts_with < between < in < range`. Substring/suffix ops (`like`, `contains`, `ends`, `not_*`) and large-set ops (`neq`, `not_in`) cannot drive intersection.
 
 ## Cost
 
-Indexed lookups on 1 M records stay in the 1–3 ms band across all 17 operators. That's mostly:
+Indexed lookups on 1 M records stay in the 1–3 ms band across most of the 38 operators. That's mostly:
 
-- B+ tree descent: O(log N) page loads, hitting the warm `BT_CACHE` after first use.
+- B+ tree descent: O(log N) page loads, hitting the warm `bt_cache` after first use.
 - Candidate count: usually small for equality/range filters.
-- Per-candidate record fetch: one Zone B memcpy + typed decode.
+- Per-candidate record fetch: one kf slot read + one seg payload memcpy + typed decode.
 
-Full scans without an index are surprisingly fast (2–3 ms on 1 M records) because Zone A (24 bytes × slot count) stays in page cache, and most records reject on metadata without touching Zone B. But full scans are O(N), so they get expensive as the object grows past a few million records.
+`len_*` operators (varchar length filters) answer entirely from btree-leaf metadata — no record fetch at all, since the leaf carries the field's encoded length. These are the fastest non-equality lookups in the system.
+
+Full scans without an index parallelize across kf shards (`THREADS` workers); each worker walks its shard's slot array and only follows live slots into segments. Many records reject on the in-kf hash alone (e.g. eq queries with a hash-routed shard) without ever touching a segment. But full scans are O(N), so they get expensive as the object grows past a few million records.
 
 ## B+ tree file format
 
-Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Leaves are **prefix-compressed** every K=16 entries:
+Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Magic `BTRG` (v3 format, 2026.05.3+). Leaves are **prefix-compressed** every K=16 entries:
 
 - Every 16th entry stores the full key (an **anchor**).
 - Entries between anchors store only the suffix that differs from the preceding anchor.
@@ -86,9 +90,16 @@ Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Leaves are **prefix-co
 
 The effect: leaves pack ~2–3× more keys per page than uncompressed. Range scans touch fewer pages.
 
+V3 adds two header fields that make DESC iteration O(1)-step:
+
+- `BtFileHeader.last_leaf_page` — pointer to the rightmost leaf. DESC iterators start here in O(1).
+- `BtPageHeader.prev_leaf` — backward link maintained on every leaf split. DESC steps left one page at a time via `ph->prev_leaf` instead of indexing into a precomputed array.
+
+Older formats (v1 `BTRE` string-keyed; v2 `BTRF` binary keys without `prev_leaf`) are rejected at open with a clear error and require a reindex. `./migrate` phase 2 handles this automatically on upgrade.
+
 ## Index maintenance
 
-Indexes are **kept in sync automatically** on `insert`, `update`, `delete`, and bulk ops. Every write call resolves the per-field value and either writes to (new value) or deletes from (old value) the index.
+Indexes are **kept in sync automatically** on `insert`, `update`, `delete`, and bulk ops. The slotcask engine's `pre_commit` hook fires while the kf wrlock is held — it resolves the per-field value for both the new payload and (on update) the old payload, and writes to (new value) or deletes from (old value) every relevant idx shard before the kf atomic store commits the record. If any index update fails, the commit is aborted and the record is not visible to readers.
 
 ### When to rebuild
 
@@ -107,15 +118,15 @@ After `remove-field`, any index referencing the tombstoned field is **automatica
 ## Inspecting indexes
 
 - `<obj>/indexes/index.conf` — authoritative list of registered indexes.
-- `<obj>/indexes/<field>/<NNN>.idx` — per-shard B+ tree files (one directory per indexed field, `splits/4` files inside).
-- `stats` output includes B+ tree cache hit rate — low hit rate on a read-heavy workload suggests raising `FCACHE_MAX` (which derives `BT_CACHE_MAX = FCACHE_MAX/4` automatically as of 2026.05.1).
+- `<obj>/indexes/<field>/<NNN>.idx` — per-shard B+ tree files (one directory per indexed field, `index_splits_for(splits)` files inside).
+- `stats` output includes B+ tree cache hit rate (`bt_cache.hits / (hits + misses)`) — low hit rate on a read-heavy workload suggests raising `FCACHE_MAX` (which derives `BT_CACHE_MAX = FCACHE_MAX/4` automatically as of 2026.05.1).
 
 ## Why per-shard?
 
-Pre-2026.05.1 each field was one big `<field>.idx` file. The 2026.05.1 redesign sharded that into `splits/4` files because:
+Pre-2026.05.1 each field was one big `<field>.idx` file. The 2026.05.1 redesign sharded that into per-`splits` slices because:
 
-1. **Concurrency hazard.** A writer doing `bulk_build` truncates and rewrites the file; a reader holding a private mmap saw inconsistent intermediate state. Per-file `pthread_rwlock_t` (one per shard) gives readers and writers proper isolation.
-2. **Read parallelism.** `find` / `count` / `aggregate` fan out across all shards via `parallel_for`; with 16 idx shards on a 16-core box, indexed lookups parallelise N-way for free.
-3. **Smaller per-file working set.** A 100M-row index that was 3 GB single-file becomes ~12 MB per shard at `splits=4096`. Easier on the page cache.
+1. **Concurrency hazard.** A writer doing `bulk_build` truncates and rewrites the file; a reader holding a private mmap saw inconsistent intermediate state. Per-file `pthread_rwlock_t` (one per idx-shard) gives readers and writers proper isolation.
+2. **Read parallelism.** `find` / `count` / `aggregate` fan out across all idx-shards via `parallel_for`; with 16 idx shards on a 16-core box, indexed lookups parallelise N-way for free.
+3. **Smaller per-file working set.** A 100M-row index that was 3 GB single-file becomes manageable per shard. Easier on the page cache.
 
-The trade is more on-disk space (~20-25 % bloat from reduced prefix-compression effectiveness with smaller per-leaf working sets, plus 1.8 MB of empty-tree headers for the typical 14-index schema) and a structural cost on bulk-insert into pre-existing-indexed objects (each merge call hits 16 files instead of 1). For static schemas, **load-then-index** is now preferred over insert-with-pre-existing-indexes.
+The trade is more on-disk space (~20-25 % bloat from reduced prefix-compression effectiveness with smaller per-leaf working sets, plus ~100KB of empty-tree headers per index at higher fan-outs) and a structural cost on bulk-insert into pre-existing-indexed objects. For static schemas at large scale (R = total records / 200K ≥ ~20 parallel chunks), **load-then-index** is preferred; for smaller-scale or steady-state workloads, parallel-insert-with-pre-existing-indexes wins. The 2026.05.2 pre-grow optimisation made every path ~2× faster, but the crossover rule still applies.

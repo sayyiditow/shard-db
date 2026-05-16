@@ -2,10 +2,12 @@
 
 Every object has a **typed binary schema**, declared once at `create-object` time and stored in `<object>/fields.conf`. Records on disk are a fixed-width packed layout driven by this schema — not JSON.
 
+On the v2 slotcask engine these typed records are the **value payload** of each segment record (`<obj>/data/streams/<stream>/<file>.dat`), prefixed by a 24-byte segment record header (hash + klen + flag + vlen) and followed by `klen` bytes of raw key.
+
 ## Why typed records
 
 - **Zero-malloc matching** — `match_typed()` compares criterion values directly against byte ranges; no JSON parsing per record.
-- **Compact** — an `int` is 4 bytes, not 4–11 ASCII digits. Zone B payloads pack densely.
+- **Compact** — an `int` is 4 bytes, not 4–11 ASCII digits. Payloads pack densely.
 - **Correct numerics** — `numeric:P,S` stores fixed-point decimals without IEEE 754 drift.
 
 ## Declaring fields
@@ -42,10 +44,13 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `long` | `id:long` | 8 | Signed 64-bit, big-endian. |
 | `short` | `flags:short` | 2 | Signed 16-bit, big-endian. Range ±32 k. |
 | `double` | `score:double` | 8 | IEEE 754. |
+| `float` | `weight:float` | 4 | IEEE 754 single-precision. |
 | `bool` | `active:bool` | 1 | `0` = false, `1` = true. |
 | `byte` | `level:byte` | 1 | Unsigned 8-bit. |
 | `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). |
 | `datetime` | `created:datetime` | 6 | `yyyyMMdd` (int32 BE) + `HHmmss` (uint16 BE packed). |
+| `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS`. Malformed input encodes 0. |
+| `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars). Malformed input encodes 0. |
 | `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
 
@@ -54,7 +59,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 `varchar:N` reserves `N + 2` bytes per record. Content longer than N is rejected on insert. Pick N carefully:
 
 - Too small → insert errors later. Migrating to a larger N requires `add-field` + manual repopulation.
-- Too large → Zone B slot size bloats. Every record pays the full reserved size, even for short strings.
+- Too large → record payload bloats. Every record pays the full reserved size, even for short strings — both inside the segment file and in the slot-size accounting used to estimate disk budget.
 
 Typical patterns:
 - `email:varchar:200`
@@ -99,7 +104,7 @@ Combined with `{"mode":"update", "if":{"version":42}}` gives you optimistic conc
 
 ## On-disk encoding
 
-Records in Zone B are encoded as `typed_encode()` (in `config.c`) packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.
+Record payloads are encoded by `typed_encode()` (in `config.c`), which packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.
 
 No field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
 
@@ -111,11 +116,12 @@ Order of operations when evolving a schema:
 
 1. **Add new field** — `add-field`. Triggers an object rebuild that re-encodes every record with the new (default-filled) column.
 2. **Rename field** — `rename-field`. Metadata-only; no data rewrite. Composite indexes referring to the renamed field are also updated.
-3. **Remove field** — `remove-field`. Tombstones the field in `fields.conf`; bytes stay reserved in Zone B until `vacuum --compact`.
-4. **Drop tombstones** — `vacuum --compact`. Full rebuild, shrinks `slot_size`.
+3. **Remove field** — `remove-field`. Tombstones the field in `fields.conf`; bytes stay reserved in every record's payload until `vacuum --compact`.
+4. **Drop tombstones** — `vacuum --compact`. Full rebuild, shrinks per-record payload size.
 
 ## Auditing the layout
 
-- `./shard-db query '{"mode":"create-object",...}'` response includes `value_size` — the total Zone B bytes per record.
+- `./shard-db query '{"mode":"create-object",...}'` response includes `value_size` — the total payload bytes per record.
 - `cat $DB_ROOT/<dir>/<obj>/fields.conf` — authoritative field order and types (including tombstoned fields, marked `:removed`).
-- `./shard-db shard-stats <dir> <obj>` — per-shard load and slot size.
+- `./shard-db shard-stats <dir> <obj>` — per-kf-shard load and per-stream segment counts.
+- `./shard-db query '{"mode":"describe-object","dir":"<d>","object":"<o>"}'` — full schema dump including `splits`, `max_key`, `value_size`, `streams`, `storage_version`, and the field list.
