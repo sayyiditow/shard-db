@@ -5266,6 +5266,104 @@ typedef struct {
     int                error;
 } V2RebuildCtx;
 
+/* Re-encode one field's bytes from old size/scale to new. Same-type only;
+   caller (cmd_edit_fields) refuses cross-type edits up front.
+
+     FT_VARCHAR  — copy [uint16 BE length][content], clamp to new capacity.
+                   varchar shrink that would clip content is rejected
+                   pre-flight; here we trust caller.
+     FT_INT/LONG/SHORT — decode BE signed, re-encode at new size with sign
+                   extension on widen, truncation on narrow. Narrow
+                   overflow caught pre-flight.
+     FT_NUMERIC  — int64 BE scaled by 10^S. Rescale on S change.
+     FT_FLOAT/DOUBLE — natural widen by IEEE 754 cast (caller validates).
+     other types — same size required; defensive memcpy. */
+static void transform_field_value(const TypedField *old_f,
+                                   const TypedField *new_f,
+                                   const uint8_t *src,
+                                   uint8_t *dst) {
+    /* No-op if size + scale identical (transform shouldn't have been
+       called, but be defensive). */
+    if (old_f->size == new_f->size &&
+        old_f->numeric_scale == new_f->numeric_scale) {
+        memcpy(dst, src, old_f->size);
+        return;
+    }
+
+    switch (old_f->type) {
+    case FT_VARCHAR: {
+        uint16_t old_clen = ((uint16_t)src[0] << 8) | (uint16_t)src[1];
+        uint16_t new_cap  = (uint16_t)(new_f->size >= 2 ? new_f->size - 2 : 0);
+        uint16_t copy_len = old_clen <= new_cap ? old_clen : new_cap;
+        dst[0] = (uint8_t)(copy_len >> 8);
+        dst[1] = (uint8_t)(copy_len & 0xFF);
+        if (copy_len > 0) memcpy(dst + 2, src + 2, copy_len);
+        /* trailing slack in dst remains zero from caller's calloc */
+        return;
+    }
+    case FT_INT:
+    case FT_LONG:
+    case FT_SHORT: {
+        int64_t v = (src[0] & 0x80) ? -1 : 0;  /* sign extend */
+        for (int i = 0; i < old_f->size; i++) v = (v << 8) | src[i];
+        for (int i = new_f->size; i-- > 0; ) {
+            dst[i] = (uint8_t)(v & 0xFF);
+            v >>= 8;
+        }
+        return;
+    }
+    case FT_NUMERIC: {
+        int64_t v = (src[0] & 0x80) ? -1 : 0;
+        for (int i = 0; i < old_f->size; i++) v = (v << 8) | src[i];
+        int delta = new_f->numeric_scale - old_f->numeric_scale;
+        if (delta > 0) {
+            int64_t mult = 1;
+            for (int i = 0; i < delta; i++) mult *= 10;
+            v *= mult;
+        } else if (delta < 0) {
+            int64_t div = 1;
+            for (int i = 0; i < -delta; i++) div *= 10;
+            v /= div;  /* truncates toward zero, matches Postgres */
+        }
+        for (size_t i = new_f->size; i-- > 0; ) {
+            dst[i] = (uint8_t)(v & 0xFF);
+            v >>= 8;
+        }
+        return;
+    }
+    case FT_FLOAT: {
+        /* float → double widen. Other float edits not supported. */
+        if (new_f->type == FT_DOUBLE) {
+            uint32_t u = 0;
+            for (size_t i = 0; i < 4; i++) u = (u << 8) | src[i];
+            float fv;
+            memcpy(&fv, &u, 4);
+            double dv = (double)fv;
+            uint64_t u64;
+            memcpy(&u64, &dv, 8);
+            for (size_t i = 8; i-- > 0; ) { dst[i] = (uint8_t)(u64 & 0xFF); u64 >>= 8; }
+            return;
+        }
+        memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
+        return;
+    }
+    default:
+        /* Same-size paths fell through above. Anything else: best-effort
+           prefix copy. Caller should have refused. */
+        memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
+        return;
+    }
+}
+
+/* True if old_f → new_f requires byte-level re-encoding (not just memcpy). */
+static inline int field_needs_transform(const TypedField *old_f,
+                                         const TypedField *new_f) {
+    if (old_f->size != new_f->size) return 1;
+    if (old_f->type == FT_NUMERIC &&
+        old_f->numeric_scale != new_f->numeric_scale) return 1;
+    return 0;
+}
+
 static int v2_rebuild_walk_cb(const uint8_t hash16[16],
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
@@ -5284,9 +5382,11 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
         return 0;
     }
 
-    /* Slot layout changed (compact, add-field, or both): recompose typed
-       payload by mapping new field offsets ← old field offsets. New fields
-       (new_to_old == -1) stay zero from calloc. */
+    /* Slot layout changed (compact, add-field, edit-field, or any combo):
+       recompose typed payload by mapping new field offsets ← old field
+       offsets. New fields (new_to_old == -1) stay zero from calloc. Edited
+       fields (size or numeric scale changed) go through transform_field_value;
+       same-shape fields take the fast memcpy path. */
     uint8_t *buf = calloc(1, ctx->new_ts->total_size);
     if (!buf) { ctx->error = 1; return 1; }
     for (int k = 0; k < ctx->new_ts->nfields; k++) {
@@ -5295,8 +5395,15 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
         size_t off = ctx->old_ts->fields[oi].offset;
         size_t sz  = ctx->old_ts->fields[oi].size;
         if (off + sz > vlen) continue;  /* defensive */
-        memcpy(buf + ctx->new_ts->fields[k].offset,
-               (const uint8_t *)value + off, sz);
+        const TypedField *of = &ctx->old_ts->fields[oi];
+        const TypedField *nf = &ctx->new_ts->fields[k];
+        if (field_needs_transform(of, nf)) {
+            transform_field_value(of, nf,
+                                   (const uint8_t *)value + off,
+                                   buf + nf->offset);
+        } else {
+            memcpy(buf + nf->offset, (const uint8_t *)value + off, sz);
+        }
     }
     int rc = slotcask_insert(ctx->new_db, -1, key, klen,
                               buf, ctx->new_ts->total_size);
