@@ -129,7 +129,7 @@ If you need to update two records atomically, your options are:
 
 ## Connection scaling
 
-Each connection runs on a worker thread (bounded by `WORKERS`, default = `max(nproc, 4)`). The server uses `epoll` on Linux and `poll` on macOS for accept, and hands off ready sockets to the worker queue. Single connection is not a bottleneck — pipelining multiple JSON requests over one socket gets close to per-connection line rate.
+Each connection runs on a worker thread (bounded by `WORKERS`, default = `max(nproc, 4)`). The accept loop in `src/db/server.c` uses `poll(2)` on both Linux and macOS — the listen socket is a single fd, so `epoll`'s selectivity has nothing to gain over the POSIX baseline `poll`, and one accept path runs everywhere. Ready connections are handed off to the worker queue. Single connection is not a bottleneck — pipelining multiple JSON requests over one socket gets close to per-connection line rate.
 
 Cache pressure: every active connection allocates a `MAX_REQUEST_SIZE`-byte read buffer. At the default 32 MB, 100 concurrent connections = 3.2 GB. Raise `MAX_REQUEST_SIZE` deliberately.
 

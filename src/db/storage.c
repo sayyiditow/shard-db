@@ -2302,7 +2302,9 @@ int cmd_delete(const char *db_root, const char *object,
 /* ========== Parallel multi-key EXISTS ========== */
 
 typedef struct {
-    char *key;
+    char *key;          /* storage form: binary for auto_key, string otherwise */
+    size_t klen;        /* binary length (was strlen(key) before auto-key) */
+    char *wire_key;     /* wire-form string for response output */
     uint8_t hash[16];
     int shard_id;
     int start_slot;
@@ -2340,7 +2342,7 @@ static void *multi_exists_shard_worker(void *arg) {
         for (int ei = 0; ei < sw->count; ei++) {
             MultiExistsEntry *e = &sw->entries[ei];
             batch[ei].key       = e->key;
-            batch[ei].klen      = strlen(e->key);
+            batch[ei].klen      = e->klen;
             batch[ei].value     = NULL;
             batch[ei].vlen      = 0;
             batch[ei].user_ctx  = NULL;
@@ -2368,15 +2370,14 @@ static void *multi_exists_shard_worker(void *arg) {
 
     for (int ei = 0; ei < sw->count; ei++) {
         MultiExistsEntry *e = &sw->entries[ei];
-        size_t klen = strlen(e->key);
         for (uint32_t p = 0; p < slots; p++) {
             uint32_t s = ((uint32_t)e->start_slot + p) & mask;
             SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag == 2) continue;
             if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, klen) == 0) {
+                h->key_len == e->klen &&
+                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
                 e->found = 1; break;
             }
         }
@@ -2421,11 +2422,34 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* v2 alignment — see cmd_get_multi for rationale. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else { e->key = NULL; e->klen = 0; }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else { e->key = NULL; e->klen = 0; }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* v2 alignment — see cmd_get_multi for rationale. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->found = 0;
         } else p++;
     }
@@ -2484,7 +2508,8 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
         char *buf = malloc(cap);
         size_t pos = 0;
         if (buf) for (int i = 0; i < key_count; i++) {
-            size_t klen = strlen(entries[i].key);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            size_t klen = strlen(out_key);
             if (pos + klen + 16 > cap) {
                 cap = (pos + klen + 16) * 2;
                 char *t = realloc(buf, cap);
@@ -2502,7 +2527,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                into our buffer via snprintf — replicate the no-quote-needed shape
                here to avoid re-implementing the quote logic. */
             /* CID 1693857/1693869 - bounds checked above, triage */
-            memcpy(buf + pos, entries[i].key, klen); pos += klen;
+            memcpy(buf + pos, out_key, klen); pos += klen;
             /* Use SB_APPEND for bounded write — pre-grow above guarantees
                room, but the macro silences the CodeQL "potentially
                overflowing snprintf" finding by clamping to cap-1. */
@@ -2520,7 +2545,8 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
         if (buf) {
             buf[pos++] = '{';
             for (int i = 0; i < key_count; i++) {
-                size_t klen = strlen(entries[i].key);
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+                size_t klen = strlen(out_key);
                 if (pos + klen + 16 > cap) {
                     cap = (pos + klen + 16) * 2;
                     char *t = realloc(buf, cap);
@@ -2533,7 +2559,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 if (cap < pos || cap - pos < klen + 16) { free(buf); buf = NULL; break; }
                 if (i) buf[pos++] = ',';
                 buf[pos++] = '"';
-                memcpy(buf + pos, entries[i].key, klen); pos += klen;
+                memcpy(buf + pos, out_key, klen); pos += klen;
                 buf[pos++] = '"'; buf[pos++] = ':';
                 if (entries[i].found) {
                     memcpy(buf + pos, "true", 4); pos += 4;
@@ -2553,7 +2579,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }
@@ -2588,11 +2614,34 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* v2 alignment — see cmd_get_multi for rationale. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else { e->key = NULL; e->klen = 0; }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else { e->key = NULL; e->klen = 0; }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* v2 alignment — see cmd_get_multi for rationale. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->found = 0;
         } else p++;
     }
@@ -2645,7 +2694,8 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
         int first = 1;
         for (int i = 0; i < key_count; i++) {
             if (entries[i].found) continue;
-            size_t klen = strlen(entries[i].key);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            size_t klen = strlen(out_key);
             if (pos + klen + 8 > cap) {
                 cap = (pos + klen + 8) * 2;
                 char *t = realloc(buf, cap);
@@ -2657,7 +2707,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             if (!first) buf[pos++] = ',';
             buf[pos++] = '"';
             /* CID 1693871 - bounds checked above, triage */
-            memcpy(buf + pos, entries[i].key, klen); pos += klen;
+            memcpy(buf + pos, out_key, klen); pos += klen;
             buf[pos++] = '"';
             first = 0;
         }
@@ -2671,7 +2721,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }
@@ -2679,7 +2729,9 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 /* ========== Parallel multi-key GET ========== */
 
 typedef struct {
-    char *key;
+    char *key;          /* storage form: binary for auto_key, string otherwise */
+    size_t klen;        /* binary length (was strlen(key) before auto-key) */
+    char *wire_key;     /* wire-form string for response output (NULL → use key) */
     uint8_t hash[16];
     int shard_id;
     int start_slot;
@@ -2723,7 +2775,7 @@ static void *multi_get_shard_worker(void *arg) {
         for (int ei = 0; ei < sw->count; ei++) {
             MultiGetEntry *e = &sw->entries[ei];
             batch[ei].key       = e->key;
-            batch[ei].klen      = strlen(e->key);
+            batch[ei].klen      = e->klen;
             batch[ei].value     = NULL;
             batch[ei].vlen      = 0;
             batch[ei].user_ctx  = NULL;
@@ -2764,10 +2816,9 @@ static void *multi_get_shard_worker(void *arg) {
             SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag == 2) continue;
-            size_t klen = strlen(e->key);
             if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, klen) == 0) {
+                h->key_len == e->klen &&
+                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
                 const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
                 char *val = typed_decode(sw->fs->ts, (const uint8_t *)raw, h->value_len);
                 /* Store just the decoded value JSON. */
@@ -2807,13 +2858,48 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 entries = t;
             }
             MultiGetEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* For v2, override the bucketing shard with slotcask's kf-shard
-               mapping so each parallel_for worker owns one kf shard and
-               doesn't queue on cross-worker kf-cache contention. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            /* Wire form (always a printable string) — used in response output. */
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+
+            /* Storage form — binary for auto_key=uuid/seq, verbatim otherwise.
+               Parse failures for AK_UUID/SEQ are caught here and the entry's
+               result_json is left NULL → renders as `null` in the response,
+               which matches the "missing key" shape clients already handle. */
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else {
+                    e->key = NULL; e->klen = 0;
+                }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else {
+                    e->key = NULL; e->klen = 0;
+                }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* For v2, override the bucketing shard with slotcask's kf-shard
+                   mapping so each parallel_for worker owns one kf shard and
+                   doesn't queue on cross-worker kf-cache contention. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                /* Malformed auto-key wire form → never matches, but keep the
+                   shard_id deterministic so bucket-sort works. */
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->result_json = NULL;
         } else p++;
     }
@@ -2875,7 +2961,8 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         OUT("\n");
         for (int i = 0; i < key_count; i++) {
             if (!entries[i].result_json) continue;
-            csv_emit_cell(entries[i].key, csv_delim);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            csv_emit_cell(out_key, csv_delim);
             JsonObj value_obj;
             int have_value = json_parse_object(entries[i].result_json,
                                                strlen(entries[i].result_json),
@@ -2904,7 +2991,8 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             buf[pos++] = '{';
             int first = 1;
             for (int i = 0; i < key_count; i++) {
-                size_t klen = strlen(entries[i].key);
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+                size_t klen = strlen(out_key);
                 size_t vlen = entries[i].result_json ? strlen(entries[i].result_json) : 4;
                 if (pos + klen + vlen + 16 > cap) {
                     cap = (pos + klen + vlen + 16) * 2;
@@ -2918,7 +3006,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 first = 0;
                 buf[pos++] = '"';
                 /* CID 1693870 - bounds checked above, triage */
-                memcpy(buf + pos, entries[i].key, klen); pos += klen;
+                memcpy(buf + pos, out_key, klen); pos += klen;
                 buf[pos++] = '"'; buf[pos++] = ':';
                 if (entries[i].result_json) {
                     /* CID 1693872 - bounds checked above, triage */
@@ -2941,11 +3029,12 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             for (int i = 0; i < key_count; i++) {
                 if (!first) OUT(",");
                 first = 0;
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
                 if (entries[i].result_json) {
-                    OUT("\"%s\":%s", entries[i].key, entries[i].result_json);
+                    OUT("\"%s\":%s", out_key, entries[i].result_json);
                     free(entries[i].result_json);
                 } else {
-                    OUT("\"%s\":null", entries[i].key);
+                    OUT("\"%s\":null", out_key);
                 }
             }
             OUT("}\n");
@@ -2954,7 +3043,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }

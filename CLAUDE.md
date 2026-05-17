@@ -30,7 +30,7 @@ Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`.
 - `storage.c` — xxh128 hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache, `build_idx_path`, `compute_addr`
 - `index.c` — per-shard B+ tree wrappers (`btree_idx_*`), parallel indexing, `reindex_clean_legacy`
 - `query.c` — find, count, aggregate, joins, bulk ops, planner (`choose_primary_source`), maintenance
-- `server.c` — multi-threaded TCP server (epoll), JSON dispatch, auth, stats, optional TLS
+- `server.c` — multi-threaded TCP server (poll-based accept + thread pool), JSON dispatch, auth, stats, optional TLS
 - `tls.c / tls.h` — OpenSSL wrapper; `tls_fopen()` wraps `SSL *` as a stdio `FILE *` via fopencookie/funopen so existing OUT() / fgets() call sites stay untouched
 - `btree.c / btree.h` — B+ tree (page-based, prefix-compressed leaves, mmap'd, `BtRangeIter`, unified `bt_acquire/bt_release`)
 - `objlock.c` — per-object rwlock (normal ops share; vacuum/rebuild exclusive)

@@ -364,6 +364,45 @@ static int test_auto_key_run(void) {
                 "bulk-insert response contains v4 marker (-4)");
     free(resp); resp = NULL;
 
+    /* === 13. multi-key get/exists/not-exists on auto-key objects ========== */
+
+    /* get multi by rendered seq keys — both "1" and "2" exist, "999" doesn't */
+    tc_request(tc,
+        "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"keys\":[\"1\",\"2\",\"999\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"1\":", "multi-get auto-seq: 1 echoed");
+    ASSERT_CONTAINS(resp, "\"2\":", "multi-get auto-seq: 2 echoed");
+    ASSERT_CONTAINS(resp, "\"999\":null", "multi-get missing key → null");
+    free(resp); resp = NULL;
+
+    /* exists multi by rendered keys */
+    tc_request(tc,
+        "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"keys\":[\"1\",\"999\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"1\":true", "multi-exists auto-seq: 1 true");
+    ASSERT_CONTAINS(resp, "\"999\":false", "multi-exists auto-seq: 999 false");
+    free(resp); resp = NULL;
+
+    /* not-exists returns missing keys */
+    tc_request(tc,
+        "{\"mode\":\"not-exists\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"keys\":[\"1\",\"999\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"999\"", "not-exists: 999 in output");
+    ASSERT_TRUE(resp && strstr(resp, "\"1\"") == NULL,
+                "not-exists: existing key 1 omitted");
+    free(resp); resp = NULL;
+
+    /* uuid multi-get by rendered uuid */
+    snprintf(buf, sizeof(buf),
+        "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"users\","
+        "\"keys\":[\"%s\",\"00000000-0000-4000-8000-000000000000\"]}",
+        uuid_alice);
+    tc_request(tc, buf, &resp);
+    ASSERT_CONTAINS(resp, "\"name\":\"Alice2\"", "multi-get auto-uuid: alice value");
+    ASSERT_CONTAINS(resp, "00000000-0000-4000-8000-000000000000\":null",
+                    "multi-get auto-uuid: missing uuid → null");
+    free(resp); resp = NULL;
+
     free(uuid_alice); free(uuid_bob);
     tc_close(tc);
     test_env_stop(&env);

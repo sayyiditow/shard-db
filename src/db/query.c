@@ -1663,6 +1663,18 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     int count = 0, errors = 0;
 
+    /* Auto-key bookkeeping: when the object has auto_key set, the wire
+       form (36-char dashed UUID or decimal int) is parsed to binary for
+       storage, and the wire string is captured per-record so the final
+       response can emit a `keys[]` array. omit-key records are marked
+       with NULL wire_key here; we fill them in below after parse with a
+       single batched generation. */
+    int auto_key_mode = sc.auto_key;
+    char **wire_keys = NULL;       /* per-record rendered key (NULL → fill from omit pool) */
+    size_t wire_cap = 0;
+    int n_omits = 0;
+    int validation_failed_idx = -1;
+
     /* Per-request statement timeout (timeout_ms / global TIMEOUT). Trip
        check is in the parse loop only — the parallel write/index phases
        run on records already in memory, so a deadline trip mid-parse
@@ -1745,6 +1757,52 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             p = obj_end;
         }
 
+        /* For auto-key objects: if the parsed id is a provided wire-form
+           key, normalise to the storage binary form. If it's an
+           omit-key record (only possible in array format on auto-key),
+           defer key assignment to the post-parse batch. */
+        char *wire_for_record = NULL;
+        if (data_ptr && auto_key_mode != AK_NONE) {
+            if (id) {
+                /* Provided wire key — parse to binary and replace id+klen.
+                   The wire string lives in arena, which is freed before the
+                   final response emit; strdup so wire_keys[] outlives the
+                   arena. Heap pointer is freed alongside the wire_keys
+                   array after the response is written. */
+                wire_for_record = strdup(id);
+                if (auto_key_mode == AK_UUID) {
+                    uint8_t bin[16];
+                    if (parse_uuid_string(id, bin) == 0) {
+                        id = (char *)arena_alloc(&arena, 16);
+                        memcpy(id, bin, 16);
+                        klen = 16;
+                    } else {
+                        if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
+                        errors++;
+                        id = NULL;
+                    }
+                } else { /* AK_SEQ */
+                    int64_t v;
+                    if (parse_seq_key(id, &v) == 0) {
+                        id = (char *)arena_alloc(&arena, 8);
+                        for (int b = 7; b >= 0; b--) { id[b] = (char)(v & 0xFF); v >>= 8; }
+                        klen = 8;
+                    } else {
+                        if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
+                        errors++;
+                        id = NULL;
+                    }
+                }
+            } else {
+                /* Omit-key record — placeholder; id+klen filled in post-parse. */
+                id = (char *)arena_alloc(&arena, auto_key_mode == AK_UUID ? 16 : 8);
+                memset(id, 0, auto_key_mode == AK_UUID ? 16 : 8);
+                klen = auto_key_mode == AK_UUID ? 16 : 8;
+                n_omits++;
+                wire_for_record = NULL;
+            }
+        }
+
         if (id && data_ptr) {
             if ((int)klen > sc.max_key) {
                 errors++;
@@ -1768,6 +1826,19 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                     }
                     records = t;
                 }
+                /* Grow wire_keys sidecar in lockstep with records when
+                   auto_key is active. */
+                if (auto_key_mode != AK_NONE) {
+                    if (rec_count >= wire_cap) {
+                        size_t new_wc = wire_cap ? wire_cap * 2 : 1024;
+                        if (new_wc < rec_cap) new_wc = rec_cap;
+                        char **t2 = realloc(wire_keys, new_wc * sizeof(char *));
+                        if (t2) { wire_keys = t2; wire_cap = new_wc; }
+                    }
+                    if (wire_keys && rec_count < wire_cap) {
+                        wire_keys[rec_count] = wire_for_record;
+                    }
+                }
                 BulkInsRecord *r = &records[rec_count++];
                 r->id = id;
                 r->payload = payload;
@@ -1782,6 +1853,60 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             }
         }
         if (obj_heap) free(obj_str);
+    }
+
+    /* Validation failure: refuse the whole batch up front so we don't
+       half-write some records with mangled keys. */
+    if (validation_failed_idx >= 0) {
+        if (wire_keys) {
+            for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        }
+        free(records); free(wire_keys);
+        arena_free(arena);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
+            validation_failed_idx);
+        return 1;
+    }
+
+    /* Post-parse: for auto-key omit records, batch-generate keys in one
+       shot (single /dev/urandom open for UUID, single seq flock for seq)
+       and fill in id+klen + wire_keys per record. */
+    if (auto_key_mode != AK_NONE && n_omits > 0) {
+        uint8_t *uuid_pool = NULL;
+        long long seq_start = 0;
+        if (auto_key_mode == AK_UUID) {
+            uuid_pool = malloc((size_t)n_omits * 16);
+            if (uuid_pool) gen_uuid4_batch(uuid_pool, n_omits);
+        } else {
+            seq_start = seq_next_val_batch(db_root, object, sc.auto_key_seq_name, n_omits);
+        }
+        int omit_idx = 0;
+        for (size_t i = 0; i < rec_count; i++) {
+            if (wire_keys && wire_keys[i]) continue;  /* provided key */
+            BulkInsRecord *r = &records[i];
+            if (auto_key_mode == AK_UUID) {
+                if (uuid_pool) memcpy(r->id, uuid_pool + omit_idx * 16, 16);
+                else gen_uuid4_raw((uint8_t *)r->id);  /* fallback per-record */
+                char wbuf[37];
+                format_uuid_string((const uint8_t *)r->id, wbuf);
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            } else {
+                int64_t v = seq_start + omit_idx;
+                for (int b = 7; b >= 0; b--) { r->id[b] = (char)(v & 0xFF); v >>= 8; }
+                char wbuf[24];
+                snprintf(wbuf, sizeof(wbuf), "%lld", (long long)(seq_start + omit_idx));
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            }
+            /* Recompute hash + shard since id was a placeholder during parse. */
+            compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+            if (sc.storage_version == 2)
+                r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            omit_idx++;
+        }
+        free(uuid_pool);
     }
 
     /* If parse tripped the deadline, abort before any write phase. Same
@@ -2038,7 +2163,20 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             (unsigned long)(t4 - t3),
             (unsigned long)(t4 - t0));
 
-    if (errors) {
+    /* Auto-key response includes the resolved keys[] array (rendered
+       wire form, in input order). Today's plain {"inserted":N,...} shape
+       stays for AK_NONE objects to keep wire compatibility. */
+    if (auto_key_mode != AK_NONE && wire_keys) {
+        OUT("{\"status\":\"bulk-inserted\",\"count\":%d,\"skipped\":%d,\"keys\":[",
+            count, skipped_total);
+        for (size_t i = 0; i < rec_count; i++) {
+            OUT("%s\"%s\"", i ? "," : "", wire_keys[i] ? wire_keys[i] : "");
+        }
+        OUT("]}\n");
+        for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        free(wire_keys);
+        wire_keys = NULL;
+    } else if (errors) {
         OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
             count, skipped_total, errors);
         fprintf(stderr, "%d errors during bulk insert (see info log for dropped keys)\n", errors);
@@ -2047,6 +2185,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     } else {
         OUT("{\"inserted\":%d}\n", count);
     }
+    free(wire_keys);  /* no-op if already freed via the auto-key branch */
     return errors > 0 ? 1 : 0;
 }
 
