@@ -55,10 +55,9 @@ static int test_slotcask_v2_query_run(void) {
 
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"qry\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\",\"age:int\",\"city:varchar:32\"],"
         "\"indexes\":[\"age\",\"city\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 object created");
     free(resp); resp = NULL;
 
     /* Seed 6 records — 3 cities, age range 25-50 */
@@ -206,10 +205,9 @@ static int test_slotcask_v2_query_run(void) {
     /* ===== Phase 3G: v2 → v2 join. Create a second v2 object and join. ===== */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"qry\",\"object\":\"orders\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"user_key:varchar:40\",\"amount:int\"],"
         "\"indexes\":[\"user_key\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 orders object created");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"qry\",\"object\":\"orders\","

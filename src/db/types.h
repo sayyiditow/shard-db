@@ -201,18 +201,11 @@ typedef struct {
     int splits;
     int max_key;
     int max_value;
-    int slot_size;        /* = payload_size per slot (max_key + max_value), 8-aligned */
-    /* Storage engine version. 1 = legacy probe-into-slot (Zone A/B + ucache).
-       2 = slotcask (keyfile shards + append-only data segments + per-stream
-       free-slot pool). Defaults to 1 for objects created before 2026.06 — the
-       schema.conf line format `dir:object:splits:max_key` produces 1 because
-       the trailing fields are absent. v2 objects write the extended form
-       `dir:object:splits:max_key:2:streams` at create time. */
-    int storage_version;
-    /* Slotcask streams count, only meaningful when storage_version=2. The
-       value is hardcoded by nproc at create time (see slotcask_streams_for_nproc)
-       and persisted in schema.conf so subsequent opens use the same count —
-       stream_id is on-disk in keyfile entries, so changing it would orphan data. */
+    int slot_size;        /* = 24B inline header + max_key + max_value, 8-aligned, floor 32 */
+    /* Slotcask streams count, hardcoded by nproc at create time and
+       persisted in schema.conf so subsequent opens use the same count —
+       stream_id is on-disk in keyfile entries, so changing it would
+       orphan data. */
     int streams;
     /* Auto-key mode — server generates the key on insert when the client
        omits it. AK_NONE (default) → today's behaviour (caller must supply
@@ -732,26 +725,16 @@ long long seq_next_val_batch(const char *db_root, const char *object,
 
 /* storage.c */
 void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]);
-void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot);
 
-/* Single source of truth for hash → shard_id, version-aware.
-   storage_version=1 → v1 big-endian (legacy zone-A layout).
-   storage_version=2 → v2 little-endian (slotcask kf layout).
-   addr_from_hash and slotcask's shard_for_hash both delegate to this;
-   cross-version callers (bulk-insert / multi-get / multi-exists
-   dispatchers) call this directly. static inline so every TU
-   (including shard-db-test/bench which don't link storage.c) sees
+/* Single source of truth for hash → shard_id. slotcask's shard_for_hash
+   delegates to this; cross-shard callers (bulk-insert / multi-get /
+   multi-exists dispatchers) call this directly. static inline so every
+   TU (including shard-db-test/bench which don't link storage.c) sees
    the definition without an extra link target. */
-static inline int compute_record_shard(const uint8_t hash[16], int splits,
-                                        int storage_version) {
-    if (storage_version == 2) {
-        uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
-        return (int)(v % (uint16_t)splits);
-    }
-    unsigned int h4 = ((unsigned)hash[0] << 8) | hash[1];
-    return (int)(h4 % (unsigned int)splits);
+static inline int compute_record_shard(const uint8_t hash[16], int splits) {
+    uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
+    return (int)(v % (uint16_t)splits);
 }
-void compute_addr(const char *key, size_t key_len, int splits, uint8_t hash_out[16], int *shard_id, int *slot);
 void build_shard_path(char *buf, size_t buflen, const char *db_root, const char *object, int shard_id);
 void build_shard_filename(char *buf, size_t buflen, const char *data_dir, int shard_id);
 void build_idx_path(char *buf, size_t buflen,
@@ -1131,22 +1114,12 @@ int cmd_list_files(const char *db_root, const char *object,
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      int storage_version,
                       const char *auto_key_spec);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */
 int cmd_drop_object(const char *db_root, const char *dir, const char *object,
                     int if_exists);
-
-/* One-shot upgrade of a v1 object to the v2 (slotcask) layout. Walks the
-   object's existing v1 shard data, writes every live record into a new
-   slotcask in the obj root, atomic-renames data/ to data.legacy/, and
-   updates the schema.conf line to append :2:streams. Idempotent —
-   already-v2 objects return status=already_v2. Caller holds
-   objlock_wrlock. */
-int cmd_migrate_storage_version(const char *db_root, const char *dir,
-                                 const char *object);
 
 /* Object discovery — used by shard-cli to populate menus. Both are read-level
    operations: list-objects needs tenant scope (or broader); describe-object

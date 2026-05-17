@@ -110,11 +110,6 @@ esac
 gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS $NCURSES_LDFLAGS -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-cli
 
-# migrate — one-shot per-release upgrade runner. Pure FS ops + system()
-# calls to shard-db; no daemon code, no OpenSSL, no ncurses.
-gcc $MODE_CFLAGS -o migrate src/migrate/main.c src/migrate/migrate_files.c -Isrc/migrate $MODE_LDFLAGS
-[ "$DO_STRIP" = 1 ] && strip migrate
-
 # shard-db-test — TAP-style C test runner. Links daemon's JSON helpers
 # (src/db/util.c) for response parsing; otherwise self-contained (TCP/TLS
 # client + assertion macros + per-test daemon fixtures). Future test cases
@@ -144,7 +139,6 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_all_field_types.c \
     src/test/cases/test_case_sensitivity.c \
     src/test/cases/test_objlock.c \
-    src/test/cases/test_migrate_binary.c \
     src/test/cases/test_field_vs_field.c \
     src/test/cases/test_binary_index.c \
     src/test/cases/test_stats_prom.c \
@@ -187,7 +181,6 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_v2_bulk.c \
     src/test/cases/test_slotcask_v2_parity.c \
     src/test/cases/test_slotcask_v2_schema.c \
-    src/test/cases/test_slotcask_v2_migrate.c \
     src/test/cases/test_slotcask_v2_crash.c \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/test/cases/test_v2_index_leak_on_clear.c \
@@ -266,7 +259,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli migrate shard-db-test shard-db-bench build/bin/
+cp shard-db shard-cli shard-db-test shard-db-bench build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
 # overwriting the existing config when an upgrade tarball lands on top.
@@ -345,4 +338,4 @@ fi
 
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
-echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli + migrate). Run ./migrate before starting the new daemon — db.env / DB_ROOT / logs are untouched."
+echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli). If still on v1 (pre-2026.05.5), upgrade to 2026.05.4 and run that release's ./migrate first — 2026.05.5+ drops v1 support entirely."

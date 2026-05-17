@@ -35,10 +35,9 @@ static int test_slotcask_v2_wire_run(void) {
 
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"sctest\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\",\"age:int\",\"email:varchar:80\",\"active:bool\"],"
         "\"indexes\":[\"age\",\"email\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 create succeeds");
     free(resp); resp = NULL;
 
     /* ===== insert + get + exists ===== */
@@ -187,7 +186,7 @@ static int test_slotcask_v2_wire_run(void) {
     /* Recreate same name — proves registry was invalidated. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"sctest\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:32\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"",
                     "recreate after drop succeeds (registry invalidated)");

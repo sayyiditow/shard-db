@@ -252,24 +252,31 @@ See [Operations → Backup](backup.md).
 
 ## Upgrades
 
-Standard upgrade flow:
+Standard upgrade flow (already on v2 / slotcask):
 
 ```bash
 systemctl stop shard-db
-# replace /opt/shard-db/shard-db, /opt/shard-db/shard-cli, /opt/shard-db/migrate
-sudo -u shard-db /opt/shard-db/migrate   # idempotent; runs per-release migrations
+# replace /opt/shard-db/shard-db and /opt/shard-db/shard-cli
 systemctl start shard-db
 ```
 
-The `./migrate` binary (shipped alongside the daemon and TUI client) runs every required migration for the version you're upgrading to, then exits. For 2026.05.1+ it does:
+The `./migrate` upgrade binary was dropped in 2026.05.5 — once your objects are on the slotcask engine, point-release upgrades are a binary swap. On startup the daemon sweeps stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
 
-1. **migrate-files** — lifts pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to flat layout.
-2. **reindex** — rebuilds every B+ tree under the per-shard v3 layout.
-3. **migrate-storage-version** — rebuilds any remaining storage_version=1 objects under the v2 slotcask engine.
+**Upgrading from a pre-2026.05.5 install with legacy v1 (probe-into-slot) objects.** This binary refuses v1 objects at load. Run the migration on the previous release first:
 
-Re-running `./migrate` after a successful pass is a no-op. On startup the daemon also sweeps any stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
+```bash
+# step 1: install 2026.05.4 (or any 2026.05.1–2026.05.4 release that bundles ./migrate)
+systemctl stop shard-db
+# replace shard-db / shard-cli / migrate with the 2026.05.4 artifacts
+sudo -u shard-db /opt/shard-db/migrate   # converts v1 objects → slotcask v2
+systemctl start shard-db
+# verify by checking schema.conf — every line should now end with `:2:<streams>`
+systemctl stop shard-db
 
-For point releases that don't add new migrations (e.g. 2026.05.3 → 2026.05.4), `./migrate` runs the no-op phases instantly. No protocol or schema changes between point releases.
+# step 2: upgrade to 2026.05.5+
+# replace shard-db / shard-cli with the new artifacts; migrate binary is gone
+systemctl start shard-db
+```
 
 ## Resource sizing
 

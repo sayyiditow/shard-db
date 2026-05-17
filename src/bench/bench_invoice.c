@@ -248,10 +248,9 @@ static int bench_invoice_run(void)
         char create[2048];
         snprintf(create, sizeof(create),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
-            "\"splits\":64,\"max_key\":16,\"storage_version\":%d,"
+            "\"splits\":64,\"max_key\":16,"
             "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
-            "\"indexes\":[]}",
-            bench_storage_version());
+            "\"indexes\":[]}");
         tc_request(tc, create, &resp);
         free(resp); resp = NULL;
     }

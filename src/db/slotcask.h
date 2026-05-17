@@ -445,7 +445,7 @@ int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                    SlotcaskBulkRec *recs, size_t n,
                                    void **out_values, size_t *out_vlens);
 
-/* For shard-id mapping use compute_record_shard(hash, splits, 2) from
+/* For shard-id mapping use compute_record_shard(hash, splits) from
    types.h — the single version-aware helper that slotcask itself
    delegates to. */
 
@@ -530,9 +530,7 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
  * That matches how the engine's cmd_* functions receive db-root context
  * (server.c builds the effective root once at dispatch time).
  *
- * Returns NULL when info->storage_version != 2 — the caller is expected to
- * fall back to the legacy probe-into-slot path. NULL is also returned on
- * open failure (logged via fprintf to stderr).
+ * Returns NULL on open failure (logged via fprintf to stderr).
  *
  * The pointer is BORROWED — never call slotcask_close on it. The registry
  * owns lifetime.
@@ -541,7 +539,6 @@ typedef struct {
     int splits;            /* num_shards for the keyfile */
     int slot_size;         /* fixed per-record byte width */
     int streams;           /* persisted at create time, hardcoded by nproc */
-    int storage_version;   /* 1 = legacy (registry returns NULL), 2 = slotcask */
 } SlotcaskSchemaInfo;
 
 SlotcaskDb *slotcask_registry_get(const char *effective_root,

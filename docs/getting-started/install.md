@@ -76,24 +76,23 @@ cosign verify-blob \
 
 ## Upgrading from a prior release
 
-shard-db ships per-release migrations as the `./migrate` binary, which runs every required migration for the version you're upgrading to, then exits. The general flow:
+Point releases of shard-db on the slotcask engine (2026.05.1 and
+later) upgrade with a binary swap:
 
 ```bash
 ./shard-db stop
 # replace build/bin/ contents with the new release artifacts
-./migrate                        # idempotent; safe to re-run
 ./shard-db start
 ```
 
-For 2026.05.1+, `./migrate` runs three phases:
+The `./migrate` upgrade binary that shipped from 2026.05.1 through
+2026.05.4 was removed in 2026.05.5. Operators on a pre-2026.05.5
+install with legacy v1 (probe-into-slot) objects on disk must first
+install 2026.05.4 and run that release's `./migrate` to convert
+objects to slotcask, then upgrade to 2026.05.5+. This binary refuses
+v1 objects at load with a clear error pointing to the same step.
 
-1. **migrate-files** — lifts pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to the flat `<obj>/files/<filename>` layout. Filesystem-only, no daemon required.
-2. **reindex** — rebuilds every B+ tree under the per-shard layout shipped in 2026.05.1 (also picks up the v3 btree format introduced in 2026.05.3, which adds `prev_leaf` for O(1)-step DESC iteration).
-3. **migrate-storage-version** — for any object still on storage_version=1 (the legacy probe-into-slot engine), rebuilds it under the v2 slotcask engine (keyfile shards + append-only segments). Idempotent — already-v2 objects are skipped.
-
-The full migration sequence runs once on the v2 upgrade; subsequent releases that don't add new migrations make `./migrate` a no-op.
-
-See the [changelog](../reference/changelog.md) for the migrations each release runs.
+See the [changelog](../reference/changelog.md) for what changed in each release.
 
 ## First-run sanity check
 

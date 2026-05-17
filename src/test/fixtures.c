@@ -166,10 +166,6 @@ int test_env_start(TestEnv *env) {
             dup2(lfd, 2);
             close(lfd);
         }
-        /* Test-only env propagation: lets the migrate tests stage v1
-           objects via create-object. Production daemons don't have
-           this set and refuse storage_version=1. */
-        setenv("SHARD_ALLOW_V1_CREATE", "1", 1);
         execl(binary_abs, binary_abs, "server", (char *)NULL);
         _exit(127);
     }
@@ -283,7 +279,6 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     if (pid < 0) return -1;
     if (pid == 0) {
         chdir(base);
-        setenv("SHARD_ALLOW_V1_CREATE", "1", 1);  /* test-only opt-in */
         execl(binary_abs, binary_abs, "server", (char *)NULL);
         _exit(127);
     }

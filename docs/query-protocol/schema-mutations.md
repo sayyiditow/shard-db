@@ -107,8 +107,8 @@ The dict form (`{"k1":{...},"k2":{...}}`) has keys baked into the wire shape —
 - `uuid` mode → `max_key` must be at least 16.
 - `seq(<name>)` mode → `max_key` must be at least 8.
 - The sequence name must be valid (`valid_field_name()` rules — no `:`, `+`, `/`, spaces, parens). The sequence file lives at `<obj>/metadata/sequences/<name>` and is shared with any field that also uses `:default=seq(<name>)`.
-- **v2 only** in practice — `auto_key` is allowed at create-object on any storage version, but the persistence shape only writes the trailing token on v2 lines (`dir:object:splits:max_key:storage_version:streams:auto_key=...`). 2026.06 drops v1 entirely.
-- **No retroactive enable** — auto_key can only be set at create-object. There is no schema mutation to add or change auto_key later. A v1-of-feature limitation; revisit only if customers need it.
+- `auto_key` is persisted as the trailing token on the schema.conf line: `dir:object:splits:max_key:2:streams:auto_key=...`.
+- **No retroactive enable** — auto_key can only be set at create-object. There is no schema mutation to add or change auto_key later. Revisit only if customers need it.
 - **Seq collisions** — for `seq` mode, if you manually insert records with numeric keys at or above the current sequence value, the next auto-generated insert can collide. Single insert returns `{"error":"condition_not_met"}` for that record; bulk-insert (JSON + delimited) skips just the colliding record (`skipped:N` in the response) and inserts every other auto-gen normally — the manual record's data is never silently overwritten. UUID collisions are effectively impossible at any realistic scale.
 
 ## add-field
@@ -196,7 +196,6 @@ No-op fast path returns `{"status":"edited","fields":N,"rebuilt":false}` — fie
 
 ### Notes
 
-- **v2 only**. v1 (legacy zone-A/B) is hard-refused with a pointer to `./migrate`. 2026.06 drops v1 entirely.
 - **Default modifiers**: if the new spec includes a different `:default=...` / `:auto_create` / `:auto_update`, that affects future inserts only — existing records keep their stored values.
 - **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field still rebuilds the index (the on-disk leaf bytes change). Queries on the indexed field continue to resolve to the same records post-edit.
 - Full object rebuild — scales with object size, not slot count. Not instantaneous on millions of records. Holds the wrlock for the duration.
@@ -269,7 +268,7 @@ Maintenance — reclaim deleted-record slots, drop tombstoned fields, or reshard
 
 | Call | What it does |
 |---|---|
-| `{"mode":"vacuum",...}` | **v1**: in-place tombstone reclaim — slots with `flag=2` are zeroed back to `flag=0`. **v2**: Direction-C seg compaction — sparse non-active seg files are pair-merged into denser ones via kf-repoint, then unlinked. Active seg of each stream is never touched. *Also*: if the host's CPU count has changed since `create-object` and `slotcask_streams_for_nproc()` no longer matches `schema.streams`, the call automatically promotes to a full rebuild that re-routes records into the new stream layout. Idempotent. |
+| `{"mode":"vacuum",...}` | Direction-C seg compaction — sparse non-active seg files are pair-merged into denser ones via kf-repoint, then unlinked. Active seg of each stream is never touched. *Also*: if the host's CPU count has changed since `create-object` and `slotcask_streams_for_nproc()` no longer matches `schema.streams`, the call automatically promotes to a full rebuild that re-routes records into the new stream layout. Idempotent. |
 | `{"mode":"vacuum","compact":true}` | Full rebuild. Drops tombstoned fields, shrinks `slot_size`. Indexes preserved. |
 | `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes data; hash routing identity is preserved. **Triggers a full reindex** — see below. Also folds in the streams-mismatch check on the same rebuild, so you never need a second call. |
 | `{"mode":"vacuum","compact":true,"splits":N}` | Both — compact schema and reshard in one pass. |

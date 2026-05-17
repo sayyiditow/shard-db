@@ -34,8 +34,8 @@ Key metrics to scrape:
 | `uptime_ms` | Drops unexpectedly (process restart). |
 | `connections.active` | Near `WORKERS` cap for extended periods. |
 | `in_flight_writes` | Stays elevated (> 0) when traffic is idle — indicates stuck writes. |
-| `ucache.hits / (hits + misses)` | Drops below 90% on a read-heavy workload — raise `FCACHE_MAX`. (Tracks v1 storage_version=1 objects only; v2 slotcask objects use the kfcache + segcache caches, which currently aren't surfaced in `stats` — track via `bt_cache` instead, which both engines share for indexes.) |
-| `bt_cache.hits / (hits + misses)` | Drops below 90% on indexed queries — raise `FCACHE_MAX` (bt_cache is derived as `FCACHE_MAX/4` since 2026.05.1; not separately configurable). This is the universal read-cache metric — both v1 and v2 objects route index reads through bt_cache. |
+| `ucache.hits / (hits + misses)` | Idle on a slotcask install — kept in the export for back-compat. Slotcask reads route through kfcache + segcache, which aren't surfaced separately yet; use `bt_cache` to gauge read-cache health. |
+| `bt_cache.hits / (hits + misses)` | Drops below 90% on indexed queries — raise `FCACHE_MAX` (bt_cache is derived as `FCACHE_MAX/4` since 2026.05.1; not separately configurable). |
 | `slow_queries[].duration_ms` | Any cross their SLO. |
 
 ### 2. Slow query log

@@ -82,9 +82,8 @@ static int test_slotcask_v2_crash_run(void) {
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"crash2\","
-        "\"splits\":8,\"max_key\":16,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"v:varchar:32\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 object created");
     free(resp); resp = NULL;
 
     char req[256];

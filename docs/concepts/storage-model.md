@@ -1,6 +1,6 @@
 # Storage model
 
-shard-db's default engine is **slotcask** (storage_version=2) — a bitcask-style key/value layout where keys and values live in separate files. It's been the default for new objects since 2026.05.1; the legacy probe-into-slot engine (storage_version=1, "v1") is reachable only via opt-in or by migrating an existing v1 install.
+shard-db's storage engine is **slotcask** — a bitcask-style key/value layout where keys and values live in separate files. Slotcask has been the default for new objects since 2026.05.1 and is the only supported engine as of 2026.05.5; the legacy probe-into-slot engine (historically "v1") was removed in that release. Operators upgrading from a pre-2026.05.5 install with v1 objects on disk must first run 2026.05.4's `./migrate` to convert them.
 
 For the full on-disk tree, see [Configuration → Storage layout](../getting-started/configuration.md#storage-layout). This page walks through what actually happens when you insert, read, or delete a record.
 
@@ -166,8 +166,8 @@ Full detail: [Concepts → Indexes](indexes.md).
 
 `<object>/files/<filename>` — uploaded via [put-file](../query-protocol/files.md). Flat layout — basename is the lookup key. Not reachable through queries; fetched directly by filename. (Pre-2026.05.2 stored at `<object>/files/<XX>/<XX>/<filename>` with xxh128 hash buckets; existing installs upgrade with the one-shot `./migrate` binary.)
 
-## Legacy v1 layout (pre-slotcask)
+## Legacy v1 layout (pre-slotcask, removed in 2026.05.5)
 
 Before 2026.05.1 the engine was probe-into-slot: each shard file (`data/NNN.bin`) held a 32-byte header, a Zone A region of 24-byte slot metadata, and a Zone B region of variable-size record payloads — keys and values interleaved within the same file. Writes flipped a `flag` byte in Zone A from 0 to 1 to commit; tombstones flipped it to 2. There was no kf/seg split, no streams, and no atomic 8-byte commit — durability relied on the OS page cache writeback ordering.
 
-v1 is still supported for backward compatibility but is not the default. New objects always land on v2; existing v1 objects upgrade via `./migrate` (phase 3, `migrate-storage-version`). The wire protocol is identical across engines — clients don't need to know which storage version a given object is using.
+This layout was removed in 2026.05.5. Operators on a pre-2026.05.5 install with v1 objects on disk must run 2026.05.4's `./migrate` to convert them to slotcask before upgrading; this binary refuses v1 at load with a clear error.

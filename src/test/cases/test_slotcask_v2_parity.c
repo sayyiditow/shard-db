@@ -87,7 +87,7 @@ static void create_obj(TestClient *tc, const char *obj, int v2) {
     if (v2) {
         snprintf(req, sizeof(req),
             "{\"mode\":\"create-object\",\"dir\":\"" DIR "\",\"object\":\"%s\","
-            "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+            "\"splits\":8,\"max_key\":40,"
             "\"fields\":[\"name:varchar:32\",\"age:int\",\"city:varchar:16\","
                        "\"score:int\"],"
             "\"indexes\":[\"age\",\"city\"]}", obj);
@@ -110,7 +110,7 @@ static void create_orders(TestClient *tc, const char *obj, int v2) {
     if (v2) {
         snprintf(req, sizeof(req),
             "{\"mode\":\"create-object\",\"dir\":\"" DIR "\",\"object\":\"%s\","
-            "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+            "\"splits\":8,\"max_key\":40,"
             "\"fields\":[\"buyer:varchar:40\",\"total:int\"],"
             "\"indexes\":[\"buyer\"]}", obj);
     } else {

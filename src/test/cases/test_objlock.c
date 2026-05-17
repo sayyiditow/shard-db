@@ -74,13 +74,9 @@ static int test_objlock_run(void) {
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
-    /* Pin to v1: this test exercises the data.new/data.old crash
-       recovery patterns from the legacy probe-into-slot layout, which
-       v2's slotcask doesn't use. Test fixture sets
-       SHARD_ALLOW_V1_CREATE=1. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"leads\","
-        "\"splits\":16,\"max_key\":32,\"storage_version\":1,"
+        "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],"
         "\"indexes\":[]}", &resp); free(resp); resp = NULL;
 

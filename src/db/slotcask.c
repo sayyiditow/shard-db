@@ -69,7 +69,7 @@ static inline void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
 /* Delegates to the version-aware compute_record_shard so the byte-order
    logic lives in exactly one place (storage.c). v2 = little-endian. */
 static int shard_for_hash(const uint8_t hash[16], int num_shards) {
-    return compute_record_shard(hash, num_shards, 2);
+    return compute_record_shard(hash, num_shards);
 }
 
 static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
@@ -3971,7 +3971,7 @@ static int reg_probe(const char *key) {
 SlotcaskDb *slotcask_registry_get(const char *effective_root,
                                   const char *object,
                                   const SlotcaskSchemaInfo *info) {
-    if (!info || info->storage_version != 2) return NULL;
+    if (!info) return NULL;
     if (info->splits <= 0 || info->slot_size <= 0 || info->streams <= 0)
         return NULL;
 

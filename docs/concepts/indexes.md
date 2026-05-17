@@ -95,7 +95,7 @@ V3 adds two header fields that make DESC iteration O(1)-step:
 - `BtFileHeader.last_leaf_page` — pointer to the rightmost leaf. DESC iterators start here in O(1).
 - `BtPageHeader.prev_leaf` — backward link maintained on every leaf split. DESC steps left one page at a time via `ph->prev_leaf` instead of indexing into a precomputed array.
 
-Older formats (v1 `BTRE` string-keyed; v2 `BTRF` binary keys without `prev_leaf`) are rejected at open with a clear error and require a reindex. `./migrate` phase 2 handles this automatically on upgrade.
+Older formats (`BTRE` string-keyed; `BTRF` binary keys without `prev_leaf`) are rejected at open with a clear error and require a reindex. Upgrade via 2026.05.4's `./migrate` first if you're upgrading from a pre-2026.05.1 install — its phase 2 rebuilds every B+ tree under the per-shard layout. Already-on-slotcask installs need no action.
 
 ## Index maintenance
 

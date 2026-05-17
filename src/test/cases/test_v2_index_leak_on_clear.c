@@ -40,10 +40,9 @@ static int test_v2_index_leak_on_clear_run(void) {
 
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":16,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"name:varchar:32\",\"city:varchar:16\"],"
         "\"indexes\":[\"city\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 object created");
     free(resp); resp = NULL;
 
     /* Insert with city=NYC — this writes a btree entry city=NYC → u1. */
