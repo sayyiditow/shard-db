@@ -576,6 +576,25 @@ int  json_obj_get(const JsonObj *o, const char *key, const char **val, size_t *v
    string / numeric / bool fields. For nested objects/arrays use json_obj_get
    which returns the span with brackets intact for recursive parsing. */
 int  json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size_t *vlen);
+/* Decode JSON string escapes (\n, \r, \t, \\, \", \/, \b, \f, \uXXXX)
+   in `in` (length `in_len`, NOT NUL-terminated required) and write the
+   decoded bytes to a freshly malloc'd buffer returned via *out_buf;
+   length goes to *out_len. The output is NUL-terminated as a courtesy.
+   Returns 0 on success, -1 on malformed escape or OOM. Caller frees
+   *out_buf. */
+int  json_unescape_string(const char *in, size_t in_len,
+                          char **out_buf, size_t *out_len);
+/* Convenience wrapper for the common dispatcher pattern:
+   - looks up `key` on the JsonObj
+   - strips surrounding quotes (json_obj_unquoted)
+   - JSON-unescapes the inner content
+   - returns a malloc'd NUL-terminated string (caller frees) or NULL.
+   The returned length excludes the trailing NUL; use the optional
+   *out_len pointer if you need the byte length for the binary content
+   (escapes may decode to bytes including embedded NULs is not
+   supported — we treat   as malformed for storage safety). */
+char *json_obj_strdup_unescaped(const JsonObj *o, const char *key,
+                                size_t *out_len);
 
 /* Convenience: parse an integer field. Returns `fallback` on miss. */
 int  json_obj_int(const JsonObj *o, const char *key, int fallback);

@@ -403,6 +403,48 @@ static int test_auto_key_run(void) {
                     "multi-get auto-uuid: missing uuid → null");
     free(resp); resp = NULL;
 
+    /* === 14. bulk-insert-delimited auto-key ============================== */
+
+    /* Seq mode: 3 rows, all empty first column → batch-gen */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"delimiter\":\",\","
+        "\"data\":\",5000\\n,5001\\n,5002\\n\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim auto-seq status");
+    ASSERT_CONTAINS(resp, "\"count\":3", "delim auto-seq count");
+    /* Seq watermark after earlier inserts is around 8 — the next 3 are 9,10,11 */
+    ASSERT_CONTAINS(resp, "\"9\"", "delim auto-seq batch first key");
+    ASSERT_CONTAINS(resp, "\"11\"", "delim auto-seq batch last key");
+    free(resp); resp = NULL;
+
+    /* Mixed: 1 provided + 2 empty (auto-gen). Provided key is upsert. */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"delimiter\":\",\","
+        "\"data\":\"900,9000\\n,9001\\n,9002\\n\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim mixed status");
+    ASSERT_CONTAINS(resp, "\"900\"", "delim mixed: provided key echoed");
+    free(resp); resp = NULL;
+
+    /* Malformed provided key (non-decimal on seq mode) refused. */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"orders\","
+        "\"delimiter\":\",\","
+        "\"data\":\"abc,1\\n,2\\n\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "delim refuses bad seq wire key");
+    free(resp); resp = NULL;
+
+    /* UUID mode delimited: 2 rows, both omit-key */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"users\","
+        "\"delimiter\":\",\","
+        "\"data\":\",DelimP\\n,DelimQ\\n\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim auto-uuid status");
+    ASSERT_CONTAINS(resp, "\"count\":2", "delim auto-uuid count");
+    ASSERT_TRUE(resp && strstr(resp, "-4") != NULL,
+                "delim auto-uuid: v4 marker present");
+    free(resp); resp = NULL;
+
     free(uuid_alice); free(uuid_bob);
     tc_close(tc);
     test_env_stop(&env);

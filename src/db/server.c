@@ -1494,12 +1494,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "bulk-insert-delimited") == 0) {
         char *file  = json_obj_strdup(&req, "file");
         char *delim = json_obj_strdup(&req, "delimiter");
-        char *data  = json_obj_strdup_raw(&req, "data");
+        /* `data` is a JSON string — strip surrounding quotes AND decode
+           the standard JSON escapes (\n, \r, \t, \\, \", \uXXXX) so the
+           delimiter parser sees real newlines between records. The
+           original strdup_raw left the literal `\n` 2-char sequence in
+           the payload, which silently broke every inline multi-row
+           import. */
+        size_t data_len = 0;
+        char *data = json_obj_strdup_unescaped(&req, "data", &data_len);
         char *ifne_s = json_obj_strdup(&req, "if_not_exists");
         int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
         char d = (delim && delim[0]) ? delim[0] : ',';
         if (data) {
-            cmd_bulk_insert_delimited_string(db_root, object, data, strlen(data), d, ifne);
+            cmd_bulk_insert_delimited_string(db_root, object, data, data_len, d, ifne);
             free(data);
         } else if (file) {
             cmd_bulk_insert_delimited(db_root, object, file, d, ifne);

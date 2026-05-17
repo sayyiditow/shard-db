@@ -89,6 +89,17 @@ CAS modifiers (`if_not_exists`, `if`) apply to provided-key inserts as usual. Om
 
 The dict form (`{"k1":{...},"k2":{...}}`) has keys baked into the wire shape — every entry is treated as provided-key.
 
+**bulk-insert-delimited** (CSV / TSV / pipe / etc.) also supports auto-key: per row, an **empty first column** means "auto-generate" and a non-empty first column is parsed as a wire-form key (upsert). Response shape matches the JSON form (`{"status":"bulk-inserted","count":N,"skipped":M,"keys":[...]}` for auto-key objects). When using inline `data` in a JSON request, the standard JSON escapes (`\n`, `\r`, `\t`, `\"`, `\\`, `\uXXXX`) are decoded before parsing — so newline-separated records work as expected.
+
+```json
+{"mode":"bulk-insert-delimited","dir":"<d>","object":"orders",
+ "delimiter":",",
+ "data":",100\n42,42\n,200\n"}
+
+// response (seq watermark was at 5):
+{"status":"bulk-inserted","count":3,"skipped":0,"keys":["6","42","7"]}
+```
+
 **update / delete** require a key as today. `auto_key` only fires on insert; update with no key errors with the usual "Missing key" message.
 
 **Constraints**:
