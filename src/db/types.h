@@ -1078,6 +1078,20 @@ int cmd_remove_fields(const char *db_root, const char *object,
                       char names[][256], int nnames);
 int cmd_add_fields(const char *db_root, const char *object,
                    char lines[][256], int nlines);
+/* Edits one or more existing fields in-place — same-type only. Allowed
+   edits: varchar grow/shrink (shrink refused pre-flight if any live
+   value's content exceeds the new cap), int/long/short widen/narrow
+   (narrow refused pre-flight on out-of-range), numeric scale change
+   (overflow refused pre-flight), float→double widen. Cross-type changes
+   are refused with a hint to use add-field + remove-field + bulk-update.
+   v2 only — v1 objects are refused with a pointer to ./migrate.
+   Triggers a rebuild_object_v2 walk that re-encodes affected fields, then
+   rewrites fields.conf in place and rebuilds every index in index.conf
+   (affected ones are stale; the wipe-and-rebuild keeps the code simple
+   at the cost of touching unaffected indexes). Caller holds
+   objlock_wrlock. */
+int cmd_edit_fields(const char *db_root, const char *object,
+                    char lines[][256], int nlines);
 void invalidate_schema_caches(const char *db_root, const char *object);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */

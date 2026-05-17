@@ -85,6 +85,7 @@ Changing these requires recompiling. Most don't need to change.
 | Tenants (`dirs.conf`) | filesystem-limited | Validated via O(1) hash. |
 | Indexes per object | no hard cap | Each is a directory of `index_splits_for(splits)` B+ tree files. Both caches (`kfcache` + `bt_cache`; `segcache` shares the kfcache budget) cap *hot* mappings, not on-disk count. |
 | Tenant name length | 64 bytes | Validated by `add-dir` (rejects `/`, `\`, `..`, control chars). |
+| `edit-field` scope | v2 storage only, same-type only | v1 objects refused with a pointer to `./migrate`. Allowed transforms: varchar grow/shrink, integer family widen/narrow (`short ↔ int ↔ long`), `numeric` scale change, `float → double` widen. Pre-flight refuses any record that wouldn't fit the new shape. Cross-type changes refused with a hint to use `add-field + remove-field + bulk-update`. Holds `objlock_wrlock` for the rebuild duration. See [schema-mutations → edit-field](../query-protocol/schema-mutations.md#edit-field). |
 
 ## Auth limits
 

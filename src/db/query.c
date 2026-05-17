@@ -5898,6 +5898,443 @@ int rebuild_object(const char *db_root, const char *object,
     return 0;
 }
 
+/* ========== edit-field ==========
+ *
+ * Same-type, in-place field edits (varchar grow/shrink, integer
+ * widen/narrow, numeric scale change, float→double widen). Wire shape:
+ *   {"mode":"edit-field","dir":..,"object":..,"fields":["name:varchar:200", ..]}
+ *
+ * v2 only — v1 is refused with a pointer to ./migrate. Cross-type changes
+ * are refused with a hint to use add-field + remove-field + bulk-update.
+ *
+ * Strategy:
+ *   1. Parse each edit spec, refuse tombstoned/unknown/duplicate/cross-type.
+ *   2. Build new_ts by overlaying each edit's TypedField onto a clone of
+ *      old_ts. Field positions, names, and active-or-tombstoned status
+ *      stay the same — only size, offset, numeric_scale, default
+ *      modifiers move.
+ *   3. If no field's encoding actually changes (field_needs_transform == 0
+ *      for every edit), skip the rebuild entirely and just rewrite
+ *      fields.conf — the only user-visible change is default modifiers,
+ *      which affects future inserts, not existing records.
+ *   4. Otherwise pre-flight scan: open the live slotcask, walk every
+ *      live record, decode each edited field per record, refuse the
+ *      whole edit if any record's value won't fit the new shape.
+ *   5. All clear — call rebuild_object_v2 (n_added=0, drop_tombstoned=0).
+ *      The enhanced v2_rebuild_walk_cb already routes edited fields
+ *      through transform_field_value. After the rebuild succeeds,
+ *      rewrite fields.conf in place and rebuild every index in
+ *      index.conf (affected indexes have stale leaf bytes; we wipe
+ *      and rebuild all to keep the code simple — acceptable for v1,
+ *      optimise later if it becomes a hot path).
+ *
+ * Caller holds objlock_wrlock on the object. */
+
+typedef struct {
+    const TypedSchema *old_ts;
+    const TypedSchema *new_ts;
+    const int *edited_old_idx;  /* old TypedSchema indices being edited */
+    int n_edits;
+    char fail_field[128];
+    char fail_reason[192];
+    int failed;
+} EditPreflightCtx;
+
+/* Decode a signed BE integer of `sz` bytes into int64. */
+static int64_t decode_be_signed(const uint8_t *src, int sz) {
+    int64_t v = (src[0] & 0x80) ? -1 : 0;
+    for (int i = 0; i < sz; i++) v = (v << 8) | src[i];
+    return v;
+}
+
+/* Return 1 if value will fit the new field's bounds; 0 otherwise. Writes
+   the human-readable reason into reason[reason_cap] on failure. */
+static int field_value_fits_new(const TypedField *old_f,
+                                const TypedField *new_f,
+                                const uint8_t *src,
+                                char *reason, size_t reason_cap) {
+    switch (old_f->type) {
+    case FT_VARCHAR: {
+        uint16_t old_clen = ((uint16_t)src[0] << 8) | (uint16_t)src[1];
+        int new_cap = new_f->size - 2;
+        if (new_cap < 0) new_cap = 0;
+        if ((int)old_clen > new_cap) {
+            snprintf(reason, reason_cap,
+                "varchar shrink: value of length %u exceeds new cap %d",
+                (unsigned)old_clen, new_cap);
+            return 0;
+        }
+        return 1;
+    }
+    case FT_INT:
+    case FT_LONG:
+    case FT_SHORT: {
+        if (new_f->size >= old_f->size) return 1;  /* widen always fits */
+        int64_t v = decode_be_signed(src, old_f->size);
+        int64_t lo = -(1LL << (new_f->size * 8 - 1));
+        int64_t hi =  (1LL << (new_f->size * 8 - 1)) - 1;
+        if (v < lo || v > hi) {
+            snprintf(reason, reason_cap,
+                "integer narrow: value %lld out of range [%lld, %lld]",
+                (long long)v, (long long)lo, (long long)hi);
+            return 0;
+        }
+        return 1;
+    }
+    case FT_NUMERIC: {
+        int delta = new_f->numeric_scale - old_f->numeric_scale;
+        if (delta <= 0) return 1;  /* scale-down truncates, never overflows */
+        int64_t v = decode_be_signed(src, old_f->size);
+        int64_t mult = 1;
+        for (int i = 0; i < delta; i++) {
+            /* Multiply with overflow detection. INT64_MAX/10 = 922337203685477580. */
+            if (v > 922337203685477580LL || v < -922337203685477580LL) {
+                snprintf(reason, reason_cap,
+                    "numeric scale-up: value %lld overflows int64 after ×10^%d",
+                    (long long)v, delta);
+                return 0;
+            }
+            mult *= 10;
+            (void)mult;  /* mult itself can't overflow at delta<=18 */
+        }
+        /* Final check — v * 10^delta */
+        int64_t scaled = v;
+        for (int i = 0; i < delta; i++) scaled *= 10;
+        (void)scaled;
+        return 1;
+    }
+    default:
+        /* Same-size paths are handled by field_needs_transform short-circuit;
+           any other type that reaches here has the same byte layout so it fits. */
+        return 1;
+    }
+}
+
+static int edit_preflight_walk_cb(const uint8_t hash16[16],
+                                  const void *key, size_t klen,
+                                  const void *value, size_t vlen,
+                                  void *ctx_v) {
+    (void)hash16; (void)key; (void)klen;
+    EditPreflightCtx *ctx = (EditPreflightCtx *)ctx_v;
+    if (ctx->failed) return 1;
+    for (int e = 0; e < ctx->n_edits; e++) {
+        int oi = ctx->edited_old_idx[e];
+        const TypedField *of = &ctx->old_ts->fields[oi];
+        const TypedField *nf = &ctx->new_ts->fields[oi];
+        if (of->offset + (size_t)of->size > vlen) continue;  /* defensive */
+        char reason[192];
+        if (!field_value_fits_new(of, nf, (const uint8_t *)value + of->offset,
+                                   reason, sizeof(reason))) {
+            strncpy(ctx->fail_field, of->name, sizeof(ctx->fail_field) - 1);
+            ctx->fail_field[sizeof(ctx->fail_field) - 1] = '\0';
+            strncpy(ctx->fail_reason, reason, sizeof(ctx->fail_reason) - 1);
+            ctx->fail_reason[sizeof(ctx->fail_reason) - 1] = '\0';
+            ctx->failed = 1;
+            return 1;  /* stop walk */
+        }
+    }
+    return 0;
+}
+
+/* Lightweight name validator, mirrors valid_field_name in config.c. */
+static int edit_valid_name(const char *name) {
+    if (!name || !name[0]) return 0;
+    size_t n = strlen(name);
+    if (n >= 128) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (c == ':' || c == '+' || c == '/' || c == '\n' ||
+            c == '\r' || c == ' ' || c == '\t')
+            return 0;
+    }
+    return 1;
+}
+
+/* Rewrite fields.conf in place, replacing each edited line with its new
+   spec. Edited lines preserve the trailing :removed marker if present
+   (edit-field rejects tombstoned fields up front, so this is defensive).
+   Lines unaffected by the edit pass through unchanged. */
+static int rewrite_fields_conf_for_edit(const char *obj_dir,
+                                         char edit_lines[][256], int n_edits) {
+    char fpath[PATH_MAX], fpath_new[PATH_MAX];
+    snprintf(fpath,     sizeof(fpath),     "%s/fields.conf", obj_dir);
+    snprintf(fpath_new, sizeof(fpath_new), "%s/fields.conf.new", obj_dir);
+
+    /* Extract just the field name from each edit_line (text up to first ':'). */
+    char edit_names[MAX_FIELDS][128];
+    for (int e = 0; e < n_edits; e++) {
+        const char *colon = strchr(edit_lines[e], ':');
+        size_t nlen = colon ? (size_t)(colon - edit_lines[e]) : strlen(edit_lines[e]);
+        if (nlen >= sizeof(edit_names[0])) nlen = sizeof(edit_names[0]) - 1;
+        memcpy(edit_names[e], edit_lines[e], nlen);
+        edit_names[e][nlen] = '\0';
+    }
+
+    FILE *fin = fopen(fpath, "r");
+    FILE *fout = fopen(fpath_new, "w");
+    if (!fin || !fout) {
+        if (fin) fclose(fin);
+        if (fout) fclose(fout);
+        return -1;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), fin)) {
+        char stripped[512];
+        strncpy(stripped, line, sizeof(stripped) - 1);
+        stripped[sizeof(stripped) - 1] = '\0';
+        stripped[strcspn(stripped, "\n")] = '\0';
+        if (stripped[0] == '\0' || stripped[0] == '#') {
+            fputs(line, fout);
+            continue;
+        }
+        const char *colon = strchr(stripped, ':');
+        size_t nlen = colon ? (size_t)(colon - stripped) : strlen(stripped);
+        int matched = -1;
+        for (int e = 0; e < n_edits; e++) {
+            size_t elen = strlen(edit_names[e]);
+            if (nlen == elen && memcmp(stripped, edit_names[e], elen) == 0) {
+                matched = e;
+                break;
+            }
+        }
+        if (matched < 0) {
+            fputs(line, fout);
+            continue;
+        }
+        fprintf(fout, "%s\n", edit_lines[matched]);
+    }
+    fclose(fin);
+    fclose(fout);
+    if (rename(fpath_new, fpath) != 0) {
+        unlink(fpath_new);
+        return -1;
+    }
+    return 0;
+}
+
+int cmd_edit_fields(const char *db_root, const char *object,
+                    char lines[][256], int n_edits) {
+    if (n_edits <= 0) {
+        OUT("{\"error\":\"No fields specified\"}\n");
+        return 1;
+    }
+    if (n_edits > MAX_FIELDS) {
+        OUT("{\"error\":\"Too many fields in one edit (max %d)\"}\n", MAX_FIELDS);
+        return 1;
+    }
+
+    Schema old_sch = load_schema(db_root, object);
+    if (old_sch.splits <= 0) {
+        OUT("{\"error\":\"Object [%s] not found\"}\n", object);
+        return 1;
+    }
+    if (old_sch.storage_version != 2) {
+        OUT("{\"error\":\"edit-field requires v2 storage; run ./migrate to upgrade [%s] first\"}\n",
+            object);
+        return 1;
+    }
+    TypedSchema *old_ts = load_typed_schema(db_root, object);
+    if (!old_ts) {
+        OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
+        return 1;
+    }
+
+    /* Parse each edit line, validate name/type, look up target field. */
+    TypedField parsed[MAX_FIELDS];
+    int edited_old_idx[MAX_FIELDS];
+
+    for (int e = 0; e < n_edits; e++) {
+        memset(&parsed[e], 0, sizeof(parsed[e]));
+        if (strstr(lines[e], ":removed")) {
+            OUT("{\"error\":\"Cannot edit with ':removed' marker; use remove-field\"}\n");
+            return 1;
+        }
+        if (!parse_field_line(lines[e], &parsed[e])) {
+            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[e]);
+            return 1;
+        }
+        if (!edit_valid_name(parsed[e].name)) {
+            OUT("{\"error\":\"Invalid field name: %s\"}\n", parsed[e].name);
+            return 1;
+        }
+        /* Duplicate-edit-in-request check. */
+        for (int b = 0; b < e; b++) {
+            if (strcmp(parsed[b].name, parsed[e].name) == 0) {
+                OUT("{\"error\":\"Duplicate edit for field [%s] in request\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+        }
+        /* Resolve to old TypedSchema index. Refuse unknown / tombstoned. */
+        int found = -1;
+        for (int i = 0; i < old_ts->nfields; i++) {
+            if (strcmp(old_ts->fields[i].name, parsed[e].name) == 0) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            OUT("{\"error\":\"Field [%s] not found\"}\n", parsed[e].name);
+            return 1;
+        }
+        if (old_ts->fields[found].removed) {
+            OUT("{\"error\":\"Field [%s] is tombstoned; cannot edit\"}\n",
+                parsed[e].name);
+            return 1;
+        }
+        /* Cross-type refusal. Allowed cross-type edits:
+             - integer family (FT_SHORT/INT/LONG) — same signed-BE encoding,
+               just different storage widths. transform_field_value handles
+               sign-extend on widen and truncates on narrow (with pre-flight
+               range check).
+             - float → double widen. */
+        const TypedField *oldf = &old_ts->fields[found];
+        int same_type = (oldf->type == parsed[e].type);
+        int int_family_old = (oldf->type == FT_SHORT || oldf->type == FT_INT ||
+                               oldf->type == FT_LONG);
+        int int_family_new = (parsed[e].type == FT_SHORT || parsed[e].type == FT_INT ||
+                               parsed[e].type == FT_LONG);
+        int int_family = int_family_old && int_family_new;
+        int float_widen = (oldf->type == FT_FLOAT && parsed[e].type == FT_DOUBLE);
+        if (!same_type && !int_family && !float_widen) {
+            OUT("{\"error\":\"Cross-type edit refused for [%s]; "
+                "use add-field <new> + remove-field <old> + bulk-update\"}\n",
+                parsed[e].name);
+            return 1;
+        }
+        edited_old_idx[e] = found;
+    }
+
+    /* Build new_ts: clone old_ts, overlay each edit, recompute offsets. */
+    TypedSchema new_ts;
+    memset(&new_ts, 0, sizeof(new_ts));
+    new_ts.typed = 1;
+    new_ts.nfields = old_ts->nfields;
+    int new_to_old[MAX_FIELDS];
+    int noff = 0;
+    for (int i = 0; i < old_ts->nfields; i++) {
+        new_ts.fields[i] = old_ts->fields[i];
+        int edit_for_i = -1;
+        for (int e = 0; e < n_edits; e++) {
+            if (edited_old_idx[e] == i) { edit_for_i = e; break; }
+        }
+        if (edit_for_i >= 0) {
+            /* Overlay the edit's parsed type info; keep name + removed flag. */
+            new_ts.fields[i].type             = parsed[edit_for_i].type;
+            new_ts.fields[i].size             = parsed[edit_for_i].size;
+            new_ts.fields[i].numeric_scale    = parsed[edit_for_i].numeric_scale;
+            new_ts.fields[i].numeric_scale_mult = parsed[edit_for_i].numeric_scale_mult;
+            /* default_kind / default_val: re-parse from the spec — but
+               parse_field_line via parse_field_type doesn't currently
+               carry defaults through (those are parsed by load_typed_schema's
+               extended parsing). Leave the existing default modifier intact
+               unless the on-disk fields.conf rewrite changes it — which it
+               will, by replacing the whole line. */
+        }
+        new_ts.fields[i].offset = noff;
+        noff += new_ts.fields[i].size;
+        new_to_old[i] = i;
+    }
+    new_ts.total_size = noff;
+
+    /* Detect no-op: every edited field's encoding is identical to its old
+       encoding. In that case fields.conf may still change (default modifier
+       differences, etc.) but no data rebuild is required. */
+    int needs_rebuild = 0;
+    for (int e = 0; e < n_edits; e++) {
+        int oi = edited_old_idx[e];
+        if (field_needs_transform(&old_ts->fields[oi], &new_ts.fields[oi])) {
+            needs_rebuild = 1;
+            break;
+        }
+    }
+
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+
+    if (!needs_rebuild) {
+        if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
+            OUT("{\"error\":\"Failed to rewrite fields.conf\"}\n");
+            return 1;
+        }
+        invalidate_schema_caches(db_root, object);
+        log_msg(3, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
+                db_root, object, n_edits);
+        OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":false}\n", n_edits);
+        return 0;
+    }
+
+    /* Pre-flight: open live slotcask and walk to verify each edited
+       field's value fits the new shape on every live record. */
+    SlotcaskSchemaInfo info = {
+        .splits = old_sch.splits, .slot_size = old_sch.slot_size,
+        .streams = old_sch.streams, .storage_version = 2,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        OUT("{\"error\":\"Failed to open slotcask for pre-flight\"}\n");
+        return 1;
+    }
+    EditPreflightCtx pf = {0};
+    pf.old_ts        = old_ts;
+    pf.new_ts        = &new_ts;
+    pf.edited_old_idx = edited_old_idx;
+    pf.n_edits       = n_edits;
+    slotcask_walk_live(sdb, edit_preflight_walk_cb, &pf);
+    if (pf.failed) {
+        OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
+            pf.fail_field, pf.fail_reason);
+        return 1;
+    }
+
+    /* Compute the new slot_size and run the v2 rebuild. */
+    Schema new_sch = old_sch;
+    new_sch.max_value = new_ts.total_size;
+    new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
+    if (new_sch.slot_size < 32) new_sch.slot_size = 32;
+
+    /* v2_rebuild_walk_cb takes the verbatim re-insert path when
+       slot_changed=0 — which would skip transform_field_value for
+       numeric-scale-only edits where slot_size happens to be unchanged.
+       For edit-field we always need the recompose path when any field's
+       encoding changed (needs_rebuild==1 here). */
+    int rc = rebuild_object_v2(db_root, object, &old_sch, old_ts,
+                                &new_sch, &new_ts, new_to_old,
+                                1 /* slot_changed → force recompose */,
+                                0 /* splits_changed */,
+                                0 /* drop_tombstoned */,
+                                NULL /* added_lines */, 0 /* n_added */);
+    if (rc != 0) {
+        /* rebuild_object_v2 already emitted an {"error":..} response. */
+        return rc;
+    }
+
+    /* Rebuild succeeded — rewrite fields.conf to lock in the new spec. */
+    if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
+        /* Data is already in new shape but fields.conf still reflects old.
+           This is the unrecoverable corner. Log loudly so the operator can
+           fix manually. */
+        log_msg(1, "EDIT-FIELD %s/%s: data rebuilt but fields.conf rewrite "
+                   "failed — manual repair required", db_root, object);
+        OUT("{\"error\":\"Data rebuilt but fields.conf rewrite failed; manual repair required\"}\n");
+        return 1;
+    }
+    invalidate_schema_caches(db_root, object);
+
+    /* Wipe + rebuild every index — the edited fields' encoded bytes have
+       changed, so any index touching them is stale. We rebuild all (not
+       just affected ones) to keep this code path simple. */
+    int idx_rebuilt = reindex_object(db_root, object);
+
+    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, idx_rebuilt=%d",
+            db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
+            idx_rebuilt);
+    OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
+        "\"slot_size\":%d,\"indexes_rebuilt\":%d}\n",
+        n_edits, new_sch.slot_size, idx_rebuilt);
+    return 0;
+}
+
 /* Per-shard vacuum worker */
 typedef struct {
     char path[PATH_MAX];

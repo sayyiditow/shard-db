@@ -129,6 +129,7 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./shard-db recount | truncate | vacuum | backup <dir> <obj>
 ./shard-db add-index <dir> <obj> <field> [-f]                   # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>
+./shard-db edit-field <dir> <obj> <name:type[:param]>           # same-type only, v2 only; JSON form covers batch
 ./shard-db reindex [dir] [obj]                                  # no args = all tenants
 
 # Diagnostics
@@ -165,7 +166,7 @@ All advanced queries: `./shard-db query '<json>'`. Wire format: newline-delimite
 | `bulk-insert / bulk-delete / bulk-update` | [bulk.md](docs/query-protocol/bulk.md) |
 | `insert / update / delete` with `if` / `if_not_exists` (CAS) | [cas.md](docs/query-protocol/cas.md) |
 | `put-file / get-file / delete-file / list-files / get-file-path` | [files.md](docs/query-protocol/files.md) |
-| `add-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
+| `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
 | `add-token / remove-token / list-tokens / add-ip / remove-ip / list-ips / stats / shard-stats / vacuum-check / list-objects / describe-object` | [diagnostics.md](docs/query-protocol/diagnostics.md) |
 | `create-object / drop-object` | [overview.md](docs/query-protocol/overview.md) |
 
