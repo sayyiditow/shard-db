@@ -461,6 +461,91 @@ static void save_tokens_conf_full(const char *db_root,
     fclose(f);
 }
 
+/* ========== Auto-key dispatch helpers ==========
+ *
+ * Normalise the wire-form key into the on-disk binary form per the
+ * object's auto_key mode. AK_NONE → verbatim copy. AK_UUID → 36-char
+ * dashed parsed to 16 bytes. AK_SEQ → decimal parsed to 8-byte int64
+ * BE. On parse error emits {"error":...} to OUT and returns -1.
+ * Caller frees *out_buf.
+ *
+ * The auto-gen helper is the omit-key path for insert: it generates a
+ * fresh binary key (UUIDv4 from /dev/urandom for AK_UUID; next value
+ * from the named sequence for AK_SEQ). Returns -1 on error (e.g. seq
+ * filesystem failure).
+ */
+
+static int auto_key_normalize(const Schema *sc, const char *key,
+                              char **out_buf, size_t *out_len) {
+    if (sc->auto_key == AK_UUID) {
+        if (!key || !key[0]) {
+            OUT("{\"error\":\"Missing key for auto_key=uuid object\"}\n");
+            return -1;
+        }
+        uint8_t bin[16];
+        if (parse_uuid_string(key, bin) < 0) {
+            OUT("{\"error\":\"Invalid key for auto_key=uuid: must be 36-char dashed UUID\"}\n");
+            return -1;
+        }
+        char *buf = malloc(16);
+        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        memcpy(buf, bin, 16);
+        *out_buf = buf; *out_len = 16;
+        return 0;
+    }
+    if (sc->auto_key == AK_SEQ) {
+        if (!key || !key[0]) {
+            OUT("{\"error\":\"Missing key for auto_key=seq object\"}\n");
+            return -1;
+        }
+        int64_t v;
+        if (parse_seq_key(key, &v) < 0) {
+            OUT("{\"error\":\"Invalid key for auto_key=seq(...): must be strict decimal int64\"}\n");
+            return -1;
+        }
+        char *buf = malloc(8);
+        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        for (int i = 7; i >= 0; i--) {
+            buf[i] = (char)(v & 0xFF);
+            v >>= 8;
+        }
+        *out_buf = buf; *out_len = 8;
+        return 0;
+    }
+    /* AK_NONE — verbatim. */
+    if (!key) { OUT("{\"error\":\"Missing key\"}\n"); return -1; }
+    *out_buf = strdup(key);
+    *out_len = strlen(key);
+    return 0;
+}
+
+static int auto_key_generate(const Schema *sc, const char *db_root,
+                              const char *object,
+                              char **out_buf, size_t *out_len) {
+    if (sc->auto_key == AK_UUID) {
+        char *buf = malloc(16);
+        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        gen_uuid4_raw((uint8_t *)buf);
+        *out_buf = buf; *out_len = 16;
+        return 0;
+    }
+    if (sc->auto_key == AK_SEQ) {
+        long long v = seq_next_val(db_root, object, sc->auto_key_seq_name);
+        if (v < 0) {
+            OUT("{\"error\":\"sequence_next failed for [%s]\"}\n", sc->auto_key_seq_name);
+            return -1;
+        }
+        char *buf = malloc(8);
+        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        int64_t vb = v;
+        for (int i = 7; i >= 0; i--) { buf[i] = (char)(vb & 0xFF); vb >>= 8; }
+        *out_buf = buf; *out_len = 8;
+        return 0;
+    }
+    OUT("{\"error\":\"auto_key_generate called on AK_NONE object\"}\n");
+    return -1;
+}
+
 /* ========== JSON QUERY DISPATCH ========== */
 
 /* Dispatch a JSON query object: {"mode":"get","object":"users","key":"k1",...} */
@@ -1061,14 +1146,17 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(mode); free(dir); free(object);
             return;
         }
+        char *auto_key_s = json_obj_strdup(&req, "auto_key");
         cmd_create_object(g_db_root, dir, object,
                           fields_j, indexes_j,
                           splits_s ? atoi(splits_s) : 0,
                           max_key_s ? atoi(max_key_s) : 0,
                           if_not_exists,
-                          sv_s ? atoi(sv_s) : 0);
+                          sv_s ? atoi(sv_s) : 0,
+                          auto_key_s);
         free(fields_j); free(indexes_j);
         free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
+        free(auto_key_s);
         free(mode); free(dir); free(object);
         return;
     }
@@ -1191,7 +1279,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     fcache_release(fc);
                 } else OUT("{\"error\":\"Not found\"}\n");
             } else {
-                cmd_get(db_root, object, key);
+                Schema sc_chk = load_schema(db_root, object);
+                if (sc_chk.auto_key != AK_NONE) {
+                    char *bin = NULL; size_t blen = 0;
+                    if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                        cmd_get(db_root, object, bin, blen);
+                        free(bin);
+                    }
+                } else {
+                    cmd_get(db_root, object, key, strlen(key));
+                }
             }
         } else {
             OUT("{\"error\":\"Missing key or keys\"}\n");
@@ -1204,10 +1301,41 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *ine_raw = json_obj_strdup(&req, "if_not_exists");
         int if_not_exists = (ine_raw && strcmp(ine_raw, "true") == 0);
         free(ine_raw);
-        if (key && value)
-            cmd_insert(db_root, object, key, value, if_cond, if_not_exists);
-        else
-            OUT("{\"error\":\"Missing key or value\"}\n");
+        if (!value) {
+            OUT("{\"error\":\"Missing value\"}\n");
+        } else {
+            Schema sc_chk = load_schema(db_root, object);
+            if (sc_chk.auto_key != AK_NONE) {
+                /* Auto-key object — generate on omit, normalise on provide. */
+                if (!key) {
+                    if (if_cond) {
+                        OUT("{\"error\":\"if predicate not compatible with auto-generated key\"}\n");
+                    } else {
+                        char *bin = NULL; size_t blen = 0;
+                        if (auto_key_generate(&sc_chk, db_root, object, &bin, &blen) == 0) {
+                            /* if_not_exists=1 ensures strict insert; AK_UUID
+                               collisions are effectively impossible, AK_SEQ
+                               collisions surface as condition_not_met when
+                               the operator has manually inserted at/above
+                               the seq watermark. */
+                            cmd_insert(db_root, object, bin, blen, value, NULL, 1);
+                            free(bin);
+                        }
+                    }
+                } else {
+                    char *bin = NULL; size_t blen = 0;
+                    if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                        cmd_insert(db_root, object, bin, blen, value, if_cond, if_not_exists);
+                        free(bin);
+                    }
+                }
+            } else {
+                if (key)
+                    cmd_insert(db_root, object, key, strlen(key), value, if_cond, if_not_exists);
+                else
+                    OUT("{\"error\":\"Missing key or value\"}\n");
+            }
+        }
         free(key); free(value); free(if_cond);
     } else if (strcmp(mode, "update") == 0) {
         char *key = json_obj_strdup(&req, "key");
@@ -1215,18 +1343,42 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *if_cond = json_obj_strdup_raw(&req, "if");
         char *dry_s = json_obj_strdup(&req, "dry_run");
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
-        if (key && value)
-            cmd_update(db_root, object, key, value, if_cond, dry);
-        else
-            OUT("{\"error\":\"Missing key or value\"}\n");
+        if (!value) {
+            OUT("{\"error\":\"Missing value\"}\n");
+        } else if (!key) {
+            OUT("{\"error\":\"Missing key for update (auto_key never fires on update)\"}\n");
+        } else {
+            Schema sc_chk = load_schema(db_root, object);
+            if (sc_chk.auto_key != AK_NONE) {
+                char *bin = NULL; size_t blen = 0;
+                if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                    cmd_update(db_root, object, bin, blen, value, if_cond, dry);
+                    free(bin);
+                }
+            } else {
+                cmd_update(db_root, object, key, strlen(key), value, if_cond, dry);
+            }
+        }
         free(key); free(value); free(if_cond); free(dry_s);
     } else if (strcmp(mode, "delete") == 0) {
         char *key = json_obj_strdup(&req, "key");
         char *if_cond = json_obj_strdup_raw(&req, "if");
         char *dry_s = json_obj_strdup(&req, "dry_run");
         int dry = (dry_s && strcmp(dry_s, "true") == 0);
-        if (key) cmd_delete(db_root, object, key, if_cond, dry);
-        else OUT("{\"error\":\"Missing key\"}\n");
+        if (!key) {
+            OUT("{\"error\":\"Missing key\"}\n");
+        } else {
+            Schema sc_chk = load_schema(db_root, object);
+            if (sc_chk.auto_key != AK_NONE) {
+                char *bin = NULL; size_t blen = 0;
+                if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                    cmd_delete(db_root, object, bin, blen, if_cond, dry);
+                    free(bin);
+                }
+            } else {
+                cmd_delete(db_root, object, key, strlen(key), if_cond, dry);
+            }
+        }
         free(key); free(if_cond); free(dry_s);
     } else if (strcmp(mode, "exists") == 0) {
         char *key = json_obj_strdup(&req, "key");
@@ -1237,7 +1389,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_exists_multi(db_root, object, keys_json, fmt, delim);
             free(keys_json); free(fmt); free(delim);
         } else if (key) {
-            cmd_exists(db_root, object, key);
+            Schema sc_chk = load_schema(db_root, object);
+            if (sc_chk.auto_key != AK_NONE) {
+                char *bin = NULL; size_t blen = 0;
+                if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                    cmd_exists(db_root, object, bin, blen);
+                    free(bin);
+                }
+            } else {
+                cmd_exists(db_root, object, key, strlen(key));
+            }
         } else {
             OUT("{\"error\":\"Missing key or keys\"}\n");
         }
@@ -1319,8 +1480,222 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *records = json_obj_strdup_raw(&req, "records");
         char *ifne_s = json_obj_strdup(&req, "if_not_exists");
         int ifne = (ifne_s && strcmp(ifne_s, "true") == 0);
-        if (records) {
-            /* Inline records — pass string directly, no temp file */
+
+        /* Auto-key bulk-insert: parse records, generate/normalise keys
+           per record, loop through cmd_insert with binary keys. This
+           bypasses the parallel bulk pipeline for correctness on
+           auto-key objects — acceptable for v1 of the feature; revisit
+           when bulk auto-key throughput becomes a bottleneck. */
+        Schema sc_chk_bi = load_schema(db_root, object);
+        if (records && sc_chk_bi.auto_key != AK_NONE) {
+            /* Parse the records array. Supports the array form:
+                 [{"key":"k","value":{...}}, {"value":{...}}, ...]
+               Dict form (`{"k1":{...},"k2":{...}}`) is also accepted —
+               every entry is treated as provided-key (no auto-gen). */
+            const char *p = json_skip(records);
+            int is_array = (*p == '[');
+            int is_dict  = (*p == '{');
+
+            if (!is_array && !is_dict) {
+                OUT("{\"error\":\"bulk-insert: records must be array or dict\"}\n");
+            } else {
+                /* First pass: parse into a vector of (key_wire_or_NULL, value_json). */
+                typedef struct { char *key; char *value; } BiRec;
+                BiRec *recs = NULL;
+                size_t recs_cap = 0, recs_n = 0;
+                int parse_err = 0;
+                if (is_array) {
+                    p++;
+                    while (*p) {
+                        p = json_skip(p);
+                        if (*p == ']') { p++; break; }
+                        if (*p == ',') { p++; continue; }
+                        if (*p != '{') { parse_err = 1; break; }
+                        /* Walk past matching '}'. */
+                        const char *start = p;
+                        int depth = 0;
+                        for (; *p; p++) {
+                            if (*p == '{') depth++;
+                            else if (*p == '}') { depth--; if (depth == 0) { p++; break; } }
+                            else if (*p == '"') {
+                                p++;
+                                while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+                            }
+                        }
+                        if (depth != 0) { parse_err = 1; break; }
+                        size_t rec_len = (size_t)(p - start);
+                        char *rec = malloc(rec_len + 1);
+                        memcpy(rec, start, rec_len); rec[rec_len] = '\0';
+                        JsonObj r; json_parse_object(rec, rec_len, &r);
+                        char *rk = json_obj_strdup(&r, "key");
+                        char *rv = json_obj_strdup_raw(&r, "value");
+                        free(rec);
+                        if (recs_n == recs_cap) {
+                            recs_cap = recs_cap ? recs_cap * 2 : 16;
+                            recs = realloc(recs, recs_cap * sizeof(BiRec));
+                        }
+                        recs[recs_n].key = rk;
+                        recs[recs_n].value = rv;
+                        recs_n++;
+                    }
+                } else {
+                    /* Dict form: {"k1":{...},"k2":{...}} */
+                    p++;
+                    while (*p) {
+                        p = json_skip(p);
+                        if (*p == '}') { p++; break; }
+                        if (*p == ',') { p++; continue; }
+                        if (*p != '"') { parse_err = 1; break; }
+                        p++;
+                        const char *kstart = p;
+                        while (*p && *p != '"') p++;
+                        size_t klen = (size_t)(p - kstart);
+                        if (*p == '"') p++;
+                        char *kbuf = malloc(klen + 1);
+                        memcpy(kbuf, kstart, klen); kbuf[klen] = '\0';
+                        p = json_skip(p);
+                        if (*p != ':') { free(kbuf); parse_err = 1; break; }
+                        p++;
+                        p = json_skip(p);
+                        const char *vstart = p;
+                        const char *vend = json_skip_value(p);
+                        size_t vlen = (size_t)(vend - vstart);
+                        char *vbuf = malloc(vlen + 1);
+                        memcpy(vbuf, vstart, vlen); vbuf[vlen] = '\0';
+                        p = vend;
+                        if (recs_n == recs_cap) {
+                            recs_cap = recs_cap ? recs_cap * 2 : 16;
+                            recs = realloc(recs, recs_cap * sizeof(BiRec));
+                        }
+                        recs[recs_n].key = kbuf;
+                        recs[recs_n].value = vbuf;
+                        recs_n++;
+                    }
+                }
+
+                if (parse_err) {
+                    OUT("{\"error\":\"bulk-insert: malformed records JSON\"}\n");
+                } else if (recs_n == 0) {
+                    OUT("{\"status\":\"bulk-inserted\",\"count\":0,\"keys\":[]}\n");
+                } else {
+                    /* Pre-flight: count omits, validate provided keys. Refuses
+                       the whole batch up front if any provided key is malformed
+                       for the auto_key mode. */
+                    int n_omits = 0;
+                    int bad_idx = -1;
+                    for (size_t i = 0; i < recs_n; i++) {
+                        if (!recs[i].key) {
+                            n_omits++;
+                        } else {
+                            /* parse-only validation */
+                            if (sc_chk_bi.auto_key == AK_UUID) {
+                                uint8_t bin[16];
+                                if (parse_uuid_string(recs[i].key, bin) < 0) { bad_idx = (int)i; break; }
+                            } else if (sc_chk_bi.auto_key == AK_SEQ) {
+                                int64_t v;
+                                if (parse_seq_key(recs[i].key, &v) < 0) { bad_idx = (int)i; break; }
+                            }
+                        }
+                    }
+                    if (bad_idx >= 0) {
+                        OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n", bad_idx);
+                    } else {
+                        /* Batched generation for omits — single seq flock or
+                           single /dev/urandom open. */
+                        uint8_t *uuid_pool = NULL;
+                        long long seq_start = 0;
+                        int omit_used = 0;
+                        if (n_omits > 0) {
+                            if (sc_chk_bi.auto_key == AK_UUID) {
+                                uuid_pool = malloc((size_t)n_omits * 16);
+                                if (!uuid_pool || gen_uuid4_batch(uuid_pool, n_omits) != 0) {
+                                    free(uuid_pool); uuid_pool = NULL;
+                                }
+                            } else if (sc_chk_bi.auto_key == AK_SEQ) {
+                                seq_start = seq_next_val_batch(db_root, object,
+                                    sc_chk_bi.auto_key_seq_name, n_omits);
+                            }
+                        }
+
+                        /* Suppress per-record OUT during the loop; collect
+                           resolved wire-form keys for the final response. */
+                        FILE *saved_out = g_out;
+                        FILE *devnull = fopen("/dev/null", "w");
+                        char **resolved = calloc(recs_n, sizeof(char *));
+                        int ok = 0, skipped = 0;
+                        for (size_t i = 0; i < recs_n; i++) {
+                            char bin_key_buf[16];
+                            const char *bin_key;
+                            size_t bin_klen;
+                            char wire[40];
+
+                            if (recs[i].key) {
+                                /* Provided — normalise to binary. */
+                                if (sc_chk_bi.auto_key == AK_UUID) {
+                                    parse_uuid_string(recs[i].key, (uint8_t *)bin_key_buf);
+                                    bin_key = bin_key_buf; bin_klen = 16;
+                                    strncpy(wire, recs[i].key, sizeof(wire) - 1);
+                                    wire[sizeof(wire) - 1] = '\0';
+                                } else {
+                                    int64_t v; parse_seq_key(recs[i].key, &v);
+                                    for (int b = 7; b >= 0; b--) {
+                                        bin_key_buf[b] = (char)(v & 0xFF); v >>= 8;
+                                    }
+                                    bin_key = bin_key_buf; bin_klen = 8;
+                                    strncpy(wire, recs[i].key, sizeof(wire) - 1);
+                                    wire[sizeof(wire) - 1] = '\0';
+                                }
+                            } else {
+                                /* Generated. */
+                                if (sc_chk_bi.auto_key == AK_UUID) {
+                                    if (uuid_pool) memcpy(bin_key_buf, uuid_pool + omit_used * 16, 16);
+                                    else gen_uuid4_raw((uint8_t *)bin_key_buf);
+                                    bin_key = bin_key_buf; bin_klen = 16;
+                                    format_uuid_string((const uint8_t *)bin_key, wire);
+                                } else {
+                                    int64_t v = seq_start + omit_used;
+                                    for (int b = 7; b >= 0; b--) {
+                                        bin_key_buf[b] = (char)(v & 0xFF); v >>= 8;
+                                    }
+                                    bin_key = bin_key_buf; bin_klen = 8;
+                                    snprintf(wire, sizeof(wire), "%lld", (long long)(seq_start + omit_used));
+                                }
+                                omit_used++;
+                            }
+                            resolved[i] = strdup(wire);
+
+                            g_out = devnull ? devnull : saved_out;
+                            int rc = cmd_insert(db_root, object, bin_key, bin_klen,
+                                                recs[i].value, NULL,
+                                                /* generated keys → strict insert,
+                                                   provided keys → respect ifne flag */
+                                                recs[i].key ? ifne : 1);
+                            g_out = saved_out;
+                            if (rc == 0) ok++;
+                            else skipped++;
+                        }
+                        if (devnull) fclose(devnull);
+                        free(uuid_pool);
+
+                        /* Emit consolidated response with resolved keys[]. */
+                        OUT("{\"status\":\"bulk-inserted\",\"count\":%d,\"skipped\":%d,\"keys\":[", ok, skipped);
+                        for (size_t i = 0; i < recs_n; i++) {
+                            OUT("%s\"%s\"", i ? "," : "", resolved[i] ? resolved[i] : "");
+                        }
+                        OUT("]}\n");
+
+                        for (size_t i = 0; i < recs_n; i++) free(resolved[i]);
+                        free(resolved);
+                    }
+                }
+                for (size_t i = 0; i < recs_n; i++) {
+                    free(recs[i].key); free(recs[i].value);
+                }
+                free(recs);
+            }
+            free(records);
+        } else if (records) {
+            /* AK_NONE — today's bulk path. */
             cmd_bulk_insert_string(db_root, object, records, ifne);
             free(records);
         } else {
@@ -1838,17 +2213,17 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     else if (fast_rd) objlock_rdlock(eff_root, object);
 
     if (strcasecmp(cmd, "get") == 0) {
-        cmd_get(eff_root, object, arg1);
+        cmd_get(eff_root, object, arg1, strlen(arg1));
     } else if (strcasecmp(cmd, "insert") == 0) {
-        cmd_insert(eff_root, object, arg1, arg2, NULL, 0);
+        cmd_insert(eff_root, object, arg1, strlen(arg1), arg2, NULL, 0);
     } else if (strcasecmp(cmd, "delete") == 0) {
-        cmd_delete(eff_root, object, arg1, NULL, 0);
+        cmd_delete(eff_root, object, arg1, strlen(arg1), NULL, 0);
     } else if (strcasecmp(cmd, "size") == 0) {
         cmd_size(eff_root, object);
     } else if (strcasecmp(cmd, "orphaned") == 0) {
         cmd_orphaned(eff_root, object);
     } else if (strcasecmp(cmd, "exists") == 0) {
-        cmd_exists(eff_root, object, arg1);
+        cmd_exists(eff_root, object, arg1, strlen(arg1));
     } else if (strcasecmp(cmd, "keys") == 0) {
         cmd_keys(eff_root, object, arg1[0] ? atoi(arg1) : 0, arg2[0] ? atoi(arg2) : 0, NULL, NULL);
     } else if (strcasecmp(cmd, "fetch") == 0) {

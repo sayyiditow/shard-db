@@ -639,6 +639,38 @@ Schema load_schema(const char *effective_root, const char *object) {
                     char *p4 = strchr(p3 + 1, ':');
                     if (p4) s.streams = atoi(p4 + 1);
                 }
+                /* Tail scan for `auto_key=...` token (added 2026.05.5).
+                   Liberal: walk every `:`-separated token after splits,
+                   accept the first one whose form matches; unknown tokens
+                   are silently ignored so the format stays
+                   forward-compatible. */
+                char *scan = p2;
+                while (scan) {
+                    char *next = strchr(scan + 1, ':');
+                    size_t tlen = next ? (size_t)(next - scan - 1) : strlen(scan + 1);
+                    const char *tok = scan + 1;
+                    if (tlen >= 9 && strncmp(tok, "auto_key=", 9) == 0) {
+                        const char *val = tok + 9;
+                        size_t vlen = tlen - 9;
+                        if (vlen == 4 && strncmp(val, "uuid", 4) == 0) {
+                            s.auto_key = AK_UUID;
+                            s.auto_key_seq_name[0] = '\0';
+                        } else if (vlen > 5 && strncmp(val, "seq(", 4) == 0 &&
+                                    val[vlen - 1] == ')') {
+                            size_t nlen = vlen - 5;  /* "seq(" + ")" */
+                            if (nlen > 0 && nlen < sizeof(s.auto_key_seq_name)) {
+                                s.auto_key = AK_SEQ;
+                                memcpy(s.auto_key_seq_name, val + 4, nlen);
+                                s.auto_key_seq_name[nlen] = '\0';
+                            }
+                        }
+                        /* Unknown auto_key value → leave AK_NONE; create-object
+                           validation already rejects bad values, so a malformed
+                           line on disk means someone hand-edited it. */
+                        break;
+                    }
+                    scan = next;
+                }
             }
             if (s.storage_version <= 0) s.storage_version = 1;
             break;
@@ -1626,18 +1658,136 @@ static void gen_date_now(char *buf, size_t bufsz) {
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 }
 
-/* UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx (36 chars + NUL) */
-static void gen_uuid4(char *buf, size_t bufsz) {
-    uint8_t b[16];
+/* === UUID helpers ===
+ *
+ * gen_uuid4_raw fills 16 bytes from /dev/urandom and stamps v4 + variant
+ * bits. Single-shot; gen_uuid4 (the string formatter) calls it then
+ * formats. gen_uuid4_batch amortises the open() over `n` UUIDs for
+ * bulk-insert. parse_uuid_string is strict (returns -1 on malformed).
+ * format_uuid_string is the inverse; both are also declared in types.h
+ * for use from server.c / storage.c. */
+
+void gen_uuid4_raw(uint8_t out[16]) {
     FILE *f = fopen("/dev/urandom", "r");
-    if (!f || fread(b, 1, 16, f) != 16) { buf[0] = '\0'; if (f) fclose(f); return; }
+    if (!f || fread(out, 1, 16, f) != 16) {
+        memset(out, 0, 16);
+        if (f) fclose(f);
+        return;
+    }
     fclose(f);
-    b[6] = (b[6] & 0x0F) | 0x40; /* version 4 */
-    b[8] = (b[8] & 0x3F) | 0x80; /* variant 1 */
-    snprintf(buf, bufsz,
+    out[6] = (out[6] & 0x0F) | 0x40;  /* version 4 */
+    out[8] = (out[8] & 0x3F) | 0x80;  /* variant 1 */
+}
+
+int gen_uuid4_batch(uint8_t *out, size_t n) {
+    if (n == 0) return 0;
+    FILE *f = fopen("/dev/urandom", "r");
+    if (!f) return -1;
+    size_t got = fread(out, 1, n * 16, f);
+    fclose(f);
+    if (got != n * 16) return -1;
+    for (size_t i = 0; i < n; i++) {
+        out[i * 16 + 6] = (out[i * 16 + 6] & 0x0F) | 0x40;
+        out[i * 16 + 8] = (out[i * 16 + 8] & 0x3F) | 0x80;
+    }
+    return 0;
+}
+
+void format_uuid_string(const uint8_t in[16], char out[37]) {
+    /* RFC 4122 canonical lowercase form: 8-4-4-4-12. */
+    snprintf(out, 37,
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
-        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
+        in[0],in[1],in[2],in[3], in[4],in[5], in[6],in[7],
+        in[8],in[9], in[10],in[11],in[12],in[13],in[14],in[15]);
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+int parse_uuid_string(const char *in, uint8_t out[16]) {
+    /* Strict: 36 chars, dash positions 8/13/18/23, hex elsewhere. */
+    if (!in) return -1;
+    if (strlen(in) != 36) return -1;
+    static const int dash_pos[4] = {8, 13, 18, 23};
+    for (int i = 0; i < 4; i++) {
+        if (in[dash_pos[i]] != '-') return -1;
+    }
+    int oi = 0;
+    for (int i = 0; i < 36; ) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { i++; continue; }
+        int hi = hex_nibble(in[i]);
+        int lo = hex_nibble(in[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[oi++] = (uint8_t)((hi << 4) | lo);
+        i += 2;
+    }
+    return 0;
+}
+
+/* Legacy wrapper kept for the default-value path (generate_default) */
+static void gen_uuid4(char *buf, size_t bufsz) {
+    if (bufsz < 37) { buf[0] = '\0'; return; }
+    uint8_t raw[16];
+    gen_uuid4_raw(raw);
+    format_uuid_string(raw, buf);
+}
+
+/* === Seq-key helpers ===
+ *
+ * parse_seq_key: strict decimal. Accepts optional leading '-', then one
+ * or more digits, then NUL. Rejects leading zeros (except literal "0"
+ * and "-0"), hex prefixes, scientific notation, whitespace.
+ * format_seq_key writes the canonical decimal form. */
+
+int parse_seq_key(const char *in, int64_t *out) {
+    if (!in || !in[0]) return -1;
+    const char *p = in;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; if (!*p) return -1; }
+    /* Reject leading zeros (e.g. "01", "007"); "0" / "-0" is the
+       only zero-prefixed form allowed. */
+    if (p[0] == '0' && p[1] != '\0') return -1;
+    int64_t v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        int d = *p - '0';
+        /* Overflow guard: v * 10 + d must stay in int64 range. */
+        if (v > (INT64_MAX - d) / 10) return -1;
+        v = v * 10 + d;
+    }
+    if (neg) v = -v;
+    *out = v;
+    return 0;
+}
+
+void format_seq_key(int64_t v, char out[24]) {
+    snprintf(out, 24, "%lld", (long long)v);
+}
+
+int format_wire_key(const Schema *sc, const char *key, size_t klen,
+                    char *out, size_t outcap) {
+    if (sc && sc->auto_key == AK_UUID) {
+        if (klen != 16 || outcap < 37) return -1;
+        format_uuid_string((const uint8_t *)key, out);
+        return 36;
+    }
+    if (sc && sc->auto_key == AK_SEQ) {
+        if (klen != 8 || outcap < 24) return -1;
+        int64_t v = 0;
+        for (int i = 0; i < 8; i++)
+            v = (v << 8) | (uint8_t)key[i];
+        format_seq_key(v, out);
+        return (int)strlen(out);
+    }
+    /* AK_NONE: verbatim copy (key is a regular string). */
+    if (klen + 1 > outcap) return -1;
+    memcpy(out, key, klen);
+    out[klen] = '\0';
+    return (int)klen;
 }
 
 /* Random N bytes, hex-encoded (2*N chars + NUL) */
@@ -1652,9 +1802,11 @@ static void gen_random_hex(int nbytes, char *buf, size_t bufsz) {
         snprintf(buf + i * 2, 3, "%02x", raw[i]);
 }
 
-/* Internal sequence next — returns next value without printing.
-   Requires db_root + object to locate the sequence file. */
-static long long seq_next_val(const char *db_root, const char *object, const char *seq_name) {
+/* Sequence next — returns next value without printing. Used by
+   DK_SEQ field defaults and by the auto_key=seq(<name>) insert path.
+   Promoted from static to public in 2026.05.5 so storage.c can call it
+   from cmd_insert. */
+long long seq_next_val(const char *db_root, const char *object, const char *seq_name) {
     char seq_dir[PATH_MAX], seq_path[PATH_MAX], lock_path[PATH_MAX];
     snprintf(seq_dir, sizeof(seq_dir), "%s/%s/metadata/sequences", db_root, object);
     mkdirp(seq_dir);
@@ -1675,6 +1827,36 @@ static long long seq_next_val(const char *db_root, const char *object, const cha
     flock(lockfd, LOCK_UN);
     close(lockfd);
     return val;
+}
+
+/* Fetch `n` next sequence values atomically — returns the starting
+   value (range is [start, start+n-1]) or -1 on error. n <= 0 returns
+   -1. Pairs with bulk-insert's batched auto_key=seq(...) path so we
+   take one flock per request rather than per record. */
+long long seq_next_val_batch(const char *db_root, const char *object,
+                              const char *seq_name, int n) {
+    if (n <= 0) return -1;
+    char seq_dir[PATH_MAX], seq_path[PATH_MAX], lock_path[PATH_MAX];
+    snprintf(seq_dir, sizeof(seq_dir), "%s/%s/metadata/sequences", db_root, object);
+    mkdirp(seq_dir);
+    snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, seq_name);
+    snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", seq_dir, seq_name);
+
+    int lockfd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) return -1;
+    flock(lockfd, LOCK_EX);
+
+    long long val = 0;
+    FILE *f = fopen(seq_path, "r");
+    if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
+    long long start = val + 1;
+    val += n;
+    f = fopen(seq_path, "w");
+    if (f) { fprintf(f, "%lld\n", val); fclose(f); }
+
+    flock(lockfd, LOCK_UN);
+    close(lockfd);
+    return start;
 }
 
 /* Generate a default value string for a field. Returns static/malloc'd string

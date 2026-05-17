@@ -361,6 +361,9 @@ int cmd_orphaned(const char *db_root, const char *object) {
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object) {
     fs->ts = load_typed_schema(db_root, object);
     fs->nfields = 0;
+    Schema sc = load_schema(db_root, object);
+    fs->auto_key = sc.auto_key;
+    fs->auto_key_schema_snapshot = sc;
 }
 
 /* Decode stored value to JSON. */
@@ -5196,9 +5199,11 @@ static int update_schema_conf_splits_streams(const char *db_root, const char *ob
     int replaced = 0;
     while (fgets(line, sizeof(line), fin)) {
         if (strncmp(line, prefix, pfxlen) == 0 && !replaced) {
-            /* Format: dir:object:splits:max_key[:storage_version[:streams]].
+            /* Format: dir:object:splits:max_key[:storage_version[:streams[:auto_key=...]]].
                Preserve every trailing field so v2 objects don't silently
-               downgrade to v1 on a splits change. */
+               downgrade to v1 on a splits change, and so auto_key=... is
+               kept across vacuum-reshards. Also walk the line tail for
+               any unknown :tok= extension and re-emit it verbatim. */
             line[strcspn(line, "\r\n")] = '\0';
             int cur_splits = 0, max_key = 0;
             int sv = 0, streams = 0;
@@ -5206,12 +5211,35 @@ static int update_schema_conf_splits_streams(const char *db_root, const char *ob
                             &cur_splits, &max_key, &sv, &streams);
             int out_splits  = (new_splits  > 0) ? new_splits  : cur_splits;
             int out_streams = (new_streams > 0) ? new_streams : streams;
-            if (n >= 4)
-                fprintf(fout, "%s%d:%d:%d:%d\n", prefix, out_splits, max_key, sv, out_streams);
-            else if (n >= 3)
-                fprintf(fout, "%s%d:%d:%d\n", prefix, out_splits, max_key, sv);
-            else
-                fprintf(fout, "%s%d:%d\n", prefix, out_splits, max_key);
+
+            /* Walk past splits[:max_key[:sv[:streams]]] to find any trailing
+               tokens (auto_key=... and future extensions) — re-emit them. */
+            char *scan = line + pfxlen;
+            int skips = n > 4 ? 4 : n;
+            for (int i = 0; i < skips; i++) {
+                char *next = strchr(scan, ':');
+                if (!next) { scan = NULL; break; }
+                scan = next + 1;
+            }
+            /* `scan` now points at the byte after the last consumed numeric
+               field. If there's more text, it begins with ':' separating
+               the next token from the streams field (which we just
+               consumed); skip that ':' before re-emitting. Actually no —
+               sscanf+strchr leaves scan PAST the colon, pointing at the
+               next field's first byte (or NUL if none). So `*scan` is
+               the next token, no leading colon. */
+            const char *tail = (scan && *scan) ? scan : NULL;
+
+            if (n >= 4) {
+                if (tail) fprintf(fout, "%s%d:%d:%d:%d:%s\n", prefix, out_splits, max_key, sv, out_streams, tail);
+                else      fprintf(fout, "%s%d:%d:%d:%d\n",    prefix, out_splits, max_key, sv, out_streams);
+            } else if (n >= 3) {
+                if (tail) fprintf(fout, "%s%d:%d:%d:%s\n", prefix, out_splits, max_key, sv, tail);
+                else      fprintf(fout, "%s%d:%d:%d\n",    prefix, out_splits, max_key, sv);
+            } else {
+                if (tail) fprintf(fout, "%s%d:%d:%s\n", prefix, out_splits, max_key, tail);
+                else      fprintf(fout, "%s%d:%d\n",    prefix, out_splits, max_key);
+            }
             replaced = 1;
         } else {
             fputs(line, fout);
@@ -6471,9 +6499,9 @@ int is_number(const char *s) {
 
 /* ========== EXISTS ========== */
 
-int cmd_exists(const char *db_root, const char *object, const char *key) {
+int cmd_exists(const char *db_root, const char *object,
+               const char *key, size_t klen) {
     Schema sc = load_schema(db_root, object);
-    size_t klen = strlen(key);
 
     if (sc.storage_version == 2) {
         SlotcaskSchemaInfo info = {
@@ -6590,13 +6618,23 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
 
 /* ========== FETCH (paginated scan with optional field projection) ========== */
 
+/* Render block's key bytes as the wire-form string, honouring the
+   object's auto_key mode (carried on FieldSchema). For AK_NONE the
+   output is a verbatim NUL-terminated copy; for AK_UUID the 16 bytes
+   render as 36-char dashed; for AK_SEQ the 8 bytes render as decimal. */
+static void render_wire_key(const FieldSchema *fs, const uint8_t *block,
+                             uint16_t klen, char out[1100]) {
+    const Schema *sc = (fs && fs->auto_key != AK_NONE)
+                        ? &fs->auto_key_schema_snapshot : NULL;
+    format_wire_key(sc, (const char *)block, klen, out, 1100);
+}
+
 /* Print a record as JSON with optional projection */
 void print_record_json(const SlotHeader *hdr, const uint8_t *block,
                               const char **proj_fields, int proj_count,
                               int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6616,7 +6654,6 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
         OUT("%s}", val);
         free(val);
     }
-    free(key);
     (*printed)++;
 }
 
@@ -6624,9 +6661,8 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
 void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
                        const char **proj_fields, int proj_count,
                        int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6647,7 +6683,6 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         OUT("%s", val);
         free(val);
     }
-    free(key);
     (*printed)++;
 }
 
@@ -6655,9 +6690,8 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
 void print_record_row(const SlotHeader *hdr, const uint8_t *block,
                       const char **proj_fields, int proj_count,
                       int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6677,7 +6711,6 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
         }
     }
     OUT("]");
-    free(key);
     (*printed)++;
 }
 
@@ -8840,9 +8873,16 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     if (sc->limit > 0 && sc->printed >= sc->limit) return 1;
     if (query_deadline_tick(sc->deadline, &sc->dl_counter)) return 1;
 
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    /* Render key per the object's auto_key mode so the wire-form
+       comparison + emit work for binary keys (AK_UUID/SEQ). Heap-alloc
+       to preserve the existing free() lifecycle in this function. */
+    char *key = malloc(1100);
+    if (!key) return 1;
+    {
+        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
+                              ? &sc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)block, hdr->key_len, key, 1100);
+    }
 
     /* Check excluded keys first */
     if (is_excluded(&sc->excluded, key)) { free(key); return 0; }
@@ -9978,10 +10018,13 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
     RecordRef rr;
     if (read_record_ref(sc->db_root, sc->object, sc->sch, hash16, &rr) != 0) return 0;
 
-    char keybuf[1024];
-    size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-    memcpy(keybuf, rr.key, kl);
-    keybuf[kl] = '\0';
+    /* Render key per the object's auto_key mode (AK_NONE → verbatim). */
+    char keybuf[1100];
+    {
+        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
+                              ? &sc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
+    }
 
     if (is_excluded(sc->excluded, keybuf)) { release_record_ref(&rr); return 0; }
 
@@ -11465,10 +11508,12 @@ static int keyset_emit_find(const char *db_root, const char *object,
         RecordRef rr;
         if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
 
-        char keybuf[1024];
-        size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, rr.key, kl);
-        keybuf[kl] = '\0';
+        char keybuf[1100];
+        {
+            const Schema *sc_p = (fs && fs->auto_key != AK_NONE)
+                                  ? &fs->auto_key_schema_snapshot : NULL;
+            format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
+        }
 
         if (is_excluded(excluded, keybuf)) { release_record_ref(&rr); continue; }
 
@@ -12074,11 +12119,14 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     if (oc->budget_exceeded) return 1;  /* stop scanning once cap hit */
     if (query_deadline_tick(oc->deadline, &oc->dl_counter)) return 1;
 
-    /* Exclusion check */
-    char keybuf[1024];
-    size_t klen = hdr->key_len < sizeof(keybuf) - 1 ? hdr->key_len : sizeof(keybuf) - 1;
-    memcpy(keybuf, block, klen);
-    keybuf[klen] = '\0';
+    /* Exclusion check — render key per auto_key mode so wire-form
+       excluded keys match what the user sent. */
+    char keybuf[1100];
+    {
+        const Schema *sc_p = (oc->fs && oc->fs->auto_key != AK_NONE)
+                              ? &oc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)block, hdr->key_len, keybuf, sizeof(keybuf));
+    }
     if (is_excluded(oc->excluded, keybuf)) return 0;
 
     const uint8_t *raw = block + hdr->key_len;
@@ -14388,10 +14436,49 @@ static int validate_field_type(const char *field_spec) {
     return 0;
 }
 
+/* Validate + parse the auto_key spec. Returns 0 on AK_NONE, 1 on
+   AK_UUID, 2 on AK_SEQ (with seq_name filled). On invalid input writes
+   the {"error":...} JSON to OUT and returns -1. Empty/NULL → 0. */
+static int parse_auto_key_spec(const char *spec, char *out_seq_name, size_t seq_cap) {
+    if (!spec || !spec[0]) return 0;
+    if (strcmp(spec, "uuid") == 0) return 1;
+    if (strncmp(spec, "seq(", 4) == 0) {
+        size_t slen = strlen(spec);
+        if (slen < 6 || spec[slen - 1] != ')') {
+            OUT("{\"error\":\"Invalid auto_key=seq(...) form; expected seq(<name>)\"}\n");
+            return -1;
+        }
+        size_t nlen = slen - 5;  /* "seq(" + ")" */
+        if (nlen >= seq_cap) {
+            OUT("{\"error\":\"auto_key=seq(<name>): name too long (max %zu)\"}\n", seq_cap - 1);
+            return -1;
+        }
+        /* Validate name characters: no `:`, `/`, `+`, spaces, `)` etc. */
+        for (size_t i = 0; i < nlen; i++) {
+            char c = spec[4 + i];
+            if (c == ':' || c == '/' || c == '+' || c == '\\' || c == ' ' ||
+                c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')') {
+                OUT("{\"error\":\"Invalid sequence name in auto_key=seq(...)\"}\n");
+                return -1;
+            }
+        }
+        if (nlen == 0) {
+            OUT("{\"error\":\"auto_key=seq(): sequence name is empty\"}\n");
+            return -1;
+        }
+        memcpy(out_seq_name, spec + 4, nlen);
+        out_seq_name[nlen] = '\0';
+        return 2;
+    }
+    OUT("{\"error\":\"Unknown auto_key mode '%s'; expected 'uuid' or 'seq(<name>)'\"}\n", spec);
+    return -1;
+}
+
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      int storage_version) {
+                      int storage_version,
+                      const char *auto_key_spec) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -14613,16 +14700,54 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
        opens use the same count (stream_id is on-disk in the keyfile entry). */
     int streams = (storage_version == 2) ? slotcask_streams_for_nproc() : 0;
 
+    /* Parse + validate auto_key_spec. Refuses cross-version invariants
+       (uuid needs max_key>=16, seq needs max_key>=8). On AK_SEQ,
+       pre-initialise the sequence file so the first `next` returns 1. */
+    char auto_seq_name[128] = {0};
+    int auto_key_kind = parse_auto_key_spec(auto_key_spec, auto_seq_name, sizeof(auto_seq_name));
+    if (auto_key_kind < 0) return 1;  /* error already emitted */
+    if (auto_key_kind == 1 && max_key < 16) {
+        OUT("{\"error\":\"auto_key=uuid requires max_key>=16 (got %d)\"}\n", max_key);
+        return 1;
+    }
+    if (auto_key_kind == 2 && max_key < 8) {
+        OUT("{\"error\":\"auto_key=seq(...) requires max_key>=8 (got %d)\"}\n", max_key);
+        return 1;
+    }
+    if (auto_key_kind == 2) {
+        /* Pre-initialise the sequence file at 0 — first `next` returns 1. */
+        char seq_dir[PATH_MAX], seq_path[PATH_MAX];
+        snprintf(seq_dir,  sizeof(seq_dir),  "%s/%s/%s/metadata/sequences", db_root, dir, object);
+        snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, auto_seq_name);
+        mkdirp(seq_dir);
+        struct stat sst;
+        if (stat(seq_path, &sst) != 0) {
+            FILE *sf = fopen(seq_path, "w");
+            if (sf) { fprintf(sf, "0\n"); fclose(sf); }
+        }
+    }
+
     if (!exists) {
         f = fopen(schema_path, "a");
         if (f) {
             if (storage_version == 1) {
                 /* v1 line stays at the historical 4-field form so old parsers
-                   keep working byte-for-byte. */
+                   keep working byte-for-byte. v1 doesn't support auto_key
+                   (the feature is documented v2-only). */
                 fprintf(f, "%s:%s:%d:%d\n", dir, object, splits, max_key);
             } else {
-                fprintf(f, "%s:%s:%d:%d:%d:%d\n",
-                        dir, object, splits, max_key, storage_version, streams);
+                /* v2 line: dir:object:splits:max_key:sv:streams[:auto_key=...] */
+                if (auto_key_kind == 1) {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=uuid\n",
+                            dir, object, splits, max_key, storage_version, streams);
+                } else if (auto_key_kind == 2) {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=seq(%s)\n",
+                            dir, object, splits, max_key, storage_version, streams,
+                            auto_seq_name);
+                } else {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d\n",
+                            dir, object, splits, max_key, storage_version, streams);
+                }
             }
             fclose(f);
         }

@@ -53,7 +53,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 - `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).
 - `$DB_ROOT/allowed_ips.conf` — global trusted IPs (skip token check).
 - `$DB_ROOT/dirs.conf` — allowed tenant directories.
-- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key`. `max_value` is derived from `fields.conf` (sum of typed-field byte lengths) and `slot_size = max_key + max_value` rounded up to 8.
+- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key[:storage_version[:streams[:auto_key=<mode>]]]`. Trailing fields are optional and added in order; v1 objects emit just the 4-field form. `auto_key=uuid` → 16-byte UUIDv4 keys; `auto_key=seq(<name>)` → 8-byte int64 BE keys from the named sequence. `max_value` is derived from `fields.conf` (sum of typed-field byte lengths) and `slot_size = max_key + max_value` rounded up to 8.
 - `$DB_ROOT/<dir>/<obj>/fields.conf` — `name:type[:size|P,S][:default=...]`.
 
 ## Storage model (high-level)
@@ -138,6 +138,8 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 
 # JSON-only (advanced)
 ./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":N,"fields":[...],"indexes":[...]}'
+./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":16,"fields":[...],"auto_key":"uuid"}'      # server-generated UUID keys
+./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":8,"fields":[...],"auto_key":"seq(my_seq)"}'  # server-generated seq keys
 ./shard-db query '{"mode":"list-objects","dir":"<dir>"}'
 ./shard-db query '{"mode":"describe-object","dir":"<dir>","object":"<obj>"}'
 
@@ -227,6 +229,7 @@ Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`.
 - `varchar` max content = **65535 bytes** (uint16 length prefix).
 - `MAX_FIELDS = 256` (bumped from 64 in 2026.04.2).
+- **Auto-key** (2026.05.5+): per-object opt-in flag at `create-object` (`"auto_key":"uuid"` or `"auto_key":"seq(<name>)"`). Server generates the key on insert when the client omits it; provided keys go through upsert (CAS modifiers respected). Stored as 16 bytes UUID binary or 8 bytes int64 BE; rendered as 36-char dashed / decimal string on every read. `update`/`delete` always require keys. Not retroactive — no schema mutation to add later. See [docs/query-protocol/schema-mutations.md → Auto-generated keys](docs/query-protocol/schema-mutations.md#auto-generated-keys).
 - `MAX_AGG_SPECS = 32`.
 - `MAX_CRITERIA_DEPTH = 16`, `MAX_INTERSECT_LEAVES = 8`.
 
