@@ -3033,7 +3033,11 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                           &st[i].old_kf_slot) == 0);
         st[i].old_found = found ? 1 : 0;
 
-        if (found && opts->if_not_exists) {
+        /* Per-record CAS OR-combines with batch-level opts.if_not_exists.
+           Auto-key bulk-insert flags omit-key records (server-generated
+           UUID / seq.next) as strict-insert while leaving provided-key
+           records as upsert in the same batch. */
+        if (found && (opts->if_not_exists || r->if_not_exists)) {
             r->status = -2;
             r->was_update = 1;
             continue;
@@ -3313,7 +3317,11 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         }
 
         if (put_rc == 1) {
-            if (opts->if_not_exists) {
+            /* Race-detection branch: kf_put_new found a concurrent insert
+               for this key (Phase 1a's lookup said missing). Per-record
+               CAS OR-combines with batch-level (auto-key strict-insert
+               needs to surface as condition_not_met on collision). */
+            if (opts->if_not_exists || r->if_not_exists) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
                 pool_push_free(&db->streams[st[i].target_stream],

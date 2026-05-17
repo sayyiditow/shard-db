@@ -2337,7 +2337,7 @@ static void *multi_exists_shard_worker(void *arg) {
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
         if (!batch) return NULL;
         for (int ei = 0; ei < sw->count; ei++) {
             MultiExistsEntry *e = &sw->entries[ei];
@@ -2765,7 +2765,7 @@ static void *multi_get_shard_worker(void *arg) {
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
         void **vals = calloc(sw->count, sizeof(void *));
         size_t *vlens = calloc(sw->count, sizeof(size_t));
         if (!batch || !vals || !vlens) {

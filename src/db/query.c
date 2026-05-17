@@ -934,6 +934,12 @@ typedef struct {
     uint8_t   hash[16];
     int       start_slot;
     int       shard_id;
+    /* Per-record strict-insert override. Auto-key bulk-insert flags
+       omit-key records (server-generated UUID / seq.next) so a collision
+       with a pre-existing key surfaces as condition_not_met instead of
+       a silent update. Zero for provided-key records → today's
+       behaviour (upsert under the batch-level opts). */
+    int       if_not_exists;
 } BulkInsRecord;
 
 /* Per-shard bucket + worker arguments. Each bucket targets exactly one
@@ -1225,7 +1231,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
        so calling it once per kf shard amortises the lock acquisition
        across all records in that shard. */
     int splits = sw->sch->splits;
-    SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
     V2BulkInsCtx    *ctxs  = malloc(sw->count * sizeof(V2BulkInsCtx));
     int *kf_shards = malloc(sw->count * sizeof(int));
     int *counts    = calloc(splits, sizeof(int));
@@ -1262,6 +1268,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         batch[pos].old_vlen  = 0;
         batch[pos].status    = 0;
         batch[pos].was_update = 0;
+        batch[pos].if_not_exists = r->if_not_exists;
     }
 
     SlotcaskBulkOpts opts = {
@@ -1690,7 +1697,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        the post-phase merge loop reads records[i].id/.payload BEFORE arena_free. */
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
-    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
+    BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
 
     while (*p) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
@@ -1843,6 +1850,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 r->id = id;
                 r->payload = payload;
                 r->klen = klen;
+                r->if_not_exists = 0;  /* default; auto-key omit post-fill sets to 1 */
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
                 /* Override shard_id with the version-aware mapping so v2
                    workers each own one kf shard (no cross-worker kf-wrlock
@@ -1904,6 +1912,11 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
             if (sc.storage_version == 2)
                 r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            /* Strict-insert on collision — see BulkInsRecord.if_not_exists.
+               UUID can't collide in practice; seq can collide if the
+               operator pre-inserted manual numeric keys at or above the
+               watermark, and silent overwrite would corrupt their data. */
+            r->if_not_exists = 1;
             omit_idx++;
         }
         free(uuid_pool);
@@ -1987,7 +2000,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     for (int g = 0; g < nshard_groups; g++) {
         int s = worker_shards[g];
         workers[g].shard_id = s;
-        workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+        workers[g].records = calloc(shard_counts[s], sizeof(BulkInsRecord));
         workers[g].count = 0;
     }
     /* Invariant: rec_count > 0 ⇒ at least one shard has count > 0 ⇒
@@ -2354,7 +2367,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
        workers join. */
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
-    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
+    BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
 
     while (rp < data_end) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
@@ -2656,7 +2669,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     for (int g = 0; g < nshard_groups; g++) {
         int s = worker_shards[g];
         workers[g].shard_id = s;
-        workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+        workers[g].records = calloc(shard_counts[s], sizeof(BulkInsRecord));
         workers[g].count = 0;
     }
     /* Same invariant as cmd_bulk_insert (JSON path): rec_count > 0 ⇒
@@ -2953,7 +2966,7 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
        aligned shard_id with compute_record_shard, see cmd_bulk_delete). */
     int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits, 2);
 
-    SlotcaskBulkRec *batch = malloc(sw->key_count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch = calloc(sw->key_count, sizeof(SlotcaskBulkRec));
     V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
     if (!batch || !ctxs) { free(batch); free(ctxs); return NULL; }
 
@@ -3556,7 +3569,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
     json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
 
-    SlotcaskBulkRec *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
     uint8_t         *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -4035,7 +4048,7 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
 
     /* Build batch + scratch slab. value_compute will write into the
        slab; rec->value points at this worker's slot up front. */
-    SlotcaskBulkRec   *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec   *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdDelimCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdDelimCtx));
     uint8_t           *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -4596,7 +4609,7 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
 
-    SlotcaskBulkRec  *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec  *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdJsonCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdJsonCtx));
     uint8_t          *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -5147,7 +5160,7 @@ static void *bulk_del_crit_shard_worker(void *arg) {
        pre-sorted by compute_record_shard). */
     int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits, 2);
 
-    SlotcaskBulkRec  *batch = malloc((size_t)w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec  *batch = calloc((size_t)w->count, sizeof(SlotcaskBulkRec));
     V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
     if (!batch || !ctxs) {
         free(batch); free(ctxs);

@@ -74,7 +74,7 @@ CAS modifiers (`if_not_exists`, `if`) apply to provided-key inserts as usual. Om
 
 **Storage shape** — keys are stored in their on-disk binary form: 16 bytes for `uuid`, 8 bytes BE int64 for `seq`. Wire I/O always renders as the canonical string form (UUID dashed, seq decimal). `get` / `delete` / `find` / `keys` / `fetch` all accept and emit the rendered form.
 
-**bulk-insert** — per-record omit-key gets auto-generated; per-record provided-key upserts. The whole batch is refused up front if any provided key is malformed. Generated keys for the batch are allocated in one shot (single `/dev/urandom` read for UUID; single seq flock for seq) so per-record overhead stays low.
+**bulk-insert** — per-record omit-key gets auto-generated; per-record provided-key upserts. The whole batch is refused up front if any provided key is malformed. Generated keys for the batch are allocated in one shot (single `/dev/urandom` read for UUID; single seq flock for seq) so per-record overhead stays low. **Per-record CAS** is enforced: omit-key records take the strict-insert path (collision → that single record is `condition_not_met` and counted in `skipped`, the other records still write) while provided-key records remain upsert. The check piggybacks on the existing kf-lookup pass — zero extra lookups, zero added latency for non-auto-key bulk-insert.
 
 ```json
 // request
@@ -109,7 +109,7 @@ The dict form (`{"k1":{...},"k2":{...}}`) has keys baked into the wire shape —
 - The sequence name must be valid (`valid_field_name()` rules — no `:`, `+`, `/`, spaces, parens). The sequence file lives at `<obj>/metadata/sequences/<name>` and is shared with any field that also uses `:default=seq(<name>)`.
 - **v2 only** in practice — `auto_key` is allowed at create-object on any storage version, but the persistence shape only writes the trailing token on v2 lines (`dir:object:splits:max_key:storage_version:streams:auto_key=...`). 2026.06 drops v1 entirely.
 - **No retroactive enable** — auto_key can only be set at create-object. There is no schema mutation to add or change auto_key later. A v1-of-feature limitation; revisit only if customers need it.
-- **Seq collisions** — for `seq` mode, if you manually insert records with numeric keys at or above the current sequence value, the next auto-generated insert can collide. The server emits `{"error":"condition_not_met"}` for the colliding generation and you must `reset` the sequence (or stop mixing manual + auto keys). UUID collisions are effectively impossible at any realistic scale.
+- **Seq collisions** — for `seq` mode, if you manually insert records with numeric keys at or above the current sequence value, the next auto-generated insert can collide. Single insert returns `{"error":"condition_not_met"}` for that record; bulk-insert (JSON + delimited) skips just the colliding record (`skipped:N` in the response) and inserts every other auto-gen normally — the manual record's data is never silently overwritten. UUID collisions are effectively impossible at any realistic scale.
 
 ## add-field
 

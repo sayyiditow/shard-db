@@ -445,6 +445,52 @@ static int test_auto_key_run(void) {
                 "delim auto-uuid: v4 marker present");
     free(resp); resp = NULL;
 
+    /* === 15. bulk-insert seq collision → strict insert errors ============= */
+
+    /* Fresh object — the earlier `orders` tests are polluted with records
+       and a churned-up sequence counter; we need known starting state. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"collide\","
+        "\"splits\":8,\"max_key\":8,"
+        "\"fields\":[\"amount:int\"],\"auto_key\":\"seq(collide_seq)\"}", &resp);
+    free(resp); resp = NULL;
+
+    /* Manually insert at "3" — the seq is at 0, so the next auto-gen of
+       5 records will hit 1, 2, 3, 4, 5 and collide at 3. */
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"collide\","
+        "\"key\":\"3\",\"value\":{\"amount\":42}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "manual seq key 3 inserted");
+    free(resp); resp = NULL;
+
+    /* Bulk-insert 5 omit-key records. "3" collides with the manual
+       record; with per-record CAS, that one slot is condition_not_met
+       and the other 4 insert. */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"collide\","
+        "\"records\":[{\"value\":{\"amount\":100}},"
+                     "{\"value\":{\"amount\":200}},"
+                     "{\"value\":{\"amount\":300}},"
+                     "{\"value\":{\"amount\":400}},"
+                     "{\"value\":{\"amount\":500}}]}", &resp);
+    ASSERT_CONTAINS(resp, "\"skipped\":1", "bulk seq collision: 1 skipped");
+    ASSERT_CONTAINS(resp, "\"count\":4", "bulk seq collision: 4 inserted");
+    free(resp); resp = NULL;
+
+    /* The manually-inserted record at "3" must still have amount=42, not 300. */
+    tc_request(tc,
+        "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"collide\",\"key\":\"3\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"amount\":42", "manual record at 3 NOT overwritten");
+    free(resp); resp = NULL;
+
+    /* Records at 1, 2, 4, 5 should exist (the non-colliding auto-gens). */
+    tc_request(tc,
+        "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"collide\",\"key\":\"4\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"amount\":400", "non-colliding auto-gen record present");
+    free(resp); resp = NULL;
+
     free(uuid_alice); free(uuid_bob);
     tc_close(tc);
     test_env_stop(&env);
