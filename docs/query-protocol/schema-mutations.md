@@ -64,6 +64,68 @@ Append new fields to an existing object.
 - Existing record count and hash routing are preserved.
 - Full object rebuild — scales with object size. Not instantaneous on millions of records.
 
+## edit-field
+
+Edit one or more existing fields in place — same-type only. Used to grow/shrink a `varchar`, widen/narrow an integer family field, change a `numeric`'s scale, or widen `float → double`.
+
+```json
+{
+  "mode": "edit-field",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "fields": [
+    "name:varchar:200",
+    "age:long",
+    "balance:numeric:18,4"
+  ]
+}
+```
+
+CLI shortcut (single-field — JSON form covers batch):
+
+```bash
+./shard-db edit-field <dir> <obj> 'name:varchar:200'
+```
+
+### What changes are allowed
+
+| Edit | Rule |
+|---|---|
+| `varchar:N → varchar:M` | Grow always allowed. Shrink refused **pre-flight** if any live record's content length exceeds `M`. |
+| Integer family (`short ↔ int ↔ long`) | Widen always allowed (sign-extension preserves negatives). Narrow refused **pre-flight** if any live record's value falls outside the new type's `[-2^(N×8-1), 2^(N×8-1) − 1]` range. |
+| `numeric:P,S1 → numeric:P,S2` | Scale-up multiplies the stored `int64` by `10^(S2−S1)`; refused pre-flight if any value would overflow `int64`. Scale-down divides and **truncates toward zero** (matches Postgres). |
+| `float → double` | Always allowed; IEEE 754 widen, no validation needed. |
+
+**Cross-type edits are hard-refused** with the hint: use `add-field <new> + remove-field <old> + bulk-update` and migrate the data explicitly.
+
+### What happens
+
+1. Takes the object's **write lock** (`objlock_wrlock`).
+2. Refuses immediately if `storage_version != 2` (point to `./migrate`).
+3. Parses every edit spec; refuses on unknown field name, tombstoned field, duplicate edit in the same request, invalid type, or cross-type change.
+4. Builds a new `TypedSchema` by overlaying each edited field onto a clone of the old schema (positions unchanged, only `size` / `offset` / `numeric_scale` move).
+5. **No-op fast path** — if no field's encoding actually changed (a varchar staying the same size with only `:default=...` modifier shift, say), skip the data rebuild and rewrite `fields.conf` only.
+6. Otherwise **pre-flight scan**: walks every live record across all keyfile shards and verifies each edited field's value fits the new shape. First violation aborts with `{"error":"Pre-flight failed on field [<name>]: <reason>"}` — no data or schema change.
+7. **Rebuild**: runs the same v2 rebuild path used by `add-field` / `vacuum --compact`, but with `transform_field_value()` re-encoding the edited fields per record. Atomic — the legacy data tree is preserved until the rebuild succeeds.
+8. Rewrites `fields.conf` to lock in the new spec.
+9. Wipes and rebuilds every index in `index.conf` — affected indexes have stale leaf bytes, and v1 of the feature rebuilds all of them for simplicity (acceptable: optimise to "only affected" later if it becomes a hot path).
+10. Releases the write lock.
+
+### Response
+
+```json
+{"status":"edited","fields":N,"rebuilt":true,"slot_size":N,"indexes_rebuilt":N}
+```
+
+No-op fast path returns `{"status":"edited","fields":N,"rebuilt":false}` — fields.conf updated but no data rebuild ran.
+
+### Notes
+
+- **v2 only**. v1 (legacy zone-A/B) is hard-refused with a pointer to `./migrate`. 2026.06 drops v1 entirely.
+- **Default modifiers**: if the new spec includes a different `:default=...` / `:auto_create` / `:auto_update`, that affects future inserts only — existing records keep their stored values.
+- **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field still rebuilds the index (the on-disk leaf bytes change). Queries on the indexed field continue to resolve to the same records post-edit.
+- Full object rebuild — scales with object size, not slot count. Not instantaneous on millions of records. Holds the wrlock for the duration.
+
 ## rename-field
 
 Metadata-only; no data rewrite.

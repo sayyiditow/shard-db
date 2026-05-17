@@ -63,6 +63,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  query '{\"mode\":\"rename-field\",\"dir\":\"...\",\"object\":\"...\",\"old\":\"...\",\"new\":\"...\"}'\n");
         fprintf(stderr, "  query '{\"mode\":\"remove-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"f1\",\"f2\"]}'\n");
         fprintf(stderr, "  query '{\"mode\":\"add-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"name:type[:param]\"]}'\n");
+        fprintf(stderr, "  query '{\"mode\":\"edit-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"name:type[:param]\"]}'\n");
+        fprintf(stderr, "  edit-field <dir> <object> <name:type[:param]>   (single-field shortcut)\n");
         fprintf(stderr, "  query '{\"mode\":\"vacuum\",\"dir\":\"...\",\"object\":\"...\",\"compact\":true,\"splits\":128}'\n");
         fprintf(stderr, "\nObject management (via JSON query):\n");
         fprintf(stderr, "  query '{\"mode\":\"create-object\",\"dir\":\"...\",\"object\":\"...\",\n");
@@ -305,6 +307,26 @@ int main(int argc, char *argv[]) {
         for (int i = 3; i < argc; i++)
             if (strcmp(argv[i], "--if-not-exists") == 0) ine = 1;
         return cmd_import_schema(port, argv[2], ine);
+    }
+    /* Schema mutation shortcut: single-field edit-field. JSON form
+       covers batch edits. */
+    if (strcmp(cmd, "edit-field") == 0) {
+        if (argc < 5) {
+            fprintf(stderr,
+                "Usage: shard-db edit-field <dir> <object> <field-spec>\n"
+                "       (spec uses the same form as add-field, e.g. 'name:varchar:200')\n"
+                "       Batch edits: use 'shard-db query' with mode=edit-field + fields:[...].\n");
+            return 1;
+        }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(argv[4]) + 128;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"edit-field\",\"dir\":\"%s\",\"object\":\"%s\",\"fields\":[\"%s\"]}",
+            argv[2], argv[3], argv[4]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
     }
     if (strcmp(cmd, "delete-file") == 0) {
         if (argc < 5) {

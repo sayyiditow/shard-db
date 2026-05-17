@@ -23,7 +23,8 @@ static int mode_is_write(const char *m) {
 static int mode_is_schema(const char *m) {
     if (!m) return 0;
     return strcasecmp(m, "rename-field") == 0 || strcasecmp(m, "remove-field") == 0 ||
-           strcasecmp(m, "add-field") == 0 || strcasecmp(m, "vacuum") == 0 ||
+           strcasecmp(m, "add-field") == 0 || strcasecmp(m, "edit-field") == 0 ||
+           strcasecmp(m, "vacuum") == 0 ||
            strcasecmp(m, "truncate") == 0 ||
            strcasecmp(m, "migrate-storage-version") == 0;
 }
@@ -280,7 +281,7 @@ static AdminLevel mode_admin_level(const char *mode) {
     if (strcmp(mode, "create-object") == 0) return ADMIN_TENANT;
     static const char *obj[] = {
         "truncate", "vacuum", "backup", "recount",
-        "add-field", "remove-field", "rename-field",
+        "add-field", "edit-field", "remove-field", "rename-field",
         "add-index", "remove-index",
         "drop-object",
         NULL
@@ -1453,6 +1454,34 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
             else cmd_add_fields(db_root, object, lines, nlines);
+            free(fields_arr);
+        }
+    } else if (strcmp(mode, "edit-field") == 0) {
+        /* fields is a JSON array of spec lines, e.g. ["name:varchar:200","age:long"] */
+        char *fields_arr = json_obj_strdup_raw(&req, "fields");
+        if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
+        else {
+            char lines[MAX_FIELDS][256];
+            int nlines = 0;
+            const char *p = fields_arr;
+            while (*p && nlines < MAX_FIELDS) {
+                while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
+                if (*p == ']' || *p == '\0') break;
+                if (*p == '"') {
+                    p++;
+                    const char *start = p;
+                    while (*p && *p != '"') p++;
+                    size_t l = p - start;
+                    if (l > 0 && l < 256) {
+                        memcpy(lines[nlines], start, l);
+                        lines[nlines][l] = '\0';
+                        nlines++;
+                    }
+                    if (*p == '"') p++;
+                } else p++;
+            }
+            if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
+            else cmd_edit_fields(db_root, object, lines, nlines);
             free(fields_arr);
         }
     } else if (strcmp(mode, "remove-field") == 0) {
