@@ -5,8 +5,8 @@
 
 /* ========== Hashing ==========
  * Single source of truth for the engine's primary-key hash. Used by:
- *   - storage.c (cmd_insert/get/delete probe-into-slot addressing)
- *   - query.c (compute_addr, btree index entries, RecordRef hash lookups)
+ *   - storage.c (cmd_insert/get/delete shard routing via compute_record_shard)
+ *   - query.c (btree index entries, RecordRef hash lookups)
  *   - slotcask.c (keyfile entry hash, slotcask_lookup_by_hash)
  * The canonical (big-endian) form makes the hash byte layout host-endian-
  * independent, so identical bytes appear in btree index entries and

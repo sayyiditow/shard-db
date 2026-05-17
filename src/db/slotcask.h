@@ -327,12 +327,12 @@ typedef struct {
 /* ============================================================ Bulk upsert
  *
  * Per-record kfcache_acquire/release pairs were the dominant cost in
- * bulk-insert-via-slotcask_upsert_with_hooks (4× single-conn regression
- * vs v1's mmap-batch path). The bulk primitive amortises that lock by
+ * bulk-insert-via-slotcask_upsert_with_hooks (the per-record kf-wrlock
+ * acquisitions add up). The bulk primitive amortises that lock by
  * accepting a batch where every record hashes to the SAME kf-shard,
  * acquiring the wrlock once for the whole batch. Caller pre-buckets
  * records by kf_shard_id (the engine's bulk_insert_shard_worker_v2
- * already does so via compute_addr).
+ * already does so via compute_record_shard).
  */
 typedef struct {
     /* input: caller fills */

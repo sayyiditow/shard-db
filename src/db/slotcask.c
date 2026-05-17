@@ -100,9 +100,7 @@ static int mkdirp_local(const char *path) {
      <data_dir>/data/streams/NNN/NNNNNN.dat rotating segment files per stream
    The `data/` umbrella keeps engine internals out of the obj root, so
    fields.conf, indexes/, files/, etc. aren't visually mixed with kf/seg
-   files. `data/` here mirrors the v1 path of the same name; the migrate
-   runner moves v1's data/ to data.legacy/ so the new structure can be
-   created cleanly. */
+   files. */
 static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
     snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }

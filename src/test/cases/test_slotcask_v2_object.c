@@ -1,15 +1,11 @@
-/* test_slotcask_v2_object.c — E2E test for v2 (slotcask) object create.
+/* test_slotcask_v2_object.c — E2E test for slotcask object create.
  *
- * Phase 2A wires create-object's `storage_version=2` arg through the daemon
- * to schema.conf + on-disk slotcask layout. cmd_get / cmd_insert / cmd_delete
- * still take the legacy probe-into-slot path; that's Phase 2C. So this test
- * verifies the create-time wiring only:
+ * Verifies the create-object wiring through to schema.conf and on-disk
+ * slotcask layout:
  *   - response JSON carries storage_version + streams
  *   - schema.conf line has the 6-field form `dir:object:splits:max_key:2:N`
- *   - on-disk shape: keyfile_NNN.kf + stream_NNN/data_000000.dat + .dirty
- *   - default-version (no arg) still produces a v1 layout (data/ exists, no
- *     keyfile/stream files)
- *   - storage_version=99 is rejected
+ *   - on-disk shape: data/kf/NNN.kf + data/streams/NNN/NNNNNN.dat
+ *   - any client-supplied `storage_version` is rejected (field removed from API)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE

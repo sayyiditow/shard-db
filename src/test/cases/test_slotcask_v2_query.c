@@ -1,14 +1,8 @@
-/* test_slotcask_v2_query.c — Phase-3 E2E for the query layer over v2 objects.
+/* test_slotcask_v2_query.c — E2E for the query layer over slotcask objects.
  *
- * Exercises find / count / keys / aggregate / find-with-cursor on a
- * storage_version=2 object via the JSON wire protocol. Confirms scan_dispatch
- * (Phase 3B+3C) and the indexed-fetch helper (Phase 3D) are wired
- * end-to-end.
- *
- * Not exercised here (deferred to Phase 3D-followup):
- *   - indexed find without order_by → routes through idx_find_parallel /
- *     process_batch which is still v1-only. Returns no rows on v2.
- *   - joins where the remote object is v2 → lookup_remote still v1-only.
+ * Exercises find / count / keys / aggregate / find-with-cursor via the
+ * JSON wire protocol. Confirms scan_dispatch and the indexed-fetch
+ * helper are wired end-to-end.
  *
  * Criteria wire format (per docs/query-protocol/find.md):
  *     "criteria": [{"field":"x","op":"eq","value":"y"}, ...]

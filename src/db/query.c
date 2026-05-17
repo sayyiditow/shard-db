@@ -10904,10 +10904,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
         if (query_deadline_tick(dl, &dl_counter)) break;
         if (ks->state[b] != 2) continue;
 
-        /* Storage-version-agnostic fetch: v1 returns a live mmap pointer
-           held by an FcacheRead handle; v2 returns a malloc'd copy. Caller
-           releases via release_record_ref. The previous v1-only path did
-           a redundant lookup-then-walk to recover the key pointer; the
+        /* slotcask fetch returns a malloc'd copy of key+value owned by
+           the RecordRef; caller releases via release_record_ref. The
            dispatch helper returns key+val together in one shot. */
         RecordRef rr;
         if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
