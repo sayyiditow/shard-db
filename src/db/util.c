@@ -344,6 +344,84 @@ int json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size_
     return 1;
 }
 
+static int hex_nibble_u8(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+int json_unescape_string(const char *in, size_t in_len,
+                         char **out_buf, size_t *out_len) {
+    if (!out_buf || !out_len) return -1;
+    /* Worst case: every escape decodes to fewer bytes than its source,
+       so in_len + 1 is a safe upper bound for the output buffer. */
+    char *out = malloc(in_len + 1);
+    if (!out) return -1;
+    size_t op = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c != '\\') {
+            out[op++] = c;
+            continue;
+        }
+        if (i + 1 >= in_len) { free(out); return -1; }
+        char e = in[++i];
+        switch (e) {
+            case '"':  out[op++] = '"';  break;
+            case '\\': out[op++] = '\\'; break;
+            case '/':  out[op++] = '/';  break;
+            case 'b':  out[op++] = '\b'; break;
+            case 'f':  out[op++] = '\f'; break;
+            case 'n':  out[op++] = '\n'; break;
+            case 'r':  out[op++] = '\r'; break;
+            case 't':  out[op++] = '\t'; break;
+            case 'u': {
+                if (i + 4 >= in_len) { free(out); return -1; }
+                int h1 = hex_nibble_u8(in[i + 1]);
+                int h2 = hex_nibble_u8(in[i + 2]);
+                int h3 = hex_nibble_u8(in[i + 3]);
+                int h4 = hex_nibble_u8(in[i + 4]);
+                if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) { free(out); return -1; }
+                unsigned cp = (h1 << 12) | (h2 << 8) | (h3 << 4) | h4;
+                i += 4;
+                /* UTF-8 encode the codepoint. Surrogate pairs intentionally
+                   pass through as separate 3-byte sequences — JSON callers
+                   that need full astral plane support should already be
+                   sending UTF-8 directly. */
+                if (cp < 0x80) {
+                    out[op++] = (char)cp;
+                } else if (cp < 0x800) {
+                    out[op++] = (char)(0xC0 | (cp >> 6));
+                    out[op++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    out[op++] = (char)(0xE0 | (cp >> 12));
+                    out[op++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    out[op++] = (char)(0x80 | (cp & 0x3F));
+                }
+                break;
+            }
+            default:
+                /* Unknown escape — refuse rather than silently pass through. */
+                free(out);
+                return -1;
+        }
+    }
+    out[op] = '\0';
+    *out_buf = out;
+    *out_len = op;
+    return 0;
+}
+
+char *json_obj_strdup_unescaped(const JsonObj *o, const char *key, size_t *out_len) {
+    const char *v; size_t vl;
+    if (!json_obj_unquoted(o, key, &v, &vl)) return NULL;
+    char *buf = NULL; size_t bl = 0;
+    if (json_unescape_string(v, vl, &buf, &bl) != 0) return NULL;
+    if (out_len) *out_len = bl;
+    return buf;
+}
+
 int json_obj_int(const JsonObj *o, const char *key, int fallback) {
     const char *v; size_t vl;
     if (!json_obj_unquoted(o, key, &v, &vl) || vl == 0) return fallback;

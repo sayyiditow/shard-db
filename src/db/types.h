@@ -214,6 +214,17 @@ typedef struct {
        and persisted in schema.conf so subsequent opens use the same count —
        stream_id is on-disk in keyfile entries, so changing it would orphan data. */
     int streams;
+    /* Auto-key mode — server generates the key on insert when the client
+       omits it. AK_NONE (default) → today's behaviour (caller must supply
+       every key). AK_UUID → 16-byte UUIDv4 binary, rendered as 36-char
+       dashed string on read. AK_SEQ → 8-byte int64 BE from a named
+       sequence (`auto_key_seq_name`), rendered as decimal string on
+       read. Set at create-object and never mutates afterward (no
+       retroactive enable; no schema mutation for it). Persisted in
+       schema.conf as a trailing `auto_key=uuid` or
+       `auto_key=seq(<name>)` token. */
+    enum AutoKeyKind { AK_NONE = 0, AK_UUID, AK_SEQ } auto_key;
+    char auto_key_seq_name[128];   /* meaningful only when auto_key == AK_SEQ */
 } Schema;
 
 /* Shard file layout:
@@ -565,6 +576,25 @@ int  json_obj_get(const JsonObj *o, const char *key, const char **val, size_t *v
    string / numeric / bool fields. For nested objects/arrays use json_obj_get
    which returns the span with brackets intact for recursive parsing. */
 int  json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size_t *vlen);
+/* Decode JSON string escapes (\n, \r, \t, \\, \", \/, \b, \f, \uXXXX)
+   in `in` (length `in_len`, NOT NUL-terminated required) and write the
+   decoded bytes to a freshly malloc'd buffer returned via *out_buf;
+   length goes to *out_len. The output is NUL-terminated as a courtesy.
+   Returns 0 on success, -1 on malformed escape or OOM. Caller frees
+   *out_buf. */
+int  json_unescape_string(const char *in, size_t in_len,
+                          char **out_buf, size_t *out_len);
+/* Convenience wrapper for the common dispatcher pattern:
+   - looks up `key` on the JsonObj
+   - strips surrounding quotes (json_obj_unquoted)
+   - JSON-unescapes the inner content
+   - returns a malloc'd NUL-terminated string (caller frees) or NULL.
+   The returned length excludes the trailing NUL; use the optional
+   *out_len pointer if you need the byte length for the binary content
+   (escapes may decode to bytes including embedded NULs is not
+   supported — we treat   as malformed for storage safety). */
+char *json_obj_strdup_unescaped(const JsonObj *o, const char *key,
+                                size_t *out_len);
 
 /* Convenience: parse an integer field. Returns `fallback` on miss. */
 int  json_obj_int(const JsonObj *o, const char *key, int fallback);
@@ -661,6 +691,44 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
                               uint8_t **out_val, size_t *out_len);
 int typed_field_index(const TypedSchema *ts, const char *name);
 void parse_field_type(const char *spec, TypedField *f);
+
+/* === Auto-key helpers (config.c) ===
+ *
+ * UUID + sequence generators that back the per-object auto_key feature
+ * (Schema.auto_key). Single-record helpers are fine for cmd_insert;
+ * the _batch variants amortise /dev/urandom open or seq flock cost for
+ * cmd_bulk_insert.
+ *
+ * `raw` / `string` distinction: raw = the 16-byte on-disk form,
+ * string = the 36-char canonical dashed render. parse + format pair
+ * convert between them; parse is strict (returns -1 on malformed).
+ *
+ * For seq: the existing `seq_next_val` was static in config.c; promoted
+ * to public so storage.c can call it from the insert path. The batch
+ * variant fetches N values under a single flock and returns the
+ * starting value (range is [start, start+n-1]).
+ *
+ * parse_seq_key / format_seq_key: strict int64 decimal parser + writer
+ * for the rendered seq-key wire form. Rejects leading zeros (except
+ * literal "0"), scientific notation, hex prefixes, whitespace. */
+void gen_uuid4_raw(uint8_t out[16]);
+int  gen_uuid4_batch(uint8_t *out, size_t n);
+int  parse_uuid_string(const char *in, uint8_t out[16]);
+void format_uuid_string(const uint8_t in[16], char out[37]);
+int  parse_seq_key(const char *in, int64_t *out);
+void format_seq_key(int64_t v, char out[24]);
+/* Render a stored key as its wire-form string per the object's auto_key
+   mode. AK_NONE → verbatim copy (caller's responsibility that buffer is
+   sized to klen+1). AK_UUID → 36-char dashed string (key must be exactly
+   16 bytes; outcap >= 37). AK_SEQ → decimal string from int64 BE (key
+   must be exactly 8 bytes; outcap >= 24). Returns bytes written
+   (excluding NUL) or -1 on bad input / buffer too small. */
+int format_wire_key(const Schema *sc, const char *key, size_t klen,
+                    char *out, size_t outcap);
+long long seq_next_val(const char *db_root, const char *object,
+                       const char *seq_name);
+long long seq_next_val_batch(const char *db_root, const char *object,
+                             const char *seq_name, int n);
 
 /* storage.c */
 void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]);
@@ -782,13 +850,22 @@ void counts_flush_all(void);
    create-object / truncate so a fresh object reads its starting count
    from disk (typically 0) instead of the stale cache. */
 void counts_invalidate(const char *db_root, const char *object);
-int cmd_get(const char *db_root, const char *object, const char *key);
-int cmd_insert(const char *db_root, const char *object, const char *key, const char *value,
+/* Single-key CRUD takes the key as raw bytes + length so binary keys
+   with embedded NULs (auto_key=uuid 16-byte or auto_key=seq 8-byte int64
+   BE) work end-to-end. String-key callers pass strlen(key) for klen. */
+int cmd_get(const char *db_root, const char *object,
+            const char *key, size_t klen);
+int cmd_insert(const char *db_root, const char *object,
+               const char *key, size_t klen,
+               const char *value,
                const char *if_json, int if_not_exists);
-int cmd_update(const char *db_root, const char *object, const char *key, const char *partial_json,
+int cmd_update(const char *db_root, const char *object,
+               const char *key, size_t klen,
+               const char *partial_json,
                const char *if_json, int dry_run);
-int cmd_delete(const char *db_root, const char *object, const char *key, const char *if_json,
-               int dry_run);
+int cmd_delete(const char *db_root, const char *object,
+               const char *key, size_t klen,
+               const char *if_json, int dry_run);
 int cmd_get_multi(const char *db_root, const char *object, const char *keys_json,
                   const char *format, const char *delimiter);
 int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json,
@@ -902,6 +979,11 @@ typedef struct {
     char fields[MAX_FIELDS][256];
     int nfields;
     TypedSchema *ts;  /* non-NULL = typed binary mode */
+    /* Auto-key rendering info — captured once at init_field_schema so
+       every per-record print site can format the wire-form key without
+       reloading the object schema. AK_NONE → keys emitted verbatim. */
+    enum AutoKeyKind auto_key;
+    Schema auto_key_schema_snapshot;  /* full Schema snapshot for format_wire_key */
 } FieldSchema;
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object);
 char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs);
@@ -952,7 +1034,8 @@ int fetch_record_by_hash(const char *db_root, const char *object, const Schema *
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);
 int cmd_count(const char *db_root, const char *object, const char *criteria_json);
-int cmd_exists(const char *db_root, const char *object, const char *key);
+int cmd_exists(const char *db_root, const char *object,
+               const char *key, size_t klen);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);
 int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format, const char *delimiter);
 int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *delimiter, const char *join_json, const char *order_by, const char *order_dir, const char *cursor_json);
@@ -1041,10 +1124,15 @@ int cmd_delete_file(const char *db_root, const char *object, const char *filenam
 int cmd_list_files(const char *db_root, const char *object,
                    const char *pattern, const char *match,
                    int offset, int limit);
+/* `auto_key_spec`: NULL/"" → no auto-key (today's behaviour); "uuid" →
+   server-generated 16-byte UUIDv4 keys; "seq(<name>)" → 8-byte int64 BE
+   from the named sequence (pre-initialised here if absent).
+   Validated + persisted in schema.conf when set. */
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      int storage_version);
+                      int storage_version,
+                      const char *auto_key_spec);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */

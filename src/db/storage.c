@@ -1108,9 +1108,9 @@ int is_number(const char *s);
 
 /* ========== GET ========== */
 
-int cmd_get(const char *db_root, const char *object, const char *key) {
+int cmd_get(const char *db_root, const char *object,
+            const char *key, size_t klen) {
     Schema sc = load_schema(db_root, object);
-    size_t klen = strlen(key);
 
     /* v2 dispatch: route through slotcask. The wire response shape (bare
        value dict for single-key get, per 2026.05.1) stays the same. */
@@ -1126,7 +1126,7 @@ int cmd_get(const char *db_root, const char *object, const char *key) {
             OUT("{\"error\":\"Not found\"}\n");
             return 1;
         }
-        log_msg(4, "GET %s.%s (%zu bytes)", object, key, vlen);
+        log_msg(4, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
         TypedSchema *ts = load_typed_schema(db_root, object);
         typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
                              g_out ? g_out : stdout);
@@ -1163,7 +1163,7 @@ int cmd_get(const char *db_root, const char *object, const char *key) {
     if (slot < 0) { fcache_release(fc); OUT("{\"error\":\"Not found\"}\n"); return 1; }
 
     SlotHeader *hdr = (SlotHeader *)(fc.map + zoneA_off(slot));
-    log_msg(4, "GET %s.%s (%u bytes)", object, key, hdr->value_len);
+    log_msg(4, "GET %s (klen=%zu, %u bytes)", object, klen, hdr->value_len);
 
     const char *raw = (const char *)(fc.map + zoneB_off(slot, slots, sc.slot_size) + hdr->key_len);
 
@@ -1344,7 +1344,7 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
 }
 
 static int cmd_insert_v2(const char *db_root, const char *object,
-                         const char *key, const char *value,
+                         const char *key, size_t klen, const char *value,
                          const char *if_json, int if_not_exists,
                          const Schema *sc) {
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -1353,7 +1353,6 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    size_t klen = strlen(key);
     if ((int)klen > sc->max_key) {
         fprintf(stderr, "Error: Key too large (%zu > %d)\n", klen, sc->max_key);
         return 1;
@@ -1448,31 +1447,32 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     }
 
     if (!result.was_update) update_count(db_root, object, 1);
+    char wire_key[1100];
+    format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
     log_msg(3, "%s %s.%s (slotcask)",
-            result.was_update ? "UPDATE" : "INSERT", object, key);
+            result.was_update ? "UPDATE" : "INSERT", object, wire_key);
 
     free(result.current_value);
     free_criteria(crit, ncrit);
     free(typed_buf);
     OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
-        result.was_update ? "updated" : "inserted", key);
+        result.was_update ? "updated" : "inserted", wire_key);
     return 0;
 }
 
 /* ========== INSERT (mmap + atomic flag flip) ========== */
 
 int cmd_insert(const char *db_root, const char *object,
-               const char *key, const char *value,
+               const char *key, size_t klen, const char *value,
                const char *if_json, int if_not_exists) {
     Schema sc = load_schema(db_root, object);
 
     if (sc.storage_version == 2) {
-        return cmd_insert_v2(db_root, object, key, value, if_json,
+        return cmd_insert_v2(db_root, object, key, klen, value, if_json,
                              if_not_exists, &sc);
     }
 
     uint8_t hash[16]; int shard_id, start_slot;
-    size_t klen = strlen(key);
 
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
@@ -1527,7 +1527,7 @@ int cmd_insert(const char *db_root, const char *object,
             memcmp(map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) { slot = (int)s; break; }
     }
     if (slot < 0 && first_tomb >= 0) slot = first_tomb;
-    if (slot < 0) { ucache_write_release(wh); log_msg(1, "HASH TABLE FULL %s.%s shard=%d", object, key, shard_id); OUT("{\"error\":\"Hash table full\"}\n"); free(typed_buf); return 1; }
+    if (slot < 0) { ucache_write_release(wh); log_msg(1, "HASH TABLE FULL %s (klen=%zu) shard=%d", object, klen, shard_id); OUT("{\"error\":\"Hash table full\"}\n"); free(typed_buf); return 1; }
 
     SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
     int is_update = (existing->flag == 1 && memcmp(existing->hash, hash, 16) == 0);
@@ -1623,14 +1623,16 @@ int cmd_insert(const char *db_root, const char *object,
     free(old_value);
 
     if (!is_update) update_count(db_root, object, 1);
+    char wire_key[1100];
+    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
     log_msg(3, "%s %s.%s (shard=%d slot=%d)", is_update ? "UPDATE" : "INSERT",
-            object, key, shard_id, slot);
+            object, wire_key, shard_id, slot);
 
     /* Post-insert: check if this shard should grow (50% load factor). */
     if (!is_update) ucache_maybe_grow(u_slot, sc.slot_size);
 
     free(typed_buf);
-    OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n", is_update ? "updated" : "inserted", key);
+    OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n", is_update ? "updated" : "inserted", wire_key);
     return 0;
 }
 
@@ -1702,7 +1704,8 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
 }
 
 static int cmd_update_v2(const char *db_root, const char *object,
-                         const char *key, const char *partial_json,
+                         const char *key, size_t klen,
+                         const char *partial_json,
                          const char *if_json, int dry_run, const Schema *sc) {
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
@@ -1711,7 +1714,6 @@ static int cmd_update_v2(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
 
-    size_t klen = strlen(key);
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
 
@@ -1737,7 +1739,9 @@ static int cmd_update_v2(const char *db_root, const char *object,
             }
         }
         free(old_val);
-        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", key);
+        char wire_key[1100];
+        format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
+        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", wire_key);
         return 0;
     }
 
@@ -1839,26 +1843,28 @@ static int cmd_update_v2(const char *db_root, const char *object,
     }
     free_criteria(crit, ncrit);
 
-    log_msg(3, "UPDATE %s.%s (slotcask)", object, key);
+    char wire_key[1100];
+    format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
+    log_msg(3, "UPDATE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
-    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", key);
+    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
 
 /* ========== PARTIAL UPDATE ========== */
 
 int cmd_update(const char *db_root, const char *object,
-               const char *key, const char *partial_json,
+               const char *key, size_t klen,
+               const char *partial_json,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
 
     if (sc.storage_version == 2) {
-        return cmd_update_v2(db_root, object, key, partial_json,
+        return cmd_update_v2(db_root, object, key, klen, partial_json,
                              if_json, dry_run, &sc);
     }
 
     uint8_t hash[16]; int shard_id, start_slot;
-    size_t klen = strlen(key);
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
 
     char shard[PATH_MAX];
@@ -1912,7 +1918,9 @@ int cmd_update(const char *db_root, const char *object,
 
     if (dry_run) {
         ucache_write_release(wh);
-        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", key);
+        char wire_key[1100];
+        format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
+        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", wire_key);
         return 0;
     }
 
@@ -2001,8 +2009,10 @@ int cmd_update(const char *db_root, const char *object,
 
         ucache_write_release(wh);
     }
-    log_msg(3, "UPDATE %s.%s (shard=%d slot=%d)", object, key, shard_id, slot);
-    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", key);
+    char wire_key[1100];
+    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
+    log_msg(3, "UPDATE %s.%s (shard=%d slot=%d)", object, wire_key, shard_id, slot);
+    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
 
@@ -2063,26 +2073,29 @@ static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
 }
 
 static int cmd_delete_v2(const char *db_root, const char *object,
-                         const char *key, const char *if_json, int dry_run,
+                         const char *key, size_t klen,
+                         const char *if_json, int dry_run,
                          const Schema *sc) {
+    char wire_key[1100];
+    format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
+
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams, .storage_version = 2,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
-        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
         return 0;
     }
 
-    size_t klen = strlen(key);
     TypedSchema *ts = load_typed_schema(db_root, object);
 
     /* dry_run: read + validate, never tombstone. */
     if (dry_run) {
         void *val = NULL; size_t vlen = 0;
         if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
-            OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+            OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
             return 0;
         }
         if (if_json) {
@@ -2099,7 +2112,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
             free_criteria(crit, ncrit);
         }
         free(val);
-        OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", key);
+        OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", wire_key);
         return 0;
     }
 
@@ -2140,7 +2153,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);
 
     if (result.not_found) {
-        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
         free(result.current_value);
         free_criteria(crit, ncrit);
         return 0;
@@ -2162,32 +2175,35 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     }
 
     update_counts(db_root, object, -1, 1);
-    log_msg(3, "DELETE %s.%s (slotcask)", object, key);
+    log_msg(3, "DELETE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
     free_criteria(crit, ncrit);
-    OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", key);
+    OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
 
 /* ========== DELETE (with probing) ========== */
 
-int cmd_delete(const char *db_root, const char *object, const char *key,
+int cmd_delete(const char *db_root, const char *object,
+               const char *key, size_t klen,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
 
     if (sc.storage_version == 2) {
-        return cmd_delete_v2(db_root, object, key, if_json, dry_run, &sc);
+        return cmd_delete_v2(db_root, object, key, klen, if_json, dry_run, &sc);
     }
 
+    char wire_key[1100];
+    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
+
     uint8_t hash[16]; int shard_id, start_slot;
-    size_t klen = strlen(key);
     compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
 
     FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key); return 0; }
+    if (!wh.map) { OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key); return 0; }
     uint8_t *map = wh.map;
     uint32_t slots = wh.slots_per_shard;
     uint32_t mask = slots - 1;
@@ -2227,7 +2243,7 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
 
         if (dry_run) {
             ucache_write_release(wh);
-            OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", key);
+            OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", wire_key);
             return 0;
         }
 
@@ -2272,11 +2288,11 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
         for (int i = 0; i < nidx; i++) free(idx_bufs[i]);
 
         update_counts(db_root, object, -1, 1);
-        log_msg(3, "DELETE %s.%s", object, key);
-        OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", key);
+        log_msg(3, "DELETE %s.%s", object, wire_key);
+        OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     } else {
         ucache_write_release(wh);
-        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", key);
+        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
     }
     return 0;
 }
@@ -2286,7 +2302,9 @@ int cmd_delete(const char *db_root, const char *object, const char *key,
 /* ========== Parallel multi-key EXISTS ========== */
 
 typedef struct {
-    char *key;
+    char *key;          /* storage form: binary for auto_key, string otherwise */
+    size_t klen;        /* binary length (was strlen(key) before auto-key) */
+    char *wire_key;     /* wire-form string for response output */
     uint8_t hash[16];
     int shard_id;
     int start_slot;
@@ -2319,12 +2337,12 @@ static void *multi_exists_shard_worker(void *arg) {
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
         if (!batch) return NULL;
         for (int ei = 0; ei < sw->count; ei++) {
             MultiExistsEntry *e = &sw->entries[ei];
             batch[ei].key       = e->key;
-            batch[ei].klen      = strlen(e->key);
+            batch[ei].klen      = e->klen;
             batch[ei].value     = NULL;
             batch[ei].vlen      = 0;
             batch[ei].user_ctx  = NULL;
@@ -2352,15 +2370,14 @@ static void *multi_exists_shard_worker(void *arg) {
 
     for (int ei = 0; ei < sw->count; ei++) {
         MultiExistsEntry *e = &sw->entries[ei];
-        size_t klen = strlen(e->key);
         for (uint32_t p = 0; p < slots; p++) {
             uint32_t s = ((uint32_t)e->start_slot + p) & mask;
             SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag == 2) continue;
             if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, klen) == 0) {
+                h->key_len == e->klen &&
+                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
                 e->found = 1; break;
             }
         }
@@ -2405,11 +2422,34 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* v2 alignment — see cmd_get_multi for rationale. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else { e->key = NULL; e->klen = 0; }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else { e->key = NULL; e->klen = 0; }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* v2 alignment — see cmd_get_multi for rationale. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->found = 0;
         } else p++;
     }
@@ -2468,7 +2508,8 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
         char *buf = malloc(cap);
         size_t pos = 0;
         if (buf) for (int i = 0; i < key_count; i++) {
-            size_t klen = strlen(entries[i].key);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            size_t klen = strlen(out_key);
             if (pos + klen + 16 > cap) {
                 cap = (pos + klen + 16) * 2;
                 char *t = realloc(buf, cap);
@@ -2486,7 +2527,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                into our buffer via snprintf — replicate the no-quote-needed shape
                here to avoid re-implementing the quote logic. */
             /* CID 1693857/1693869 - bounds checked above, triage */
-            memcpy(buf + pos, entries[i].key, klen); pos += klen;
+            memcpy(buf + pos, out_key, klen); pos += klen;
             /* Use SB_APPEND for bounded write — pre-grow above guarantees
                room, but the macro silences the CodeQL "potentially
                overflowing snprintf" finding by clamping to cap-1. */
@@ -2504,7 +2545,8 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
         if (buf) {
             buf[pos++] = '{';
             for (int i = 0; i < key_count; i++) {
-                size_t klen = strlen(entries[i].key);
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+                size_t klen = strlen(out_key);
                 if (pos + klen + 16 > cap) {
                     cap = (pos + klen + 16) * 2;
                     char *t = realloc(buf, cap);
@@ -2517,7 +2559,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 if (cap < pos || cap - pos < klen + 16) { free(buf); buf = NULL; break; }
                 if (i) buf[pos++] = ',';
                 buf[pos++] = '"';
-                memcpy(buf + pos, entries[i].key, klen); pos += klen;
+                memcpy(buf + pos, out_key, klen); pos += klen;
                 buf[pos++] = '"'; buf[pos++] = ':';
                 if (entries[i].found) {
                     memcpy(buf + pos, "true", 4); pos += 4;
@@ -2537,7 +2579,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }
@@ -2572,11 +2614,34 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* v2 alignment — see cmd_get_multi for rationale. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else { e->key = NULL; e->klen = 0; }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else { e->key = NULL; e->klen = 0; }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* v2 alignment — see cmd_get_multi for rationale. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->found = 0;
         } else p++;
     }
@@ -2629,7 +2694,8 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
         int first = 1;
         for (int i = 0; i < key_count; i++) {
             if (entries[i].found) continue;
-            size_t klen = strlen(entries[i].key);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            size_t klen = strlen(out_key);
             if (pos + klen + 8 > cap) {
                 cap = (pos + klen + 8) * 2;
                 char *t = realloc(buf, cap);
@@ -2641,7 +2707,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
             if (!first) buf[pos++] = ',';
             buf[pos++] = '"';
             /* CID 1693871 - bounds checked above, triage */
-            memcpy(buf + pos, entries[i].key, klen); pos += klen;
+            memcpy(buf + pos, out_key, klen); pos += klen;
             buf[pos++] = '"';
             first = 0;
         }
@@ -2655,7 +2721,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }
@@ -2663,7 +2729,9 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 /* ========== Parallel multi-key GET ========== */
 
 typedef struct {
-    char *key;
+    char *key;          /* storage form: binary for auto_key, string otherwise */
+    size_t klen;        /* binary length (was strlen(key) before auto-key) */
+    char *wire_key;     /* wire-form string for response output (NULL → use key) */
     uint8_t hash[16];
     int shard_id;
     int start_slot;
@@ -2697,7 +2765,7 @@ static void *multi_get_shard_worker(void *arg) {
         SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
         if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
         void **vals = calloc(sw->count, sizeof(void *));
         size_t *vlens = calloc(sw->count, sizeof(size_t));
         if (!batch || !vals || !vlens) {
@@ -2707,7 +2775,7 @@ static void *multi_get_shard_worker(void *arg) {
         for (int ei = 0; ei < sw->count; ei++) {
             MultiGetEntry *e = &sw->entries[ei];
             batch[ei].key       = e->key;
-            batch[ei].klen      = strlen(e->key);
+            batch[ei].klen      = e->klen;
             batch[ei].value     = NULL;
             batch[ei].vlen      = 0;
             batch[ei].user_ctx  = NULL;
@@ -2748,10 +2816,9 @@ static void *multi_get_shard_worker(void *arg) {
             SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
             if (h->flag == 0 && h->key_len == 0) break;
             if (h->flag == 2) continue;
-            size_t klen = strlen(e->key);
             if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, klen) == 0) {
+                h->key_len == e->klen &&
+                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
                 const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
                 char *val = typed_decode(sw->fs->ts, (const uint8_t *)raw, h->value_len);
                 /* Store just the decoded value JSON. */
@@ -2791,13 +2858,48 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 entries = t;
             }
             MultiGetEntry *e = &entries[key_count++];
-            e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-            compute_addr(e->key, klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-            /* For v2, override the bucketing shard with slotcask's kf-shard
-               mapping so each parallel_for worker owns one kf shard and
-               doesn't queue on cross-worker kf-cache contention. */
-            if (sc.storage_version == 2)
-                e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            /* Wire form (always a printable string) — used in response output. */
+            e->wire_key = malloc(klen + 1);
+            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
+
+            /* Storage form — binary for auto_key=uuid/seq, verbatim otherwise.
+               Parse failures for AK_UUID/SEQ are caught here and the entry's
+               result_json is left NULL → renders as `null` in the response,
+               which matches the "missing key" shape clients already handle. */
+            if (sc.auto_key == AK_UUID) {
+                uint8_t bin[16];
+                if (parse_uuid_string(e->wire_key, bin) == 0) {
+                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
+                } else {
+                    e->key = NULL; e->klen = 0;
+                }
+            } else if (sc.auto_key == AK_SEQ) {
+                int64_t v;
+                if (parse_seq_key(e->wire_key, &v) == 0) {
+                    e->key = malloc(8);
+                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
+                    e->klen = 8;
+                } else {
+                    e->key = NULL; e->klen = 0;
+                }
+            } else {
+                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
+                e->klen = klen;
+            }
+            if (e->key) {
+                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
+                /* For v2, override the bucketing shard with slotcask's kf-shard
+                   mapping so each parallel_for worker owns one kf shard and
+                   doesn't queue on cross-worker kf-cache contention. */
+                if (sc.storage_version == 2)
+                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+            } else {
+                /* Malformed auto-key wire form → never matches, but keep the
+                   shard_id deterministic so bucket-sort works. */
+                e->shard_id = 0;
+                e->start_slot = 0;
+                memset(e->hash, 0, 16);
+            }
             e->result_json = NULL;
         } else p++;
     }
@@ -2859,7 +2961,8 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         OUT("\n");
         for (int i = 0; i < key_count; i++) {
             if (!entries[i].result_json) continue;
-            csv_emit_cell(entries[i].key, csv_delim);
+            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+            csv_emit_cell(out_key, csv_delim);
             JsonObj value_obj;
             int have_value = json_parse_object(entries[i].result_json,
                                                strlen(entries[i].result_json),
@@ -2888,7 +2991,8 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             buf[pos++] = '{';
             int first = 1;
             for (int i = 0; i < key_count; i++) {
-                size_t klen = strlen(entries[i].key);
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
+                size_t klen = strlen(out_key);
                 size_t vlen = entries[i].result_json ? strlen(entries[i].result_json) : 4;
                 if (pos + klen + vlen + 16 > cap) {
                     cap = (pos + klen + vlen + 16) * 2;
@@ -2902,7 +3006,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 first = 0;
                 buf[pos++] = '"';
                 /* CID 1693870 - bounds checked above, triage */
-                memcpy(buf + pos, entries[i].key, klen); pos += klen;
+                memcpy(buf + pos, out_key, klen); pos += klen;
                 buf[pos++] = '"'; buf[pos++] = ':';
                 if (entries[i].result_json) {
                     /* CID 1693872 - bounds checked above, triage */
@@ -2925,11 +3029,12 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             for (int i = 0; i < key_count; i++) {
                 if (!first) OUT(",");
                 first = 0;
+                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
                 if (entries[i].result_json) {
-                    OUT("\"%s\":%s", entries[i].key, entries[i].result_json);
+                    OUT("\"%s\":%s", out_key, entries[i].result_json);
                     free(entries[i].result_json);
                 } else {
-                    OUT("\"%s\":null", entries[i].key);
+                    OUT("\"%s\":null", out_key);
                 }
             }
             OUT("}\n");
@@ -2938,7 +3043,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
 
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
-    for (int i = 0; i < key_count; i++) free(entries[i].key);
+    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
 }

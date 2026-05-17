@@ -20,7 +20,7 @@ A high-performance database in C. Single static binary, single process, no exter
 - **Per-request statement timeout** — any query can carry `"timeout_ms":N`; thread-local override of the global `TIMEOUT`.
 - **shard-cli TUI** — separate ncurses client that connects over the same TCP+TLS wire; menus for browse / query / schema / maintenance / auth / live stats. See [CLI reference → shard-cli](cli/shard-cli.md).
 
-**Platform:** Linux x86_64 / ARM64 and macOS Apple Silicon (2026.05.4+). Uses `mmap`, POSIX pthreads, and `poll`/`epoll` depending on platform. License: **MIT**.
+**Platform:** Linux x86_64 / ARM64 and macOS Apple Silicon (2026.05.4+). Uses `mmap`, POSIX pthreads, and `poll(2)` for the accept loop on both platforms (the earlier Linux-only `epoll` path was retired in 2026.05.4 with the macOS port — single listen fd had nothing to gain from `epoll`'s selectivity). License: **MIT**.
 
 ## 60-second tour
 

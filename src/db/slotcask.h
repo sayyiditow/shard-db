@@ -341,6 +341,13 @@ typedef struct {
     const void *value;
     size_t      vlen;
     void       *user_ctx;              /* passed to pre_commit per record */
+    /* Per-record CAS: when set, this record is strict-insert regardless
+       of the per-batch opts.if_not_exists. Used by auto-key bulk-insert
+       to mark omit-key records (generated UUIDv4 / seq.next) as
+       strict-insert while provided-key records in the same batch
+       remain upsert. The primitive OR-combines this with opts->if_not_exists.
+       Zero-init = today's behaviour (per-batch opts only). */
+    int         if_not_exists;
     /* Optional: caller-provided OLD value. If old_value != NULL the bulk
        primitive uses it for pre_commit and skips its own segcache read
        — useful when the caller already has OLD in hand (bulk-update

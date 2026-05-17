@@ -361,6 +361,9 @@ int cmd_orphaned(const char *db_root, const char *object) {
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object) {
     fs->ts = load_typed_schema(db_root, object);
     fs->nfields = 0;
+    Schema sc = load_schema(db_root, object);
+    fs->auto_key = sc.auto_key;
+    fs->auto_key_schema_snapshot = sc;
 }
 
 /* Decode stored value to JSON. */
@@ -931,6 +934,12 @@ typedef struct {
     uint8_t   hash[16];
     int       start_slot;
     int       shard_id;
+    /* Per-record strict-insert override. Auto-key bulk-insert flags
+       omit-key records (server-generated UUID / seq.next) so a collision
+       with a pre-existing key surfaces as condition_not_met instead of
+       a silent update. Zero for provided-key records → today's
+       behaviour (upsert under the batch-level opts). */
+    int       if_not_exists;
 } BulkInsRecord;
 
 /* Per-shard bucket + worker arguments. Each bucket targets exactly one
@@ -1222,7 +1231,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
        so calling it once per kf shard amortises the lock acquisition
        across all records in that shard. */
     int splits = sw->sch->splits;
-    SlotcaskBulkRec *batch = malloc(sw->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
     V2BulkInsCtx    *ctxs  = malloc(sw->count * sizeof(V2BulkInsCtx));
     int *kf_shards = malloc(sw->count * sizeof(int));
     int *counts    = calloc(splits, sizeof(int));
@@ -1259,6 +1268,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         batch[pos].old_vlen  = 0;
         batch[pos].status    = 0;
         batch[pos].was_update = 0;
+        batch[pos].if_not_exists = r->if_not_exists;
     }
 
     SlotcaskBulkOpts opts = {
@@ -1660,6 +1670,18 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     int count = 0, errors = 0;
 
+    /* Auto-key bookkeeping: when the object has auto_key set, the wire
+       form (36-char dashed UUID or decimal int) is parsed to binary for
+       storage, and the wire string is captured per-record so the final
+       response can emit a `keys[]` array. omit-key records are marked
+       with NULL wire_key here; we fill them in below after parse with a
+       single batched generation. */
+    int auto_key_mode = sc.auto_key;
+    char **wire_keys = NULL;       /* per-record rendered key (NULL → fill from omit pool) */
+    size_t wire_cap = 0;
+    int n_omits = 0;
+    int validation_failed_idx = -1;
+
     /* Per-request statement timeout (timeout_ms / global TIMEOUT). Trip
        check is in the parse loop only — the parallel write/index phases
        run on records already in memory, so a deadline trip mid-parse
@@ -1675,7 +1697,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        the post-phase merge loop reads records[i].id/.payload BEFORE arena_free. */
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
-    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
+    BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
 
     while (*p) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
@@ -1742,6 +1764,52 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             p = obj_end;
         }
 
+        /* For auto-key objects: if the parsed id is a provided wire-form
+           key, normalise to the storage binary form. If it's an
+           omit-key record (only possible in array format on auto-key),
+           defer key assignment to the post-parse batch. */
+        char *wire_for_record = NULL;
+        if (data_ptr && auto_key_mode != AK_NONE) {
+            if (id) {
+                /* Provided wire key — parse to binary and replace id+klen.
+                   The wire string lives in arena, which is freed before the
+                   final response emit; strdup so wire_keys[] outlives the
+                   arena. Heap pointer is freed alongside the wire_keys
+                   array after the response is written. */
+                wire_for_record = strdup(id);
+                if (auto_key_mode == AK_UUID) {
+                    uint8_t bin[16];
+                    if (parse_uuid_string(id, bin) == 0) {
+                        id = (char *)arena_alloc(&arena, 16);
+                        memcpy(id, bin, 16);
+                        klen = 16;
+                    } else {
+                        if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
+                        errors++;
+                        id = NULL;
+                    }
+                } else { /* AK_SEQ */
+                    int64_t v;
+                    if (parse_seq_key(id, &v) == 0) {
+                        id = (char *)arena_alloc(&arena, 8);
+                        for (int b = 7; b >= 0; b--) { id[b] = (char)(v & 0xFF); v >>= 8; }
+                        klen = 8;
+                    } else {
+                        if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
+                        errors++;
+                        id = NULL;
+                    }
+                }
+            } else {
+                /* Omit-key record — placeholder; id+klen filled in post-parse. */
+                id = (char *)arena_alloc(&arena, auto_key_mode == AK_UUID ? 16 : 8);
+                memset(id, 0, auto_key_mode == AK_UUID ? 16 : 8);
+                klen = auto_key_mode == AK_UUID ? 16 : 8;
+                n_omits++;
+                wire_for_record = NULL;
+            }
+        }
+
         if (id && data_ptr) {
             if ((int)klen > sc.max_key) {
                 errors++;
@@ -1765,10 +1833,24 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                     }
                     records = t;
                 }
+                /* Grow wire_keys sidecar in lockstep with records when
+                   auto_key is active. */
+                if (auto_key_mode != AK_NONE) {
+                    if (rec_count >= wire_cap) {
+                        size_t new_wc = wire_cap ? wire_cap * 2 : 1024;
+                        if (new_wc < rec_cap) new_wc = rec_cap;
+                        char **t2 = realloc(wire_keys, new_wc * sizeof(char *));
+                        if (t2) { wire_keys = t2; wire_cap = new_wc; }
+                    }
+                    if (wire_keys && rec_count < wire_cap) {
+                        wire_keys[rec_count] = wire_for_record;
+                    }
+                }
                 BulkInsRecord *r = &records[rec_count++];
                 r->id = id;
                 r->payload = payload;
                 r->klen = klen;
+                r->if_not_exists = 0;  /* default; auto-key omit post-fill sets to 1 */
                 compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
                 /* Override shard_id with the version-aware mapping so v2
                    workers each own one kf shard (no cross-worker kf-wrlock
@@ -1779,6 +1861,65 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             }
         }
         if (obj_heap) free(obj_str);
+    }
+
+    /* Validation failure: refuse the whole batch up front so we don't
+       half-write some records with mangled keys. */
+    if (validation_failed_idx >= 0) {
+        if (wire_keys) {
+            for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        }
+        free(records); free(wire_keys);
+        arena_free(arena);
+        for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        if (json_mmaped) munmap(json, len + 1); else free(json);
+        OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
+            validation_failed_idx);
+        return 1;
+    }
+
+    /* Post-parse: for auto-key omit records, batch-generate keys in one
+       shot (single /dev/urandom open for UUID, single seq flock for seq)
+       and fill in id+klen + wire_keys per record. */
+    if (auto_key_mode != AK_NONE && n_omits > 0) {
+        uint8_t *uuid_pool = NULL;
+        long long seq_start = 0;
+        if (auto_key_mode == AK_UUID) {
+            uuid_pool = malloc((size_t)n_omits * 16);
+            if (uuid_pool) gen_uuid4_batch(uuid_pool, n_omits);
+        } else {
+            seq_start = seq_next_val_batch(db_root, object, sc.auto_key_seq_name, n_omits);
+        }
+        int omit_idx = 0;
+        for (size_t i = 0; i < rec_count; i++) {
+            if (wire_keys && wire_keys[i]) continue;  /* provided key */
+            BulkInsRecord *r = &records[i];
+            if (auto_key_mode == AK_UUID) {
+                if (uuid_pool) memcpy(r->id, uuid_pool + omit_idx * 16, 16);
+                else gen_uuid4_raw((uint8_t *)r->id);  /* fallback per-record */
+                char wbuf[37];
+                format_uuid_string((const uint8_t *)r->id, wbuf);
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            } else {
+                int64_t v = seq_start + omit_idx;
+                for (int b = 7; b >= 0; b--) { r->id[b] = (char)(v & 0xFF); v >>= 8; }
+                char wbuf[24];
+                snprintf(wbuf, sizeof(wbuf), "%lld", (long long)(seq_start + omit_idx));
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            }
+            /* Recompute hash + shard since id was a placeholder during parse. */
+            compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+            if (sc.storage_version == 2)
+                r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            /* Strict-insert on collision — see BulkInsRecord.if_not_exists.
+               UUID can't collide in practice; seq can collide if the
+               operator pre-inserted manual numeric keys at or above the
+               watermark, and silent overwrite would corrupt their data. */
+            r->if_not_exists = 1;
+            omit_idx++;
+        }
+        free(uuid_pool);
     }
 
     /* If parse tripped the deadline, abort before any write phase. Same
@@ -1859,7 +2000,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     for (int g = 0; g < nshard_groups; g++) {
         int s = worker_shards[g];
         workers[g].shard_id = s;
-        workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+        workers[g].records = calloc(shard_counts[s], sizeof(BulkInsRecord));
         workers[g].count = 0;
     }
     /* Invariant: rec_count > 0 ⇒ at least one shard has count > 0 ⇒
@@ -2035,7 +2176,20 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
             (unsigned long)(t4 - t3),
             (unsigned long)(t4 - t0));
 
-    if (errors) {
+    /* Auto-key response includes the resolved keys[] array (rendered
+       wire form, in input order). Today's plain {"inserted":N,...} shape
+       stays for AK_NONE objects to keep wire compatibility. */
+    if (auto_key_mode != AK_NONE && wire_keys) {
+        OUT("{\"status\":\"bulk-inserted\",\"count\":%d,\"skipped\":%d,\"keys\":[",
+            count, skipped_total);
+        for (size_t i = 0; i < rec_count; i++) {
+            OUT("%s\"%s\"", i ? "," : "", wire_keys[i] ? wire_keys[i] : "");
+        }
+        OUT("]}\n");
+        for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        free(wire_keys);
+        wire_keys = NULL;
+    } else if (errors) {
         OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
             count, skipped_total, errors);
         fprintf(stderr, "%d errors during bulk insert (see info log for dropped keys)\n", errors);
@@ -2044,6 +2198,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     } else {
         OUT("{\"inserted\":%d}\n", count);
     }
+    free(wire_keys);  /* no-op if already freed via the auto-key branch */
     return errors > 0 ? 1 : 0;
 }
 
@@ -2170,6 +2325,18 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     const char *rp = data;                /* read pointer — never written to */
     const char *data_end = data + st.st_size;
 
+    /* Auto-key bookkeeping — mirrors cmd_bulk_insert (JSON path).
+       When the object has auto_key set, the wire form of the first
+       column is parsed to binary for storage, or — when the first
+       column is empty — the record is flagged as omit-key and gets a
+       batch-generated key after parse. wire_keys[] tracks rendered
+       forms in input order so the final response can emit `keys[]`. */
+    int auto_key_mode = sc.auto_key;
+    char **wire_keys = NULL;
+    size_t wire_cap = 0;
+    int n_omits = 0;
+    int validation_failed_idx = -1;
+
     /* Compute active-field mapping once — tombstone set is fixed for the
        lifetime of this bulk insert. Common case (no tombstones) hits the
        fast path that matches direct positional encoding. */
@@ -2200,7 +2367,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
        workers join. */
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
-    BulkInsRecord *records = malloc(rec_cap * sizeof(BulkInsRecord));
+    BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
 
     while (rp < data_end) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
@@ -2222,16 +2389,84 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         if (rp < data_end && *rp == '\r') rp++;
         if (rp < data_end && *rp == '\n') rp++;
 
-        /* First field is the key; remaining fields in fields.conf order. */
+        /* First field is the key; remaining fields in fields.conf order.
+           For auto-key objects, an empty first field means "generate";
+           a non-empty wire form is parsed to the binary storage form. */
         const char *key_end = line_start;
         while (key_end < line_end && *key_end != delimiter) key_end++;
         if (key_end == line_end) continue;  /* no delimiter — skip line */
         const char *id_start = line_start;
         size_t klen = key_end - line_start;
 
+        /* Auto-key path: normalise the wire-form first column or flag
+           as omit for post-parse batch generation. */
+        char *auto_id = NULL;          /* arena binary key when set */
+        size_t auto_klen = 0;
+        char *wire_for_record = NULL;
+        int is_omit = 0;
+        if (auto_key_mode != AK_NONE) {
+            if (klen == 0) {
+                is_omit = 1;
+                auto_klen = (auto_key_mode == AK_UUID) ? 16 : 8;
+                auto_id = (char *)arena_alloc(&arena, auto_klen);
+                memset(auto_id, 0, auto_klen);
+                n_omits++;
+            } else {
+                /* strdup the wire form for the response — line buffer is
+                   mmap-owned and arena dies before response emit. */
+                char *wbuf = malloc(klen + 1);
+                if (wbuf) { memcpy(wbuf, id_start, klen); wbuf[klen] = '\0'; }
+                wire_for_record = wbuf;
+                if (auto_key_mode == AK_UUID) {
+                    uint8_t bin[16];
+                    char tmp[64];
+                    if (klen < sizeof(tmp)) {
+                        memcpy(tmp, id_start, klen); tmp[klen] = '\0';
+                        if (parse_uuid_string(tmp, bin) == 0) {
+                            auto_id = (char *)arena_alloc(&arena, 16);
+                            memcpy(auto_id, bin, 16);
+                            auto_klen = 16;
+                        }
+                    }
+                    if (!auto_id) {
+                        if (validation_failed_idx < 0)
+                            validation_failed_idx = (int)rec_count;
+                        free(wbuf);
+                        errors++;
+                        continue;
+                    }
+                } else { /* AK_SEQ */
+                    int64_t v;
+                    char tmp[32];
+                    if (klen < sizeof(tmp)) {
+                        memcpy(tmp, id_start, klen); tmp[klen] = '\0';
+                        if (parse_seq_key(tmp, &v) == 0) {
+                            auto_id = (char *)arena_alloc(&arena, 8);
+                            for (int b = 7; b >= 0; b--) {
+                                auto_id[b] = (char)(v & 0xFF); v >>= 8;
+                            }
+                            auto_klen = 8;
+                        }
+                    }
+                    if (!auto_id) {
+                        if (validation_failed_idx < 0)
+                            validation_failed_idx = (int)rec_count;
+                        free(wbuf);
+                        errors++;
+                        continue;
+                    }
+                }
+            }
+        }
+
         /* Skip oversized keys before any encode work. (ts->total_size >
-           sc.max_value was already hoisted above.) */
-        if ((int)klen > sc.max_key) { errors++; continue; }
+           sc.max_value was already hoisted above.) Auto-key paths already
+           have the correct binary klen at this point. */
+        size_t check_klen = auto_id ? auto_klen : klen;
+        if ((int)check_klen > sc.max_key) {
+            free(wire_for_record);
+            errors++; continue;
+        }
 
         /* Walk remaining spans into vals[] without copying. */
         int nvals = 0;
@@ -2257,8 +2492,12 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         /* Arena-allocated key + typed payload — survive until arena_free()
            post-Phase-2. Encode directly into the arena payload (zero-init
            first, then encode_field_len writes each field in place); skips
-           the typed_tmp bounce + memcpy that used to sit between them. */
-        char *id = arena_strndup(&arena, id_start, klen);
+           the typed_tmp bounce + memcpy that used to sit between them.
+           For auto-key paths the binary key is already in `auto_id` /
+           `auto_klen`; for AK_NONE we copy the wire-form key into arena. */
+        char *id;
+        if (auto_id) { id = auto_id; klen = auto_klen; }
+        else         { id = arena_strndup(&arena, id_start, klen); }
         uint8_t *payload = arena_alloc(&arena, ts->total_size);
         memset(payload, 0, ts->total_size);
 
@@ -2286,9 +2525,27 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                    shard-bucket loop instead of dereferencing NULL records. */
                 records = NULL;
                 rec_count = 0;
+                free(wire_for_record);
                 break;
             }
             records = t;
+        }
+        /* Grow wire_keys[] in lockstep with records[] when auto_key is
+           active. wire_keys[i] is NULL for omit records — filled in by
+           the post-parse batch generation. */
+        if (auto_key_mode != AK_NONE) {
+            if (rec_count >= wire_cap) {
+                size_t new_wc = wire_cap ? wire_cap * 2 : 1024;
+                if (new_wc < rec_cap) new_wc = rec_cap;
+                char **t2 = realloc(wire_keys, new_wc * sizeof(char *));
+                if (t2) { wire_keys = t2; wire_cap = new_wc; }
+            }
+            if (wire_keys && rec_count < wire_cap) {
+                wire_keys[rec_count] = wire_for_record;  /* heap-owned, freed at response */
+            }
+        } else {
+            (void)is_omit;
+            free(wire_for_record);  /* AK_NONE: shouldn't be set, defensive */
         }
         BulkInsRecord *r = &records[rec_count++];
         r->id = id;
@@ -2298,6 +2555,59 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         /* v2 dispatcher-shard alignment — see cmd_bulk_insert (JSON path) */
         if (sc.storage_version == 2)
             r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+    }
+
+    /* Validation failure: refuse the whole batch before any write.
+       Matches the JSON path. */
+    if (validation_failed_idx >= 0) {
+        if (wire_keys) {
+            for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+            free(wire_keys);
+        }
+        free(records);
+        arena_free(arena);
+        for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
+        free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+        OUT("{\"error\":\"bulk-insert-delimited validation failed at record %d: malformed key for auto_key mode\"}\n",
+            validation_failed_idx);
+        return 1;
+    }
+
+    /* Post-parse: batch-generate keys for omit records. Single
+       /dev/urandom open for UUID, single seq flock for seq. */
+    if (auto_key_mode != AK_NONE && n_omits > 0) {
+        uint8_t *uuid_pool = NULL;
+        long long seq_start = 0;
+        if (auto_key_mode == AK_UUID) {
+            uuid_pool = malloc((size_t)n_omits * 16);
+            if (uuid_pool) gen_uuid4_batch(uuid_pool, n_omits);
+        } else {
+            seq_start = seq_next_val_batch(db_root, object, sc.auto_key_seq_name, n_omits);
+        }
+        int omit_idx = 0;
+        for (size_t i = 0; i < rec_count; i++) {
+            if (wire_keys && wire_keys[i]) continue;  /* provided key */
+            BulkInsRecord *r = &records[i];
+            if (auto_key_mode == AK_UUID) {
+                if (uuid_pool) memcpy(r->id, uuid_pool + omit_idx * 16, 16);
+                else gen_uuid4_raw((uint8_t *)r->id);
+                char wbuf[37];
+                format_uuid_string((const uint8_t *)r->id, wbuf);
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            } else {
+                int64_t v = seq_start + omit_idx;
+                for (int b = 7; b >= 0; b--) { r->id[b] = (char)(v & 0xFF); v >>= 8; }
+                char wbuf[24];
+                snprintf(wbuf, sizeof(wbuf), "%lld", (long long)(seq_start + omit_idx));
+                if (wire_keys) wire_keys[i] = strdup(wbuf);
+            }
+            /* Recompute hash + shard now that the placeholder id is final. */
+            compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+            if (sc.storage_version == 2)
+                r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            omit_idx++;
+        }
+        free(uuid_pool);
     }
 
     /* If parse tripped the deadline, abort before any write phase. */
@@ -2359,7 +2669,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     for (int g = 0; g < nshard_groups; g++) {
         int s = worker_shards[g];
         workers[g].shard_id = s;
-        workers[g].records = malloc(shard_counts[s] * sizeof(BulkInsRecord));
+        workers[g].records = calloc(shard_counts[s], sizeof(BulkInsRecord));
         workers[g].count = 0;
     }
     /* Same invariant as cmd_bulk_insert (JSON path): rec_count > 0 ⇒
@@ -2518,7 +2828,19 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
             (unsigned long)(t4 - t3),
             (unsigned long)(t4 - t0));
 
-    if (errors) {
+    /* Auto-key response carries the resolved wire-form keys[] in input
+       order. AK_NONE keeps today's plain shape. */
+    if (auto_key_mode != AK_NONE && wire_keys) {
+        OUT("{\"status\":\"bulk-inserted\",\"count\":%d,\"skipped\":%d,\"keys\":[",
+            count, delim_skipped_total);
+        for (size_t i = 0; i < rec_count; i++) {
+            OUT("%s\"%s\"", i ? "," : "", wire_keys[i] ? wire_keys[i] : "");
+        }
+        OUT("]}\n");
+        for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        free(wire_keys);
+        wire_keys = NULL;
+    } else if (errors) {
         OUT("{\"inserted\":%d,\"skipped\":%d,\"errors\":%d,\"error\":\"some_records_dropped\"}\n",
             count, delim_skipped_total, errors);
         fprintf(stderr, "%d errors during delimited import (see info log for dropped keys)\n", errors);
@@ -2527,6 +2849,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     } else {
         OUT("{\"inserted\":%d}\n", count);
     }
+    free(wire_keys);  /* no-op if NULL */
     return errors > 0 ? 1 : 0;
 }
 
@@ -2643,7 +2966,7 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
        aligned shard_id with compute_record_shard, see cmd_bulk_delete). */
     int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits, 2);
 
-    SlotcaskBulkRec *batch = malloc(sw->key_count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch = calloc(sw->key_count, sizeof(SlotcaskBulkRec));
     V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
     if (!batch || !ctxs) { free(batch); free(ctxs); return NULL; }
 
@@ -3246,7 +3569,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
     json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
 
-    SlotcaskBulkRec *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
     uint8_t         *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -3725,7 +4048,7 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
 
     /* Build batch + scratch slab. value_compute will write into the
        slab; rec->value points at this worker's slot up front. */
-    SlotcaskBulkRec   *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec   *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdDelimCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdDelimCtx));
     uint8_t           *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -4286,7 +4609,7 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
 
-    SlotcaskBulkRec  *batch   = malloc(w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec  *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdJsonCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdJsonCtx));
     uint8_t          *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
@@ -4837,7 +5160,7 @@ static void *bulk_del_crit_shard_worker(void *arg) {
        pre-sorted by compute_record_shard). */
     int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits, 2);
 
-    SlotcaskBulkRec  *batch = malloc((size_t)w->count * sizeof(SlotcaskBulkRec));
+    SlotcaskBulkRec  *batch = calloc((size_t)w->count, sizeof(SlotcaskBulkRec));
     V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
     if (!batch || !ctxs) {
         free(batch); free(ctxs);
@@ -5196,9 +5519,11 @@ static int update_schema_conf_splits_streams(const char *db_root, const char *ob
     int replaced = 0;
     while (fgets(line, sizeof(line), fin)) {
         if (strncmp(line, prefix, pfxlen) == 0 && !replaced) {
-            /* Format: dir:object:splits:max_key[:storage_version[:streams]].
+            /* Format: dir:object:splits:max_key[:storage_version[:streams[:auto_key=...]]].
                Preserve every trailing field so v2 objects don't silently
-               downgrade to v1 on a splits change. */
+               downgrade to v1 on a splits change, and so auto_key=... is
+               kept across vacuum-reshards. Also walk the line tail for
+               any unknown :tok= extension and re-emit it verbatim. */
             line[strcspn(line, "\r\n")] = '\0';
             int cur_splits = 0, max_key = 0;
             int sv = 0, streams = 0;
@@ -5206,12 +5531,35 @@ static int update_schema_conf_splits_streams(const char *db_root, const char *ob
                             &cur_splits, &max_key, &sv, &streams);
             int out_splits  = (new_splits  > 0) ? new_splits  : cur_splits;
             int out_streams = (new_streams > 0) ? new_streams : streams;
-            if (n >= 4)
-                fprintf(fout, "%s%d:%d:%d:%d\n", prefix, out_splits, max_key, sv, out_streams);
-            else if (n >= 3)
-                fprintf(fout, "%s%d:%d:%d\n", prefix, out_splits, max_key, sv);
-            else
-                fprintf(fout, "%s%d:%d\n", prefix, out_splits, max_key);
+
+            /* Walk past splits[:max_key[:sv[:streams]]] to find any trailing
+               tokens (auto_key=... and future extensions) — re-emit them. */
+            char *scan = line + pfxlen;
+            int skips = n > 4 ? 4 : n;
+            for (int i = 0; i < skips; i++) {
+                char *next = strchr(scan, ':');
+                if (!next) { scan = NULL; break; }
+                scan = next + 1;
+            }
+            /* `scan` now points at the byte after the last consumed numeric
+               field. If there's more text, it begins with ':' separating
+               the next token from the streams field (which we just
+               consumed); skip that ':' before re-emitting. Actually no —
+               sscanf+strchr leaves scan PAST the colon, pointing at the
+               next field's first byte (or NUL if none). So `*scan` is
+               the next token, no leading colon. */
+            const char *tail = (scan && *scan) ? scan : NULL;
+
+            if (n >= 4) {
+                if (tail) fprintf(fout, "%s%d:%d:%d:%d:%s\n", prefix, out_splits, max_key, sv, out_streams, tail);
+                else      fprintf(fout, "%s%d:%d:%d:%d\n",    prefix, out_splits, max_key, sv, out_streams);
+            } else if (n >= 3) {
+                if (tail) fprintf(fout, "%s%d:%d:%d:%s\n", prefix, out_splits, max_key, sv, tail);
+                else      fprintf(fout, "%s%d:%d:%d\n",    prefix, out_splits, max_key, sv);
+            } else {
+                if (tail) fprintf(fout, "%s%d:%d:%s\n", prefix, out_splits, max_key, tail);
+                else      fprintf(fout, "%s%d:%d\n",    prefix, out_splits, max_key);
+            }
             replaced = 1;
         } else {
             fputs(line, fout);
@@ -6471,9 +6819,9 @@ int is_number(const char *s) {
 
 /* ========== EXISTS ========== */
 
-int cmd_exists(const char *db_root, const char *object, const char *key) {
+int cmd_exists(const char *db_root, const char *object,
+               const char *key, size_t klen) {
     Schema sc = load_schema(db_root, object);
-    size_t klen = strlen(key);
 
     if (sc.storage_version == 2) {
         SlotcaskSchemaInfo info = {
@@ -6590,13 +6938,23 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
 
 /* ========== FETCH (paginated scan with optional field projection) ========== */
 
+/* Render block's key bytes as the wire-form string, honouring the
+   object's auto_key mode (carried on FieldSchema). For AK_NONE the
+   output is a verbatim NUL-terminated copy; for AK_UUID the 16 bytes
+   render as 36-char dashed; for AK_SEQ the 8 bytes render as decimal. */
+static void render_wire_key(const FieldSchema *fs, const uint8_t *block,
+                             uint16_t klen, char out[1100]) {
+    const Schema *sc = (fs && fs->auto_key != AK_NONE)
+                        ? &fs->auto_key_schema_snapshot : NULL;
+    format_wire_key(sc, (const char *)block, klen, out, 1100);
+}
+
 /* Print a record as JSON with optional projection */
 void print_record_json(const SlotHeader *hdr, const uint8_t *block,
                               const char **proj_fields, int proj_count,
                               int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6616,7 +6974,6 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
         OUT("%s}", val);
         free(val);
     }
-    free(key);
     (*printed)++;
 }
 
@@ -6624,9 +6981,8 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
 void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
                        const char **proj_fields, int proj_count,
                        int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6647,7 +7003,6 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         OUT("%s", val);
         free(val);
     }
-    free(key);
     (*printed)++;
 }
 
@@ -6655,9 +7010,8 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
 void print_record_row(const SlotHeader *hdr, const uint8_t *block,
                       const char **proj_fields, int proj_count,
                       int *printed, FieldSchema *fs) {
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    char key[1100];
+    render_wire_key(fs, block, hdr->key_len, key);
 
     const char *raw = (const char *)block + hdr->key_len;
 
@@ -6677,7 +7031,6 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
         }
     }
     OUT("]");
-    free(key);
     (*printed)++;
 }
 
@@ -8840,9 +9193,16 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     if (sc->limit > 0 && sc->printed >= sc->limit) return 1;
     if (query_deadline_tick(sc->deadline, &sc->dl_counter)) return 1;
 
-    char *key = malloc(hdr->key_len + 1);
-    memcpy(key, block, hdr->key_len);
-    key[hdr->key_len] = '\0';
+    /* Render key per the object's auto_key mode so the wire-form
+       comparison + emit work for binary keys (AK_UUID/SEQ). Heap-alloc
+       to preserve the existing free() lifecycle in this function. */
+    char *key = malloc(1100);
+    if (!key) return 1;
+    {
+        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
+                              ? &sc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)block, hdr->key_len, key, 1100);
+    }
 
     /* Check excluded keys first */
     if (is_excluded(&sc->excluded, key)) { free(key); return 0; }
@@ -9978,10 +10338,13 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
     RecordRef rr;
     if (read_record_ref(sc->db_root, sc->object, sc->sch, hash16, &rr) != 0) return 0;
 
-    char keybuf[1024];
-    size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-    memcpy(keybuf, rr.key, kl);
-    keybuf[kl] = '\0';
+    /* Render key per the object's auto_key mode (AK_NONE → verbatim). */
+    char keybuf[1100];
+    {
+        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
+                              ? &sc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
+    }
 
     if (is_excluded(sc->excluded, keybuf)) { release_record_ref(&rr); return 0; }
 
@@ -11465,10 +11828,12 @@ static int keyset_emit_find(const char *db_root, const char *object,
         RecordRef rr;
         if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
 
-        char keybuf[1024];
-        size_t kl = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, rr.key, kl);
-        keybuf[kl] = '\0';
+        char keybuf[1100];
+        {
+            const Schema *sc_p = (fs && fs->auto_key != AK_NONE)
+                                  ? &fs->auto_key_schema_snapshot : NULL;
+            format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
+        }
 
         if (is_excluded(excluded, keybuf)) { release_record_ref(&rr); continue; }
 
@@ -12074,11 +12439,14 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     if (oc->budget_exceeded) return 1;  /* stop scanning once cap hit */
     if (query_deadline_tick(oc->deadline, &oc->dl_counter)) return 1;
 
-    /* Exclusion check */
-    char keybuf[1024];
-    size_t klen = hdr->key_len < sizeof(keybuf) - 1 ? hdr->key_len : sizeof(keybuf) - 1;
-    memcpy(keybuf, block, klen);
-    keybuf[klen] = '\0';
+    /* Exclusion check — render key per auto_key mode so wire-form
+       excluded keys match what the user sent. */
+    char keybuf[1100];
+    {
+        const Schema *sc_p = (oc->fs && oc->fs->auto_key != AK_NONE)
+                              ? &oc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)block, hdr->key_len, keybuf, sizeof(keybuf));
+    }
     if (is_excluded(oc->excluded, keybuf)) return 0;
 
     const uint8_t *raw = block + hdr->key_len;
@@ -14388,10 +14756,49 @@ static int validate_field_type(const char *field_spec) {
     return 0;
 }
 
+/* Validate + parse the auto_key spec. Returns 0 on AK_NONE, 1 on
+   AK_UUID, 2 on AK_SEQ (with seq_name filled). On invalid input writes
+   the {"error":...} JSON to OUT and returns -1. Empty/NULL → 0. */
+static int parse_auto_key_spec(const char *spec, char *out_seq_name, size_t seq_cap) {
+    if (!spec || !spec[0]) return 0;
+    if (strcmp(spec, "uuid") == 0) return 1;
+    if (strncmp(spec, "seq(", 4) == 0) {
+        size_t slen = strlen(spec);
+        if (slen < 6 || spec[slen - 1] != ')') {
+            OUT("{\"error\":\"Invalid auto_key=seq(...) form; expected seq(<name>)\"}\n");
+            return -1;
+        }
+        size_t nlen = slen - 5;  /* "seq(" + ")" */
+        if (nlen >= seq_cap) {
+            OUT("{\"error\":\"auto_key=seq(<name>): name too long (max %zu)\"}\n", seq_cap - 1);
+            return -1;
+        }
+        /* Validate name characters: no `:`, `/`, `+`, spaces, `)` etc. */
+        for (size_t i = 0; i < nlen; i++) {
+            char c = spec[4 + i];
+            if (c == ':' || c == '/' || c == '+' || c == '\\' || c == ' ' ||
+                c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')') {
+                OUT("{\"error\":\"Invalid sequence name in auto_key=seq(...)\"}\n");
+                return -1;
+            }
+        }
+        if (nlen == 0) {
+            OUT("{\"error\":\"auto_key=seq(): sequence name is empty\"}\n");
+            return -1;
+        }
+        memcpy(out_seq_name, spec + 4, nlen);
+        out_seq_name[nlen] = '\0';
+        return 2;
+    }
+    OUT("{\"error\":\"Unknown auto_key mode '%s'; expected 'uuid' or 'seq(<name>)'\"}\n", spec);
+    return -1;
+}
+
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      int storage_version) {
+                      int storage_version,
+                      const char *auto_key_spec) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -14613,16 +15020,54 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
        opens use the same count (stream_id is on-disk in the keyfile entry). */
     int streams = (storage_version == 2) ? slotcask_streams_for_nproc() : 0;
 
+    /* Parse + validate auto_key_spec. Refuses cross-version invariants
+       (uuid needs max_key>=16, seq needs max_key>=8). On AK_SEQ,
+       pre-initialise the sequence file so the first `next` returns 1. */
+    char auto_seq_name[128] = {0};
+    int auto_key_kind = parse_auto_key_spec(auto_key_spec, auto_seq_name, sizeof(auto_seq_name));
+    if (auto_key_kind < 0) return 1;  /* error already emitted */
+    if (auto_key_kind == 1 && max_key < 16) {
+        OUT("{\"error\":\"auto_key=uuid requires max_key>=16 (got %d)\"}\n", max_key);
+        return 1;
+    }
+    if (auto_key_kind == 2 && max_key < 8) {
+        OUT("{\"error\":\"auto_key=seq(...) requires max_key>=8 (got %d)\"}\n", max_key);
+        return 1;
+    }
+    if (auto_key_kind == 2) {
+        /* Pre-initialise the sequence file at 0 — first `next` returns 1. */
+        char seq_dir[PATH_MAX], seq_path[PATH_MAX];
+        snprintf(seq_dir,  sizeof(seq_dir),  "%s/%s/%s/metadata/sequences", db_root, dir, object);
+        snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, auto_seq_name);
+        mkdirp(seq_dir);
+        struct stat sst;
+        if (stat(seq_path, &sst) != 0) {
+            FILE *sf = fopen(seq_path, "w");
+            if (sf) { fprintf(sf, "0\n"); fclose(sf); }
+        }
+    }
+
     if (!exists) {
         f = fopen(schema_path, "a");
         if (f) {
             if (storage_version == 1) {
                 /* v1 line stays at the historical 4-field form so old parsers
-                   keep working byte-for-byte. */
+                   keep working byte-for-byte. v1 doesn't support auto_key
+                   (the feature is documented v2-only). */
                 fprintf(f, "%s:%s:%d:%d\n", dir, object, splits, max_key);
             } else {
-                fprintf(f, "%s:%s:%d:%d:%d:%d\n",
-                        dir, object, splits, max_key, storage_version, streams);
+                /* v2 line: dir:object:splits:max_key:sv:streams[:auto_key=...] */
+                if (auto_key_kind == 1) {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=uuid\n",
+                            dir, object, splits, max_key, storage_version, streams);
+                } else if (auto_key_kind == 2) {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=seq(%s)\n",
+                            dir, object, splits, max_key, storage_version, streams,
+                            auto_seq_name);
+                } else {
+                    fprintf(f, "%s:%s:%d:%d:%d:%d\n",
+                            dir, object, splits, max_key, storage_version, streams);
+                }
             }
             fclose(f);
         }

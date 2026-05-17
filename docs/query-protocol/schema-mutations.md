@@ -30,11 +30,86 @@ Create a new typed object. See [Quick start](../getting-started/quickstart.md) f
 | `splits` | no | `8` (`DEFAULT_SPLITS`) | Initial shard count. Must be a power of 2 in `[8, 4096]` (`MIN_SPLITS`–`MAX_SPLITS`). The default is tuned for sub-1M-row objects; pass `splits` explicitly for larger workloads. |
 | `max_key` | no | `64` | Max key length in bytes. Hard ceiling 1024 (`MAX_KEY_CEILING`). |
 | `fields` | yes | — | Array of typed field specs. See [Concepts → Typed records](../concepts/typed-records.md). |
+| `indexes` | no | `[]` | Fields to index at creation. Single or composite (`"a+b"`). |
+| `auto_key` | no | (none) | Opt into server-generated keys at insert time. `"uuid"` → 16-byte UUIDv4 binary, rendered as 36-char dashed string on read (requires `max_key >= 16`). `"seq(<name>)"` → 8-byte int64 BE from a named sequence, rendered as decimal string on read (requires `max_key >= 8`; sequence is pre-initialised to 0 if absent, first `next` returns 1). Set once at create-object and immutable for the object's life — there is no `set-auto-key` mutation. See [Auto-generated keys](#auto-generated-keys) below. |
 
 `value_size` (the per-record payload size, stored in segment files) is **always computed** as the sum of typed-field sizes — not user-configurable. Returned in `create-object` and `describe-object` responses; recorded internally for slot-size accounting.
-| `indexes` | no | `[]` | Fields to index at creation. Single or composite (`"a+b"`). |
 
 Response: `{"status":"created","object":"...","splits":N,"max_key":N,"value_size":N,"fields":N}`.
+
+### Auto-generated keys
+
+Declare `"auto_key":"uuid"` or `"auto_key":"seq(<name>)"` at create-object to turn on server-generated keys.
+
+```json
+{
+  "mode":"create-object","dir":"<d>","object":"users",
+  "splits":16,"max_key":16,
+  "fields":["name:varchar:64"],
+  "auto_key":"uuid"
+}
+```
+
+**Insert with the key omitted** → server generates per the object's mode, returns the rendered key:
+
+```json
+// request
+{"mode":"insert","dir":"<d>","object":"users","value":{"name":"Alice"}}
+
+// response
+{"status":"inserted","key":"7a8c2f12-9d31-4abc-9c4a-1a2b3c4d5e6f"}
+```
+
+**Insert with a key provided** → upsert (exists → update, else → insert). The provided key must parse in the rendered form (36-char dashed UUID or decimal int).
+
+```json
+// request
+{"mode":"insert","dir":"<d>","object":"orders","key":"42","value":{"amount":99}}
+
+// response
+{"status":"inserted","key":"42"}
+```
+
+CAS modifiers (`if_not_exists`, `if`) apply to provided-key inserts as usual. Omit-key + `if:{...}` is rejected at parse time (the predicate applies to a specific record; auto-gen doesn't compose).
+
+**Storage shape** — keys are stored in their on-disk binary form: 16 bytes for `uuid`, 8 bytes BE int64 for `seq`. Wire I/O always renders as the canonical string form (UUID dashed, seq decimal). `get` / `delete` / `find` / `keys` / `fetch` all accept and emit the rendered form.
+
+**bulk-insert** — per-record omit-key gets auto-generated; per-record provided-key upserts. The whole batch is refused up front if any provided key is malformed. Generated keys for the batch are allocated in one shot (single `/dev/urandom` read for UUID; single seq flock for seq) so per-record overhead stays low. **Per-record CAS** is enforced: omit-key records take the strict-insert path (collision → that single record is `condition_not_met` and counted in `skipped`, the other records still write) while provided-key records remain upsert. The check piggybacks on the existing kf-lookup pass — zero extra lookups, zero added latency for non-auto-key bulk-insert.
+
+```json
+// request
+{"mode":"bulk-insert","dir":"<d>","object":"orders",
+ "records":[{"value":{"amount":1}},
+            {"key":"500","value":{"amount":500}},
+            {"value":{"amount":2}}]}
+
+// response — keys[] preserves input order
+{"status":"bulk-inserted","count":3,"skipped":0,"keys":["4","500","5"]}
+```
+
+The dict form (`{"k1":{...},"k2":{...}}`) has keys baked into the wire shape — every entry is treated as provided-key.
+
+**bulk-insert-delimited** (CSV / TSV / pipe / etc.) also supports auto-key: per row, an **empty first column** means "auto-generate" and a non-empty first column is parsed as a wire-form key (upsert). Response shape matches the JSON form (`{"status":"bulk-inserted","count":N,"skipped":M,"keys":[...]}` for auto-key objects). When using inline `data` in a JSON request, the standard JSON escapes (`\n`, `\r`, `\t`, `\"`, `\\`, `\uXXXX`) are decoded before parsing — so newline-separated records work as expected.
+
+```json
+{"mode":"bulk-insert-delimited","dir":"<d>","object":"orders",
+ "delimiter":",",
+ "data":",100\n42,42\n,200\n"}
+
+// response (seq watermark was at 5):
+{"status":"bulk-inserted","count":3,"skipped":0,"keys":["6","42","7"]}
+```
+
+**update / delete** require a key as today. `auto_key` only fires on insert; update with no key errors with the usual "Missing key" message.
+
+**Constraints**:
+
+- `uuid` mode → `max_key` must be at least 16.
+- `seq(<name>)` mode → `max_key` must be at least 8.
+- The sequence name must be valid (`valid_field_name()` rules — no `:`, `+`, `/`, spaces, parens). The sequence file lives at `<obj>/metadata/sequences/<name>` and is shared with any field that also uses `:default=seq(<name>)`.
+- **v2 only** in practice — `auto_key` is allowed at create-object on any storage version, but the persistence shape only writes the trailing token on v2 lines (`dir:object:splits:max_key:storage_version:streams:auto_key=...`). 2026.06 drops v1 entirely.
+- **No retroactive enable** — auto_key can only be set at create-object. There is no schema mutation to add or change auto_key later. A v1-of-feature limitation; revisit only if customers need it.
+- **Seq collisions** — for `seq` mode, if you manually insert records with numeric keys at or above the current sequence value, the next auto-generated insert can collide. Single insert returns `{"error":"condition_not_met"}` for that record; bulk-insert (JSON + delimited) skips just the colliding record (`skipped:N` in the response) and inserts every other auto-gen normally — the manual record's data is never silently overwritten. UUID collisions are effectively impossible at any realistic scale.
 
 ## add-field
 
