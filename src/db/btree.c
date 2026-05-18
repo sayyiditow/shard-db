@@ -230,6 +230,15 @@ static int page_bsearch_leaf(uint8_t *page, const char *target, size_t tlen) {
     return end;
 }
 
+/* Internal-page bsearch: first slot whose key is `>= target`. The routing
+   convention is `entry[pos - 1].child` (or `next_leaf` when pos == 0).
+   With duplicate values allowed in the leaf chain, a value v that equals
+   a separator key may legitimately exist on multiple consecutive leaves
+   — keeping the `>=` (loose) form lets the descent land on the leftmost
+   such leaf, and downstream walkers continue forward via `next_leaf`
+   to enumerate the rest. The single-leaf-descent paths (btree_delete in
+   particular) must also continue forward — see btree_delete's leaf-chain
+   loop. */
 static int page_bsearch_internal(uint8_t *page, const char *target, size_t tlen) {
     BtPageHeader *ph = (BtPageHeader *)page;
     int lo = 0, hi = ph->count;
@@ -805,48 +814,286 @@ static int leaf_append(uint8_t *page, const char *value, size_t vlen,
     return 0;
 }
 
-/* Insert leaf entry at position pos (pos is the physical slot index returned by
-   page_bsearch_leaf — first non-tomb slot >= target). Decompresses, drops
-   tombstones, inserts new entry, rebuilds. */
-static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t vlen,
-                               const uint8_t *hash) {
-    /* Stack-allocate worst-case buffers: max ~256 entries on a 4KB page
-       when fully packed with tiny keys. 256 entries * 512 bytes = 128KB
-       worst-case decoded data — comfortable for 8MB Linux stack limit. */
-#define PI_MAX_ENTRIES 256
-    LeafRec  recs[PI_MAX_ENTRIES];
-    char     buf[PI_MAX_ENTRIES * BT_MAX_VAL_LEN];
-    uint8_t  hashbuf[PI_MAX_ENTRIES * BT_HASH_SIZE];
-
-    LeafIter it;
-    leaf_iter_init(&it, page);
-    char *p = buf;
-    uint8_t *h = hashbuf;
-    int dst = 0;
-    int inserted = 0;
-    while (leaf_iter_next(&it) && dst < PI_MAX_ENTRIES - 1) {
-        if (!inserted && it.slot_idx >= pos) {
-            memcpy(p, value, vlen);
-            memcpy(h, hash, BT_HASH_SIZE);
-            recs[dst].value = p; recs[dst].vlen = vlen; recs[dst].hash = h;
-            p += vlen; h += BT_HASH_SIZE; dst++;
-            inserted = 1;
+/* Decode the value bytes stored at physical slot `slot_idx` into out_buf.
+   Walks the prefix chain forward from the nearest anchor (≤ K = 16 entries).
+   Returns 0 on success, -1 if slot_idx is out of range. Works on tombstoned
+   entries too — the bytes are still encoded; we just ignore the tomb flag. */
+static int leaf_decode_value_at(uint8_t *page, int slot_idx,
+                                char *out_buf, size_t *out_len) {
+    BtPageHeader *ph = (BtPageHeader *)page;
+    if (slot_idx < 0 || slot_idx >= (int)ph->count) return -1;
+    int anchor = slot_idx & ~(BT_LEAF_RESTART_K - 1);
+    char buf[BT_MAX_VAL_LEN]; size_t blen = 0;
+    for (int s = anchor; s <= slot_idx; s++) {
+        uint8_t *e = page_entry(page, s);
+        uint8_t prefix_len = leaf_entry_prefix_len(e);
+        size_t  suffix_len = leaf_entry_suffix_len(e);
+        if ((s & (BT_LEAF_RESTART_K - 1)) == 0) {
+            blen = suffix_len;
+            if (blen > BT_MAX_VAL_LEN) blen = BT_MAX_VAL_LEN;
+            memcpy(buf, leaf_entry_suffix(e), blen);
+        } else {
+            size_t klen = (size_t)prefix_len + suffix_len;
+            if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
+            memcpy(buf + prefix_len, leaf_entry_suffix(e), suffix_len);
+            blen = klen;
         }
+    }
+    memcpy(out_buf, buf, blen);
+    *out_len = blen;
+    return 0;
+}
+
+/* Rewrite a leaf page tightly using the existing slot directory. Walks live
+   entries via leaf_iter (drops tombstones), then re-encodes via leaf_rebuild.
+   Used by the in-place insert path when free_space + dead_bytes is just
+   enough to fit the new entry but free_space alone isn't.
+
+   Byte-identical to what leaf_rebuild produces from the same record set
+   on a fresh insert sequence. dead_bytes is reset to 0. */
+static int page_leaf_compact(uint8_t *page) {
+    BtPageHeader *ph = (BtPageHeader *)page;
+#define PLC_MAX_ENTRIES 260
+    LeafRec  recs[PLC_MAX_ENTRIES];
+    /* Two scratch buffers: one for key bytes (chained via LeafRec.value
+       pointers, freed when the function returns), one for hashes. Sized
+       for the worst case of 256 entries * 512 B = 128 KB on stack. */
+    char     buf[PLC_MAX_ENTRIES * BT_MAX_VAL_LEN];
+    uint8_t  hashbuf[PLC_MAX_ENTRIES * BT_HASH_SIZE];
+
+    LeafIter it; leaf_iter_init(&it, page);
+    char *p = buf; uint8_t *h = hashbuf;
+    int dst = 0;
+    while (leaf_iter_next(&it) && dst < PLC_MAX_ENTRIES) {
         memcpy(p, it.key_buf, it.key_len);
         memcpy(h, it.hash, BT_HASH_SIZE);
         recs[dst].value = p; recs[dst].vlen = it.key_len; recs[dst].hash = h;
         p += it.key_len; h += BT_HASH_SIZE; dst++;
     }
-    if (!inserted && dst < PI_MAX_ENTRIES) {
-        memcpy(p, value, vlen);
-        memcpy(h, hash, BT_HASH_SIZE);
-        recs[dst].value = p; recs[dst].vlen = vlen; recs[dst].hash = h;
-        dst++;
+    int rc = leaf_rebuild(page, recs, dst);
+    if (rc == 0) ph->dead_bytes = 0;
+    return rc;
+#undef PLC_MAX_ENTRIES
+}
+
+/* Per-affected-slot patch: a slot in the NEW layout (after the shift) whose
+   bytes need to be re-encoded. The new_slot indices are NOT contiguous —
+   most slots between patches keep their old bytes and just shift in the
+   slot directory. */
+typedef struct {
+    int      new_slot;            /* slot index in post-insertion layout */
+    int      is_anchor;           /* 1 if (new_slot % K) == 0 */
+    int      is_tomb;             /* preserves tombstone flag from source */
+    char     val_buf[BT_MAX_VAL_LEN];
+    size_t   val_len;
+    char     pred_buf[BT_MAX_VAL_LEN];
+    size_t   pred_len;            /* meaningful when !is_anchor */
+    const uint8_t *hash;          /* points into the existing page or caller-supplied */
+    int      src_old_slot;        /* -1 = inserted X; else old slot whose bytes become dead */
+    /* Filled by the encoder. */
+    uint8_t  prefix_len;
+    size_t   suffix_len;
+    size_t   entry_bytes;         /* 2 + 1 + suffix_len + 16 */
+    uint16_t new_offset;          /* byte offset of new encoding within the page */
+} LeafPatch;
+
+/* Insert leaf entry at position pos (the physical slot index returned by
+   page_bsearch_leaf). In-place: only ~10 entries are re-encoded per insert
+   on average vs the previous ~256 (full rebuild). The old encoded bytes of
+   the displaced entries become "dead bytes" inside the data region, tracked
+   in ph->dead_bytes and reclaimed by page_leaf_compact() when space pressure
+   demands it. Byte layout is identical to what the previous full-rebuild
+   path produced; no format change. */
+static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t vlen,
+                               const uint8_t *hash) {
+    BtPageHeader *ph = (BtPageHeader *)page;
+    const int K = BT_LEAF_RESTART_K;
+    const int N = (int)ph->count;
+
+    if (pos < 0 || pos > N) return -1;
+    if (vlen > BT_MAX_VAL_LEN) return -1;
+
+    /* Append fast path. */
+    if (pos == N) {
+        char last_key[BT_MAX_VAL_LEN]; size_t last_key_len = 0;
+        if (N > 0 && (N & (K - 1)) != 0) {
+            if (leaf_decode_value_at(page, N - 1, last_key, &last_key_len) != 0)
+                return -1;
+        }
+        return leaf_append(page, value, vlen, hash, last_key, &last_key_len);
     }
 
-    int rc = leaf_rebuild(page, recs, dst);
-    return rc;
-#undef PI_MAX_ENTRIES
+    /* In-place algorithm. Capacity 64 covers the worst case at K=16:
+       2 patches for pos / pos+1 + 2 patches per anchor crossing × at
+       most ceil(256/16) = 16 crossings = 34, comfortably within 64. */
+#define LPI_MAX_PATCHES 64
+    LeafPatch patches[LPI_MAX_PATCHES];
+    int n = 0;
+
+    /* Patch at slot pos: the new entry. */
+    {
+        LeafPatch *p = &patches[n++];
+        p->new_slot = pos;
+        memcpy(p->val_buf, value, vlen);
+        p->val_len = vlen;
+        p->hash = hash;
+        p->is_tomb = 0;
+        p->src_old_slot = -1;
+        if ((pos & (K - 1)) == 0) {
+            p->is_anchor = 1;
+        } else {
+            p->is_anchor = 0;
+            if (leaf_decode_value_at(page, pos - 1, p->pred_buf, &p->pred_len) != 0)
+                return -1;
+        }
+    }
+
+    /* Patch at slot pos+1: was old slot pos; predecessor changed to X. Must
+       be present here (we ruled out pos == N). */
+    {
+        LeafPatch *p = &patches[n++];
+        p->new_slot = pos + 1;
+        if (leaf_decode_value_at(page, pos, p->val_buf, &p->val_len) != 0)
+            return -1;
+        uint8_t *src_e = page_entry(page, pos);
+        p->hash = leaf_entry_hash(src_e);
+        p->is_tomb = leaf_entry_is_tomb(src_e);
+        p->src_old_slot = pos;
+        if (((pos + 1) & (K - 1)) == 0) {
+            p->is_anchor = 1;
+        } else {
+            p->is_anchor = 0;
+            memcpy(p->pred_buf, value, vlen);
+            p->pred_len = vlen;
+        }
+    }
+
+    /* Anchor crossings: each new anchor at slot m*K (m*K > pos+1, m*K <= N
+       in the new layout where valid slot indices go 0..N) needs the old
+       slot (m*K - 1)'s value lifted into anchor form, plus its successor
+       slot m*K + 1 needs a fresh prefix relative to the new anchor. */
+    int first_anchor;
+    if (((pos + 1) & (K - 1)) == 0) {
+        /* Patch 1 already wrote an anchor at slot pos+1 — start after it. */
+        first_anchor = (pos + 1) + K;
+    } else {
+        /* Smallest m*K strictly greater than pos+1. */
+        first_anchor = ((pos + 1) / K + 1) * K;
+    }
+    for (int s = first_anchor; s <= N; s += K) {
+        if (n + 2 > LPI_MAX_PATCHES) return -1; /* shouldn't trip at K=16 */
+        /* Anchor patch at slot s: value comes from old slot (s - 1). */
+        LeafPatch *a = &patches[n++];
+        a->new_slot = s;
+        if (leaf_decode_value_at(page, s - 1, a->val_buf, &a->val_len) != 0)
+            return -1;
+        uint8_t *src_a = page_entry(page, s - 1);
+        a->hash = leaf_entry_hash(src_a);
+        a->is_tomb = leaf_entry_is_tomb(src_a);
+        a->src_old_slot = s - 1;
+        a->is_anchor = 1;
+
+        /* Successor patch at slot s+1: value comes from old slot s; prefix
+           is computed against the new anchor's value (cached in `a`). */
+        if (s + 1 <= N) {
+            LeafPatch *q = &patches[n++];
+            q->new_slot = s + 1;
+            if (leaf_decode_value_at(page, s, q->val_buf, &q->val_len) != 0)
+                return -1;
+            uint8_t *src_q = page_entry(page, s);
+            q->hash = leaf_entry_hash(src_q);
+            q->is_tomb = leaf_entry_is_tomb(src_q);
+            q->src_old_slot = s;
+            q->is_anchor = 0;
+            memcpy(q->pred_buf, a->val_buf, a->val_len);
+            q->pred_len = a->val_len;
+        }
+    }
+
+    /* Encode each patch: compute prefix_len, suffix_len, and entry_bytes. */
+    size_t total_new_bytes = 0;
+    for (int i = 0; i < n; i++) {
+        LeafPatch *p = &patches[i];
+        if (p->is_anchor) {
+            p->prefix_len = 0;
+            p->suffix_len = p->val_len;
+        } else {
+            size_t cpl = common_prefix_len(p->pred_buf, p->pred_len,
+                                            p->val_buf, p->val_len);
+            p->prefix_len = (uint8_t)cpl;
+            p->suffix_len = p->val_len - cpl;
+        }
+        p->entry_bytes = leaf_entry_bytes(p->suffix_len);
+        total_new_bytes += p->entry_bytes;
+    }
+
+    /* Sum the displaced old encoding sizes (for dead_bytes accounting). */
+    size_t total_dead_added = 0;
+    for (int i = 0; i < n; i++) {
+        if (patches[i].src_old_slot < 0) continue;
+        uint8_t *old_e = page_entry(page, patches[i].src_old_slot);
+        total_dead_added += 2 + (size_t)entry_data_len(old_e);
+    }
+
+    /* Space check. Need data room for the new entries + one extra slot
+       directory entry. */
+    size_t need = total_new_bytes + sizeof(uint16_t);
+    size_t free = page_free_space(page);
+    if (free < need) {
+        size_t reclaimable = free + (size_t)ph->dead_bytes;
+        if (reclaimable < need) return -1; /* caller drives split */
+        if (page_leaf_compact(page) != 0) return -1;
+        /* Compaction drops tombstones, so the slot count may have shrunk
+           and `pos` from the pre-compaction bsearch no longer points at
+           the right insertion slot. Re-bsearch with the same target
+           value. Patches reference old slot offsets via leaf_entry_hash
+           pointers, which compaction has moved — recursing rebuilds the
+           patch list from scratch against the compacted page. It cannot
+           recurse further because the page is now tight (free space
+           alone covers `need`). */
+#undef LPI_MAX_PATCHES
+        int new_pos = page_bsearch_leaf(page, value, vlen);
+        return page_insert_at_leaf(page, new_pos, value, vlen, hash);
+    }
+
+    /* Reserve space by lowering data_end once for the whole batch. Each
+       patch then gets a unique sub-range to write into, top of reservation
+       toward bottom. */
+    uint32_t reserve_start = ph->data_end - (uint32_t)total_new_bytes;
+    ph->data_end = reserve_start;
+    uint32_t cur_off = reserve_start;
+    for (int i = 0; i < n; i++) {
+        LeafPatch *p = &patches[i];
+        uint8_t *e = page + cur_off;
+        uint16_t dlen = (uint16_t)(1 + p->suffix_len + BT_HASH_SIZE);
+        bt_store_u16(e, (uint16_t)(p->is_tomb ? (dlen | 0x8000) : dlen));
+        e[2] = p->prefix_len;
+        const char *suffix = (p->is_anchor
+                                ? p->val_buf
+                                : p->val_buf + p->prefix_len);
+        memcpy(e + 3, suffix, p->suffix_len);
+        memcpy(e + 3 + p->suffix_len, p->hash, BT_HASH_SIZE);
+        p->new_offset = (uint16_t)cur_off;
+        cur_off += (uint32_t)p->entry_bytes;
+    }
+
+    /* Slot directory rewrite. Conceptually: shift slots[pos..N-1] up by one,
+       then point each patched slot at its new offset. Stage to a scratch
+       array to keep the logic linear; max length 257 (N+1). */
+    uint16_t *slots = page_slots(page);
+    uint16_t new_slots[260];
+    for (int i = 0; i < pos; i++) new_slots[i] = slots[i];
+    new_slots[pos] = 0;  /* placeholder; patch for slot pos overwrites */
+    for (int i = pos + 1; i <= N; i++) new_slots[i] = slots[i - 1];
+    for (int i = 0; i < n; i++)
+        new_slots[patches[i].new_slot] = patches[i].new_offset;
+    for (int i = 0; i <= N; i++) slots[i] = new_slots[i];
+    ph->count = (uint32_t)(N + 1);
+
+    /* Dead-byte accounting: the old encoded bytes for every patched
+       source slot are now unreachable from the slot directory. */
+    ph->dead_bytes += (uint32_t)total_dead_added;
+    return 0;
 }
 
 /* Insert entry into an INTERNAL page at position pos. Returns 0 on success,
@@ -1195,7 +1442,7 @@ void btree_delete(const char *path, const char *value, size_t vlen,
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
-    /* Traverse to leaf */
+    /* Descend to the leaf where the value's range begins. */
     uint32_t page_id = fh->root_page;
     while (1) {
         uint8_t *page = bt_page(&bt, page_id);
@@ -1206,21 +1453,45 @@ void btree_delete(const char *path, const char *value, size_t vlen,
         else page_id = entry_child(page_entry(page, pos - 1));
     }
 
-    /* Search within leaf */
-    uint8_t *page = bt_page(&bt, page_id);
-    int pos = page_bsearch(page, value, vlen);
+    /* Walk the leaf chain forward looking for the (value, hash) pair. Why
+       the chain and not just the descent target? Two cases the descent
+       alone misses:
+         (a) value == an internal-page separator key. With the `>=`
+             internal bsearch convention, descent lands on the leaf
+             holding the LAST values < separator — but a unique value
+             equal to the separator may live on the NEXT leaf as its
+             first entry.
+         (b) value is duplicated across leaves (status="PAID" with
+             many entries spilling across leaf boundaries). The target
+             record's hash may be on any of those leaves.
+       Stop as soon as we see a value strictly greater than target —
+       the chain is ascending so nothing further can match. If a leaf
+       has no slot >= target (pos == count), keep walking — the target
+       may be on the next leaf. */
+    while (page_id != 0) {
+        uint8_t *page = bt_page(&bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        int pos = page_bsearch(page, value, vlen);
 
-    LeafIter it;
-    leaf_iter_init(&it, page);
-    if (leaf_iter_seek(&it, pos)) {
-        do {
-            if (val_cmp(it.key_buf, it.key_len, value, vlen) != 0) break;
-            if (memcmp(it.hash, hash, BT_HASH_SIZE) == 0) {
-                page_remove_at(page, it.slot_idx);
-                fh->entry_count--;
-                break;
-            }
-        } while (leaf_iter_next(&it));
+        LeafIter it;
+        leaf_iter_init(&it, page);
+        int found = 0;
+        int saw_greater = 0;
+        if (leaf_iter_seek(&it, pos)) {
+            do {
+                int c = val_cmp(it.key_buf, it.key_len, value, vlen);
+                if (c > 0) { saw_greater = 1; break; }
+                if (c < 0) continue; /* shouldn't happen — leaf_iter_seek lands at-or-past */
+                if (memcmp(it.hash, hash, BT_HASH_SIZE) == 0) {
+                    page_remove_at(page, it.slot_idx);
+                    fh->entry_count--;
+                    found = 1;
+                    break;
+                }
+            } while (leaf_iter_next(&it));
+        }
+        if (found || saw_greater) break;
+        page_id = ph->next_leaf;
     }
 
     bt_release(&bt);

@@ -185,6 +185,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/test/cases/test_v2_index_leak_on_clear.c \
     src/test/cases/test_btree.c \
+    src/test/cases/test_btree_inplace_leaf.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_keyset.c \
