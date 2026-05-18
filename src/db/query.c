@@ -13837,15 +13837,25 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
     if (auto_key_kind == 2) {
-        /* Pre-initialise the sequence file at 0 — first `next` returns 1. */
+        /* Pre-initialise the sequence file at 0 — first `next` returns 1.
+           Use O_CREAT|O_EXCL so create-if-absent is one atomic syscall —
+           the previous stat() + fopen("w") pattern was a TOCTOU race
+           (CodeQL #89): an attacker who could win the gap between the
+           two calls could swap the path target for a symlink and
+           redirect the write. EEXIST is the silent no-op we want; any
+           other errno is logged but non-fatal (sequence file is
+           recoverable via reindex). */
         char seq_dir[PATH_MAX], seq_path[PATH_MAX];
         snprintf(seq_dir,  sizeof(seq_dir),  "%s/%s/%s/metadata/sequences", db_root, dir, object);
         snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, auto_seq_name);
         mkdirp(seq_dir);
-        struct stat sst;
-        if (stat(seq_path, &sst) != 0) {
-            FILE *sf = fopen(seq_path, "w");
-            if (sf) { fprintf(sf, "0\n"); fclose(sf); }
+        int sfd = open(seq_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (sfd >= 0) {
+            (void)write(sfd, "0\n", 2);
+            close(sfd);
+        } else if (errno != EEXIST) {
+            log_msg(1, "auto_key seq init: open(%s) failed: %s",
+                    seq_path, strerror(errno));
         }
     }
 
