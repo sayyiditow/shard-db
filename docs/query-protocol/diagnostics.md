@@ -34,8 +34,8 @@ Human-readable block with the same numbers. Use `format:"table"` from the CLI; J
 
 ### What to watch
 
-- **`ucache` hit rate** — below 90% on a read-heavy workload = `FCACHE_MAX` too low. Tracks **v1 (storage_version=1)** objects only — v2 slotcask objects route through `kfcache` + `segcache`, which sit behind the same `FCACHE_MAX` budget but aren't surfaced as separate JSON fields yet. For v2-only deployments, watch `bt_cache` instead.
-- **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived). Both engines route index reads through bt_cache, so this is the universal read-cache metric.
+- **`ucache` hit rate** — kept in the export for back-compat; idle on a slotcask install. Reads route through `kfcache` + `segcache` (under the same `FCACHE_MAX` budget) which aren't surfaced as separate JSON fields yet. Watch `bt_cache` instead.
+- **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived). The universal read-cache metric.
 - **`in_flight_writes`** — should drain quickly. Sustained high = bottleneck (disk, lock contention).
 - **`slow_queries` ring** — the last 64 queries exceeding `SLOW_QUERY_MS`. See also `slow-*.log` for history.
 
@@ -91,7 +91,7 @@ Wire it into Prometheus with a small textfile-exporter cron, or expose `/metrics
 
 ## shard-stats
 
-Per-keyfile (v2) or per-shard (v1) load factor and slot count.
+Per-keyfile load factor and slot count.
 
 ```json
 {"mode":"shard-stats","dir":"<dir>","object":"<obj>"}
@@ -100,7 +100,7 @@ Per-keyfile (v2) or per-shard (v1) load factor and slot count.
 {"mode":"shard-stats"}                            // all objects everywhere
 ```
 
-### Response (v2)
+### Response
 
 ```json
 {
@@ -114,27 +114,13 @@ Per-keyfile (v2) or per-shard (v1) load factor and slot count.
 }
 ```
 
-In v2 each row describes one keyfile shard (`data/kf/NNN.kf`) — the key→location index. Data segments under `data/streams/NNN/*.dat` are not surfaced here. `slots` is kf entry capacity; `records` is live entries (= live record count); `load` is `records/slots`; the kf auto-resplits when `load` crosses 0.75. `max_grows` is doublings observed past the splits-tier initial capacity.
-
-### Response (v1, legacy)
-
-```json
-{
-  "splits":16, "shards_on_disk":16,
-  "total_records":244,"total_bytes":1048576,
-  "shard_list": [
-    {"shard":0,"slots":256,"records":110,"load":0.430,"bytes":65536}
-  ],
-  "avg_rec_per_shard":15, "max_grows":0
-}
-```
+Each row describes one keyfile shard (`data/kf/NNN.kf`) — the key→location index. Data segments under `data/streams/NNN/*.dat` are not surfaced here. `slots` is kf entry capacity; `records` is live entries (= live record count); `load` is `records/slots`; the kf auto-resplits when `load` crosses 0.75. `max_grows` is doublings observed past the splits-tier initial capacity.
 
 ### What to watch
 
-- **Load over 0.5** (v1) — about to double `slots_per_shard`.
-- **Load over 0.75** (v2) — kf shard about to resplit; doubling cost is paid inline by the next writer.
+- **Load over 0.75** — kf shard about to resplit; doubling cost is paid inline by the next writer.
 - **Large skew across rows** — hash isn't evenly distributing. Usually a sign of an adversarial key distribution; `vacuum --splits N` can rebalance.
-- **`avg_rec_per_shard` past 200K (v1) or steadily climbing (v2)** — re-split with `vacuum --splits=N`.
+- **`avg_rec_per_shard` steadily climbing** — re-split with `vacuum --splits=N`.
 
 CLI:
 

@@ -121,7 +121,7 @@ When to care: heavy ad-hoc analytics that legitimately need bigger working sets.
 
 ## INDEX_BUILD_BUDGET_MB — reindex peak memory cap
 
-Caps peak memory of multi-field index builds (`./shard-db reindex`, `./shard-db add-index` with multiple fields, `./migrate` phase 2). The plural `cmd_add_indexes` extracts every indexed field's keys during one parallel scan of storage; without a budget that's `O(nfields × records)` resident, which OOMs hosts on big-record + many-index schemas.
+Caps peak memory of multi-field index builds (`./shard-db reindex`, `./shard-db add-index` with multiple fields). The plural `cmd_add_indexes` extracts every indexed field's keys during one parallel scan of storage; without a budget that's `O(nfields × records)` resident, which OOMs hosts on big-record + many-index schemas.
 
 - **Default 1024 MB**.
 - **Floor 64 MB**. Below this, even single-field passes can't fit reasonable working sets.

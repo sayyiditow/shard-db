@@ -4,6 +4,39 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.5
+
+Breaking-cleanup release. Legacy v1 (probe-into-slot) storage engine
+removed entirely; slotcask is the only supported layout. The `./migrate`
+upgrade binary is also dropped — already-on-slotcask installs upgrade
+with a binary swap.
+
+- **v1 storage engine removed.** Every Zone A / Zone B code path,
+  the `SHARD_ALLOW_V1_CREATE` test opt-in, the v1 text counts file,
+  and the `addr_from_hash` / `compute_addr` helpers are gone. `Schema`
+  + `SlotcaskSchemaInfo` lose their `storage_version` fields. The
+  `storage_version` slot in `schema.conf` is preserved on disk for
+  forward compatibility, and the daemon refuses any value other than
+  `2` at load with an error pointing operators at the 2026.05.4
+  migrate path.
+- **`./migrate` binary dropped.** Operators upgrading from a pre-2026.05.5
+  install with v1 objects on disk must first install 2026.05.4 and
+  run that release's `./migrate` to convert objects to slotcask, then
+  upgrade to 2026.05.5. Already-on-slotcask installs (2026.05.1+)
+  upgrade with a binary swap.
+- **edit-field shipped** — same-type schema mutations
+  (`varchar:N` width change, `numeric:P,S` precision/scale within
+  ranges, `default=` updates). Cross-type transforms remain refused.
+  See [Schema mutations](../query-protocol/schema-mutations.md).
+- **auto-key shipped** — `"auto_key":"uuid"` or
+  `"auto_key":"seq(<name>)"` at `create-object` makes the server
+  generate keys on inserts that omit the `key` field. Provided keys
+  go through upsert as before; CAS modifiers respected.
+- Test coverage retained: 77 cases / 3035 assertions still pass after
+  the cleanup. ~12 000 lines of dispatch + fallback code retired.
+
+Full notes: [release-notes/2026.05.5.md](../release-notes/2026.05.5.md).
+
 ## 2026.05.4
 
 Query performance, concurrency-safety, **and macOS support**. No protocol changes, no schema changes, no migration step — drop in the new binaries and restart.

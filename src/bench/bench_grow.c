@@ -67,8 +67,8 @@ static void run_scenario(TestClient *tc, const char *label, int splits, int rows
     char req[512];
     snprintf(req, sizeof(req),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"%s\","
-        "\"splits\":%d,\"max_key\":24,\"storage_version\":%d,"
-        "\"fields\":[\"v:varchar:128\"]}", obj, splits, bench_storage_version());
+        "\"splits\":%d,\"max_key\":24,"
+        "\"fields\":[\"v:varchar:128\"]}", obj, splits);
 
     char *resp = NULL;
     if (tc_request(tc, req, &resp) != 0) {

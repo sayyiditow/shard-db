@@ -128,7 +128,7 @@ Both lists live under `$DB_ROOT` so they travel with the data root.
 
 ## Schema — `schema.conf` and per-object `fields.conf`
 
-- `$DB_ROOT/schema.conf` — one line per object: `dir:object:splits:max_key:storage_version:streams`. Auto-managed by `create-object` (and `migrate-storage-version` during v1→v2 upgrade) — don't edit by hand. `storage_version=2` is the slotcask engine; `streams` is the number of seg-write streams (derived from nproc at create time, immutable for the object's life unless `vacuum` self-heals a streams-mismatch).
+- `$DB_ROOT/schema.conf` — one line per object: `dir:object:splits:max_key:2:streams[:auto_key=<mode>]`. Auto-managed by `create-object` — don't edit by hand. The literal `2` is the engine-version slot, kept on disk for forward compatibility; this version refuses any other value at load (legacy v1 objects must be upgraded via 2026.05.4's `./migrate` first). `streams` is the number of seg-write streams (derived from nproc at create time, immutable for the object's life unless `vacuum` self-heals a streams-mismatch).
 - `$DB_ROOT/<dir>/<object>/fields.conf` — typed field definitions, one per line: `name:type[:size|P,S][:default=...]`. Also auto-managed (via `create-object`, `add-field`, `remove-field`, `rename-field`).
 
 See [Concepts → Typed records](../concepts/typed-records.md) for the on-disk layout and all type definitions.
@@ -172,14 +172,14 @@ $DB_ROOT/
     slow-YYYY-MM-DD.log
 ```
 
-The v2 engine (`storage_version=2`, the default since 2026.05.1) separates **keys** from **values**:
+The slotcask engine separates **keys** from **values**:
 
 - `data/kf/NNN.kf` — keyfile shards. Each is a 24-byte file header (`SKF1` magic + version + live count + tombstone count) followed by a packed array of 24-byte slot headers. Slot count per shard is tiered on `splits` — 1M at `splits ≤ 16`, 256K at `splits ≤ 128`, 128K at `splits ≤ 1024`, 64K at `splits ≤ 4096`. Shards auto-resplit in-place (doubling capacity) at 75 % fill, up to a per-shard ceiling of 16M slots.
 - `data/streams/NNN/NNNNNN.dat` — append-only segment files. Each stream has its own subdirectory; segments rotate at 128 MB. Writers in different streams don't contend. The number of streams is fixed at `create-object` time from `nproc` (≤ 8 → nproc; ≤ 16 → 8; else 16).
 
 Each indexed field is split into `index_splits_for(splits)` btree files — non-linear curve in `src/db/types.h`: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`. Writes route by record hash to a single idx-shard; reads fan out across all shards in parallel.
 
-Legacy v1 objects (storage_version=1, pre-2026.05) use a different layout: `data/NNN.bin` shard files with Zone A (24-byte slot headers) + Zone B (record payloads) interleaved per shard, no kf/streams split. The `./migrate` binary rebuilds them as v2 on upgrade.
+Pre-2026.05.5 installs with legacy v1 (probe-into-slot, `data/NNN.bin` shard files with Zone A + Zone B layout) must first upgrade to 2026.05.4 and run that release's `./migrate` to convert objects to the slotcask layout — 2026.05.5+ refuses v1 objects at load.
 
 ## Next
 

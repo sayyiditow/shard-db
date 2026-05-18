@@ -1,15 +1,11 @@
-/* test_slotcask_v2_object.c — Phase-2A E2E test for storage_version=2 path.
+/* test_slotcask_v2_object.c — E2E test for slotcask object create.
  *
- * Phase 2A wires create-object's `storage_version=2` arg through the daemon
- * to schema.conf + on-disk slotcask layout. cmd_get / cmd_insert / cmd_delete
- * still take the legacy probe-into-slot path; that's Phase 2C. So this test
- * verifies the create-time wiring only:
+ * Verifies the create-object wiring through to schema.conf and on-disk
+ * slotcask layout:
  *   - response JSON carries storage_version + streams
  *   - schema.conf line has the 6-field form `dir:object:splits:max_key:2:N`
- *   - on-disk shape: keyfile_NNN.kf + stream_NNN/data_000000.dat + .dirty
- *   - default-version (no arg) still produces a v1 layout (data/ exists, no
- *     keyfile/stream files)
- *   - storage_version=99 is rejected
+ *   - on-disk shape: data/kf/NNN.kf + data/streams/NNN/NNNNNN.dat
+ *   - any client-supplied `storage_version` is rejected (field removed from API)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -71,12 +67,11 @@ static int test_slotcask_v2_object_run(void) {
     /* --- v2 create --- */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"sc_users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\",\"age:int\"],"
         "\"indexes\":[\"age\"]}", &resp);
     ASSERT_NOT_NULL(resp, "v2 create-object response");
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "v2 create succeeds");
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 response carries storage_version=2");
     ASSERT_CONTAINS(resp, "\"streams\":", "v2 response carries streams field");
     free(resp); resp = NULL;
 
@@ -84,7 +79,6 @@ static int test_slotcask_v2_object_run(void) {
     char *line = read_schema_line(env.db_root, "v2tenant", "sc_users");
     ASSERT_NOT_NULL(line, "v2 schema.conf line present");
     if (line) {
-        ASSERT_CONTAINS(line, ":2:", "schema line carries storage_version=2");
         /* Count the colons — must be at least 5 (dir:obj:splits:max_key:sv:streams). */
         int colons = 0;
         for (char *c = line; *c; c++) if (*c == ':') colons++;
@@ -111,14 +105,13 @@ static int test_slotcask_v2_object_run(void) {
        file is correctly absent after a clean create. (Recovery exercise lives
        in a separate test.) */
 
-    /* --- default create (no storage_version) — should land on v2 --- */
+    /* --- default create (no storage_version) — lands on v2 (only engine
+           supported in 2026.05.5+). --- */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"default_users\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "default create succeeds");
-    ASSERT_CONTAINS(resp, "\"storage_version\":2",
-                    "default create lands on v2");
     free(resp); resp = NULL;
 
     line = read_schema_line(env.db_root, "v2tenant", "default_users");
@@ -135,21 +128,13 @@ static int test_slotcask_v2_object_run(void) {
     ASSERT_TRUE(file_exists(path),
                 "default lands on v2 layout (data/kf/000.kf present)");
 
-    /* --- explicit storage_version=1 also works --- */
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"explicit_v1\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":1,"
-        "\"fields\":[\"name:varchar:32\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "explicit v1 create succeeds");
-    free(resp); resp = NULL;
-
-    /* --- invalid storage_version rejected --- */
+    /* --- any explicit storage_version is rejected (field removed from API) --- */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"v2tenant\",\"object\":\"bogus\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":99,"
+        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
         "\"fields\":[\"name:varchar:32\"]}", &resp);
-    ASSERT_CONTAINS(resp, "storage_version=99 invalid",
-                    "storage_version=99 rejected with error");
+    ASSERT_CONTAINS(resp, "storage_version is not configurable",
+                    "explicit storage_version rejected with the documented error");
     free(resp); resp = NULL;
 
     /* The bogus object must not be on disk. */

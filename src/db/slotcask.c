@@ -69,7 +69,7 @@ static inline void compute_hash(const void *key, size_t klen, uint8_t out[16]) {
 /* Delegates to the version-aware compute_record_shard so the byte-order
    logic lives in exactly one place (storage.c). v2 = little-endian. */
 static int shard_for_hash(const uint8_t hash[16], int num_shards) {
-    return compute_record_shard(hash, num_shards, 2);
+    return compute_record_shard(hash, num_shards);
 }
 
 static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
@@ -100,9 +100,7 @@ static int mkdirp_local(const char *path) {
      <data_dir>/data/streams/NNN/NNNNNN.dat rotating segment files per stream
    The `data/` umbrella keeps engine internals out of the obj root, so
    fields.conf, indexes/, files/, etc. aren't visually mixed with kf/seg
-   files. `data/` here mirrors the v1 path of the same name; the migrate
-   runner moves v1's data/ to data.legacy/ so the new structure can be
-   created cleanly. */
+   files. */
 static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
     snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }
@@ -3971,7 +3969,7 @@ static int reg_probe(const char *key) {
 SlotcaskDb *slotcask_registry_get(const char *effective_root,
                                   const char *object,
                                   const SlotcaskSchemaInfo *info) {
-    if (!info || info->storage_version != 2) return NULL;
+    if (!info) return NULL;
     if (info->splits <= 0 || info->slot_size <= 0 || info->streams <= 0)
         return NULL;
 

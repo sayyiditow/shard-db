@@ -126,10 +126,9 @@ static int run_strategy(const char *label, const char *ratio_value,
         char create[1024];
         snprintf(create, sizeof(create),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"inc\","
-            "\"splits\":64,\"max_key\":32,\"storage_version\":%d,"
+            "\"splits\":64,\"max_key\":32,"
             "\"fields\":[\"status:varchar:16\",\"region:varchar:16\",\"amount:double\"],"
-            "\"indexes\":[\"status\",\"region\"]}",
-            bench_storage_version());
+            "\"indexes\":[\"status\",\"region\"]}");
         tc_request(tc, create, &resp);
         free(resp); resp = NULL;
     }

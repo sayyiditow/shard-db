@@ -1,28 +1,9 @@
 #include "types.h"
 #include "slotcask.h"
 
-/* ========== Hashing & Addressing ==========
- * compute_hash_raw lives in util.c (single source of truth — slotcask.c
- * also calls it, so the canonical-XXH128 byte layout stays bit-identical
- * across the engine and the storage layer). */
-
-/* Derive shard_id and raw slot position from hash. Slot is 32-bit to
-   support dynamic per-shard growth beyond 65K slots; callers mask with
-   (slots_per_shard - 1) when probing. */
-void addr_from_hash(const uint8_t hash[16], int splits, int *shard_id, int *slot) {
-    /* v1 byte order — addr_from_hash is the v1 path's helper. */
-    *shard_id = compute_record_shard(hash, splits, 1);
-    /* Bytes 2-5: 32 bits of slot entropy (v1 zone-A probe; v2 ignores). */
-    uint32_t raw = ((uint32_t)hash[2] << 24) | ((uint32_t)hash[3] << 16)
-                 | ((uint32_t)hash[4] << 8)  |  (uint32_t)hash[5];
-    *slot = (int)raw;
-}
-
-void compute_addr(const char *key, size_t key_len, int splits,
-                         uint8_t hash_out[16], int *shard_id, int *slot) {
-    compute_hash_raw(key, key_len, hash_out);
-    addr_from_hash(hash_out, splits, shard_id, slot);
-}
+/* Hashing & shard derivation live in util.c (compute_hash_raw) and
+   slotcask.c (compute_record_shard) — single source of truth across the
+   engine and storage layer. */
 
 /* Shard filename format: <dir>/NNN.bin (3 hex digits, supports up to MAX_SPLITS=4096).
    Single source of truth — change here if the format ever changes. */
@@ -927,120 +908,31 @@ static void update_counts(const char *db_root, const char *object, int live_delt
     }
 }
 
+/* The slotcask kf header is the source of truth for record counts —
+   slotcask_put / slotcask_delete update it atomically under the kf-shard
+   wrlock. The four mutators below remain as no-ops so existing callers
+   (bulk-insert / vacuum / truncate / etc.) keep their bookkeeping shape
+   without forcing every site to dispatch on storage layout. */
 void update_count(const char *db_root, const char *object, int delta) {
-    /* v2: kf header is the source of truth; slotcask_put / slotcask_delete
-       have already updated it atomically under the kf wrlock. Skip the
-       legacy text-counts write to avoid a stale-on-crash divergence
-       between cache and kf. v1 still uses the text counts file. */
-    /* Same dual-form normalisation as resolve_counts. */
-    char eff_root[PATH_MAX]; const char *bare_obj;
-    const char *slash = strchr(object, '/');
-    if (slash) {
-        size_t dir_len = (size_t)(slash - object);
-        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
-                 db_root, (int)dir_len, object);
-        bare_obj = slash + 1;
-    } else {
-        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
-        bare_obj = object;
-    }
-    Schema sc = load_schema(eff_root, bare_obj);
-    if (sc.storage_version == 2) return;
-    update_counts(db_root, object, delta, 0);
+    (void)db_root; (void)object; (void)delta;
 }
 
 void update_deleted_count(const char *db_root, const char *object, int delta) {
-    /* Same dual-form normalisation as resolve_counts. */
-    char eff_root[PATH_MAX]; const char *bare_obj;
-    const char *slash = strchr(object, '/');
-    if (slash) {
-        size_t dir_len = (size_t)(slash - object);
-        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
-                 db_root, (int)dir_len, object);
-        bare_obj = slash + 1;
-    } else {
-        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
-        bare_obj = object;
-    }
-    Schema sc = load_schema(eff_root, bare_obj);
-    if (sc.storage_version == 2) return;
-    update_counts(db_root, object, 0, delta);
+    (void)db_root; (void)object; (void)delta;
 }
 
 void set_count(const char *db_root, const char *object, int count) {
-    /* v2: kf header is the source of truth; truncate / rebuild / vacuum
-       already update it atomically. Skip the legacy text-counts write. */
-    /* Same dual-form normalisation as resolve_counts. */
-    char eff_root[PATH_MAX]; const char *bare_obj;
-    const char *slash = strchr(object, '/');
-    if (slash) {
-        size_t dir_len = (size_t)(slash - object);
-        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
-                 db_root, (int)dir_len, object);
-        bare_obj = slash + 1;
-    } else {
-        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
-        bare_obj = object;
-    }
-    Schema sc = load_schema(eff_root, bare_obj);
-    if (sc.storage_version == 2) return;
-    char cpath[PATH_MAX], lpath[PATH_MAX];
-    counts_paths(cpath, lpath, db_root, object);
-    CountsCacheEntry *e = counts_cache_get(cpath);
-    if (e) {
-        atomic_store_explicit(&e->live, (int64_t)count, memory_order_relaxed);
-        counts_flush_entry(cpath, lpath, e);  /* set_count callers expect persistence */
-        return;
-    }
-    /* Cache-full fallback — direct disk write. */
-    int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
-    if (lockfd < 0) { log_msg(1, "set_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
-    flock(lockfd, LOCK_EX);
-    int live, del;
-    counts_read_locked(cpath, &live, &del);
-    counts_write_locked(cpath, count, del);
-    flock(lockfd, LOCK_UN);
-    close(lockfd);
+    (void)db_root; (void)object; (void)count;
 }
 
 void reset_deleted_count(const char *db_root, const char *object) {
-    /* Same dual-form normalisation as resolve_counts. */
-    char eff_root[PATH_MAX]; const char *bare_obj;
-    const char *slash = strchr(object, '/');
-    if (slash) {
-        size_t dir_len = (size_t)(slash - object);
-        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
-                 db_root, (int)dir_len, object);
-        bare_obj = slash + 1;
-    } else {
-        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
-        bare_obj = object;
-    }
-    Schema sc = load_schema(eff_root, bare_obj);
-    if (sc.storage_version == 2) return;
-    char cpath[PATH_MAX], lpath[PATH_MAX];
-    counts_paths(cpath, lpath, db_root, object);
-    CountsCacheEntry *e = counts_cache_get(cpath);
-    if (e) {
-        atomic_store_explicit(&e->deleted, 0, memory_order_relaxed);
-        counts_flush_entry(cpath, lpath, e);
-        return;
-    }
-    int lockfd = open(lpath, O_RDWR | O_CREAT, 0644);
-    if (lockfd < 0) { log_msg(1, "reset_deleted_count: open(%s) failed: %s", lpath, strerror(errno)); return; }
-    flock(lockfd, LOCK_EX);
-    int live, del;
-    counts_read_locked(cpath, &live, &del);
-    counts_write_locked(cpath, live, 0);
-    flock(lockfd, LOCK_UN);
-    close(lockfd);
+    (void)db_root; (void)object;
 }
 
-/* Resolve (live, deleted) for an object. v2 sums kf headers — the kf header
-   is updated atomically inside slotcask_put / slotcask_delete and is the
-   single source of truth for record counts (cannot go stale across daemon
-   crashes the way a separate counts file can). v1 falls back to the legacy
-   text counts file.
+/* Resolve (live, deleted) for an object. Sums kf headers — each is updated
+   atomically inside slotcask_put / slotcask_delete and is the single source
+   of truth for record counts (cannot go stale across daemon crashes the
+   way a separate counts file would).
 
    Callers pass `object` in two forms historically:
      1. (db_root, "object")          — most call sites
@@ -1062,32 +954,16 @@ static int resolve_counts(const char *db_root, const char *object,
         bare_obj = object;
     }
     Schema sc = load_schema(eff_root, bare_obj);
-    if (sc.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
-        if (!sdb) { *out_live = 0; *out_deleted = 0; return -1; }
-        uint64_t total = 0, deleted = 0;
-        slotcask_sum_kf_totals(sdb, &total, &deleted);
-        *out_live    = total > deleted ? total - deleted : 0;
-        *out_deleted = deleted;
-        return 0;
-    }
-    /* v1 fallback (legacy text counts file). */
-    char cpath[PATH_MAX], lpath[PATH_MAX];
-    counts_paths(cpath, lpath, db_root, object);
-    int live = 0, del = 0;
-    CountsCacheEntry *e = counts_cache_get(cpath);
-    if (e) {
-        live = (int)atomic_load_explicit(&e->live, memory_order_relaxed);
-        del  = (int)atomic_load_explicit(&e->deleted, memory_order_relaxed);
-    } else {
-        counts_read_locked(cpath, &live, &del);
-    }
-    *out_live = (uint64_t)live;
-    *out_deleted = (uint64_t)del;
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size,
+        .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
+    if (!sdb) { *out_live = 0; *out_deleted = 0; return -1; }
+    uint64_t total = 0, deleted = 0;
+    slotcask_sum_kf_totals(sdb, &total, &deleted);
+    *out_live    = total > deleted ? total - deleted : 0;
+    *out_deleted = deleted;
     return 0;
 }
 
@@ -1112,67 +988,25 @@ int cmd_get(const char *db_root, const char *object,
             const char *key, size_t klen) {
     Schema sc = load_schema(db_root, object);
 
-    /* v2 dispatch: route through slotcask. The wire response shape (bare
-       value dict for single-key get, per 2026.05.1) stays the same. */
-    if (sc.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
-        void *val = NULL; size_t vlen = 0;
-        if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
-            OUT("{\"error\":\"Not found\"}\n");
-            return 1;
-        }
-        log_msg(4, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
-        TypedSchema *ts = load_typed_schema(db_root, object);
-        typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
-                             g_out ? g_out : stdout);
-        fputc('\n', g_out ? g_out : stdout);
-        free(val);
-        return 0;
+    /* Route through slotcask. Wire response shape (bare value dict for
+       single-key get, per 2026.05.1) is preserved. */
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size,
+        .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
+    void *val = NULL; size_t vlen = 0;
+    if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+        OUT("{\"error\":\"Not found\"}\n");
+        return 1;
     }
-
-    uint8_t hash[16]; int shard_id, start_slot;
-    compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
-
-    /* Probe Zone A (metadata-only) */
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-    int slot = -1;
-    for (uint32_t i = 0; i < slots; i++) {
-        uint32_t s = ((uint32_t)start_slot + i) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0) break;
-        if (h->flag == 2) continue;
-        if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-            h->key_len == klen &&
-            memcmp(fc.map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
-            slot = (int)s; break;
-        }
-    }
-
-    if (slot < 0) { fcache_release(fc); OUT("{\"error\":\"Not found\"}\n"); return 1; }
-
-    SlotHeader *hdr = (SlotHeader *)(fc.map + zoneA_off(slot));
-    log_msg(4, "GET %s (klen=%zu, %u bytes)", object, klen, hdr->value_len);
-
-    const char *raw = (const char *)(fc.map + zoneB_off(slot, slots, sc.slot_size) + hdr->key_len);
-
+    log_msg(4, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
     TypedSchema *ts = load_typed_schema(db_root, object);
-    /* Stream straight into g_out — saves a malloc + memcpy on every GET. */
-    typed_decode_stream(ts, (const uint8_t *)raw, hdr->value_len,
-                        g_out ? g_out : stdout);
+    typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
+                         g_out ? g_out : stdout);
     fputc('\n', g_out ? g_out : stdout);
-    fcache_release(fc);
+    free(val);
     return 0;
 }
 
@@ -1376,7 +1210,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
-        .streams = sc->streams, .storage_version = 2,
+        .streams = sc->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
@@ -1466,174 +1300,8 @@ int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen, const char *value,
                const char *if_json, int if_not_exists) {
     Schema sc = load_schema(db_root, object);
-
-    if (sc.storage_version == 2) {
-        return cmd_insert_v2(db_root, object, key, klen, value, if_json,
-                             if_not_exists, &sc);
-    }
-
-    uint8_t hash[16]; int shard_id, start_slot;
-
-    TypedSchema *ts = load_typed_schema(db_root, object);
-    if (!ts) {
-        OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
-        return 1;
-    }
-    uint8_t *typed_buf = NULL;
-    const char *store_value;
-    size_t vlen;
-
-    typed_buf = malloc(ts->total_size);
-    int enc = typed_encode_defaults(ts, value, typed_buf, ts->total_size, db_root, object);
-    if (enc < 0) {
-        free(typed_buf);
-        OUT("{\"error\":\"Typed encode failed\"}\n");
-        return 1;
-    }
-    store_value = (const char *)typed_buf;
-    vlen = ts->total_size;
-
-    if ((int)klen > sc.max_key) {
-        fprintf(stderr, "Error: Key too large (%zu > %d)\n", klen, sc.max_key);
-        free(typed_buf);
-        return 1;
-    }
-    if ((int)vlen > sc.max_value) {
-        fprintf(stderr, "Error: Value too large (%zu > %d)\n", vlen, sc.max_value);
-        free(typed_buf);
-        return 1;
-    }
-
-    compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    /* Acquire write lock on cached shard (creates with INITIAL_SLOTS if missing) */
-    FcacheRead wh = ucache_get_write(shard, sc.slot_size);
-    if (!wh.map) { free(typed_buf); OUT("{\"error\":\"Cannot open shard\"}\n"); return 1; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    /* Probe Zone A */
-    int slot = -1, first_tomb = -1;
-    for (uint32_t i = 0; i < slots; i++) {
-        uint32_t s = ((uint32_t)start_slot + i) & mask;
-        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) { slot = (first_tomb >= 0) ? first_tomb : (int)s; break; }
-        if (h->flag == 2) { if (first_tomb < 0) first_tomb = (int)s; continue; }
-        if (memcmp(h->hash, hash, 16) == 0 && h->key_len == klen &&
-            memcmp(map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) { slot = (int)s; break; }
-    }
-    if (slot < 0 && first_tomb >= 0) slot = first_tomb;
-    if (slot < 0) { ucache_write_release(wh); log_msg(1, "HASH TABLE FULL %s (klen=%zu) shard=%d", object, klen, shard_id); OUT("{\"error\":\"Hash table full\"}\n"); free(typed_buf); return 1; }
-
-    SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
-    int is_update = (existing->flag == 1 && memcmp(existing->hash, hash, 16) == 0);
-
-    /* CAS: check conditions before writing */
-    if (if_not_exists && is_update) {
-        /* Record already exists — CAS failure */
-        TypedSchema *ts2 = load_typed_schema(db_root, object);
-        const uint8_t *old_raw = map + zoneB_off(slot, slots, sc.slot_size) + existing->key_len;
-        char *cur = typed_decode(ts2, old_raw, existing->value_len);
-        ucache_write_release(wh);
-        OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n", cur ? cur : "null");
-        free(cur); free(typed_buf);
-        return 1;
-    }
-    if (if_json) {
-        if (!is_update) {
-            /* Record doesn't exist — condition can't match */
-            ucache_write_release(wh);
-            OUT("{\"error\":\"condition_not_met\",\"current\":null}\n");
-            free(typed_buf);
-            return 1;
-        }
-        SearchCriterion *crit = NULL; int ncrit = 0;
-        parse_criteria_json(if_json, &crit, &ncrit);
-        TypedSchema *ts2 = load_typed_schema(db_root, object);
-        const uint8_t *old_raw = map + zoneB_off(slot, slots, sc.slot_size) + existing->key_len;
-        int pass = cas_check(ts2, old_raw, crit, ncrit);
-        if (!pass) {
-            char *cur = typed_decode(ts2, old_raw, existing->value_len);
-            ucache_write_release(wh);
-            OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n", cur ? cur : "null");
-            free(cur); free_criteria(crit, ncrit); free(typed_buf);
-            return 1;
-        }
-        free_criteria(crit, ncrit);
-    }
-
-    /* Save old value as JSON for index diff (only if updating) */
-    char *old_value = NULL;
-    if (is_update && existing->value_len > 0) {
-        const char *old_raw = (const char *)(map + zoneB_off(slot, slots, sc.slot_size) + existing->key_len);
-        old_value = typed_decode(ts, (const uint8_t *)old_raw, existing->value_len);
-    }
-
-    /* Write header+payload and activate atomically while holding wrlock.
-       Growth can safely relocate this slot on the next grow tick because the
-       record is fully active (flag=1) before the lock is released. */
-    SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-    memset(hdr, 0, HEADER_SIZE);
-    memcpy(hdr->hash, hash, 16);
-    hdr->flag = 0;
-    hdr->key_len = (uint16_t)klen;
-    hdr->value_len = (uint32_t)vlen;
-    uint8_t *payload = map + zoneB_off(slot, slots, sc.slot_size);
-    memcpy(payload, key, klen);
-    memcpy(payload + klen, store_value, vlen);
-    hdr->flag = 1;
-    if (!is_update) ucache_bump_record_count(wh.slot, 1);
-    int u_slot = wh.slot;
-    ucache_write_release(wh);
-
-    /* Indexing — parallel per field, skip unchanged values */
-    char fields[MAX_FIELDS][256];
-    int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
-    /* load_index_fields null-terminates each entry within 256 bytes
-       (config.c:698 cache-hit, :720 cache-miss). Re-asserting the term
-       in caller scope so Coverity STRING_NULL stops chaining through
-       every fields[i] consumer downstream. Cheap: one byte write per
-       index field on the schema-load path (once per query). */
-    for (int _i = 0; _i < nfields; _i++) fields[_i][255] = '\0';
-    if (nfields > 0 && is_update && old_value) {
-        TypedSchema *idx_ts = load_typed_schema(db_root, object);
-        for (int i = 0; i < nfields; i++) {
-            uint8_t *new_key = NULL, *old_key = NULL;
-            size_t new_len = 0, old_len = 0;
-            int have_new = build_index_key_from_json(idx_ts, value, fields[i], &new_key, &new_len);
-            int have_old = build_index_key_from_json(idx_ts, old_value, fields[i], &old_key, &old_len);
-            int changed = 0;
-            if (have_new && !have_old) changed = 1;
-            else if (have_new && have_old) {
-                if (new_len != old_len || memcmp(new_key, old_key, new_len) != 0) changed = 1;
-            }
-            if (changed) {
-                if (have_old) delete_index_entry(db_root, object, fields[i], sc.splits, old_key, old_len, hash);
-                if (have_new) write_index_entry(db_root, object, fields[i], sc.splits, new_key, new_len, hash);
-            }
-            free(new_key); free(old_key);
-        }
-    } else {
-        index_parallel(db_root, object, sc.splits, value, hash, fields, nfields);
-    }
-    free(old_value);
-
-    if (!is_update) update_count(db_root, object, 1);
-    char wire_key[1100];
-    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
-    log_msg(3, "%s %s.%s (shard=%d slot=%d)", is_update ? "UPDATE" : "INSERT",
-            object, wire_key, shard_id, slot);
-
-    /* Post-insert: check if this shard should grow (50% load factor). */
-    if (!is_update) ucache_maybe_grow(u_slot, sc.slot_size);
-
-    free(typed_buf);
-    OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n", is_update ? "updated" : "inserted", wire_key);
-    return 0;
+    return cmd_insert_v2(db_root, object, key, klen, value, if_json,
+                         if_not_exists, &sc);
 }
 
 /* ========== PARTIAL UPDATE — v2 (slotcask) helper ==========
@@ -1709,7 +1377,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
                          const char *if_json, int dry_run, const Schema *sc) {
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
-        .streams = sc->streams, .storage_version = 2,
+        .streams = sc->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
@@ -1858,179 +1526,8 @@ int cmd_update(const char *db_root, const char *object,
                const char *partial_json,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
-
-    if (sc.storage_version == 2) {
-        return cmd_update_v2(db_root, object, key, klen, partial_json,
-                             if_json, dry_run, &sc);
-    }
-
-    uint8_t hash[16]; int shard_id, start_slot;
-    compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    /* Find the record (Zone A probe) */
-    int slot = -1;
-    for (uint32_t i = 0; i < slots; i++) {
-        uint32_t s = ((uint32_t)start_slot + i) & mask;
-        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag == 2) continue;
-        if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-            h->key_len == klen &&
-            memcmp(map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
-            slot = (int)s; break;
-        }
-    }
-
-    if (slot < 0) {
-        ucache_write_release(wh);
-        OUT("{\"error\":\"Not found\"}\n"); return 1;
-    }
-
-    SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-    uint8_t *value_ptr = map + zoneB_off(slot, slots, sc.slot_size) + hdr->key_len;
-
-    /* Load typed schema for in-place update */
-    TypedSchema *ts = load_typed_schema(db_root, object);
-
-    /* CAS: check conditions before writing */
-    if (if_json && ts) {
-        SearchCriterion *crit = NULL; int ncrit = 0;
-        parse_criteria_json(if_json, &crit, &ncrit);
-        int pass = cas_check(ts, value_ptr, crit, ncrit);
-        if (!pass) {
-            char *cur = typed_decode(ts, value_ptr, hdr->value_len);
-            ucache_write_release(wh);
-            OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n", cur ? cur : "null");
-            free(cur); free_criteria(crit, ncrit);
-            return 1;
-        }
-        free_criteria(crit, ncrit);
-    }
-
-    if (dry_run) {
-        ucache_write_release(wh);
-        char wire_key[1100];
-        format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
-        OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", wire_key);
-        return 0;
-    }
-
-    /* Index fields — collect old values before modifying */
-    char idx_fields[MAX_FIELDS][256];
-    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* see fields[] re-term comment above */
-    uint8_t *old_idx_bufs[MAX_FIELDS];
-    size_t  old_idx_lens[MAX_FIELDS];
-    int     old_idx_have[MAX_FIELDS];
-    memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-    memset(old_idx_lens, 0, sizeof(old_idx_lens));
-    memset(old_idx_have, 0, sizeof(old_idx_have));
-
-    if (ts) {
-        /* ===== TYPED BINARY: in-place field update at known offsets ===== */
-
-        /* Extract fields from partial JSON */
-        const char *field_names[MAX_FIELDS];
-        char *field_vals[MAX_FIELDS];
-        for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
-        json_get_fields(partial_json, field_names, ts->nfields, field_vals);
-
-        /* Save old index values (as index-key bytes) before modifying. */
-        for (int i = 0; i < nidx; i++) {
-            old_idx_have[i] = build_index_key_from_record(ts, value_ptr, idx_fields[i],
-                                                         &old_idx_bufs[i], &old_idx_lens[i]);
-        }
-
-        /* Write changed fields directly at byte offsets — no decode/merge/re-encode.
-           Tombstoned fields are skipped (their bytes stay reserved but unused). */
-        for (int i = 0; i < ts->nfields; i++) {
-            if (field_vals[i]) {
-                if (!ts->fields[i].removed)
-                    encode_field(&ts->fields[i], field_vals[i], value_ptr + ts->fields[i].offset);
-                free(field_vals[i]);
-            }
-        }
-
-        /* auto_update fields: always stamp current datetime on every update */
-        for (int i = 0; i < ts->nfields; i++) {
-            if (ts->fields[i].removed) continue;
-            if (ts->fields[i].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm;
-                localtime_r(&now, &tm);
-                if (ts->fields[i].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                             tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&ts->fields[i], tbuf, value_ptr + ts->fields[i].offset);
-            }
-        }
-
-        /* Read new index values while we still hold the write lock (same mmap) */
-        if (nidx > 0) {
-            uint8_t *new_val = map + zoneB_off(slot, slots, sc.slot_size) + klen;
-            for (int i = 0; i < nidx; i++) {
-                uint8_t *new_buf = NULL;
-                size_t new_len = 0;
-                int have_new = build_index_key_from_record(ts, new_val, idx_fields[i],
-                                                          &new_buf, &new_len);
-                int changed = 0;
-                if (have_new && !old_idx_have[i]) changed = 1;
-                else if (!have_new && old_idx_have[i]) changed = 1;
-                else if (have_new && old_idx_have[i]) {
-                    if (new_len != old_idx_lens[i] ||
-                        memcmp(new_buf, old_idx_bufs[i], new_len) != 0) changed = 1;
-                }
-                if (changed) {
-                    if (old_idx_have[i])
-                        delete_index_entry(db_root, object, idx_fields[i], sc.splits,
-                                           old_idx_bufs[i], old_idx_lens[i], hash);
-                    if (have_new)
-                        write_index_entry(db_root, object, idx_fields[i], sc.splits,
-                                          new_buf, new_len, hash);
-                }
-                free(old_idx_bufs[i]);
-                free(new_buf);
-            }
-        }
-
-        ucache_write_release(wh);
-    }
-    char wire_key[1100];
-    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
-    log_msg(3, "UPDATE %s.%s (shard=%d slot=%d)", object, wire_key, shard_id, slot);
-    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
-    return 0;
-}
-
-/* ========== DELETE helpers ========== */
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const char *field;
-    int splits;
-    const uint8_t *val;
-    size_t vlen;
-    const uint8_t *hash;
-} DelIdxArg;
-static void *del_idx_fn(void *arg) {
-    DelIdxArg *a = (DelIdxArg *)arg;
-    delete_index_entry(a->db_root, a->object, a->field, a->splits,
-                       a->val, a->vlen, a->hash);
-    return NULL;
+    return cmd_update_v2(db_root, object, key, klen, partial_json,
+                         if_json, dry_run, &sc);
 }
 
 /* ========== DELETE — v2 (slotcask) helper ========== */
@@ -2081,7 +1578,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
 
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
-        .streams = sc->streams, .storage_version = 2,
+        .streams = sc->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
@@ -2188,113 +1685,7 @@ int cmd_delete(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *if_json, int dry_run) {
     Schema sc = load_schema(db_root, object);
-
-    if (sc.storage_version == 2) {
-        return cmd_delete_v2(db_root, object, key, klen, if_json, dry_run, &sc);
-    }
-
-    char wire_key[1100];
-    format_wire_key(&sc, key, klen, wire_key, sizeof(wire_key));
-
-    uint8_t hash[16]; int shard_id, start_slot;
-    compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key); return 0; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    int slot = -1;
-    for (uint32_t i = 0; i < slots; i++) {
-        uint32_t s = ((uint32_t)start_slot + i) & mask;
-        SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag == 2) continue;
-        if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-            h->key_len == klen &&
-            memcmp(map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
-            slot = (int)s; break;
-        }
-    }
-
-    if (slot >= 0) {
-        SlotHeader *h = (SlotHeader *)(map + zoneA_off(slot));
-
-        /* CAS: check conditions before deleting */
-        if (if_json) {
-            const uint8_t *raw = (const uint8_t *)(map + zoneB_off(slot, slots, sc.slot_size) + h->key_len);
-            TypedSchema *ts_cas = load_typed_schema(db_root, object);
-            SearchCriterion *crit = NULL; int ncrit = 0;
-            parse_criteria_json(if_json, &crit, &ncrit);
-            int pass = cas_check(ts_cas, raw, crit, ncrit);
-            if (!pass) {
-                char *cur = typed_decode(ts_cas, raw, h->value_len);
-                ucache_write_release(wh);
-                OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n", cur ? cur : "null");
-                free(cur); free_criteria(crit, ncrit);
-                return 1;
-            }
-            free_criteria(crit, ncrit);
-        }
-
-        if (dry_run) {
-            ucache_write_release(wh);
-            OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", wire_key);
-            return 0;
-        }
-
-        /* Extract indexed field values BEFORE tombstoning, for index cleanup */
-        char idx_fields[MAX_FIELDS][256];
-        int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-        for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* see fields[] re-term comment above */
-        uint8_t *idx_bufs[MAX_FIELDS];
-        size_t   idx_lens[MAX_FIELDS];
-        int      idx_have[MAX_FIELDS];
-        memset(idx_bufs, 0, sizeof(idx_bufs));
-        memset(idx_lens, 0, sizeof(idx_lens));
-        memset(idx_have, 0, sizeof(idx_have));
-
-        if (nidx > 0) {
-            const uint8_t *raw = (const uint8_t *)(map + zoneB_off(slot, slots, sc.slot_size) + h->key_len);
-            TypedSchema *ts = load_typed_schema(db_root, object);
-            for (int i = 0; i < nidx; i++) {
-                idx_have[i] = build_index_key_from_record(ts, raw, idx_fields[i],
-                                                         &idx_bufs[i], &idx_lens[i]);
-            }
-        }
-
-        /* Tombstone the record */
-        h->flag = 2;
-        ucache_bump_record_count(wh.slot, -1);
-
-        ucache_write_release(wh);
-
-        /* Clean up index entries — parallel across indexes via shared pool */
-        if (nidx > 0) {
-            DelIdxArg dia[MAX_FIELDS];
-            int dic = 0;
-            for (int i = 0; i < nidx; i++) {
-                if (idx_have[i]) {
-                    dia[dic++] = (DelIdxArg){ db_root, object, idx_fields[i], sc.splits,
-                                              idx_bufs[i], idx_lens[i], hash };
-                }
-            }
-            parallel_for(del_idx_fn, dia, dic, sizeof(DelIdxArg));
-        }
-        for (int i = 0; i < nidx; i++) free(idx_bufs[i]);
-
-        update_counts(db_root, object, -1, 1);
-        log_msg(3, "DELETE %s.%s", object, wire_key);
-        OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
-    } else {
-        ucache_write_release(wh);
-        OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
-    }
-    return 0;
+    return cmd_delete_v2(db_root, object, key, klen, if_json, dry_run, &sc);
 }
 
 /* ========== MULTI-KEY GET ========== */
@@ -2324,65 +1715,37 @@ static void *multi_exists_shard_worker(void *arg) {
     MultiExistsShardWork *sw = (MultiExistsShardWork *)arg;
     if (sw->count == 0) return NULL;
 
-    /* v2 dispatch: bulk_lookup_in_kfshard amortises kfcache_acquire +
-       segcache_acquire across the worker's records — vs the old per-
-       record slotcask_exists path that took both caches per call. The
-       dispatcher already aligned shard_id with compute_record_shard so
-       all entries here hash to the same kf shard. */
-    if (sw->sch->storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-            .streams = sw->sch->streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
-        if (!sdb) return NULL;
+    /* bulk_lookup_in_kfshard amortises kfcache_acquire + segcache_acquire
+       across the worker's records. The dispatcher already aligned
+       shard_id with compute_record_shard so all entries here hash to the
+       same kf shard. */
+    SlotcaskSchemaInfo info = {
+        .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
+        .streams = sw->sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-        if (!batch) return NULL;
-        for (int ei = 0; ei < sw->count; ei++) {
-            MultiExistsEntry *e = &sw->entries[ei];
-            batch[ei].key       = e->key;
-            batch[ei].klen      = e->klen;
-            batch[ei].value     = NULL;
-            batch[ei].vlen      = 0;
-            batch[ei].user_ctx  = NULL;
-            batch[ei].old_value = NULL;
-            batch[ei].old_vlen  = 0;
-            batch[ei].status    = 0;
-            batch[ei].was_update = 0;
-        }
-        int kf_shard_id = sw->entries[0].shard_id;  /* aligned by dispatcher */
-        slotcask_bulk_lookup_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count);
-        for (int ei = 0; ei < sw->count; ei++) {
-            sw->entries[ei].found = (batch[ei].status == 0) ? 1 : 0;
-        }
-        free(batch);
-        return NULL;
-    }
-
-    int sid = sw->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
+    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
+    if (!batch) return NULL;
     for (int ei = 0; ei < sw->count; ei++) {
         MultiExistsEntry *e = &sw->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == e->klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
-                e->found = 1; break;
-            }
-        }
+        batch[ei].key       = e->key;
+        batch[ei].klen      = e->klen;
+        batch[ei].value     = NULL;
+        batch[ei].vlen      = 0;
+        batch[ei].user_ctx  = NULL;
+        batch[ei].old_value = NULL;
+        batch[ei].old_vlen  = 0;
+        batch[ei].status    = 0;
+        batch[ei].was_update = 0;
     }
-    fcache_release(fc);
+    int kf_shard_id = sw->entries[0].shard_id;  /* aligned by dispatcher */
+    slotcask_bulk_lookup_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count);
+    for (int ei = 0; ei < sw->count; ei++) {
+        sw->entries[ei].found = (batch[ei].status == 0) ? 1 : 0;
+    }
+    free(batch);
     return NULL;
 }
 
@@ -2441,10 +1804,9 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 e->klen = klen;
             }
             if (e->key) {
-                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-                /* v2 alignment — see cmd_get_multi for rationale. */
-                if (sc.storage_version == 2)
-                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+                compute_hash_raw(e->key, e->klen, e->hash);
+                e->shard_id = compute_record_shard(e->hash, sc.splits);
+                e->start_slot = 0;
             } else {
                 e->shard_id = 0;
                 e->start_slot = 0;
@@ -2633,10 +1995,9 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 e->klen = klen;
             }
             if (e->key) {
-                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-                /* v2 alignment — see cmd_get_multi for rationale. */
-                if (sc.storage_version == 2)
-                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+                compute_hash_raw(e->key, e->klen, e->hash);
+                e->shard_id = compute_record_shard(e->hash, sc.splits);
+                e->start_slot = 0;
             } else {
                 e->shard_id = 0;
                 e->start_slot = 0;
@@ -2752,82 +2113,51 @@ static void *multi_get_shard_worker(void *arg) {
     MultiGetShardWork *sw = (MultiGetShardWork *)arg;
     if (sw->count == 0) return NULL;
 
-    /* v2 dispatch: bulk_get_in_kfshard amortises kfcache + segcache
-       across the worker's records — vs the old per-record slotcask_get
-       which took both caches per call. typed_decode still happens per
-       record (it's per-record-shape work). The dispatcher already
-       aligned shard_id with compute_record_shard. */
-    if (sw->sch->storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-            .streams = sw->sch->streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
-        if (!sdb) return NULL;
+    /* bulk_get_in_kfshard amortises kfcache + segcache across the
+       worker's records (vs per-record slotcask_get which would take
+       both caches per call). typed_decode still happens per record
+       (it's per-record-shape work). The dispatcher already aligned
+       shard_id with compute_record_shard. */
+    SlotcaskSchemaInfo info = {
+        .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
+        .streams = sw->sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    if (!sdb) return NULL;
 
-        SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-        void **vals = calloc(sw->count, sizeof(void *));
-        size_t *vlens = calloc(sw->count, sizeof(size_t));
-        if (!batch || !vals || !vlens) {
-            free(batch); free(vals); free(vlens);
-            return NULL;
-        }
-        for (int ei = 0; ei < sw->count; ei++) {
-            MultiGetEntry *e = &sw->entries[ei];
-            batch[ei].key       = e->key;
-            batch[ei].klen      = e->klen;
-            batch[ei].value     = NULL;
-            batch[ei].vlen      = 0;
-            batch[ei].user_ctx  = NULL;
-            batch[ei].old_value = NULL;
-            batch[ei].old_vlen  = 0;
-            batch[ei].status    = 0;
-            batch[ei].was_update = 0;
-        }
-        int kf_shard_id = sw->entries[0].shard_id;
-        slotcask_bulk_get_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count,
-                                       vals, vlens);
-        for (int ei = 0; ei < sw->count; ei++) {
-            MultiGetEntry *e = &sw->entries[ei];
-            if (batch[ei].status == 0 && vals[ei]) {
-                char *decoded = sw->fs ? typed_decode(sw->fs->ts,
-                                                       (const uint8_t *)vals[ei],
-                                                       (uint32_t)vlens[ei]) : NULL;
-                e->result_json = decoded ? decoded : strdup("null");
-                free(vals[ei]);
-            }
-        }
+    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
+    void **vals = calloc(sw->count, sizeof(void *));
+    size_t *vlens = calloc(sw->count, sizeof(size_t));
+    if (!batch || !vals || !vlens) {
         free(batch); free(vals); free(vlens);
         return NULL;
     }
-
-    int sid = sw->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
     for (int ei = 0; ei < sw->count; ei++) {
         MultiGetEntry *e = &sw->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, e->hash, 16) == 0 &&
-                h->key_len == e->klen &&
-                memcmp(fc.map + zoneB_off(s, slots, sw->sch->slot_size), e->key, e->klen) == 0) {
-                const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
-                char *val = typed_decode(sw->fs->ts, (const uint8_t *)raw, h->value_len);
-                /* Store just the decoded value JSON. */
-                e->result_json = val ? val : strdup("null");
-                break;
-            }
+        batch[ei].key       = e->key;
+        batch[ei].klen      = e->klen;
+        batch[ei].value     = NULL;
+        batch[ei].vlen      = 0;
+        batch[ei].user_ctx  = NULL;
+        batch[ei].old_value = NULL;
+        batch[ei].old_vlen  = 0;
+        batch[ei].status    = 0;
+        batch[ei].was_update = 0;
+    }
+    int kf_shard_id = sw->entries[0].shard_id;
+    slotcask_bulk_get_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count,
+                                   vals, vlens);
+    for (int ei = 0; ei < sw->count; ei++) {
+        MultiGetEntry *e = &sw->entries[ei];
+        if (batch[ei].status == 0 && vals[ei]) {
+            char *decoded = sw->fs ? typed_decode(sw->fs->ts,
+                                                   (const uint8_t *)vals[ei],
+                                                   (uint32_t)vlens[ei]) : NULL;
+            e->result_json = decoded ? decoded : strdup("null");
+            free(vals[ei]);
         }
     }
-    fcache_release(fc);
+    free(batch); free(vals); free(vlens);
     return NULL;
 }
 
@@ -2887,12 +2217,12 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 e->klen = klen;
             }
             if (e->key) {
-                compute_addr(e->key, e->klen, sc.splits, e->hash, &e->shard_id, &e->start_slot);
-                /* For v2, override the bucketing shard with slotcask's kf-shard
-                   mapping so each parallel_for worker owns one kf shard and
-                   doesn't queue on cross-worker kf-cache contention. */
-                if (sc.storage_version == 2)
-                    e->shard_id = compute_record_shard(e->hash, sc.splits, 2);
+                /* Bucket by slotcask's kf-shard mapping so each parallel_for
+                   worker owns one kf shard and doesn't queue on cross-worker
+                   kf-cache contention. */
+                compute_hash_raw(e->key, e->klen, e->hash);
+                e->shard_id = compute_record_shard(e->hash, sc.splits);
+                e->start_slot = 0;
             } else {
                 /* Malformed auto-key wire form → never matches, but keep the
                    shard_id deterministic so bucket-sort works. */

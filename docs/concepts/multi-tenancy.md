@@ -36,7 +36,7 @@ Admin commands themselves have a scope. A token needs `rwx` AND scope at least a
 
 | Command | Admin scope | Who can run it |
 |---|---|---|
-| `stats`, `stats-prom`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens`, `add-dir`/`remove-dir`, `reindex` (all-tenants form), `migrate-storage-version` | server | global `rwx` or trusted IP only |
+| `stats`, `stats-prom`, `db-dirs`, `vacuum-check`, `shard-stats`, `add-ip`/`remove-ip`/`list-ips`, `add-token`/`remove-token`/`list-tokens`, `add-dir`/`remove-dir`, `reindex` (all-tenants form) | server | global `rwx` or trusted IP only |
 | `create-object`, `drop-object`, `list-objects`, `describe-object` | tenant | global `rwx` or tenant `rwx` on that dir |
 | `truncate`, `vacuum`, `backup`, `restore`, `recount`, `add-field`, `remove-field`, `rename-field`, `add-index`, `remove-index`, `reindex` (per-object form) | object | any `rwx` whose scope covers that object |
 

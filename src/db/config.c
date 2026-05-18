@@ -620,6 +620,8 @@ Schema load_schema(const char *effective_root, const char *object) {
         return s;
     }
     char line[512];
+    int found = 0;
+    int legacy_v1 = 0;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, prefix, pfxlen) == 0) {
@@ -629,13 +631,17 @@ Schema load_schema(const char *effective_root, const char *object) {
             s.splits = atoi(p);
             if (s.splits <= 0) s.splits = 64;
             char *p2 = strchr(p, ':');
+            int parsed_version = 0;
             if (p2) {
                 s.max_key = atoi(p2 + 1);
-                /* Optional trailing fields (added in 2026.06 for slotcask v2):
-                   :storage_version:streams. Absent → defaults: version=1, streams=0. */
+                /* Schema line: dir:object:splits:max_key:2:streams[:auto_key=...].
+                   The `2` slot is the storage-engine version, kept in the
+                   on-disk format for forward compatibility. Absent or any
+                   value other than 2 → legacy v1, which this binary no
+                   longer supports. */
                 char *p3 = strchr(p2 + 1, ':');
                 if (p3) {
-                    s.storage_version = atoi(p3 + 1);
+                    parsed_version = atoi(p3 + 1);
                     char *p4 = strchr(p3 + 1, ':');
                     if (p4) s.streams = atoi(p4 + 1);
                 }
@@ -672,35 +678,37 @@ Schema load_schema(const char *effective_root, const char *object) {
                     scan = next;
                 }
             }
-            if (s.storage_version <= 0) s.storage_version = 1;
+            if (parsed_version != 2) legacy_v1 = 1;
+            found = 1;
             break;
         }
     }
     fclose(f);
+
+    if (found && legacy_v1) {
+        /* Object exists on disk but is in the legacy zone-A/B layout. This
+           binary (2026.05.5+) dropped the v1 read path entirely. Operators
+           still on v1 must first upgrade to 2026.05.4 and run that
+           release's `./migrate` to convert objects to v2, then redeploy. */
+        fprintf(stderr,
+                "Error: Object [%s] is in legacy v1 storage; this binary "
+                "supports v2 only. Install 2026.05.4 first and run "
+                "`./migrate` to convert v1 → v2, then upgrade.\n",
+                object);
+        Schema zeroed = {0};
+        return zeroed;
+    }
 
     /* Derive max_value from typed fields.conf */
     TypedSchema *ts = load_typed_schema(effective_root, object);
     if (ts && ts->total_size > 0) {
         s.max_value = ts->total_size;
     }
-    /* slot_size meaning differs by storage version:
-       v1: width of one Zone B slot, header lives separately in Zone A.
-           formula: max_key + max_value, rounded to 8.
-       v2: width of one slotcask segment slot, header is INLINE
-           (24 bytes: hash + klen + flag + reserved + vlen).
-           formula: 24 + max_key + max_value, rounded to 8, floor 32.
-       Mixing the two semantics — i.e., feeding a v1 slot_size to
-       slotcask_open — silently fails inserts when klen+vlen approaches
-       max because slotcask_insert's "24 + klen + vlen <= slot_size"
-       guard rejects records that should fit. */
-    if (s.storage_version == 2) {
-        s.slot_size = 24 + s.max_key + s.max_value;
-        s.slot_size = (s.slot_size + 7) & ~7;
-        if (s.slot_size < 32) s.slot_size = 32;
-    } else {
-        s.slot_size = s.max_key + s.max_value;
-        s.slot_size = (s.slot_size + 7) & ~7;
-    }
+    /* slot_size = 24B inline per-record header + max_key + max_value,
+       rounded up to 8 bytes, floor 32. */
+    s.slot_size = 24 + s.max_key + s.max_value;
+    s.slot_size = (s.slot_size + 7) & ~7;
+    if (s.slot_size < 32) s.slot_size = 32;
 
     pthread_mutex_lock(&g_schema_lock);
     uint32_t sidx = str_hash(cache_key) % SCHEMA_BUCKETS;

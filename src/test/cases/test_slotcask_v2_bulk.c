@@ -66,11 +66,10 @@ static int test_slotcask_v2_bulk_run(void) {
     /* v2 object */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"bulk2\",\"object\":\"orders\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"region:varchar:16\","
                     "\"note:varchar:32\"],"
         "\"indexes\":[\"status\",\"amount\",\"region\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 object created");
     free(resp); resp = NULL;
 
     /* ===== bulk-insert: 6 records ===== */

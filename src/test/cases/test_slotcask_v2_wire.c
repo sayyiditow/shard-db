@@ -1,13 +1,8 @@
-/* test_slotcask_v2_wire.c — Phase-2C E2E test for storage_version=2.
+/* test_slotcask_v2_wire.c — E2E test for slotcask wire-protocol CRUD.
  *
- * Spawns a daemon and exercises the full v2 wire-protocol round-trip for
- * single-record CRUD. Confirms cmd_get/exists/insert/delete/update dispatch
- * correctly to the slotcask engine when storage_version=2 is set.
- *
- * Out of scope (Phase 3): query-layer dispatch — find/count/aggregate over
- * v2 still walks the legacy probe-into-slot path and returns []. The
- * pre_commit index hook IS being fired (validated in test-slotcask-cas);
- * the find layer just doesn't know to fetch v2 records yet.
+ * Spawns a daemon and exercises the full wire-protocol round-trip for
+ * single-record CRUD. Confirms cmd_get / exists / insert / delete /
+ * update dispatch correctly through the slotcask engine.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -35,10 +30,9 @@ static int test_slotcask_v2_wire_run(void) {
 
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"sctest\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:64\",\"age:int\",\"email:varchar:80\",\"active:bool\"],"
         "\"indexes\":[\"age\",\"email\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 create succeeds");
     free(resp); resp = NULL;
 
     /* ===== insert + get + exists ===== */
@@ -187,7 +181,7 @@ static int test_slotcask_v2_wire_run(void) {
     /* Recreate same name — proves registry was invalidated. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"sctest\",\"object\":\"users\","
-        "\"splits\":8,\"max_key\":40,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:32\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"",
                     "recreate after drop succeeds (registry invalidated)");

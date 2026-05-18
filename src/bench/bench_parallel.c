@@ -356,21 +356,20 @@ static void recreate_object(TestClient *tc, int with_indexes)
     char  *req     = malloc(req_cap);
     if (!req) return;
 
-    int sv = bench_storage_version();
     if (with_indexes) {
         snprintf(req, req_cap,
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
-            "\"splits\":%d,\"max_key\":64,\"storage_version\":%d,"
+            "\"splits\":%d,\"max_key\":64,"
             "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
             "\"indexes\":[" INVOICE_INDEX_FIELDS "]}",
-            SPLITS, sv);
+            SPLITS);
     } else {
         snprintf(req, req_cap,
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
-            "\"splits\":%d,\"max_key\":64,\"storage_version\":%d,"
+            "\"splits\":%d,\"max_key\":64,"
             "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
             "\"indexes\":[]}",
-            SPLITS, sv);
+            SPLITS);
     }
     tc_request(tc, req, &resp);
     free(resp);

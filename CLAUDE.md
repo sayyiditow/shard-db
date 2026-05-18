@@ -53,7 +53,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 - `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).
 - `$DB_ROOT/allowed_ips.conf` — global trusted IPs (skip token check).
 - `$DB_ROOT/dirs.conf` — allowed tenant directories.
-- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key[:storage_version[:streams[:auto_key=<mode>]]]`. Trailing fields are optional and added in order; v1 objects emit just the 4-field form. `auto_key=uuid` → 16-byte UUIDv4 keys; `auto_key=seq(<name>)` → 8-byte int64 BE keys from the named sequence. `max_value` is derived from `fields.conf` (sum of typed-field byte lengths) and `slot_size = max_key + max_value` rounded up to 8.
+- `$DB_ROOT/schema.conf` — `dir:object:splits:max_key:2:streams[:auto_key=<mode>]`. The literal `2` is the engine-version slot, kept in the on-disk format for forward compatibility; this binary refuses any other value at load (legacy v1 objects must be upgraded via 2026.05.4's `./migrate` first). `auto_key=uuid` → 16-byte UUIDv4 keys; `auto_key=seq(<name>)` → 8-byte int64 BE keys from the named sequence. `max_value` is derived from `fields.conf` (sum of typed-field byte lengths) and `slot_size = 24 + max_key + max_value` rounded up to 8, floor 32.
 - `$DB_ROOT/<dir>/<obj>/fields.conf` — `name:type[:size|P,S][:default=...]`.
 
 ## Storage model (high-level)
@@ -142,10 +142,12 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./shard-db query '{"mode":"create-object","dir":"...","object":"...","splits":N,"max_key":8,"fields":[...],"auto_key":"seq(my_seq)"}'  # server-generated seq keys
 ./shard-db query '{"mode":"list-objects","dir":"<dir>"}'
 ./shard-db query '{"mode":"describe-object","dir":"<dir>","object":"<obj>"}'
-
-# Per-release one-shot upgrade — separate binary at build/bin/migrate. Run with daemon stopped; manages start/stop itself.
-./migrate
 ```
+
+Operators upgrading from a pre-2026.05.5 install that still has v1
+(legacy probe-into-slot) objects must first install 2026.05.4 and run
+that release's `./migrate` to convert v1 → v2; this version refuses
+any v1 object at load. v2-clean installs upgrade directly.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds.
 

@@ -251,16 +251,14 @@ void scan_shards_v2_streaming(SlotcaskDb *db, scan_callback cb, void *ctx) {
 int scan_dispatch(const char *db_root, const char *object,
                   const Schema *sc, const char *data_dir,
                   scan_callback cb, void *ctx) {
-    if (sc->storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sc->splits, .slot_size = sc->slot_size,
-            .streams = sc->streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (!sdb) return -1;
-        scan_shards_v2(sdb, cb, ctx);
-        return 0;
-    }
+    SlotcaskSchemaInfo info = {
+        .splits = sc->splits, .slot_size = sc->slot_size,
+        .streams = sc->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return -1;
+    scan_shards_v2(sdb, cb, ctx);
+    return 0;
     scan_shards(data_dir, sc->slot_size, cb, ctx);
     return 0;
 }
@@ -269,14 +267,12 @@ int scan_dispatch(const char *db_root, const char *object,
  *
  * Indexed query paths (PRIMARY_LEAF / INTERSECT / KEYSET) get a list of
  * 16-byte hashes from the btree and need to fetch the underlying record.
- * v1 resolves hash → (shard, slot) via addr_from_hash and probes the
- * Zone A mmap. v2 calls slotcask_lookup_by_hash, which gives transient
- * pointers under the segcache rdlock — so we copy key+value into a
- * malloc'd buffer that outlives the cb.
+ * slotcask_lookup_by_hash gives transient pointers under the segcache
+ * rdlock — we copy key+value into a malloc'd buffer that outlives the
+ * cb so callers can hold the reference past release_record_ref.
  *
- * RecordRef carries either lifecycle. release_record_ref handles both.
- * The (key, val) pointers are laid out contiguously so callers using the
- * existing v1 (key followed by val) layout work unchanged.
+ * The (key, val) pointers are laid out contiguously so callers using
+ * the historical (key followed by val) layout still work unchanged.
  */
 
 static int v2_record_capture_cb(const uint8_t hash[16],
@@ -301,18 +297,17 @@ int read_record_ref(const char *db_root, const char *object,
                     const Schema *sch, const uint8_t hash[16],
                     RecordRef *out) {
     memset(out, 0, sizeof(*out));
-    if (sch->storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sch->splits, .slot_size = sch->slot_size,
-            .streams = sch->streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (!sdb) return -1;
-        slotcask_lookup_by_hash(sdb, hash, v2_record_capture_cb, out);
-        return out->v2_buf ? 0 : -1;
-    }
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return -1;
+    slotcask_lookup_by_hash(sdb, hash, v2_record_capture_cb, out);
+    return out->v2_buf ? 0 : -1;
     int shard_id, start_slot;
-    addr_from_hash(hash, sch->splits, &shard_id, &start_slot);
+    shard_id = compute_record_shard(hash, sch->splits);
+    start_slot = 0;
     char shard_path[PATH_MAX];
     build_shard_path(shard_path, sizeof(shard_path), db_root, object, shard_id);
     FcacheRead fc = fcache_get_read(shard_path);
@@ -565,7 +560,8 @@ static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16
     }
     CollectedHash *e = &sc->entries[sc->count++];
     memcpy(e->hash, hash16, 16);
-    addr_from_hash(hash16, sc->splits, &e->shard_id, &e->start_slot);
+    e->shard_id = compute_record_shard(hash16, sc->splits);
+    e->start_slot = 0;
     return 0;
 }
 
@@ -695,49 +691,7 @@ static int parallel_fetch_and_print(const char *db_root, const char *object,
 
 /* Bulk ops use ucache (unified shard cache in storage.c) */
 
-/* ---- Shared worker types for parallel activation and index builds ---- */
-typedef struct { UCacheEntry *e; int slot_size; } ActivateArg;
-static void *activate_worker(void *arg) {
-    ActivateArg *a = (ActivateArg *)arg;
-    pthread_rwlock_wrlock(&a->e->rwlock);
-    if (a->e->map) {
-        uint32_t shard_slots = a->e->slots_per_shard;
-        uint32_t activated = 0;
-        size_t slot_bits_cap = (shard_slots + 7) / 8;
-        if (a->e->slot_bits && a->e->max_dirty_slot >= 0) {
-            /* Fast path: only visit slots recorded in the bitmap. */
-            size_t max_byte = (size_t)a->e->max_dirty_slot / 8;
-            if (max_byte >= slot_bits_cap) max_byte = slot_bits_cap - 1;
-            for (size_t b = 0; b <= max_byte; b++) {
-                uint8_t bv = a->e->slot_bits[b];
-                if (!bv) continue;
-                for (int bit = 0; bit < 8; bit++) {
-                    if (!(bv & (1 << bit))) continue;
-                    uint32_t s = (uint32_t)(b * 8 + bit);
-                    if (s >= shard_slots) continue;
-                    SlotHeader *h = (SlotHeader *)(a->e->map + zoneA_off(s));
-                    if (h->flag == 0 && h->key_len > 0) { h->flag = 1; activated++; }
-                }
-            }
-            memset(a->e->slot_bits, 0, slot_bits_cap);
-            a->e->max_dirty_slot = -1;
-        } else {
-            /* Fallback: full Zone A scan (used if slot_bits not allocated) */
-            for (uint32_t s = 0; s < shard_slots; s++) {
-                SlotHeader *h = (SlotHeader *)(a->e->map + zoneA_off(s));
-                if (h->flag == 0 && h->key_len > 0) { h->flag = 1; activated++; }
-            }
-        }
-        if (activated > 0) {
-            ShardHeader *sh = (ShardHeader *)a->e->map;
-            if (sh->magic == SHARD_MAGIC) sh->record_count += activated;
-        }
-    }
-    a->e->dirty = 0;
-    pthread_rwlock_unlock(&a->e->rwlock);
-    return NULL;
-}
-
+/* ---- Shared worker types for parallel index builds ---- */
 typedef struct { char ipath[PATH_MAX]; BtEntry *pairs; size_t pair_count; } IdxBuildArg;
 static void *idx_build_worker(void *arg) __attribute__((unused));
 static void *idx_build_worker(void *arg) {
@@ -983,44 +937,6 @@ typedef struct {
     size_t         *idx_pair_caps;    /* [nidx] */
 } BulkInsShardWork;
 
-/* Phase 1.6 pre-grow: per-shard worker that reads current slot count + live
-   record count, computes the smallest power-of-2 that holds (live + incoming),
-   and calls ucache_grow_to once. parallel_for-compatible signature. Each
-   worker owns a distinct shard, so the underlying wrlocks are disjoint. */
-typedef struct {
-    const char *db_root;
-    const char *object;
-    int         shard_id;
-    int         incoming;
-    int         slot_size;
-} PreGrowArg;
-
-static void *pre_grow_shard_worker(void *arg) {
-    PreGrowArg *a = (PreGrowArg *)arg;
-    char shard_path[PATH_MAX];
-    build_shard_path(shard_path, sizeof(shard_path),
-                     a->db_root, a->object, a->shard_id);
-    uint32_t cur_slots = ucache_peek_slots(shard_path, a->slot_size);
-    if (cur_slots == 0) return NULL;
-    uint32_t live = 0;
-    FcacheRead fc = fcache_get_read(shard_path);
-    if (fc.map) {
-        ShardHeader *hdr = (ShardHeader *)fc.map;
-        if (hdr->magic == SHARD_MAGIC) live = hdr->record_count;
-        fcache_release(fc);
-    }
-    uint64_t needed = (uint64_t)live + (uint64_t)a->incoming;
-    uint32_t target = cur_slots;
-    while ((uint64_t)target < needed) {
-        if (target >= (1u << 30)) break; /* sanity ceiling */
-        target *= 2;
-    }
-    if (target > cur_slots) {
-        (void)ucache_grow_to(shard_path, target, a->slot_size);
-    }
-    return NULL;
-}
-
 /* Build the shard→worker mapping used by every parallel bulk path
    (bulk_insert, bulk_update, bulk_delete, both JSON and delimited
    forms). Caller has already counted records per shard.
@@ -1058,35 +974,7 @@ static int build_shard_worker_map(const int *shard_counts, int splits,
     return nw;
 }
 
-/* Drives parallel pre-grow across the shards that have incoming records.
-   Returns 0 on success, -1 on alloc failure (non-fatal — caller proceeds and
-   the worker's in-loop grow path remains as fallback). */
-static int pre_grow_shards_for_bulk_insert(const char *db_root,
-                                           const char *object,
-                                           const Schema *sc,
-                                           const int *shard_counts) {
-    int n = 0;
-    for (int s = 0; s < sc->splits; s++) if (shard_counts[s] > 0) n++;
-    if (n == 0) return 0;
-
-    PreGrowArg *args = malloc((size_t)n * sizeof(PreGrowArg));
-    if (!args) return -1;
-    int j = 0;
-    for (int s = 0; s < sc->splits; s++) {
-        if (shard_counts[s] <= 0) continue;
-        args[j].db_root     = db_root;
-        args[j].object      = object;
-        args[j].shard_id    = s;
-        args[j].incoming    = shard_counts[s];
-        args[j].slot_size   = sc->slot_size;
-        j++;
-    }
-    parallel_for_io(pre_grow_shard_worker, args, n, sizeof(PreGrowArg));
-    free(args);
-    return 0;
-}
-
-/* === v2 (slotcask) bulk-insert worker ===
+/* === Slotcask bulk-insert worker ===
  *
  * Each parent worker's records all hash to one kf-shard, so successive
  * slotcask_upsert_with_hooks calls all touch the same kfcache rwlock —
@@ -1214,7 +1102,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
 
     SlotcaskSchemaInfo info = {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-        .streams = sw->sch->streams, .storage_version = 2,
+        .streams = sw->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
@@ -1224,12 +1112,9 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         return NULL;
     }
 
-    /* Sub-bucket records by their TRUE kf shard. The dispatcher buckets by
-       v1's big-endian addr_from_hash, but slotcask uses little-endian
-       shard_for_hash, so a single big-endian bucket can spread across
-       many kf shards. The bulk primitive holds one kf wrlock per call,
-       so calling it once per kf shard amortises the lock acquisition
-       across all records in that shard. */
+    /* Sub-bucket records by their kf shard. The bulk primitive holds
+       one kf wrlock per call, so calling it once per kf shard amortises
+       the lock acquisition across all records in that shard. */
     int splits = sw->sch->splits;
     SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
     V2BulkInsCtx    *ctxs  = malloc(sw->count * sizeof(V2BulkInsCtx));
@@ -1246,7 +1131,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     }
 
     for (size_t i = 0; i < sw->count; i++) {
-        kf_shards[i] = compute_record_shard(sw->records[i].hash, splits, 2);
+        kf_shards[i] = compute_record_shard(sw->records[i].hash, splits);
         counts[kf_shards[i]]++;
     }
     int run = 0;
@@ -1317,224 +1202,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
 static void *bulk_insert_shard_worker(void *arg) {
     BulkInsShardWork *sw = (BulkInsShardWork *)arg;
     if (sw->count == 0) return NULL;
-    if (sw->sch->storage_version == 2) return bulk_insert_shard_worker_v2(sw);
-    uint64_t t_worker_start = now_ms_coarse();
-
-    char shard_path[PATH_MAX];
-    build_shard_path(shard_path, sizeof(shard_path), sw->db_root, sw->object, sw->shard_id);
-
-    FcacheRead wh = ucache_get_write(shard_path, sw->sch->slot_size);
-    if (!wh.map) {
-        log_msg(1, "INSERT_DROP shard=%d (cannot open shard, dropping %zu records)",
-                sw->shard_id, sw->count);
-        sw->errors += (int)sw->count;
-        return NULL;
-    }
-
-    size_t i = 0;
-    while (i < sw->count && wh.map) {
-        BulkInsRecord *r = &sw->records[i];
-        uint8_t *map = wh.map;
-        UCacheEntry *e = ucache_entry(wh.slot);
-        uint32_t slots = wh.slots_per_shard;
-        uint32_t mask = slots - 1;
-
-        /* Probe for slot */
-        int slot = -1, first_tomb = -1;
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)r->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) { slot = (int)s; break; }
-            if (h->flag == 2) { if (first_tomb < 0) first_tomb = (int)s; continue; }
-            if (memcmp(h->hash, r->hash, 16) == 0 &&
-                h->key_len == r->klen &&
-                memcmp(map + zoneB_off(s, slots, sw->sch->slot_size), r->id, r->klen) == 0) {
-                slot = (int)s; break;
-            }
-        }
-        if (slot < 0 && first_tomb >= 0) slot = first_tomb;
-
-        if (slot < 0) {
-            /* Shard full — release lock so grow can take it, grow, reacquire, retry */
-            ucache_write_release(wh);
-            uint64_t t_grow_start = now_ms_coarse();
-            int grow_result = ucache_grow_shard(shard_path, sw->sch->slot_size);
-            sw->grow_ms += now_ms_coarse() - t_grow_start;
-            sw->grow_count++;
-            if (grow_result < 0) {
-                /* All remaining records in this bucket fail */
-                for (size_t j = i; j < sw->count; j++)
-                    log_msg(1, "INSERT_DROP shard=%d key=%s (shard full: cannot grow)",
-                            sw->shard_id, sw->records[j].id);
-                sw->errors += (int)(sw->count - i);
-                wh.map = NULL;
-                break;
-            }
-            wh = ucache_get_write(shard_path, sw->sch->slot_size);
-            if (!wh.map) {
-                /* Grow succeeded but reacquire failed — e.g. EMFILE hit on open.
-                   Count the remaining records as errors so the caller doesn't
-                   silently lose them. */
-                log_msg(1, "INSERT_DROP shard=%d (reacquire after grow failed, dropping %zu records)",
-                        sw->shard_id, sw->count - i);
-                sw->errors += (int)(sw->count - i);
-                break;
-            }
-            continue; /* re-probe same record index */
-        }
-
-        /* Write header + payload */
-        SlotHeader *existing = (SlotHeader *)(map + zoneA_off(slot));
-        int is_update = (existing->flag == 1 &&
-                         memcmp(existing->hash, r->hash, 16) == 0);
-        if (is_update && sw->if_not_exists) {
-            /* CAS: caller asked us not to overwrite — count as skipped and
-               leave the existing record alone. */
-            sw->skipped++;
-            i++;
-            continue;
-        }
-        /* Capture old index keys BEFORE the slot rewrite. Without this,
-           overwriting an existing key leaves stale (old-value, key-hash)
-           pairs in every index — symptoms: idx_count_cb over-counts (no
-           record fetch to filter the stale hit), find pays an extra
-           record fetch per stale entry, index files grow per overwrite.
-           Mirrors what cmd_update does for single-record overwrites. */
-        uint8_t *old_idx_bufs[MAX_FIELDS];
-        size_t   old_idx_lens[MAX_FIELDS];
-        int      old_idx_have[MAX_FIELDS];
-        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-        memset(old_idx_lens, 0, sizeof(old_idx_lens));
-        memset(old_idx_have, 0, sizeof(old_idx_have));
-        if (is_update && sw->nidx > 0) {
-            uint8_t *old_value_ptr = map + zoneB_off(slot, slots, sw->sch->slot_size) +
-                                     existing->key_len;
-            for (int fi = 0; fi < sw->nidx; fi++) {
-                old_idx_have[fi] = build_index_key_from_record(
-                    sw->ts, old_value_ptr, sw->idx_fields[fi],
-                    &old_idx_bufs[fi], &old_idx_lens[fi]);
-            }
-        }
-        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-        memset(hdr, 0, HEADER_SIZE);
-        memcpy(hdr->hash, r->hash, 16);
-        hdr->flag = 0;
-        hdr->key_len = (uint16_t)r->klen;
-        hdr->value_len = (uint32_t)sw->ts->total_size;
-        uint8_t *payload = map + zoneB_off(slot, slots, sw->sch->slot_size);
-        memcpy(payload, r->id, r->klen);
-        memcpy(payload + r->klen, r->payload, sw->ts->total_size);
-        e->dirty = 1;
-
-        if ((uint32_t)slot < slots) {
-            size_t bits_cap = (slots + 7) / 8;
-            if (!e->slot_bits) e->slot_bits = calloc(bits_cap, 1);
-            if (e->slot_bits) e->slot_bits[slot / 8] |= (uint8_t)(1 << (slot % 8));
-            if (slot > e->max_dirty_slot) e->max_dirty_slot = slot;
-        }
-
-        if (!is_update) sw->inserted++;
-
-        /* Collect index entries from the typed payload.
-           Composite indexes use the legacy ASCII-concat path.
-           Single-field indexes use typed_field_to_index_key so the binary
-           representation matches what the read side encodes via
-           encode_field_for_index. Without this, every signed-numeric
-           indexed query misses (write ASCII, read sign-flipped binary). */
-        for (int fi = 0; fi < sw->nidx; fi++) {
-            uint8_t *key_buf = NULL;
-            size_t key_len = 0;
-
-            if (sw->idx_is_composite[fi]) {
-                char cat[4096]; int cp = 0; int ok = 1;
-                for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
-                    int tidx = sw->idx_field_indices[fi][si];
-                    char *v = (tidx >= 0) ? typed_get_field_str(sw->ts, r->payload, tidx) : NULL;
-                    if (!v || !v[0]) { ok = 0; free(v); break; }
-                    int sl = strlen(v);
-                    if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
-                    free(v);
-                }
-                if (ok && cp > 0) {
-                    key_buf = malloc((size_t)cp);
-                    memcpy(key_buf, cat, (size_t)cp);
-                    key_len = (size_t)cp;
-                }
-            } else {
-                int tidx = sw->idx_field_indices[fi][0];
-                if (tidx >= 0) {
-                    const TypedField *f = &sw->ts->fields[tidx];
-                    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-                    key_buf = malloc(cap);
-                    typed_field_to_index_key(sw->ts, r->payload, tidx, key_buf, &key_len);
-                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
-                }
-            }
-
-            int have_new = (key_buf != NULL && key_len > 0);
-            int unchanged = old_idx_have[fi] && have_new &&
-                            key_len == old_idx_lens[fi] &&
-                            memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
-
-            /* Drop stale btree entry on overwrite. Skip the drop iff old==new
-               because re-adding via btree_bulk_merge would duplicate (the
-               bulk path does not dedup on (value, hash) pairs the way
-               btree_insert does). */
-            if (old_idx_have[fi] && !unchanged) {
-                delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                                   sw->sch->splits,
-                                   old_idx_bufs[fi], old_idx_lens[fi], r->hash);
-            }
-            if (old_idx_have[fi]) free(old_idx_bufs[fi]);
-
-            if (unchanged) {
-                /* No-op: old btree entry still points at this hash with the
-                   same value bytes. Don't queue a new entry — would duplicate. */
-                free(key_buf);
-                continue;
-            }
-
-            if (have_new) {
-                if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
-                    size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
-                    BtEntry *t = xrealloc_or_free(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
-                    if (!t) {
-                        log_msg(1, "INDEX_OOM shard=%d field=%s (dropped index pair on realloc; rerun reindex)",
-                                sw->shard_id, sw->idx_fields[fi]);
-                        sw->idx_pairs[fi] = NULL;
-                        sw->idx_pair_counts[fi] = 0;
-                        sw->idx_pair_caps[fi] = 0;
-                        free(key_buf);
-                        continue;
-                    }
-                    sw->idx_pairs[fi] = t;
-                    sw->idx_pair_caps[fi] = new_cap;
-                }
-                BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
-                bp->value = (const char *)key_buf;
-                bp->vlen  = key_len;
-                memcpy(bp->hash, r->hash, 16);
-            } else {
-                free(key_buf);
-            }
-        }
-
-        i++;
-    }
-
-    if (wh.map) {
-        /* Note: we previously called ucache_nudge_writeback(wh.slot) here to
-           kick the kernel's writeback early, but sync_file_range(nbytes=0)
-           ended up blocking in balance_dirty_pages under concurrent
-           writeback from all 16 workers — turning "non-blocking nudge"
-           into "synchronous flush storm" at 5 M+ scale. Left the helper
-           in storage.c for future targeted use (e.g. ranged flush of just
-           what we touched) but no longer fire it on the shard-worker end
-           path. The regular kernel writeback daemons handle durability. */
-        ucache_write_release(wh);
-    }
-    sw->wall_ms = now_ms_coarse() - t_worker_start;
-    return NULL;
+    return bulk_insert_shard_worker_v2(sw);
 }
 
 /* Internal: bulk insert from a json string already in memory (no file I/O) */
@@ -1851,13 +1519,10 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 r->payload = payload;
                 r->klen = klen;
                 r->if_not_exists = 0;  /* default; auto-key omit post-fill sets to 1 */
-                compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
-                /* Override shard_id with the version-aware mapping so v2
-                   workers each own one kf shard (no cross-worker kf-wrlock
-                   contention). compute_addr itself stays v1 byte-order
-                   to preserve the legacy slot-probe semantics for v1. */
-                if (sc.storage_version == 2)
-                    r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+                compute_hash_raw(id, klen, r->hash);
+                /* Shard mapping that keeps each v2 worker owning one kf
+                   shard — no cross-worker kf-wrlock contention. */
+                r->shard_id = compute_record_shard(r->hash, sc.splits);
             }
         }
         if (obj_heap) free(obj_str);
@@ -1909,9 +1574,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 if (wire_keys) wire_keys[i] = strdup(wbuf);
             }
             /* Recompute hash + shard since id was a placeholder during parse. */
-            compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
-            if (sc.storage_version == 2)
-                r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            compute_hash_raw(r->id, r->klen, r->hash);
+            r->shard_id = compute_record_shard(r->hash, sc.splits);
             /* Strict-insert on collision — see BulkInsRecord.if_not_exists.
                UUID can't collide in practice; seq can collide if the
                operator pre-inserted manual numeric keys at or above the
@@ -1957,16 +1621,10 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
        per grow, and each subsequent grow re-buckets a growing record set —
        so total rebuild work scales with the number of incremental doublings.
        One up-front grow to the right size avoids that.
-       Target: smallest power of 2 that holds (live + incoming). No 50%
-       headroom — bulk-insert tolerates high load factors fine and
-       over-allocating balloons the sparse mmap (page-fault tax > tighter
-       probe chains). The pre-grow loop runs in parallel across shards.
-       v2 (slotcask) keyfile shards are pre-sized at slotcask_open time and
-       resplit per-shard internally on load — no Zone A pre-grow applies,
-       but slotcask_pregrow_kf below absorbs the same role for the kf. */
-    if (sc.storage_version != 2) {
-        pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
-    } else {
+       Slotcask keyfile shards are pre-sized at slotcask_open time and
+       resplit per-shard internally on load — slotcask_pregrow_kf below
+       absorbs the same role for the kf. */
+    {
         /* Pre-grow kf shards to fit the incoming records up-front. Without
            this, kf resplits trigger inline during the bulk insert and
            their msync(MS_SYNC) joins the segment writeback queue — a
@@ -1976,7 +1634,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
            per-shard resplit at its quiet-system cost. */
         SlotcaskSchemaInfo info = {
             .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams, .storage_version = 2,
+            .streams = sc.streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
@@ -2108,26 +1766,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     /* Activate all dirty shards for THIS object — filter by path prefix.
        v2 (slotcask) commits each record individually via the keyfile flip,
        so there's no batched .new→active activation step to run here. */
-    if (sc.storage_version != 2) {
-        char obj_prefix[PATH_MAX];
-        snprintf(obj_prefix, sizeof(obj_prefix), "%s/%s/data/", db_root, object);
-        size_t prefix_len = strlen(obj_prefix);
-
-        /* Scan ucache for dirty entries matching this object */
-        int ucap = ucache_slot_count();
-        ActivateArg *act_args = malloc(ucap * sizeof(ActivateArg));
-        int act_count = 0;
-        for (int i = 0; i < ucap; i++) {
-            UCacheEntry *e = ucache_entry(i);
-            if (!e || !e->used || !e->dirty) continue;
-            if (strncmp(e->path, obj_prefix, prefix_len) != 0) continue;
-            act_args[act_count].e = e;
-            act_args[act_count].slot_size = sc.slot_size;
-            act_count++;
-        }
-        parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
-        free(act_args);
-    }
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     /* ucache keeps mmaps open — OS flushes dirty pages */
@@ -2551,10 +2189,11 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         r->id = id;
         r->payload = payload;
         r->klen = klen;
-        compute_addr(id, klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
+        compute_hash_raw(id, klen, r->hash);
+        r->shard_id = compute_record_shard(r->hash, sc.splits);
+        r->start_slot = 0;
         /* v2 dispatcher-shard alignment — see cmd_bulk_insert (JSON path) */
-        if (sc.storage_version == 2)
-            r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+                    r->shard_id = compute_record_shard(r->hash, sc.splits);
     }
 
     /* Validation failure: refuse the whole batch before any write.
@@ -2602,9 +2241,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 if (wire_keys) wire_keys[i] = strdup(wbuf);
             }
             /* Recompute hash + shard now that the placeholder id is final. */
-            compute_addr(r->id, r->klen, sc.splits, r->hash, &r->shard_id, &r->start_slot);
-            if (sc.storage_version == 2)
-                r->shard_id = compute_record_shard(r->hash, sc.splits, 2);
+            compute_hash_raw(r->id, r->klen, r->hash);
+            r->shard_id = compute_record_shard(r->hash, sc.splits);
+            r->start_slot = 0;
+                            r->shard_id = compute_record_shard(r->hash, sc.splits);
             omit_idx++;
         }
         free(uuid_pool);
@@ -2636,16 +2276,12 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
-    /* ===== Phase 1.6: pre-grow shards once, sized to the incoming batch.
-       See cmd_bulk_insert (JSON path) for the rationale. v2 (slotcask)
-       keyfile shards self-size at open + auto-resplit, no Zone A grow. */
-    if (sc.storage_version != 2) {
-        pre_grow_shards_for_bulk_insert(db_root, object, &sc, shard_counts);
-    } else {
-        /* See bulk-insert-JSON dispatch above for rationale. */
+    /* ===== Phase 1.6: pre-grow kf shards once, sized to the incoming batch.
+       See cmd_bulk_insert (JSON path) for the rationale. */
+    {
         SlotcaskSchemaInfo info = {
             .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams, .storage_version = 2,
+            .streams = sc.streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
@@ -2767,25 +2403,6 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
 
     /* Activate — parallel across shards for THIS object. v2 commits per
        record via keyfile flip, no batched activation needed. */
-    if (sc.storage_version != 2) {
-        char obj_prefix[PATH_MAX];
-        snprintf(obj_prefix, sizeof(obj_prefix), "%s/%s/data/", db_root, object);
-        size_t prefix_len = strlen(obj_prefix);
-
-        int ucap = ucache_slot_count();
-        ActivateArg *act_args = malloc(ucap * sizeof(ActivateArg));
-        int act_count = 0;
-        for (int i = 0; i < ucap; i++) {
-            UCacheEntry *e = ucache_entry(i);
-            if (!e || !e->used || !e->dirty) continue;
-            if (strncmp(e->path, obj_prefix, prefix_len) != 0) continue;
-            act_args[act_count].e = e;
-            act_args[act_count].slot_size = sc.slot_size;
-            act_count++;
-        }
-        parallel_for(activate_worker, act_args, act_count, sizeof(ActivateArg));
-        free(act_args);
-    }
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     /* data owned by caller — see bulk_ins_delim_run / bulk_upd_delim_run */
@@ -2957,14 +2574,14 @@ static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
 static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     SlotcaskSchemaInfo info = {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-        .streams = sw->sch->streams, .storage_version = 2,
+        .streams = sw->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) return NULL;
 
     /* All keys in this worker hash to the same kf shard (dispatcher
        aligned shard_id with compute_record_shard, see cmd_bulk_delete). */
-    int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits, 2);
+    int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits);
 
     SlotcaskBulkRec *batch = calloc(sw->key_count, sizeof(SlotcaskBulkRec));
     V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
@@ -3002,96 +2619,7 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
 static void *bulk_del_shard_worker(void *arg) {
     BulkDelShardWork *sw = (BulkDelShardWork *)arg;
     if (sw->key_count == 0) return NULL;
-    if (sw->sch->storage_version == 2) return bulk_del_shard_worker_v2(sw);
-
-    /* shard_slots stores start_slot per key; for the per-shard file we
-       need shard_id derived from the first key's hash. */
-    int shard_id, dummy;
-    addr_from_hash(sw->hashes[0], sw->sch->splits, &shard_id, &dummy);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, shard_id);
-
-    /* Use the persistent ucache write path: per-entry rwlock serializes
-       writers but readers stay live, and the mmap is shared with the
-       reader pool. The previous open + flock + mmap MAP_SHARED + munmap
-       per worker dropped + reopened the kernel mapping every time, so
-       bulk-delete paid the page-fault hit on each call AND held a
-       cross-process flock that blocked concurrent readers using the same
-       file via ucache. */
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) return NULL;
-    uint8_t *map = wh.map;
-    ShardHeader *sh = (ShardHeader *)map;
-    if (sh->magic != SHARD_MAGIC) { ucache_write_release(wh); return NULL; }
-    uint32_t slots = sh->slots_per_shard;
-    uint32_t mask = slots - 1;
-    uint32_t tombstoned_here = 0;
-
-    for (int ki = 0; ki < sw->key_count; ki++) {
-        int start_slot = sw->shard_slots[ki];
-        size_t klen = strlen(sw->keys[ki]);
-
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, sw->hashes[ki], 16) == 0 &&
-                h->key_len == klen &&
-                memcmp(map + zoneB_off(s, slots, sw->sch->slot_size), sw->keys[ki], klen) == 0) {
-
-                /* Extract index values (as index-key bytes) before tombstoning */
-                if (sw->nidx > 0 && sw->ts) {
-                    const uint8_t *raw = map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len;
-                    for (int fi = 0; fi < sw->nidx; fi++) {
-                        uint8_t *buf = NULL; size_t blen = 0;
-                        if (build_index_key_from_record(sw->ts, raw, sw->idx_fields[fi], &buf, &blen)) {
-                            sw->idx_vals[fi][ki] = buf;
-                            sw->idx_lens[fi][ki] = blen;
-                        } else {
-                            sw->idx_vals[fi][ki] = NULL;
-                            sw->idx_lens[fi][ki] = 0;
-                        }
-                    }
-                }
-
-                h->flag = 2; /* tombstone */
-                sw->deleted++;
-                tombstoned_here++;
-                break;
-            }
-        }
-    }
-
-    if (tombstoned_here > 0) {
-        sh->record_count = (sh->record_count > tombstoned_here)
-            ? sh->record_count - tombstoned_here : 0;
-    }
-    ucache_write_release(wh);
-    return NULL;
-}
-
-/* Per-index bulk delete worker — deletes all collected values from one index */
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const char *field;
-    int splits;
-    uint8_t **vals;
-    size_t   *vlens;
-    uint8_t (*hashes)[16];
-    int count;
-} BulkDelIdxWork;
-
-static void *bulk_del_idx_worker(void *arg) {
-    BulkDelIdxWork *iw = (BulkDelIdxWork *)arg;
-    for (int i = 0; i < iw->count; i++) {
-        if (iw->vals[i] && iw->vlens[i] > 0)
-            delete_index_entry(iw->db_root, iw->object, iw->field, iw->splits,
-                               iw->vals[i], iw->vlens[i], iw->hashes[i]);
-    }
-    return NULL;
+    return bulk_del_shard_worker_v2(sw);
 }
 
 /* Internal: takes a malloc'd buffer of keys (JSON array OR newline-separated)
@@ -3181,10 +2709,9 @@ static int bulk_delete_run(const char *db_root, const char *object,
     int *start_slots = malloc(key_count * sizeof(int));
 
     for (int i = 0; i < key_count; i++) {
-        compute_addr(keys[i], strlen(keys[i]), sch.splits, hashes[i], &shard_ids[i], &start_slots[i]);
-        /* v2 alignment — see cmd_bulk_insert for rationale. */
-        if (sch.storage_version == 2)
-            shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
+        compute_hash_raw(keys[i], strlen(keys[i]), hashes[i]);
+        shard_ids[i] = compute_record_shard(hashes[i], sch.splits);
+        start_slots[i] = 0;
     }
 
     int *shard_counts = calloc(sch.splits, sizeof(int));
@@ -3235,42 +2762,9 @@ static int bulk_delete_run(const char *db_root, const char *object,
     int total_deleted = 0;
     for (int g = 0; g < nshard_groups; g++) total_deleted += workers[g].deleted;
 
-    if (sch.storage_version != 2 && nidx > 0 && total_deleted > 0) {
-        /* Flatten idx_vals+idx_lens across all shard groups: per index,
-           collect (val, vlen, hash) triples. */
-        BulkDelIdxWork *idx_workers = malloc(nidx * sizeof(BulkDelIdxWork));
-        for (int fi = 0; fi < nidx; fi++) {
-            idx_workers[fi].db_root = db_root;
-            idx_workers[fi].object = object;
-            idx_workers[fi].field = idx_fields[fi];
-            idx_workers[fi].splits = sch.splits;
-            idx_workers[fi].vals = malloc(key_count * sizeof(uint8_t *));
-            idx_workers[fi].vlens = malloc(key_count * sizeof(size_t));
-            idx_workers[fi].hashes = malloc(key_count * sizeof(uint8_t[16]));
-            idx_workers[fi].count = 0;
-            for (int g = 0; g < nshard_groups; g++) {
-                for (int ki = 0; ki < workers[g].key_count; ki++) {
-                    if (workers[g].idx_vals[fi][ki] && workers[g].idx_lens[fi][ki] > 0) {
-                        int c = idx_workers[fi].count;
-                        idx_workers[fi].vals[c] = workers[g].idx_vals[fi][ki];
-                        idx_workers[fi].vlens[c] = workers[g].idx_lens[fi][ki];
-                        memcpy(idx_workers[fi].hashes[c], workers[g].hashes[ki], 16);
-                        idx_workers[fi].count++;
-                    }
-                }
-            }
-        }
-
-        parallel_for_io(bulk_del_idx_worker, idx_workers, nidx, sizeof(BulkDelIdxWork));
-
-        for (int fi = 0; fi < nidx; fi++) {
-            for (int i = 0; i < idx_workers[fi].count; i++) free(idx_workers[fi].vals[i]);
-            free(idx_workers[fi].vals);
-            free(idx_workers[fi].vlens);
-            free(idx_workers[fi].hashes);
-        }
-        free(idx_workers);
-    }
+    /* v2 drops btree index entries inside the per-record pre_commit hook
+       in bulk_del_shard_worker_v2 (under the kf-shard wrlock), so no
+       post-pass index cleanup is needed here. */
 
     /* Cleanup workers */
     for (int g = 0; g < nshard_groups; g++) {
@@ -3558,7 +3052,7 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
 static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
-        .streams = w->sch->streams, .storage_version = 2,
+        .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
@@ -3620,124 +3114,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
 static void *bulk_upd_shard_worker(void *arg) {
     BulkUpdShardWork *w = (BulkUpdShardWork *)arg;
     if (w->count == 0) return NULL;
-    if (w->sch->storage_version == 2) return bulk_upd_shard_worker_v2(w);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { w->skipped += w->count; return NULL; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    for (int ki = 0; ki < w->count; ki++) {
-        BulkUpdRec *rec = &w->recs[ki];
-        int slot = -1;
-        for (uint32_t si = 0; si < slots; si++) {
-            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
-                h->key_len == rec->klen &&
-                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
-                slot = (int)s; break;
-            }
-        }
-        if (slot < 0) { w->skipped++; continue; }
-
-        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
-
-        if (!criteria_match_tree(value_ptr, w->tree, w->fs)) { w->skipped++; continue; }
-
-        /* Per-record CAS — re-verify the `if` condition under the wrlock.
-           Race window between phase-1 scan and phase-2 write is closed
-           here; failures count as skipped, not errors. */
-        if (w->cas_crit && w->cas_ncrit > 0 &&
-            !cas_check(w->ts, value_ptr, w->cas_crit, w->cas_ncrit)) {
-            w->skipped++; continue;
-        }
-
-        /* Collect old index values (as index-key bytes) */
-        uint8_t *old_idx_bufs[MAX_FIELDS];
-        size_t   old_idx_lens[MAX_FIELDS];
-        int      old_idx_have[MAX_FIELDS];
-        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-        memset(old_idx_lens, 0, sizeof(old_idx_lens));
-        memset(old_idx_have, 0, sizeof(old_idx_have));
-        for (int fi = 0; fi < w->nidx; fi++) {
-            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
-                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
-        }
-
-        /* Apply partial update */
-        const char *field_names[MAX_FIELDS];
-        char *field_vals[MAX_FIELDS];
-        for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
-        json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
-
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (field_vals[fi]) {
-                if (!w->ts->fields[fi].removed)
-                    encode_field(&w->ts->fields[fi], field_vals[fi], value_ptr + w->ts->fields[fi].offset);
-                free(field_vals[fi]);
-            }
-        }
-
-        /* auto_update fields */
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm;
-                localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                             tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
-            }
-        }
-
-        /* Update indexes for changed values */
-        if (w->nidx > 0) {
-            uint8_t *new_val = map + zoneB_off(slot, slots, w->sch->slot_size) + rec->klen;
-            for (int fi = 0; fi < w->nidx; fi++) {
-                uint8_t *new_buf = NULL; size_t new_len = 0;
-                int have_new = build_index_key_from_record(w->ts, new_val, w->idx_fields[fi],
-                                                          &new_buf, &new_len);
-                int changed = 0;
-                if (have_new && !old_idx_have[fi]) changed = 1;
-                else if (!have_new && old_idx_have[fi]) changed = 1;
-                else if (have_new && old_idx_have[fi]) {
-                    if (new_len != old_idx_lens[fi] ||
-                        memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
-                }
-                if (changed) {
-                    if (old_idx_have[fi])
-                        delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                           w->sch->splits,
-                                           old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
-                    if (have_new)
-                        write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                          w->sch->splits,
-                                          new_buf, new_len, rec->hash);
-                }
-                free(old_idx_bufs[fi]);
-                free(new_buf);
-            }
-        }
-
-        w->updated++;
-    }
-
-    ucache_write_release(wh);
-    return NULL;
+    return bulk_upd_shard_worker_v2(w);
 }
 
 int cmd_bulk_update(const char *db_root, const char *object,
@@ -3819,11 +3196,9 @@ int cmd_bulk_update(const char *db_root, const char *object,
     for (int i = 0; i < matched; i++) {
         all[i].key = ctx.keys[i];
         all[i].klen = strlen(ctx.keys[i]);
-        compute_addr(all[i].key, all[i].klen, sch.splits,
-                     all[i].hash, &all[i].shard_id, &all[i].start_slot);
-        /* v2 alignment — see cmd_bulk_insert for rationale. */
-        if (sch.storage_version == 2)
-            all[i].shard_id = compute_record_shard(all[i].hash, sch.splits, 2);
+        compute_hash_raw(all[i].key, all[i].klen, all[i].hash);
+        all[i].shard_id = compute_record_shard(all[i].hash, sch.splits);
+        all[i].start_slot = 0;
     }
 
     /* Bucket by shard_id. */
@@ -4041,7 +3416,7 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
 static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
-        .streams = w->sch->streams, .storage_version = 2,
+        .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
@@ -4092,143 +3467,7 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
 static void *bulk_upd_delim_shard_worker(void *arg) {
     BulkUpdDelimShardWork *w = (BulkUpdDelimShardWork *)arg;
     if (w->count == 0) return NULL;
-    if (w->sch->storage_version == 2) return bulk_upd_delim_shard_worker_v2(w);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { w->skipped += w->count; return NULL; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    struct { const char *ptr; size_t len; } vals[MAX_FIELDS];
-
-    for (int ki = 0; ki < w->count; ki++) {
-        BulkUpdDelimRec *rec = &w->recs[ki];
-
-        /* Probe for the record — must already exist */
-        int slot = -1;
-        for (uint32_t si = 0; si < slots; si++) {
-            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
-                h->key_len == rec->klen &&
-                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
-                slot = (int)s; break;
-            }
-        }
-        if (slot < 0) { w->skipped++; continue; }
-
-        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
-
-        /* Re-parse field spans from the mmap'd CSV line. Cheaper than buffering
-           all spans in phase 1 (N*M*16 bytes for invoice-size schemas). */
-        int nvals = 0;
-        const char *vp = rec->body_start;
-        const char *line_end = rec->line_end;
-        while (nvals < w->active_count) {
-            const char *v_start = vp;
-            while (vp < line_end && *vp != w->delimiter) vp++;
-            vals[nvals].ptr = v_start;
-            vals[nvals].len = vp - v_start;
-            nvals++;
-            if (vp < line_end) vp++;
-            else if (nvals < w->active_count) {
-                while (nvals < w->active_count) {
-                    vals[nvals].ptr = line_end;
-                    vals[nvals].len = 0;
-                    nvals++;
-                }
-            }
-        }
-
-        /* Capture old index values (as index-key bytes) before patching. */
-        uint8_t *old_idx_bufs[MAX_FIELDS];
-        size_t   old_idx_lens[MAX_FIELDS];
-        int      old_idx_have[MAX_FIELDS];
-        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-        memset(old_idx_lens, 0, sizeof(old_idx_lens));
-        memset(old_idx_have, 0, sizeof(old_idx_have));
-        for (int fi = 0; fi < w->nidx; fi++) {
-            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
-                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
-        }
-
-        /* Patch each non-blank field into the typed payload at its fixed offset.
-           Blank cells are intentionally left untouched — 9a "update-only, blank
-           cell leaves alone" semantics. */
-        if (!w->has_tombstones) {
-            for (int i = 0; i < w->active_count && i < nvals; i++) {
-                if (vals[i].len > 0)
-                    encode_field_len(&w->ts->fields[i], vals[i].ptr, vals[i].len,
-                                     value_ptr + w->ts->fields[i].offset);
-            }
-        } else {
-            for (int i = 0; i < w->active_count && i < nvals; i++) {
-                int fi = w->active_indices[i];
-                if (vals[i].len > 0)
-                    encode_field_len(&w->ts->fields[fi], vals[i].ptr, vals[i].len,
-                                     value_ptr + w->ts->fields[fi].offset);
-            }
-        }
-
-        /* auto_update fields — refresh timestamp on every successful update */
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm;
-                localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                             tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
-            }
-        }
-
-        /* Compare old vs new index values and apply delta only where changed.
-           This is the "idx_changed_bitmap" optimisation from 9a — a blank CSV
-           cell on an indexed field leaves the field unchanged and therefore
-           does zero B+ tree work for that index. */
-        for (int fi = 0; fi < w->nidx; fi++) {
-            uint8_t *new_buf = NULL; size_t new_len = 0;
-            int have_new = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
-                                                      &new_buf, &new_len);
-            int changed = 0;
-            if (have_new && !old_idx_have[fi]) changed = 1;
-            else if (!have_new && old_idx_have[fi]) changed = 1;
-            else if (have_new && old_idx_have[fi]) {
-                if (new_len != old_idx_lens[fi] ||
-                    memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
-            }
-            if (changed) {
-                if (old_idx_have[fi])
-                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                       w->sch->splits,
-                                       old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
-                if (have_new)
-                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                      w->sch->splits,
-                                      new_buf, new_len, rec->hash);
-            }
-            free(old_idx_bufs[fi]);
-            free(new_buf);
-        }
-
-        w->updated++;
-    }
-
-    ucache_write_release(wh);
-    return NULL;
+    return bulk_upd_delim_shard_worker_v2(w);
 }
 
 /* Shared body for bulk-update-delimited (file + inline string entry points).
@@ -4319,10 +3558,11 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
         r->klen = klen;
         r->body_start = key_end + 1;
         r->line_end   = line_end;
-        compute_addr(r->key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+        compute_hash_raw(r->key, klen, r->hash);
+        r->shard_id = compute_record_shard(r->hash, sch.splits);
+        r->start_slot = 0;
         /* v2 alignment — see cmd_bulk_insert for rationale. */
-        if (sch.storage_version == 2)
-            r->shard_id = compute_record_shard(r->hash, sch.splits, 2);
+                    r->shard_id = compute_record_shard(r->hash, sch.splits);
     }
 
     /* ===== Phase 1.5: bucket by shard_id.
@@ -4604,7 +3844,7 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
 static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
-        .streams = w->sch->streams, .storage_version = 2,
+        .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) { w->skipped += w->count; return NULL; }
@@ -4653,109 +3893,7 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
 static void *bulk_upd_json_shard_worker(void *arg) {
     BulkUpdJsonShardWork *w = (BulkUpdJsonShardWork *)arg;
     if (w->count == 0) return NULL;
-    if (w->sch->storage_version == 2) return bulk_upd_json_shard_worker_v2(w);
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), w->db_root, w->object, w->shard_id);
-    FcacheRead wh = ucache_get_write(shard, 0);
-    if (!wh.map) { w->skipped += w->count; return NULL; }
-    uint8_t *map = wh.map;
-    uint32_t slots = wh.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    for (int ki = 0; ki < w->count; ki++) {
-        BulkUpdJsonRec *rec = &w->recs[ki];
-
-        /* Probe — must already exist (update-only semantics) */
-        int slot = -1;
-        for (uint32_t si = 0; si < slots; si++) {
-            uint32_t s = ((uint32_t)rec->start_slot + si) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag == 2) continue;
-            if (h->flag == 1 && memcmp(h->hash, rec->hash, 16) == 0 &&
-                h->key_len == rec->klen &&
-                memcmp(map + zoneB_off(s, slots, w->sch->slot_size), rec->key, rec->klen) == 0) {
-                slot = (int)s; break;
-            }
-        }
-        if (slot < 0) { w->skipped++; continue; }
-
-        SlotHeader *hdr = (SlotHeader *)(map + zoneA_off(slot));
-        uint8_t *value_ptr = map + zoneB_off(slot, slots, w->sch->slot_size) + hdr->key_len;
-
-        /* Capture old index keys before patching. */
-        uint8_t *old_idx_bufs[MAX_FIELDS];
-        size_t   old_idx_lens[MAX_FIELDS];
-        int      old_idx_have[MAX_FIELDS];
-        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-        memset(old_idx_lens, 0, sizeof(old_idx_lens));
-        memset(old_idx_have, 0, sizeof(old_idx_have));
-        for (int fi = 0; fi < w->nidx; fi++) {
-            old_idx_have[fi] = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
-                                                          &old_idx_bufs[fi], &old_idx_lens[fi]);
-        }
-
-        /* Patch each touched field at its fixed offset. Tombstoned fields
-           are silently skipped — the touched-list was filtered in phase 1. */
-        for (int i = 0; i < rec->n_fields; i++) {
-            int tidx = rec->field_indices[i];
-            if (tidx < 0 || tidx >= w->ts->nfields) continue;
-            if (w->ts->fields[tidx].removed) continue;
-            encode_field(&w->ts->fields[tidx], rec->field_values[i],
-                         value_ptr + w->ts->fields[tidx].offset);
-        }
-
-        /* auto_update fields — refresh timestamp on every successful update */
-        for (int fi = 0; fi < w->ts->nfields; fi++) {
-            if (w->ts->fields[fi].removed) continue;
-            if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-                char tbuf[20];
-                time_t now = time(NULL);
-                struct tm tm;
-                localtime_r(&now, &tm);
-                if (w->ts->fields[fi].type == FT_DATE)
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-                else
-                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                             tm.tm_hour, tm.tm_min, tm.tm_sec);
-                encode_field(&w->ts->fields[fi], tbuf, value_ptr + w->ts->fields[fi].offset);
-            }
-        }
-
-        /* Drop-old / insert-new btree entries where the indexed value moved. */
-        for (int fi = 0; fi < w->nidx; fi++) {
-            uint8_t *new_buf = NULL; size_t new_len = 0;
-            int have_new = build_index_key_from_record(w->ts, value_ptr, w->idx_fields[fi],
-                                                      &new_buf, &new_len);
-            int changed = 0;
-            if (have_new && !old_idx_have[fi]) changed = 1;
-            else if (!have_new && old_idx_have[fi]) changed = 1;
-            else if (have_new && old_idx_have[fi]) {
-                if (new_len != old_idx_lens[fi] ||
-                    memcmp(new_buf, old_idx_bufs[fi], new_len) != 0) changed = 1;
-            }
-            if (changed) {
-                if (old_idx_have[fi])
-                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                       w->sch->splits,
-                                       old_idx_bufs[fi], old_idx_lens[fi], rec->hash);
-                if (have_new)
-                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                      w->sch->splits,
-                                      new_buf, new_len, rec->hash);
-            }
-            if (old_idx_have[fi]) free(old_idx_bufs[fi]);
-            free(new_buf);
-        }
-
-        w->updated++;
-    }
-
-    ucache_write_release(wh);
-    return NULL;
+    return bulk_upd_json_shard_worker_v2(w);
 }
 
 /* Internal helper: read input (file path or in-memory string) into a heap buffer.
@@ -4950,10 +4088,11 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         r = &records[rec_count++];
         r->key = key;
         r->klen = klen;
-        compute_addr(key, klen, sch.splits, r->hash, &r->shard_id, &r->start_slot);
+        compute_hash_raw(key, klen, r->hash);
+        r->shard_id = compute_record_shard(r->hash, sch.splits);
+        r->start_slot = 0;
         /* v2 alignment — see cmd_bulk_insert for rationale. */
-        if (sch.storage_version == 2)
-            r->shard_id = compute_record_shard(r->hash, sch.splits, 2);
+                    r->shard_id = compute_record_shard(r->hash, sch.splits);
         if (n_touched > 0) {
             r->n_fields = n_touched;
             r->field_indices = malloc(n_touched * sizeof(int));
@@ -5158,7 +4297,7 @@ static void *bulk_del_crit_shard_worker(void *arg) {
 
     /* All keys in this worker hash to the same kf shard (dispatcher
        pre-sorted by compute_record_shard). */
-    int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits, 2);
+    int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits);
 
     SlotcaskBulkRec  *batch = calloc((size_t)w->count, sizeof(SlotcaskBulkRec));
     V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
@@ -5267,126 +4406,126 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
        bulk-delete (key-list) all use. The pre_commit hook re-verifies
        criteria + CAS under the kf wrlock (returning non-zero skips the
        record) and drops index entries for the deleted record. */
-    if (sch.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sch.splits, .slot_size = sch.slot_size,
-            .streams = sch.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        char idx_fields[MAX_FIELDS][256];
-        int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-        for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
 
-        if (!sdb || matched == 0) {
-            log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
-                     object, matched, sdb ? 0 : matched);
-            OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":%d}\n",
-                matched, sdb ? 0 : matched);
-            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
-            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
-            free(ctx.keys); free_criteria_tree(tree);
-            return 0;
-        }
-
-        /* Compute hash + shard-id per matched key; bucket-sort into per-shard
-           workers. Same O(n + splits) pattern as cmd_bulk_insert and
-           cmd_bulk_delete (replaces the old O(n²) insertion sort). */
-        uint8_t (*hashes)[16] = malloc((size_t)matched * sizeof(uint8_t[16]));
-        int      *shard_ids   = malloc((size_t)matched * sizeof(int));
-        if (!hashes || !shard_ids) {
-            free(hashes); free(shard_ids);
-            OUT("{\"error\":\"oom: bulk_delete_criteria\"}\n");
-            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
-            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
-            free(ctx.keys); free_criteria_tree(tree);
-            return 1;
-        }
-        for (int i = 0; i < matched; i++) {
-            compute_hash_raw(ctx.keys[i], strlen(ctx.keys[i]), hashes[i]);
-            shard_ids[i] = compute_record_shard(hashes[i], sch.splits, 2);
-        }
-
-        int *shard_counts = calloc(sch.splits, sizeof(int));
-        if (!shard_counts) {
-            free(hashes); free(shard_ids);
-            OUT("{\"error\":\"oom: bulk_delete_criteria buckets\"}\n");
-            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
-            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
-            free(ctx.keys); free_criteria_tree(tree);
-            return 1;
-        }
-        for (int i = 0; i < matched; i++) shard_counts[shard_ids[i]]++;
-        int *worker_shards = NULL, *shard_to_worker = NULL;
-        int nshard_groups = build_shard_worker_map(shard_counts, sch.splits,
-                                                    &worker_shards, &shard_to_worker);
-
-        BulkDelCritShardWork *workers = nshard_groups > 0
-            ? calloc(nshard_groups, sizeof(BulkDelCritShardWork)) : NULL;
-        if (nshard_groups < 0 || (nshard_groups > 0 && !workers)) {
-            free(workers); free(worker_shards); free(shard_to_worker);
-            free(shard_counts); free(hashes); free(shard_ids);
-            OUT("{\"error\":\"oom: bulk_delete_criteria workers\"}\n");
-            if (cas_crit) free_criteria(cas_crit, cas_ncrit);
-            for (int i = 0; i < matched; i++) free(ctx.keys[i]);
-            free(ctx.keys); free_criteria_tree(tree);
-            return 1;
-        }
-        for (int g = 0; g < nshard_groups; g++) {
-            int s = worker_shards[g];
-            int cnt = shard_counts[s];
-            workers[g].sdb = sdb;
-            workers[g].db_root = db_root;
-            workers[g].object  = object;
-            workers[g].sch     = &sch;
-            workers[g].ts      = ts;
-            workers[g].tree    = tree;
-            workers[g].fs      = &fs;
-            workers[g].cas_crit  = cas_crit;
-            workers[g].cas_ncrit = cas_ncrit;
-            workers[g].idx_fields = idx_fields;
-            workers[g].nidx       = nidx;
-            workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
-            workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
-            workers[g].count  = 0;
-        }
-        for (int i = 0; i < matched; i++) {
-            int w = shard_to_worker[shard_ids[i]];
-            int slot = workers[w].count++;
-            workers[w].keys[slot] = ctx.keys[i];   /* shallow ref; freed once below */
-            memcpy(workers[w].hashes[slot], hashes[i], 16);
-        }
-
-        parallel_for(bulk_del_crit_shard_worker, workers, nshard_groups,
-                      sizeof(BulkDelCritShardWork));
-
-        for (int g = 0; g < nshard_groups; g++) {
-            deleted += workers[g].deleted;
-            skipped += workers[g].skipped;
-            free(workers[g].keys);
-            free(workers[g].hashes);
-        }
-        free(workers); free(hashes); free(shard_ids);
-        free(shard_counts); free(worker_shards); free(shard_to_worker);
-
-        if (deleted > 0) {
-            update_count(db_root, object, -deleted);
-            update_deleted_count(db_root, object, deleted);
-        }
-        log_msg(3, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
-                 object, matched, deleted, skipped);
-        OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
-
+    if (!sdb || matched == 0) {
+        log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
+                 object, matched, sdb ? 0 : matched);
+        OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":%d}\n",
+            matched, sdb ? 0 : matched);
         if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
     }
 
+    /* Compute hash + shard-id per matched key; bucket-sort into per-shard
+       workers. Same O(n + splits) pattern as cmd_bulk_insert and
+       cmd_bulk_delete (replaces the old O(n²) insertion sort). */
+    uint8_t (*hashes)[16] = malloc((size_t)matched * sizeof(uint8_t[16]));
+    int      *shard_ids   = malloc((size_t)matched * sizeof(int));
+    if (!hashes || !shard_ids) {
+        free(hashes); free(shard_ids);
+        OUT("{\"error\":\"oom: bulk_delete_criteria\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys); free_criteria_tree(tree);
+        return 1;
+    }
+    for (int i = 0; i < matched; i++) {
+        compute_hash_raw(ctx.keys[i], strlen(ctx.keys[i]), hashes[i]);
+        shard_ids[i] = compute_record_shard(hashes[i], sch.splits);
+    }
+
+    int *shard_counts = calloc(sch.splits, sizeof(int));
+    if (!shard_counts) {
+        free(hashes); free(shard_ids);
+        OUT("{\"error\":\"oom: bulk_delete_criteria buckets\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys); free_criteria_tree(tree);
+        return 1;
+    }
+    for (int i = 0; i < matched; i++) shard_counts[shard_ids[i]]++;
+    int *worker_shards = NULL, *shard_to_worker = NULL;
+    int nshard_groups = build_shard_worker_map(shard_counts, sch.splits,
+                                                &worker_shards, &shard_to_worker);
+
+    BulkDelCritShardWork *workers = nshard_groups > 0
+        ? calloc(nshard_groups, sizeof(BulkDelCritShardWork)) : NULL;
+    if (nshard_groups < 0 || (nshard_groups > 0 && !workers)) {
+        free(workers); free(worker_shards); free(shard_to_worker);
+        free(shard_counts); free(hashes); free(shard_ids);
+        OUT("{\"error\":\"oom: bulk_delete_criteria workers\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys); free_criteria_tree(tree);
+        return 1;
+    }
+    for (int g = 0; g < nshard_groups; g++) {
+        int s = worker_shards[g];
+        int cnt = shard_counts[s];
+        workers[g].sdb = sdb;
+        workers[g].db_root = db_root;
+        workers[g].object  = object;
+        workers[g].sch     = &sch;
+        workers[g].ts      = ts;
+        workers[g].tree    = tree;
+        workers[g].fs      = &fs;
+        workers[g].cas_crit  = cas_crit;
+        workers[g].cas_ncrit = cas_ncrit;
+        workers[g].idx_fields = idx_fields;
+        workers[g].nidx       = nidx;
+        workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
+        workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
+        workers[g].count  = 0;
+    }
+    for (int i = 0; i < matched; i++) {
+        int w = shard_to_worker[shard_ids[i]];
+        int slot = workers[w].count++;
+        workers[w].keys[slot] = ctx.keys[i];   /* shallow ref; freed once below */
+        memcpy(workers[w].hashes[slot], hashes[i], 16);
+    }
+
+    parallel_for(bulk_del_crit_shard_worker, workers, nshard_groups,
+                  sizeof(BulkDelCritShardWork));
+
+    for (int g = 0; g < nshard_groups; g++) {
+        deleted += workers[g].deleted;
+        skipped += workers[g].skipped;
+        free(workers[g].keys);
+        free(workers[g].hashes);
+    }
+    free(workers); free(hashes); free(shard_ids);
+    free(shard_counts); free(worker_shards); free(shard_to_worker);
+
+    if (deleted > 0) {
+        update_count(db_root, object, -deleted);
+        update_deleted_count(db_root, object, deleted);
+    }
+    log_msg(3, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
+             object, matched, deleted, skipped);
+    OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
+
+    if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+    for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+    free(ctx.keys); free_criteria_tree(tree);
+    return 0;
+
     for (int i = 0; i < matched; i++) {
         const char *key = ctx.keys[i];
         size_t klen = strlen(key);
         uint8_t hash[16]; int shard_id, start_slot;
-        compute_addr(key, klen, sch.splits, hash, &shard_id, &start_slot);
+        compute_hash_raw(key, klen, hash);
+        shard_id = compute_record_shard(hash, sch.splits);
+        start_slot = 0;
 
         char shard[PATH_MAX];
         build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
@@ -5949,7 +5088,7 @@ int rebuild_object(const char *db_root, const char *object,
     /* streams change is a no-op for v1 (no streams concept). For v2, the
        caller (typically vacuum) passes the desired stream count. 0 = keep. */
     int old_streams = old_sch.streams;
-    int new_streams = (new_streams_arg > 0 && old_sch.storage_version == 2)
+    int new_streams = (new_streams_arg > 0 )
                       ? new_streams_arg : old_streams;
     int streams_changed = (new_streams != old_streams);
 
@@ -6001,14 +5140,9 @@ int rebuild_object(const char *db_root, const char *object,
     new_sch.splits = new_splits;
     new_sch.streams = new_streams;
     new_sch.max_value = new_ts.total_size;
-    /* slot_size depends on storage version — v2 includes a 24B inline
-       per-record header, v1 doesn't (see load_schema commentary). */
-    if (old_sch.storage_version == 2) {
-        new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
-        if (new_sch.slot_size < 32) new_sch.slot_size = 32;
-    } else {
-        new_sch.slot_size = (new_sch.max_key + new_sch.max_value + 7) & ~7;
-    }
+    /* slot_size = 24B inline header + max_key + max_value, rounded to 8, floor 32. */
+    new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
+    if (new_sch.slot_size < 32) new_sch.slot_size = 32;
 
     int slot_changed = (new_sch.slot_size != old_sch.slot_size);
 
@@ -6019,12 +5153,10 @@ int rebuild_object(const char *db_root, const char *object,
     }
 
     /* v2 path runs an entirely separate rebuild over slotcask files. */
-    if (old_sch.storage_version == 2) {
-        return rebuild_object_v2(db_root, object, &old_sch, old_ts,
-                                  &new_sch, &new_ts, new_to_old,
-                                  slot_changed, splits_changed,
-                                  drop_tombstoned, added_lines, n_added);
-    }
+    return rebuild_object_v2(db_root, object, &old_sch, old_ts,
+                              &new_sch, &new_ts, new_to_old,
+                              slot_changed, splits_changed,
+                              drop_tombstoned, added_lines, n_added);
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
@@ -6476,11 +5608,6 @@ int cmd_edit_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"Object [%s] not found\"}\n", object);
         return 1;
     }
-    if (old_sch.storage_version != 2) {
-        OUT("{\"error\":\"edit-field requires v2 storage; run ./migrate to upgrade [%s] first\"}\n",
-            object);
-        return 1;
-    }
     TypedSchema *old_ts = load_typed_schema(db_root, object);
     if (!old_ts) {
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
@@ -6616,7 +5743,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
        field's value fits the new shape on every live record. */
     SlotcaskSchemaInfo info = {
         .splits = old_sch.splits, .slot_size = old_sch.slot_size,
-        .streams = old_sch.streams, .storage_version = 2,
+        .streams = old_sch.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
@@ -6719,11 +5846,9 @@ int cmd_vacuum(const char *db_root, const char *object,
        infrastructure as a splits change. The check folds into both flag
        paths so a single `vacuum` invocation always converges streams. */
     int new_streams = 0;
-    if (sch.storage_version == 2) {
-        int derived = slotcask_streams_for_nproc();
-        if (derived != sch.streams && derived > 0)
-            new_streams = derived;
-    }
+    int derived = slotcask_streams_for_nproc();
+    if (derived != sch.streams && derived > 0)
+        new_streams = derived;
 
     /* Heavy path: --compact, --splits, or streams mismatch — all converge
        through rebuild_object. */
@@ -6739,24 +5864,22 @@ int cmd_vacuum(const char *db_root, const char *object,
        seg get migrated into a denser non-active seg's tombstone holes, then
        the now-empty donor file is unlinked. The active seg is never touched
        so concurrent appends after vacuum return are unaffected. */
-    if (sch.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sch.splits, .slot_size = sch.slot_size,
-            .streams = sch.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        int dropped = 0;
-        if (sdb) {
-            (void)slotcask_compact_segs(sdb, &dropped);
-            /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
-               returns to 0 (kf-derived counts model — there's no separate
-               counts file to lie via anymore). */
-            (void)slotcask_compact_kf(sdb);
-        }
-        reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
-        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
-        return 0;
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    int dropped = 0;
+    if (sdb) {
+        (void)slotcask_compact_segs(sdb, &dropped);
+        /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
+           returns to 0 (kf-derived counts model — there's no separate
+           counts file to lie via anymore). */
+        (void)slotcask_compact_kf(sdb);
     }
+    reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
+    OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
+    return 0;
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
@@ -6823,20 +5946,20 @@ int cmd_exists(const char *db_root, const char *object,
                const char *key, size_t klen) {
     Schema sc = load_schema(db_root, object);
 
-    if (sc.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (!sdb) { OUT("false\n"); return 1; }
-        int rc = slotcask_exists(sdb, key, klen);
-        OUT("%s\n", rc == 1 ? "true" : "false");
-        return rc == 1 ? 0 : 1;
-    }
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size,
+        .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { OUT("false\n"); return 1; }
+    int rc = slotcask_exists(sdb, key, klen);
+    OUT("%s\n", rc == 1 ? "true" : "false");
+    return rc == 1 ? 0 : 1;
 
     uint8_t hash[16]; int shard_id, start_slot;
-    compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
+    compute_hash_raw(key, klen, hash);
+    shard_id = compute_record_shard(hash, sc.splits);
+    start_slot = 0;
 
     char shard[PATH_MAX];
     build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
@@ -6918,12 +6041,11 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
        a limit-bound caller never reads. The threshold (1000) is well below
        typical full-scan workloads but covers the common KEYS first N case
        and admin previews. */
-    int use_streaming = (sch.storage_version == 2 &&
-                          limit > 0 && limit <= 1000);
+    int use_streaming = (limit > 0 && limit <= 1000);
     if (use_streaming) {
         SlotcaskSchemaInfo info = {
             .splits = sch.splits, .slot_size = sch.slot_size,
-            .streams = sch.streams, .storage_version = 2,
+            .streams = sch.streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (sdb) scan_shards_v2_streaming(sdb, keys_cb, &ctx);
@@ -7263,7 +6385,7 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
 
     SlotcaskSchemaInfo info = {
         .splits = sch->splits, .slot_size = sch->slot_size,
-        .streams = sch->streams, .storage_version = 2,
+        .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
 
@@ -7318,10 +6440,8 @@ int cmd_fetch(const char *db_root, const char *object,
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     if (limit <= 0) limit = g_global_limit;
     Schema sch = load_schema(db_root, object);
-    if (sch.storage_version == 2) {
-        return cmd_fetch_v2(db_root, object, offset, limit, proj_str, cursor,
-                             format, delimiter, &sch);
-    }
+    return cmd_fetch_v2(db_root, object, offset, limit, proj_str, cursor,
+                         format, delimiter, &sch);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
     FieldSchema fs_fetch;
@@ -9422,7 +8542,8 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
 
     CollectedHash *e = &cc->entries[idx];
     memcpy(e->hash, hash16, 16);
-    addr_from_hash(hash16, cc->splits, &e->shard_id, &e->start_slot);
+    e->shard_id = compute_record_shard(hash16, cc->splits);
+    e->start_slot = 0;
     return 0;
 }
 
@@ -9993,52 +9114,16 @@ static void *shard_count_worker(void *arg) {
     ShardCountCtx *sc = (ShardCountCtx *)arg;
     if (sc->entry_count == 0) return NULL;
 
-    /* v2: layout-agnostic per-hash fetch via read_record_ref. The shard
-       grouping the planner did was a v1 locality hint; for v2 we just
-       walk the entries linearly and let slotcask route each lookup. */
-    if (sc->sch->storage_version == 2) {
-        size_t local = 0;
-        for (int ei = 0; ei < sc->entry_count; ei++) {
-            if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
-            RecordRef rr;
-            if (read_record_ref(sc->db_root, sc->object, sc->sch,
-                                 sc->entries[ei].hash, &rr) != 0) continue;
-            if (criteria_match_tree(rr.val, sc->tree, sc->fs)) local++;
-            release_record_ref(&rr);
-        }
-        sc->count = local;
-        return NULL;
-    }
-
-    int sid = sc->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sc->db_root, sc->object, sid);
-
-    /* Use the persistent shard mmap cache — same path as shard_find_worker.
-       Direct mmap+munmap per query was paying ~100µs of page-fault + TLB
-       work per shard, swamping the actual count work for selective queries. */
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
+    /* Layout-agnostic per-hash fetch via read_record_ref. */
     size_t local = 0;
     for (int ei = 0; ei < sc->entry_count; ei++) {
         if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
-        CollectedHash *e = &sc->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, e->hash, 16) != 0) continue;
-
-            const uint8_t *raw = fc.map + zoneB_off(s, slots, sc->sch->slot_size) + h->key_len;
-            if (criteria_match_tree(raw, sc->tree, sc->fs)) local++;
-            break;
-        }
+        RecordRef rr;
+        if (read_record_ref(sc->db_root, sc->object, sc->sch,
+                             sc->entries[ei].hash, &rr) != 0) continue;
+        if (criteria_match_tree(rr.val, sc->tree, sc->fs)) local++;
+        release_record_ref(&rr);
     }
-    fcache_release(fc);
     sc->count = local;
     return NULL;
 }
@@ -10246,20 +9331,18 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
        routes per hash internally — so we feed the collected hashes through
        keyset_emit_find which already speaks RecordRef + read_record_ref.
        Joins handled there too via the dispatched lookup_remote (Phase 3G). */
-    if (sch->storage_version == 2) {
-        KeySet *ks = keyset_new(cc.count);
-        if (!ks) { collect_ctx_destroy(&cc); return -2; }
-        for (size_t i = 0; i < cc.count; i++)
-            keyset_insert(ks, cc.entries[i].hash);
-        int rc = keyset_emit_find(db_root, object, sch, ks,
-                                  tree, excluded, offset, limit,
-                                  proj_fields, proj_count, fs,
-                                  rows_fmt, dict_fmt, csv_delim,
-                                  joins, njoins, dl);
-        keyset_free(ks);
-        collect_ctx_destroy(&cc);
-        return rc;
-    }
+    KeySet *ks = keyset_new(cc.count);
+    if (!ks) { collect_ctx_destroy(&cc); return -2; }
+    for (size_t i = 0; i < cc.count; i++)
+        keyset_insert(ks, cc.entries[i].hash);
+    int rc = keyset_emit_find(db_root, object, sch, ks,
+                              tree, excluded, offset, limit,
+                              proj_fields, proj_count, fs,
+                              rows_fmt, dict_fmt, csv_delim,
+                              joins, njoins, dl);
+    keyset_free(ks);
+    collect_ctx_destroy(&cc);
+    return rc;
 
     int count = 0, printed = 0;
     process_batch(cc.entries, cc.count, db_root, object, sch,
@@ -11608,7 +10691,8 @@ static int keyset_to_batch_cb(const uint8_t hash[16], void *ctx) {
     if (kc->count >= kc->cap) return -1;  /* shouldn't happen — cap = keyset_size */
     CollectedHash *e = &kc->entries[kc->count++];
     memcpy(e->hash, hash, 16);
-    addr_from_hash(hash, kc->splits, &e->shard_id, &e->start_slot);
+    e->shard_id = compute_record_shard(hash, kc->splits);
+    e->start_slot = 0;
     return 0;
 }
 
@@ -11820,10 +10904,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
         if (query_deadline_tick(dl, &dl_counter)) break;
         if (ks->state[b] != 2) continue;
 
-        /* Storage-version-agnostic fetch: v1 returns a live mmap pointer
-           held by an FcacheRead handle; v2 returns a malloc'd copy. Caller
-           releases via release_record_ref. The previous v1-only path did
-           a redundant lookup-then-walk to recover the key pointer; the
+        /* slotcask fetch returns a malloc'd copy of key+value owned by
+           the RecordRef; caller releases via release_record_ref. The
            dispatch helper returns key+val together in one shot. */
         RecordRef rr;
         if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
@@ -13312,12 +12394,11 @@ int cmd_find(const char *db_root, const char *object,
            response is per-record. Otherwise the buffered Pass-1 path
            collects refs the limit will never read. Same threshold + form
            as cmd_keys; see scan_shards_v2_streaming. */
-        int use_streaming = (sch.storage_version == 2 &&
-                              limit > 0 && limit <= 1000);
+        int use_streaming = (limit > 0 && limit <= 1000);
         if (use_streaming) {
             SlotcaskSchemaInfo info = {
                 .splits = sch.splits, .slot_size = sch.slot_size,
-                .streams = sch.streams, .storage_version = 2,
+                .streams = sch.streams,
             };
             SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
             if (sdb) scan_shards_v2_streaming(sdb, adv_search_cb, &ctx);
@@ -13539,8 +12620,10 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(meta_path, sizeof(meta_path), "%s/object.json", bak_dir);
     FILE *mf = fopen(meta_path, "w");
     if (mf) {
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":%d,\"streams\":%d}\n",
-                sch.splits, sch.max_key, sch.storage_version, sch.streams);
+        /* storage_version slot kept in the backup metadata for forward
+           compatibility — every object the daemon writes is v2. */
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d}\n",
+                sch.splits, sch.max_key, sch.streams);
         fclose(mf);
     }
 
@@ -13880,78 +12963,46 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     if (!rows) { OUT("{\"error\":\"oom\"}\n"); return 1; }
     int nrows = 0;
 
-    if (sch.storage_version == 2) {
-        /* v2 layout: walk data/kf/NNN.kf. Each file is [24B SlotcaskKfHeader]
-           [N × 24B SlotcaskKfEntry]. The header carries `total` (live +
-           tombstoned) and `deleted` (tombstones); live = total - deleted,
-           so we don't need to scan the entry array at all — one pread of
-           the header per shard is enough. */
-        char kf_dir[PATH_MAX];
-        snprintf(kf_dir, sizeof(kf_dir), "%s/kf", data_dir);
-        DIR *d1 = opendir(kf_dir);
-        if (!d1) { OUT("{\"error\":\"Object [%s] has no kf data\"}\n", object); free(rows); return 1; }
-        struct dirent *e1;
-        while ((e1 = readdir(d1))) {
-            if (e1->d_name[0] == '.') continue;
-            size_t nl = strlen(e1->d_name);
-            if (nl < 4 || strcmp(e1->d_name + nl - 3, ".kf") != 0) continue;
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/%s", kf_dir, e1->d_name);
-            int fd = open(path, O_RDONLY);
-            if (fd < 0) continue;
-            struct stat st; if (fstat(fd, &st) < 0) { close(fd); continue; }
-            uint32_t slots = 0, live = 0;
-            if ((uint64_t)st.st_size >= SLOTCASK_KF_HDR_SIZE) {
-                slots = (uint32_t)(((uint64_t)st.st_size - SLOTCASK_KF_HDR_SIZE)
-                                   / sizeof(SlotcaskKfEntry));
-                SlotcaskKfHeader hdr;
-                if (pread(fd, &hdr, sizeof(hdr), 0) == (ssize_t)sizeof(hdr)
-                    && hdr.magic == SLOTCASK_KF_MAGIC) {
-                    live = (uint32_t)(hdr.total - hdr.deleted);
-                }
-            }
-            close(fd);
-            int sid = (int)strtol(e1->d_name, NULL, 10);
-            if (nrows >= cap) {
-                cap *= 2;
-                Row *t = xrealloc_or_free(rows, cap * sizeof(*t));
-                if (!t) { rows = NULL; nrows = 0; break; }
-                rows = t;
-            }
-            rows[nrows++] = (Row){ sid, slots, live, (uint64_t)st.st_size };
-        }
-        closedir(d1);
-        goto sort_and_emit;
-    }
-
-    DIR *d1 = opendir(data_dir);
-    if (!d1) { OUT("{\"error\":\"Object [%s] has no data\"}\n", object); free(rows); return 1; }
+    /* v2 layout: walk data/kf/NNN.kf. Each file is [24B SlotcaskKfHeader]
+       [N × 24B SlotcaskKfEntry]. The header carries `total` (live +
+       tombstoned) and `deleted` (tombstones); live = total - deleted,
+       so we don't need to scan the entry array at all — one pread of
+       the header per shard is enough. */
+    char kf_dir[PATH_MAX];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/kf", data_dir);
+    DIR *d1 = opendir(kf_dir);
+    if (!d1) { OUT("{\"error\":\"Object [%s] has no kf data\"}\n", object); free(rows); return 1; }
     struct dirent *e1;
     while ((e1 = readdir(d1))) {
         if (e1->d_name[0] == '.') continue;
         size_t nl = strlen(e1->d_name);
-        if (nl < 5 || strcmp(e1->d_name + nl - 4, ".bin") != 0) continue;
+        if (nl < 4 || strcmp(e1->d_name + nl - 3, ".kf") != 0) continue;
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", data_dir, e1->d_name);
+        snprintf(path, sizeof(path), "%s/%s", kf_dir, e1->d_name);
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
         struct stat st; if (fstat(fd, &st) < 0) { close(fd); continue; }
-        ShardHeader hdr;
-        if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) { close(fd); continue; }
+        uint32_t slots = 0, live = 0;
+        if ((uint64_t)st.st_size >= SLOTCASK_KF_HDR_SIZE) {
+            slots = (uint32_t)(((uint64_t)st.st_size - SLOTCASK_KF_HDR_SIZE)
+                               / sizeof(SlotcaskKfEntry));
+            SlotcaskKfHeader hdr;
+            if (pread(fd, &hdr, sizeof(hdr), 0) == (ssize_t)sizeof(hdr)
+                && hdr.magic == SLOTCASK_KF_MAGIC) {
+                live = (uint32_t)(hdr.total - hdr.deleted);
+            }
+        }
         close(fd);
-        if (hdr.magic != SHARD_MAGIC) continue;
-        int sid = (int)strtol(e1->d_name, NULL, 16);
+        int sid = (int)strtol(e1->d_name, NULL, 10);
         if (nrows >= cap) {
             cap *= 2;
             Row *t = xrealloc_or_free(rows, cap * sizeof(*t));
             if (!t) { rows = NULL; nrows = 0; break; }
             rows = t;
         }
-        rows[nrows++] = (Row){ sid, hdr.slots_per_shard, hdr.record_count, (uint64_t)st.st_size };
+        rows[nrows++] = (Row){ sid, slots, live, (uint64_t)st.st_size };
     }
     closedir(d1);
-
-sort_and_emit:
 
     /* Sort by shard_id */
     for (int i = 1; i < nrows; i++) {
@@ -13972,9 +13023,7 @@ sort_and_emit:
 
     /* `grows` = log2(max_slots / initial). v1 uses INITIAL_SLOTS=256; v2 uses
        the splits-tier initial from slotcask_default_slots_for_splits(). */
-    uint32_t initial = (sch.storage_version == 2)
-        ? (uint32_t)slotcask_default_slots_for_splits(sch.splits)
-        : (uint32_t)INITIAL_SLOTS;
+    uint32_t initial = (uint32_t)slotcask_default_slots_for_splits(sch.splits);
     int grows = 0;
     for (uint32_t s = max_slots; initial > 0 && s > initial; s >>= 1) grows++;
 
@@ -13999,21 +13048,18 @@ sort_and_emit:
         }
     }
 
-    /* v2 emits keyfile-flavored field names (kf shards aren't data shards);
-       v1 keeps `shard`/`shards_on_disk`/`shard_list` as those rows really are
-       data shards. */
-    int v2 = (sch.storage_version == 2);
-    const char *count_key = v2 ? "keyfiles"  : "shards_on_disk";
-    const char *list_key  = v2 ? "keyfiles"  : "shard_list";
-    const char *row_key   = v2 ? "keyfile"   : "shard";
+    /* Keyfile-flavored field names — kf shards aren't data shards. */
+    const char *count_key = "keyfiles";
+    const char *list_key  = "keyfiles";
+    const char *row_key   = "keyfile";
 
     if (as_table) {
         OUT("splits=%d %s=%d total_records=%lu total_bytes=%lu avg_rec_per_shard=%lu max_grows=%d avg_load=%.3f\n",
             sch.splits, count_key, nrows, (unsigned long)total_records, (unsigned long)total_bytes,
             (unsigned long)rps, grows, avg_load);
         if (nrows != sch.splits)
-            OUT("warn: %s (%d) ≠ splits (%d) — partial vacuum/reshard or missing %s files?\n",
-                count_key, nrows, sch.splits, v2 ? "kf" : "shard");
+            OUT("warn: %s (%d) ≠ splits (%d) — partial vacuum/reshard or missing kf files?\n",
+                count_key, nrows, sch.splits);
         OUT("  %-8s %-10s %-10s %-8s %-14s\n", row_key, "slots", "records", "load", "bytes");
         for (int i = 0; i < nrows; i++) {
             double load = rows[i].slots ? (double)rows[i].records / (double)rows[i].slots : 0.0;
@@ -14049,18 +13095,16 @@ sort_and_emit:
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
 
-    if (sch.storage_version == 2) {
-        SlotcaskSchemaInfo info = {
-            .splits = sch.splits, .slot_size = sch.slot_size,
-            .streams = sch.streams, .storage_version = 2,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        uint64_t total_hdr = 0, deleted_hdr = 0;
-        if (sdb) slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr);
-        int live = (int)(total_hdr > deleted_hdr ? total_hdr - deleted_hdr : 0);
-        OUT("{\"count\":%d}\n", live);
-        return 0;
-    }
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    uint64_t total_hdr = 0, deleted_hdr = 0;
+    if (sdb) slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr);
+    int live = (int)(total_hdr > deleted_hdr ? total_hdr - deleted_hdr : 0);
+    OUT("{\"count\":%d}\n", live);
+    return 0;
 
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
@@ -14135,14 +13179,10 @@ int cmd_truncate(const char *db_root, const char *object) {
     invalidate_idx_cache(object);
     counts_invalidate(db_root, object);
 
-    /* v2: drop the cached slotcask handle so the rmrf below doesn't tug
-       on live mmaps. The data/ wipe further down handles the actual
-       file removal — v2's kf + stream files all live under data/, same
-       umbrella as v1's data/NNN.bin. */
-    Schema sch = load_schema(db_root, object);
-    if (sch.storage_version == 2) {
-        slotcask_registry_invalidate(db_root, object);
-    }
+    /* Drop the cached slotcask handle so the rmrf below doesn't tug on
+       live mmaps. The data/ wipe further down handles the actual file
+       removal — kf + stream files all live under data/. */
+    slotcask_registry_invalidate(db_root, object);
 
     /* Only delete data, metadata, and index data — preserve config files */
     char path[PATH_MAX];
@@ -14174,218 +13214,6 @@ int cmd_truncate(const char *db_root, const char *object) {
 
     set_count(db_root, object, 0);
     OUT("{\"status\":\"truncated\",\"object\":\"%s\"}\n", object);
-    return 0;
-}
-
-/* ========== MIGRATE-STORAGE-VERSION (v1 → v2) ==========
- *
- * Walks the object's existing v1 shard files, writes each live record
- * into a fresh slotcask, atomic-renames data/ to data.legacy/, and
- * appends :2:streams to the schema.conf line.
- *
- * Hashes survive the migration unchanged (compute_hash_raw is canonical
- * across both layouts after the Phase 3E refactor), so the per-shard
- * btree indexes already at <obj>/indexes/<field>/<NNN>.idx keep
- * pointing to valid records — read_record_ref dispatches on
- * storage_version and routes to slotcask_lookup_by_hash post-migration.
- * No reindex needed.
- *
- * Caller holds objlock_wrlock (mode_is_schema). */
-
-typedef struct {
-    SlotcaskDb *sdb;
-    /* Updated from parallel scan_shards workers — must be atomic.
-       Plain int++ raced and undercounted on slower CPUs (CI ASan
-       reliably hit it; local rarely). */
-    int         inserted;
-    int         err;
-} MigrateWalkCtx;
-
-static int migrate_walk_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
-    MigrateWalkCtx *c = (MigrateWalkCtx *)ctx;
-    const uint8_t *key = block;
-    const uint8_t *value = block + hdr->key_len;
-    int rc = slotcask_insert(c->sdb, -1,
-                              key, hdr->key_len,
-                              value, hdr->value_len);
-    if (rc != 0) {
-        __atomic_store_n(&c->err, 1, __ATOMIC_RELEASE);
-        return 1;  /* halt scan on insert failure */
-    }
-    __atomic_fetch_add(&c->inserted, 1, __ATOMIC_RELAXED);
-    return 0;
-}
-
-/* Append :2:streams to the matching dir:object: line in schema.conf. */
-static int update_schema_conf_to_v2(const char *db_root, const char *object,
-                                     int streams) {
-    const char *dir = db_root + strlen(g_db_root);
-    if (*dir == '/') dir++;
-
-    char conf[PATH_MAX], tmp[PATH_MAX];
-    snprintf(conf, sizeof(conf), "%s/schema.conf", g_db_root);
-    snprintf(tmp,  sizeof(tmp),  "%s/schema.conf.tmp.%d", g_db_root, (int)getpid());
-
-    char prefix[512];
-    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
-
-    FILE *fin = fopen(conf, "r");
-    if (!fin) return -1;
-    int lockfd = fileno(fin);
-    flock(lockfd, LOCK_EX);
-
-    FILE *fout = fopen(tmp, "w");
-    if (!fout) { flock(lockfd, LOCK_UN); fclose(fin); return -1; }
-
-    char line[512];
-    int replaced = 0;
-    while (fgets(line, sizeof(line), fin)) {
-        if (!replaced && strncmp(line, prefix, pfxlen) == 0) {
-            line[strcspn(line, "\r\n")] = '\0';
-            int splits = 0, max_key = 0, sv = 0, st = 0;
-            int n = sscanf(line + pfxlen, "%d:%d:%d:%d",
-                            &splits, &max_key, &sv, &st);
-            if (n >= 4) {
-                /* Already has trailing version+streams — overwrite. */
-                fprintf(fout, "%s%d:%d:2:%d\n", prefix, splits, max_key, streams);
-            } else if (n >= 2) {
-                fprintf(fout, "%s%d:%d:2:%d\n", prefix, splits, max_key, streams);
-            } else {
-                fputs(line, fout); fputc('\n', fout);
-            }
-            replaced = 1;
-        } else {
-            fputs(line, fout);
-        }
-    }
-    fclose(fout);
-    int ok = (rename(tmp, conf) == 0);
-    flock(lockfd, LOCK_UN);
-    fclose(fin);
-    return ok ? 0 : -1;
-}
-
-/* Atomic rename `src` → `dst` that FAILS with EEXIST if `dst` already
-   exists. Linux: renameat2(RENAME_NOREPLACE). macOS: renamex_np with
-   RENAME_EXCL (10.12+). Anywhere else: stat-then-rename with a small
-   TOCTOU window — only used by the operator-driven migrate path, which
-   doesn't run concurrent renames. */
-static int rename_noreplace(const char *src, const char *dst) {
-#if defined(__linux__) && defined(RENAME_NOREPLACE)
-    return renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE);
-#elif defined(__APPLE__)
-    extern int renamex_np(const char *, const char *, unsigned int);
-    /* RENAME_EXCL is the macOS analogue (sys/stdio.h, 10.12+).
-       Hardcoded value to avoid depending on _DARWIN_C_SOURCE feature
-       test gating the constant — it's a stable kernel ABI. */
-    return renamex_np(src, dst, /* RENAME_EXCL */ 0x4);
-#else
-    struct stat st;
-    if (stat(dst, &st) == 0) { errno = EEXIST; return -1; }
-    return rename(src, dst);
-#endif
-}
-
-int cmd_migrate_storage_version(const char *db_root, const char *dir,
-                                 const char *object) {
-    Schema sc = load_schema(db_root, object);
-    if (sc.splits <= 0) {
-        OUT("{\"error\":\"object [%s/%s] not found\"}\n", dir, object);
-        return 1;
-    }
-    if (sc.storage_version == 2) {
-        OUT("{\"status\":\"already_v2\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-            dir, object);
-        return 0;
-    }
-
-    char obj_dir[PATH_MAX];
-    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/data", obj_dir);
-    char data_legacy[PATH_MAX];
-    snprintf(data_legacy, sizeof(data_legacy), "%s/data.legacy", obj_dir);
-
-    /* v2 slot_size includes the 24B inline per-record header (see
-       load_schema commentary). streams from nproc. */
-    int streams = slotcask_streams_for_nproc();
-    int new_slot_size = (24 + sc.max_key + sc.max_value + 7) & ~7;
-    if (new_slot_size < 32) new_slot_size = 32;
-
-    /* Step 1: atomically rename v1 data/ → data.legacy/ so the new
-       slotcask can create its own data/ subtree (kf/, streams/) without
-       colliding with the v1 NNN.bin files.
-
-       Use renameat2(RENAME_NOREPLACE) — the rename succeeds only if
-       data.legacy doesn't already exist, in one atomic syscall. This
-       eliminates the stat-then-rename TOCTOU window that the previous
-       shape had (CodeQL CIDs flagged 12979 + 12992; Coverity CID
-       1693835 same root cause). errno mapping recovers the same three
-       error messages the old stats produced. */
-    fcache_invalidate(data_dir);
-    if (rename_noreplace(data_dir, data_legacy) != 0) {
-        int e = errno;
-        if (e == EEXIST) {
-            OUT("{\"error\":\"data.legacy/ exists; previous migration aborted — manual cleanup required\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-                dir, object);
-        } else if (e == ENOENT) {
-            OUT("{\"error\":\"data/ missing for v1 object [%s/%s]\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-                dir, object, dir, object);
-        } else {
-            OUT("{\"error\":\"rename data/ → data.legacy/ failed: %s\"}\n",
-                strerror(e));
-        }
-        return 1;
-    }
-
-    /* Step 2: open the new v2 slotcask. mkdirp's data/kf/ and
-       data/streams/ on the way in. */
-    SlotcaskDb sdb;
-    if (slotcask_open(&sdb, obj_dir, sc.splits, streams, new_slot_size) != 0) {
-        /* Best-effort rollback of the rename. data/ doesn't exist (we
-           just renamed it away) and data.legacy is ours — RENAME_NOREPLACE
-           keeps this race-free too. If rollback also fails the operator
-           sees both error paths logged. */
-        if (rename_noreplace(data_legacy, data_dir) != 0)
-            log_msg(1, "migrate: rollback rename failed: %s", strerror(errno));
-        OUT("{\"error\":\"slotcask_open failed\",\"dir\":\"%s\",\"object\":\"%s\"}\n",
-            dir, object);
-        return 1;
-    }
-
-    /* Step 3: walk every live v1 record (now at data.legacy/) and
-       insert into the new slotcask. */
-    MigrateWalkCtx wctx = { &sdb, 0, 0 };
-    scan_shards(data_legacy, sc.slot_size, migrate_walk_cb, &wctx);
-    slotcask_close(&sdb);
-
-    if (wctx.err) {
-        OUT("{\"error\":\"insert failed during migration after %d records\",\"inserted\":%d}\n",
-            wctx.inserted, wctx.inserted);
-        return 1;
-    }
-
-    /* Step 4: update schema.conf line to append :2:streams. After this
-       the next request sees storage_version=2 and routes through
-       slotcask. */
-    if (update_schema_conf_to_v2(db_root, object, streams) != 0) {
-        OUT("{\"error\":\"schema.conf update failed\"}\n");
-        return 1;
-    }
-
-    invalidate_schema_caches(db_root, object);
-    /* The slotcask we just opened was a stack-local handle; the registry
-       doesn't know about it. Drop any lingering registry entry so the
-       next request re-opens with the freshly-written schema.conf
-       metadata. */
-    slotcask_registry_invalidate(db_root, object);
-
-    log_msg(3, "MIGRATE %s/%s: v1 → v2, %d records, streams=%d, slot_size=%d",
-            dir, object, wctx.inserted, streams, new_slot_size);
-    /* `upgraded` (not `migrated`) to disambiguate from migrate-files's
-       summary line in mixed-output captures. */
-    OUT("{\"status\":\"upgraded\",\"dir\":\"%s\",\"object\":\"%s\",\"records\":%d,\"streams\":%d,\"slot_size\":%d}\n",
-        dir, object, wctx.inserted, streams, new_slot_size);
     return 0;
 }
 
@@ -14797,7 +13625,6 @@ static int parse_auto_key_spec(const char *spec, char *out_seq_name, size_t seq_
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      int storage_version,
                       const char *auto_key_spec) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
@@ -14901,27 +13728,6 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* All new objects are v2 (slotcask). The storage_version JSON
-       field is no longer part of the public create-object API — any
-       value sent is ignored. v1 is supported only for reading
-       existing on-disk objects and for the migrate runner's tests
-       (which set SHARD_ALLOW_V1_CREATE=1 to opt into the legacy
-       writer for setup). */
-    {
-        const char *allow = getenv("SHARD_ALLOW_V1_CREATE");
-        int test_legacy = (allow && allow[0] == '1');
-        if (!test_legacy) {
-            storage_version = 2;
-        } else {
-            if (storage_version == 0) storage_version = 2;
-            if (storage_version != 1 && storage_version != 2) {
-                OUT("{\"error\":\"storage_version=%d invalid; must be 1 (legacy) or 2 (slotcask)\"}\n",
-                    storage_version);
-                return 1;
-            }
-        }
-    }
-
     /* Validate indexes reference defined field names */
     if (indexes_json && indexes_json[0]) {
         p = json_skip(indexes_json);
@@ -14978,12 +13784,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
     char path[PATH_MAX];
-    /* Legacy probe-into-slot needs data/. Slotcask uses keyfile_*.kf +
-       stream_NNN/ created lazily by slotcask_open() below. */
-    if (storage_version == 1) {
-        snprintf(path, sizeof(path), "%s/%s/data", eff_root, object);
-        mkdirp(path);
-    }
+    /* Slotcask uses keyfile_*.kf + stream_NNN/ created lazily by
+       slotcask_open() below. */
     snprintf(path, sizeof(path), "%s/%s/metadata", eff_root, object);
     mkdirp(path);
     snprintf(path, sizeof(path), "%s/%s/indexes", eff_root, object);
@@ -15018,7 +13820,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     /* Streams count for slotcask: hardcoded by nproc at create time so subsequent
        opens use the same count (stream_id is on-disk in the keyfile entry). */
-    int streams = (storage_version == 2) ? slotcask_streams_for_nproc() : 0;
+    int streams = slotcask_streams_for_nproc();
 
     /* Parse + validate auto_key_spec. Refuses cross-version invariants
        (uuid needs max_key>=16, seq needs max_key>=8). On AK_SEQ,
@@ -15035,39 +13837,44 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
     if (auto_key_kind == 2) {
-        /* Pre-initialise the sequence file at 0 — first `next` returns 1. */
+        /* Pre-initialise the sequence file at 0 — first `next` returns 1.
+           Use O_CREAT|O_EXCL so create-if-absent is one atomic syscall —
+           the previous stat() + fopen("w") pattern was a TOCTOU race
+           (CodeQL #89): an attacker who could win the gap between the
+           two calls could swap the path target for a symlink and
+           redirect the write. EEXIST is the silent no-op we want; any
+           other errno is logged but non-fatal (sequence file is
+           recoverable via reindex). */
         char seq_dir[PATH_MAX], seq_path[PATH_MAX];
         snprintf(seq_dir,  sizeof(seq_dir),  "%s/%s/%s/metadata/sequences", db_root, dir, object);
         snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, auto_seq_name);
         mkdirp(seq_dir);
-        struct stat sst;
-        if (stat(seq_path, &sst) != 0) {
-            FILE *sf = fopen(seq_path, "w");
-            if (sf) { fprintf(sf, "0\n"); fclose(sf); }
+        int sfd = open(seq_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (sfd >= 0) {
+            (void)write(sfd, "0\n", 2);
+            close(sfd);
+        } else if (errno != EEXIST) {
+            log_msg(1, "auto_key seq init: open(%s) failed: %s",
+                    seq_path, strerror(errno));
         }
     }
 
     if (!exists) {
         f = fopen(schema_path, "a");
         if (f) {
-            if (storage_version == 1) {
-                /* v1 line stays at the historical 4-field form so old parsers
-                   keep working byte-for-byte. v1 doesn't support auto_key
-                   (the feature is documented v2-only). */
-                fprintf(f, "%s:%s:%d:%d\n", dir, object, splits, max_key);
+            /* Schema line: dir:object:splits:max_key:2:streams[:auto_key=...].
+               The literal `2` is the storage-version slot — kept in the on-disk
+               format for forward compatibility with future engine versions,
+               even though every object the daemon writes is v2. */
+            if (auto_key_kind == 1) {
+                fprintf(f, "%s:%s:%d:%d:2:%d:auto_key=uuid\n",
+                        dir, object, splits, max_key, streams);
+            } else if (auto_key_kind == 2) {
+                fprintf(f, "%s:%s:%d:%d:2:%d:auto_key=seq(%s)\n",
+                        dir, object, splits, max_key, streams, auto_seq_name);
             } else {
-                /* v2 line: dir:object:splits:max_key:sv:streams[:auto_key=...] */
-                if (auto_key_kind == 1) {
-                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=uuid\n",
-                            dir, object, splits, max_key, storage_version, streams);
-                } else if (auto_key_kind == 2) {
-                    fprintf(f, "%s:%s:%d:%d:%d:%d:auto_key=seq(%s)\n",
-                            dir, object, splits, max_key, storage_version, streams,
-                            auto_seq_name);
-                } else {
-                    fprintf(f, "%s:%s:%d:%d:%d:%d\n",
-                            dir, object, splits, max_key, storage_version, streams);
-                }
+                fprintf(f, "%s:%s:%d:%d:2:%d\n",
+                        dir, object, splits, max_key, streams);
             }
             fclose(f);
         }
@@ -15093,14 +13900,13 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     load_dirs();
 
-    /* Slotcask v2: create the on-disk layout (keyfile_*.kf + stream_NNN/) so
-       the object is immediately usable. slotcask_open is idempotent — recovery
-       semantics handle a re-open if we crash partway. */
-    if (storage_version == 2) {
+    /* Create the on-disk layout (keyfile_*.kf + stream_NNN/) so the object is
+       immediately usable. slotcask_open is idempotent — recovery semantics
+       handle a re-open if we crash partway. */
+    {
         char obj_data_dir[PATH_MAX];
         snprintf(obj_data_dir, sizeof(obj_data_dir), "%s/%s", eff_root, object);
-        /* v2 slot_size includes the 24B per-record inline header (see
-           load_schema commentary). */
+        /* slot_size includes the 24B per-record inline header. */
         int slot_size = (24 + max_key + total_value_size + 7) & ~7;
         if (slot_size < 32) slot_size = 32;
         SlotcaskDb sdb;
@@ -15134,13 +13940,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    if (storage_version == 2) {
-        OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
-            object, dir, splits, max_key, total_value_size, nfields, streams);
-    } else {
-        OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d}\n",
-            object, dir, splits, max_key, total_value_size, nfields);
-    }
+    OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
+        object, dir, splits, max_key, total_value_size, nfields, streams);
     return 0;
 }
 
@@ -16756,32 +15557,30 @@ static void *shard_agg_worker(void *arg) {
     /* v2: layout-agnostic per-hash fetch via read_record_ref. The
        shard grouping the planner did was a v1 locality hint; v2
        slotcask routes per-hash internally so we just iterate. */
-    if (sa->sch->storage_version == 2) {
-        for (int ei = 0; ei < sa->entry_count; ei++) {
-            if (query_deadline_tick(sa->deadline, &sa->dl_counter)) break;
-            RecordRef rr;
-            if (read_record_ref(sa->db_root, sa->object, sa->sch,
-                                 sa->entries[ei].hash, &rr) != 0) continue;
-            /* Synthesise a SlotHeader for the cb. block = key bytes
-               followed by value bytes — exactly what agg_scan_cb walks. */
-            SlotHeader hdr = {0};
-            memcpy(hdr.hash, sa->entries[ei].hash, 16);
-            hdr.flag = 1;
-            hdr.key_len = (uint16_t)rr.klen;
-            hdr.value_len = (uint32_t)rr.vlen;
-            uint8_t stk[2048];
-            uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
-                ? stk : malloc(rr.klen + rr.vlen);
-            if (block) {
-                memcpy(block, rr.key, rr.klen);
-                memcpy(block + rr.klen, rr.val, rr.vlen);
-                agg_scan_cb(&hdr, block, &sa->local);
-                if (block != stk) free(block);
-            }
-            release_record_ref(&rr);
+    for (int ei = 0; ei < sa->entry_count; ei++) {
+        if (query_deadline_tick(sa->deadline, &sa->dl_counter)) break;
+        RecordRef rr;
+        if (read_record_ref(sa->db_root, sa->object, sa->sch,
+                             sa->entries[ei].hash, &rr) != 0) continue;
+        /* Synthesise a SlotHeader for the cb. block = key bytes
+           followed by value bytes — exactly what agg_scan_cb walks. */
+        SlotHeader hdr = {0};
+        memcpy(hdr.hash, sa->entries[ei].hash, 16);
+        hdr.flag = 1;
+        hdr.key_len = (uint16_t)rr.klen;
+        hdr.value_len = (uint32_t)rr.vlen;
+        uint8_t stk[2048];
+        uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
+            ? stk : malloc(rr.klen + rr.vlen);
+        if (block) {
+            memcpy(block, rr.key, rr.klen);
+            memcpy(block + rr.klen, rr.val, rr.vlen);
+            agg_scan_cb(&hdr, block, &sa->local);
+            if (block != stk) free(block);
         }
-        return NULL;
+        release_record_ref(&rr);
     }
+    return NULL;
 
     int sid = sa->entries[0].shard_id;
     char shard[PATH_MAX];
@@ -16844,95 +15643,6 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
         agg_ctx_free_local(&workers[g].local);
     }
     free(workers);
-}
-
-/* ========== PRIMARY_NONE aggregate via per-worker scan ==========
-
-   v1 data-shard path: spawns one scan worker per data shard, each with
-   its own cloned AggCtx (own hash table, own accumulators), so the
-   per-record callback runs lock-free. After all workers finish,
-   merge their local hash tables into main_ctx via agg_ctx_merge.
-
-   Memory: per worker the local hash table holds ≤ records_per_shard
-   distinct group keys (low-cardinality group_by → tiny; high-card →
-   bounded by shard slice size). Merge cost is O(N_workers × distinct
-   keys per worker) which is small in both regimes. */
-typedef struct {
-    const char  *path;
-    int          slot_size;
-    AggCtx       local;
-    QueryDeadline *deadline;
-} ScanAggWork;
-
-static void *scan_agg_worker(void *arg) {
-    ScanAggWork *w = (ScanAggWork *)arg;
-    /* scan_one_shard calls agg_scan_cb per record on &w->local. Since
-       each worker has its own cloned AggCtx, no mutex needed. */
-    scan_one_shard(w->path, w->slot_size, agg_scan_cb, &w->local);
-    return NULL;
-}
-
-static int parallel_agg_scan_shards(AggCtx *main_ctx, const char *data_dir,
-                                    int slot_size) {
-    /* Collect shard paths (mirrors scan_shards' setup). */
-    char **paths = NULL;
-    int path_count = 0, path_cap = 256;
-    paths = malloc((size_t)path_cap * sizeof(char *));
-    if (!paths) return -1;
-
-    DIR *d1 = opendir(data_dir);
-    if (!d1) { free(paths); return -1; }
-    struct dirent *e1;
-    while ((e1 = readdir(d1))) {
-        if (e1->d_name[0] == '.') continue;
-        size_t nlen = strlen(e1->d_name);
-        if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
-        if (path_count >= path_cap) {
-            path_cap *= 2;
-            char **t = realloc(paths, (size_t)path_cap * sizeof(char *));
-            if (!t) {
-                for (int k = 0; k < path_count; k++) free(paths[k]);
-                free(paths);
-                closedir(d1);
-                return -1;
-            }
-            paths = t;
-        }
-        char binpath[PATH_MAX];
-        snprintf(binpath, sizeof(binpath), "%s/%s", data_dir, e1->d_name);
-        paths[path_count++] = strdup(binpath);
-    }
-    closedir(d1);
-
-    if (path_count == 0) { free(paths); return 0; }
-
-    ScanAggWork *workers = calloc((size_t)path_count, sizeof(ScanAggWork));
-    if (!workers) {
-        for (int i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        return -1;
-    }
-    for (int i = 0; i < path_count; i++) {
-        workers[i].path = paths[i];
-        workers[i].slot_size = slot_size;
-        workers[i].deadline = main_ctx->deadline;
-        agg_ctx_clone_shared(&workers[i].local, main_ctx);
-    }
-
-    g_scan_stop = 0;  /* match scan_shards' contract */
-    parallel_for(scan_agg_worker, workers, path_count, sizeof(ScanAggWork));
-
-    /* Merge each worker's hash table into main_ctx, freeing src buckets. */
-    for (int i = 0; i < path_count; i++) {
-        if (workers[i].local.budget_exceeded) main_ctx->budget_exceeded = 1;
-        agg_ctx_merge(main_ctx, &workers[i].local);
-        agg_ctx_free_local(&workers[i].local);
-    }
-
-    free(workers);
-    for (int i = 0; i < path_count; i++) free(paths[i]);
-    free(paths);
-    return 0;
 }
 
 /* Sort context for qsort */
@@ -17071,25 +15781,14 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
                            ctx->deadline, &budget_exceeded);
         if (budget_exceeded) ctx->budget_exceeded = 1;
     } else {
-        /* Hash aggregation: per-worker AggCtx clone scanned in parallel,
-           merged into main ctx at end. Replaces the old shared-ctx
-           scan_shards(agg_scan_cb, ctx) path that serialised every
-           record through ctx->lock. */
-        if (sch->storage_version == 2) {
-            /* v2: parallel kf shard scan with per-worker cloned AggCtx
-               (own hash table per kf shard), merged at end. The old path
-               passed the shared ctx through scan_shards_v2 which fanned
-               out internally via parallel_for — all workers shared the
-               same AggCtx, requiring the per-record mutex in agg_scan_cb. */
-            SlotcaskSchemaInfo info = {
-                .splits = sch->splits, .slot_size = sch->slot_size,
-                .streams = sch->streams, .storage_version = 2,
-            };
-            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-            if (sdb) parallel_agg_scan_shards_v2(ctx, sdb);
-        } else {
-            parallel_agg_scan_shards(ctx, data_dir, sch->slot_size);
-        }
+        /* Hash aggregation: parallel kf shard scan with per-worker cloned
+           AggCtx (own hash table per kf shard), merged at end. */
+        SlotcaskSchemaInfo info = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (sdb) parallel_agg_scan_shards_v2(ctx, sdb);
     }
 
     if (ctx->deadline->timed_out) return -1;
@@ -18787,18 +17486,14 @@ int cmd_aggregate(const char *db_root, const char *object,
             vs_need_lookup = 1;
         }
     }
-    /* v2 storage required for slotcask_lookup_by_hash (v1 falls through). */
     SlotcaskDb *vs_sdb = NULL;
     if (vs_eligible && vs_need_lookup) {
-        if (sch.storage_version != 2) { vs_eligible = 0; }
-        else {
-            SlotcaskSchemaInfo info = {
-                .splits = sch.splits, .slot_size = sch.slot_size,
-                .streams = sch.streams, .storage_version = 2,
-            };
-            vs_sdb = slotcask_registry_get(db_root, object, &info);
-            if (!vs_sdb) vs_eligible = 0;
-        }
+        SlotcaskSchemaInfo info = {
+            .splits = sch.splits, .slot_size = sch.slot_size,
+            .streams = sch.streams,
+        };
+        vs_sdb = slotcask_registry_get(db_root, object, &info);
+        if (!vs_sdb) vs_eligible = 0;
     }
     if (vs_eligible) {
         int n_idx_g = index_splits_for(sch.splits);

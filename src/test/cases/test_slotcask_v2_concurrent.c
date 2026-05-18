@@ -171,9 +171,8 @@ static int test_slotcask_v2_concurrent_run(void) {
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"o\","
-        "\"splits\":8,\"max_key\":16,\"storage_version\":2,"
+        "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"v:int\",\"writer:int\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"storage_version\":2", "v2 object created");
     free(resp); resp = NULL;
     tc_close(tc); tc = NULL;
 

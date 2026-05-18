@@ -1133,13 +1133,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *sv_s = json_obj_strdup(&req, "storage_version");
         int if_not_exists = ine_s && (strcmp(ine_s, "true") == 0 || strcmp(ine_s, "1") == 0);
 
-        /* storage_version is no longer part of the public create-object
-           API. Every new object is v2 (slotcask). The field is rejected
-           outright unless the daemon is running with SHARD_ALLOW_V1_CREATE=1
-           (test-fixture-only opt-in for the migrate runner's setup). */
-        const char *allow = getenv("SHARD_ALLOW_V1_CREATE");
-        int test_legacy = (allow && allow[0] == '1');
-        if (sv_s && !test_legacy) {
+        if (sv_s) {
             OUT("{\"error\":\"storage_version is not configurable; objects are always v2 (slotcask)\"}\n");
             free(fields_j); free(indexes_j);
             free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
@@ -1152,7 +1146,6 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                           splits_s ? atoi(splits_s) : 0,
                           max_key_s ? atoi(max_key_s) : 0,
                           if_not_exists,
-                          sv_s ? atoi(sv_s) : 0,
                           auto_key_s);
         free(fields_j); free(indexes_j);
         free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
@@ -1238,7 +1231,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 Schema sc = load_schema(db_root, object);
                 uint8_t hash[16]; int shard_id, start_slot;
                 size_t klen = strlen(key);
-                compute_addr(key, klen, sc.splits, hash, &shard_id, &start_slot);
+                compute_hash_raw(key, klen, hash);
+                shard_id = compute_record_shard(hash, sc.splits);
+                start_slot = 0;
                 char shard[PATH_MAX];
                 build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
                 FcacheRead fc = fcache_get_read(shard);
@@ -1691,8 +1686,6 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(fmt);
     } else if (strcmp(mode, "truncate") == 0) {
         cmd_truncate(db_root, object);
-    } else if (strcmp(mode, "migrate-storage-version") == 0) {
-        cmd_migrate_storage_version(db_root, dir, object);
     } else if (strcmp(mode, "backup") == 0) {
         cmd_backup(db_root, object);
     } else if (strcmp(mode, "put-file") == 0) {

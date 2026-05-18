@@ -193,9 +193,8 @@ static int bench_kv_run(void)
         char create[512];
         snprintf(create, sizeof(create),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
-            "\"splits\":128,\"max_key\":16,\"storage_version\":%d,"
-            "\"fields\":[\"v:varchar:100\"]}",
-            bench_storage_version());
+            "\"splits\":128,\"max_key\":16,"
+            "\"fields\":[\"v:varchar:100\"]}");
         tc_request(tc, create, &resp);
         free(resp); resp = NULL;
     }
