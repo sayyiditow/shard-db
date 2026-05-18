@@ -2943,17 +2943,87 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
 }
 
 /* Phase 5 — tombstone OLD seg slots for successful upserts. Done
-   outside the kf wrlock so the seg write doesn't hold both locks. */
+   outside the kf wrlock so the seg write doesn't hold both locks.
+   Records are sorted by (old_sid, old_fid) and walked in runs so
+   one segcache_acquire covers every tombstone in the same file —
+   mirrors the bulk-delete Phase 3 batching. Cuts the acquire/release
+   pair count from N to (unique-files), which at indexed-update scale
+   is the dominant cost (random-write into cold segment pages). */
 static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
                                         SlotcaskBulkRec *recs,
                                         SlotcaskBulkState *st, size_t n) {
+    int *tomb_idx = malloc(n * sizeof(int));
+    if (!tomb_idx) {
+        /* OOM: fall back to per-record tombstone. */
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status != 0) continue;
+            if (!st[i].old_found) continue;
+            seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
+            pool_push_free(&db->streams[st[i].old_sid],
+                            st[i].old_fid, st[i].old_off);
+        }
+        return;
+    }
+
+    int tcount = 0;
     for (size_t i = 0; i < n; i++) {
         if (recs[i].status != 0) continue;
         if (!st[i].old_found) continue;
-        seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
-        pool_push_free(&db->streams[st[i].old_sid],
-                        st[i].old_fid, st[i].old_off);
+        tomb_idx[tcount++] = (int)i;
     }
+
+    /* Insertion sort by (old_sid, old_fid). Batches at this scale are
+       per-kf-shard slices (typically <200K records), so insertion sort
+       is fine and matches the pattern bulk-delete + Phase 1b use. */
+    for (int a = 1; a < tcount; a++) {
+        int tmp = tomb_idx[a];
+        uint8_t  ta_sid = st[tmp].old_sid;
+        uint16_t ta_fid = st[tmp].old_fid;
+        int b = a - 1;
+        while (b >= 0) {
+            int bi = tomb_idx[b];
+            if (st[bi].old_sid < ta_sid ||
+                (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
+                break;
+            tomb_idx[b + 1] = tomb_idx[b];
+            b--;
+        }
+        tomb_idx[b + 1] = tmp;
+    }
+
+    int k = 0;
+    while (k < tcount) {
+        int run_end = k + 1;
+        uint8_t  sid = st[tomb_idx[k]].old_sid;
+        uint16_t fid = st[tomb_idx[k]].old_fid;
+        while (run_end < tcount &&
+               st[tomb_idx[run_end]].old_sid == sid &&
+               st[tomb_idx[run_end]].old_fid == fid)
+            run_end++;
+
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, sid, fid);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0) != 0) {
+            /* Acquire failed: best-effort push to pool anyway so the
+               slots are reusable, but the flag stays at 1. A vacuum
+               sweep will catch them via kf reverse-lookup later. */
+            for (int j = k; j < run_end; j++) {
+                int i = tomb_idx[j];
+                pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off);
+            }
+            k = run_end;
+            continue;
+        }
+        for (int j = k; j < run_end; j++) {
+            int i = tomb_idx[j];
+            __atomic_store_n(&h.map[st[i].old_off + 18], 2, __ATOMIC_RELEASE);
+            pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off);
+        }
+        segcache_release(&h);
+        k = run_end;
+    }
+    free(tomb_idx);
 }
 
 /* Slow bulk upsert: lookup → optional OLD read → seg write → kf commit.
