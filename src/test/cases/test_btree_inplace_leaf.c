@@ -7,17 +7,8 @@
  * exercises the algorithm's correctness across:
  *
  *  1. Randomized fills (many anchor crossings, varied prefix overlap)
- *  2. Tombstone preservation at moderate scale
+ *  2. Tombstone preservation through interleaved deletes + new inserts
  *  3. Long-prefix workloads (heavy prefix-compression exercise)
- *
- * Scope note: scaling the random-shuffle fill past ~1000 entries triggers
- * a *pre-existing* btree-internal-page bug (some entries become
- * unsearchable after many individual btree_insert calls in shuffled
- * order — both the old full-rebuild leaf-insert algorithm and this
- * in-place rewrite reproduce the same delete-failure count when scaled
- * past that point, so the bug lives in the split/promote path, not in
- * page_insert_at_leaf). Tests here stay below the threshold to keep
- * signal focused on the in-place algorithm itself.
  *
  * The verification harness is value-only: we never inspect the page
  * bytes directly — we just confirm reads agree with a reference set
@@ -238,19 +229,13 @@ static int test_btree_inplace_leaf_run(void) {
     bt_cache_shutdown();
     unlink(path);
 
-    if (run_long_prefix_test(path) != 0) goto fail;
+    if (run_tombstone_preservation_test(path, 400) != 0) goto fail;
     bt_cache_shutdown();
     unlink(path);
 
-    /* run_tombstone_preservation_test is held back pending investigation
-       of a *pre-existing* btree bug: at small scales (n≥~400 inserts
-       in shuffled order followed by sparse deletes), some btree_delete
-       calls silently no-op even though the entry is present. Reproduces
-       identically with both the old full-rebuild and the new in-place
-       leaf insert algorithms, so the bug lives in the split / promote /
-       internal-page traversal path rather than in page_insert_at_leaf.
-       Tracked in memory `btree_split_delete_bug_2026_05_18`. */
-    (void)run_tombstone_preservation_test;
+    if (run_long_prefix_test(path) != 0) goto fail;
+    bt_cache_shutdown();
+    unlink(path);
 
     return t_ctx->failed > 0 ? 1 : 0;
 fail:

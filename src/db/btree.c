@@ -230,6 +230,15 @@ static int page_bsearch_leaf(uint8_t *page, const char *target, size_t tlen) {
     return end;
 }
 
+/* Internal-page bsearch: first slot whose key is `>= target`. The routing
+   convention is `entry[pos - 1].child` (or `next_leaf` when pos == 0).
+   With duplicate values allowed in the leaf chain, a value v that equals
+   a separator key may legitimately exist on multiple consecutive leaves
+   — keeping the `>=` (loose) form lets the descent land on the leftmost
+   such leaf, and downstream walkers continue forward via `next_leaf`
+   to enumerate the rest. The single-leaf-descent paths (btree_delete in
+   particular) must also continue forward — see btree_delete's leaf-chain
+   loop. */
 static int page_bsearch_internal(uint8_t *page, const char *target, size_t tlen) {
     BtPageHeader *ph = (BtPageHeader *)page;
     int lo = 0, hi = ph->count;
@@ -1433,7 +1442,7 @@ void btree_delete(const char *path, const char *value, size_t vlen,
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
-    /* Traverse to leaf */
+    /* Descend to the leaf where the value's range begins. */
     uint32_t page_id = fh->root_page;
     while (1) {
         uint8_t *page = bt_page(&bt, page_id);
@@ -1444,21 +1453,45 @@ void btree_delete(const char *path, const char *value, size_t vlen,
         else page_id = entry_child(page_entry(page, pos - 1));
     }
 
-    /* Search within leaf */
-    uint8_t *page = bt_page(&bt, page_id);
-    int pos = page_bsearch(page, value, vlen);
+    /* Walk the leaf chain forward looking for the (value, hash) pair. Why
+       the chain and not just the descent target? Two cases the descent
+       alone misses:
+         (a) value == an internal-page separator key. With the `>=`
+             internal bsearch convention, descent lands on the leaf
+             holding the LAST values < separator — but a unique value
+             equal to the separator may live on the NEXT leaf as its
+             first entry.
+         (b) value is duplicated across leaves (status="PAID" with
+             many entries spilling across leaf boundaries). The target
+             record's hash may be on any of those leaves.
+       Stop as soon as we see a value strictly greater than target —
+       the chain is ascending so nothing further can match. If a leaf
+       has no slot >= target (pos == count), keep walking — the target
+       may be on the next leaf. */
+    while (page_id != 0) {
+        uint8_t *page = bt_page(&bt, page_id);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        int pos = page_bsearch(page, value, vlen);
 
-    LeafIter it;
-    leaf_iter_init(&it, page);
-    if (leaf_iter_seek(&it, pos)) {
-        do {
-            if (val_cmp(it.key_buf, it.key_len, value, vlen) != 0) break;
-            if (memcmp(it.hash, hash, BT_HASH_SIZE) == 0) {
-                page_remove_at(page, it.slot_idx);
-                fh->entry_count--;
-                break;
-            }
-        } while (leaf_iter_next(&it));
+        LeafIter it;
+        leaf_iter_init(&it, page);
+        int found = 0;
+        int saw_greater = 0;
+        if (leaf_iter_seek(&it, pos)) {
+            do {
+                int c = val_cmp(it.key_buf, it.key_len, value, vlen);
+                if (c > 0) { saw_greater = 1; break; }
+                if (c < 0) continue; /* shouldn't happen — leaf_iter_seek lands at-or-past */
+                if (memcmp(it.hash, hash, BT_HASH_SIZE) == 0) {
+                    page_remove_at(page, it.slot_idx);
+                    fh->entry_count--;
+                    found = 1;
+                    break;
+                }
+            } while (leaf_iter_next(&it));
+        }
+        if (found || saw_greater) break;
+        page_id = ph->next_leaf;
     }
 
     bt_release(&bt);
