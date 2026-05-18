@@ -1230,4 +1230,30 @@ int is_token_valid(const char *token);
 
 /* index.c — comparators */
 int cmp_btentry_fn(const void *a, const void *b);
+
+/* index.c — index-key extractors (out_val alloc'd, caller frees; _into
+   variant writes into out of capacity out_cap and returns -1 on overflow). */
+int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
+                                const char *spec,
+                                uint8_t **out_val, size_t *out_len);
+int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
+                                      const char *spec,
+                                      uint8_t *out, size_t out_cap,
+                                      size_t *out_len);
+
+/* index.c — per-field index update worker. Either old_key or new_key may
+   be NULL (pure insert / pure delete); both NULL = no-op. Dispatched
+   via parallel_for from every CRUD pre_commit. */
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const char    *field;
+    int            splits;
+    uint8_t       *new_key;
+    size_t         new_len;
+    uint8_t       *old_key;
+    size_t         old_len;
+    const uint8_t *hash;
+} UpdateIdxArg;
+void *update_idx_fn(void *arg);
 #endif

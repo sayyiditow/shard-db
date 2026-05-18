@@ -1075,31 +1075,9 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     return 1;
 }
 
-/* Per-field index update worker — fires from v2_insert_pre_commit's
-   parallel diff path. Either old_key or new_key may be NULL (pure
-   insert / pure delete of an indexed value); both NULL means no work. */
-typedef struct {
-    const char    *db_root;
-    const char    *object;
-    const char    *field;
-    int            splits;
-    uint8_t       *new_key;
-    size_t         new_len;
-    uint8_t       *old_key;
-    size_t         old_len;
-    const uint8_t *hash;
-} UpdateIdxArg;
-
-static void *update_idx_fn(void *arg) {
-    UpdateIdxArg *a = (UpdateIdxArg *)arg;
-    if (a->old_key)
-        delete_index_entry(a->db_root, a->object, a->field, a->splits,
-                           a->old_key, a->old_len, a->hash);
-    if (a->new_key)
-        write_index_entry(a->db_root, a->object, a->field, a->splits,
-                          a->new_key, a->new_len, a->hash);
-    return NULL;
-}
+/* UpdateIdxArg / update_idx_fn now live in index.c (declared in types.h)
+   so query.c can dispatch the same per-field worker for its bulk
+   update/delete pre_commits. */
 
 static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
@@ -1342,15 +1320,66 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
     (void)new_vlen; (void)is_update;
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old || c->nidx == 0) return 0;
+
+    /* Phase 1 (serial): diff each field; build a dispatch list of only
+       the fields that actually changed. Phase 2 (parallel): apply the
+       changes via parallel_for + update_idx_fn. For a 14-idx workload,
+       parallel drops the field-update wall time from N*~1µs serial to
+       ~1µs parallel.
+
+       Index keys live in a single arena slab allocated once per call.
+       Slot size INDEX_KEY_MAX (4096) matches the composite-cap that
+       build_index_key_from_record_into honours. Replaces 2*nidx
+       malloc/free pairs with 1 per call. Oversized varchar indexes
+       (>4096) fall back via the malloc'd variant. */
+    enum { INDEX_KEY_MAX = 4096 };
+    size_t arena_bytes = (size_t)c->nidx * (size_t)(2 * INDEX_KEY_MAX);
+    uint8_t *arena = malloc(arena_bytes);
+    UpdateIdxArg args[MAX_FIELDS];
+    uint8_t *fb_bufs[2 * MAX_FIELDS]; int n_fb = 0;
+    int n_args = 0;
+
     for (int i = 0; i < c->nidx; i++) {
+        uint8_t *old_slot = arena ? arena + (size_t)i * 2 * INDEX_KEY_MAX : NULL;
+        uint8_t *new_slot = old_slot ? old_slot + INDEX_KEY_MAX : NULL;
+        size_t old_len = 0, new_len = 0;
+        int have_old = 0, have_new = 0;
         uint8_t *old_buf = NULL, *new_buf = NULL;
-        size_t   old_len = 0, new_len = 0;
-        int have_old = build_index_key_from_record(c->idx_ts, old->value,
-                                                   c->idx_fields[i],
-                                                   &old_buf, &old_len);
-        int have_new = build_index_key_from_record(c->idx_ts, new_value,
-                                                   c->idx_fields[i],
-                                                   &new_buf, &new_len);
+
+        if (arena) {
+            int ro = build_index_key_from_record_into(c->idx_ts, old->value,
+                                                       c->idx_fields[i],
+                                                       old_slot, INDEX_KEY_MAX, &old_len);
+            int rn = build_index_key_from_record_into(c->idx_ts, new_value,
+                                                       c->idx_fields[i],
+                                                       new_slot, INDEX_KEY_MAX, &new_len);
+            have_old = (ro == 1);
+            have_new = (rn == 1);
+            old_buf = have_old ? old_slot : NULL;
+            new_buf = have_new ? new_slot : NULL;
+            /* If either side overflowed the arena slot, fall back to malloc
+               for this field — preserves correctness for jumbo varchar
+               indexes. */
+            if (ro == -1) {
+                have_old = build_index_key_from_record(c->idx_ts, old->value,
+                                                       c->idx_fields[i], &old_buf, &old_len);
+                if (have_old) fb_bufs[n_fb++] = old_buf;
+            }
+            if (rn == -1) {
+                have_new = build_index_key_from_record(c->idx_ts, new_value,
+                                                       c->idx_fields[i], &new_buf, &new_len);
+                if (have_new) fb_bufs[n_fb++] = new_buf;
+            }
+        } else {
+            /* Arena alloc failed — fall back to per-field malloc. */
+            have_old = build_index_key_from_record(c->idx_ts, old->value,
+                                                   c->idx_fields[i], &old_buf, &old_len);
+            have_new = build_index_key_from_record(c->idx_ts, new_value,
+                                                   c->idx_fields[i], &new_buf, &new_len);
+            if (have_old) fb_bufs[n_fb++] = old_buf;
+            if (have_new) fb_bufs[n_fb++] = new_buf;
+        }
+
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -1359,15 +1388,22 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(c->db_root, c->object, c->idx_fields[i],
-                                   c->splits, old_buf, old_len, c->hash);
-            if (have_new)
-                write_index_entry(c->db_root, c->object, c->idx_fields[i],
-                                  c->splits, new_buf, new_len, c->hash);
+            args[n_args].db_root = c->db_root;
+            args[n_args].object  = c->object;
+            args[n_args].field   = c->idx_fields[i];
+            args[n_args].splits  = c->splits;
+            args[n_args].new_key = have_new ? new_buf : NULL;
+            args[n_args].new_len = new_len;
+            args[n_args].old_key = have_old ? old_buf : NULL;
+            args[n_args].old_len = old_len;
+            args[n_args].hash    = c->hash;
+            n_args++;
         }
-        free(old_buf); free(new_buf);
     }
+
+    if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+    for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
+    free(arena);
     return 0;
 }
 
@@ -1556,16 +1592,55 @@ static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
 static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
     if (!old || c->nidx == 0) return 0;
+
+    /* Same parallel-fanout + arena allocation pattern as
+       v2_update_pre_commit. update_idx_fn with new_key=NULL is a
+       pure delete. */
+    enum { INDEX_KEY_MAX = 4096 };
+    size_t arena_bytes = (size_t)c->nidx * (size_t)INDEX_KEY_MAX;
+    uint8_t *arena = malloc(arena_bytes);
+    UpdateIdxArg args[MAX_FIELDS];
+    uint8_t *fb_bufs[MAX_FIELDS]; int n_fb = 0;
+    int n_args = 0;
+
     for (int i = 0; i < c->nidx; i++) {
         uint8_t *ikey = NULL;
-        size_t   ilen = 0;
-        if (build_index_key_from_record(c->idx_ts, old->value,
-                                        c->idx_fields[i], &ikey, &ilen)) {
-            delete_index_entry(c->db_root, c->object, c->idx_fields[i],
-                               c->splits, ikey, ilen, c->hash);
-            free(ikey);
+        size_t ilen = 0;
+        int have = 0;
+        if (arena) {
+            uint8_t *slot = arena + (size_t)i * INDEX_KEY_MAX;
+            int rc = build_index_key_from_record_into(c->idx_ts, old->value,
+                                                       c->idx_fields[i],
+                                                       slot, INDEX_KEY_MAX, &ilen);
+            if (rc == 1) { ikey = slot; have = 1; }
+            else if (rc == -1) {
+                have = build_index_key_from_record(c->idx_ts, old->value,
+                                                   c->idx_fields[i],
+                                                   &ikey, &ilen);
+                if (have) fb_bufs[n_fb++] = ikey;
+            }
+        } else {
+            have = build_index_key_from_record(c->idx_ts, old->value,
+                                               c->idx_fields[i],
+                                               &ikey, &ilen);
+            if (have) fb_bufs[n_fb++] = ikey;
         }
+        if (!have) continue;
+        args[n_args].db_root = c->db_root;
+        args[n_args].object  = c->object;
+        args[n_args].field   = c->idx_fields[i];
+        args[n_args].splits  = c->splits;
+        args[n_args].new_key = NULL;
+        args[n_args].new_len = 0;
+        args[n_args].old_key = ikey;
+        args[n_args].old_len = ilen;
+        args[n_args].hash    = c->hash;
+        n_args++;
     }
+
+    if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+    for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
+    free(arena);
     return 0;
 }
 

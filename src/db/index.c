@@ -277,6 +277,21 @@ void write_index_entry(const char *db_root, const char *object,
                      (const char *)val, vlen, hash16);
 }
 
+/* Per-field index update worker — dispatched via parallel_for from
+   every CRUD pre_commit (insert, update, delete, bulk variants).
+   NULL keys = skip that side, so the same worker covers insert-only,
+   delete-only, and changed-field update with NULL acting as "no-op". */
+void *update_idx_fn(void *arg) {
+    UpdateIdxArg *a = (UpdateIdxArg *)arg;
+    if (a->old_key)
+        delete_index_entry(a->db_root, a->object, a->field, a->splits,
+                           a->old_key, a->old_len, a->hash);
+    if (a->new_key)
+        write_index_entry(a->db_root, a->object, a->field, a->splits,
+                          a->new_key, a->new_len, a->hash);
+    return NULL;
+}
+
 /* Delete from index — uses B+ tree */
 void delete_index_entry(const char *db_root, const char *object,
                                const char *field, int splits,
@@ -507,6 +522,50 @@ int cmp_str_numeric(const void *a, const void *b) {
 
 /* Build an index key from a typed record for a (possibly composite) spec.
    See types.h for contract. */
+/* Write the index key for `spec` into caller buffer `out` of capacity
+   `out_cap`. Returns 1 on a written key, 0 on empty/missing field, -1
+   if the key wouldn't fit in `out_cap`. No allocations on the success
+   path — the per-call alloc/free pair the malloc'd variant pays is
+   what makes this useful for hot pre_commit hooks. */
+int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
+                                      const char *spec,
+                                      uint8_t *out, size_t out_cap,
+                                      size_t *out_len) {
+    if (!ts || !record || !spec || !out || !out_len) return 0;
+    *out_len = 0;
+
+    if (strchr(spec, '+')) {
+        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
+        size_t cp = 0;
+        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
+        while (tok) {
+            int fi = typed_field_index(ts, tok);
+            if (fi < 0) return 0;
+            char *v = typed_get_field_str(ts, record, fi);
+            if (!v) return 0;
+            size_t sl = strlen(v);
+            if (cp + sl > out_cap) { free(v); return -1; }
+            memcpy(out + cp, v, sl); cp += sl;
+            free(v);
+            tok = strtok_r(NULL, "+", &_tok_save);
+        }
+        if (cp == 0) return 0;
+        *out_len = cp;
+        return 1;
+    }
+
+    int fi = typed_field_index(ts, spec);
+    if (fi < 0) return 0;
+    const TypedField *f = &ts->fields[fi];
+    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+    if (cap > out_cap) return -1;
+    size_t blen = 0;
+    typed_field_to_index_key(ts, record, fi, out, &blen);
+    if (blen == 0) return 0;
+    *out_len = blen;
+    return 1;
+}
+
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
                                 const char *spec,
                                 uint8_t **out_val, size_t *out_len) {
