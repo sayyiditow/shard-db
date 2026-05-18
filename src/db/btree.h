@@ -58,7 +58,15 @@ typedef struct __attribute__((packed)) {
     uint32_t next_leaf;     /* next leaf page id (0=none) / leftmost child for internal */
     uint32_t prev_leaf;     /* previous leaf page id (0=none); 0 for internal nodes */
     uint32_t data_end;      /* byte offset where entry data ends (grows from end of page) */
-    uint32_t _pad;
+    /* Bytes orphaned in the entry data region after in-place leaf inserts
+       re-encode entries at new offsets and leave the old offsets unreachable
+       from the slot directory. `page_free_space + dead_bytes` is the total
+       reclaimable space; compaction (page_leaf_compact) walks the slot
+       directory and rewrites live entries tightly, resetting this to 0.
+       Pre-2026.05.5 pages have this field zero-initialised, which the new
+       code treats as "no dead bytes yet" — correct for any page produced
+       by the old full-rebuild algorithm. */
+    uint32_t dead_bytes;
 } BtPageHeader;
 
 /* Within a page after the header:
