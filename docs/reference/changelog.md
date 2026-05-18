@@ -7,9 +7,12 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 ## 2026.05.5
 
 Breaking-cleanup release. Legacy v1 (probe-into-slot) storage engine
-removed entirely; slotcask is the only supported layout. The `./migrate`
-upgrade binary is also dropped — already-on-slotcask installs upgrade
-with a binary swap.
+removed entirely; slotcask is the only supported layout. B+ tree
+on-disk sort order also changes to `(value, hash)` (magic `'BTRH'`),
+closing a silent-no-op bug in `btree_delete` on duplicate-value
+clusters and restoring O(log N) deletes. `./migrate` rebuilds btrees
+on first start after upgrade — idempotent, reindex-only, no data-shard
+work.
 
 - **v1 storage engine removed.** Every Zone A / Zone B code path,
   the `SHARD_ALLOW_V1_CREATE` test opt-in, the v1 text counts file,
@@ -19,11 +22,21 @@ with a binary swap.
   forward compatibility, and the daemon refuses any value other than
   `2` at load with an error pointing operators at the 2026.05.4
   migrate path.
-- **`./migrate` binary dropped.** Operators upgrading from a pre-2026.05.5
-  install with v1 objects on disk must first install 2026.05.4 and
-  run that release's `./migrate` to convert objects to slotcask, then
-  upgrade to 2026.05.5. Already-on-slotcask installs (2026.05.1+)
-  upgrade with a binary swap.
+- **B+ tree (value, hash) sort.** Indexed btrees now order entries by
+  `(value, hash)` lexicographically. Internal pages carry the
+  separator's hash alongside its value so descent routes directly to
+  the unique leaf holding the target tuple. Replaces the pre-2026.05.5
+  fallback that walked the entire leaf chain whenever the cluster
+  spanned multiple leaves — and silently no-op'd when the entry sat
+  on a leaf the walk had already crossed. Magic rolls `'BTRG'` →
+  `'BTRH'`; existing btrees must be rebuilt via `./migrate`.
+- **`./migrate` reinstated** as the BTRH reindex orchestrator. Reads
+  `db.env`, starts the daemon, runs `./shard-db reindex`, stops the
+  daemon. Idempotent — running on an already-BTRH install just
+  rewrites btrees in their current format. Operators upgrading from
+  a pre-2026.05.5 install with v1 objects must still install 2026.05.4
+  first and run that release's `./migrate` to convert v1 → slotcask,
+  then upgrade.
 - **edit-field shipped** — same-type schema mutations
   (`varchar:N` width change, `numeric:P,S` precision/scale within
   ranges, `default=` updates). Cross-type transforms remain refused.
@@ -32,8 +45,10 @@ with a binary swap.
   `"auto_key":"seq(<name>)"` at `create-object` makes the server
   generate keys on inserts that omit the `key` field. Provided keys
   go through upsert as before; CAS modifiers respected.
-- Test coverage retained: 77 cases / 3035 assertions still pass after
-  the cleanup. ~12 000 lines of dispatch + fallback code retired.
+- Test coverage: 79 cases / 3058 assertions including a new
+  `test-btree-value-hash-sort` covering insert/delete/bulk-merge/split
+  invariants for the new sort order. ~12 000 lines of v1 dispatch +
+  fallback code retired.
 
 Full notes: [release-notes/2026.05.5.md](../release-notes/2026.05.5.md).
 

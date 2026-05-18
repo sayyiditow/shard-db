@@ -186,6 +186,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_v2_index_leak_on_clear.c \
     src/test/cases/test_btree.c \
     src/test/cases/test_btree_inplace_leaf.c \
+    src/test/cases/test_btree_value_hash_sort.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_keyset.c \
@@ -249,6 +250,13 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
 
+# migrate — one-shot upgrade orchestrator. Spawns ./shard-db start, runs
+# ./shard-db reindex (idempotent — rewrites btrees in the (value, hash)
+# sort 2026.05.5 expects), then stops the daemon. Standalone binary; no
+# daemon source linkage.
+gcc $MODE_CFLAGS -o migrate src/migrate/main.c
+[ "$DO_STRIP" = 1 ] && strip migrate
+
 mkdir -p build/bin
 
 # Purge any dev-run artifacts so `./build.sh` always emits a clean tree.
@@ -260,7 +268,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli shard-db-test shard-db-bench build/bin/
+cp shard-db shard-cli shard-db-test shard-db-bench migrate build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
 # overwriting the existing config when an upgrade tarball lands on top.
@@ -339,4 +347,4 @@ fi
 
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
-echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli). If still on v1 (pre-2026.05.5), upgrade to 2026.05.4 and run that release's ./migrate first — 2026.05.5+ drops v1 support entirely."
+echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli + migrate), then run ./migrate once to rebuild B+ trees into 2026.05.5's (value, hash)-sorted layout. If still on v1 (pre-2026.05.5), first upgrade to 2026.05.4 and run that release's ./migrate."
