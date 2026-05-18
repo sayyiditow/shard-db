@@ -240,15 +240,19 @@ The parallel Pass 1 + parallel merge wins are most visible at this scale. 2026.0
 | query | warm |
 |---|---|
 | ASC by indexed field, `limit 100` | 0.2-15 ms |
-| **DESC by age** (currently walks full forward leaf chain to collect IDs) | **18-30 ms** warm, 1-10 s cold (architectural — `prev_leaf` pointer is on the backlog) |
+| **DESC by age** | **~0.3 ms warm** (O(1)-step DESC via `last_leaf_page` + `prev_leaf` since 2026.05.3 — supersedes the older "walks full forward chain" caveat) |
 | ASC + criteria, continuation | 1-3 ms |
-| `offset 50000 limit 100` | 4-5 ms |
+| `offset 50000 limit 100` | 3-5 ms |
 
 ### Cold-cache caveat
 
 Aggregate full-btree walks (sum/avg/max with no criteria) and OR-cross-field queries pay 5-15× cold-vs-warm penalty at 25M scale. First query against each indexed field reads ~750 MB of btree pages from disk; subsequent queries within the same daemon lifetime hit the OS page cache. **Production deployments with steady query patterns hit warm numbers**; a fresh daemon's first query against any large index pays the cold cost once.
 
 For workloads that genuinely need fast cold-start (e.g. on-demand analytics) the kf header + segment data are mmap'd `MAP_SHARED` with `MADV_HUGEPAGE` — `posix_fadvise(POSIX_FADV_WILLNEED)` on startup would prefetch but isn't done today.
+
+### BTRH (2026.05.5+) and read performance
+
+The B+ tree format rolled `'BTRG'` → `'BTRH'` to add a `(value, hash)` lexicographic order, which makes `btree_delete` descent O(log N) again (`btree_delete` knows both the value and the record's hash and can route directly to the unique leaf). Readers — `btree_search`, `btree_range`, cursor walk — only know the target value, not the record hash, so they continue to bsearch by value only. Index-read complexity and code paths are unchanged. The format does add 16 bytes per internal-page separator (the separator's hash), narrowing fanout slightly; measured against 25M users × 12 indexes, that did not produce a visible regression on any indexed-eq, range, AND-intersect, OR, or cursor query.
 
 ## 4. Invoice single-threaded — 1M records, 64 fields, 14 indexes
 
