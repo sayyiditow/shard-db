@@ -1387,31 +1387,6 @@ static int kf_repoint(SlotcaskKfHandle *kh, const uint8_t hash[16],
     return -1;
 }
 
-static int kf_tombstone(SlotcaskKfHandle *kh, const uint8_t hash[16],
-                        const void *key, size_t klen, const char *data_dir,
-                        uint8_t *out_stream_id, uint16_t *out_file_id,
-                        uint32_t *out_offset, size_t *used_delta) {
-    KfProbeIter it; kf_probe_init(&it, kh, hash);
-    size_t slot;
-    while ((slot = kf_probe_next(&it)) != (size_t)-1) {
-        SlotcaskKfEntry *e = &kh->map[slot];
-        if (e->flag != 1) continue;       /* tombstone or other → keep walking */
-        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
-                                   e->offset, key, klen);
-        if (km < 0) return -1;
-        if (km == 1) {
-            *out_stream_id = e->stream_id;
-            *out_file_id = e->file_id;
-            *out_offset = e->offset;
-            e->flag = 2;
-            if (kh->hdr) kh->hdr->deleted++;
-            (*used_delta)++;
-            return 0;
-        }
-    }
-    return -1;
-}
-
 /* ============================================================ Free pool */
 
 static int pool_push_free(SlotcaskStream *p, uint16_t file_id, uint32_t offset) {
@@ -1630,24 +1605,38 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
 
-    /* 1. Lookup. */
-    SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
-    uint8_t old_flag, old_sid;
-    uint16_t old_fid;
-    uint32_t old_off;
-    int lookup_rc = kf_lookup(&kh, hash, key, klen, db->data_dir,
-                              &old_flag, &old_sid, &old_fid, &old_off);
-    kfcache_release(&kh);
-    if (lookup_rc < 0) return -1;
-
-    /* 2. Reserve target. */
     int sid_data = stream_id_hint;
     if (sid_data < 0 || sid_data >= db->num_streams)
         sid_data = (int)((unsigned)hash[15] % (unsigned)db->num_streams);
     SlotcaskStream *pool = &db->streams[sid_data];
-    SlotcaskFreeSlot fs;
     uint8_t target_stream = (uint8_t)sid_data;
+
+    /* Single kf wrlock window: lookup → reserve → seg_write_record →
+       repoint. Pre-2026.05.6 this used two acquire/release cycles
+       with the seg write outside; the seg write is a memcpy into
+       mmap (segcache rdlock only) so holding the kf wrlock across
+       it costs nothing extra for single-conn workloads and only
+       serialises writers that happen to route to the same kf shard
+       (1/splits probability — ~0.8 % at splits=128). Tombstone of
+       the old slot stays OUTSIDE the lock: it touches a different
+       segment file and readers tolerate the brief in-between window
+       via hash verification on retry. */
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+
+    uint8_t old_flag, old_sid;
+    uint16_t old_fid;
+    uint32_t old_off;
+    size_t kf_slot;
+    int lookup_rc = kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                         &old_flag, &old_sid, &old_fid, &old_off,
+                                         &kf_slot);
+    if (lookup_rc < 0) {
+        kfcache_release(&kh);
+        return -1;
+    }
+
+    SlotcaskFreeSlot fs;
     uint16_t target_fid;
     uint32_t target_off;
     int got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
@@ -1656,34 +1645,28 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
         target_off = fs.offset;
     } else {
         uint32_t fid, off;
-        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
+        if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
+            kfcache_release(&kh);
+            return -1;
+        }
         target_fid = (uint16_t)fid;
         target_off = off;
     }
 
-    /* 3. Write new record. */
     if (seg_write_record(db, target_stream, target_fid, target_off,
                          hash, key, klen, value, vlen) != 0) {
+        kfcache_release(&kh);
         if (got_pool) pool_push_free(pool, target_fid, target_off);
         return -1;
     }
 
-    /* 4. Repoint keyfile (commit point). */
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
-        seg_write_flag(db, target_stream, target_fid, target_off, 2);
-        if (got_pool) pool_push_free(pool, target_fid, target_off);
-        return -1;
-    }
-    int repoint_rc = kf_repoint(&kh, hash, target_stream, target_fid, target_off,
-                                key, klen, db->data_dir);
+    /* Repoint at the slot we already probed — same wrlock window, so the
+       slot index from kf_lookup_with_slot is still authoritative. Skips
+       a second probe + a second verify_stored_key seg read. */
+    kf_repoint_at_slot(&kh, kf_slot, target_stream, target_fid, target_off);
     kfcache_release(&kh);
-    if (repoint_rc != 0) {
-        seg_write_flag(db, target_stream, target_fid, target_off, 2);
-        pool_push_free(pool, target_fid, target_off);
-        return -1;
-    }
 
-    /* 5. Tombstone old slot + return to pool. */
+    /* Tombstone old slot + return it to its stream pool — unlocked. */
     seg_write_flag(db, old_sid, old_fid, old_off, 2);
     pool_push_free(&db->streams[old_sid], old_fid, old_off);
     return 0;
@@ -1699,14 +1682,25 @@ int slotcask_delete(SlotcaskDb *db,
 
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
-    uint8_t old_sid;
+
+    /* lookup_with_slot + tombstone_at_slot avoids the second hash-chain
+       probe + verify_stored_key seg-read that the original kf_tombstone
+       performs. Same wrlock window holds, so the captured slot stays
+       authoritative. */
+    uint8_t old_flag, old_sid;
     uint16_t old_fid;
     uint32_t old_off;
-    size_t used_delta = 0;
-    int rc = kf_tombstone(&kh, hash, key, klen, db->data_dir,
-                          &old_sid, &old_fid, &old_off, &used_delta);
+    size_t kf_slot;
+    int found = (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                      &old_flag, &old_sid, &old_fid, &old_off,
+                                      &kf_slot) == 0);
+    if (!found) {
+        kfcache_release(&kh);
+        return -1;
+    }
+    kf_tombstone_at_slot(&kh, kf_slot);
     kfcache_release(&kh);
-    if (rc < 0) return -1;
+
     seg_write_flag(db, old_sid, old_fid, old_off, 2);
     pool_push_free(&db->streams[old_sid], old_fid, old_off);
     return 0;
