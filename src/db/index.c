@@ -619,7 +619,7 @@ int cmp_btentry_fn(const void *a, const void *b) {
     if (r) return r;
     if (ea->vlen < eb->vlen) return -1;
     if (ea->vlen > eb->vlen) return 1;
-    return 0;
+    return memcmp(ea->hash, eb->hash, BT_HASH_SIZE);
 }
 int cmp_str_raw(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);

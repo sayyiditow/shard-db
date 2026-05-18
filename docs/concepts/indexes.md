@@ -82,7 +82,7 @@ Full scans without an index parallelize across kf shards (`THREADS` workers); ea
 
 ## B+ tree file format
 
-Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Magic `BTRG` (v3 format, 2026.05.3+). Leaves are **prefix-compressed** every K=16 entries:
+Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Magic `BTRH` (v4 format, 2026.05.5+ — entries sort by `(value, hash)`). Leaves are **prefix-compressed** every K=16 entries:
 
 - Every 16th entry stores the full key (an **anchor**).
 - Entries between anchors store only the suffix that differs from the preceding anchor.
@@ -90,12 +90,14 @@ Page-based, fixed `INDEX_PAGE_SIZE` (default 4096 bytes). Magic `BTRG` (v3 forma
 
 The effect: leaves pack ~2–3× more keys per page than uncompressed. Range scans touch fewer pages.
 
-V3 adds two header fields that make DESC iteration O(1)-step:
+V4 (`BTRH`) adds the `(value, hash)` total order. Within a duplicate-value cluster, hashes break ties so every entry has a unique sort position. Internal pages carry both the separator value and its hash, so descent for a known `(value, hash)` tuple routes directly to the unique leaf holding it — `btree_delete` is O(log N) again instead of falling back to a chain walk.
+
+V3 (`BTRG`) added two header fields that make DESC iteration O(1)-step. V4 keeps them:
 
 - `BtFileHeader.last_leaf_page` — pointer to the rightmost leaf. DESC iterators start here in O(1).
 - `BtPageHeader.prev_leaf` — backward link maintained on every leaf split. DESC steps left one page at a time via `ph->prev_leaf` instead of indexing into a precomputed array.
 
-Older formats (`BTRE` string-keyed; `BTRF` binary keys without `prev_leaf`) are rejected at open with a clear error and require a reindex. Upgrade via 2026.05.4's `./migrate` first if you're upgrading from a pre-2026.05.1 install — its phase 2 rebuilds every B+ tree under the per-shard layout. Already-on-slotcask installs need no action.
+Older formats (`BTRE`, `BTRF`, `BTRG`) are rejected at open with a clear error and require a reindex. Run 2026.05.5's `./migrate` once — it spawns the daemon, calls `./shard-db reindex`, and stops the daemon. Idempotent: re-running on an already-BTRH install just rebuilds btrees in their current format. From pre-2026.05.1 installs, install 2026.05.4 first and run that release's `./migrate` to convert v1 objects to slotcask, then upgrade to 2026.05.5 and re-run `./migrate`.
 
 ## Index maintenance
 

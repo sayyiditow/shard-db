@@ -23,32 +23,45 @@
 #define BT_HASH_SIZE    16      /* raw xxh128 bytes */
 #define BT_MAX_VAL_LEN  512    /* max value length */
 
-/* File magic. "BTRG" (v3) = adds last_leaf_page in header + prev_leaf per
-   leaf page → O(num_shards) max & O(1)-leaf-step DESC iteration without
-   the forward-walk-then-reverse on the entire leaf chain. The v1 "BTRE"
-   and v2 "BTRF" magics are rejected on open — run ./shard-db reindex
-   (or ./migrate, which calls it) to rebuild. */
-#define BT_MAGIC_V1  0x42545245u  /* legacy string-keyed format */
-#define BT_MAGIC_V2  0x42545246u  /* binary-native keys, no prev_leaf */
-#define BT_MAGIC     0x42545247u  /* current: prev_leaf + last_leaf_page */
+/* File magic. "BTRH" (current, 2026.05.5+) = (value, hash) leaf sort +
+   internal-page separators include hash, so single-key delete lands
+   directly on the target leaf in O(log N) instead of walking the
+   value-cluster chain. Previous "BTRG" (v3) added last_leaf_page +
+   prev_leaf for O(1)-step DESC iteration; the v2 "BTRF" and v1 "BTRE"
+   magics predate that. All non-current magics are rejected on open —
+   run ./migrate to rebuild every btree. */
+#define BT_MAGIC_V1  0x42545245u  /* legacy: string-keyed */
+#define BT_MAGIC_V2  0x42545246u  /* legacy: binary keys without prev_leaf */
+#define BT_MAGIC_V3  0x42545247u  /* legacy: BTRG, prev_leaf + last_leaf_page */
+#define BT_MAGIC     0x42545248u  /* current: BTRH — (value, hash) sort */
 
 /* Configurable page size — set before first use */
 extern int bt_page_size; /* default 4096, set from db.env INDEX_PAGE_SIZE */
 
-/* File header (page 0) */
+/* File header (page 0). Fixed-name fields total 56 bytes; the remainder
+   of the 4 KB page is `reserved` and zero-initialised so future fields
+   can be added without bumping BT_MAGIC unless the meaning of existing
+   ones changes. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;         /* BT_MAGIC */
     uint32_t root_page;     /* page id of root */
     uint32_t page_count;    /* total pages allocated */
     uint32_t height;        /* tree height (1 = root is leaf) */
-    uint64_t entry_count;   /* total entries */
+    uint64_t entry_count;   /* total entries (lifetime inserts - lifetime deletes) */
     uint8_t  key_type;      /* FT_* of indexed field (FT_VARCHAR for composite) */
     uint8_t  key_signed;    /* 1 if sign-flip applied at encode, 0 for raw-bytes */
     uint8_t  _pad[2];
     uint32_t last_leaf_page;/* rightmost leaf in chain — DESC iter starts here.
                                Maintained on split (when the rightmost leaf
                                splits, the new right half becomes the last). */
-    uint8_t  reserved[4096 - 32]; /* header always occupies first page */
+    /* Per-shard lifetime counters (added 2026.05.5). Used by shard-stats
+       and as a "reindex needed?" heuristic. Updated under the bt rwlock
+       on every mutate; no read-path cost. */
+    uint64_t insert_count;   /* total btree_insert calls that landed an entry */
+    uint64_t delete_count;   /* total btree_delete calls that removed an entry */
+    uint64_t tombstone_count;/* slots currently in tomb state (recovered on
+                                next leaf rebuild / compaction) */
+    uint8_t  reserved[4096 - 56]; /* header always occupies first page */
 } BtFileHeader;
 
 /* Page header (first 24 bytes of every page) */

@@ -78,12 +78,22 @@ static inline void leaf_entry_set_tomb(uint8_t *entry) {
     bt_store_u16(entry, bt_load_u16(entry) | 0x8000);
 }
 
-/* Internal-page entry helpers (flat format) */
+/* Internal-page entry helpers (flat format).
+   Layout (2026.05.5+, BT_MAGIC = 'BTRH'):
+     [uint16 data_len] [value_bytes] [hash:16] [child_id:4]
+   data_len = vlen + 16 + 4. The 16-byte hash carries the right-half-
+   first-key's record hash so descent can route by (value, hash) tuples
+   and land directly on the target leaf without walking duplicate-value
+   clusters. */
 static inline const char *int_entry_value(uint8_t *entry) {
     return (const char *)(entry + 2);
 }
 static inline size_t int_entry_vlen(uint8_t *entry) {
-    return (size_t)entry_data_len(entry) - 4;
+    return (size_t)entry_data_len(entry) - BT_HASH_SIZE - 4;
+}
+static inline const uint8_t *int_entry_hash(uint8_t *entry) {
+    /* hash sits between value bytes and child_id. */
+    return entry + 2 + (size_t)entry_data_len(entry) - BT_HASH_SIZE - 4;
 }
 static inline uint32_t entry_child(uint8_t *entry) {
     uint16_t dlen = entry_data_len(entry);
@@ -124,6 +134,19 @@ static inline int val_cmp(const void *v1, size_t l1, const void *v2, size_t l2) 
     if (l1 < l2) return -1;
     if (l1 > l2) return 1;
     return 0;
+}
+
+/* Lexicographic comparison of (value, hash) tuples. Tied values fall
+   through to a 16-byte memcmp on the hashes; since record hashes are
+   xxh128 digests of unique primary keys, the hash tiebreak makes
+   every entry's sort position unique within a btree. This is the
+   comparator that defines the on-disk sort order on 'BTRH' btrees
+   for inserts and for any descent that knows the target's hash. */
+static inline int val_hash_cmp(const void *v1, size_t l1, const uint8_t *h1,
+                                const void *v2, size_t l2, const uint8_t *h2) {
+    int r = val_cmp(v1, l1, v2, l2);
+    if (r != 0) return r;
+    return memcmp(h1, h2, BT_HASH_SIZE);
 }
 
 /* Longest common prefix length (capped at 255 to fit in uint8_t prefix_len). */
@@ -230,15 +253,61 @@ static int page_bsearch_leaf(uint8_t *page, const char *target, size_t tlen) {
     return end;
 }
 
-/* Internal-page bsearch: first slot whose key is `>= target`. The routing
-   convention is `entry[pos - 1].child` (or `next_leaf` when pos == 0).
-   With duplicate values allowed in the leaf chain, a value v that equals
-   a separator key may legitimately exist on multiple consecutive leaves
-   — keeping the `>=` (loose) form lets the descent land on the leftmost
-   such leaf, and downstream walkers continue forward via `next_leaf`
-   to enumerate the rest. The single-leaf-descent paths (btree_delete in
-   particular) must also continue forward — see btree_delete's leaf-chain
-   loop. */
+/* Value-hash variant of the leaf bsearch — used by inserts and deletes
+   when both value AND hash are known. Returns the first physical slot
+   whose stored (value, hash) is >= the target tuple. Within a value
+   cluster, hashes are now sorted (the BT_MAGIC = 'BTRH' invariant), so
+   the target (value, hash) lands at a uniquely identified slot: equal
+   when the entry exists, strictly-greater when it doesn't.
+
+   The anchor bsearch (stage 1) compares against the anchor's full
+   (value, hash) tuple — the anchor's hash sits at `leaf_entry_hash(e)`
+   immediately after the suffix bytes. */
+static int page_bsearch_leaf_vh(uint8_t *page, const char *target, size_t tlen,
+                                 const uint8_t *target_hash) {
+    BtPageHeader *ph = (BtPageHeader *)page;
+    int n = ph->count;
+    if (n == 0) return 0;
+    int K = BT_LEAF_RESTART_K;
+    int n_anchors = (n + K - 1) / K;
+
+    int lo = 0, hi = n_anchors;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        uint8_t *e = page_entry(page, mid * K);
+        const uint8_t *av = leaf_entry_suffix(e);
+        size_t al = leaf_entry_suffix_len(e);
+        const uint8_t *ah = leaf_entry_hash(e);
+        if (val_hash_cmp(av, al, ah, target, tlen, target_hash) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    if (lo == 0) return 0;
+
+    int start = (lo - 1) * K;
+    int end = lo * K;
+    if (end > n) end = n;
+
+    LeafIter it;
+    leaf_iter_init(&it, page);
+    it.slot_idx = start - 1;
+    while (leaf_iter_next(&it) && it.slot_idx < end) {
+        if (val_hash_cmp(it.key_buf, it.key_len, it.hash,
+                          target, tlen, target_hash) >= 0)
+            return it.slot_idx;
+    }
+    return end;
+}
+
+/* Internal-page bsearch by value only: first slot whose key is `>= target`.
+   Used by btree_search / range scans where the target hash is unknown
+   and we want to land on the leftmost leaf that might hold the value
+   cluster. Downstream code walks the leaf chain forward via next_leaf
+   to enumerate all duplicates.
+
+   When the caller knows both value AND hash (btree_delete, bt_insert_rec
+   for positioning), use page_bsearch_internal_vh instead — it routes
+   directly to the unique target leaf in O(log fanout) without walking. */
 static int page_bsearch_internal(uint8_t *page, const char *target, size_t tlen) {
     BtPageHeader *ph = (BtPageHeader *)page;
     int lo = 0, hi = ph->count;
@@ -253,7 +322,34 @@ static int page_bsearch_internal(uint8_t *page, const char *target, size_t tlen)
     return lo;
 }
 
-/* Binary search within a page. Returns index of first entry >= target. */
+/* Internal-page bsearch by (value, hash): first slot whose (value, hash)
+   is STRICTLY greater than target — an `upper_bound`. The routing
+   convention `entry[pos - 1].child` then lands on the child responsible
+   for the half-open range [key[pos-1], key[pos]), and crucially routes
+   target == separator to the separator's RIGHT child (because the
+   separator IS the first key of that child's range, by construction in
+   bt_split_leaf which promotes the right-half's first (value, hash)).
+   Used by paths that know the target's hash and need uniqueness:
+   bt_insert_rec descent, btree_delete. */
+static int page_bsearch_internal_vh(uint8_t *page, const char *target, size_t tlen,
+                                     const uint8_t *target_hash) {
+    BtPageHeader *ph = (BtPageHeader *)page;
+    int lo = 0, hi = ph->count;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        uint8_t *e = page_entry(page, mid);
+        if (val_hash_cmp(int_entry_value(e), int_entry_vlen(e),
+                          int_entry_hash(e),
+                          target, tlen, target_hash) <= 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* Binary search within a page. Returns index of first entry >= target.
+   Value-only variant — for callers that don't know the hash. */
 static int page_bsearch(uint8_t *page, const char *target, size_t target_len) {
     BtPageHeader *ph = (BtPageHeader *)page;
     if (ph->page_type == 1) return page_bsearch_leaf(page, target, target_len);
@@ -388,6 +484,9 @@ static void bt_init_file(uint8_t *map) {
     fh->key_type = 0;
     fh->key_signed = 0;
     fh->last_leaf_page = 1;     /* the lone leaf is rightmost */
+    fh->insert_count = 0;
+    fh->delete_count = 0;
+    fh->tombstone_count = 0;
     uint8_t *leaf = map + bt_page_size;
     memset(leaf, 0, bt_page_size);
     BtPageHeader *lh = (BtPageHeader *)leaf;
@@ -434,16 +533,22 @@ static int bt_open_file(const char *path, int writer,
 
     if (fresh) bt_init_file(map);
     else {
-        /* Reject older btree formats. V1 was string-keyed; V2 lacked
-           prev_leaf + last_leaf_page. Both require a reindex to upgrade
-           to V3 (current). */
+        /* Reject any non-current btree format. V1 was string-keyed; V2
+           lacked prev_leaf + last_leaf_page; V3 ('BTRG') had value-only
+           leaf sort and value-only internal-page separators. The current
+           format ('BTRH', 2026.05.5+) adds (value, hash) leaf sort and
+           hash-bearing internal-page separators — same on-disk leaf byte
+           layout but the comparator + descent semantics differ. Operators
+           upgrade by running ./migrate which reindexes every object's
+           btrees with the current format. */
         BtFileHeader *fh = (BtFileHeader *)map;
         if (fh->magic != BT_MAGIC) {
             const char *which = (fh->magic == BT_MAGIC_V1) ? "V1 (string-keyed)"
                               : (fh->magic == BT_MAGIC_V2) ? "V2 (no prev_leaf)"
+                              : (fh->magic == BT_MAGIC_V3) ? "V3 (BTRG, value-only sort)"
                               : "unknown";
             fprintf(stderr,
-                "btree: rejecting %s format at %s — run ./shard-db reindex (or ./migrate)\n",
+                "btree: rejecting %s format at %s — run ./migrate to reindex\n",
                 which, path);
             munmap(map, sz);
             close(fd);
@@ -1052,7 +1157,7 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
            recurse further because the page is now tight (free space
            alone covers `need`). */
 #undef LPI_MAX_PATCHES
-        int new_pos = page_bsearch_leaf(page, value, vlen);
+        int new_pos = page_bsearch_leaf_vh(page, value, vlen, hash);
         return page_insert_at_leaf(page, new_pos, value, vlen, hash);
     }
 
@@ -1097,15 +1202,17 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
 }
 
 /* Insert entry into an INTERNAL page at position pos. Returns 0 on success,
-   -1 if no space. The 4-byte child_id is appended after `value` in the entry
-   payload, matching the internal-page layout. Leaves take a different path —
-   call page_insert_at_leaf directly. The two functions used to share a
-   polymorphic suffix dispatch; splitting them removes the buffer-size
-   ambiguity that Coverity OVERRUN heuristics flagged on the internal path. */
+   -1 if no space. Layout per the BT_MAGIC = 'BTRH' format:
+       [uint16 data_len][value_bytes][hash:16][child_id:4]
+   data_len = vlen + 16 + 4. The hash carries the right-half's first-key
+   hash from the originating leaf split; routing uses (value, hash) tuple
+   comparison so descent lands directly on the target leaf for known
+   (value, hash) lookups. */
 static int page_insert_at_internal(uint8_t *page, int pos, const char *value,
-                                   size_t vlen, uint32_t child_id) {
+                                   size_t vlen, const uint8_t *hash,
+                                   uint32_t child_id) {
     BtPageHeader *ph = (BtPageHeader *)page;
-    uint16_t data_len = (uint16_t)(vlen + 4);
+    uint16_t data_len = (uint16_t)(vlen + BT_HASH_SIZE + 4);
     size_t entry_bytes = 2 + data_len;
     size_t needed = entry_bytes + sizeof(uint16_t);
     if (page_free_space(page) < needed) return -1;
@@ -1114,7 +1221,8 @@ static int page_insert_at_internal(uint8_t *page, int pos, const char *value,
     uint8_t *entry = page + ph->data_end;
     bt_store_u16(entry, data_len);
     memcpy(entry + 2, value, vlen);
-    memcpy(entry + 2 + vlen, &child_id, 4);
+    memcpy(entry + 2 + vlen, hash, BT_HASH_SIZE);
+    memcpy(entry + 2 + vlen + BT_HASH_SIZE, &child_id, 4);
 
     uint16_t *slots = page_slots(page);
     if (pos < (int)ph->count)
@@ -1148,9 +1256,12 @@ static void page_remove_at(uint8_t *page, int pos) {
 
 /* ========== Split ========== */
 
-/* Split a leaf page. Returns new page_id. Promotes middle key via out params. */
+/* Split a leaf page. Returns new page_id. Promotes the first key+hash of
+   the new (right) half via out params; the caller uses that tuple as the
+   separator on the parent internal page. */
 static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
-                              char *promote_val, size_t *promote_vlen) {
+                              char *promote_val, size_t *promote_vlen,
+                              uint8_t promote_hash[BT_HASH_SIZE]) {
     uint32_t new_id = bt_alloc_page(bt);
     uint8_t *old_pg = bt_page(bt, page_id);
     uint8_t *new_pg = bt_page(bt, new_id);
@@ -1203,10 +1314,11 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
     }
     int split_at = live / 2;
 
-    /* Promote first key of new page (recs[split_at]). */
+    /* Promote first (value, hash) of new page (recs[split_at]). */
     *promote_vlen = recs[split_at].vlen;
     if (*promote_vlen > BT_MAX_VAL_LEN) *promote_vlen = BT_MAX_VAL_LEN;
     memcpy(promote_val, recs[split_at].value, *promote_vlen);
+    memcpy(promote_hash, recs[split_at].hash, BT_HASH_SIZE);
 
     /* Rebuild new first (inherits old's next_leaf already). */
     leaf_rebuild(new_pg, &recs[split_at], live - split_at);
@@ -1220,7 +1332,8 @@ static uint32_t bt_split_leaf(BtFile *bt, uint32_t page_id,
 
 /* Split an internal page. Similar to leaf split. */
 static uint32_t bt_split_internal(BtFile *bt, uint32_t page_id,
-                                  char *promote_val, size_t *promote_vlen) {
+                                  char *promote_val, size_t *promote_vlen,
+                                  uint8_t promote_hash[BT_HASH_SIZE]) {
     uint32_t new_id = bt_alloc_page(bt);
     uint8_t *old_pg = bt_page(bt, page_id);
     uint8_t *new_pg = bt_page(bt, new_id);
@@ -1234,18 +1347,22 @@ static uint32_t bt_split_internal(BtFile *bt, uint32_t page_id,
     new_h->next_leaf = 0;
     new_h->data_end = bt_page_size;
 
-    /* The middle entry gets promoted. Its right child becomes leftmost of new page. */
+    /* The middle entry gets promoted. Its right child becomes leftmost of
+       new page. Carry both value and hash up — the parent internal page
+       stores them as a single (value, hash) separator. */
     uint8_t *mid_entry = page_entry(old_pg, mid);
     *promote_vlen = int_entry_vlen(mid_entry);
     if (*promote_vlen > BT_MAX_VAL_LEN) *promote_vlen = BT_MAX_VAL_LEN;
     memcpy(promote_val, int_entry_value(mid_entry), *promote_vlen);
+    memcpy(promote_hash, int_entry_hash(mid_entry), BT_HASH_SIZE);
     new_h->next_leaf = entry_child(mid_entry); /* leftmost child of new page */
 
     for (int i = mid + 1; i < (int)old_h->count; i++) {
         uint8_t *e = page_entry(old_pg, i);
         size_t vlen = int_entry_vlen(e);
         uint32_t child = entry_child(e);
-        page_insert_at_internal(new_pg, new_h->count, int_entry_value(e), vlen, child);
+        page_insert_at_internal(new_pg, new_h->count, int_entry_value(e), vlen,
+                                int_entry_hash(e), child);
     }
 
     old_h = (BtPageHeader *)bt_page(bt, page_id);
@@ -1256,18 +1373,26 @@ static uint32_t bt_split_internal(BtFile *bt, uint32_t page_id,
 
 /* ========== Insert ========== */
 
-/* Recursive insert. Returns -1 if no split, otherwise new_page_id and sets promote key. */
+/* Recursive insert. Returns -1 if no split, otherwise sets the
+   (promote_val, promote_hash, *new_child) triple for the caller to insert
+   on the parent internal page. */
 static int bt_insert_rec(BtFile *bt, uint32_t page_id,
                          const char *value, size_t vlen, const uint8_t *hash,
-                         char *promote_val, size_t *promote_vlen, uint32_t *new_child) {
+                         char *promote_val, size_t *promote_vlen,
+                         uint8_t promote_hash[BT_HASH_SIZE],
+                         uint32_t *new_child) {
     uint8_t *page = bt_page(bt, page_id);
     BtPageHeader *ph = (BtPageHeader *)page;
 
     if (ph->page_type == 1) {
-        /* Leaf page */
-        int pos = page_bsearch(page, value, vlen);
+        /* Leaf page. Position by (value, hash) so duplicate-value clusters
+           stay hash-sorted on disk — this lets btree_delete bsearch
+           directly to the target tuple. */
+        int pos = page_bsearch_leaf_vh(page, value, vlen, hash);
 
-        /* Check for duplicate */
+        /* Duplicate check: at the (value, hash)-positioned slot, if the
+           entry already has identical value AND hash, it's a true
+           duplicate (same record reindexing) and we skip. */
         if (pos < (int)ph->count) {
             LeafIter dit; leaf_iter_init(&dit, page);
             if (leaf_iter_seek(&dit, pos) &&
@@ -1283,32 +1408,29 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         }
 
         /* Page full — split */
-        /* First insert into a temp buffer, then split */
-        /* For simplicity: split first, then insert into correct half */
-        *new_child = bt_split_leaf(bt, page_id, promote_val, promote_vlen);
+        *new_child = bt_split_leaf(bt, page_id, promote_val, promote_vlen,
+                                    promote_hash);
 
-        /* Determine which page to insert into. Use val_cmp (length-tiebreak)
-           instead of raw memcmp — the old code had a length-bound bug where
-           value could be longer than promote_val and the wrong comparison
-           length was used. This also makes the decision consistent with
-           page_bsearch's ordering across the file. */
+        /* Determine which page to insert into. Compare the inserting
+           (value, hash) tuple against the promoted (value, hash)
+           separator: >= goes RIGHT, < goes LEFT. */
         page = bt_page(bt, page_id);
         uint8_t *new_pg = bt_page(bt, *new_child);
-        if (val_cmp(value, vlen, promote_val, *promote_vlen) >= 0) {
-            pos = page_bsearch(new_pg, value, vlen);
+        if (val_hash_cmp(value, vlen, hash,
+                          promote_val, *promote_vlen, promote_hash) >= 0) {
+            pos = page_bsearch_leaf_vh(new_pg, value, vlen, hash);
             page_insert_at_leaf(new_pg, pos, value, vlen, hash);
         } else {
-            pos = page_bsearch(page, value, vlen);
+            pos = page_bsearch_leaf_vh(page, value, vlen, hash);
             page_insert_at_leaf(page, pos, value, vlen, hash);
         }
 
         return 0; /* split happened */
     } else {
-        /* Internal page — find child.
-           next_leaf stores leftmost child. Entries store [key, right_child].
-           Find rightmost key <= value, follow its right child.
-           If value < all keys, follow leftmost child. */
-        int pos = page_bsearch(page, value, vlen);
+        /* Internal page — find child via (value, hash) descent so a
+           split that promoted v == sep doesn't misroute on the next
+           insert of the same value. */
+        int pos = page_bsearch_internal_vh(page, value, vlen, hash);
         uint32_t child_id;
 
         if (pos == 0) {
@@ -1319,33 +1441,42 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
 
         char sub_promote[BT_MAX_VAL_LEN];
         size_t sub_promote_len;
+        uint8_t sub_promote_hash[BT_HASH_SIZE];
         uint32_t sub_new_child;
 
         int result = bt_insert_rec(bt, child_id, value, vlen, hash,
-                                   sub_promote, &sub_promote_len, &sub_new_child);
+                                   sub_promote, &sub_promote_len,
+                                   sub_promote_hash, &sub_new_child);
         if (result == -1) return -1; /* no split below */
 
-        /* Child split — insert promoted key + new child into this page */
+        /* Child split — insert promoted (value, hash, child) into this page */
         page = bt_page(bt, page_id); /* re-fetch after potential remap */
         ph = (BtPageHeader *)page;
-        int ipos = page_bsearch(page, sub_promote, sub_promote_len);
+        int ipos = page_bsearch_internal_vh(page, sub_promote, sub_promote_len,
+                                             sub_promote_hash);
 
         if (page_insert_at_internal(page, ipos, sub_promote, sub_promote_len,
-                                    sub_new_child) == 0) {
+                                    sub_promote_hash, sub_new_child) == 0) {
             return -1; /* inserted into this page, no further split */
         }
 
         /* This internal page is full — split it too */
-        *new_child = bt_split_internal(bt, page_id, promote_val, promote_vlen);
+        *new_child = bt_split_internal(bt, page_id, promote_val, promote_vlen,
+                                        promote_hash);
 
         page = bt_page(bt, page_id);
         uint8_t *new_pg = bt_page(bt, *new_child);
-        if (val_cmp(sub_promote, sub_promote_len, promote_val, *promote_vlen) >= 0) {
-            ipos = page_bsearch(new_pg, sub_promote, sub_promote_len);
-            page_insert_at_internal(new_pg, ipos, sub_promote, sub_promote_len, sub_new_child);
+        if (val_hash_cmp(sub_promote, sub_promote_len, sub_promote_hash,
+                          promote_val, *promote_vlen, promote_hash) >= 0) {
+            ipos = page_bsearch_internal_vh(new_pg, sub_promote, sub_promote_len,
+                                             sub_promote_hash);
+            page_insert_at_internal(new_pg, ipos, sub_promote, sub_promote_len,
+                                    sub_promote_hash, sub_new_child);
         } else {
-            ipos = page_bsearch(page, sub_promote, sub_promote_len);
-            page_insert_at_internal(page, ipos, sub_promote, sub_promote_len, sub_new_child);
+            ipos = page_bsearch_internal_vh(page, sub_promote, sub_promote_len,
+                                             sub_promote_hash);
+            page_insert_at_internal(page, ipos, sub_promote, sub_promote_len,
+                                    sub_promote_hash, sub_new_child);
         }
 
         return 0; /* split propagated */
@@ -1362,12 +1493,14 @@ void btree_insert(const char *path, const char *value, size_t vlen,
     if (bt_acquire(&bt, path, 1) != 0) return;
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
-    char promote_val[BT_MAX_VAL_LEN];
-    size_t promote_vlen;
+    char    promote_val[BT_MAX_VAL_LEN];
+    size_t  promote_vlen;
+    uint8_t promote_hash[BT_HASH_SIZE];
     uint32_t new_child;
 
     int result = bt_insert_rec(&bt, fh->root_page, value, vlen, hash,
-                               promote_val, &promote_vlen, &new_child);
+                               promote_val, &promote_vlen, promote_hash,
+                               &new_child);
 
     if (result == 0) {
         /* Root was split — create new root */
@@ -1382,10 +1515,11 @@ void btree_insert(const char *path, const char *value, size_t vlen,
         rh->next_leaf = 0;
         rh->data_end = bt_page_size;
 
-        /* old_root is leftmost child (in next_leaf), promote key points to new_child */
+        /* old_root is leftmost child (in next_leaf), promote (value, hash) → new_child */
         uint32_t old_root = fh->root_page;
         rh->next_leaf = old_root; /* leftmost child pointer */
-        page_insert_at_internal(root_pg, 0, promote_val, promote_vlen, new_child);
+        page_insert_at_internal(root_pg, 0, promote_val, promote_vlen,
+                                promote_hash, new_child);
 
         fh->root_page = new_root;
         fh->height++;
@@ -1393,6 +1527,7 @@ void btree_insert(const char *path, const char *value, size_t vlen,
 
     fh = (BtFileHeader *)bt.map;
     fh->entry_count++;
+    fh->insert_count++;
     bt_release(&bt);
 }
 
@@ -1408,12 +1543,14 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
         if (entries[i].vlen > BT_MAX_VAL_LEN) continue;
 
         BtFileHeader *fh = (BtFileHeader *)bt.map;
-        char promote_val[BT_MAX_VAL_LEN];
-        size_t promote_vlen;
+        char    promote_val[BT_MAX_VAL_LEN];
+        size_t  promote_vlen;
+        uint8_t promote_hash[BT_HASH_SIZE];
         uint32_t new_child;
 
         int result = bt_insert_rec(&bt, fh->root_page, entries[i].value, entries[i].vlen,
-                                   entries[i].hash, promote_val, &promote_vlen, &new_child);
+                                   entries[i].hash, promote_val, &promote_vlen,
+                                   promote_hash, &new_child);
         if (result == 0) {
             fh = (BtFileHeader *)bt.map;
             uint32_t new_root = bt_alloc_page(&bt);
@@ -1424,12 +1561,14 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
             rh->count = 0;
             rh->next_leaf = fh->root_page;
             rh->data_end = bt_page_size;
-            page_insert_at_internal(root_pg, 0, promote_val, promote_vlen, new_child);
+            page_insert_at_internal(root_pg, 0, promote_val, promote_vlen,
+                                    promote_hash, new_child);
             fh->root_page = new_root;
             fh->height++;
         }
         fh = (BtFileHeader *)bt.map;
         fh->entry_count++;
+        fh->insert_count++;
     }
 
     bt_release(&bt);
@@ -1442,56 +1581,35 @@ void btree_delete(const char *path, const char *value, size_t vlen,
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
-    /* Descend to the leaf where the value's range begins. */
+    /* Descend by (value, hash) tuples. With the BT_MAGIC='BTRH' invariant
+       that internal-page separators carry both value and hash, this
+       descent lands directly on the unique leaf containing the target
+       (value, hash) entry. No leaf-chain walk needed. */
     uint32_t page_id = fh->root_page;
     while (1) {
         uint8_t *page = bt_page(&bt, page_id);
         BtPageHeader *ph = (BtPageHeader *)page;
-        if (ph->page_type == 1) break; /* leaf */
-        int pos = page_bsearch(page, value, vlen);
+        if (ph->page_type == 1) break;
+        int pos = page_bsearch_internal_vh(page, value, vlen, hash);
         if (pos == 0) page_id = ph->next_leaf;
         else page_id = entry_child(page_entry(page, pos - 1));
     }
 
-    /* Walk the leaf chain forward looking for the (value, hash) pair. Why
-       the chain and not just the descent target? Two cases the descent
-       alone misses:
-         (a) value == an internal-page separator key. With the `>=`
-             internal bsearch convention, descent lands on the leaf
-             holding the LAST values < separator — but a unique value
-             equal to the separator may live on the NEXT leaf as its
-             first entry.
-         (b) value is duplicated across leaves (status="PAID" with
-             many entries spilling across leaf boundaries). The target
-             record's hash may be on any of those leaves.
-       Stop as soon as we see a value strictly greater than target —
-       the chain is ascending so nothing further can match. If a leaf
-       has no slot >= target (pos == count), keep walking — the target
-       may be on the next leaf. */
-    while (page_id != 0) {
-        uint8_t *page = bt_page(&bt, page_id);
-        BtPageHeader *ph = (BtPageHeader *)page;
-        int pos = page_bsearch(page, value, vlen);
+    uint8_t *page = bt_page(&bt, page_id);
+    BtPageHeader *lh = (BtPageHeader *)page;
+    int pos = page_bsearch_leaf_vh(page, value, vlen, hash);
 
-        LeafIter it;
-        leaf_iter_init(&it, page);
-        int found = 0;
-        int saw_greater = 0;
-        if (leaf_iter_seek(&it, pos)) {
-            do {
-                int c = val_cmp(it.key_buf, it.key_len, value, vlen);
-                if (c > 0) { saw_greater = 1; break; }
-                if (c < 0) continue; /* shouldn't happen — leaf_iter_seek lands at-or-past */
-                if (memcmp(it.hash, hash, BT_HASH_SIZE) == 0) {
-                    page_remove_at(page, it.slot_idx);
-                    fh->entry_count--;
-                    found = 1;
-                    break;
-                }
-            } while (leaf_iter_next(&it));
-        }
-        if (found || saw_greater) break;
-        page_id = ph->next_leaf;
+    LeafIter it;
+    leaf_iter_init(&it, page);
+    int ok_seek = leaf_iter_seek(&it, pos);
+    int v_ok = ok_seek && val_cmp(it.key_buf, it.key_len, value, vlen) == 0;
+    int h_ok = v_ok && memcmp(it.hash, hash, BT_HASH_SIZE) == 0;
+    (void)lh;
+    if (h_ok) {
+        page_remove_at(page, it.slot_idx);
+        fh->entry_count--;
+        fh->delete_count++;
+        fh->tombstone_count++;
     }
 
     bt_release(&bt);
@@ -2129,15 +2247,19 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
             int child_is_leaf = (ch->page_type == 1);
             size_t kvlen;
             char key_buf[BT_MAX_VAL_LEN];
+            uint8_t key_hash[BT_HASH_SIZE];
             if (child_is_leaf) {
-                /* Slot 0 is an anchor — prefix_len=0, suffix is full value. */
+                /* Slot 0 is an anchor — prefix_len=0, suffix is full value;
+                   hash sits at the tail. */
                 kvlen = leaf_entry_suffix_len(first_e);
                 if (kvlen > BT_MAX_VAL_LEN) kvlen = BT_MAX_VAL_LEN;
                 memcpy(key_buf, leaf_entry_suffix(first_e), kvlen);
+                memcpy(key_hash, leaf_entry_hash(first_e), BT_HASH_SIZE);
             } else {
                 kvlen = int_entry_vlen(first_e);
                 if (kvlen > BT_MAX_VAL_LEN) kvlen = BT_MAX_VAL_LEN;
                 memcpy(key_buf, int_entry_value(first_e), kvlen);
+                memcpy(key_hash, int_entry_hash(first_e), BT_HASH_SIZE);
             }
 
             ppg = bt_page(&bt, cur_parent);
@@ -2145,7 +2267,7 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
 
             if (page_insert_at_internal(ppg, pph->count,
                                         key_buf, kvlen,
-                                        child_ids[i]) == -1) {
+                                        key_hash, child_ids[i]) == -1) {
                 /* Parent full — new parent */
                 cur_parent = bt_alloc_page(&bt);
                 ppg = bt_page(&bt, cur_parent);
@@ -2269,7 +2391,9 @@ extract_done:
 
 static int bt_cmp_entry(const void *a, const void *b) {
     const BtEntry *ea = a, *eb = b;
-    return val_cmp(ea->value, ea->vlen, eb->value, eb->vlen);
+    int r = val_cmp(ea->value, ea->vlen, eb->value, eb->vlen);
+    if (r != 0) return r;
+    return memcmp(ea->hash, eb->hash, BT_HASH_SIZE);
 }
 
 /* Sort new_entries, merge with existing B+ tree contents, rebuild.
@@ -2382,8 +2506,8 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
 
     size_t ei = 0, ni = 0, ci = 0;
     while (ei < exist_count && ni < new_count) {
-        if (val_cmp(existing[ei].value, existing[ei].vlen,
-                    new_entries[ni].value, new_entries[ni].vlen) <= 0)
+        if (val_hash_cmp(existing[ei].value, existing[ei].vlen, existing[ei].hash,
+                          new_entries[ni].value, new_entries[ni].vlen, new_entries[ni].hash) <= 0)
             combined[ci++] = existing[ei++];
         else
             combined[ci++] = new_entries[ni++];

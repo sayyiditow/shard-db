@@ -147,7 +147,13 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 Operators upgrading from a pre-2026.05.5 install that still has v1
 (legacy probe-into-slot) objects must first install 2026.05.4 and run
 that release's `./migrate` to convert v1 → v2; this version refuses
-any v1 object at load. v2-clean installs upgrade directly.
+any v1 object at load.
+
+2026.05.5 also rolls B+ tree magic `'BTRG'` → `'BTRH'` for the
+`(value, hash)` sort order. Existing v2-clean installs must run 2026.05.5's
+`./migrate` once after upgrade — it spawns the daemon, runs
+`./shard-db reindex` to rebuild btrees in the new format, then stops the
+daemon. Idempotent on already-BTRH installs.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds.
 
