@@ -107,11 +107,25 @@ int test_env_start(TestEnv *env) {
     char base[512];
     snprintf(base, sizeof(base), "%s/shard-db-test-%d-%d",
              tmpdir, (int)getpid(), idx);
-    snprintf(env->db_root, sizeof(env->db_root), "%s/db", base);
 
     /* Wipe + recreate the directory tree. */
     run_cmd("rm -rf %s", base);
     mkdir(base, 0755);
+
+    /* Resolve to absolute. The fixture chdirs the daemon into `base`
+       before exec, so a relative DB_ROOT in db.env would resolve to
+       `base/<DB_ROOT>` from the daemon's POV — but the bench / test
+       still references `env.db_root` from its own CWD (the caller's
+       cwd, not `base`), producing a `base/db/.../base/db/...` double
+       nesting visible in `du` (cosmetic) and breaking any post-bench
+       path checks. realpath() collapses the path under the caller's
+       cwd; everything written into db.env + env.db_root is then
+       absolute and consistent across both processes. */
+    char base_abs[PATH_MAX];
+    if (realpath(base, base_abs)) {
+        snprintf(base, sizeof(base), "%s", base_abs);
+    }
+    snprintf(env->db_root, sizeof(env->db_root), "%s/db", base);
     mkdir(env->db_root, 0755);
 
     /* db.env tells the daemon which port + paths to use. */
