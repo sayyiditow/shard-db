@@ -45,6 +45,27 @@ work.
   `"auto_key":"seq(<name>)"` at `create-object` makes the server
   generate keys on inserts that omit the `key` field. Provided keys
   go through upsert as before; CAS modifiers respected.
+- **Slotcask CRUD write paths optimised.** Four wins land together
+  in PR #46 — measured on 10M-record real-disk workloads:
+  - Single `slotcask_update` / `slotcask_delete` collapse their
+    redundant double kf-wrlock cycle (test-only entry points; the
+    production paths already had the single-cycle pattern).
+  - Bulk-upsert Phase 5 tombstones now sort by `(sid, fid)` and walk
+    in runs under one segcache rdlock per file, mirroring
+    bulk-delete's Phase 3 batching.
+  - Every CRUD pre_commit (`v2_update`, `v2_delete`,
+    `v2_bulk_upd_pre_commit_bulk`) dispatches per-indexed-field
+    delete+write via `parallel_for + update_idx_fn` (promoted from
+    storage.c-static to a shared index.c helper).
+  - Index-key extraction in pre_commits uses a no-alloc arena
+    (`build_index_key_from_record_into`) instead of `2 × nidx`
+    mallocs per record. Jumbo varchar indexes (>4096 B) fall back
+    to malloc.
+
+  Bench deltas vs main HEAD on real disk: BULK INSERT JSON +33%,
+  CSV +45%; single UPDATE/DELETE p50 ~2.6× faster; bulk
+  UPDATE/DELETE 3–20× faster; parallel UPDATE 2.7× faster. Tombstone
+  contract unchanged; no semantics change.
 - Test coverage: 79 cases / 3058 assertions including a new
   `test-btree-value-hash-sort` covering insert/delete/bulk-merge/split
   invariants for the new sort order. ~12 000 lines of v1 dispatch +
