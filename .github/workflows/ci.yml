@@ -50,7 +50,7 @@ jobs:
           uname -a
 
       - name: Build
-        # build.sh produces shard-db, shard-cli, migrate, shard-db-test, and
+        # build.sh produces shard-db, shard-cli, shard-db-test, and
         # shard-db-bench under build/bin/. Test runner ships as a single
         # binary linking every src/test/cases/test_*.c case via
         # TEST_REGISTER static-init; one invocation runs the whole suite.
@@ -67,7 +67,7 @@ jobs:
         # matrix legs (linux-x86_64, linux-arm64, macos-arm64) coexist.
         run: |
           tarball="shard-db-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
-          tar -C build/bin -czf "$tarball" shard-db shard-cli migrate
+          tar -C build/bin -czf "$tarball" shard-db shard-cli
           ls -l "$tarball"
 
       - name: Upload binary artifact
