@@ -988,6 +988,14 @@ static int build_shard_worker_map(const int *shard_counts, int splits,
 typedef struct {
     BulkInsShardWork *sw;
     BulkInsRecord    *rec;
+    /* Per-worker arena for OLD index-key extraction during update upserts.
+       nidx slots × INDEX_KEY_MAX bytes, reused across every record in this
+       worker's kf-shard slice. pre_commits fire serially under the kf
+       wrlock so reuse is safe. NEW keys can't share the arena — they're
+       queued into sw->idx_pairs[fi] and consumed by btree_bulk_merge
+       after the pre_commit returns. */
+    uint8_t          *old_arena;
+    size_t            old_arena_slot;
 } V2BulkInsCtx;
 
 /* Per-record pre_commit hook fired under the kf-shard wrlock by
@@ -1001,10 +1009,15 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
     BulkInsRecord    *r  = ctx->rec;
     if (sw->nidx == 0) return 0;
 
-    /* Old idx values (only on update + when caller has an old record). */
+    /* Old idx values (only on update + when caller has an old record).
+       Bufs point either into the worker's shared arena (no per-field
+       malloc) or to malloc'd memory when the arena overflowed for a
+       particular field. old_idx_owned[fi] tracks ownership so cleanup
+       only frees malloc'd entries. */
     uint8_t *old_idx_bufs[MAX_FIELDS];
     size_t   old_idx_lens[MAX_FIELDS];
     int      old_idx_have[MAX_FIELDS];
+    int      old_idx_owned[MAX_FIELDS];
     /* Zero-init bufs + lens too — Coverity CIDs 1693836/1693840 flagged
        reads of old_idx_bufs[fi]/old_idx_lens[fi] inside an
        old_idx_have[fi]-guarded condition. The short-circuit means the
@@ -1013,11 +1026,30 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
     memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
     memset(old_idx_lens, 0, sizeof(old_idx_lens));
     memset(old_idx_have, 0, sizeof(old_idx_have));
+    memset(old_idx_owned, 0, sizeof(old_idx_owned));
     if (is_update && old) {
         for (int fi = 0; fi < sw->nidx; fi++) {
-            old_idx_have[fi] = build_index_key_from_record(
-                sw->ts, old->value, sw->idx_fields[fi],
-                &old_idx_bufs[fi], &old_idx_lens[fi]);
+            if (ctx->old_arena) {
+                uint8_t *slot = ctx->old_arena + (size_t)fi * ctx->old_arena_slot;
+                int rc = build_index_key_from_record_into(
+                    sw->ts, old->value, sw->idx_fields[fi],
+                    slot, ctx->old_arena_slot, &old_idx_lens[fi]);
+                if (rc == 1) {
+                    old_idx_bufs[fi] = slot;
+                    old_idx_have[fi] = 1;
+                } else if (rc == -1) {
+                    /* Oversized index key — fall back to malloc. */
+                    old_idx_have[fi] = build_index_key_from_record(
+                        sw->ts, old->value, sw->idx_fields[fi],
+                        &old_idx_bufs[fi], &old_idx_lens[fi]);
+                    old_idx_owned[fi] = old_idx_have[fi];
+                }
+            } else {
+                old_idx_have[fi] = build_index_key_from_record(
+                    sw->ts, old->value, sw->idx_fields[fi],
+                    &old_idx_bufs[fi], &old_idx_lens[fi]);
+                old_idx_owned[fi] = old_idx_have[fi];
+            }
         }
     }
 
@@ -1066,7 +1098,9 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
                                sw->sch->splits,
                                old_idx_bufs[fi], old_idx_lens[fi], r->hash);
         }
-        if (old_idx_have[fi]) free(old_idx_bufs[fi]);
+        /* Arena-backed bufs are owned by the worker (freed after the
+           full batch); only malloc'd fallback bufs are freed here. */
+        if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
 
         if (unchanged) { free(key_buf); continue; }
 
@@ -1137,6 +1171,16 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     int run = 0;
     for (int s = 0; s < splits; s++) { offsets[s] = run; run += counts[s]; }
 
+    /* Per-worker arena: replaces (count × nidx) per-field mallocs in the
+       pre_commit hook with one allocation reused across every record's
+       OLD-key extraction. NEW keys still come from malloc — they outlive
+       the pre_commit return (queued into sw->idx_pairs[fi] and consumed
+       by btree_bulk_merge). */
+    enum { INDEX_KEY_MAX = 4096 };
+    uint8_t *old_arena = (sw->nidx > 0)
+        ? malloc((size_t)sw->nidx * INDEX_KEY_MAX)
+        : NULL;
+
     /* Pack records into [batch] grouped by kf shard, with [ctxs] mirrored. */
     for (size_t i = 0; i < sw->count; i++) {
         int s = kf_shards[i];
@@ -1144,6 +1188,8 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         BulkInsRecord *r = &sw->records[i];
         ctxs[pos].sw  = sw;
         ctxs[pos].rec = r;
+        ctxs[pos].old_arena      = old_arena;
+        ctxs[pos].old_arena_slot = INDEX_KEY_MAX;
         batch[pos].key       = r->id;
         batch[pos].klen      = r->klen;
         batch[pos].value     = r->payload;
@@ -1188,6 +1234,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     }
     free(batch); free(ctxs); free(kf_shards);
     free(counts); free(offsets); free(cursors);
+    free(old_arena);
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }
@@ -2549,6 +2596,14 @@ typedef struct {
 typedef struct {
     BulkDelShardWork *sw;
     int               ki;
+    /* Shared scratch arena for index-key extraction. nidx slots of
+       INDEX_KEY_MAX bytes each, reused across every pre_commit call
+       in this shard's batch — the worker fires records serially under
+       the kf wrlock so the buffer is safe to reuse. NULL if the
+       worker's arena malloc failed; pre_commit then falls back to the
+       per-call malloc path. */
+    uint8_t          *arena;
+    size_t            arena_slot;   /* INDEX_KEY_MAX, repeated for clarity */
 } V2BulkDelCtx;
 
 /* Per-record pre_commit, bulk-shaped: ctx via rec->user_ctx. */
@@ -2561,12 +2616,24 @@ static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
 
     for (int fi = 0; fi < sw->nidx; fi++) {
         uint8_t *buf = NULL; size_t blen = 0;
-        if (build_index_key_from_record(sw->ts, old->value, sw->idx_fields[fi],
-                                          &buf, &blen)) {
-            delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                                sw->sch->splits, buf, blen, sw->hashes[ki]);
-            free(buf);
+        int from_arena = 0;
+        if (ctx->arena) {
+            uint8_t *slot = ctx->arena + (size_t)fi * ctx->arena_slot;
+            int rc = build_index_key_from_record_into(sw->ts, old->value,
+                                                       sw->idx_fields[fi],
+                                                       slot, ctx->arena_slot, &blen);
+            if (rc == 1) { buf = slot; from_arena = 1; }
+            else if (rc == 0) continue;     /* missing/empty field */
+            /* rc == -1: oversized index key — fall through to malloc. */
         }
+        if (!buf) {
+            if (!build_index_key_from_record(sw->ts, old->value, sw->idx_fields[fi],
+                                              &buf, &blen))
+                continue;
+        }
+        delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
+                            sw->sch->splits, buf, blen, sw->hashes[ki]);
+        if (!from_arena) free(buf);
     }
     return 0;
 }
@@ -2587,9 +2654,22 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
     if (!batch || !ctxs) { free(batch); free(ctxs); return NULL; }
 
+    /* One arena allocation for the whole shard's batch. Replaces
+       (key_count * nidx) per-field mallocs in the pre_commit hook with
+       a single malloc/free pair shared across every record. The arena
+       gets reused for each record under the kf wrlock — pre_commits
+       fire serially inside slotcask_bulk_delete_in_kfshard. */
+    enum { INDEX_KEY_MAX = 4096 };
+    uint8_t *arena = NULL;
+    if (sw->nidx > 0) {
+        arena = malloc((size_t)sw->nidx * INDEX_KEY_MAX);
+    }
+
     for (int ki = 0; ki < sw->key_count; ki++) {
-        ctxs[ki].sw  = sw;
-        ctxs[ki].ki  = ki;
+        ctxs[ki].sw         = sw;
+        ctxs[ki].ki         = ki;
+        ctxs[ki].arena      = arena;
+        ctxs[ki].arena_slot = INDEX_KEY_MAX;
         batch[ki].key       = sw->keys[ki];
         batch[ki].klen      = strlen(sw->keys[ki]);
         batch[ki].value     = NULL;
@@ -2612,6 +2692,7 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
         if (batch[ki].status == 0) sw->deleted++;
         /* status=-2 (not found) and status=-1 (error) are not counted. */
     }
+    free(arena);
     free(batch); free(ctxs);
     return NULL;
 }
@@ -2955,6 +3036,16 @@ typedef struct {
     /* Pointer (not owner) to the shared per-worker field_vals array
        parsed once from value_json. */
     char            **field_vals;
+    /* Shared arenas for OLD and NEW index-key extraction during
+       pre_commit. nidx slots × INDEX_KEY_MAX bytes each, reused
+       across every record in the worker's batch — pre_commit fires
+       serially inside slotcask_bulk_upsert_in_kfshard. Both old and
+       new keys are call-scoped (delete + write fire inline). NULL
+       on arena malloc failure → pre_commit falls back to per-field
+       malloc for that record. */
+    uint8_t          *old_arena;
+    uint8_t          *new_arena;
+    size_t            arena_slot;
 } V2BulkUpdCtx;
 
 /* value_compute: rolls together the per-record steps that the old
@@ -3020,15 +3111,59 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
     if (w->nidx == 0 || !old) return 0;
 
     const uint8_t *new_value = (const uint8_t *)rec->value;
+
+    /* Diff fields against the shared arenas; queue only changed fields
+       into args[] for parallel dispatch via update_idx_fn. Both old and
+       new keys are call-scoped (delete + write fire inline inside
+       update_idx_fn), so arena reuse is safe. fb_bufs tracks malloc'd
+       fallback buffers for keys too large to fit in an arena slot. */
+    UpdateIdxArg args[MAX_FIELDS];
+    uint8_t *fb_bufs[2 * MAX_FIELDS]; int n_fb = 0;
+    int n_args = 0;
+
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
-        int have_old = build_index_key_from_record(w->ts, old->value,
-                                                    w->idx_fields[fi],
-                                                    &old_buf, &old_len);
-        int have_new = build_index_key_from_record(w->ts, new_value,
-                                                    w->idx_fields[fi],
-                                                    &new_buf, &new_len);
+        int have_old = 0, have_new = 0;
+
+        if (ctx->old_arena) {
+            uint8_t *slot = ctx->old_arena + (size_t)fi * ctx->arena_slot;
+            int rc = build_index_key_from_record_into(w->ts, old->value,
+                                                       w->idx_fields[fi],
+                                                       slot, ctx->arena_slot, &old_len);
+            if (rc == 1) { old_buf = slot; have_old = 1; }
+            else if (rc == -1) {
+                have_old = build_index_key_from_record(w->ts, old->value,
+                                                       w->idx_fields[fi],
+                                                       &old_buf, &old_len);
+                if (have_old) fb_bufs[n_fb++] = old_buf;
+            }
+        } else {
+            have_old = build_index_key_from_record(w->ts, old->value,
+                                                   w->idx_fields[fi],
+                                                   &old_buf, &old_len);
+            if (have_old) fb_bufs[n_fb++] = old_buf;
+        }
+
+        if (ctx->new_arena) {
+            uint8_t *slot = ctx->new_arena + (size_t)fi * ctx->arena_slot;
+            int rc = build_index_key_from_record_into(w->ts, new_value,
+                                                       w->idx_fields[fi],
+                                                       slot, ctx->arena_slot, &new_len);
+            if (rc == 1) { new_buf = slot; have_new = 1; }
+            else if (rc == -1) {
+                have_new = build_index_key_from_record(w->ts, new_value,
+                                                       w->idx_fields[fi],
+                                                       &new_buf, &new_len);
+                if (have_new) fb_bufs[n_fb++] = new_buf;
+            }
+        } else {
+            have_new = build_index_key_from_record(w->ts, new_value,
+                                                   w->idx_fields[fi],
+                                                   &new_buf, &new_len);
+            if (have_new) fb_bufs[n_fb++] = new_buf;
+        }
+
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -3037,15 +3172,21 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, upd_rec->hash);
-            if (have_new)
-                write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, upd_rec->hash);
+            args[n_args].db_root = w->db_root;
+            args[n_args].object  = w->object;
+            args[n_args].field   = w->idx_fields[fi];
+            args[n_args].splits  = w->sch->splits;
+            args[n_args].new_key = have_new ? new_buf : NULL;
+            args[n_args].new_len = new_len;
+            args[n_args].old_key = have_old ? old_buf : NULL;
+            args[n_args].old_len = old_len;
+            args[n_args].hash    = upd_rec->hash;
+            n_args++;
         }
-        free(old_buf); free(new_buf);
     }
+
+    if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+    for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     return 0;
 }
 
@@ -3072,11 +3213,21 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         w->skipped += w->count;
         return NULL;
     }
+    /* Two per-worker arenas (OLD + NEW index keys) shared across every
+       record in the batch. Replaces (count × nidx × 2) per-field mallocs
+       in v2_bulk_upd_pre_commit_bulk with two upfront malloc/free pairs. */
+    enum { INDEX_KEY_MAX = 4096 };
+    uint8_t *old_arena = (w->nidx > 0) ? malloc((size_t)w->nidx * INDEX_KEY_MAX) : NULL;
+    uint8_t *new_arena = (w->nidx > 0) ? malloc((size_t)w->nidx * INDEX_KEY_MAX) : NULL;
+
     for (int ki = 0; ki < w->count; ki++) {
         BulkUpdRec *rec = &w->recs[ki];
         ctxs[ki].w          = w;
         ctxs[ki].rec        = rec;
         ctxs[ki].field_vals = field_vals;
+        ctxs[ki].old_arena  = old_arena;
+        ctxs[ki].new_arena  = new_arena;
+        ctxs[ki].arena_slot = INDEX_KEY_MAX;
         batch[ki].key       = rec->key;
         batch[ki].klen      = rec->klen;
         batch[ki].value     = scratch + (size_t)ki * (size_t)w->ts->total_size;
@@ -3103,6 +3254,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     }
 
     free(batch); free(ctxs); free(scratch);
+    free(old_arena); free(new_arena);
     for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
     return NULL;
 }
