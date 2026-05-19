@@ -1228,6 +1228,13 @@ void load_tokens_conf(const char *db_root);
 int is_ip_trusted(const char *ip);
 int is_token_valid(const char *token);
 
+/* util.c — JSON-escape a byte string into a caller-provided buffer.
+   Escapes " \ and U+0000..U+001F per RFC 8259; other bytes (incl.
+   UTF-8 multi-byte) pass through. Worst-case expansion is 6x.
+   Returns bytes written or -1 if dst_cap is too small. */
+int json_escape_into(char *dst, size_t dst_cap,
+                     const char *src, size_t slen);
+
 /* index.c — comparators */
 int cmp_btentry_fn(const void *a, const void *b);
 

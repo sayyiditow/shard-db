@@ -8247,7 +8247,19 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     case FT_VARCHAR: {
         int len = varchar_eff_len(field_ptr, tf->size);
         if (len == 0) return snprintf(buf, bufsz, "\"\"");
-        return snprintf(buf, bufsz, "\"%.*s\"", len, (const char *)(field_ptr + 2));
+        /* Escape per RFC 8259 — varchar content is opaque bytes,
+           may contain " \ or control chars. Caller sizes buf for
+           up to 6 * len + 2 worst case. NUL-terminate so callers
+           that pass the buffer to printf-%s read a bounded string. */
+        if (bufsz < 4) return -1;
+        buf[0] = '"';
+        int esc = json_escape_into(buf + 1, bufsz - 3,
+                                    (const char *)(field_ptr + 2),
+                                    (size_t)len);
+        if (esc < 0) return -1;
+        buf[1 + esc] = '"';
+        buf[2 + esc] = '\0';
+        return 2 + esc;
     }
     case FT_DATE:
     case FT_DATETIME:
