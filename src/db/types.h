@@ -150,6 +150,11 @@ enum FieldType {
     FT_DATE,        /* date — 4 bytes int32 yyyyMMdd big-endian */
     FT_DATETIME,    /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
     FT_TIME,        /* time — 3 bytes uint24 big-endian (seconds since midnight) */
+    FT_TIMESTAMP,   /* timestamp — 8 bytes int64 big-endian (Unix epoch milliseconds);
+                       semantic int64 with auto_create / auto_update generators that
+                       emit clock_gettime(CLOCK_REALTIME) in ms. Distinct from FT_LONG
+                       (no time-source defaults) and FT_DATETIME (calendar-packed,
+                       can't represent pre-1970 or post-9999 dates). */
     FT_UUID         /* uuid — 16 bytes binary */
 };
 

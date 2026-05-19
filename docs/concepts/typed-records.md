@@ -50,6 +50,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). |
 | `datetime` | `created:datetime` | 6 | `yyyyMMdd` (int32 BE) + `HHmmss` (uint16 BE packed). |
 | `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS`. Malformed input encodes 0. |
+| `timestamp` | `created_at:timestamp` | 8 | Unix epoch **milliseconds** as int64 BE. Storage layout is identical to `long`; the type carries the additional semantic that `:auto_create` / `:auto_update` emit `clock_gettime(CLOCK_REALTIME)` in ms. Suitable for API timelines, event ordering, telemetry — anything where `Date.now()`-style values are the lingua franca. Distinct from `datetime` (which is calendar-packed and can't represent pre-1970 / post-9999). Available since 2026.05.6. |
 | `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars). Malformed input encodes 0. |
 | `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
@@ -85,8 +86,8 @@ Append default modifiers after the type spec. They trigger server-side when the 
 | `default=seq(name)` | Next value from named [sequence](../query-protocol/overview.md) on **INSERT** | `id:long:default=seq(invoice_id)` |
 | `default=uuid()` | UUID v4 on **INSERT** (36 chars) | `token:varchar:36:default=uuid()` |
 | `default=random(N)` | N random bytes, hex-encoded (2N chars) on **INSERT** | `salt:varchar:16:default=random(8)` |
-| `auto_create` | Server datetime on **INSERT** only | `created:datetime:auto_create` |
-| `auto_update` | Server datetime on **INSERT and every UPDATE** | `modified:datetime:auto_update` |
+| `auto_create` | Server timestamp on **INSERT** only | `created:datetime:auto_create` (calendar-packed) or `created_at:timestamp:auto_create` (epoch ms, 2026.05.6+) |
+| `auto_update` | Server timestamp on **INSERT and every UPDATE** | `modified:datetime:auto_update` or `updated_at:timestamp:auto_update` |
 
 A single field can carry at most one of: `default=...`, `auto_create`, `auto_update`.
 

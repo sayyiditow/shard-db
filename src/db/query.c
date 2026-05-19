@@ -7790,7 +7790,8 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         return 0;
     case FT_VARCHAR:
         return match_typed_varchar(p, f->size, cc);
-    case FT_LONG: {
+    case FT_LONG:
+    case FT_TIMESTAMP: {
         int64_t v = ld_be_i64(p);
         return cmp_op_i64(v, cc->i1, cc->i2, cc->op, cc->in_i64, cc->in_count, cc);
     }
@@ -13742,6 +13743,7 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "date") == 0)   return 4;
     if (strcmp(type, "datetime") == 0) return 6;
     if (strcmp(type, "time") == 0)    return 3;
+    if (strcmp(type, "timestamp") == 0) return 8;
     if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
@@ -13862,7 +13864,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, uuid, currency, numeric:P,S\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, timestamp, uuid, currency, numeric:P,S\"}\n",
                    field_specs[nfields]);
             return 1;
         }
@@ -14235,6 +14237,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_DATE:     return "date";
         case FT_DATETIME: return "datetime";
         case FT_TIME:     return "time";
+        case FT_TIMESTAMP: return "timestamp";
         case FT_UUID:     return "uuid";
         default:          return "unknown";
     }

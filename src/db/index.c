@@ -1136,6 +1136,7 @@ static size_t typed_field_str_avg(const TypedField *f) {
     case FT_DATE:     return 8;   /* YYYYMMDD via %08d */
     case FT_DATETIME: return 14;  /* YYYYMMDDHHmmss */
     case FT_TIME:     return 8;   /* HH:MM:SS */
+    case FT_TIMESTAMP: return 20; /* Unix epoch ms, up to 19 digits + sign */
     case FT_UUID:     return 36;  /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
     }
     return 16;
