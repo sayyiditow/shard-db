@@ -798,69 +798,150 @@ int load_fields_conf(const char *db_root, const char *object,
     return count;
 }
 
-/* Index fields cache — hash set, avoids re-reading index.conf on every insert */
+/* Index fields cache — hash set, avoids re-reading index.conf on every insert.
+   Stores both the bare field name (composite-aware) and its declared IndexType.
+   Lines on disk are either `field` (legacy → IT_BTREE) or `field:type`. */
 #define IDX_BUCKETS 256
 struct IdxCache {
     char name[256];
     char fields[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
     int nfields;
     int used;
 };
 struct IdxCache g_idx_cache[IDX_BUCKETS];
 pthread_mutex_t g_idx_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int load_index_fields(const char *db_root, const char *object,
-                             char fields[][256], int max_fields) {
-    uint32_t idx = str_hash(object) % IDX_BUCKETS;
+/* Resolve a literal index-type token ("bitmap", "trigram", "btree") to its
+   enum value. Returns 1 on success and writes *out, 0 on unknown token. */
+static int parse_index_type_token(const char *tok, size_t len, enum IndexType *out) {
+    if (len == 5 && memcmp(tok, "btree", 5) == 0)   { *out = IT_BTREE;   return 1; }
+    if (len == 6 && memcmp(tok, "bitmap", 6) == 0)  { *out = IT_BITMAP;  return 1; }
+    if (len == 7 && memcmp(tok, "trigram", 7) == 0) { *out = IT_TRIGRAM; return 1; }
+    return 0;
+}
+
+/* Split one index.conf line into `name` and `type`. Line format:
+     `field`          -> name=field,    type=IT_BTREE
+     `field:bitmap`   -> name=field,    type=IT_BITMAP
+     `f1+f2:bitmap`   -> name=f1+f2,    type=IT_BITMAP   (composite + type)
+   The colon is only the type-separator when it follows the LAST + in a
+   composite (or the whole name for single-field). We split on the LAST `:`
+   to keep field names that legitimately contain other chars intact. */
+static void split_index_spec(const char *line, char *name_out, size_t name_cap,
+                             enum IndexType *type_out) {
+    const char *colon = strrchr(line, ':');
+    if (colon) {
+        enum IndexType t;
+        if (parse_index_type_token(colon + 1, strlen(colon + 1), &t)) {
+            size_t nlen = (size_t)(colon - line);
+            if (nlen >= name_cap) nlen = name_cap - 1;
+            memcpy(name_out, line, nlen);
+            name_out[nlen] = '\0';
+            *type_out = t;
+            return;
+        }
+        /* Colon present but type unknown → treat as plain name; the caller
+           probably has a field name with a colon (rare, but don't lose it). */
+    }
+    strncpy(name_out, line, name_cap - 1);
+    name_out[name_cap - 1] = '\0';
+    *type_out = IT_BTREE;
+}
+
+/* Populate g_idx_cache for `object` if not already cached. Returns the
+   slot index, or -1 if the cache is full (which would be a config bug
+   given IDX_BUCKETS=256). Caller holds no lock; we take + drop g_idx_lock
+   internally. Reading index.conf happens outside the lock; insertion is
+   guarded so two concurrent misses don't double-populate. */
+static int idx_cache_ensure(const char *db_root, const char *object) {
+    uint32_t hash = str_hash(object);
+
     pthread_mutex_lock(&g_idx_lock);
     for (int i = 0; i < IDX_BUCKETS; i++) {
-        int slot = (idx + i) % IDX_BUCKETS;
+        int slot = (hash + i) % IDX_BUCKETS;
         if (!g_idx_cache[slot].used) break;
         if (strcmp(g_idx_cache[slot].name, object) == 0) {
-            int n = g_idx_cache[slot].nfields;
-            for (int j = 0; j < n && j < max_fields; j++) {
-                memcpy(fields[j], g_idx_cache[slot].fields[j], 256);
-                fields[j][255] = '\0';
-            }
             pthread_mutex_unlock(&g_idx_lock);
-            return n < max_fields ? n : max_fields;
+            return slot;
         }
     }
     pthread_mutex_unlock(&g_idx_lock);
 
-    /* Cache miss — read from file */
+    /* Cache miss — read from file outside the lock. */
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", db_root, object);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    int count = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), f) && count < max_fields) {
-        line[strcspn(line, "\n")] = '\0';
-        if (line[0] == '\0' || line[0] == '#') continue;
-        strncpy(fields[count], line, 255);
-        fields[count][255] = '\0';
-        count++;
-    }
-    fclose(f);
 
-    /* Store in cache */
+    char tmp_fields[MAX_FIELDS][256];
+    enum IndexType tmp_types[MAX_FIELDS];
+    int count = 0;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) && count < MAX_FIELDS) {
+            line[strcspn(line, "\n")] = '\0';
+            if (line[0] == '\0' || line[0] == '#') continue;
+            split_index_spec(line, tmp_fields[count], sizeof(tmp_fields[count]),
+                             &tmp_types[count]);
+            count++;
+        }
+        fclose(f);
+    }
+
+    /* Install in cache. Race-safe: another thread may have populated the
+       same slot meanwhile; we re-scan under lock and reuse if so. */
     pthread_mutex_lock(&g_idx_lock);
-    uint32_t sidx = str_hash(object) % IDX_BUCKETS;
+    int return_slot = -1;
     for (int i = 0; i < IDX_BUCKETS; i++) {
-        int slot = (sidx + i) % IDX_BUCKETS;
+        int slot = (hash + i) % IDX_BUCKETS;
+        if (g_idx_cache[slot].used && strcmp(g_idx_cache[slot].name, object) == 0) {
+            return_slot = slot;
+            break;
+        }
         if (!g_idx_cache[slot].used) {
             strncpy(g_idx_cache[slot].name, object, 255);
+            g_idx_cache[slot].name[255] = '\0';
             g_idx_cache[slot].nfields = count;
-            for (int j = 0; j < count; j++)
-                memcpy(g_idx_cache[slot].fields[j], fields[j], 256);
+            for (int j = 0; j < count; j++) {
+                memcpy(g_idx_cache[slot].fields[j], tmp_fields[j], 256);
+                g_idx_cache[slot].types[j] = tmp_types[j];
+            }
             g_idx_cache[slot].used = 1;
+            return_slot = slot;
             break;
         }
     }
     pthread_mutex_unlock(&g_idx_lock);
+    return return_slot;
+}
 
-    return count;
+int load_index_fields(const char *db_root, const char *object,
+                             char fields[][256], int max_fields) {
+    int slot = idx_cache_ensure(db_root, object);
+    if (slot < 0) return 0;
+
+    pthread_mutex_lock(&g_idx_lock);
+    int n = g_idx_cache[slot].nfields;
+    int copy = n < max_fields ? n : max_fields;
+    for (int j = 0; j < copy; j++) {
+        memcpy(fields[j], g_idx_cache[slot].fields[j], 256);
+        fields[j][255] = '\0';
+    }
+    pthread_mutex_unlock(&g_idx_lock);
+    return copy;
+}
+
+int load_index_types(const char *db_root, const char *object,
+                     enum IndexType *types, int max_fields) {
+    int slot = idx_cache_ensure(db_root, object);
+    if (slot < 0) return 0;
+
+    pthread_mutex_lock(&g_idx_lock);
+    int n = g_idx_cache[slot].nfields;
+    int copy = n < max_fields ? n : max_fields;
+    for (int j = 0; j < copy; j++) types[j] = g_idx_cache[slot].types[j];
+    pthread_mutex_unlock(&g_idx_lock);
+    return copy;
 }
 
 /* Invalidate index cache for an object (after add-index) */

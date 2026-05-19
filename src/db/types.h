@@ -158,6 +158,17 @@ enum FieldType {
     FT_UUID         /* uuid — 16 bytes binary */
 };
 
+/* Index types — declared per-field at create-object, persisted in
+   <obj>/indexes/index.conf as `field` (btree default) or `field:type`.
+   See [[index-types-roadmap]] for the design. */
+enum IndexType {
+    IT_BTREE   = 0,   /* default — sorted B+ tree, all 38 search operators */
+    IT_BITMAP  = 1,   /* one dense bitmap per distinct value; eq/AND only.
+                         Auto-default for bool fields at create-object. */
+    IT_TRIGRAM = 2,   /* 3-gram inverted; varchar substring/regex search.
+                         Always user-declared. Reserved for 2026.05.7 phase 2. */
+};
+
 enum DefaultKind {
     DK_NONE = 0,
     DK_LITERAL,       /* default=<value> — constant, INSERT only */
@@ -630,6 +641,10 @@ int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
 int load_splits(const char *db_root, const char *object);
 int load_index_fields(const char *db_root, const char *object, char fields[][256], int max_fields);
+/* Companion to load_index_fields — fills `types[i]` with the IndexType for
+   each indexed field at the same position. Returns the same count. Legacy
+   bare lines (no :type suffix) default to IT_BTREE. */
+int load_index_types(const char *db_root, const char *object, enum IndexType *types, int max_fields);
 void invalidate_idx_cache(const char *object);
 void load_dirs(void);
 int is_valid_dir(const char *dir);

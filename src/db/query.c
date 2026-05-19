@@ -13894,7 +13894,43 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* Validate indexes reference defined field names */
+    /* Parse + validate `indexes` into an in-memory list of (name, type) so
+       we can:
+         1. Reject unknown types / type-field mismatches upfront.
+         2. Auto-default `IT_BITMAP` for `bool` fields not explicitly indexed.
+         3. Write `<obj>/indexes/index.conf` from the canonicalised list
+            rather than re-parsing the JSON.
+
+       Line format on disk is `name` (legacy → IT_BTREE) or `name:type`.
+       Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
+    struct ParsedIdx { char name[256]; enum IndexType type; };
+    struct ParsedIdx pidx[MAX_FIELDS];
+    int npidx = 0;
+
+    /* Helper closures aren't a thing in C — declare a small lambda-ish via
+       a macro so the field-type lookup is a single readable expression in
+       the hot loop below. Returns 1 if `fname` matches a field whose typed
+       name (the substring after the first `:`) equals `expected_tname`. */
+    #define FIELD_TYPE_IS(fname, fnlen, expected_tname)                       \
+        ({                                                                    \
+            int _matched = 0;                                                 \
+            for (int _i = 0; _i < nfields; _i++) {                            \
+                const char *_c = strchr(field_specs[_i], ':');                \
+                if (!_c) continue;                                            \
+                int _nlen = (int)(_c - field_specs[_i]);                      \
+                if (_nlen != (fnlen)) continue;                               \
+                if (memcmp(field_specs[_i], (fname), _nlen) != 0) continue;   \
+                /* Found field; check its type name */                        \
+                size_t _elen = strlen(expected_tname);                        \
+                if (strncmp(_c + 1, (expected_tname), _elen) == 0 &&          \
+                    (_c[1 + _elen] == '\0' || _c[1 + _elen] == ':')) {        \
+                    _matched = 1;                                             \
+                }                                                             \
+                break;                                                        \
+            }                                                                 \
+            _matched;                                                         \
+        })
+
     if (indexes_json && indexes_json[0]) {
         p = json_skip(indexes_json);
         if (*p == '[') {
@@ -13910,21 +13946,60 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                     int ilen = (int)(p - istart);
                     if (*p == '"') p++;
 
-                    char idx_name[512];
-                    memcpy(idx_name, istart, ilen < 511 ? ilen : 511);
-                    idx_name[ilen < 511 ? ilen : 511] = '\0';
+                    if (ilen <= 0 || ilen >= 256) {
+                        OUT("{\"error\":\"invalid index spec (empty or >255 chars)\"}\n");
+                        return 1;
+                    }
+                    if (npidx >= MAX_FIELDS) {
+                        OUT("{\"error\":\"too many index specs (max %d)\"}\n", MAX_FIELDS);
+                        return 1;
+                    }
 
-                    /* For composite indexes like "field1+field2", validate each part */
-                    char check[512];
-                    strncpy(check, idx_name, 511); check[511] = '\0';
+                    char idx_spec[256];
+                    memcpy(idx_spec, istart, ilen);
+                    idx_spec[ilen] = '\0';
+
+                    /* Split on the LAST `:` — only if the suffix is a known
+                       index-type keyword. Otherwise treat as a plain name
+                       (covers hypothetical future field names with `:`). */
+                    char *colon = strrchr(idx_spec, ':');
+                    enum IndexType itype = IT_BTREE;
+                    if (colon) {
+                        const char *suffix = colon + 1;
+                        size_t slen = strlen(suffix);
+                        if (slen == 5 && memcmp(suffix, "btree", 5) == 0) {
+                            itype = IT_BTREE; *colon = '\0';
+                        } else if (slen == 6 && memcmp(suffix, "bitmap", 6) == 0) {
+                            itype = IT_BITMAP; *colon = '\0';
+                        } else if (slen == 7 && memcmp(suffix, "trigram", 7) == 0) {
+                            itype = IT_TRIGRAM; *colon = '\0';
+                        }
+                        /* Unknown suffix → leave intact, treat whole string as a
+                           composite-aware field name. The composite walk below
+                           will fail-fast if the name doesn't resolve. */
+                    }
+
+                    /* Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
+                    int is_composite = (strchr(idx_spec, '+') != NULL);
+                    if (is_composite && itype != IT_BTREE) {
+                        OUT("{\"error\":\"composite indexes are btree-only (got \\\"%s\\\"); declare each field separately if you need bitmap/trigram\"}\n",
+                            idx_spec);
+                        return 1;
+                    }
+
+                    /* Walk the composite — validate every part exists and, for
+                       non-btree types, that the field's storage type matches
+                       the index type's contract. */
+                    char check[256];
+                    strncpy(check, idx_spec, 255); check[255] = '\0';
                     char *_tok_save = NULL; char *tok = strtok_r(check, "+", &_tok_save);
                     while (tok) {
+                        int tok_len = (int)strlen(tok);
                         int found = 0;
                         for (int i = 0; i < nfields; i++) {
-                            /* Extract field name (before first colon) */
                             const char *c = strchr(field_specs[i], ':');
                             int nlen = c ? (int)(c - field_specs[i]) : (int)strlen(field_specs[i]);
-                            if ((int)strlen(tok) == nlen && memcmp(tok, field_specs[i], nlen) == 0) {
+                            if (tok_len == nlen && memcmp(tok, field_specs[i], nlen) == 0) {
                                 found = 1; break;
                             }
                         }
@@ -13932,12 +14007,61 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             OUT("{\"error\":\"index field \\\"%s\\\" not found in fields\"}\n", tok);
                             return 1;
                         }
+                        /* Index-type ↔ field-type contract (single-field only;
+                           composites are btree-only above). */
+                        if (!is_composite) {
+                            if (itype == IT_BITMAP) {
+                                /* Bitmap is right for bool (auto-default) and
+                                   user-declared low-cardinality varchar enums. */
+                                if (!FIELD_TYPE_IS(tok, tok_len, "bool") &&
+                                    !FIELD_TYPE_IS(tok, tok_len, "varchar")) {
+                                    OUT("{\"error\":\"bitmap index requires bool or varchar field (got \\\"%s\\\")\"}\n", tok);
+                                    return 1;
+                                }
+                            } else if (itype == IT_TRIGRAM) {
+                                if (!FIELD_TYPE_IS(tok, tok_len, "varchar")) {
+                                    OUT("{\"error\":\"trigram index requires varchar field (got \\\"%s\\\")\"}\n", tok);
+                                    return 1;
+                                }
+                            }
+                        }
                         tok = strtok_r(NULL, "+", &_tok_save);
                     }
+
+                    strncpy(pidx[npidx].name, idx_spec, sizeof(pidx[npidx].name) - 1);
+                    pidx[npidx].name[sizeof(pidx[npidx].name) - 1] = '\0';
+                    pidx[npidx].type = itype;
+                    npidx++;
                 } else p++;
             }
         }
     }
+
+    /* Auto-default: every `bool` field that isn't already declared as an
+       index gets IT_BITMAP. Single-field only; bool can't legally be in a
+       composite anyway since we reject non-btree composites above. */
+    for (int i = 0; i < nfields; i++) {
+        const char *c = strchr(field_specs[i], ':');
+        if (!c) continue;
+        int fnlen = (int)(c - field_specs[i]);
+        if (strncmp(c + 1, "bool", 4) != 0) continue;
+        if (c[5] != '\0' && c[5] != ':') continue;  /* exactly "bool" or "bool:..." */
+
+        int already = 0;
+        for (int j = 0; j < npidx; j++) {
+            if ((int)strlen(pidx[j].name) == fnlen &&
+                memcmp(pidx[j].name, field_specs[i], fnlen) == 0) {
+                already = 1; break;
+            }
+        }
+        if (already) continue;
+        if (npidx >= MAX_FIELDS) break;  /* full — drop the implicit; user can add later */
+        memcpy(pidx[npidx].name, field_specs[i], fnlen);
+        pidx[npidx].name[fnlen] = '\0';
+        pidx[npidx].type = IT_BITMAP;
+        npidx++;
+    }
+    #undef FIELD_TYPE_IS
 
     /* All validation passed — invalidate caches (in case object is being recreated) */
     invalidate_idx_cache(object);
@@ -14083,24 +14207,22 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         slotcask_close(&sdb);
     }
 
-    /* Write index.conf if indexes provided */
-    if (indexes_json && indexes_json[0]) {
+    /* Write index.conf from the parsed list — both explicit indexes and any
+       auto-defaulted bitmap entries on bool fields. Line format is `name`
+       for btree (back-compat with pre-2026.05.7 readers) or `name:type` for
+       bitmap/trigram. */
+    if (npidx > 0) {
         snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", eff_root, object);
         f = fopen(path, "w");
         if (f) {
-            p = json_skip(indexes_json);
-            if (*p == '[') p++;
-            while (*p) {
-                p = json_skip(p);
-                if (*p == ']') break;
-                if (*p == ',') { p++; continue; }
-                if (*p == '"') {
-                    p++;
-                    const char *start = p;
-                    while (*p && *p != '"') p++;
-                    fprintf(f, "%.*s\n", (int)(p - start), start);
-                    if (*p == '"') p++;
-                } else p++;
+            for (int i = 0; i < npidx; i++) {
+                const char *type_suffix = "";
+                switch (pidx[i].type) {
+                    case IT_BTREE:   type_suffix = "";          break;
+                    case IT_BITMAP:  type_suffix = ":bitmap";   break;
+                    case IT_TRIGRAM: type_suffix = ":trigram";  break;
+                }
+                fprintf(f, "%s%s\n", pidx[i].name, type_suffix);
             }
             fclose(f);
         }

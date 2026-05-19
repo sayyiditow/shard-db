@@ -189,6 +189,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_btree_value_hash_sort.c \
     src/test/cases/test_json_escape.c \
     src/test/cases/test_timestamp.c \
+    src/test/cases/test_bitmap_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_keyset.c \
