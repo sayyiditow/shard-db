@@ -7,34 +7,46 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 ## 2026.05.6
 
 Hotfix release for two latent JSON-escape bugs in the typed-record
-path that surface whenever varchar bytes contain `"`, `\`, or
-control chars (`< 0x20`). HN comment text caught both directions on
-the first real load while building the public showcase.
+path plus a new `timestamp` field type. HN comment text caught
+both escape bugs on the first real load while building the public
+showcase; the `timestamp` type was a community draft from
+2026-04-30 that paired cleanly with the same release.
 
-- **Decode side:** `decode_field_to_buf` and `buf_field_value` no
-  longer emit raw varchar bytes inside JSON quotes — both route
-  through a new `json_escape_into()` helper that does
-  RFC 8259-compliant escaping. Pre-fix, stored newlines / quotes /
-  backslashes corrupted the response stream mid-object.
-- **Encode side:** `typed_encode` and `typed_encode_defaults` now
-  route FT_VARCHAR string values through the pre-existing
-  `json_unescape_string()` helper, so wire-form escapes (`\"`,
-  `\n`, `\\`, `\uXXXX`…) become their intended byte sequences in
-  storage. Pre-fix, `"a\"b"` on the wire was stored as the four
-  literal bytes `a\"b`. CSV path is untouched (raw bytes are
-  correct for CSV).
-- `typed_decode` / `typed_decode_stream` switched the per-field
-  output buffer from a fixed 512-byte stack `vbuf` to a heap
-  allocation sized for FT_VARCHAR worst-case (6 × content_max).
-- Regression test `test-json-escape` added — 13 assertions
-  covering single get, multi-get dict, and find array round-trips
-  on `"`, `\`, raw newline, raw tab.
+- **Decode side (escape).** `decode_field_to_buf` and
+  `buf_field_value` no longer emit raw varchar bytes inside JSON
+  quotes — both route through a new `json_escape_into()` helper
+  that does RFC 8259-compliant escaping. Pre-fix, stored
+  newlines / quotes / backslashes corrupted the response stream
+  mid-object.
+- **Encode side (unescape).** `typed_encode` and
+  `typed_encode_defaults` now route FT_VARCHAR string values
+  through the pre-existing `json_unescape_string()` helper, so
+  wire-form escapes (`\"`, `\n`, `\\`, `\uXXXX`…) become their
+  intended byte sequences in storage. Pre-fix, `"a\"b"` on the
+  wire was stored as the four literal bytes `a\"b`. CSV path is
+  untouched (raw bytes are correct for CSV).
+- **Outer-buffer sizing.** `typed_decode` and
+  `typed_decode_stream` switched both the per-field decode buffer
+  AND the outer record-JSON buffer from flat heuristics to
+  per-field-type sizing. Pre-fix the outer buffer (`nfields *
+  300`) silently truncated mid-value on records with multi-KB
+  varchar content (e.g. HN comments); `SB_APPEND` fails closed
+  rather than loud, so corruption was invisible from the wire.
+- **New: `timestamp` field type.** 8 bytes, signed int64 BE,
+  semantic Unix epoch milliseconds. Storage / comparison / index
+  key identical to `FT_LONG`; the type adds `:auto_create` and
+  `:auto_update` generators that emit
+  `clock_gettime(CLOCK_REALTIME)` in ms. Distinct from
+  `datetime` (calendar-packed, can't represent pre-1970 / post-9999)
+  and `long` (no time-source defaults).
+- Regression tests: `test-json-escape` (19 assertions) and
+  `test-timestamp` (14 assertions).
 
 Wire format unchanged. On-disk schema unchanged. No `./migrate`.
 Existing varchar records that contain JSON metacharacters remain
 on disk in their pre-fix shape; re-ingest if you need clean data.
 
-Test coverage: **80 cases / 3071 assertions, 0 failures.**
+Test coverage: **81 cases / 3091 assertions, 0 failures.**
 
 Full notes: [release-notes/2026.05.6.md](../release-notes/2026.05.6.md).
 

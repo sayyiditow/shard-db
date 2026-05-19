@@ -1472,11 +1472,22 @@ static int cmd_update_v2(const char *db_root, const char *object,
         }
     }
 
-    /* auto_update fields: stamp current datetime/date on every update. */
+    /* auto_update fields: stamp current value on every update.
+       Each typed type gets its appropriate now-form:
+         FT_DATE      — yyyyMMdd (8-char int32 packed)
+         FT_TIMESTAMP — Unix epoch ms (int64 BE; 2026.05.6+)
+         everything else — yyyyMMddHHmmss (FT_DATETIME / fallback) */
     for (int i = 0; i < ts->nfields; i++) {
         if (ts->fields[i].removed) continue;
-        if (ts->fields[i].default_kind == DK_AUTO_UPDATE) {
-            char tbuf[20];
+        if (ts->fields[i].default_kind != DK_AUTO_UPDATE) continue;
+
+        char tbuf[24];
+        if (ts->fields[i].type == FT_TIMESTAMP) {
+            struct timespec tsn;
+            clock_gettime(CLOCK_REALTIME, &tsn);
+            long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+            snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+        } else {
             time_t now = time(NULL);
             struct tm tmv;
             localtime_r(&now, &tmv);
@@ -1487,8 +1498,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
                 snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
                          tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-            encode_field(&ts->fields[i], tbuf, new_buf + ts->fields[i].offset);
         }
+        encode_field(&ts->fields[i], tbuf, new_buf + ts->fields[i].offset);
     }
 
     char idx_fields[MAX_FIELDS][256];

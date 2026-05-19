@@ -925,6 +925,14 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "time") == 0) {
         f->type = FT_TIME;
         f->size = 3;
+    } else if (strcmp(spec, "timestamp") == 0) {
+        /* Unix epoch milliseconds, 8-byte int64 BE. Byte layout +
+           index-key + comparison identical to FT_LONG; the type only
+           differs in its auto_create / auto_update generators (which
+           emit clock_gettime(CLOCK_REALTIME) in ms) and in the
+           name-token for fields.conf / wire schema declarations. */
+        f->type = FT_TIMESTAMP;
+        f->size = 8;
     } else if (strcmp(spec, "uuid") == 0) {
         f->type = FT_UUID;
         f->size = 16;
@@ -1158,7 +1166,11 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         memcpy(out + 2, val, vlen);
         break;
     }
-    case FT_LONG: {
+    case FT_LONG:
+    case FT_TIMESTAMP: {
+        /* Both store an int64 BE. Same encoding; FT_TIMESTAMP just
+           carries the additional semantic that the value is Unix
+           epoch milliseconds (drives auto_create / auto_update). */
         char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         int64_t v = strtoll(cbuf, NULL, 10);
         out[0] = (v >> 56) & 0xFF; out[1] = (v >> 48) & 0xFF;
@@ -1333,7 +1345,10 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = vlen;
         break;
     }
-    case FT_LONG: {
+    case FT_LONG:
+    case FT_TIMESTAMP: {
+        /* Same index-key shape — top-bit-flipped BE int64 gives a memcmp
+           total order over the signed range. */
         char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         int64_t v = strtoll(cbuf, NULL, 10);
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
@@ -1511,7 +1526,8 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         break;
     }
     case FT_LONG:
-    case FT_NUMERIC: {
+    case FT_NUMERIC:
+    case FT_TIMESTAMP: {
         /* Stored BE signed — flip top bit for memcmp total-order. */
         memcpy(out, src, 8);
         out[0] ^= 0x80;
@@ -1673,6 +1689,19 @@ static void gen_datetime_now(char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "%04d%02d%02d%02d%02d%02d",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+/* Current Unix epoch milliseconds as a decimal string into buf
+   (>= 21 bytes for the 19-digit max + sign + NUL). Used by
+   FT_TIMESTAMP's auto_create / auto_update generators. Wall clock
+   via clock_gettime(CLOCK_REALTIME) — sub-millisecond precision is
+   fine, leap seconds are POSIX-collapsed (same convention every
+   ms-since-epoch source on the planet uses). */
+static void gen_timestamp_now(char *buf, size_t bufsz) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    snprintf(buf, bufsz, "%lld", ms);
 }
 
 /* Current date as "yyyyMMdd" into buf (>= 9 bytes) */
@@ -1896,7 +1925,9 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
         return tf->default_val;
     case DK_AUTO_CREATE:
     case DK_AUTO_UPDATE:
-        if (tf->type == FT_DATETIME)
+        if (tf->type == FT_TIMESTAMP)
+            gen_timestamp_now(gen_buf, bufsz);
+        else if (tf->type == FT_DATETIME)
             gen_datetime_now(gen_buf, bufsz);
         else if (tf->type == FT_DATE)
             gen_date_now(gen_buf, bufsz);
@@ -2031,6 +2062,23 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         if (v == 0) return 0; /* skip zero */
         return snprintf(buf, buflen, "%lld", (long long)v);
     }
+    case FT_TIMESTAMP: {
+        /* 0 is a valid timestamp (1970-01-01T00:00:00Z), so don't skip
+           it — but uninitialised-storage zero looks the same as a real
+           epoch-zero record, and there's no out-of-band sentinel to
+           tell them apart. We match FT_LONG's skip-on-zero behaviour
+           since uninit-zero is overwhelmingly the common case (a
+           record using `auto_create` will always be > 0; an explicit
+           0 epoch-ms is exotic enough that the existing emit-as-empty
+           is acceptable). Callers needing strict "0 is valid" can
+           inspect raw bytes via typed_get_field_str. */
+        int64_t v = ((int64_t)data[0] << 56) | ((int64_t)data[1] << 48) |
+                    ((int64_t)data[2] << 40) | ((int64_t)data[3] << 32) |
+                    ((int64_t)data[4] << 24) | ((int64_t)data[5] << 16) |
+                    ((int64_t)data[6] << 8) | data[7];
+        if (v == 0) return 0;
+        return snprintf(buf, buflen, "%lld", (long long)v);
+    }
     case FT_INT: {
         int32_t v = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
                     ((int32_t)data[2] << 8) | data[3];
@@ -2118,11 +2166,27 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
     if (!ts || !ts->typed) return NULL;
-    /* Estimate output: {"field":"value",...}. 300/field is generous for the
-       common case (short field names, typed-binary values that fit in a
-       512-byte vbuf), and SB_APPEND clamps if a pathological schema with
-       very long field names ever undershoots. */
-    size_t est = ts->nfields * 300 + 16;
+    /* Size the outer record-JSON buffer based on actual field types.
+       Pre-2026.05.6 this was a flat `nfields * 300` heuristic, which
+       silently truncated mid-field on records carrying a large
+       varchar (e.g. HN comment text up to 8 KB). For each field:
+         "name":<value>, =>  name_len + 4 punctuation bytes
+       Plus the value:
+         FT_VARCHAR: worst-case 6 * (size - 2) + 2 quotes (escapes can
+                     6x-expand control chars per RFC 8259)
+         everything else: a generous 64 bytes (long literals, dates,
+                     numerics — all fit comfortably) */
+    size_t est = 4;  /* { ... } + NUL */
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed) continue;
+        est += (size_t)ts->fields[i].name_len + 4;
+        if (ts->fields[i].type == FT_VARCHAR) {
+            int cm = ts->fields[i].size > 2 ? ts->fields[i].size - 2 : 0;
+            est += (size_t)cm * 6 + 2;
+        } else {
+            est += 64;
+        }
+    }
     char *buf = malloc(est);
     size_t pos = 0;
     if (est > 0) buf[pos++] = '{';

@@ -103,6 +103,75 @@ static int test_json_escape_run(void) {
     ASSERT_CONTAINS(resp, "tab\\there", "find: k4 tab escaped");
     free(resp); resp = NULL;
 
+    /* Large-varchar truncation regression (2026.05.6 hotfix).
+       typed_decode's outer record-JSON buffer used to be sized as a
+       flat nfields*300 heuristic, which silently truncated mid-value
+       on records whose varchar content approached its declared
+       capacity. HN comment text (varchar:8192 in practice) hit this
+       immediately. Build a record with a >2KB text field and verify
+       the round-trip is intact and the find-dict response stays
+       parseable across multiple records of that shape. */
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"big\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"big\",\"object\":\"posts\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"title:varchar:64\",\"body:varchar:8192\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* Build a 4KB body containing a quote, a backslash, and a newline
+       to exercise all three escape paths in the same large value. */
+    char big[5000];
+    size_t bp = 0;
+    for (int rep = 0; rep < 80 && bp + 60 < sizeof(big); rep++) {
+        bp += (size_t)snprintf(big + bp, sizeof(big) - bp,
+            "line %d with a \\\"quote\\\" and a \\\\ slash; tabs:\\there.\\n",
+            rep);
+    }
+    big[bp] = '\0';
+
+    char ins[6000];
+    snprintf(ins, sizeof(ins),
+        "{\"mode\":\"insert\",\"dir\":\"big\",\"object\":\"posts\","
+        "\"key\":\"p1\",\"value\":{\"title\":\"big\",\"body\":\"%s\"}}",
+        big);
+    tc_request(tc, ins, &resp);
+    ASSERT_CONTAINS(resp, "\"inserted\"", "large-varchar insert succeeded");
+    free(resp); resp = NULL;
+
+    /* get → body field must end with the same closing token we wrote
+       and the response must close with `}`. Pre-fix this truncated
+       mid-body and the outer record's closing brace was lost. */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"big\",\"object\":\"posts\",\"key\":\"p1\"}", &resp);
+    {
+        size_t rl = strlen(resp);
+        while (rl > 0 && (resp[rl - 1] == '\n' || resp[rl - 1] == ' ')) rl--;
+        ASSERT_TRUE(rl > 0 && resp[rl - 1] == '}', "large body: response closes with }");
+    }
+    ASSERT_CONTAINS(resp, "line 79", "large body: last line round-tripped");
+    free(resp); resp = NULL;
+
+    /* Insert a second record so find returns >1 row, and verify the
+       multi-row dict format closes cleanly (the find/dict path is
+       where the showcase /search route hit the bug). */
+    char ins2[6000];
+    snprintf(ins2, sizeof(ins2),
+        "{\"mode\":\"insert\",\"dir\":\"big\",\"object\":\"posts\","
+        "\"key\":\"p2\",\"value\":{\"title\":\"big2\",\"body\":\"%s\"}}",
+        big);
+    tc_request(tc, ins2, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"big\",\"object\":\"posts\","
+        "\"criteria\":[],\"limit\":10,\"format\":\"dict\"}", &resp);
+    {
+        size_t rl = strlen(resp);
+        while (rl > 0 && (resp[rl - 1] == '\n' || resp[rl - 1] == ' ')) rl--;
+        ASSERT_TRUE(rl > 0 && resp[rl - 1] == '}', "find dict: response closes with }");
+    }
+    ASSERT_CONTAINS(resp, "\"p1\":", "find dict: first record present");
+    ASSERT_CONTAINS(resp, "\"p2\":", "find dict: second record present");
+    free(resp); resp = NULL;
+
     tc_close(tc);
     test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;
