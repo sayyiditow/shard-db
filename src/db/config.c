@@ -1637,8 +1637,26 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
                array/object literals pass through as-is. */
             const char *ev = vstart; size_t el = vlen;
             if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
-            if (el > 0)
-                encode_field_len(&ts->fields[i], ev, el, out + ts->fields[i].offset);
+            if (el > 0) {
+                /* Varchar values carry JSON escapes (\" \n \\ \uXXXX
+                   etc.) — must decode before storage or round-trips
+                   come back double-escaped. Other types' values are
+                   numeric / bool / null literals that don't need it. */
+                if (ts->fields[i].type == FT_VARCHAR) {
+                    char *unesc = NULL; size_t unesc_len = 0;
+                    if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
+                        encode_field_len(&ts->fields[i], unesc, unesc_len,
+                                          out + ts->fields[i].offset);
+                        free(unesc);
+                    } else {
+                        encode_field_len(&ts->fields[i], ev, el,
+                                          out + ts->fields[i].offset);
+                    }
+                } else {
+                    encode_field_len(&ts->fields[i], ev, el,
+                                      out + ts->fields[i].offset);
+                }
+            }
             break;
         }
     }
@@ -1944,7 +1962,22 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 const char *ev = vstart; size_t el = vlen;
                 if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
                 if (el > 0) {
-                    encode_field_len(&ts->fields[i], ev, el, out + ts->fields[i].offset);
+                    /* Same JSON-unescape pass typed_encode does for
+                       varchars — keeps wire and stored bytes in sync. */
+                    if (ts->fields[i].type == FT_VARCHAR) {
+                        char *unesc = NULL; size_t unesc_len = 0;
+                        if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
+                            encode_field_len(&ts->fields[i], unesc, unesc_len,
+                                              out + ts->fields[i].offset);
+                            free(unesc);
+                        } else {
+                            encode_field_len(&ts->fields[i], ev, el,
+                                              out + ts->fields[i].offset);
+                        }
+                    } else {
+                        encode_field_len(&ts->fields[i], ev, el,
+                                          out + ts->fields[i].offset);
+                    }
                     seen[i] = 1;
                 }
                 break;
@@ -1969,12 +2002,26 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
 static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *buf, int buflen) {
     switch (f->type) {
     case FT_VARCHAR: {
-        /* Layout: [uint16 BE length][content]. */
+        /* Layout: [uint16 BE length][content]. Content bytes are
+           opaque (UTF-8 text in practice but the engine doesn't
+           enforce it) so we MUST escape per RFC 8259 — raw quotes /
+           backslashes / control chars in HN comment bodies broke
+           the response JSON before this. Caller's buflen needs
+           room for up to 6 * len + 2 (quotes); decode_field_to_buf
+           callers must size accordingly for FT_VARCHAR — see
+           varchar_decode_capacity(). */
         int len = ((int)data[0] << 8) | (int)data[1];
         int content_max = f->size - 2;
         if (len > content_max) len = content_max;  /* defensive */
         if (len == 0) return 0;
-        return snprintf(buf, buflen, "\"%.*s\"", len, (const char *)(data + 2));
+        if (buflen < 4) return -1;  /* "" + NUL */
+        buf[0] = '"';
+        int esc = json_escape_into(buf + 1, (size_t)buflen - 3,
+                                   (const char *)(data + 2), (size_t)len);
+        if (esc < 0) return -1;
+        buf[1 + esc] = '"';
+        buf[2 + esc] = '\0';   /* caller renders with %s */
+        return 2 + esc;
     }
     case FT_LONG: {
         int64_t v = ((int64_t)data[0] << 56) | ((int64_t)data[1] << 48) |
@@ -2086,13 +2133,28 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
         if (f->removed) continue;  /* tombstoned — not visible to consumers */
         if (f->offset + f->size > data_len) break;
 
-        char vbuf[512];
-        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, sizeof(vbuf));
-        if (vlen <= 0) continue; /* skip empty/zero fields */
+        /* Stack buffer covers non-varchar fields (numbers / bool / dates
+           fit comfortably). Varchar may need 6 * content_max + 2 bytes
+           worst-case after JSON-escape expansion (\u00XX per byte); fall
+           back to a heap allocation for those. */
+        char vbuf_stack[512];
+        char *vbuf = vbuf_stack;
+        int vbufsz = (int)sizeof(vbuf_stack);
+        if (f->type == FT_VARCHAR) {
+            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
+            if (need > vbufsz) {
+                vbuf = malloc((size_t)need);
+                if (!vbuf) { vbuf = vbuf_stack; }   /* falls back; may truncate */
+                else        { vbufsz = need; }
+            }
+        }
+        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, vbufsz);
+        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first && pos + 1 < est) buf[pos++] = ',';
         SB_APPEND(buf, pos, est, "\"%s\":%s", f->name, vbuf);
         first = 0;
+        if (vbuf != vbuf_stack) free(vbuf);
     }
     if (pos + 1 < est) buf[pos++] = '}';
     buf[pos] = '\0';
@@ -2109,13 +2171,24 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
         if (f->removed) continue;
         if (f->offset + f->size > data_len) break;
 
-        char vbuf[512];
-        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, sizeof(vbuf));
-        if (vlen <= 0) continue;
+        char vbuf_stack[512];
+        char *vbuf = vbuf_stack;
+        int vbufsz = (int)sizeof(vbuf_stack);
+        if (f->type == FT_VARCHAR) {
+            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
+            if (need > vbufsz) {
+                vbuf = malloc((size_t)need);
+                if (!vbuf) { vbuf = vbuf_stack; }
+                else        { vbufsz = need; }
+            }
+        }
+        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, vbufsz);
+        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first) fputc(',', out);
         fprintf(out, "\"%s\":%s", f->name, vbuf);
         first = 0;
+        if (vbuf != vbuf_stack) free(vbuf);
     }
     fputc('}', out);
 }

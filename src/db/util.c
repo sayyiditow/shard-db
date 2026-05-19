@@ -508,3 +508,48 @@ char *json_obj_string_or_array(const JsonObj *o, const char *key) {
     buf[pos] = '\0';
     return strdup(buf);
 }
+
+/* Write src[0..slen) to dst[0..dst_cap) as JSON-escaped string contents
+   (without the surrounding quotes — caller adds them). Escapes ", \, and
+   all C0 control characters (U+0000..U+001F) per RFC 8259. Bytes >= 0x20
+   (including UTF-8 multi-byte sequences) pass through unchanged.
+
+   Returns the number of bytes written, or -1 if dst_cap is too small for
+   the expanded output. Worst-case expansion is 6x (every byte becomes
+   \u00XX); caller sizing dst as 6*slen+1 guarantees success. */
+int json_escape_into(char *dst, size_t dst_cap,
+                     const char *src, size_t slen) {
+    static const char hex[] = "0123456789abcdef";
+    size_t out = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)src[i];
+        const char *e = NULL;
+        switch (c) {
+        case '"':  e = "\\\""; break;
+        case '\\': e = "\\\\"; break;
+        case '\b': e = "\\b";  break;
+        case '\f': e = "\\f";  break;
+        case '\n': e = "\\n";  break;
+        case '\r': e = "\\r";  break;
+        case '\t': e = "\\t";  break;
+        default: break;
+        }
+        if (e) {
+            if (out + 2 > dst_cap) return -1;
+            dst[out++] = e[0];
+            dst[out++] = e[1];
+        } else if (c < 0x20) {
+            if (out + 6 > dst_cap) return -1;
+            dst[out++] = '\\';
+            dst[out++] = 'u';
+            dst[out++] = '0';
+            dst[out++] = '0';
+            dst[out++] = hex[c >> 4];
+            dst[out++] = hex[c & 0xF];
+        } else {
+            if (out + 1 > dst_cap) return -1;
+            dst[out++] = (char)c;
+        }
+    }
+    return (int)out;
+}
