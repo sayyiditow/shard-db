@@ -4,6 +4,40 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.6
+
+Hotfix release for two latent JSON-escape bugs in the typed-record
+path that surface whenever varchar bytes contain `"`, `\`, or
+control chars (`< 0x20`). HN comment text caught both directions on
+the first real load while building the public showcase.
+
+- **Decode side:** `decode_field_to_buf` and `buf_field_value` no
+  longer emit raw varchar bytes inside JSON quotes — both route
+  through a new `json_escape_into()` helper that does
+  RFC 8259-compliant escaping. Pre-fix, stored newlines / quotes /
+  backslashes corrupted the response stream mid-object.
+- **Encode side:** `typed_encode` and `typed_encode_defaults` now
+  route FT_VARCHAR string values through the pre-existing
+  `json_unescape_string()` helper, so wire-form escapes (`\"`,
+  `\n`, `\\`, `\uXXXX`…) become their intended byte sequences in
+  storage. Pre-fix, `"a\"b"` on the wire was stored as the four
+  literal bytes `a\"b`. CSV path is untouched (raw bytes are
+  correct for CSV).
+- `typed_decode` / `typed_decode_stream` switched the per-field
+  output buffer from a fixed 512-byte stack `vbuf` to a heap
+  allocation sized for FT_VARCHAR worst-case (6 × content_max).
+- Regression test `test-json-escape` added — 13 assertions
+  covering single get, multi-get dict, and find array round-trips
+  on `"`, `\`, raw newline, raw tab.
+
+Wire format unchanged. On-disk schema unchanged. No `./migrate`.
+Existing varchar records that contain JSON metacharacters remain
+on disk in their pre-fix shape; re-ingest if you need clean data.
+
+Test coverage: **80 cases / 3071 assertions, 0 failures.**
+
+Full notes: [release-notes/2026.05.6.md](../release-notes/2026.05.6.md).
+
 ## 2026.05.5
 
 Breaking-cleanup release. Legacy v1 (probe-into-slot) storage engine
