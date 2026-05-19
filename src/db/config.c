@@ -812,12 +812,19 @@ struct IdxCache {
 struct IdxCache g_idx_cache[IDX_BUCKETS];
 pthread_mutex_t g_idx_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Resolve a literal index-type token ("bitmap", "trigram", "btree") to its
-   enum value. Returns 1 on success and writes *out, 0 on unknown token. */
+/* Resolve a literal index-type token ("bitmap", "bitmap(N)", "trigram",
+   "btree") to its enum value. Returns 1 on success and writes *out, 0
+   on unknown token. The cap (N) is recognised but not extracted here —
+   the cache stores type only; callers that need the cap parse the
+   index.conf line directly. */
 static int parse_index_type_token(const char *tok, size_t len, enum IndexType *out) {
     if (len == 5 && memcmp(tok, "btree", 5) == 0)   { *out = IT_BTREE;   return 1; }
     if (len == 6 && memcmp(tok, "bitmap", 6) == 0)  { *out = IT_BITMAP;  return 1; }
     if (len == 7 && memcmp(tok, "trigram", 7) == 0) { *out = IT_TRIGRAM; return 1; }
+    /* bitmap(N) form — match the "bitmap(" prefix + trailing ')'. */
+    if (len > 7 && memcmp(tok, "bitmap(", 7) == 0 && tok[len - 1] == ')') {
+        *out = IT_BITMAP; return 1;
+    }
     return 0;
 }
 

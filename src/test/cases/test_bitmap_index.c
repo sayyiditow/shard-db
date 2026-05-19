@@ -43,7 +43,7 @@ static int run_unit_assertions(void) {
     unlink(path);
 
     /* === Bool fast-path: 256 slots, 2 hardcoded values. === */
-    BitmapShard *bm = bm_open(path, 256, 1, 1);
+    BitmapShard *bm = bm_open(path, 256, 1, 1, 0);
     ASSERT_NOT_NULL(bm, "bm_open: bool create");
     if (!bm) return 1;
 
@@ -112,7 +112,7 @@ static int run_unit_assertions(void) {
     bm_close(bm);
 
     /* === Persistence across close/reopen. === */
-    bm = bm_open(path, 1024, 0, 0);
+    bm = bm_open(path, 1024, 0, 0, 0);
     ASSERT_NOT_NULL(bm, "bm_open: reopen no-create");
     if (bm) {
         ASSERT_EQ_INT((int)bm_slots(bm), 1024, "persisted slots");
@@ -126,7 +126,7 @@ static int run_unit_assertions(void) {
     unlink(path);
 
     /* === Varchar enum (no fast-path): dict grows on demand. === */
-    bm = bm_open(path, 64, 1, 0);
+    bm = bm_open(path, 64, 1, 0, 0);
     ASSERT_NOT_NULL(bm, "bm_open: varchar enum create");
     if (!bm) return 1;
     ASSERT_EQ_INT((int)bm_n_values(bm), 0, "varchar starts empty");
@@ -145,7 +145,7 @@ static int run_unit_assertions(void) {
 
     /* Persistence after dict growth. */
     bm_close(bm);
-    bm = bm_open(path, 64, 0, 0);
+    bm = bm_open(path, 64, 0, 0, 0);
     ASSERT_NOT_NULL(bm, "reopen after dict-grow");
     if (bm) {
         ASSERT_EQ_INT((int)bm_n_values(bm), 3, "persisted dict size");
@@ -159,27 +159,28 @@ static int run_unit_assertions(void) {
            contract is "bitmap is for bool + low-cardinality enums" —
            anyone declaring bitmap on a field with thousands of distinct
            values is mis-indexing and should reach for btree. === */
-    bm = bm_open(path, 64, 1, 0);
+    bm = bm_open(path, 64, 1, 0, 0);
     ASSERT_NOT_NULL(bm, "bm_open: cap test");
     if (bm) {
-        /* Fill the dict to exactly BM_MAX_VALUES distinct values. */
+        /* Fill the dict to exactly BM_DEFAULT_MAX_VALUES distinct
+           values (the cap baked into a default-create file). */
         char val[16];
         int ok_until_cap = 1;
-        for (int i = 0; i < BM_MAX_VALUES; i++) {
-            int n = snprintf(val, sizeof(val), "v%d", i);
+        for (uint32_t i = 0; i < BM_DEFAULT_MAX_VALUES; i++) {
+            int n = snprintf(val, sizeof(val), "v%u", i);
             if (bm_set(bm, (const uint8_t *)val, (size_t)n, 0) != 0) {
                 ok_until_cap = 0;
                 break;
             }
         }
-        ASSERT_TRUE(ok_until_cap, "first BM_MAX_VALUES values all succeed");
-        ASSERT_EQ_INT((int)bm_n_values(bm), BM_MAX_VALUES,
-                      "dict at exactly the cap");
+        ASSERT_TRUE(ok_until_cap, "first BM_DEFAULT_MAX_VALUES values all succeed");
+        ASSERT_EQ_INT((int)bm_n_values(bm), (int)BM_DEFAULT_MAX_VALUES,
+                      "dict at exactly the default cap");
 
         /* The 257th distinct value is refused. */
         int rc = bm_set(bm, (const uint8_t *)"over", 4, 0);
         ASSERT_EQ_INT(rc, -1, "bm_set refuses past cap");
-        ASSERT_EQ_INT((int)bm_n_values(bm), BM_MAX_VALUES,
+        ASSERT_EQ_INT((int)bm_n_values(bm), (int)BM_DEFAULT_MAX_VALUES,
                       "dict size unchanged after refusal");
 
         /* But existing values still work — the cap doesn't poison the
@@ -189,6 +190,31 @@ static int run_unit_assertions(void) {
         ASSERT_EQ_INT((int)bm_count(bm, (const uint8_t *)"v0", 2), 2,
                       "v0 has 2 bits set");
         bm_close(bm);
+    }
+    unlink(path);
+
+    /* === Per-file cap override: declare a custom cap at create. === */
+    bm = bm_open(path, 64, 1, 0, 4);   /* cap = 4 */
+    ASSERT_NOT_NULL(bm, "bm_open: cap-override create");
+    if (bm) {
+        ASSERT_EQ_INT((int)bm_max_values(bm), 4, "header has custom cap=4");
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"a", 1, 0), 0, "v1 ok");
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"b", 1, 1), 0, "v2 ok");
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"c", 1, 2), 0, "v3 ok");
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"d", 1, 3), 0, "v4 ok (cap)");
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"e", 1, 4), -1, "v5 refused at cap=4");
+        ASSERT_EQ_INT((int)bm_n_values(bm), 4, "dict at custom cap exactly");
+
+        /* Persistence of the custom cap. */
+        bm_close(bm);
+        bm = bm_open(path, 64, 0, 0, 0);  /* arg ignored on existing file */
+        ASSERT_NOT_NULL(bm, "reopen with cap baked in");
+        if (bm) {
+            ASSERT_EQ_INT((int)bm_max_values(bm), 4, "cap survives reopen");
+            ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"e", 1, 5), -1,
+                          "still refused after reopen");
+            bm_close(bm);
+        }
     }
     unlink(path);
     return 0;
@@ -343,6 +369,37 @@ static int test_bitmap_index_run(void) {
                         "no duplicate 'flag:bitmap' entry");
         }
     }
+    free(resp); resp = NULL;
+
+    /* === Bitmap cap override `:bitmap(N)` round-trips through create-object
+           + describe-object + index.conf. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"capover\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"region:varchar:8\"],"
+        "\"indexes\":[\"region:bitmap(1024)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create with bitmap(1024)");
+    free(resp); resp = NULL;
+
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"capover\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"region:bitmap(1024)\"", "describe surfaces cap");
+    free(resp); resp = NULL;
+
+    /* Reject cap out of [2, BM_HARD_CEILING]. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"cap_lo\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"k:varchar:8\"],\"indexes\":[\"k:bitmap(1)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "bitmap cap=1 rejected");
+    ASSERT_CONTAINS(resp, "out of range", "error mentions range");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"cap_hi\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"k:varchar:8\"],\"indexes\":[\"k:bitmap(99999)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "bitmap cap=99999 rejected");
+    ASSERT_CONTAINS(resp, "out of range", "error mentions range");
     free(resp); resp = NULL;
 
     /* === Restart: schema + index.conf survive across daemon stop/start.

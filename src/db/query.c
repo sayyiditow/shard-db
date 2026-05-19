@@ -1,6 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "simd.h"
+#include "bitmap.h"
 #include <fnmatch.h>
 #include <math.h>
 
@@ -13903,7 +13904,11 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
        Line format on disk is `name` (legacy → IT_BTREE) or `name:type`.
        Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
-    struct ParsedIdx { char name[256]; enum IndexType type; };
+    struct ParsedIdx {
+        char name[256];
+        enum IndexType type;
+        uint32_t max_values;   /* bitmap-only: 0 = default (BM_DEFAULT_MAX_VALUES) */
+    };
     struct ParsedIdx pidx[MAX_FIELDS];
     int npidx = 0;
 
@@ -13961,16 +13966,43 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
                     /* Split on the LAST `:` — only if the suffix is a known
                        index-type keyword. Otherwise treat as a plain name
-                       (covers hypothetical future field names with `:`). */
+                       (covers hypothetical future field names with `:`).
+                       Bitmap accepts an optional `(N)` for the per-file
+                       cap; `bitmap` alone uses BM_DEFAULT_MAX_VALUES. */
                     char *colon = strrchr(idx_spec, ':');
                     enum IndexType itype = IT_BTREE;
+                    uint32_t imax = 0;
                     if (colon) {
                         const char *suffix = colon + 1;
                         size_t slen = strlen(suffix);
                         if (slen == 5 && memcmp(suffix, "btree", 5) == 0) {
                             itype = IT_BTREE; *colon = '\0';
-                        } else if (slen == 6 && memcmp(suffix, "bitmap", 6) == 0) {
-                            itype = IT_BITMAP; *colon = '\0';
+                        } else if (slen >= 6 && memcmp(suffix, "bitmap", 6) == 0) {
+                            /* Either bare `bitmap` or `bitmap(N)`. */
+                            if (slen == 6) {
+                                itype = IT_BITMAP; *colon = '\0';
+                            } else if (suffix[6] == '(' && suffix[slen - 1] == ')') {
+                                /* Parse N. atoi is fine — we validate the
+                                   range right after. */
+                                char numbuf[16] = {0};
+                                size_t nlen = slen - 8;  /* exclude "bitmap(" + ")" */
+                                if (nlen == 0 || nlen >= sizeof(numbuf)) {
+                                    OUT("{\"error\":\"invalid bitmap cap in \\\"%s\\\"\"}\n", idx_spec);
+                                    return 1;
+                                }
+                                memcpy(numbuf, suffix + 7, nlen);
+                                long v = strtol(numbuf, NULL, 10);
+                                if (v < 2 || v > (long)BM_HARD_CEILING) {
+                                    OUT("{\"error\":\"bitmap cap %ld out of range [2, %u] in \\\"%s\\\"\"}\n",
+                                        v, BM_HARD_CEILING, idx_spec);
+                                    return 1;
+                                }
+                                itype = IT_BITMAP;
+                                imax = (uint32_t)v;
+                                *colon = '\0';
+                            }
+                            /* `bitmap...` that's neither bare nor `bitmap(N)` →
+                               leave unrecognised, fall through. */
                         } else if (slen == 7 && memcmp(suffix, "trigram", 7) == 0) {
                             itype = IT_TRIGRAM; *colon = '\0';
                         }
@@ -14031,6 +14063,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                     strncpy(pidx[npidx].name, idx_spec, sizeof(pidx[npidx].name) - 1);
                     pidx[npidx].name[sizeof(pidx[npidx].name) - 1] = '\0';
                     pidx[npidx].type = itype;
+                    pidx[npidx].max_values = imax;  /* 0 for non-bitmap or default */
                     npidx++;
                 } else p++;
             }
@@ -14059,6 +14092,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         memcpy(pidx[npidx].name, field_specs[i], fnlen);
         pidx[npidx].name[fnlen] = '\0';
         pidx[npidx].type = IT_BITMAP;
+        pidx[npidx].max_values = 0;  /* bool auto-default uses BM_DEFAULT_MAX_VALUES */
         npidx++;
     }
     #undef FIELD_TYPE_IS
@@ -14209,20 +14243,29 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
     /* Write index.conf from the parsed list — both explicit indexes and any
        auto-defaulted bitmap entries on bool fields. Line format is `name`
-       for btree (back-compat with pre-2026.05.7 readers) or `name:type` for
-       bitmap/trigram. */
+       for btree (back-compat with pre-2026.05.7 readers), `name:type` for
+       trigram, or `name:bitmap[(N)]` where the (N) is only emitted when a
+       non-default cap was declared. */
     if (npidx > 0) {
         snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", eff_root, object);
         f = fopen(path, "w");
         if (f) {
             for (int i = 0; i < npidx; i++) {
-                const char *type_suffix = "";
                 switch (pidx[i].type) {
-                    case IT_BTREE:   type_suffix = "";          break;
-                    case IT_BITMAP:  type_suffix = ":bitmap";   break;
-                    case IT_TRIGRAM: type_suffix = ":trigram";  break;
+                    case IT_BTREE:
+                        fprintf(f, "%s\n", pidx[i].name);
+                        break;
+                    case IT_BITMAP:
+                        if (pidx[i].max_values && pidx[i].max_values != BM_DEFAULT_MAX_VALUES) {
+                            fprintf(f, "%s:bitmap(%u)\n", pidx[i].name, pidx[i].max_values);
+                        } else {
+                            fprintf(f, "%s:bitmap\n", pidx[i].name);
+                        }
+                        break;
+                    case IT_TRIGRAM:
+                        fprintf(f, "%s:trigram\n", pidx[i].name);
+                        break;
                 }
-                fprintf(f, "%s%s\n", pidx[i].name, type_suffix);
             }
             fclose(f);
         }

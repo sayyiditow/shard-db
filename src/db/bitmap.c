@@ -29,7 +29,14 @@
 #define BM_MAGIC 0x31304D42u   /* 'BM01' little-endian */
 #define BM_VERSION 1
 
-/* Header is 32 bytes; layout pinned in bitmap.h. */
+/* Header is 32 bytes; layout pinned in bitmap.h. The former `reserved`
+   slot is now `max_values` — the per-file distinct-value cap set by
+   create-object. Stored as uint32 to allow future expansion past
+   BM_HARD_CEILING without another format bump (the on-disk slot is
+   already wide enough; the .h ceiling is the policy gate). Files
+   produced before this field existed read it as 0 thanks to the
+   ftruncate zero-fill; bm_open treats 0 as BM_DEFAULT_MAX_VALUES for
+   forward compatibility. */
 struct __attribute__((packed)) BmHeader {
     uint32_t magic;
     uint16_t version;
@@ -39,7 +46,7 @@ struct __attribute__((packed)) BmHeader {
     uint32_t dict_off;
     uint32_t bitmaps_off;
     uint32_t stride;
-    uint32_t reserved;
+    uint32_t max_values;
 };
 
 struct BitmapShard {
@@ -159,7 +166,8 @@ static int bm_dict_lookup(const BitmapShard *bm, const uint8_t *value, size_t vl
 
 /* ─────────────────────── creation ─────────────────────── */
 
-static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath) {
+static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath,
+                            uint32_t max_values) {
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -171,6 +179,7 @@ static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath)
     hdr.flags = bool_fastpath ? BM_FLAG_BOOL_FASTPATH : 0;
     hdr.slots = slots;
     hdr.stride = bm_stride_for(slots);
+    hdr.max_values = max_values ? max_values : BM_DEFAULT_MAX_VALUES;
 
     /* Dict is PACKED — no pre-reserved capacity. Holding leading zero
        bytes would be read by bm_dict_lookup() as `len=0` entries and
@@ -217,7 +226,8 @@ static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath)
     return 0;
 }
 
-BitmapShard *bm_open(const char *path, int slots, int create, int bool_fastpath) {
+BitmapShard *bm_open(const char *path, int slots, int create,
+                     int bool_fastpath, uint32_t max_values) {
     /* Ensure parent dir exists. The caller's `<obj>/indexes/<field>/`
        layer might be brand new on first insert. */
     char dir[1024];
@@ -231,7 +241,8 @@ BitmapShard *bm_open(const char *path, int slots, int create, int bool_fastpath)
     int fd = open(path, O_RDWR);
     if (fd < 0) {
         if (!create) return NULL;
-        if (bm_write_initial(path, (uint32_t)slots, bool_fastpath) != 0) return NULL;
+        if (bm_write_initial(path, (uint32_t)slots, bool_fastpath, max_values) != 0)
+            return NULL;
         fd = open(path, O_RDWR);
         if (fd < 0) return NULL;
     }
@@ -250,7 +261,17 @@ BitmapShard *bm_open(const char *path, int slots, int create, int bool_fastpath)
         bm_close(bm);
         return NULL;
     }
+    /* Back-compat: header from pre-cap builds has max_values=0. Treat
+       as the default so old files don't suddenly refuse new inserts. */
+    if (bm->hdr.max_values == 0) {
+        bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
+        memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
+    }
     return bm;
+}
+
+uint32_t bm_max_values(const BitmapShard *bm) {
+    return bm ? bm->hdr.max_values : 0;
 }
 
 void bm_close(BitmapShard *bm) {
@@ -274,10 +295,12 @@ static int bm_dict_add(BitmapShard *bm, const uint8_t *value, size_t vlen) {
     const uint8_t *old = (const uint8_t *)bm->mmap_ptr;
     uint32_t old_n = bm->hdr.n_values;
 
-    /* Enforce the cardinality contract. Past BM_MAX_VALUES, bitmap
-       isn't the right index — btree is. The wire layer translates
-       this -1 into a user-actionable error. */
-    if (old_n >= BM_MAX_VALUES) return -1;
+    /* Enforce the per-file cardinality contract. Past `max_values`,
+       bitmap isn't the right index for this dataset — btree is, or the
+       operator can declare a higher cap at create-object via
+       `field:bitmap(N)`. The wire layer translates this -1 into an
+       actionable error pointing them at the override. */
+    if (old_n >= bm->hdr.max_values) return -1;
 
     /* Actual packed bytes — NOT bitmaps_off - dict_off, which would
        include alignment padding. */

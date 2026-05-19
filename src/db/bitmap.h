@@ -54,16 +54,31 @@ typedef struct BitmapShard BitmapShard;
 /* Flags */
 #define BM_FLAG_BOOL_FASTPATH  0x0001u
 
-/* Maximum distinct values a single bitmap index may hold. Bitmap is the
-   right tool for bool + low-cardinality enums; if a user's data has
-   more than this many distinct values, btree is the correct index
-   choice (shard-db's planner uses indexes when available regardless of
-   selectivity, so a btree of any size beats a bitmap that's outgrown
-   its design point). bm_set returns -1 when this cap is exceeded and
-   the wire layer surfaces an actionable error pointing the operator
-   at btree. Bool fast-path is unaffected — it always has exactly 2
-   values. */
-#define BM_MAX_VALUES 256
+/* Distinct-value limits.
+ *
+ * Each bitmap file declares its own `max_values` in its header. The
+ * value is set at create-object via `field:bitmap` (default
+ * BM_DEFAULT_MAX_VALUES) or `field:bitmap(N)` (operator override). If
+ * a user's data has more than `max_values` distinct values, bm_set
+ * returns -1 and the wire layer surfaces an actionable error pointing
+ * the operator at btree.
+ *
+ * Storage is dynamic regardless of the cap: a bitmap file only holds
+ * `n_values` bitmaps at any given moment, where `n_values` is the
+ * actual number of distinct values seen so far. The cap is an upper
+ * bound, not a pre-allocation reservation.
+ *
+ * The hard ceiling (BM_HARD_CEILING) is the fixed maximum for any
+ * single bitmap: 65535. Past that the dict's uint16 length-prefix and
+ * value-index encoding would need to widen, which would be a format
+ * change. Bool fast-path is unaffected — it always has exactly 2
+ * values. */
+#define BM_DEFAULT_MAX_VALUES 256u
+#define BM_HARD_CEILING       65535u
+
+/* Legacy alias kept for any callers still wired to the previous name.
+   Resolves to the default cap. */
+#define BM_MAX_VALUES BM_DEFAULT_MAX_VALUES
 
 /* Build the canonical bitmap shard path for a (object, field, NNN) tuple.
    `db_root` is the effective root (i.e. `$DB_ROOT/<dir>`). Mirrors
@@ -78,9 +93,18 @@ void bm_build_path(char *out, size_t outlen,
        file pre-initialised with the two values 0x00 and 0x01.
      - If `create == 1` and `bool_fastpath == 0`, creates an empty
        dictionary (n_values=0). Callers add values via bm_set on demand.
-   `slots` must match the data shard's current slots_per_shard. The file
-   is mmap'd MAP_SHARED, writable. */
-BitmapShard *bm_open(const char *path, int slots, int create, int bool_fastpath);
+   `slots` must match the data shard's current slots_per_shard.
+   `max_values` is the per-file cap from the create-object declaration:
+   pass 0 to use BM_DEFAULT_MAX_VALUES; pass any value in
+   [2, BM_HARD_CEILING] to override. When opening an existing file
+   (create == 0), the `max_values` arg is ignored — the value baked
+   into the header wins. The file is mmap'd MAP_SHARED, writable. */
+BitmapShard *bm_open(const char *path, int slots, int create,
+                     int bool_fastpath, uint32_t max_values);
+
+/* Read the per-file cap baked into the header. Returns the resolved
+   value (never 0 — defaults to BM_DEFAULT_MAX_VALUES). */
+uint32_t bm_max_values(const BitmapShard *bm);
 
 /* Close + unmap. Safe on NULL. */
 void bm_close(BitmapShard *bm);
