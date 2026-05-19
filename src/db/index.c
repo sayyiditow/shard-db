@@ -1,4 +1,6 @@
 #include "types.h"
+#include "bitmap.h"
+#include "slotcask.h"
 
 /* Per-shard build worker shared by cmd_add_index and cmd_add_indexes; defined
    below alongside the partition_by_shard helper. */
@@ -277,18 +279,90 @@ void write_index_entry(const char *db_root, const char *object,
                      (const char *)val, vlen, hash16);
 }
 
+/* Build the bitmap shard file path for a (object, field, NNN) tuple,
+   mirroring build_idx_path / bm_build_path. */
+static void bitmap_shard_path(char *out, size_t outlen,
+                              const char *db_root, const char *object,
+                              const char *field, int shard_idx) {
+    bm_build_path(out, outlen, db_root, object, field, shard_idx);
+}
+
+/* Bitmap insert/delete: open the per-data-shard `.bm` file, flip the
+   bit for (value, slot). `bool_fastpath` is detected by checking field
+   value bytes — a bool encoding is exactly 1 byte (0x00 or 0x01).
+   For varchar enums the value is variable-length bytes.
+
+   Returns 0 on success, -1 if the dict cap was exceeded (the caller
+   surfaces an actionable error pointing the operator at btree). */
+static int bitmap_update(const char *db_root, const char *object,
+                         const char *field, int kf_shard, int splits,
+                         uint32_t kf_slot, uint32_t max_values,
+                         const uint8_t *new_val, size_t new_len,
+                         const uint8_t *old_val, size_t old_len) {
+    char path[1024];
+    bitmap_shard_path(path, sizeof(path), db_root, object, field, kf_shard);
+
+    int bool_fastpath = 0;
+    if (new_val && new_len == 1) bool_fastpath = 1;
+    else if (old_val && old_len == 1) bool_fastpath = 1;
+
+    int slots = (int)slotcask_default_slots_for_splits(splits);
+
+    BitmapShard *bm = bm_open(path, slots, 1, bool_fastpath, max_values);
+    if (!bm) return 0;  /* best-effort — failed open means no bitmap update,
+                           treat as soft skip rather than fatal write
+                           failure. Cap-exceeded path lives below where the
+                           file does exist. */
+
+    int rc = 0;
+    if (old_val) bm_clear(bm, old_val, old_len, kf_slot);
+    if (new_val) {
+        if (bm_set(bm, new_val, new_len, kf_slot) != 0) {
+            rc = -1;  /* dict cap exceeded — caller aborts the write */
+        }
+    }
+    bm_close(bm);
+    return rc;
+}
+
 /* Per-field index update worker — dispatched via parallel_for from
    every CRUD pre_commit (insert, update, delete, bulk variants).
    NULL keys = skip that side, so the same worker covers insert-only,
-   delete-only, and changed-field update with NULL acting as "no-op". */
+   delete-only, and changed-field update with NULL acting as "no-op".
+
+   Dispatches on UpdateIdxArg::type. Composite indexes (field1+field2)
+   are always btree per the 2026.05.7 contract. */
 void *update_idx_fn(void *arg) {
     UpdateIdxArg *a = (UpdateIdxArg *)arg;
-    if (a->old_key)
-        delete_index_entry(a->db_root, a->object, a->field, a->splits,
-                           a->old_key, a->old_len, a->hash);
-    if (a->new_key)
-        write_index_entry(a->db_root, a->object, a->field, a->splits,
-                          a->new_key, a->new_len, a->hash);
+
+    switch (a->type) {
+        case IT_BTREE:
+        case IT_TRIGRAM: /* trigram lands in a later phase; fall back to btree-style for now */
+            if (a->old_key)
+                delete_index_entry(a->db_root, a->object, a->field, a->splits,
+                                   a->old_key, a->old_len, a->hash);
+            if (a->new_key)
+                write_index_entry(a->db_root, a->object, a->field, a->splits,
+                                  a->new_key, a->new_len, a->hash);
+            break;
+
+        case IT_BITMAP:
+            /* The slow-path insert case can call us with kf_slot=0 and
+               kf_shard=0 unset (slotcask determined the slot AFTER
+               pre_commit). Detect by the absence of a publish: if the
+               caller didn't write to the out-params, skip the bitmap
+               update. Reindex will catch it. We can't reliably tell
+               "unset" from "shard 0 + slot 0", so the field-level
+               convention is: callers that don't have the slot leave
+               type=IT_BTREE and rely on the btree path. Anyone setting
+               type=IT_BITMAP guarantees they've populated shard+slot. */
+            a->out_error = bitmap_update(a->db_root, a->object, a->field,
+                                         a->kf_shard, a->splits,
+                                         a->kf_slot, a->bm_max_values,
+                                         a->new_key, a->new_len,
+                                         a->old_key, a->old_len);
+            break;
+    }
     return NULL;
 }
 
@@ -383,7 +457,8 @@ char *build_composite_value(const char *field_name, const char *json_value) {
 
 void index_parallel(const char *db_root, const char *object, int splits,
                            const char *value, const uint8_t hash16[16],
-                           char fields[][256], int nfields) {
+                           char fields[][256], int nfields,
+                           const enum IndexType *types) {
     if (nfields <= 0) return;
 
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -424,6 +499,12 @@ void index_parallel(const char *db_root, const char *object, int splits,
     memset(idx_keys, 0, sizeof(idx_keys));
 
     for (int i = 0; i < nfields; i++) {
+        /* Skip fields whose index type isn't btree — they're maintained
+           via update_idx_fn's type-dispatch path. Composites are always
+           btree (the non-btree composite case is rejected upstream at
+           create-object). */
+        if (types && types[i] != IT_BTREE) continue;
+
         uint8_t *key_buf = NULL;
         size_t key_len = 0;
 

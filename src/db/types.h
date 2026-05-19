@@ -890,9 +890,14 @@ void write_index_entry(const char *db_root, const char *object, const char *fiel
 void delete_index_entry(const char *db_root, const char *object, const char *field,
                         int splits,
                         const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
+/* `types` is optional — when non-NULL, fields whose type isn't IT_BTREE
+   are skipped (their index updates land via update_idx_fn in a separate
+   parallel pass). When NULL, every field gets a btree write — matches
+   legacy callers + the reindex builder path. */
 void index_parallel(const char *db_root, const char *object, int splits,
                     const char *value, const uint8_t hash16[16],
-                    char fields[][256], int nfields);
+                    char fields[][256], int nfields,
+                    const enum IndexType *types);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
 
@@ -1270,7 +1275,11 @@ int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *recor
 
 /* index.c — per-field index update worker. Either old_key or new_key may
    be NULL (pure insert / pure delete); both NULL = no-op. Dispatched
-   via parallel_for from every CRUD pre_commit. */
+   via parallel_for from every CRUD pre_commit.
+
+   The (type, shard, slot, max_values) tuple is consumed by bitmap and
+   trigram index types. For IT_BTREE callers can leave them zero — the
+   btree path keys by `hash` and ignores them entirely. */
 typedef struct {
     const char    *db_root;
     const char    *object;
@@ -1281,6 +1290,13 @@ typedef struct {
     uint8_t       *old_key;
     size_t         old_len;
     const uint8_t *hash;
+    enum IndexType type;          /* IT_BTREE (default) / IT_BITMAP / IT_TRIGRAM */
+    int            kf_shard;      /* bitmap-only: data shard index */
+    uint32_t       kf_slot;       /* bitmap-only: slot within data shard */
+    uint32_t       bm_max_values; /* bitmap-only: per-file cap (0 = default) */
+    int            out_error;     /* written by update_idx_fn: 0 ok, non-zero = abort.
+                                     -1 = bitmap dict cap exceeded; pre_commit walks
+                                     args[] after parallel_for and aborts the write. */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
 #endif

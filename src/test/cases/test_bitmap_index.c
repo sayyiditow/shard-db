@@ -371,6 +371,118 @@ static int test_bitmap_index_run(void) {
     }
     free(resp); resp = NULL;
 
+    /* === End-to-end: insert records, verify bits land in the bitmap shard
+           files. Uses bm_open() directly to inspect the on-disk state the
+           daemon wrote. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"e2e\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"label:varchar:16\"],"
+        "\"indexes\":[\"label:bitmap\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create e2e (bool auto + label:bitmap)");
+    free(resp); resp = NULL;
+
+    /* Insert 6 records with varied (flag, label) so each bool value gets
+       some bits and the varchar enum has 3 distinct labels. */
+    const struct { const char *k; const char *flag; const char *label; } rows[] = {
+        { "k1", "true",  "alpha"   },
+        { "k2", "false", "alpha"   },
+        { "k3", "true",  "beta"    },
+        { "k4", "false", "beta"    },
+        { "k5", "true",  "gamma"   },
+        { "k6", "true",  "gamma"   },
+    };
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"e2e\","
+            "\"key\":\"%s\",\"value\":{\"flag\":%s,\"label\":\"%s\"}}",
+            rows[i].k, rows[i].flag, rows[i].label);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "insert e2e row");
+        free(resp); resp = NULL;
+    }
+
+    /* Sum popcounts across all 8 data shards. Each bitmap shard file
+       lives at <db_root>/t/e2e/indexes/<field>/<NNN>.bm. */
+    uint32_t flag_true_count = 0, flag_false_count = 0;
+    uint32_t alpha_count = 0, beta_count = 0, gamma_count = 0;
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm",
+                 env.db_root, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            uint8_t t = 0x01, f = 0x00;
+            flag_true_count  += bm_count(bm, &t, 1);
+            flag_false_count += bm_count(bm, &f, 1);
+            bm_close(bm);
+        }
+
+        snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/label/%03x.bm",
+                 env.db_root, s);
+        bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            alpha_count += bm_count(bm, (const uint8_t *)"alpha", 5);
+            beta_count  += bm_count(bm, (const uint8_t *)"beta",  4);
+            gamma_count += bm_count(bm, (const uint8_t *)"gamma", 5);
+            bm_close(bm);
+        }
+    }
+    ASSERT_EQ_INT((int)flag_true_count,  4, "bitmap: 4 true bits set across shards");
+    ASSERT_EQ_INT((int)flag_false_count, 2, "bitmap: 2 false bits set across shards");
+    ASSERT_EQ_INT((int)alpha_count,      2, "bitmap: 2 alpha bits set");
+    ASSERT_EQ_INT((int)beta_count,       2, "bitmap: 2 beta bits set");
+    ASSERT_EQ_INT((int)gamma_count,      2, "bitmap: 2 gamma bits set");
+
+    /* === Update one record's flag (true→false). Bit should move. === */
+    tc_request(tc,
+        "{\"mode\":\"update\",\"dir\":\"t\",\"object\":\"e2e\","
+        "\"key\":\"k1\",\"value\":{\"flag\":false,\"label\":\"alpha\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"updated\"", "update k1 flag true→false");
+    free(resp); resp = NULL;
+
+    flag_true_count = 0; flag_false_count = 0;
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm", env.db_root, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            uint8_t t = 0x01, f = 0x00;
+            flag_true_count  += bm_count(bm, &t, 1);
+            flag_false_count += bm_count(bm, &f, 1);
+            bm_close(bm);
+        }
+    }
+    ASSERT_EQ_INT((int)flag_true_count,  3, "post-update: 3 true bits (was 4)");
+    ASSERT_EQ_INT((int)flag_false_count, 3, "post-update: 3 false bits (was 2)");
+
+    /* === Delete one record. Its bits should clear. === */
+    tc_request(tc,
+        "{\"mode\":\"delete\",\"dir\":\"t\",\"object\":\"e2e\",\"key\":\"k5\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"deleted\"", "delete k5");
+    free(resp); resp = NULL;
+
+    flag_true_count = 0; gamma_count = 0;
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm", env.db_root, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            uint8_t t = 0x01;
+            flag_true_count += bm_count(bm, &t, 1);
+            bm_close(bm);
+        }
+        snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/label/%03x.bm", env.db_root, s);
+        bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            gamma_count += bm_count(bm, (const uint8_t *)"gamma", 5);
+            bm_close(bm);
+        }
+    }
+    ASSERT_EQ_INT((int)flag_true_count, 2, "post-delete: 2 true bits (k5 cleared)");
+    ASSERT_EQ_INT((int)gamma_count,     1, "post-delete: 1 gamma bit (was 2)");
+
     /* === Bitmap cap override `:bitmap(N)` round-trips through create-object
            + describe-object + index.conf. === */
     tc_request(tc,
@@ -401,6 +513,135 @@ static int test_bitmap_index_run(void) {
     ASSERT_CONTAINS(resp, "\"error\"", "bitmap cap=99999 rejected");
     ASSERT_CONTAINS(resp, "out of range", "error mentions range");
     free(resp); resp = NULL;
+
+    /* === Cap-aware CRUD: a custom :bitmap(N) cap must be respected at
+           insert time. Default cap (256) gets exercised by the e2e block
+           above; this block hits the override path. We create with
+           bitmap(4), insert 4 distinct values (all succeed), and confirm
+           the on-disk header carries cap=4 (the file was materialised at
+           create-object with the right value). The insert-past-cap
+           refusal lands in a richer test once Phase 4 surfaces the
+           error path through the wire — for now we verify the header
+           is correctly stamped, which is what CRUD reads on each open. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"capcrud\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"col:varchar:8\"],\"indexes\":[\"col:bitmap(4)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create capcrud bitmap(4)");
+    free(resp); resp = NULL;
+
+    /* Open shard 0 directly and confirm the header has cap=4. The file
+       was pre-materialised in cmd_create_object so every data shard
+       carries the same cap. */
+    {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/capcrud/indexes/col/000.bm", env.db_root);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        ASSERT_NOT_NULL(bm, "pre-materialised bitmap shard present");
+        if (bm) {
+            ASSERT_EQ_INT((int)bm_max_values(bm), 4, "header carries cap=4");
+            bm_close(bm);
+        }
+    }
+
+    /* Insert 4 records with 4 distinct labels — all four succeed. */
+    const char *capcrud_labels[] = { "red", "blu", "grn", "ylw" };
+    for (int i = 0; i < 4; i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"capcrud\","
+            "\"key\":\"k%d\",\"value\":{\"col\":\"%s\"}}", i, capcrud_labels[i]);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "capcrud row inserted");
+        free(resp); resp = NULL;
+    }
+
+    /* Inspect: the 4 distinct labels landed somewhere across the 8 shards.
+       Sum n_values across shards == 4 distinct varchar values seen total. */
+    int total_n_values = 0;
+    int total_set_bits = 0;
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/capcrud/indexes/col/%03x.bm", env.db_root, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            total_n_values += (int)bm_n_values(bm);
+            for (int i = 0; i < 4; i++) {
+                total_set_bits += (int)bm_count(
+                    bm, (const uint8_t *)capcrud_labels[i],
+                    strlen(capcrud_labels[i]));
+            }
+            bm_close(bm);
+        }
+    }
+    /* Each label lives in whichever shard the key hashes into, so the
+       n_values total isn't strictly 4 — distinct-per-shard ≤ 4. But the
+       total set bits across shards == 4 (one per insert). */
+    ASSERT_EQ_INT(total_set_bits, 4, "4 bits set across all shards");
+    ASSERT_TRUE(total_n_values >= 1 && total_n_values <= 4,
+                "per-shard dict size within cap");
+
+    /* === 5th distinct value past the per-file cap on the SAME data
+           shard must fail. The cap is per-shard (not global), so the
+           insert needs to target a shard that already has 4 distinct
+           values. We can't easily predict which shard the test keys
+           hash into, so create a fresh narrow-cap bitmap with splits=8
+           and use a fixed-shard placement trick: pick keys that all
+           fall in the same xxh-derived shard. As a more robust
+           shortcut for the assertion, drop to a single-shard object
+           (splits=8 still) and stuff 5 distinct values targeting
+           shard 0 until we trip the cap. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"capovf\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"v:varchar:4\"],\"indexes\":[\"v:bitmap(2)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create capovf bitmap(2)");
+    free(resp); resp = NULL;
+
+    /* Brute-force find 3 distinct keys whose xxh128 lands in the same
+       data shard, then insert 3 distinct values. The first 2 succeed;
+       the 3rd hits the cap=2 and fails. We try sequential keys until
+       we find a hash collision on shard 0. */
+    int collisions[3] = { -1, -1, -1 };
+    int found_n = 0;
+    {
+        uint8_t hash_buf[16];
+        for (int k = 0; k < 1024 && found_n < 3; k++) {
+            char keybuf[16];
+            int kl = snprintf(keybuf, sizeof(keybuf), "k%d", k);
+            /* xxh128 over the key. We don't have the helper exposed in
+               the test header, so probe by inserting then checking
+               which .bm shard now has the bit. That's slow but works
+               for a 3-key probe in test scope. Easier: keep inserting
+               distinct labels and stop when one fails. */
+            (void)hash_buf; (void)kl;
+            collisions[found_n++] = k;
+        }
+    }
+    /* Use sequential keys k0..k2 with 3 distinct values; let the
+       insert path tell us when the cap is hit. The 5th insert across
+       ALL shards is fine because the cap is per-shard; what we test
+       is "if any shard accumulates >cap distinct values, that insert
+       fails". A 3-distinct varchar spread of 3 inserts only fails if
+       all three land in the same shard — possible at splits=8 with
+       enough attempts. Practical assertion: try 24 inserts of 24
+       distinct values; some MUST collide and trip the cap. */
+    int saw_cap_error = 0;
+    for (int k = 0; k < 24; k++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"capovf\","
+            "\"key\":\"k%d\",\"value\":{\"v\":\"v%d\"}}", k, k);
+        tc_request(tc, req, &resp);
+        if (resp && strstr(resp, "\"error\"")) {
+            saw_cap_error = 1;
+            free(resp); resp = NULL;
+            break;
+        }
+        free(resp); resp = NULL;
+    }
+    ASSERT_TRUE(saw_cap_error,
+                "bitmap(2) cap eventually trips across 24 distinct values");
 
     /* === Restart: schema + index.conf survive across daemon stop/start.
            No `test_env_restart` helper — compose it from stop_keep + start_at,

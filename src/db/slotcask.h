@@ -322,6 +322,14 @@ typedef struct {
     void                     *check_ctx;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
+    /* Optional out-params: when non-NULL, slotcask writes the target kf
+       shard index + kf slot index here BEFORE invoking pre_commit. The
+       pre_commit ctx can read them via its own pointer to the same
+       storage. Used by bitmap-index updates which key by (shard, slot)
+       rather than by hash. Existing callers leave these NULL and the
+       fields are ignored — no behaviour change. */
+    int                      *out_kf_shard;
+    uint32_t                 *out_kf_slot;
 } SlotcaskUpsertOpts;
 
 /* ============================================================ Bulk upsert
@@ -504,6 +512,12 @@ typedef struct {
        original behavior (always read OLD when a hook is set). pre_commit
        still fires; old is passed as NULL when this flag is on. */
     int                 skip_old_read;
+    /* Optional out-params: when non-NULL, slotcask writes the kf shard
+       index + the slot of the record being deleted here BEFORE invoking
+       pre_commit. Used by bitmap-index updates which key by (shard,
+       slot). Existing callers leave these NULL — no behaviour change. */
+    int                *out_kf_shard;
+    uint32_t           *out_kf_slot;
 } SlotcaskDeleteOpts;
 
 typedef struct {

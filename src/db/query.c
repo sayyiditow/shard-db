@@ -14271,6 +14271,42 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
+    /* Materialize bitmap shard files NOW so each file's header carries
+       the declared cap (default or override). Empty at create-time;
+       CRUD maintains bits on insert/update/delete, reindex backfills
+       any records that pre-existed the field. Per declared bitmap field,
+       create `splits` per-data-shard files. */
+    for (int i = 0; i < npidx; i++) {
+        if (pidx[i].type != IT_BITMAP) continue;
+        /* Skip composite — already rejected upstream, defensive only. */
+        if (strchr(pidx[i].name, '+')) continue;
+        /* Find field's storage type to set the bool fast-path flag. */
+        int is_bool = 0;
+        int fnlen = (int)strlen(pidx[i].name);
+        for (int j = 0; j < nfields; j++) {
+            const char *fc = strchr(field_specs[j], ':');
+            if (!fc) continue;
+            int jlen = (int)(fc - field_specs[j]);
+            if (jlen != fnlen) continue;
+            if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
+            if (strncmp(fc + 1, "bool", 4) == 0 && (fc[5] == '\0' || fc[5] == ':')) {
+                is_bool = 1;
+            }
+            break;
+        }
+        int slots_per_shard = (int)slotcask_default_slots_for_splits(splits);
+        for (int s = 0; s < splits; s++) {
+            char bm_path[PATH_MAX];
+            bm_build_path(bm_path, sizeof(bm_path), eff_root, object,
+                          pidx[i].name, s);
+            BitmapShard *bm = bm_open(bm_path, slots_per_shard, 1, is_bool,
+                                      pidx[i].max_values);
+            if (bm) bm_close(bm);
+            /* Best-effort: if a single shard fails to create, the next
+               insert will retry. Don't fail the whole create-object. */
+        }
+    }
+
     OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
         object, dir, splits, max_key, total_value_size, nfields, streams);
     return 0;

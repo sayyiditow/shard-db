@@ -1112,7 +1112,7 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
 static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
                       uint8_t stream_id, uint16_t file_id, uint32_t offset,
                       const void *key, size_t klen, const char *data_dir,
-                      size_t *used_delta) {
+                      size_t *used_delta, size_t *out_slot) {
     (void)db;  /* db param retained for ABI; per-shard load lives in the header */
     /* Load-triggered resplit. The header tracks `total` (= live + tombstoned),
        which matches the linear-probe pressure that drives chain length —
@@ -1163,6 +1163,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
                 else             hdr->total++;    /* fresh slot occupied */
             }
             (*used_delta)++;
+            if (out_slot) *out_slot = target_idx;
             return 0;
         }
         if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
@@ -1180,6 +1181,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
             e->flag = 1;
             if (hdr) hdr->deleted--;  /* tombstone reclaimed; total unchanged */
             (*used_delta)++;
+            if (out_slot) *out_slot = slot;
             return 0;
         }
         if (e->flag == 2 && first_tomb == (size_t)-1) {
@@ -1198,6 +1200,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
         t->flag = 1;
         if (hdr) hdr->deleted--;  /* tombstone reclaimed */
         (*used_delta)++;
+        if (out_slot) *out_slot = first_tomb;
         return 0;
     }
     return -1;
@@ -1583,7 +1586,7 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     }
     size_t used_delta = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, NULL);
     kfcache_release(&kh);
     if (put_rc != 0) {
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
@@ -2276,11 +2279,17 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     }
 
     size_t used_delta = 0;
+    size_t put_slot = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, &put_slot);
 
     if (put_rc == 0) {
         /* NEW key path. Run check (with NULL old) and pre_commit. */
+        /* Publish (shard, slot) to opts out-params for index-update hooks
+           that key by physical location (bitmap). Done BEFORE check + pre_commit
+           so user code sees the location of the just-written kf entry. */
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
         if (opts->check && opts->check(NULL, opts->check_ctx) == 0) {
             /* Check rejected. Roll back: tombstone the seg + clear the
                kf entry we just wrote. We need to find our slot to clear it. */
@@ -2400,6 +2409,12 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             }
             return -2;
         }
+        /* Publish (shard, ex_slot) for index hooks that key by physical
+           location (bitmap). On an in-place update the slot doesn't
+           move — kf_repoint_at_slot below rewrites the entry without
+           changing its index. */
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)ex_slot;
         if (opts->pre_commit) {
             int rc = opts->pre_commit(&old_rec, value, vlen, 1, opts->pre_commit_ctx);
             if (rc != 0) {
@@ -2525,6 +2540,18 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         return -1;
     }
 
+    /* Publish (shard, slot) for index hooks that key by physical location
+       (bitmap). For updates kf_slot is the existing slot from
+       kf_lookup_with_slot. For inserts the slot isn't determined yet in
+       this slow path — kf_put_new below picks it. Callers using bitmap
+       through the slow path can't rely on the slot during pre_commit for
+       fresh inserts; that corner is currently rare (slow path runs only
+       when check_needs_old / require_existing is set). */
+    if (found) {
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
+    }
+
     /* Pre-commit hook (Option B index ordering). Caller updates indexes
        here; if it errors out we tombstone the new slot and bail. */
     if (opts->pre_commit) {
@@ -2548,7 +2575,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     } else {
         size_t used_delta = 0;
         kf_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                           key, klen, db->data_dir, &used_delta);
+                           key, klen, db->data_dir, &used_delta, NULL);
         /* Under wrlock; a "1 = already exists" return here would mean a race
            we haven't seen evidence of, but treat it as a hard error. */
         if (kf_rc == 1) kf_rc = -1;
@@ -2655,8 +2682,9 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     }
 
     size_t used_delta = 0;
+    size_t put_slot = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, &put_slot);
     if (put_rc != 0) {
         if (put_rc == 1) {
             /* Duplicate — read the existing record so the caller can
@@ -2702,6 +2730,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        return error. The orphan kf entry will be cleaned up by vacuum's
        compact_kf pass. Same trade-off the existing upsert path makes for
        pre_commit failure (just on the opposite side of kf commit). */
+    if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+    if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
     if (opts->pre_commit) {
         int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
         if (rc != 0) {
@@ -3262,7 +3292,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             size_t used_delta = 0;
             kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
                                 st[i].target_fid, st[i].target_off,
-                                r->key, r->klen, db->data_dir, &used_delta);
+                                r->key, r->klen, db->data_dir, &used_delta, NULL);
             if (kf_rc == 1) kf_rc = -1;
         }
         if (kf_rc != 0) {
@@ -3350,7 +3380,7 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         int put_rc = kf_put_new(db, &kh, st[i].hash,
                                  st[i].target_stream, st[i].target_fid,
                                  st[i].target_off, r->key, r->klen,
-                                 db->data_dir, &used_delta);
+                                 db->data_dir, &used_delta, NULL);
 
         if (put_rc == 0) {
             /* New key. Run pre_commit (with old=NULL). */
@@ -3977,6 +4007,12 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         }
         return -2;
     }
+
+    /* Publish (shard, slot) for index hooks that key by physical location
+       (bitmap). Done before pre_commit so the bitmap branch of
+       update_idx_fn can address the slot we're about to tombstone. */
+    if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+    if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
 
     if (opts->pre_commit) {
         int rc = opts->pre_commit(needs_old ? &old_rec : NULL,
