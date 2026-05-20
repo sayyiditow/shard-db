@@ -1,6 +1,9 @@
 # Indexes
 
-shard-db indexes are **B+ trees with prefix-compressed leaves**, stored per-object under `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every one of the 38 search operators uses an index when one is available (with a few intentional full-scan exceptions noted in [find → Operators](../query-protocol/find.md#operators)).
+shard-db ships two index types:
+
+- **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).
+- **Bitmap** (auto-default for `bool` since 2026.05.7; opt-in via `"field:bitmap"` or `"field:bitmap(N)"` for low-cardinality `varchar` enums) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
 
 ## When to add an index
 
@@ -9,7 +12,11 @@ Add an index when:
 - The object is big enough that a full scan is noticeably slow (tens of thousands of records and up), or
 - You'll use the field as a `join` `remote` key.
 
-Don't bother for tiny objects or fields with very low cardinality (`bool`, `active: true/false`) — the index scan overhead isn't worth it vs a 2–3 ms shard scan.
+For `bool` fields (or future low-cardinality varchar enums) you usually don't need to make a decision — the auto-default puts them on bitmap. Bitmap pays off most when:
+- Your queries `count` / `aggregate` on the field (popcount is O(slots / 64), no btree leaf walk per match).
+- Selectivity is broad (10%+ of records match). At those selectivities a btree leaf walk emits one cb per match; bitmap returns in popcount time.
+
+Bitmap's per-shard dict cap is 256 by default (override `bitmap(N)` up to 65535). When the cap is exceeded the wire layer surfaces an actionable error pointing at btree — the operator should switch the field's index type.
 
 ## Single and composite indexes
 
@@ -20,6 +27,22 @@ Don't bother for tiny objects or fields with very low cardinality (`bool`, `acti
 ```
 
 Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`index_splits_for(splits)` shards). For `splits=64`, that's 8 idx-shard files; for `splits=128`, 16 files; for `splits=4096`, 128 files. See the curve table above.
+
+### Explicit type
+
+`add-index` / `create-object` accept an explicit type suffix when you want bitmap (or future trigram) on a field that wouldn't auto-default to it:
+
+```json
+{"mode":"add-index","dir":"acme","object":"users","field":"status:bitmap"}
+```
+
+```json
+{"mode":"add-index","dir":"acme","object":"users","field":"status:bitmap(32)"}
+```
+
+Files created: `<obj>/indexes/status/<NNN>.bm` (one per data shard, not the btree fan-out curve). The bitmap-shard layout is 1:1 with data shards because each bit maps directly to a slot.
+
+Allowed suffixes today: `field:btree` (default), `field:bitmap`, `field:bitmap(N)` where `N ∈ [2, 65535]`. Without a suffix, `bool` fields auto-default to bitmap; every other type defaults to btree.
 
 ### Composite
 

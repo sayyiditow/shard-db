@@ -55,6 +55,8 @@ Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even di
 
 13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). 12 indexes (`username`, `email`, `age`, `active`, `birthday`, `user_id`, `rank`, `score`, `level`, `created_at`, `balance`, `hourly_rate`); `bio` left non-indexed to exercise full-scan paths. C-bench measurements; cache is hot from the same-process bulk insert.
 
+`active` is a `bool` field — since 2026.05.7 it auto-defaults to a **bitmap** index (one dense bit per slot, per-distinct-value). All other typed fields fall back to btree. The planner routes eq/IN/NEQ/NOT_IN through bitmap popcount and every other op through a per-shard dict-scan (≤ 256 dict entries per shard) so any operator goes through the index — never the data file.
+
 **Insert** (1M records, 1 conn, JSON, 12 indexes built upfront): **0.24 M/sec** (4.12 s).
 
 ### COUNT — point lookups & ranges by field type
@@ -196,7 +198,8 @@ These numbers assume **warm cache** (kernel page cache holds the relevant kf + s
 | query | warm | cold (first-touch on this index) |
 |---|---|---|
 | `eq username` (point lookup, varchar idx) | **0.1 ms** | 1-2 ms |
-| `eq active=false` (~3.5M matches, bool) | 15-30 ms | 200-400 ms |
+| `eq active=false` (bool, bitmap popcount since 2026.05.7) | **5-20 ms** | 30-60 ms |
+| `neq active!=false` (bool, bitmap subtraction shortcut) | **5-10 ms** | 30-60 ms |
 | `eq age=30` (~417K matches, int) | 1-3 ms | 50-150 ms |
 | `eq bio` (full scan, ~25M records) | 800-1500 ms | 6-9 s |
 | `gt user_id>500000` (range, ~12.5M matches) | 200-400 ms | 1-2.5 s |
@@ -204,7 +207,7 @@ These numbers assume **warm cache** (kernel page cache holds the relevant kf + s
 | `contains bio 'DevOps'` (full scan + simd memmem) | 800-1000 ms | 1-3 s |
 | `icontains bio 'devops'` (full scan + simd memcasemem) | 800-1000 ms | 1-3 s |
 | `OR 5 leaves on age` | 2-3 s | 9-12 s |
-| `OR cross-field` (age=30 OR active=false) | 4-5 s | 14-15 s |
+| **`OR cross-field` (age=30 OR active=false)** | **~320 ms** (was 4-5 s pre-2026.05.7 — `active` is now on a bitmap, half the keyset is sized + filled from a popcount instead of a btree leaf walk) | 1-2 s |
 | `eq_field age == rank` (always full scan) | 590-700 ms | 600-700 ms (CPU-bound) |
 
 ### AGGREGATE — single-fn standalone
@@ -220,13 +223,28 @@ The leaf-only walker + MADV_SEQUENTIAL combo shipped in 2026.05.4 brings cold su
 | `sum balance` (numeric) | 40-50 ms | **~210 ms** | 13-16 s |
 | `avg score` (double) | 40-50 ms | **~40 ms** (warm path) | 0.5-2 s |
 
+### AGGREGATE — with criteria on a bitmap-indexed field
+
+2026.05.7 routes criteria on bool / future-enum fields through the field's bitmap index instead of a btree leaf walk. For aggregates that filter by `active=true/false` (or any bitmap field), the candidate KeySet is now sized exactly via `bm_count` per shard (cache-friendly stride-byte popcount) and populated via a per-shard bitmap walk. Previous behaviour fell through to a btree leaf walk with under-sized KeySet (the latent O(N × cap) probe trap fixed in 2026.05.7).
+
+| query | warm | pre-bitmap (≤ 2026.05.5) |
+|---|---|---|
+| `avg score where active=false` | **~2.7 s** | 15-16 s |
+| `aggregate(count + avg) where active=false` | **~2.4 s** | 15-16 s |
+| `min/max <indexed> where active=true` | **<1 ms** (same-field shortcut still applies) | <1 ms |
+
+The remaining 2-3 s isn't bitmap-related — it's the per-record fetch + score-extract for ~3.5M matching records. Streaming bitmap→kf→aggregator without materializing the keyset would close most of that gap; queued as a backlog item.
+
 ### AGGREGATE — bundled & grouped
 
 The parallel Pass 1 + parallel merge wins are most visible at this scale. 2026.05.4 added two streaming-distinct fast paths gated on `single varchar group_by + finite limit + no criteria/having/order_by` — for queries that match the shape, the wins are dramatic:
 
 | query | warm |
 |---|---|
-| `group by active` (count + avg) | 3-5 s |
+| `group by active` (count + avg) | **~820 ms** (was 3-5 s pre-2026.05.7 — `group by` field is bool, hits bitmap dict-scan) |
+| `group by age where active=true (eq crit)` | **~1.9 s** (was 41 s pre-2026.05.7 — criteria's keyset now sized via bitmap popcount, not under-allocated and prone to O(N × cap) probe trap) |
+| `group by active where age 25..50 AND score>50` | **~37 ms** (AND-intersect-on-indexed; primary is the most selective btree leaf, bitmap finishes the filter) |
+| `group by age top 5` (limit-bound, indexed group_by) | **~75 ms** |
 | **`group by username, count limit 10` (varchar idx, high-card)** | **~3 ms cold** (was 4-5 s — streaming k-way merge, 2026.05.4) |
 | **`group by email, sum(balance) limit 10` (varchar idx + indexed numeric agg)** | **~4 ms cold** (was 5-8 s — streaming k-way merge + per-emit lookup, 2026.05.4) |
 | `group by username, count` (no limit, full enumeration) | 4-5 s |
