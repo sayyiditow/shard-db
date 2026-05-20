@@ -14380,6 +14380,29 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                         tok = strtok_r(NULL, "+", &_tok_save);
                     }
 
+                    /* Bool (and future enum) auto-bitmap rule:
+                       a bool field listed in `indexes` WITHOUT an explicit
+                       `:type` suffix becomes bitmap, not btree. The
+                       alternative — silently giving bool a btree — is almost
+                       always the wrong tool. Explicit `field:btree` still
+                       wins; the override only fires when the spec was bare. */
+                    int was_explicit_type = (colon != NULL);
+                    if (itype == IT_BTREE && !is_composite && !was_explicit_type) {
+                        int fnlen2 = (int)strlen(idx_spec);
+                        for (int i = 0; i < nfields; i++) {
+                            const char *c = strchr(field_specs[i], ':');
+                            if (!c) continue;
+                            int nl = (int)(c - field_specs[i]);
+                            if (nl != fnlen2) continue;
+                            if (memcmp(field_specs[i], idx_spec, nl) != 0) continue;
+                            if (strncmp(c + 1, "bool", 4) == 0 &&
+                                (c[5] == '\0' || c[5] == ':')) {
+                                itype = IT_BITMAP;
+                            }
+                            break;
+                        }
+                    }
+
                     strncpy(pidx[npidx].name, idx_spec, sizeof(pidx[npidx].name) - 1);
                     pidx[npidx].name[sizeof(pidx[npidx].name) - 1] = '\0';
                     pidx[npidx].type = itype;

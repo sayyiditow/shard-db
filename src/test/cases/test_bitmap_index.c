@@ -371,6 +371,30 @@ static int test_bitmap_index_run(void) {
     }
     free(resp); resp = NULL;
 
+    /* === Bool listed in indexes WITHOUT :type auto-becomes bitmap.
+           The escape hatch is explicit :btree. Same rule will apply to
+           enum once that type lands. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bool_listed\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\"],\"indexes\":[\"flag\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bool_listed");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"bool_listed\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"flag:bitmap\"", "bool with bare 'flag' becomes bitmap");
+    free(resp); resp = NULL;
+
+    /* Explicit :btree on bool → respected (escape hatch). */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bool_btree\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\"],\"indexes\":[\"flag:btree\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bool_btree");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"bool_btree\"}", &resp);
+    ASSERT_NOT_CONTAINS(resp, "\"flag:bitmap\"", "explicit :btree NOT promoted to bitmap");
+    free(resp); resp = NULL;
+
     /* === End-to-end: insert records, verify bits land in the bitmap shard
            files. Uses bm_open() directly to inspect the on-disk state the
            daemon wrote. === */
