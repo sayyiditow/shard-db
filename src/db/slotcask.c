@@ -104,6 +104,13 @@ static int mkdirp_local(const char *path) {
 static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
     snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }
+
+/* Public wrapper for the bitmap-index read path in query.c. Same layout as
+   kf_path_for; exposed so callers don't duplicate the convention. */
+void slotcask_kf_path(char *out, size_t outlen,
+                      const char *data_dir, int shard_id) {
+    snprintf(out, outlen, "%s/data/kf/%03d.kf", data_dir, shard_id);
+}
 static void stream_dir_for(char out[PATH_MAX], const char *data_dir, int stream_id) {
     snprintf(out, PATH_MAX, "%s/data/streams/%03d", data_dir, stream_id);
 }

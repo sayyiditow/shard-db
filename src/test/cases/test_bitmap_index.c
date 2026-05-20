@@ -483,6 +483,67 @@ static int test_bitmap_index_run(void) {
     ASSERT_EQ_INT((int)flag_true_count, 2, "post-delete: 2 true bits (k5 cleared)");
     ASSERT_EQ_INT((int)gamma_count,     1, "post-delete: 1 gamma bit (was 2)");
 
+    /* === Phase 4: read-side planner uses the bitmap. Find / count / find-with-AND
+           on a bitmap-indexed bool field must return the same results as
+           the equivalent full-scan query. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"qry\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"name:varchar:8\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create qry");
+    free(resp); resp = NULL;
+
+    /* Insert: 6 records, 4 with flag=true, 2 with flag=false. Specific
+       names so we can validate AND-with-btree later if needed. */
+    const struct { const char *k; const char *flag; const char *name; } qrows[] = {
+        { "q1", "true",  "alice" },
+        { "q2", "false", "bob"   },
+        { "q3", "true",  "carol" },
+        { "q4", "true",  "alice" },
+        { "q5", "false", "alice" },
+        { "q6", "true",  "dave"  },
+    };
+    for (size_t i = 0; i < sizeof(qrows)/sizeof(qrows[0]); i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"qry\","
+            "\"key\":\"%s\",\"value\":{\"flag\":%s,\"name\":\"%s\"}}",
+            qrows[i].k, qrows[i].flag, qrows[i].name);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "qry row inserted");
+        free(resp); resp = NULL;
+    }
+
+    /* count(flag=true) MUST be 4. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"qry\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag=true via bitmap planner");
+    free(resp); resp = NULL;
+
+    /* count(flag=false) MUST be 2. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"qry\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "2", "count flag=false via bitmap planner");
+    free(resp); resp = NULL;
+
+    /* find(flag=true) returns all 4 keys. */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"t\",\"object\":\"qry\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"fields\":[\"name\"]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"q1\"", "find flag=true: q1");
+    ASSERT_CONTAINS(resp, "\"q3\"", "find flag=true: q3");
+    ASSERT_CONTAINS(resp, "\"q4\"", "find flag=true: q4");
+    ASSERT_CONTAINS(resp, "\"q6\"", "find flag=true: q6");
+    ASSERT_NOT_CONTAINS(resp, "\"q2\"", "find flag=true: q2 absent");
+    ASSERT_NOT_CONTAINS(resp, "\"q5\"", "find flag=true: q5 absent");
+    free(resp); resp = NULL;
+
     /* === Bitmap cap override `:bitmap(N)` round-trips through create-object
            + describe-object + index.conf. === */
     tc_request(tc,

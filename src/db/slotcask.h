@@ -120,6 +120,12 @@ int  kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                      size_t slots_capacity, int writer);
 void kfcache_release(SlotcaskKfHandle *h);
 
+/* Build the canonical kf shard path under a slotcask data_dir. Public
+   wrapper around the internal kf_path_for so query.c (bitmap index path)
+   can construct kf paths without duplicating the layout convention. */
+void slotcask_kf_path(char *out, size_t outlen,
+                      const char *data_dir, int shard_id);
+
 /* ============================================================ segcache */
 
 typedef struct {

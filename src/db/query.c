@@ -8876,10 +8876,43 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
    the legacy ASCII storage of composite indexes). With the per-shard index
    layout each call fans out across index_splits_for(splits) shard files
    internally. */
+/* Forward decls — both definitions live near build_keyset_from_bitmap. */
+static enum IndexType field_index_type(const char *db_root, const char *object,
+                                       const char *field);
+
+/* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
+   per live matching slot. */
+static void bitmap_emit_for_shard(const char *db_root, const char *object,
+                                  const char *field, int shard_idx,
+                                  const uint8_t *value, size_t vlen,
+                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
+
+/* Type-aware front for the planner's per-leaf dispatch. Bitmap-indexed
+   eq leaves walk the bitmap shards directly and emit per-match
+   callbacks; everything else falls through to the existing btree path. */
 static void btree_dispatch(const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
+    if (field_index_type(db_root, object, field) == IT_BITMAP &&
+        pc->op == OP_EQUAL) {
+        uint8_t valbuf[1032];
+        size_t  vallen = 0;
+        encode_criterion_value(tf, pc->value, strlen(pc->value), valbuf, &vallen);
+        if (vallen == 0) return;
+        Schema sc = load_schema(db_root, object);
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) return;
+        for (int s = 0; s < splits; s++) {
+            bitmap_emit_for_shard(db_root, object, field, s, valbuf, vallen,
+                                  cb, ctx, sdb);
+        }
+        return;
+    }
+
     /* Stack buffers for encoded key bytes. Max fixed-type output is 8 B;
        varchar caps at f->size - 2 ≤ 65533 — BT_MAX_VAL_LEN = 512 in practice.
        Keep generous for the "contains text + 4 sentinel bytes" suffix cases. */
@@ -10391,8 +10424,22 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
        index_splits_for(splits) shards. btree_idx_exists checks for any
        non-empty shard.
        Old single-file <field>.idx layout is gone; load_splits trips into
-       the schema cache so this stays cheap on the planner hot path. */
+       the schema cache so this stays cheap on the planner hot path.
+
+       Bitmap-indexed fields don't have .idx files — they have .bm files
+       at <obj>/indexes/<field>/<NNN>.bm. The planner picks them up only
+       for ops bitmap supports (OP_EQUAL for MVP). Other ops on a
+       bitmap-only field fall back to PRIMARY_NONE (full scan). */
+    enum IndexType itype = field_index_type(db_root, object, c->field);
     Schema sch = load_schema(db_root, object);
+    if (itype == IT_BITMAP) {
+        if (c->op != OP_EQUAL) return 0;
+        if (out_idx_path) {
+            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
+                     db_root, object, c->field);
+        }
+        return 1;
+    }
     if (!btree_idx_exists(db_root, object, c->field, sch.splits)) return 0;
     if (out_idx_path) {
         /* out_idx_path is now an opaque tag for callers that want a
@@ -10669,10 +10716,171 @@ static int intersect_collect_cb(const char *val, size_t vlen,
    field). Without the live_count floor, the file-size hint can underestimate
    by an order of magnitude on densely-compressed btrees and the inserts
    degrade to O(cap) once the table fills. */
+/* Bitmap-walk → bt_result_cb adapter. Bit positions emitted by bm_walk
+   are slot indices in the matching kf shard; the kf entry at that slot
+   holds the record's hash. Each live entry's hash gets emitted via the
+   shared callback as if it came from a btree walk — gives every
+   downstream consumer (count, find, intersect) the same shape. */
+typedef struct {
+    SlotcaskKfEntry *kf_map;
+    size_t           kf_capacity;
+    const uint8_t   *val;   /* encoded query value bytes — emitted to cb */
+    size_t           vlen;
+    bt_result_cb     cb;
+    void            *cb_ctx;
+} BmEmitCtx;
+
+static int bm_emit_cb(uint32_t slot, void *ctx) {
+    BmEmitCtx *c = (BmEmitCtx *)ctx;
+    if (slot >= c->kf_capacity) return 0;
+    SlotcaskKfEntry *e = &c->kf_map[slot];
+    if (e->flag != 1) return 0;  /* empty / tombstoned */
+    int rc = c->cb((const char *)c->val, c->vlen, e->hash, c->cb_ctx);
+    return rc;
+}
+
+/* Walk a single shard's bitmap for `value`, emitting cb per live
+   matching slot (with the kf entry's hash). Used by btree_dispatch's
+   bitmap front. */
+static void bitmap_emit_for_shard(const char *db_root, const char *object,
+                                  const char *field, int shard_idx,
+                                  const uint8_t *value, size_t vlen,
+                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+    if (!bm) return;
+
+    char kfp[PATH_MAX];
+    slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+        bm_close(bm);
+        return;
+    }
+
+    BmEmitCtx ec = { kh.map, kh.capacity, value, vlen, cb, ctx };
+    bm_walk(bm, value, vlen, bm_emit_cb, &ec);
+
+    /* idx_count_cb (and any other batched-thread-local consumer) accumulates
+       a per-thread pending count and only flushes at shard boundaries.
+       Mirror the btree shard walker's flush-after-shard convention here so
+       the count makes it into the caller's ctx. */
+    idx_count_cb_flush_thread();
+
+    kfcache_release(&kh);
+    bm_close(bm);
+}
+
+/* Bitmap-walk → KeySet collector. Kept for compatibility with the
+   build_keyset_from_bitmap helper that the planner uses for
+   intersect-leaf builds. */
+typedef struct {
+    SlotcaskKfEntry *kf_map;
+    size_t           kf_capacity;
+    KeySet          *ks;
+    QueryDeadline   *dl;
+} BmCollectCtx;
+
+static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
+    BmCollectCtx *c = (BmCollectCtx *)ctx;
+    if (c->dl && c->dl->timed_out) return 1;
+    if (slot >= c->kf_capacity) return 0;
+    SlotcaskKfEntry *e = &c->kf_map[slot];
+    if (e->flag != 1) return 0;
+    keyset_insert(c->ks, e->hash);
+    return 0;
+}
+
+/* Resolve a field's IndexType from the cached index.conf. Linear scan
+   over the cached arrays — cheap for the planner hot path. */
+static enum IndexType field_index_type(const char *db_root, const char *object,
+                                       const char *field) {
+    char fields[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
+    int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
+    int count = n < n2 ? n : n2;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(fields[i], field) == 0) return types[i];
+    }
+    return IT_BTREE;
+}
+
+/* Walk every data shard's bitmap shard for the matching value, lift each
+   live record's hash into a KeySet. Returns NULL on timeout / failure;
+   caller falls through to full scan. */
+static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
+                                        int splits,
+                                        const SearchCriterion *leaf,
+                                        const TypedField *tf,
+                                        QueryDeadline *dl) {
+    /* Bitmap supports eq only for MVP. i-variant (case-insensitive) deferred
+       since bytewise bitmap dict can't fold case without a separate index. */
+    if (leaf->op != OP_EQUAL) return NULL;
+
+    /* Encode the query value the same way bitmap_update encoded the stored
+       value. encode_criterion_value handles the TypedField conversion. */
+    uint8_t valbuf[1024];
+    size_t  vallen = 0;
+    encode_criterion_value(tf, leaf->value, strlen(leaf->value), valbuf, &vallen);
+    if (vallen == 0) return NULL;
+
+    /* Need a slotcask handle to read kf entries. */
+    Schema sc = load_schema(db_root, object);
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return NULL;
+
+    KeySet *ks = keyset_new(1024);
+    if (!ks) return NULL;
+
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (!bm) continue;
+
+        char kfp[PATH_MAX];
+        slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            bm_close(bm);
+            continue;
+        }
+
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
+        bm_walk(bm, valbuf, vallen, bm_collect_to_keyset_cb, &c);
+
+        kfcache_release(&kh);
+        bm_close(bm);
+    }
+    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    return ks;
+}
+
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
+    /* Dispatch by index type. Bitmap-indexed eq goes through the
+       bitmap walker; everything else stays on the existing btree path. */
+    enum IndexType itype = field_index_type(db_root, object, leaf->field);
+    if (itype == IT_BITMAP) {
+        TypedSchema *ts = load_typed_schema(db_root, object);
+        const TypedField *tf = resolve_idx_field(ts, leaf->field);
+        KeySet *ks = build_keyset_from_bitmap(db_root, object, splits,
+                                              leaf, tf, dl);
+        if (ks) return ks;
+        /* Fall through to btree path if bitmap couldn't help (op not eq,
+           timeout, etc.). For most bitmap leaves this just produces a
+           NULL since there's no btree to fall back to, and the caller
+           drops to full-scan — same effective behavior. */
+    }
     size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
     int live = get_live_count(db_root, object);
     if (live > 0 && (size_t)live > hint) hint = (size_t)live;
