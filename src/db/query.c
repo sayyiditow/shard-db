@@ -10974,8 +10974,18 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
 }
 
 /* Walk every data shard's bitmap shard for the matching value, lift each
-   live record's hash into a KeySet. Returns NULL on timeout / failure;
-   caller falls through to full scan. */
+   live record's hash into a KeySet. Returns NULL on timeout / failure
+   or when the projected keyset footprint exceeds the per-query memory
+   budget — caller falls through to full scan in either case.
+
+   Sizing: KeySet has no resize (see keyset.c). If the table fills,
+   every subsequent insert linear-probes the whole capacity uselessly.
+   The previous fixed `keyset_new(1024)` was a latent O(N × cap) trap
+   that turned `group by age where active=true` at 25M into a 41-second
+   query with silently-wrong results (only ~2048 hashes recorded out of
+   12.5M matches). We now popcount across all shards first (cheap —
+   bm_count is a byte popcount) to size the keyset exactly, mirroring
+   the btree path's leaf_capacity_hint behaviour. */
 static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                         int splits,
                                         const SearchCriterion *leaf,
@@ -11000,9 +11010,37 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return NULL;
 
-    KeySet *ks = keyset_new(1024);
+    /* Pass A: sum bm_count across every shard to get exact match cardinality.
+       Each bm_count is a cache-friendly stride-byte popcount — ~ms-scale at
+       25M / 128 shards even cold. Worth it to size the keyset right. */
+    size_t total_matches = 0;
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) return NULL;
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        total_matches += bm_count(bm, valbuf, vallen);
+        bm_close(bm);
+    }
+
+    /* Budget check: keyset_new rounds up to next_pow2(hint*2); each slot
+       is keys[16] + state[4] = 20 B. Match the btree path's guard so
+       monster keysets (e.g. 50%-selective bitmap on a billion-row table)
+       fall through to scan instead of OOM-ing the daemon. */
+    size_t ks_bytes_est = (total_matches ? total_matches : 1024)
+                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
+
+    KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
     if (!ks) return NULL;
 
+    /* Pass B: actually walk the bitmaps and lift matching hashes via
+       kf lookup. Serial for now — the inserts themselves run lock-free
+       (keyset_insert uses per-bucket CAS) so a parallel-walk would be
+       safe, but kfcache_acquire / page faults on cold kf are the real
+       cost and that doesn't trivially parallelise. Revisit if 25M+
+       cold benches show this still dominating. */
     for (int s = 0; s < splits; s++) {
         if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
 
@@ -18466,7 +18504,10 @@ int cmd_aggregate(const char *db_root, const char *object,
         igb_done = 1;  /* ctx populated — skip the IGB block, emit below. */
         goto igb_skip;
     }
-vs_skip:
+vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
+               directly by a declaration. Trips -Wc23-extensions on
+               clang. The `;` keeps us valid C11/17 without changing
+               control flow. */
 
     /* Fast path: indexed group_by (single field, btree exists). Walks the
        group_by btree directly to bucket per encoded value; for any
