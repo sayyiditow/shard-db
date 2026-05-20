@@ -1170,6 +1170,7 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             }
         }
         free(old_json);
+        bm_flush_thread_bitmap_cache();
         if (bm_overflow) return -1;
     } else {
         /* Fresh insert: parallel write of all index entries. Btree entries
@@ -1223,6 +1224,7 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                     free(bm_args[i].new_key);
                 }
             }
+            bm_flush_thread_bitmap_cache();
             if (bm_overflow) return -1;
         }
     }
@@ -1515,6 +1517,7 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
     }
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
+    bm_flush_thread_bitmap_cache();
     return bm_overflow ? -1 : 0;
 }
 
@@ -1780,6 +1783,7 @@ static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
     if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
+    bm_flush_thread_bitmap_cache();
     return 0;
 }
 

@@ -1299,4 +1299,9 @@ typedef struct {
                                      args[] after parallel_for and aborts the write. */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
+/* Release this thread's cached bitmap shard handle, if any. Called at
+   batch boundaries (end of bulk worker, end of pre_commit's parallel_for)
+   to drop fds and ensure subsequent reindex/wipe operations don't leave
+   stale TLS pointers. Safe no-op when nothing cached. */
+void bm_flush_thread_bitmap_cache(void);
 #endif

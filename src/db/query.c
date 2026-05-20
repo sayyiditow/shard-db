@@ -1265,6 +1265,11 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     free(batch); free(ctxs); free(kf_shards);
     free(counts); free(offsets); free(cursors);
     free(old_arena);
+    /* Release the worker thread's cached bitmap handle so we don't
+       leak open file descriptors across requests, and so a subsequent
+       reindex/wipe in the engine doesn't leave this thread with a
+       stale TLS pointer to an unlinked .bm. */
+    bm_flush_thread_bitmap_cache();
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }

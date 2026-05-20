@@ -287,6 +287,35 @@ static void bitmap_shard_path(char *out, size_t outlen,
     bm_build_path(out, outlen, db_root, object, field, shard_idx);
 }
 
+/* Thread-local bitmap handle cache. Bulk paths process N records under
+   one kf wrlock — they all hit the SAME .bm file path (same field, same
+   kf_shard). Opening+closing the bitmap per record is mmap+ftruncate
+   overhead × N which dominated 10M-bench wall time. The TLS cache keeps
+   one handle open per worker thread; a path-mismatch evicts the cached
+   one and opens the new one. Calls bm_flush_thread_bitmap_cache() (below)
+   at safe seams to release.
+
+   Concurrency: each worker thread has its own slot — no cross-thread
+   sharing. Per-shard kf wrlock serialises writes against other workers
+   touching the same .bm file. */
+static __thread struct {
+    BitmapShard *bm;
+    char         path[1024];
+    int          dirty;     /* unused today; reserved for batched-flush */
+} tls_bm_cache = { NULL, {0}, 0 };
+
+/* Drop the cached handle if any. Callers invoke this at the end of a
+   batch (e.g. after a parallel-for finishes) so the file isn't held
+   open across long-lived requests, and to ensure any subsequent
+   reindex that wipes the .bm file doesn't leave stale TLS pointers. */
+void bm_flush_thread_bitmap_cache(void) {
+    if (tls_bm_cache.bm) {
+        bm_close(tls_bm_cache.bm);
+        tls_bm_cache.bm = NULL;
+        tls_bm_cache.path[0] = '\0';
+    }
+}
+
 /* Bitmap insert/delete: open the per-data-shard `.bm` file, flip the
    bit for (value, slot). `bool_fastpath` is detected by checking field
    value bytes — a bool encoding is exactly 1 byte (0x00 or 0x01).
@@ -308,11 +337,22 @@ static int bitmap_update(const char *db_root, const char *object,
 
     int slots = (int)slotcask_default_slots_for_splits(splits);
 
-    BitmapShard *bm = bm_open(path, slots, 1, bool_fastpath, max_values);
-    if (!bm) return 0;  /* best-effort — failed open means no bitmap update,
-                           treat as soft skip rather than fatal write
-                           failure. Cap-exceeded path lives below where the
-                           file does exist. */
+    /* Hit the TLS cache when the path matches; reuse without
+       re-mmap'ing. Evict on mismatch (different field or shard than the
+       previous call from this thread). */
+    BitmapShard *bm;
+    if (tls_bm_cache.bm && strcmp(tls_bm_cache.path, path) == 0) {
+        bm = tls_bm_cache.bm;
+    } else {
+        if (tls_bm_cache.bm) {
+            bm_close(tls_bm_cache.bm);
+            tls_bm_cache.bm = NULL;
+        }
+        bm = bm_open(path, slots, 1, bool_fastpath, max_values);
+        if (!bm) return 0;
+        tls_bm_cache.bm = bm;
+        snprintf(tls_bm_cache.path, sizeof(tls_bm_cache.path), "%s", path);
+    }
 
     /* Auto-grow on slot overflow. Slotcask doubles a kf shard's
        slots_per_shard on auto-resplit (80% load trigger); the bitmap
@@ -334,10 +374,12 @@ static int bitmap_update(const char *db_root, const char *object,
     if (old_val) bm_clear(bm, old_val, old_len, kf_slot);
     if (new_val) {
         if (bm_set(bm, new_val, new_len, kf_slot) != 0) {
-            rc = -1;  /* dict cap exceeded — caller aborts the write */
+            rc = -1;
         }
     }
-    bm_close(bm);
+    /* Don't bm_close — the TLS cache holds the handle for the next
+       same-path call. Eviction happens on path mismatch above, or
+       explicitly via bm_flush_thread_bitmap_cache() at batch boundaries. */
     return rc;
 }
 
