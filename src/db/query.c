@@ -5129,6 +5129,19 @@ static void transform_field_value(const TypedField *old_f,
         memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
         return;
     }
+    case FT_ENUM:
+        /* 1B → 2B widen: zero-extend the byte index. The existing index
+           value stays unchanged (record at byte 0x05 in 1B becomes
+           0x00 0x05 in 2B). 2B → 1B narrow is rejected by the enum diff
+           validator above; same-width edits short-circuit via
+           field_needs_transform=0 before we get here. */
+        if (new_f->size == 2 && old_f->size == 1) {
+            dst[0] = 0x00;
+            dst[1] = src[0];
+            return;
+        }
+        memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
+        return;
     default:
         /* Same-size paths fell through above. Anything else: best-effort
            prefix copy. Caller should have refused. */
@@ -5888,7 +5901,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
 }
 
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int n_edits) {
+                    char lines[][256], int n_edits, int allow_rename) {
     if (n_edits <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
         return 1;
@@ -5972,6 +5985,46 @@ int cmd_edit_fields(const char *db_root, const char *object,
                 parsed[e].name);
             return 1;
         }
+
+        /* FT_ENUM diff: new value list must be a strict prefix of the old
+           (append), optionally with renames at existing positions when the
+           caller passed `allow_rename`. Anything else (remove, reorder,
+           length shrink) corrupts existing records, so refuse loudly.
+           Width transitions: 1B → 2B is allowed when the new list count
+           exceeds 256 — the rebuild path handles the record re-encoding
+           via transform_field_value. 2B → 1B not supported (would lose
+           record data if any record holds an index ≥ 256). */
+        if (oldf->type == FT_ENUM && parsed[e].type == FT_ENUM) {
+            int oldn = oldf->n_enum_values;
+            int newn = parsed[e].n_enum_values;
+            if (newn < oldn) {
+                OUT("{\"error\":\"enum edit refused for [%s]: cannot remove or shrink the value list (records reference values by position — removing would corrupt them). Append-only edits supported.\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+            if (oldf->enum_width == 2 && parsed[e].enum_width == 1) {
+                OUT("{\"error\":\"enum edit refused for [%s]: cannot narrow 2-byte → 1-byte enum.\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+            int had_rename = 0;
+            for (int i = 0; i < oldn; i++) {
+                const char *ov = oldf->enum_values[i];
+                const char *nv = parsed[e].enum_values[i];
+                if (!ov || !nv) {
+                    OUT("{\"error\":\"enum edit for [%s]: internal value list corrupt at position %d\"}\n",
+                        parsed[e].name, i);
+                    return 1;
+                }
+                if (strcmp(ov, nv) != 0) had_rename = 1;
+            }
+            if (had_rename && !allow_rename) {
+                OUT("{\"error\":\"enum edit refused for [%s]: at least one value at an existing position changed — that's a rename. Re-issue with allow_rename:true to confirm (existing records keep their byte index but the displayed value changes).\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+        }
+
         edited_old_idx[e] = found;
     }
 
@@ -5994,6 +6047,15 @@ int cmd_edit_fields(const char *db_root, const char *object,
             new_ts.fields[i].size             = parsed[edit_for_i].size;
             new_ts.fields[i].numeric_scale    = parsed[edit_for_i].numeric_scale;
             new_ts.fields[i].numeric_scale_mult = parsed[edit_for_i].numeric_scale_mult;
+            /* FT_ENUM: overlay the new value list + width. Pointer is
+               shared with parsed[edit_for_i] which lives on this stack
+               frame; that's safe because new_ts is also stack-local and
+               doesn't outlive parsed[]. The on-disk fields.conf rewrite
+               (lines[]) carries the canonical spec; load_typed_schema
+               will re-allocate enum_values from disk on next read. */
+            new_ts.fields[i].enum_values    = parsed[edit_for_i].enum_values;
+            new_ts.fields[i].n_enum_values  = parsed[edit_for_i].n_enum_values;
+            new_ts.fields[i].enum_width     = parsed[edit_for_i].enum_width;
             /* default_kind / default_val: re-parse from the spec — but
                parse_field_line via parse_field_type doesn't currently
                carry defaults through (those are parsed by load_typed_schema's
@@ -6031,6 +6093,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
         log_msg(3, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
                 db_root, object, n_edits);
         OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":false}\n", n_edits);
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
         return 0;
     }
 
@@ -6102,6 +6165,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
         "\"slot_size\":%d,\"indexes_rebuilt\":%d}\n",
         n_edits, new_sch.slot_size, idx_rebuilt);
+    for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
     return 0;
 }
 

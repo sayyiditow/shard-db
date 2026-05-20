@@ -1222,7 +1222,7 @@ int cmd_add_fields(const char *db_root, const char *object,
    at the cost of touching unaffected indexes). Caller holds
    objlock_wrlock. */
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int nlines);
+                    char lines[][256], int nlines, int allow_rename);
 void invalidate_schema_caches(const char *db_root, const char *object);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */
