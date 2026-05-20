@@ -1068,6 +1068,10 @@ typedef struct {
        address the just-written record by (shard, slot). */
     int               kf_shard;
     uint32_t          kf_slot;
+    /* Populated by pre_commit when a bitmap-index field's per-file cap
+       is exceeded. cmd_insert_v2 surfaces this as the wire-level error
+       so the operator gets an actionable message + the field name. */
+    char              err_buf[256];
 } V2InsertCtx;
 
 static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1152,7 +1156,15 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
         if (n_args > 0) {
             parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
             for (int i = 0; i < n_args; i++) {
-                if (args[i].out_error == -1) bm_overflow = 1;
+                if (args[i].out_error == -1 && !c->err_buf[0]) {
+                    bm_overflow = 1;
+                    snprintf(c->err_buf, sizeof(c->err_buf),
+                        "bitmap index on field '%s' exceeded distinct-value cap "
+                        "(this insert/update would push the dict past the per-file limit). "
+                        "Either declare a higher cap with field:bitmap(N), or switch to btree: "
+                        "remove-index then add-index without :bitmap.",
+                        args[i].field);
+                }
                 free(args[i].new_key);
                 free(args[i].old_key);
             }
@@ -1200,7 +1212,14 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             if (n_bm > 0) {
                 parallel_for(update_idx_fn, bm_args, n_bm, sizeof(UpdateIdxArg));
                 for (int i = 0; i < n_bm; i++) {
-                    if (bm_args[i].out_error == -1) bm_overflow = 1;
+                    if (bm_args[i].out_error == -1 && !c->err_buf[0]) {
+                        bm_overflow = 1;
+                        snprintf(c->err_buf, sizeof(c->err_buf),
+                            "bitmap index on field '%s' exceeded distinct-value cap "
+                            "(this insert would push the dict past the per-file limit). "
+                            "Either declare a higher cap with field:bitmap(N), or switch to btree.",
+                            bm_args[i].field);
+                    }
                     free(bm_args[i].new_key);
                 }
             }
@@ -1318,7 +1337,11 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         free(result.current_value);
         free_criteria(crit, ncrit);
         free(typed_buf);
-        OUT("{\"error\":\"upsert failed\"}\n");
+        if (ctx.err_buf[0]) {
+            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+        } else {
+            OUT("{\"error\":\"upsert failed\"}\n");
+        }
         return 1;
     }
 
@@ -1373,6 +1396,8 @@ typedef struct {
        by physical slot, not by hash). */
     int               kf_shard;
     uint32_t          kf_slot;
+    /* Populated by pre_commit on bitmap-index cap overflow. */
+    char              err_buf[256];
 } V2UpdateCtx;
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1477,8 +1502,16 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
     int bm_overflow = 0;
     if (n_args > 0) {
         parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
-        for (int i = 0; i < n_args; i++)
-            if (args[i].out_error == -1) bm_overflow = 1;
+        for (int i = 0; i < n_args; i++) {
+            if (args[i].out_error == -1 && !c->err_buf[0]) {
+                bm_overflow = 1;
+                snprintf(c->err_buf, sizeof(c->err_buf),
+                    "bitmap index on field '%s' exceeded distinct-value cap "
+                    "(this update would push the dict past the per-file limit). "
+                    "Either declare a higher cap with field:bitmap(N), or switch to btree.",
+                    args[i].field);
+            }
+        }
     }
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
@@ -1637,7 +1670,11 @@ static int cmd_update_v2(const char *db_root, const char *object,
     if (rc != 0) {
         free(result.current_value);
         free_criteria(crit, ncrit);
-        OUT("{\"error\":\"update failed\"}\n");
+        if (ctx.err_buf[0]) {
+            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+        } else {
+            OUT("{\"error\":\"update failed\"}\n");
+        }
         return 1;
     }
     free_criteria(crit, ncrit);

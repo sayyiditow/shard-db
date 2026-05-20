@@ -757,6 +757,7 @@ static int test_bitmap_index_run(void) {
        enough attempts. Practical assertion: try 24 inserts of 24
        distinct values; some MUST collide and trip the cap. */
     int saw_cap_error = 0;
+    int actionable_msg = 0;
     for (int k = 0; k < 24; k++) {
         char req[256];
         snprintf(req, sizeof(req),
@@ -765,6 +766,10 @@ static int test_bitmap_index_run(void) {
         tc_request(tc, req, &resp);
         if (resp && strstr(resp, "\"error\"")) {
             saw_cap_error = 1;
+            if (strstr(resp, "bitmap index on field 'v' exceeded") &&
+                strstr(resp, "or switch to btree")) {
+                actionable_msg = 1;
+            }
             free(resp); resp = NULL;
             break;
         }
@@ -772,6 +777,8 @@ static int test_bitmap_index_run(void) {
     }
     ASSERT_TRUE(saw_cap_error,
                 "bitmap(2) cap eventually trips across 24 distinct values");
+    ASSERT_TRUE(actionable_msg,
+                "cap-exceeded error names the field + suggests btree");
 
     /* === Restart: schema + index.conf survive across daemon stop/start.
            No `test_env_restart` helper — compose it from stop_keep + start_at,
