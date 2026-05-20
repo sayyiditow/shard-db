@@ -8161,6 +8161,44 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         default: return 0;
         }
     }
+    case FT_ENUM: {
+        /* Encoded byte index → enum_values lookup → criterion match.
+           compile_one (FT_ENUM case in phase 3) pre-resolves c->value
+           to its byte index in cc->i1, and (for IN/NOT_IN) c->in_values
+           to cc->in_i64. Here we just decode the record bytes and
+           compare integer indices. -1 means "no such value in dict"
+           — matches OP_NOT_EQUAL, OP_NOT_IN, OP_NOT_EXISTS only. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int64_t v;
+        if (f->enum_width == 2) {
+            v = (int64_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+        } else {
+            v = (int64_t)p[0];
+        }
+        /* The literal byte 0x00 is a legit enum index. EXISTS is
+           always 1 because every record gets a valid index on insert. */
+        switch (cc->op) {
+        case OP_EXISTS:     return 1;
+        case OP_NOT_EXISTS: return 0;
+        case OP_EQUAL:      return cc->i1 >= 0 && v == cc->i1;
+        case OP_NOT_EQUAL:  return cc->i1 < 0 || v != cc->i1;
+        case OP_LESS:       return cc->i1 >= 0 && v <  cc->i1;
+        case OP_GREATER:    return cc->i1 >= 0 && v >  cc->i1;
+        case OP_LESS_EQ:    return cc->i1 >= 0 && v <= cc->i1;
+        case OP_GREATER_EQ: return cc->i1 >= 0 && v >= cc->i1;
+        case OP_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (cc->in_i64[i] >= 0 && v == cc->in_i64[i]) return 1;
+            return 0;
+        }
+        case OP_NOT_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (cc->in_i64[i] >= 0 && v == cc->in_i64[i]) return 0;
+            return 1;
+        }
+        default: return 0;
+        }
+    }
     }
     return 0;
 }
@@ -14635,6 +14673,50 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
+    if (strncmp(type, "enum(", 5) == 0) {
+        /* Validate enum(v1,v2,...) — empty list, duplicates, missing
+           close paren, and over-ceiling all → invalid (return 0).
+           Returns the storage byte width: 1 for ≤256 values, 2 for
+           257..65535. create-object is cold path, simple alloc is fine. */
+        const char *open  = type + 5;
+        const char *close = strrchr(open, ')');
+        if (!close || close <= open) return 0;
+
+        /* Pass 1: count + duplicate-check via a heap-allocated value list.
+           A worst-case 65535-entry list of avg ~8B = ~640 KB peak — fine. */
+        char **vals = calloc(65536, sizeof(char *));
+        if (!vals) return 0;
+        int n = 0;
+        const char *p = open;
+        while (p < close) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl == 0) goto enum_invalid;            /* empty value */
+            if (n >= 65535)            goto enum_invalid;
+            char *v = malloc(vl + 1);
+            if (!v) goto enum_invalid;
+            memcpy(v, p, vl); v[vl] = '\0';
+            for (int i = 0; i < n; i++) {
+                if (strcmp(vals[i], v) == 0) {  /* duplicate */
+                    free(v);
+                    goto enum_invalid;
+                }
+            }
+            vals[n++] = v;
+            p = (next < close) ? next + 1 : close;
+        }
+        if (n == 0) goto enum_invalid;
+        int width = (n <= 256) ? 1 : 2;
+        for (int i = 0; i < n; i++) free(vals[i]);
+        free(vals);
+        return width;
+
+enum_invalid:
+        for (int i = 0; i < n; i++) free(vals[i]);
+        free(vals);
+        return 0;
+    }
     return 0;
 }
 

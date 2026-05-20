@@ -1249,6 +1249,16 @@ static size_t typed_field_str_avg(const TypedField *f) {
     case FT_TIME:     return 8;   /* HH:MM:SS */
     case FT_TIMESTAMP: return 20; /* Unix epoch ms, up to 19 digits + sign */
     case FT_UUID:     return 36;  /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+    case FT_ENUM: {
+        /* Mean length of the declared value strings; pre-declared at
+           create-object, so the estimate is exact (not heuristic). */
+        if (!f->enum_values || f->n_enum_values <= 0) return 8;
+        size_t sum = 0;
+        for (int i = 0; i < f->n_enum_values; i++)
+            sum += f->enum_values[i] ? strlen(f->enum_values[i]) : 0;
+        size_t avg = sum / (size_t)f->n_enum_values;
+        return avg < 1 ? 1 : avg;
+    }
     }
     return 16;
 }

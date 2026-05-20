@@ -155,7 +155,13 @@ enum FieldType {
                        emit clock_gettime(CLOCK_REALTIME) in ms. Distinct from FT_LONG
                        (no time-source defaults) and FT_DATETIME (calendar-packed,
                        can't represent pre-1970 or post-9999 dates). */
-    FT_UUID         /* uuid — 16 bytes binary */
+    FT_UUID,        /* uuid — 16 bytes binary */
+    FT_ENUM         /* enum(v1,v2,...) — declared value list, encoded as
+                       1-byte index (≤256 values) or 2-byte BE index
+                       (257-65535 values). The byte width is fixed at
+                       declaration time; auto-widens 1→2 via edit-field
+                       when an append pushes count past 256. Auto-defaults
+                       to a bitmap index (like FT_BOOL). */
 };
 
 /* Index types — declared per-field at create-object, persisted in
@@ -192,6 +198,14 @@ typedef struct {
                            its bytes stay reserved until vacuum compacts them out */
     enum DefaultKind default_kind;
     char default_val[256]; /* literal value, seq name, or random byte count */
+
+    /* FT_ENUM only — populated by load_typed_schema, freed by
+       free_typed_schema. Empty/zeroed for every other type.
+       `enum_values` is a heap-allocated array of strdup'd value strings;
+       a record's encoded byte index `i` decodes to `enum_values[i]`. */
+    char **enum_values;
+    int    n_enum_values;
+    int    enum_width;  /* 1 if n_enum_values <= 256, else 2 (BE) */
 } TypedField;
 
 typedef struct {

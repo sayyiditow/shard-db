@@ -1010,7 +1010,26 @@ void invalidate_idx_cache(const char *object) {
 /* ========== Typed Field System ========== */
 
 /* Parse type string like "varchar:40", "long", "numeric:19,4" */
+/* Free the enum value list owned by a TypedField. Safe on NULL.
+   Used by:
+   - cache invalidation (so we don't leak when a schema is replaced)
+   - parse_field_type re-entry (defensive cleanup if a TypedField is
+     parsed twice without going through cache eviction)
+   - free_typed_schema (the explicit cleanup helper) */
+void free_enum_values(TypedField *f) {
+    if (!f || !f->enum_values) return;
+    for (int i = 0; i < f->n_enum_values; i++) free(f->enum_values[i]);
+    free(f->enum_values);
+    f->enum_values = NULL;
+    f->n_enum_values = 0;
+    f->enum_width = 0;
+}
+
 void parse_field_type(const char *spec, TypedField *f) {
+    /* Defensive cleanup — if the same TypedField is re-parsed in place,
+       drop the old enum value list before overwriting. */
+    free_enum_values(f);
+
     f->type = FT_NONE;
     f->size = 0;
     f->numeric_scale = 0;
@@ -1076,6 +1095,58 @@ void parse_field_type(const char *spec, TypedField *f) {
         const char *comma = strchr(spec + 8, ',');
         if (comma) f->numeric_scale = atoi(comma + 1);
         else f->numeric_scale = 2; /* default 2 decimal places */
+    } else if (strncmp(spec, "enum(", 5) == 0) {
+        /* enum(red,green,blue) — declared value list.
+           Storage byte width is auto-picked by count:
+             n_enum_values <= 256 → 1 byte (0..255)
+             n_enum_values <= 65535 → 2 bytes BE
+           Width >65535 is rejected at create-object.
+           Values are split on `,`; commas inside values aren't supported.
+           Duplicates are rejected at create-object (this function only
+           parses; the validator above lives in cmd_create_object). */
+        const char *open  = spec + 5;          /* after "enum(" */
+        const char *close = strrchr(open, ')');
+        if (!close || close <= open) return;   /* malformed → FT_NONE */
+
+        /* First pass: count values + max length to size the heap alloc. */
+        int n = 0;
+        const char *p = open;
+        while (p < close) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl > 0) n++;
+            p = (next < close) ? next + 1 : close;
+        }
+        if (n == 0 || n > 65535) return;       /* empty list or over ceiling */
+
+        char **vals = calloc((size_t)n, sizeof(char *));
+        if (!vals) return;
+        int written = 0;
+        p = open;
+        while (p < close && written < n) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl > 0) {
+                vals[written] = malloc(vl + 1);
+                if (!vals[written]) {
+                    /* OOM mid-parse — undo and bail */
+                    for (int i = 0; i < written; i++) free(vals[i]);
+                    free(vals);
+                    return;
+                }
+                memcpy(vals[written], p, vl);
+                vals[written][vl] = '\0';
+                written++;
+            }
+            p = (next < close) ? next + 1 : close;
+        }
+        f->type = FT_ENUM;
+        f->enum_values = vals;
+        f->n_enum_values = written;
+        f->enum_width = (written <= 256) ? 1 : 2;
+        f->size = f->enum_width;
     }
     /* Precompute 10^scale so decode-hot paths don't recompute per record */
     if (f->type == FT_NUMERIC) {
@@ -2491,6 +2562,12 @@ void invalidate_schema_caches(const char *db_root, const char *object) {
     pthread_mutex_lock(&g_typed_lock);
     for (int i = 0; i < TYPED_BUCKETS; i++) {
         if (g_typed_cache[i].used && strcmp(g_typed_cache[i].name, key) == 0) {
+            /* Free any heap-owned per-field state (enum_values today;
+               room for future per-field heap allocations). */
+            TypedSchema *ts = &g_typed_cache[i].schema;
+            for (int fi = 0; fi < ts->nfields; fi++) {
+                free_enum_values(&ts->fields[fi]);
+            }
             g_typed_cache[i].used = 0;
             g_typed_cache[i].name[0] = '\0';
         }
