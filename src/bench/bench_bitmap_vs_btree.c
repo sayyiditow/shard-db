@@ -4,8 +4,11 @@
  * `flag:bitmap` (auto-default behaviour, made explicit for clarity),
  * the other `flag:btree`. Bulk-insert N identical records into each,
  * then run count + find queries `flag eq false` / `flag eq true` on
- * both. The section formatter prints the rows side-by-side with a
- * relative bar chart that makes the bitmap win obvious.
+ * both, sweeping `limit ∈ {1000, 100000, 1000000}` so the crossover
+ * is visible: btree narrowly wins low-limit (less file-open setup),
+ * bitmap wins mid/high-limit (ffs-over-uint64 beats leaf-walk). The
+ * section formatter prints the rows side-by-side with a relative
+ * bar chart that makes the bitmap win obvious.
  *
  * Scale: SHARD_BENCH_COUNT (default 1_000_000). At 1M records the
  * gap between bitmap popcount and btree walk is large enough to
@@ -200,8 +203,10 @@ static int bench_bitmap_vs_btree_run(void) {
         "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]}");
     bench_table_section_end();
 
-    /* find limit=1000 — same selector but materialises records.
-       Bitmap still walks fewer bits before stopping at limit. */
+    /* find limit=1000 — at low limit both stop early and the per-match
+       cost is dominated by payload fetch. Bitmap pays a higher
+       setup cost (one .bm per data shard vs ~splits/4 .idx for btree),
+       so btree narrowly wins here. */
     bench_table_section_begin("find flag eq <bool> (limit=1000)");
     bench_table_run(tc, "bitmap flag=false",
         "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"bm\","
@@ -221,14 +226,61 @@ static int bench_bitmap_vs_btree_run(void) {
         "\"limit\":1000}");
     bench_table_section_end();
 
+    /* find limit=100000 — mid-scale. Per-match key extraction starts
+       to matter; bitmap's ffs-over-uint64 packs 64 candidates per
+       word vs btree walking a leaf entry per match. Crossover region. */
+    bench_table_section_begin("find flag eq <bool> (limit=100000)");
+    bench_table_run(tc, "bitmap flag=false",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"bm\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}],"
+        "\"limit\":100000}");
+    bench_table_run(tc, "btree  flag=false",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"btr\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}],"
+        "\"limit\":100000}");
+    bench_table_run(tc, "bitmap flag=true",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"bm\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":100000}");
+    bench_table_run(tc, "btree  flag=true",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"btr\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":100000}");
+    bench_table_section_end();
+
+    /* find limit=1000000 — high-scale. Index-scan cost dominates over
+       setup. Bitmap's dense-bit iteration is now several times faster
+       than walking a million btree leaf entries. */
+    bench_table_section_begin("find flag eq <bool> (limit=1000000)");
+    bench_table_run(tc, "bitmap flag=false",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"bm\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}],"
+        "\"limit\":1000000}");
+    bench_table_run(tc, "btree  flag=false",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"btr\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}],"
+        "\"limit\":1000000}");
+    bench_table_run(tc, "bitmap flag=true",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"bm\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":1000000}");
+    bench_table_run(tc, "btree  flag=true",
+        "{\"mode\":\"find\",\"dir\":\"b\",\"object\":\"btr\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":1000000}");
+    bench_table_section_end();
+
     printf("\nNotes:\n");
     printf("  · Both indexes serve eq queries; bitmap on bool is ~125 KB\n");
     printf("    per shard (2 dense bitmaps), btree carries every value.\n");
     printf("  · count() on bitmap is a popcount over each shard's bitmap;\n");
     printf("    count() on btree walks every matching leaf entry.\n");
-    printf("  · find() differs less because both still fetch ≤limit\n");
-    printf("    record payloads from segments — the lookup-by-hash cost\n");
-    printf("    is the same once you have the matching keys.\n");
+    printf("  · find() crossover: bitmap opens one .bm per data shard\n");
+    printf("    vs btree's ~splits/4 .idx files, so setup cost is higher.\n");
+    printf("    At low limit (1k) btree edges ahead — fetch dominates and\n");
+    printf("    the setup tax matters. At mid/high limits (100k, 1M) the\n");
+    printf("    per-match scan cost flips it: bitmap's ffs-over-uint64\n");
+    printf("    packs 64 candidates per word, btree walks leaf-by-leaf.\n");
 
     tc_close(tc);
     test_env_stop(&te);
