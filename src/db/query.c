@@ -7546,6 +7546,24 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         }
         break;
     }
+    case FT_ENUM:
+        /* Resolve the criterion's display-string value to its byte index
+           in the enum's value list. -1 means "no such value" — match_typed
+           interprets that as "no record can match this criterion under
+           positive ops" (EQ/IN/LT/GT/etc.) and "every record matches under
+           the negation" (NEQ/NOT_IN). The c->value lookup uses
+           enum_value_index (linear scan; cold path, n ≤ 65535). */
+        if (cc->tf && c->value[0]) {
+            cc->i1 = (int64_t)enum_value_index(cc->tf, c->value, strlen(c->value));
+        } else {
+            cc->i1 = -1;
+        }
+        if (cc->tf && c->value2[0]) {
+            cc->i2 = (int64_t)enum_value_index(cc->tf, c->value2, strlen(c->value2));
+        } else {
+            cc->i2 = -1;
+        }
+        break;
     case FT_VARCHAR:
     default:
         break;
@@ -7637,6 +7655,13 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             cc->in_uuid = malloc(sizeof(uint8_t[16]) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 parse_uuid(c->in_values[i], cc->in_uuid[i]);
+            break;
+        case FT_ENUM:
+            cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                cc->in_i64[i] = (int64_t)enum_value_index(cc->tf,
+                                                          c->in_values[i],
+                                                          strlen(c->in_values[i]));
             break;
         default:
             /* VARCHAR, DATETIME, BOOL, BYTE: use raw strings via c->in_values */
@@ -15720,6 +15745,22 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                 b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
+    case FT_ENUM: {
+        /* Stored bytes are the byte index. Look up enum_values[idx]
+           and copy. Out-of-range index (data corruption) → empty string. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int idx = (f->enum_width == 2)
+                    ? (int)(((uint16_t)p[0] << 8) | (uint16_t)p[1])
+                    : (int)p[0];
+        if (idx < 0 || idx >= f->n_enum_values) return 0;
+        const char *s = f->enum_values[idx];
+        if (!s) return 0;
+        size_t sl = strlen(s);
+        if (sl >= bufsz) sl = bufsz - 1;
+        memcpy(buf, s, sl);
+        buf[sl] = '\0';
+        return (int)sl;
+    }
     default:
         return 0;
     }
@@ -15968,6 +16009,25 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         memcpy(buf, p, cl);
         buf[cl] = '\0';
         return (int)cl;
+    }
+    case FT_ENUM: {
+        /* Index-key for enum = byte index (1 or 2 BE). Decode to
+           enum_values[idx]. Used by the bitmap dict-scan path so a
+           query like `WHERE color LIKE 'r%'` can iterate the dict,
+           decode each entry to its display string, then match_criterion
+           against the user's pattern. */
+        if (!f->enum_values || f->n_enum_values <= 0 || plen == 0) return 0;
+        int idx = (f->enum_width == 2 && plen >= 2)
+                    ? (int)(((uint16_t)p[0] << 8) | (uint16_t)p[1])
+                    : (int)p[0];
+        if (idx < 0 || idx >= f->n_enum_values) return 0;
+        const char *s = f->enum_values[idx];
+        if (!s) return 0;
+        size_t sl = strlen(s);
+        if (sl >= bufsz) sl = bufsz - 1;
+        memcpy(buf, s, sl);
+        buf[sl] = '\0';
+        return (int)sl;
     }
     default: return 0;
     }

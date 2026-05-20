@@ -1010,6 +1010,21 @@ void invalidate_idx_cache(const char *object) {
 /* ========== Typed Field System ========== */
 
 /* Parse type string like "varchar:40", "long", "numeric:19,4" */
+/* Look up a value string in an FT_ENUM field's value list. Returns the
+   0-based index on hit, -1 on miss. Linear scan — fine for n ≤ 65535
+   on cold-path encoding; the hot path (match_typed) pre-resolves the
+   criterion value to an index at compile time. */
+int enum_value_index(const TypedField *f, const char *val, size_t vlen) {
+    if (!f || f->type != FT_ENUM || !f->enum_values) return -1;
+    for (int i = 0; i < f->n_enum_values; i++) {
+        const char *ev = f->enum_values[i];
+        if (!ev) continue;
+        size_t el = strlen(ev);
+        if (el == vlen && memcmp(ev, val, vlen) == 0) return i;
+    }
+    return -1;
+}
+
 /* Free the enum value list owned by a TypedField. Safe on NULL.
    Used by:
    - cache invalidation (so we don't leak when a schema is replaced)
@@ -1497,6 +1512,25 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         out[6] = (v >> 8) & 0xFF;  out[7] = v & 0xFF;
         break;
     }
+    case FT_ENUM: {
+        /* Look up val in the value list; write the byte index (1 or 2
+           bytes BE based on f->enum_width). On miss, zero the field —
+           the JSON parse layer above is responsible for rejecting
+           unknown values before we get here. enum_width is always
+           f->size for FT_ENUM. */
+        int idx = enum_value_index(f, (const char *)val, vlen);
+        if (idx < 0) {
+            memset(out, 0, f->size);
+            break;
+        }
+        if (f->enum_width == 2) {
+            out[0] = (uint8_t)((idx >> 8) & 0xFF);
+            out[1] = (uint8_t)(idx & 0xFF);
+        } else {
+            out[0] = (uint8_t)(idx & 0xFF);
+        }
+        break;
+    }
     default:
         memset(out, 0, f->size);
         break;
@@ -1699,6 +1733,29 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 8;
         break;
     }
+    case FT_ENUM: {
+        /* Index-key for enum = byte-index encoding identical to the
+           stored record bytes. On miss (criterion uses a value not in
+           the list), emit a sentinel that doesn't match any valid
+           record: out_len = 0 ensures the bitmap dict lookup misses
+           cleanly, and any btree range/eq search using this key
+           finds nothing — which is the right answer for a query
+           filtering on a value that doesn't exist. */
+        int idx = enum_value_index(f, (const char *)val, vlen);
+        if (idx < 0) {
+            *out_len = 0;
+            break;
+        }
+        if (f->enum_width == 2) {
+            out[0] = (uint8_t)((idx >> 8) & 0xFF);
+            out[1] = (uint8_t)(idx & 0xFF);
+            *out_len = 2;
+        } else {
+            out[0] = (uint8_t)(idx & 0xFF);
+            *out_len = 1;
+        }
+        break;
+    }
     default:
         memset(out, 0, f->size);
         *out_len = f->size;
@@ -1803,6 +1860,18 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
     case FT_BYTE:
         out[0] = src[0];
         *out_len = 1;
+        break;
+    case FT_ENUM:
+        /* Stored bytes ARE the index-key encoding (1 or 2 bytes BE).
+           Memcpy through; bitmap dict lookups use byte-equality on
+           these. */
+        if (f->enum_width == 2) {
+            out[0] = src[0]; out[1] = src[1];
+            *out_len = 2;
+        } else {
+            out[0] = src[0];
+            *out_len = 1;
+        }
         break;
     default:
         *out_len = 0;

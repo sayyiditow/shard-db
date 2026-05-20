@@ -680,11 +680,17 @@ typedef struct {
 } ParsedIndexSpec;
 int parse_index_spec(const char *spec, ParsedIndexSpec *out);
 
-/* The canonical auto-bitmap rule. Today: bool fields whose spec was
-   bare (no explicit :type) become bitmap. Enum will join the same
-   condition once that type lands. Single source of truth so the rule
-   can never drift between create-object and reindex. */
+/* The canonical auto-bitmap rule. Today: bool and enum fields whose
+   spec was bare (no explicit :type) become bitmap. Single source of
+   truth so the rule can never drift between create-object and reindex. */
 int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type);
+
+/* FT_ENUM helpers (config.c). enum_value_index returns the 0-based
+   byte index of a value string in an FT_ENUM field's value list (-1
+   on miss). free_enum_values releases the heap-owned value strings
+   on schema invalidation / re-parse. */
+int  enum_value_index(const TypedField *f, const char *val, size_t vlen);
+void free_enum_values(TypedField *f);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
 void build_effective_root(char *out, size_t outlen, const char *dir);
