@@ -6943,53 +6943,6 @@ typedef struct {
                               parallel shard scans */
 } AdvSearchCtx;
 
-/* Vlen-aware match. Identical semantics to match_criterion but
-   callers that already know the value's byte length (every cb on
-   the btree-scan hot path: idx_count_cb, collect_hash_cb,
-   stream_keyset_cb, agg's per-leaf path) can skip a per-entry
-   strlen scan. Concretely: OP_ENDS_WITH used to compute
-   `strlen(val_str)` per leaf entry — at 25M emails averaging ~25
-   bytes that was ~625 MB of redundant memory scans just to find
-   string lengths. With vlen passed in we go straight to memcmp.
-   OP_CONTAINS / OP_LIKE / OP_STARTS_WITH also benefit slightly
-   (strstr+strncmp internally still walk the haystack, but at
-   least we avoid the second strlen for length validation).
-   Other ops delegate to match_criterion — for them the perf
-   gain is marginal and the existing path is well-trodden. */
-int match_criterion_vlen(const char *val, size_t vlen,
-                         const SearchCriterion *c) {
-    if (!val && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
-    switch (c->op) {
-    case OP_ENDS_WITH: {
-        size_t cl = strlen(c->value);
-        if (vlen < cl) return 0;
-        return memcmp(val + vlen - cl, c->value, cl) == 0;
-    }
-    case OP_STARTS_WITH: {
-        size_t cl = strlen(c->value);
-        if (vlen < cl) return 0;
-        return memcmp(val, c->value, cl) == 0;
-    }
-    case OP_CONTAINS: {
-        size_t cl = strlen(c->value);
-        if (cl == 0) return 1;
-        if (vlen < cl) return 0;
-        return memmem(val, vlen, c->value, cl) != NULL;
-    }
-    case OP_NOT_CONTAINS: {
-        size_t cl = strlen(c->value);
-        if (cl == 0) return 0;
-        if (vlen < cl) return 1;
-        return memmem(val, vlen, c->value, cl) == NULL;
-    }
-    default:
-        /* Other ops still need strlen-style semantics — fall back to
-           match_criterion. val must be NUL-terminated; callers on the
-           cb hot path already do tmp[vlen] = '\0' before invoking. */
-        return match_criterion(val, c);
-    }
-}
-
 int match_criterion(const char *val_str, const SearchCriterion *c) {
     if (!val_str && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
 
@@ -8897,16 +8850,10 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
     if (cc->primary_crit && op_is_length(cc->primary_crit->op)) {
         if (!match_length_vlen(vlen, cc->primary_crit)) return 0;
     } else if (cc->check_primary && cc->primary_crit) {
-        /* Vlen-aware match avoids strlen on val for ENDS_WITH /
-           CONTAINS / STARTS_WITH — at high-cardinality varchar
-           indexes (25M emails) that strlen scan was the dominant
-           per-entry cost. Other ops still need a NUL-terminated
-           tmp; the vlen variant falls back to match_criterion for
-           those, so we keep the copy + null-terminate.  */
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, cc->primary_crit)) return 0;
+        if (!match_criterion(tmp, cc->primary_crit)) return 0;
     }
 
     /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
@@ -8951,7 +8898,7 @@ static int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16,
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, sk->primary_crit)) return 0;
+        if (!match_criterion(tmp, sk->primary_crit)) return 0;
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
@@ -9377,7 +9324,7 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, ic->primary_crit)) return 0;
+        if (!match_criterion(tmp, ic->primary_crit)) return 0;
     }
     idx_count_local.pending++;
     /* Cap residency so a freak query (millions of matches in one shard
@@ -9907,7 +9854,7 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, sc->primary_crit)) return 0;
+        if (!match_criterion(tmp, sc->primary_crit)) return 0;
     }
 
     /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
@@ -16952,7 +16899,7 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, ia->primary_crit)) return 0;
+        if (!match_criterion(tmp, ia->primary_crit)) return 0;
     }
     /* Layout-agnostic fetch + invoke agg_scan_cb on the synthesized header. */
     RecordRef rr;
