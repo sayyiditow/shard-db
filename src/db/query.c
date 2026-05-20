@@ -11835,11 +11835,35 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
-            btree_dispatch(db_root, object, pc->field, sch.splits,
-                           pc, pc_tf, idx_count_cb, &ic);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%zu\n", ic.count);
+            /* Bitmap + eq has a popcount fast path: sum bm_count across
+               every data shard, no per-bit cb invocation. ~100× faster
+               than walking via btree_dispatch + idx_count_cb at 10M
+               rows (cache-friendly stride-byte scan instead of 5M
+               per-bit callbacks). */
+            if (op == OP_EQUAL &&
+                field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+                uint8_t valbuf[1024];
+                size_t  vallen = 0;
+                encode_criterion_value(pc_tf, pc->value, strlen(pc->value),
+                                       valbuf, &vallen);
+                size_t total = 0;
+                for (int s = 0; s < sch.splits; s++) {
+                    char bp[1024];
+                    bm_build_path(bp, sizeof(bp), db_root, object, pc->field, s);
+                    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+                    if (!bm) continue;
+                    total += bm_count(bm, valbuf, vallen);
+                    bm_close(bm);
+                }
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", total);
+            } else {
+                IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
+                btree_dispatch(db_root, object, pc->field, sch.splits,
+                               pc, pc_tf, idx_count_cb, &ic);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", ic.count);
+            }
         } else {
             CollectCtx cc;
             collect_ctx_init(&cc);
