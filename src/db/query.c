@@ -9019,33 +9019,45 @@ static void btree_dispatch(const char *db_root, const char *object,
                            SearchCriterion *pc, const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
     if (field_index_type(db_root, object, field) == IT_BITMAP &&
-        pc->op == OP_EQUAL) {
-        uint8_t valbuf[1032];
-        size_t  vallen = 0;
-        encode_criterion_value(tf, pc->value, strlen(pc->value), valbuf, &vallen);
-        if (vallen == 0) return;
+        (pc->op == OP_EQUAL || pc->op == OP_IN)) {
         Schema sc = load_schema(db_root, object);
         SlotcaskSchemaInfo info = {
             .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (!sdb) return;
-        /* Parallel shard fan-out — mirrors btree's shard_walk_dispatch.
-           Each worker grabs one shard. A shared atomic stop_flag lets
-           a worker that hits the caller's limit cancel the rest mid-
-           flight. The cb (collect_hash_cb / idx_count_cb) is already
-           thread-safe via atomic counter + TLS batching. */
+
+        /* For OP_IN we loop once per value, parallel-fanning each value
+           across all shards. Per-value bitmaps are disjoint (every
+           record sets exactly one value's bit), so emit cb across the
+           values produces no duplicates. For 2-4 values on bool/enum
+           this is a small constant overhead; for huge IN lists the
+           tradeoff is still favourable vs full scan. The stop_flag is
+           shared across all per-value parallel_for invocations so an
+           early-stop from any cb (e.g. find's limit) propagates. */
+        int n_vals = (pc->op == OP_EQUAL) ? 1 : pc->in_count;
+        if (n_vals <= 0) return;
+
         int stop_flag = 0;
         BmShardWalkArg *args = malloc((size_t)splits * sizeof(BmShardWalkArg));
         if (!args) return;
-        for (int s = 0; s < splits; s++) {
-            args[s] = (BmShardWalkArg){
-                .db_root = db_root, .object = object, .field = field,
-                .shard_idx = s, .value = valbuf, .vlen = vallen,
-                .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
-            };
+
+        for (int vi = 0; vi < n_vals; vi++) {
+            if (__atomic_load_n(&stop_flag, __ATOMIC_RELAXED)) break;
+            uint8_t valbuf[1032];
+            size_t  vallen = 0;
+            const char *raw = (pc->op == OP_EQUAL) ? pc->value : pc->in_values[vi];
+            encode_criterion_value(tf, raw, strlen(raw), valbuf, &vallen);
+            if (vallen == 0) continue;
+            for (int s = 0; s < splits; s++) {
+                args[s] = (BmShardWalkArg){
+                    .db_root = db_root, .object = object, .field = field,
+                    .shard_idx = s, .value = valbuf, .vlen = vallen,
+                    .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+                };
+            }
+            parallel_for(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
         }
-        parallel_for(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
         free(args);
         return;
     }
@@ -10570,18 +10582,21 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     enum IndexType itype = field_index_type(db_root, object, c->field);
     Schema sch = load_schema(db_root, object);
     if (itype == IT_BITMAP) {
-        /* Bitmap serves OP_EQUAL natively (popcount fast path) and
-           OP_NOT_EQUAL via the count-mode subtraction shortcut at
-           the PRIMARY_LEAF site (op_is_negatable → op_invert →
-           eq → popcount). Without claiming NEQ here, the planner
-           falls to PRIMARY_NONE for `neq <bool>=X` and degrades
-           to a full scan (~1s at 25M vs ~30ms via popcount —
-           that's the regression that prompted this fix).
-           OTHER negatable ops (NOT_LIKE / NOT_CONTAINS / NOT_IN /
-           NOT_EXISTS) invert to ops that bitmap does NOT serve;
-           those would re-dispatch into btree_idx_* against a
-           non-existent .idx file. They stay PRIMARY_NONE for now. */
-        if (c->op != OP_EQUAL && c->op != OP_NOT_EQUAL) return 0;
+        /* Bitmap serves the following directly:
+             - OP_EQUAL  : popcount of one value's bitmap
+             - OP_IN     : sum popcount across listed values' bitmaps
+             - OP_NOT_EQUAL : via op_invert → EQ, subtracted from total
+             - OP_NOT_IN    : via op_invert → IN, subtracted from total
+           The negation ops route through the PRIMARY_LEAF count-mode
+           subtraction shortcut. EXISTS / NOT_EXISTS / IN-whole-domain
+           are already pre-empted by typed-field shortcuts before the
+           planner; they never reach this function with bitmap.
+           Other ops (LIKE/CONTAINS/range/regex/len_*) don't apply to
+           bool semantically — leave them as PRIMARY_NONE for now;
+           the full-coverage dict-scan path is a follow-up. */
+        if (c->op != OP_EQUAL && c->op != OP_NOT_EQUAL &&
+            c->op != OP_IN    && c->op != OP_NOT_IN)
+            return 0;
         if (out_idx_path) {
             snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
                      db_root, object, c->field);
@@ -10973,6 +10988,55 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
     return IT_BTREE;
 }
 
+/* Sum bm_count for a single encoded value across every data shard.
+   Cache-friendly stride-byte popcount in each shard. Cheap (~ms-scale
+   at 25M / 128 shards even cold). Shared between count's popcount
+   fast path, the negation-shortcut popcount, and IN-sum below. */
+static size_t bm_popcount_one_value(const char *db_root, const char *object,
+                                     const char *field, int splits,
+                                     const uint8_t *value, size_t vlen) {
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) {
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        total += bm_count(bm, value, vlen);
+        bm_close(bm);
+    }
+    return total;
+}
+
+/* Total bitmap match count for an OP_EQUAL / OP_IN criterion.
+   Per-value bitmaps are disjoint by construction (each record's value
+   sets exactly one bit across the per-value maps), so summing across
+   the IN values gives the exact match count without dedup. */
+static size_t bm_popcount_for_crit(const char *db_root, const char *object,
+                                    int splits, const SearchCriterion *crit,
+                                    const TypedField *tf) {
+    if (!crit) return 0;
+    uint8_t v[1024];
+    size_t  vl = 0;
+    if (crit->op == OP_EQUAL) {
+        encode_criterion_value(tf, crit->value, strlen(crit->value), v, &vl);
+        if (vl == 0) return 0;
+        return bm_popcount_one_value(db_root, object, crit->field, splits, v, vl);
+    }
+    if (crit->op == OP_IN) {
+        size_t total = 0;
+        for (int i = 0; i < crit->in_count; i++) {
+            vl = 0;
+            encode_criterion_value(tf, crit->in_values[i],
+                                   strlen(crit->in_values[i]), v, &vl);
+            if (vl == 0) continue;
+            total += bm_popcount_one_value(db_root, object, crit->field,
+                                            splits, v, vl);
+        }
+        return total;
+    }
+    return 0;
+}
+
 /* Walk every data shard's bitmap shard for the matching value, lift each
    live record's hash into a KeySet. Returns NULL on timeout / failure
    or when the projected keyset footprint exceeds the per-query memory
@@ -10991,16 +11055,44 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                         const SearchCriterion *leaf,
                                         const TypedField *tf,
                                         QueryDeadline *dl) {
-    /* Bitmap supports eq only for MVP. i-variant (case-insensitive) deferred
-       since bytewise bitmap dict can't fold case without a separate index. */
-    if (leaf->op != OP_EQUAL) return NULL;
+    /* Bitmap serves eq and IN natively. NEQ + NOT_IN come in via the
+       count-mode subtraction shortcut (op_invert → eq/IN). i-variants
+       (case-insensitive) are deferred — bytewise bitmap dict can't
+       fold case without a separate index. */
+    if (leaf->op != OP_EQUAL && leaf->op != OP_IN) return NULL;
 
-    /* Encode the query value the same way bitmap_update encoded the stored
-       value. encode_criterion_value handles the TypedField conversion. */
-    uint8_t valbuf[1024];
-    size_t  vallen = 0;
-    encode_criterion_value(tf, leaf->value, strlen(leaf->value), valbuf, &vallen);
-    if (vallen == 0) return NULL;
+    /* Encode every query value up-front so we can both pre-count and
+       walk later without re-encoding. n_vals = 1 for OP_EQUAL, in_count
+       for OP_IN. Bool/byte/numeric values all fit in <= 8B; even
+       varchar bitmaps (future enum-text) cap at 1024 here. */
+    int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
+    if (n_vals <= 0) return NULL;
+    uint8_t (*vals)[1024] = calloc((size_t)n_vals, sizeof(*vals));
+    size_t *vlens = calloc((size_t)n_vals, sizeof(*vlens));
+    if (!vals || !vlens) { free(vals); free(vlens); return NULL; }
+    if (leaf->op == OP_EQUAL) {
+        encode_criterion_value(tf, leaf->value, strlen(leaf->value),
+                               vals[0], &vlens[0]);
+    } else {
+        for (int i = 0; i < n_vals; i++) {
+            encode_criterion_value(tf, leaf->in_values[i],
+                                   strlen(leaf->in_values[i]),
+                                   vals[i], &vlens[i]);
+        }
+    }
+    /* Drop any zero-length encodings (e.g. NULL/empty); they'd cause
+       bm_count/bm_walk to return 0/0 anyway but the explicit check
+       keeps the inner loop branchless. */
+    int n_kept = 0;
+    for (int i = 0; i < n_vals; i++) {
+        if (vlens[i] == 0) continue;
+        if (n_kept != i) {
+            memcpy(vals[n_kept], vals[i], vlens[i]);
+            vlens[n_kept] = vlens[i];
+        }
+        n_kept++;
+    }
+    if (n_kept == 0) { free(vals); free(vlens); return NULL; }
 
     /* Need a slotcask handle to read kf entries. */
     Schema sc = load_schema(db_root, object);
@@ -11008,19 +11100,25 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) { free(vals); free(vlens); return NULL; }
 
-    /* Pass A: sum bm_count across every shard to get exact match cardinality.
-       Each bm_count is a cache-friendly stride-byte popcount — ~ms-scale at
-       25M / 128 shards even cold. Worth it to size the keyset right. */
+    /* Pass A: sum bm_count across every (shard × value). Each bm_count
+       is a cache-friendly stride-byte popcount — ~ms-scale at 25M /
+       128 shards even cold. Worth it to size the keyset right.
+       Per-value bitmaps are disjoint by construction, so the sum is
+       exact match cardinality even for IN. */
     size_t total_matches = 0;
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) return NULL;
+        if (dl && dl->timed_out) {
+            free(vals); free(vlens); return NULL;
+        }
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
         BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
         if (!bm) continue;
-        total_matches += bm_count(bm, valbuf, vallen);
+        for (int i = 0; i < n_kept; i++) {
+            total_matches += bm_count(bm, vals[i], vlens[i]);
+        }
         bm_close(bm);
     }
 
@@ -11030,19 +11128,25 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        fall through to scan instead of OOM-ing the daemon. */
     size_t ks_bytes_est = (total_matches ? total_matches : 1024)
                            * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
+    if (ks_bytes_est > g_query_buffer_max_bytes) {
+        free(vals); free(vlens); return NULL;
+    }
 
     KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
-    if (!ks) return NULL;
+    if (!ks) { free(vals); free(vlens); return NULL; }
 
-    /* Pass B: actually walk the bitmaps and lift matching hashes via
-       kf lookup. Serial for now — the inserts themselves run lock-free
+    /* Pass B: walk the bitmaps and lift matching hashes via kf lookup.
+       Serial across shards — the inserts themselves run lock-free
        (keyset_insert uses per-bucket CAS) so a parallel-walk would be
        safe, but kfcache_acquire / page faults on cold kf are the real
-       cost and that doesn't trivially parallelise. Revisit if 25M+
-       cold benches show this still dominating. */
+       cost and that doesn't trivially parallelise. For each shard we
+       walk every value's bitmap into the same keyset; duplicates are
+       impossible (values are distinct → bitmaps disjoint) so no extra
+       check needed. */
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+        if (dl && dl->timed_out) {
+            keyset_free(ks); free(vals); free(vlens); return NULL;
+        }
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
@@ -11058,11 +11162,14 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         }
 
         BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
-        bm_walk(bm, valbuf, vallen, bm_collect_to_keyset_cb, &c);
+        for (int i = 0; i < n_kept; i++) {
+            bm_walk(bm, vals[i], vlens[i], bm_collect_to_keyset_cb, &c);
+        }
 
         kfcache_release(&kh);
         bm_close(bm);
     }
+    free(vals); free(vlens);
     if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
     return ks;
 }
@@ -12016,24 +12123,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
              tree->children[0]->kind == CNODE_LEAF);
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
-        /* Bitmap-eq popcount: lifted helper for both the negation
-           branch (neq via op_invert → eq) and the plain eq branch.
-           Cache-friendly stride-byte scan instead of per-bit cb. */
-        #define BM_POPCOUNT_EQ(dst_var, crit_ptr) do { \
-            uint8_t valbuf[1024]; size_t vallen = 0; \
-            encode_criterion_value(pc_tf, (crit_ptr)->value, \
-                                   strlen((crit_ptr)->value), valbuf, &vallen); \
-            (dst_var) = 0; \
-            for (int s = 0; s < sch.splits; s++) { \
-                char bp[1024]; \
-                bm_build_path(bp, sizeof(bp), db_root, object, \
-                              (crit_ptr)->field, s); \
-                BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */); \
-                if (!bm) continue; \
-                (dst_var) += bm_count(bm, valbuf, vallen); \
-                bm_close(bm); \
-            } \
-        } while (0)
 
         if (is_single_leaf && op_is_negatable(op)) {
             /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
@@ -12044,13 +12133,15 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             pos.op = op_invert(op);
             size_t pos_count = 0;
             int pos_ok = 1;
-            if (pos.op == OP_EQUAL &&
+            if ((pos.op == OP_EQUAL || pos.op == OP_IN) &&
                 field_index_type(db_root, object, pc->field) == IT_BITMAP) {
                 /* Bitmap popcount fast path for the inverted positive.
                    ~30 ms at 25M vs ~370 ms via per-bit cb fan-out — and
                    vs ~1 s when leaf_is_indexed used to reject neq on
-                   bitmap entirely (full scan). */
-                BM_POPCOUNT_EQ(pos_count, &pos);
+                   bitmap entirely (full scan). Also handles NOT_IN by
+                   inverting to IN and summing per-value popcounts. */
+                pos_count = bm_popcount_for_crit(db_root, object, sch.splits,
+                                                  &pos, pc_tf);
             } else {
                 int pos_cp = op_needs_check_primary(pos.op);
                 IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
@@ -12066,15 +12157,14 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            /* Bitmap + eq has a popcount fast path: sum bm_count across
-               every data shard, no per-bit cb invocation. ~100× faster
-               than walking via btree_dispatch + idx_count_cb at 10M
-               rows (cache-friendly stride-byte scan instead of 5M
-               per-bit callbacks). */
-            if (op == OP_EQUAL &&
+            /* Bitmap + eq/in has a popcount fast path: sum bm_count across
+               every (data shard × value), no per-bit cb invocation.
+               ~100× faster than walking via btree_dispatch + idx_count_cb
+               (cache-friendly stride-byte scan instead of per-bit callbacks). */
+            if ((op == OP_EQUAL || op == OP_IN) &&
                 field_index_type(db_root, object, pc->field) == IT_BITMAP) {
-                size_t total = 0;
-                BM_POPCOUNT_EQ(total, pc);
+                size_t total = bm_popcount_for_crit(db_root, object,
+                                                     sch.splits, pc, pc_tf);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", total);
             } else {
