@@ -3,7 +3,7 @@
 shard-db ships two index types:
 
 - **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).
-- **Bitmap** (auto-default for `bool` since 2026.05.7; opt-in via `"field:bitmap"` or `"field:bitmap(N)"` for low-cardinality `varchar` enums) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
+- **Bitmap** (auto-default for `bool` and `enum` fields since 2026.05.7; opt-in via `"field:bitmap"` or `"field:bitmap(N)"` for low-cardinality `varchar`) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
 
 ## When to add an index
 
@@ -12,7 +12,7 @@ Add an index when:
 - The object is big enough that a full scan is noticeably slow (tens of thousands of records and up), or
 - You'll use the field as a `join` `remote` key.
 
-For `bool` fields (or future low-cardinality varchar enums) you usually don't need to make a decision — the auto-default puts them on bitmap. Bitmap pays off most when:
+For `bool` and `enum` fields you usually don't need to make a decision — the auto-default puts them on bitmap. Bitmap pays off most when:
 - Your queries `count` / `aggregate` on the field (popcount is O(slots / 64), no btree leaf walk per match).
 - Selectivity is broad (10%+ of records match). At those selectivities a btree leaf walk emits one cb per match; bitmap returns in popcount time.
 

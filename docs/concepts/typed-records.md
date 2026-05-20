@@ -54,6 +54,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars). Malformed input encodes 0. |
 | `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
+| `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Auto-defaults to a [bitmap index](indexes.md). Available since 2026.05.7. |
 
 ### varchar sizing
 
