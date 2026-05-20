@@ -70,6 +70,14 @@ static const char *const BIOS[] = {
 };
 #define N_BIOS 15
 
+/* enum(category) values — must match the create-object spec below.
+   5 values exercises both the bitmap popcount fast path (eq/IN) and
+   the generic dict-scan path (range, LIKE, len_*) at 25M scale. */
+static const char *const CATEGORIES[] = {
+    "electronics", "clothing", "books", "home", "sports"
+};
+#define N_CATEGORIES 5
+
 /* Lowercase a name into out (in-place safe with the static table since
    we're not mutating the source). out must be sized for input length+1. */
 static void lower_str(const char *in, char *out) {
@@ -121,15 +129,15 @@ static int make_memfd(const char *name, const char *data, size_t size) {
  * per record, peak buffer is ~7 GB, fits comfortably in modern RAM
  * even at SHARD_BENCH_COUNT=100M. */
 static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t *out_size) {
-    size_t cap = (size_t)count * 720 + 16;
+    size_t cap = (size_t)count * 760 + 16;
     char *buf = malloc(cap);
     if (!buf) return -1;
     size_t pos = 0;
     buf[pos++] = '[';
     for (int k = 0; k < count; k++) {
         int i = start_i + k;
-        if (pos + 720 > cap) {
-            cap = pos + (size_t)(count - k) * 720 + 16;
+        if (pos + 760 > cap) {
+            cap = pos + (size_t)(count - k) * 760 + 16;
             char *t = realloc(buf, cap);
             if (!t) { free(buf); return -1; }
             buf = t;
@@ -161,6 +169,8 @@ static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t
         char key[33];
         make_user_key(i, key);
 
+        const char *cat = CATEGORIES[i % N_CATEGORIES];
+
         int n = snprintf(buf + pos, cap - pos,
             "%s{\"key\":\"%s\",\"value\":{"
               "\"username\":\"%s.%s%d\","
@@ -175,7 +185,8 @@ static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t
               "\"birthday\":\"%04d%02d%02d\","
               "\"created_at\":\"2024%02d%02d%02d%02d%02d\","
               "\"balance\":\"%.2f\","
-              "\"hourly_rate\":\"%.4f\""
+              "\"hourly_rate\":\"%.4f\","
+              "\"category\":\"%s\""
             "}}",
             k > 0 ? "," : "",
             key,
@@ -187,7 +198,8 @@ static int build_users_chunk_json(int start_i, int count, char **out_buf, size_t
             level,
             year, mo, da,
             mo, da, c_h, c_m, c_s,
-            balance, hourly);
+            balance, hourly,
+            cat);
         if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
         pos += (size_t)n;
     }
@@ -343,7 +355,8 @@ static int bench_queries_run(void) {
                         "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
                         "\"rank:short\",\"score:double\",\"active:bool\","
                         "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                        "\"balance:numeric:12,2\",\"hourly_rate:currency\"],"
+                        "\"balance:numeric:12,2\",\"hourly_rate:currency\","
+                        "\"category:enum(electronics,clothing,books,home,sports)\"],"
             "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
                          "\"score\",\"active\",\"level\",\"birthday\","
                          "\"created_at\",\"balance\",\"hourly_rate\"]}",
@@ -524,6 +537,22 @@ static int bench_queries_run(void) {
     BR("hourly in 3-set         (currency)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"hourly_rate\",\"op\":\"in\",\"value\":\"50,100,200\"}]}");
     BR("username in 2-set       (varchar idx)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"in\",\"value\":\"alice.smith0,bob.jones1\"}]}");
     BR("email in 2-set          (varchar idx)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"email\",\"op\":\"in\",\"value\":\"alice0@gmail.com,bob1@yahoo.com\"}]}");
+    bench_table_section_end();
+
+    /* ---------- COUNT — enum field (auto-bitmap, 5 values) ---------- */
+    bench_table_section_begin("COUNT — enum (auto-bitmap on category, 5 values)");
+    BR("category=electronics                   (eq)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"eq\",\"value\":\"electronics\"}]}");
+    BR("category!=electronics                  (neq)",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"neq\",\"value\":\"electronics\"}]}");
+    BR("category in {electronics,books}        (in 2)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"in\",\"value\":\"electronics,books\"}]}");
+    BR("category not_in {electronics}          (not_in)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"not_in\",\"value\":\"electronics\"}]}");
+    BR("category=unknown                       (miss)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"eq\",\"value\":\"unknown\"}]}");
+    bench_table_section_end();
+
+    /* ---------- AGGREGATE — group_by on enum (exercises dict-scan via bitmap) ---------- */
+    bench_table_section_begin("AGGREGATE — group_by on enum");
+    BR("group by category count",                         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"category\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    BR("group by category, avg(balance)",                 "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"category\"],\"aggregates\":[{\"fn\":\"avg\",\"field\":\"balance\"}]}");
+    BR("group by category where active=true count",       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"category\"],\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
     bench_table_section_end();
 
     /* ---------- COUNT — string operators (CS) on indexed varchar ---------- */

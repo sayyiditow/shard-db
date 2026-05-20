@@ -141,7 +141,7 @@ Append new fields to an existing object.
 
 ## edit-field
 
-Edit one or more existing fields in place — same-type only. Used to grow/shrink a `varchar`, widen/narrow an integer family field, change a `numeric`'s scale, or widen `float → double`.
+Edit one or more existing fields in place — same-type only. Used to grow/shrink a `varchar`, widen/narrow an integer family field, change a `numeric`'s scale, widen `float → double`, or append / rename / widen an `enum`.
 
 ```json
 {
@@ -153,6 +153,17 @@ Edit one or more existing fields in place — same-type only. Used to grow/shrin
     "age:long",
     "balance:numeric:18,4"
   ]
+}
+```
+
+For enum renames, set `"allow_rename": true` at the top level — without it, any change at an existing enum position is rejected (renames are easy to typo and would silently relabel every existing record):
+
+```json
+{
+  "mode": "edit-field",
+  "dir": "acme", "object": "items",
+  "fields": ["color:enum(crimson,green,blue,yellow)"],
+  "allow_rename": true
 }
 ```
 
@@ -170,8 +181,14 @@ CLI shortcut (single-field — JSON form covers batch):
 | Integer family (`short ↔ int ↔ long`) | Widen always allowed (sign-extension preserves negatives). Narrow refused **pre-flight** if any live record's value falls outside the new type's `[-2^(N×8-1), 2^(N×8-1) − 1]` range. |
 | `numeric:P,S1 → numeric:P,S2` | Scale-up multiplies the stored `int64` by `10^(S2−S1)`; refused pre-flight if any value would overflow `int64`. Scale-down divides and **truncates toward zero** (matches Postgres). |
 | `float → double` | Always allowed; IEEE 754 widen, no validation needed. |
+| `enum(a,b,c) → enum(a,b,c,d,…)` (append) | Always allowed. Existing records keep their byte index; new value gets the next index. No rebuild needed; only `fields.conf` is updated. |
+| `enum(a,b,c) → enum(a,b,c,…257+ values)` (auto-widen 1B → 2B) | Allowed. Triggers a full record rebuild (zero-extends each record's byte index) and rewrites the bitmap with the wider encoding. |
+| `enum(a,b,c) → enum(x,b,c)` (rename at position) | Requires `"allow_rename": true` in the request body. Existing records keep their byte index; the displayed value changes. Without the flag, refused. |
+| `enum(a,b,c) → enum(a,b)` (remove) | **Always refused.** Records reference values by position; removing would corrupt every record using the dropped value. |
+| `enum(a,b,c) → enum(c,a,b)` (reorder) | **Refused** (caught by the position-by-position diff — same shape as remove). |
+| `enum(…) → enum(…)` narrow 2B → 1B | **Refused.** Records that hold an index ≥ 256 would lose data. |
 
-**Cross-type edits are hard-refused** with the hint: use `add-field <new> + remove-field <old> + bulk-update` and migrate the data explicitly.
+**Other cross-type edits are hard-refused** with the hint: use `add-field <new> + remove-field <old> + bulk-update` and migrate the data explicitly.
 
 ### What happens
 

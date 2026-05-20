@@ -873,7 +873,7 @@ int parse_index_spec(const char *spec, ParsedIndexSpec *out) {
 int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type) {
     if (had_explicit_type) return 0;
     if (field_type == FT_BOOL) return 1;
-    /* Future: if (field_type == FT_ENUM) return 1; */
+    if (field_type == FT_ENUM) return 1;
     return 0;
 }
 
@@ -1010,7 +1010,41 @@ void invalidate_idx_cache(const char *object) {
 /* ========== Typed Field System ========== */
 
 /* Parse type string like "varchar:40", "long", "numeric:19,4" */
+/* Look up a value string in an FT_ENUM field's value list. Returns the
+   0-based index on hit, -1 on miss. Linear scan — fine for n ≤ 65535
+   on cold-path encoding; the hot path (match_typed) pre-resolves the
+   criterion value to an index at compile time. */
+int enum_value_index(const TypedField *f, const char *val, size_t vlen) {
+    if (!f || f->type != FT_ENUM || !f->enum_values) return -1;
+    for (int i = 0; i < f->n_enum_values; i++) {
+        const char *ev = f->enum_values[i];
+        if (!ev) continue;
+        size_t el = strlen(ev);
+        if (el == vlen && memcmp(ev, val, vlen) == 0) return i;
+    }
+    return -1;
+}
+
+/* Free the enum value list owned by a TypedField. Safe on NULL.
+   Used by:
+   - cache invalidation (so we don't leak when a schema is replaced)
+   - parse_field_type re-entry (defensive cleanup if a TypedField is
+     parsed twice without going through cache eviction)
+   - free_typed_schema (the explicit cleanup helper) */
+void free_enum_values(TypedField *f) {
+    if (!f || !f->enum_values) return;
+    for (int i = 0; i < f->n_enum_values; i++) free(f->enum_values[i]);
+    free(f->enum_values);
+    f->enum_values = NULL;
+    f->n_enum_values = 0;
+    f->enum_width = 0;
+}
+
 void parse_field_type(const char *spec, TypedField *f) {
+    /* Defensive cleanup — if the same TypedField is re-parsed in place,
+       drop the old enum value list before overwriting. */
+    free_enum_values(f);
+
     f->type = FT_NONE;
     f->size = 0;
     f->numeric_scale = 0;
@@ -1076,6 +1110,58 @@ void parse_field_type(const char *spec, TypedField *f) {
         const char *comma = strchr(spec + 8, ',');
         if (comma) f->numeric_scale = atoi(comma + 1);
         else f->numeric_scale = 2; /* default 2 decimal places */
+    } else if (strncmp(spec, "enum(", 5) == 0) {
+        /* enum(red,green,blue) — declared value list.
+           Storage byte width is auto-picked by count:
+             n_enum_values <= 256 → 1 byte (0..255)
+             n_enum_values <= 65535 → 2 bytes BE
+           Width >65535 is rejected at create-object.
+           Values are split on `,`; commas inside values aren't supported.
+           Duplicates are rejected at create-object (this function only
+           parses; the validator above lives in cmd_create_object). */
+        const char *open  = spec + 5;          /* after "enum(" */
+        const char *close = strrchr(open, ')');
+        if (!close || close <= open) return;   /* malformed → FT_NONE */
+
+        /* First pass: count values + max length to size the heap alloc. */
+        int n = 0;
+        const char *p = open;
+        while (p < close) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl > 0) n++;
+            p = (next < close) ? next + 1 : close;
+        }
+        if (n == 0 || n > 65535) return;       /* empty list or over ceiling */
+
+        char **vals = calloc((size_t)n, sizeof(char *));
+        if (!vals) return;
+        int written = 0;
+        p = open;
+        while (p < close && written < n) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl > 0) {
+                vals[written] = malloc(vl + 1);
+                if (!vals[written]) {
+                    /* OOM mid-parse — undo and bail */
+                    for (int i = 0; i < written; i++) free(vals[i]);
+                    free(vals);
+                    return;
+                }
+                memcpy(vals[written], p, vl);
+                vals[written][vl] = '\0';
+                written++;
+            }
+            p = (next < close) ? next + 1 : close;
+        }
+        f->type = FT_ENUM;
+        f->enum_values = vals;
+        f->n_enum_values = written;
+        f->enum_width = (written <= 256) ? 1 : 2;
+        f->size = f->enum_width;
     }
     /* Precompute 10^scale so decode-hot paths don't recompute per record */
     if (f->type == FT_NUMERIC) {
@@ -1426,6 +1512,25 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         out[6] = (v >> 8) & 0xFF;  out[7] = v & 0xFF;
         break;
     }
+    case FT_ENUM: {
+        /* Look up val in the value list; write the byte index (1 or 2
+           bytes BE based on f->enum_width). On miss, zero the field —
+           the JSON parse layer above is responsible for rejecting
+           unknown values before we get here. enum_width is always
+           f->size for FT_ENUM. */
+        int idx = enum_value_index(f, (const char *)val, vlen);
+        if (idx < 0) {
+            memset(out, 0, f->size);
+            break;
+        }
+        if (f->enum_width == 2) {
+            out[0] = (uint8_t)((idx >> 8) & 0xFF);
+            out[1] = (uint8_t)(idx & 0xFF);
+        } else {
+            out[0] = (uint8_t)(idx & 0xFF);
+        }
+        break;
+    }
     default:
         memset(out, 0, f->size);
         break;
@@ -1628,6 +1733,29 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 8;
         break;
     }
+    case FT_ENUM: {
+        /* Index-key for enum = byte-index encoding identical to the
+           stored record bytes. On miss (criterion uses a value not in
+           the list), emit a sentinel that doesn't match any valid
+           record: out_len = 0 ensures the bitmap dict lookup misses
+           cleanly, and any btree range/eq search using this key
+           finds nothing — which is the right answer for a query
+           filtering on a value that doesn't exist. */
+        int idx = enum_value_index(f, (const char *)val, vlen);
+        if (idx < 0) {
+            *out_len = 0;
+            break;
+        }
+        if (f->enum_width == 2) {
+            out[0] = (uint8_t)((idx >> 8) & 0xFF);
+            out[1] = (uint8_t)(idx & 0xFF);
+            *out_len = 2;
+        } else {
+            out[0] = (uint8_t)(idx & 0xFF);
+            *out_len = 1;
+        }
+        break;
+    }
     default:
         memset(out, 0, f->size);
         *out_len = f->size;
@@ -1732,6 +1860,18 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
     case FT_BYTE:
         out[0] = src[0];
         *out_len = 1;
+        break;
+    case FT_ENUM:
+        /* Stored bytes ARE the index-key encoding (1 or 2 bytes BE).
+           Memcpy through; bitmap dict lookups use byte-equality on
+           these. */
+        if (f->enum_width == 2) {
+            out[0] = src[0]; out[1] = src[1];
+            *out_len = 2;
+        } else {
+            out[0] = src[0];
+            *out_len = 1;
+        }
         break;
     default:
         *out_len = 0;
@@ -2288,6 +2428,29 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
+    case FT_ENUM: {
+        /* Stored bytes are the byte index (1 or 2 BE). Always emit
+           (byte 0 is a legit enum index, not "unset"). Output is a
+           JSON-quoted string from enum_values[idx]. Out-of-range
+           index (data corruption) → empty string. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int idx = (f->enum_width == 2)
+                    ? (int)(((uint16_t)data[0] << 8) | (uint16_t)data[1])
+                    : (int)data[0];
+        if (idx < 0 || idx >= f->n_enum_values) return snprintf(buf, buflen, "\"\"");
+        const char *s = f->enum_values[idx];
+        if (!s) return snprintf(buf, buflen, "\"\"");
+        /* Escape per RFC 8259 — enum value strings are user-supplied
+           at create-object, may carry quotes/backslashes/control chars.
+           Same buffer-sizing contract as FT_VARCHAR. */
+        if (buflen < 4) return -1;
+        buf[0] = '"';
+        int esc = json_escape_into(buf + 1, (size_t)buflen - 3, s, strlen(s));
+        if (esc < 0) return -1;
+        buf[1 + esc] = '"';
+        buf[2 + esc] = '\0';
+        return 2 + esc;
+    }
     default:
         return 0;
     }
@@ -2491,6 +2654,12 @@ void invalidate_schema_caches(const char *db_root, const char *object) {
     pthread_mutex_lock(&g_typed_lock);
     for (int i = 0; i < TYPED_BUCKETS; i++) {
         if (g_typed_cache[i].used && strcmp(g_typed_cache[i].name, key) == 0) {
+            /* Free any heap-owned per-field state (enum_values today;
+               room for future per-field heap allocations). */
+            TypedSchema *ts = &g_typed_cache[i].schema;
+            for (int fi = 0; fi < ts->nfields; fi++) {
+                free_enum_values(&ts->fields[fi]);
+            }
             g_typed_cache[i].used = 0;
             g_typed_cache[i].name[0] = '\0';
         }

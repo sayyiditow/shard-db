@@ -1647,8 +1647,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     if (*p == '"') p++;
                 } else p++;
             }
+            /* Optional `allow_rename` flag for FT_ENUM rename edits.
+               Without it, any rename at an existing enum position is
+               rejected. */
+            char *allow_rename_str = json_obj_strdup(&req, "allow_rename");
+            int allow_rename = (allow_rename_str &&
+                                (strcmp(allow_rename_str, "true") == 0 ||
+                                 strcmp(allow_rename_str, "1") == 0));
+            free(allow_rename_str);
             if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-            else cmd_edit_fields(db_root, object, lines, nlines);
+            else cmd_edit_fields(db_root, object, lines, nlines, allow_rename);
             free(fields_arr);
         }
     } else if (strcmp(mode, "remove-field") == 0) {

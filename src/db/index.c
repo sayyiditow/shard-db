@@ -1249,6 +1249,16 @@ static size_t typed_field_str_avg(const TypedField *f) {
     case FT_TIME:     return 8;   /* HH:MM:SS */
     case FT_TIMESTAMP: return 20; /* Unix epoch ms, up to 19 digits + sign */
     case FT_UUID:     return 36;  /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+    case FT_ENUM: {
+        /* Mean length of the declared value strings; pre-declared at
+           create-object, so the estimate is exact (not heuristic). */
+        if (!f->enum_values || f->n_enum_values <= 0) return 8;
+        size_t sum = 0;
+        for (int i = 0; i < f->n_enum_values; i++)
+            sum += f->enum_values[i] ? strlen(f->enum_values[i]) : 0;
+        size_t avg = sum / (size_t)f->n_enum_values;
+        return avg < 1 ? 1 : avg;
+    }
     }
     return 16;
 }
@@ -1542,13 +1552,20 @@ int cmd_add_indexes(const char *db_root, const char *object,
 
         /* Auto-promote bare bool/enum names to bitmap (legacy index.conf
            lines emitted before the rule existed). The rule lives in
-           config.c so create-object and reindex can never drift. */
+           config.c so create-object and reindex can never drift. For
+           2-byte enums, bump max_values to 65535 so the bitmap cap
+           matches the enum's byte-width domain. */
         if (!ps.is_composite && ts_for_idx) {
             int fi_t = typed_field_index(ts_for_idx, ps.name);
             if (fi_t >= 0 &&
                 idx_should_auto_bitmap(ps.had_explicit_type,
                                        ts_for_idx->fields[fi_t].type)) {
                 types[i] = IT_BITMAP;
+                if (ts_for_idx->fields[fi_t].type == FT_ENUM &&
+                    ts_for_idx->fields[fi_t].enum_width == 2 &&
+                    maxes[i] == 0) {
+                    maxes[i] = 65535;
+                }
                 promoted++;
             }
         }

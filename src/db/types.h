@@ -155,7 +155,13 @@ enum FieldType {
                        emit clock_gettime(CLOCK_REALTIME) in ms. Distinct from FT_LONG
                        (no time-source defaults) and FT_DATETIME (calendar-packed,
                        can't represent pre-1970 or post-9999 dates). */
-    FT_UUID         /* uuid — 16 bytes binary */
+    FT_UUID,        /* uuid — 16 bytes binary */
+    FT_ENUM         /* enum(v1,v2,...) — declared value list, encoded as
+                       1-byte index (≤256 values) or 2-byte BE index
+                       (257-65535 values). The byte width is fixed at
+                       declaration time; auto-widens 1→2 via edit-field
+                       when an append pushes count past 256. Auto-defaults
+                       to a bitmap index (like FT_BOOL). */
 };
 
 /* Index types — declared per-field at create-object, persisted in
@@ -192,6 +198,14 @@ typedef struct {
                            its bytes stay reserved until vacuum compacts them out */
     enum DefaultKind default_kind;
     char default_val[256]; /* literal value, seq name, or random byte count */
+
+    /* FT_ENUM only — populated by load_typed_schema, freed by
+       free_typed_schema. Empty/zeroed for every other type.
+       `enum_values` is a heap-allocated array of strdup'd value strings;
+       a record's encoded byte index `i` decodes to `enum_values[i]`. */
+    char **enum_values;
+    int    n_enum_values;
+    int    enum_width;  /* 1 if n_enum_values <= 256, else 2 (BE) */
 } TypedField;
 
 typedef struct {
@@ -666,11 +680,17 @@ typedef struct {
 } ParsedIndexSpec;
 int parse_index_spec(const char *spec, ParsedIndexSpec *out);
 
-/* The canonical auto-bitmap rule. Today: bool fields whose spec was
-   bare (no explicit :type) become bitmap. Enum will join the same
-   condition once that type lands. Single source of truth so the rule
-   can never drift between create-object and reindex. */
+/* The canonical auto-bitmap rule. Today: bool and enum fields whose
+   spec was bare (no explicit :type) become bitmap. Single source of
+   truth so the rule can never drift between create-object and reindex. */
 int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type);
+
+/* FT_ENUM helpers (config.c). enum_value_index returns the 0-based
+   byte index of a value string in an FT_ENUM field's value list (-1
+   on miss). free_enum_values releases the heap-owned value strings
+   on schema invalidation / re-parse. */
+int  enum_value_index(const TypedField *f, const char *val, size_t vlen);
+void free_enum_values(TypedField *f);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
 void build_effective_root(char *out, size_t outlen, const char *dir);
@@ -1202,7 +1222,7 @@ int cmd_add_fields(const char *db_root, const char *object,
    at the cost of touching unaffected indexes). Caller holds
    objlock_wrlock. */
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int nlines);
+                    char lines[][256], int nlines, int allow_rename);
 void invalidate_schema_caches(const char *db_root, const char *object);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */

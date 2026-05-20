@@ -5129,6 +5129,19 @@ static void transform_field_value(const TypedField *old_f,
         memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
         return;
     }
+    case FT_ENUM:
+        /* 1B → 2B widen: zero-extend the byte index. The existing index
+           value stays unchanged (record at byte 0x05 in 1B becomes
+           0x00 0x05 in 2B). 2B → 1B narrow is rejected by the enum diff
+           validator above; same-width edits short-circuit via
+           field_needs_transform=0 before we get here. */
+        if (new_f->size == 2 && old_f->size == 1) {
+            dst[0] = 0x00;
+            dst[1] = src[0];
+            return;
+        }
+        memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
+        return;
     default:
         /* Same-size paths fell through above. Anything else: best-effort
            prefix copy. Caller should have refused. */
@@ -5888,7 +5901,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
 }
 
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int n_edits) {
+                    char lines[][256], int n_edits, int allow_rename) {
     if (n_edits <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
         return 1;
@@ -5972,6 +5985,46 @@ int cmd_edit_fields(const char *db_root, const char *object,
                 parsed[e].name);
             return 1;
         }
+
+        /* FT_ENUM diff: new value list must be a strict prefix of the old
+           (append), optionally with renames at existing positions when the
+           caller passed `allow_rename`. Anything else (remove, reorder,
+           length shrink) corrupts existing records, so refuse loudly.
+           Width transitions: 1B → 2B is allowed when the new list count
+           exceeds 256 — the rebuild path handles the record re-encoding
+           via transform_field_value. 2B → 1B not supported (would lose
+           record data if any record holds an index ≥ 256). */
+        if (oldf->type == FT_ENUM && parsed[e].type == FT_ENUM) {
+            int oldn = oldf->n_enum_values;
+            int newn = parsed[e].n_enum_values;
+            if (newn < oldn) {
+                OUT("{\"error\":\"enum edit refused for [%s]: cannot remove or shrink the value list (records reference values by position — removing would corrupt them). Append-only edits supported.\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+            if (oldf->enum_width == 2 && parsed[e].enum_width == 1) {
+                OUT("{\"error\":\"enum edit refused for [%s]: cannot narrow 2-byte → 1-byte enum.\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+            int had_rename = 0;
+            for (int i = 0; i < oldn; i++) {
+                const char *ov = oldf->enum_values[i];
+                const char *nv = parsed[e].enum_values[i];
+                if (!ov || !nv) {
+                    OUT("{\"error\":\"enum edit for [%s]: internal value list corrupt at position %d\"}\n",
+                        parsed[e].name, i);
+                    return 1;
+                }
+                if (strcmp(ov, nv) != 0) had_rename = 1;
+            }
+            if (had_rename && !allow_rename) {
+                OUT("{\"error\":\"enum edit refused for [%s]: at least one value at an existing position changed — that's a rename. Re-issue with allow_rename:true to confirm (existing records keep their byte index but the displayed value changes).\"}\n",
+                    parsed[e].name);
+                return 1;
+            }
+        }
+
         edited_old_idx[e] = found;
     }
 
@@ -5994,6 +6047,15 @@ int cmd_edit_fields(const char *db_root, const char *object,
             new_ts.fields[i].size             = parsed[edit_for_i].size;
             new_ts.fields[i].numeric_scale    = parsed[edit_for_i].numeric_scale;
             new_ts.fields[i].numeric_scale_mult = parsed[edit_for_i].numeric_scale_mult;
+            /* FT_ENUM: overlay the new value list + width. Pointer is
+               shared with parsed[edit_for_i] which lives on this stack
+               frame; that's safe because new_ts is also stack-local and
+               doesn't outlive parsed[]. The on-disk fields.conf rewrite
+               (lines[]) carries the canonical spec; load_typed_schema
+               will re-allocate enum_values from disk on next read. */
+            new_ts.fields[i].enum_values    = parsed[edit_for_i].enum_values;
+            new_ts.fields[i].n_enum_values  = parsed[edit_for_i].n_enum_values;
+            new_ts.fields[i].enum_width     = parsed[edit_for_i].enum_width;
             /* default_kind / default_val: re-parse from the spec — but
                parse_field_line via parse_field_type doesn't currently
                carry defaults through (those are parsed by load_typed_schema's
@@ -6031,6 +6093,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
         log_msg(3, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
                 db_root, object, n_edits);
         OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":false}\n", n_edits);
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
         return 0;
     }
 
@@ -6102,6 +6165,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
         "\"slot_size\":%d,\"indexes_rebuilt\":%d}\n",
         n_edits, new_sch.slot_size, idx_rebuilt);
+    for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
     return 0;
 }
 
@@ -7546,6 +7610,24 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         }
         break;
     }
+    case FT_ENUM:
+        /* Resolve the criterion's display-string value to its byte index
+           in the enum's value list. -1 means "no such value" — match_typed
+           interprets that as "no record can match this criterion under
+           positive ops" (EQ/IN/LT/GT/etc.) and "every record matches under
+           the negation" (NEQ/NOT_IN). The c->value lookup uses
+           enum_value_index (linear scan; cold path, n ≤ 65535). */
+        if (cc->tf && c->value[0]) {
+            cc->i1 = (int64_t)enum_value_index(cc->tf, c->value, strlen(c->value));
+        } else {
+            cc->i1 = -1;
+        }
+        if (cc->tf && c->value2[0]) {
+            cc->i2 = (int64_t)enum_value_index(cc->tf, c->value2, strlen(c->value2));
+        } else {
+            cc->i2 = -1;
+        }
+        break;
     case FT_VARCHAR:
     default:
         break;
@@ -7637,6 +7719,13 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             cc->in_uuid = malloc(sizeof(uint8_t[16]) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 parse_uuid(c->in_values[i], cc->in_uuid[i]);
+            break;
+        case FT_ENUM:
+            cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                cc->in_i64[i] = (int64_t)enum_value_index(cc->tf,
+                                                          c->in_values[i],
+                                                          strlen(c->in_values[i]));
             break;
         default:
             /* VARCHAR, DATETIME, BOOL, BYTE: use raw strings via c->in_values */
@@ -8161,6 +8250,44 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         default: return 0;
         }
     }
+    case FT_ENUM: {
+        /* Encoded byte index → enum_values lookup → criterion match.
+           compile_one (FT_ENUM case in phase 3) pre-resolves c->value
+           to its byte index in cc->i1, and (for IN/NOT_IN) c->in_values
+           to cc->in_i64. Here we just decode the record bytes and
+           compare integer indices. -1 means "no such value in dict"
+           — matches OP_NOT_EQUAL, OP_NOT_IN, OP_NOT_EXISTS only. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int64_t v;
+        if (f->enum_width == 2) {
+            v = (int64_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+        } else {
+            v = (int64_t)p[0];
+        }
+        /* The literal byte 0x00 is a legit enum index. EXISTS is
+           always 1 because every record gets a valid index on insert. */
+        switch (cc->op) {
+        case OP_EXISTS:     return 1;
+        case OP_NOT_EXISTS: return 0;
+        case OP_EQUAL:      return cc->i1 >= 0 && v == cc->i1;
+        case OP_NOT_EQUAL:  return cc->i1 < 0 || v != cc->i1;
+        case OP_LESS:       return cc->i1 >= 0 && v <  cc->i1;
+        case OP_GREATER:    return cc->i1 >= 0 && v >  cc->i1;
+        case OP_LESS_EQ:    return cc->i1 >= 0 && v <= cc->i1;
+        case OP_GREATER_EQ: return cc->i1 >= 0 && v >= cc->i1;
+        case OP_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (cc->in_i64[i] >= 0 && v == cc->in_i64[i]) return 1;
+            return 0;
+        }
+        case OP_NOT_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (cc->in_i64[i] >= 0 && v == cc->in_i64[i]) return 0;
+            return 1;
+        }
+        default: return 0;
+        }
+    }
     }
     return 0;
 }
@@ -8481,6 +8608,9 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     }
     case FT_DATE:
     case FT_DATETIME:
+    case FT_ENUM:
+        /* Enum's display string is a JSON string (quoted, escaped).
+           DATE/DATETIME are also strings on the wire. */
         n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
         if (n <= 0) return snprintf(buf, bufsz, "null");
         return snprintf(buf, bufsz, "\"%s\"", tmp);
@@ -14635,6 +14765,50 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
+    if (strncmp(type, "enum(", 5) == 0) {
+        /* Validate enum(v1,v2,...) — empty list, duplicates, missing
+           close paren, and over-ceiling all → invalid (return 0).
+           Returns the storage byte width: 1 for ≤256 values, 2 for
+           257..65535. create-object is cold path, simple alloc is fine. */
+        const char *open  = type + 5;
+        const char *close = strrchr(open, ')');
+        if (!close || close <= open) return 0;
+
+        /* Pass 1: count + duplicate-check via a heap-allocated value list.
+           A worst-case 65535-entry list of avg ~8B = ~640 KB peak — fine. */
+        char **vals = calloc(65536, sizeof(char *));
+        if (!vals) return 0;
+        int n = 0;
+        const char *p = open;
+        while (p < close) {
+            const char *next = memchr(p, ',', (size_t)(close - p));
+            if (!next) next = close;
+            size_t vl = (size_t)(next - p);
+            if (vl == 0) goto enum_invalid;            /* empty value */
+            if (n >= 65535)            goto enum_invalid;
+            char *v = malloc(vl + 1);
+            if (!v) goto enum_invalid;
+            memcpy(v, p, vl); v[vl] = '\0';
+            for (int i = 0; i < n; i++) {
+                if (strcmp(vals[i], v) == 0) {  /* duplicate */
+                    free(v);
+                    goto enum_invalid;
+                }
+            }
+            vals[n++] = v;
+            p = (next < close) ? next + 1 : close;
+        }
+        if (n == 0) goto enum_invalid;
+        int width = (n <= 256) ? 1 : 2;
+        for (int i = 0; i < n; i++) free(vals[i]);
+        free(vals);
+        return width;
+
+enum_invalid:
+        for (int i = 0; i < n; i++) free(vals[i]);
+        free(vals);
+        return 0;
+    }
     return 0;
 }
 
@@ -14912,7 +15086,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
                     /* Auto-promote (single source of truth for the rule —
                        config.c::idx_should_auto_bitmap). Find this field's
-                       FieldType from field_specs[], pass to the rule. */
+                       FieldType from field_specs[], pass to the rule. For
+                       FT_ENUM also pick the right bitmap cap: 1-byte enum
+                       gets the default (256), 2-byte enum needs 65535 so
+                       the dict can grow to the enum's full domain. */
                     if (!ps.is_composite) {
                         int fnlen2 = (int)strlen(ps.name);
                         for (int i = 0; i < nfields; i++) {
@@ -14923,8 +15100,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             if (memcmp(field_specs[i], ps.name, nl) != 0) continue;
                             TypedField tf = {0};
                             parse_field_type(c + 1, &tf);
-                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type))
+                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type)) {
                                 ps.type = IT_BITMAP;
+                                if (tf.type == FT_ENUM && tf.enum_width == 2 &&
+                                    ps.max_values == 0) {
+                                    ps.max_values = 65535;
+                                }
+                            }
+                            free_enum_values(&tf);
                             break;
                         }
                     }
@@ -14939,15 +15122,22 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    /* Auto-default: every `bool` field that isn't already declared as an
-       index gets IT_BITMAP. Single-field only; bool can't legally be in a
-       composite anyway since we reject non-btree composites above. */
+    /* Auto-default: every `bool` or `enum(...)` field that isn't already
+       declared as an index gets IT_BITMAP. Single-field only; bool / enum
+       can't legally be in a composite anyway since we reject non-btree
+       composites above. For enum the bitmap cap matches the byte-width
+       ceiling: 1-byte (≤256 values) keeps the default (256), 2-byte
+       (257-65535 values) needs cap=65535 so the dict can grow to the
+       full enum domain. */
     for (int i = 0; i < nfields; i++) {
         const char *c = strchr(field_specs[i], ':');
         if (!c) continue;
         int fnlen = (int)(c - field_specs[i]);
-        if (strncmp(c + 1, "bool", 4) != 0) continue;
-        if (c[5] != '\0' && c[5] != ':') continue;  /* exactly "bool" or "bool:..." */
+
+        int is_bool = (strncmp(c + 1, "bool", 4) == 0 &&
+                       (c[5] == '\0' || c[5] == ':'));
+        int is_enum = (strncmp(c + 1, "enum(", 5) == 0);
+        if (!is_bool && !is_enum) continue;
 
         int already = 0;
         for (int j = 0; j < npidx; j++) {
@@ -14961,7 +15151,16 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         memcpy(pidx[npidx].name, field_specs[i], fnlen);
         pidx[npidx].name[fnlen] = '\0';
         pidx[npidx].type = IT_BITMAP;
-        pidx[npidx].max_values = 0;  /* bool auto-default uses BM_DEFAULT_MAX_VALUES */
+        pidx[npidx].max_values = 0;  /* bool/1B-enum: default 256 */
+        if (is_enum) {
+            /* Parse the enum spec once to learn enum_width. */
+            TypedField tf = {0};
+            parse_field_type(c + 1, &tf);
+            if (tf.type == FT_ENUM && tf.enum_width == 2) {
+                pidx[npidx].max_values = 65535;
+            }
+            free_enum_values(&tf);
+        }
         npidx++;
     }
     #undef FIELD_TYPE_IS
@@ -15309,6 +15508,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_TIME:     return "time";
         case FT_TIMESTAMP: return "timestamp";
         case FT_UUID:     return "uuid";
+        case FT_ENUM:     return "enum";
         default:          return "unknown";
     }
 }
@@ -15638,6 +15838,22 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                 b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
+    case FT_ENUM: {
+        /* Stored bytes are the byte index. Look up enum_values[idx]
+           and copy. Out-of-range index (data corruption) → empty string. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int idx = (f->enum_width == 2)
+                    ? (int)(((uint16_t)p[0] << 8) | (uint16_t)p[1])
+                    : (int)p[0];
+        if (idx < 0 || idx >= f->n_enum_values) return 0;
+        const char *s = f->enum_values[idx];
+        if (!s) return 0;
+        size_t sl = strlen(s);
+        if (sl >= bufsz) sl = bufsz - 1;
+        memcpy(buf, s, sl);
+        buf[sl] = '\0';
+        return (int)sl;
+    }
     default:
         return 0;
     }
@@ -15886,6 +16102,25 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         memcpy(buf, p, cl);
         buf[cl] = '\0';
         return (int)cl;
+    }
+    case FT_ENUM: {
+        /* Index-key for enum = byte index (1 or 2 BE). Decode to
+           enum_values[idx]. Used by the bitmap dict-scan path so a
+           query like `WHERE color LIKE 'r%'` can iterate the dict,
+           decode each entry to its display string, then match_criterion
+           against the user's pattern. */
+        if (!f->enum_values || f->n_enum_values <= 0 || plen == 0) return 0;
+        int idx = (f->enum_width == 2 && plen >= 2)
+                    ? (int)(((uint16_t)p[0] << 8) | (uint16_t)p[1])
+                    : (int)p[0];
+        if (idx < 0 || idx >= f->n_enum_values) return 0;
+        const char *s = f->enum_values[idx];
+        if (!s) return 0;
+        size_t sl = strlen(s);
+        if (sl >= bufsz) sl = bufsz - 1;
+        memcpy(buf, s, sl);
+        buf[sl] = '\0';
+        return (int)sl;
     }
     default: return 0;
     }
