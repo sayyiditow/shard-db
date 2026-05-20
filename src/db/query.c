@@ -919,6 +919,15 @@ typedef struct {
     const int      *idx_field_counts;
     const int      *idx_is_composite;
     const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM */
+    /* Per-field bitmap accumulators — mirror btree's idx_pairs[] but
+       carry (slot, value) instead of (value, hash). Filled by
+       v2_bulk_ins_pre_commit_bulk under the kf wrlock; flushed AFTER
+       each per-shard slotcask_bulk_upsert call returns, holding the
+       bm wrlock once per (shard, field) instead of once per record.
+       Counts reset between shard iterations. */
+    struct BmPair **bm_pairs;        /* [nidx] */
+    size_t         *bm_pair_counts;  /* [nidx] */
+    size_t         *bm_pair_caps;    /* [nidx] */
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
@@ -999,6 +1008,16 @@ typedef struct {
     uint8_t          *old_arena;
     size_t            old_arena_slot;
 } V2BulkInsCtx;
+
+/* (slot, value) pair queued for batched bitmap flush. Inline value
+   buffer covers bool (1 B) + typical varchar enum values (≤32 B);
+   longer encodings fall back to the per-record bm_open path. */
+#define BM_PAIR_INLINE  64
+typedef struct BmPair {
+    uint32_t slot;
+    uint16_t vlen;
+    uint8_t  value[BM_PAIR_INLINE];
+} BmPair;
 
 /* Per-record pre_commit hook fired under the kf-shard wrlock by
    slotcask_bulk_upsert_in_kfshard. Reads the V2BulkInsCtx via
@@ -1096,27 +1115,45 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
                         key_len == old_idx_lens[fi] &&
                         memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
 
-        /* Bitmap fields: dispatch to update_idx_fn inline since the slot
-           is known (rec->kf_slot). Btree fields continue accumulating
-           into sw->idx_pairs for the batched post-wrlock write. */
+        /* Bitmap fields: enqueue (slot, value) into the per-field
+           accumulator. The post-shard flush (bulk_insert_shard_worker_v2)
+           opens the .bm shard with writer=1 once, applies all bm_set's,
+           then releases — same lock-amortisation pattern btree uses
+           via idx_pairs[] + btree_bulk_merge. */
         if (itype == IT_BITMAP) {
-            if (!unchanged) {
+            if (!unchanged && have_new && key_len <= BM_PAIR_INLINE && sw->bm_pairs) {
+                if (sw->bm_pair_counts[fi] >= sw->bm_pair_caps[fi]) {
+                    size_t new_cap = sw->bm_pair_caps[fi]
+                                     ? sw->bm_pair_caps[fi] * 2 : 256;
+                    BmPair *t = xrealloc_or_free(sw->bm_pairs[fi],
+                                                  new_cap * sizeof(BmPair));
+                    if (!t) {
+                        log_msg(1, "INDEX_OOM shard=%d field=%s (dropped bitmap pair)",
+                                sw->shard_id, sw->idx_fields[fi]);
+                        sw->bm_pairs[fi] = NULL;
+                        sw->bm_pair_counts[fi] = 0;
+                        sw->bm_pair_caps[fi] = 0;
+                    } else {
+                        sw->bm_pairs[fi] = t;
+                        sw->bm_pair_caps[fi] = new_cap;
+                    }
+                }
+                if (sw->bm_pairs[fi]) {
+                    BmPair *p = &sw->bm_pairs[fi][sw->bm_pair_counts[fi]++];
+                    p->slot = rec->kf_slot;
+                    p->vlen = (uint16_t)key_len;
+                    memcpy(p->value, key_buf, key_len);
+                }
+            } else if (!unchanged && have_new) {
+                /* Oversized value or no accumulator — fall back to the
+                   per-record path. Same correctness, slower. */
                 UpdateIdxArg a = {0};
-                a.db_root = sw->db_root;
-                a.object  = sw->object;
-                a.field   = sw->idx_fields[fi];
-                a.splits  = sw->sch->splits;
-                a.new_key = have_new ? key_buf : NULL;
-                a.new_len = key_len;
-                a.old_key = old_idx_have[fi] ? old_idx_bufs[fi] : NULL;
-                a.old_len = old_idx_lens[fi];
-                a.hash    = r->hash;
-                a.type    = IT_BITMAP;
-                a.kf_shard = rec->kf_shard;
-                a.kf_slot  = rec->kf_slot;
+                a.db_root = sw->db_root; a.object = sw->object;
+                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+                a.new_key = key_buf; a.new_len = key_len;
+                a.hash = r->hash; a.type = IT_BITMAP;
+                a.kf_shard = rec->kf_shard; a.kf_slot = rec->kf_slot;
                 update_idx_fn(&a);
-                /* a.out_error not propagated for bulk MVP — a single record
-                   over the cap won't fail the whole batch. Reindex catches it. */
             }
             if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
             free(key_buf);
@@ -1211,6 +1248,22 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         ? malloc((size_t)sw->nidx * INDEX_KEY_MAX)
         : NULL;
 
+    /* Bitmap accumulators — per-field BmPair arrays. Reset between shard
+       iterations (each shard flushes its own pending bm_set's, then
+       counts go back to 0). Only allocated when there's at least one
+       bitmap-typed field. */
+    int has_bm_field = 0;
+    if (sw->idx_types) {
+        for (int fi = 0; fi < sw->nidx; fi++) {
+            if (sw->idx_types[fi] == IT_BITMAP) { has_bm_field = 1; break; }
+        }
+    }
+    if (has_bm_field) {
+        sw->bm_pairs       = calloc((size_t)sw->nidx, sizeof(BmPair *));
+        sw->bm_pair_counts = calloc((size_t)sw->nidx, sizeof(size_t));
+        sw->bm_pair_caps   = calloc((size_t)sw->nidx, sizeof(size_t));
+    }
+
     /* Pack records into [batch] grouped by kf shard, with [ctxs] mirrored. */
     for (size_t i = 0; i < sw->count; i++) {
         int s = kf_shards[i];
@@ -1251,6 +1304,51 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
                     batch[offsets[s] + k].status = -1;
             }
         }
+
+        /* Flush accumulated bitmap pairs for this shard. One bm_open
+           per (shard, field) — wrlock acquired once, all bm_set's
+           applied, wrlock released. Same amortisation pattern btree
+           uses with btree_insert_batch in the merge phase. */
+        if (has_bm_field && sw->bm_pairs) {
+            int slots_per_shard =
+                (int)slotcask_default_slots_for_splits(sw->sch->splits);
+            for (int fi = 0; fi < sw->nidx; fi++) {
+                if (sw->idx_types[fi] != IT_BITMAP) continue;
+                if (sw->bm_pair_counts[fi] == 0) continue;
+                if (!sw->bm_pairs[fi]) {
+                    sw->bm_pair_counts[fi] = 0;
+                    continue;
+                }
+                char bp[PATH_MAX];
+                bm_build_path(bp, sizeof(bp), sw->db_root, sw->object,
+                              sw->idx_fields[fi], s);
+                /* bool_fastpath autodetect: first queued pair is 1 byte? */
+                int bool_fast = (sw->bm_pair_counts[fi] > 0 &&
+                                 sw->bm_pairs[fi][0].vlen == 1);
+                BitmapShard *bm = bm_open(bp, slots_per_shard, 1,
+                                          bool_fast, 0, 1 /* writer */);
+                if (bm) {
+                    /* Auto-grow if any pair exceeds current stride. The
+                       largest slot in this batch bounds the requirement. */
+                    uint32_t max_slot = 0;
+                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
+                        if (sw->bm_pairs[fi][k].slot > max_slot)
+                            max_slot = sw->bm_pairs[fi][k].slot;
+                    }
+                    if (max_slot >= bm_slots(bm)) {
+                        uint32_t want = max_slot + 1, grown = 1;
+                        while (grown < want && grown < 0x80000000u) grown <<= 1;
+                        bm_grow(bm, grown);
+                    }
+                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
+                        BmPair *p = &sw->bm_pairs[fi][k];
+                        bm_set(bm, p->value, p->vlen, p->slot);
+                    }
+                    bm_close(bm);
+                }
+                sw->bm_pair_counts[fi] = 0;
+            }
+        }
     }
 
     for (size_t i = 0; i < sw->count; i++) {
@@ -1265,11 +1363,15 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     free(batch); free(ctxs); free(kf_shards);
     free(counts); free(offsets); free(cursors);
     free(old_arena);
-    /* Release the worker thread's cached bitmap handle so we don't
-       leak open file descriptors across requests, and so a subsequent
-       reindex/wipe in the engine doesn't leave this thread with a
-       stale TLS pointer to an unlinked .bm. */
-    bm_flush_thread_bitmap_cache();
+    /* Free per-field bitmap accumulators (all already flushed above). */
+    if (sw->bm_pairs) {
+        for (int fi = 0; fi < sw->nidx; fi++) free(sw->bm_pairs[fi]);
+        free(sw->bm_pairs); free(sw->bm_pair_counts); free(sw->bm_pair_caps);
+        sw->bm_pairs = NULL;
+        sw->bm_pair_counts = NULL;
+        sw->bm_pair_caps = NULL;
+    }
+    bm_flush_thread_bitmap_cache();  /* no-op shim, kept for symmetry */
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }
