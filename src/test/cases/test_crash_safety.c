@@ -33,42 +33,19 @@
 #define BASELINE  1000   /* records inserted + acked before the crash phase */
 #define CRASH_AT   500   /* additional inserts attempted before SIGKILL */
 
-/* Local convenience for "rm -rf <path>"-style cleanups. Mirrors the
-   helper in fixtures.c; we re-implement to keep the test self-contained
-   rather than exposing it through fixtures.h. */
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
-
-/* Parse the count value from a recount/count response. Daemon returns
-   either a bare integer ("1234") or {"count":N}. Handle both. */
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n') resp++;
-    if (*resp == '{') {
-        const char *p = strstr(resp, "\"count\":");
-        return p ? atoi(p + 8) : -1;
-    }
-    return atoi(resp);
-}
-
 static int test_crash_safety_run(void) {
     /* 1. Persistent on-disk dir tree (caller-owned, survives restart). */
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-crash-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755);
     mkdir(db_root, 0755);
 
     int port = test_pick_port();
     if (port < 0) {
         ASSERT_TRUE(0, "pick port");
-        run_cmd("rm -rf %s", base);
+        tu_run_cmd("rm -rf %s", base);
         return 1;
     }
 
@@ -76,14 +53,14 @@ static int test_crash_safety_run(void) {
     TestEnv env = {0};
     if (test_env_start_at(&env, db_root, port) != 0) {
         ASSERT_TRUE(0, "first daemon spawn");
-        run_cmd("rm -rf %s", base);
+        tu_run_cmd("rm -rf %s", base);
         return 1;
     }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "first connect");
-    if (!tc) { test_env_kill(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
@@ -110,7 +87,7 @@ static int test_crash_safety_run(void) {
     tc_request(tc,
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"crash\"}",
         &resp);
-    int count_pre = parse_count(resp);
+    int count_pre = tu_parse_count(resp);
     free(resp); resp = NULL;
     ASSERT_EQ_INT(count_pre, BASELINE, "baseline count matches pre-crash");
 
@@ -138,14 +115,14 @@ static int test_crash_safety_run(void) {
     TestEnv env2 = {0};
     if (test_env_start_at(&env2, db_root, port) != 0) {
         ASSERT_TRUE(0, "daemon respawn at same db_root");
-        run_cmd("rm -rf %s", base);
+        tu_run_cmd("rm -rf %s", base);
         return 1;
     }
 
     cfg.port = env2.port;
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "reconnect after restart");
-    if (!tc) { test_env_kill(&env2); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_kill(&env2); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* 5. Recount: must be in [BASELINE, BASELINE+CRASH_AT] and
           ≥ BASELINE+crash_phase_committed (every record acked before
@@ -153,7 +130,7 @@ static int test_crash_safety_run(void) {
     tc_request(tc,
         "{\"mode\":\"recount\",\"dir\":\"default\",\"object\":\"crash\"}",
         &resp);
-    int count_after = parse_count(resp);
+    int count_after = tu_parse_count(resp);
     free(resp); resp = NULL;
 
     ASSERT_TRUE(count_after >= BASELINE,
@@ -198,7 +175,7 @@ static int test_crash_safety_run(void) {
     test_env_stop(&env2);   /* env2 wipes its own db_root via test_env_stop */
     /* test_env_stop's cleanup walked one level up from db_root, which
        is `base` — so the parent dir is gone. Belt-and-suspenders: */
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
 
     return t_ctx->failed > 0 ? 1 : 0;
 }

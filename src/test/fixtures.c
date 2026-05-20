@@ -367,3 +367,73 @@ void test_env_stop(TestEnv *env) {
         }
     }
 }
+
+
+/* ---- Shared test utilities (formerly duplicated across case files) ---- */
+
+int tu_run_cmd(const char *fmt, ...) {
+    char cmd[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    return system(cmd);
+}
+
+char *tu_capture_cmd(const char *fmt, ...) {
+    char cmd[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return NULL;
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { pclose(fp); return NULL; }
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); pclose(fp); return NULL; }
+            buf = nb;
+        }
+        buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    pclose(fp);
+    return buf;
+}
+
+char *tu_read_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long sz = ftell(fp);
+    if (sz < 0) { fclose(fp); return NULL; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return NULL; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(fp); return NULL; }
+    size_t n = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return buf;
+}
+
+int tu_file_exists(const char *path) {
+    /* Existence-only — matches the legacy `stat() == 0` semantics so
+       callers passing directory paths (`indexes/<field>/`) work. */
+    struct stat st;
+    return (stat(path, &st) == 0) ? 1 : 0;
+}
+
+int tu_parse_count(const char *resp) {
+    if (!resp) return -1;
+    while (*resp == ' ' || *resp == '\n' || *resp == '\t') resp++;
+    if (*resp == '{') {
+        const char *p = strstr(resp, "\"count\":");
+        return p ? atoi(p + 8) : -1;
+    }
+    return atoi(resp);
+}

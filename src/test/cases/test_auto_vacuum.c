@@ -26,52 +26,26 @@
 #include <time.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n') resp++;
-    return atoi(resp);
-}
 
 static int test_auto_vacuum_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-av-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755); mkdir(db_root, 0755);
     char logs_dir[300]; snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
     mkdir(logs_dir, 0755);
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* db.env with auto-vacuum on at 60-sec interval (min allowed),
        tight thresholds: pct=10%, min_deleted=10. */
     char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
     FILE *f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); run_cmd("rm -rf %s", base); return 1; }
+    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
     fprintf(f,
         "export DB_ROOT=\"%s\"\n"
         "export PORT=%d\n"
@@ -92,11 +66,11 @@ static int test_auto_vacuum_run(void) {
     const char *sdb_rel = "./build/bin/shard-db";
     if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
     if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     pid_t pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); run_cmd("rm -rf %s", base); return 1; }
+    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
         chdir(base);
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
@@ -120,12 +94,12 @@ static int test_auto_vacuum_run(void) {
         struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL);
     }
     ASSERT_TRUE(ready, "daemon ready with AUTO_VACUUM=1");
-    if (!ready) { stop_no_wipe(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!ready) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { stop_no_wipe(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
@@ -194,7 +168,7 @@ static int test_auto_vacuum_run(void) {
 
     /* Confirm orphaned count for big = 30. */
     tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
-    ASSERT_EQ_INT(parse_count(resp), 30, "big orphaned=30 pre-vacuum");
+    ASSERT_EQ_INT(tu_parse_count(resp), 30, "big orphaned=30 pre-vacuum");
     free(resp); resp = NULL;
 
     /* Force the auto-vacuum cycle. We can't shrink AUTO_VACUUM_INTERVAL_SEC
@@ -218,24 +192,24 @@ static int test_auto_vacuum_run(void) {
         sleep(90);
 
         tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
-        int orphaned_after = parse_count(resp);
+        int orphaned_after = tu_parse_count(resp);
         ASSERT_EQ_INT(orphaned_after, 0, "big orphaned=0 after auto-vacuum tick");
         free(resp); resp = NULL;
 
         /* sml should be untouched. */
         tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"sml\"}", &resp);
-        ASSERT_EQ_INT(parse_count(resp), 2, "sml orphaned=2 (untouched, below threshold)");
+        ASSERT_EQ_INT(tu_parse_count(resp), 2, "sml orphaned=2 (untouched, below threshold)");
         free(resp); resp = NULL;
 
         /* Live count for big unchanged (vacuum reclaims tombstones, not live). */
         tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
-        ASSERT_EQ_INT(parse_count(resp), 20, "big size=20 (50 - 30 deleted)");
+        ASSERT_EQ_INT(tu_parse_count(resp), 20, "big size=20 (50 - 30 deleted)");
         free(resp); resp = NULL;
     }
 
     tc_close(tc);
-    stop_no_wipe(&env);
-    run_cmd("rm -rf %s", base);
+    test_env_stop_keep(&env);
+    tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

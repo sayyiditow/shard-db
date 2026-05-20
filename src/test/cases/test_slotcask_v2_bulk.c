@@ -23,11 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n' || *resp == '\r') resp++;
-    return atoi(resp);
-}
 
 static int count_where(TestClient *tc, const char *criteria) {
     char req[1024];
@@ -36,7 +31,7 @@ static int count_where(TestClient *tc, const char *criteria) {
         "\"criteria\":%s}", criteria);
     char *resp = NULL;
     tc_request(tc, req, &resp);
-    int n = parse_count(resp);
+    int n = tu_parse_count(resp);
     free(resp);
     return n;
 }
@@ -45,7 +40,7 @@ static int count_total(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
         "{\"mode\":\"count\",\"dir\":\"bulk2\",\"object\":\"orders\"}", &resp);
-    int n = parse_count(resp);
+    int n = tu_parse_count(resp);
     free(resp);
     return n;
 }
