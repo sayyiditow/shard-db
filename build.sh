@@ -225,6 +225,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
 # files under src/bench/ get listed here.
 gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/shard-db-bench.c \
+    src/bench/bench_common.c \
     src/bench/bench_stats.c \
     src/bench/bench_table.c \
     src/bench/bench_kv.c \
