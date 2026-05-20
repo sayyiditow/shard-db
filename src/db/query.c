@@ -6943,6 +6943,61 @@ typedef struct {
                               parallel shard scans */
 } AdvSearchCtx;
 
+/* Vlen-aware match. Identical semantics to match_criterion but
+   callers that already know the value's byte length (every cb on
+   the btree-scan hot path: idx_count_cb, collect_hash_cb,
+   stream_keyset_cb, agg's per-leaf path) can skip a per-entry
+   strlen scan on the haystack. Concretely OP_ENDS_WITH used to
+   compute strlen(val_str) per leaf entry; at 25M emails averaging
+   ~25 bytes that is ~625 MB of redundant memory scans just to
+   find string lengths the cb already has in hand. The win is
+   small on hot cache (~10% vs the libc strstr/strcmp paths which
+   are aggressively SIMD-optimised) but real and durable.
+
+   Implementation notes:
+   - Specialised for the four ops where vlen genuinely changes
+     the per-entry cost shape: ENDS_WITH, STARTS_WITH, CONTAINS,
+     NOT_CONTAINS. All four become a single memcmp / memmem call.
+   - Other ops still need C-string semantics — numeric coercion,
+     regex on NUL-terminated buffers, equality strcmp — so we
+     fall back to match_criterion. Callers on the cb hot path
+     already do tmp[vlen] = '\\0' before invoking, so val is
+     guaranteed NUL-terminated for the fallback.
+   - First-pass attempt of this helper appeared to regress ends
+     queries by ~10× in one bench run, leading to a revert.
+     Subsequent benches showed that was cold-page-cache jitter
+     between runs, not a real regression — re-applied here. */
+int match_criterion_vlen(const char *val, size_t vlen,
+                         const SearchCriterion *c) {
+    if (!val && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
+    switch (c->op) {
+    case OP_ENDS_WITH: {
+        size_t cl = strlen(c->value);
+        if (vlen < cl) return 0;
+        return memcmp(val + vlen - cl, c->value, cl) == 0;
+    }
+    case OP_STARTS_WITH: {
+        size_t cl = strlen(c->value);
+        if (vlen < cl) return 0;
+        return memcmp(val, c->value, cl) == 0;
+    }
+    case OP_CONTAINS: {
+        size_t cl = strlen(c->value);
+        if (cl == 0) return 1;
+        if (vlen < cl) return 0;
+        return memmem(val, vlen, c->value, cl) != NULL;
+    }
+    case OP_NOT_CONTAINS: {
+        size_t cl = strlen(c->value);
+        if (cl == 0) return 0;
+        if (vlen < cl) return 1;
+        return memmem(val, vlen, c->value, cl) == NULL;
+    }
+    default:
+        return match_criterion(val, c);
+    }
+}
+
 int match_criterion(const char *val_str, const SearchCriterion *c) {
     if (!val_str && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
 
@@ -8853,7 +8908,7 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, cc->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, cc->primary_crit)) return 0;
     }
 
     /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
@@ -8898,7 +8953,7 @@ static int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16,
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, sk->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, sk->primary_crit)) return 0;
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
@@ -9324,7 +9379,7 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, ic->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, ic->primary_crit)) return 0;
     }
     idx_count_local.pending++;
     /* Cap residency so a freak query (millions of matches in one shard
@@ -9854,7 +9909,7 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, sc->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, sc->primary_crit)) return 0;
     }
 
     /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
@@ -16899,7 +16954,7 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, ia->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, ia->primary_crit)) return 0;
     }
     /* Layout-agnostic fetch + invoke agg_scan_cb on the synthesized header. */
     RecordRef rr;
