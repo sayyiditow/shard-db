@@ -646,6 +646,31 @@ int load_index_fields(const char *db_root, const char *object, char fields[][256
    bare lines (no :type suffix) default to IT_BTREE. */
 int load_index_types(const char *db_root, const char *object, enum IndexType *types, int max_fields);
 void invalidate_idx_cache(const char *object);
+
+/* Parsed index spec from a wire string or index.conf line. Centralises
+   the suffix-recognition logic so create-object, add-index, and the
+   reindex path all agree on the same grammar:
+     "field"            → IT_BTREE,    max=0, explicit=0  (bare name)
+     "field:btree"      → IT_BTREE,    max=0, explicit=1
+     "field:bitmap"     → IT_BITMAP,   max=0, explicit=1
+     "field:bitmap(N)"  → IT_BITMAP,   max=N, explicit=1
+     "field:trigram"    → IT_TRIGRAM,  max=0, explicit=1
+     "a+b" / "a+b:btree" → composite, btree-only
+   Returns 0 on success, -1 on bad type token or unparsable cap. */
+typedef struct {
+    char           name[256];
+    enum IndexType type;
+    uint32_t       max_values;        /* bitmap-only; 0 means "default" */
+    int            had_explicit_type; /* 1 if input had a recognised :type suffix */
+    int            is_composite;      /* 1 if name contains '+' */
+} ParsedIndexSpec;
+int parse_index_spec(const char *spec, ParsedIndexSpec *out);
+
+/* The canonical auto-bitmap rule. Today: bool fields whose spec was
+   bare (no explicit :type) become bitmap. Enum will join the same
+   condition once that type lands. Single source of truth so the rule
+   can never drift between create-object and reindex. */
+int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
 void build_effective_root(char *out, size_t outlen, const char *dir);

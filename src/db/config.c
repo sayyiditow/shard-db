@@ -828,32 +828,89 @@ static int parse_index_type_token(const char *tok, size_t len, enum IndexType *o
     return 0;
 }
 
-/* Split one index.conf line into `name` and `type`. Line format:
-     `field`          -> name=field,    type=IT_BTREE
-     `field:bitmap`   -> name=field,    type=IT_BITMAP
-     `f1+f2:bitmap`   -> name=f1+f2,    type=IT_BITMAP   (composite + type)
-   The colon is only the type-separator when it follows the LAST + in a
-   composite (or the whole name for single-field). We split on the LAST `:`
-   to keep field names that legitimately contain other chars intact. */
+/* Canonical index-spec parser. Both create-object's wire validator
+   and cmd_add_indexes's reindex path call this — single source of
+   truth for the grammar. Returns 0 on success, -1 on bad cap or
+   oversized spec. See ParsedIndexSpec in types.h for the format. */
+int parse_index_spec(const char *spec, ParsedIndexSpec *out) {
+    if (!spec || !*spec || !out) return -1;
+    size_t L = strlen(spec);
+    if (L >= sizeof(out->name)) return -1;
+
+    out->type = IT_BTREE;
+    out->max_values = 0;
+    out->had_explicit_type = 0;
+
+    /* Try the LAST `:` first; if its suffix is a known type keyword,
+       split. Otherwise the whole spec is the field name (composite or
+       not). */
+    const char *colon = strrchr(spec, ':');
+    if (colon) {
+        const char *suf = colon + 1;
+        size_t sl = strlen(suf);
+        if (sl == 5 && memcmp(suf, "btree", 5) == 0) {
+            out->type = IT_BTREE; out->had_explicit_type = 1;
+        } else if (sl == 6 && memcmp(suf, "bitmap", 6) == 0) {
+            out->type = IT_BITMAP; out->had_explicit_type = 1;
+        } else if (sl == 7 && memcmp(suf, "trigram", 7) == 0) {
+            out->type = IT_TRIGRAM; out->had_explicit_type = 1;
+        } else if (sl > 7 && memcmp(suf, "bitmap(", 7) == 0 && suf[sl - 1] == ')') {
+            /* bitmap(N): parse N. */
+            char numbuf[16] = {0};
+            size_t nl = sl - 8;
+            if (nl == 0 || nl >= sizeof(numbuf)) return -1;
+            memcpy(numbuf, suf + 7, nl);
+            long v = strtol(numbuf, NULL, 10);
+            if (v <= 0) return -1;
+            out->type = IT_BITMAP;
+            out->max_values = (uint32_t)v;
+            out->had_explicit_type = 1;
+        }
+        if (out->had_explicit_type) {
+            size_t nlen = (size_t)(colon - spec);
+            memcpy(out->name, spec, nlen);
+            out->name[nlen] = '\0';
+        } else {
+            /* Colon present but no known type token — treat as plain
+               name (preserves the field-with-colon edge case). */
+            memcpy(out->name, spec, L + 1);
+        }
+    } else {
+        memcpy(out->name, spec, L + 1);
+    }
+    out->is_composite = (strchr(out->name, '+') != NULL);
+    return 0;
+}
+
+/* The single auto-bitmap rule. Both create-object and reindex defer
+   to this so the behaviour can never drift. Today: bare-named bool
+   fields auto-promote. Enum will join when that type lands — just
+   add the condition here. */
+int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type) {
+    if (had_explicit_type) return 0;
+    if (field_type == FT_BOOL) return 1;
+    /* Future: if (field_type == FT_ENUM) return 1; */
+    return 0;
+}
+
+/* Legacy shim used by the idx cache loader. Returns only (name, type) —
+   discards explicit-type tracking + cap. parse_index_spec is the canonical
+   entry; this wrapper is the cheapest way to keep idx_cache_ensure's
+   call site untouched. */
 static void split_index_spec(const char *line, char *name_out, size_t name_cap,
                              enum IndexType *type_out) {
-    const char *colon = strrchr(line, ':');
-    if (colon) {
-        enum IndexType t;
-        if (parse_index_type_token(colon + 1, strlen(colon + 1), &t)) {
-            size_t nlen = (size_t)(colon - line);
-            if (nlen >= name_cap) nlen = name_cap - 1;
-            memcpy(name_out, line, nlen);
-            name_out[nlen] = '\0';
-            *type_out = t;
-            return;
-        }
-        /* Colon present but type unknown → treat as plain name; the caller
-           probably has a field name with a colon (rare, but don't lose it). */
+    ParsedIndexSpec ps;
+    if (parse_index_spec(line, &ps) != 0) {
+        strncpy(name_out, line, name_cap - 1);
+        name_out[name_cap - 1] = '\0';
+        *type_out = IT_BTREE;
+        return;
     }
-    strncpy(name_out, line, name_cap - 1);
-    name_out[name_cap - 1] = '\0';
-    *type_out = IT_BTREE;
+    size_t nlen = strlen(ps.name);
+    if (nlen >= name_cap) nlen = name_cap - 1;
+    memcpy(name_out, ps.name, nlen);
+    name_out[nlen] = '\0';
+    *type_out = ps.type;
 }
 
 /* Populate g_idx_cache for `object` if not already cached. Returns the

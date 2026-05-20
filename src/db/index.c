@@ -1518,54 +1518,40 @@ int cmd_add_indexes(const char *db_root, const char *object,
     if (nfields == 0) { OUT("{\"error\":\"No fields specified\"}\n"); return 1; }
 
     Schema sch = load_schema(db_root, object);
+    TypedSchema *ts_for_idx = load_typed_schema(db_root, object);
 
-    /* Split into (name, type, max_values) per field. Bitmap fields get
-       rebuilt via build_bitmap_pass (declared further down). Btree
-       fields continue through the existing batched-build path. */
+    /* Parse + auto-promote each spec via the canonical helpers
+       (config.c::parse_index_spec + idx_should_auto_bitmap). Same logic
+       create-object's wire validator uses — single source of truth. */
     char       names[MAX_FIELDS][256];
     enum IndexType types[MAX_FIELDS];
     uint32_t   maxes[MAX_FIELDS];
+    int        promoted = 0;
     for (int i = 0; i < nfields; i++) {
-        const char *colon = strrchr(fields[i], ':');
-        types[i] = IT_BTREE;
-        maxes[i] = 0;
-        if (colon) {
-            const char *suf = colon + 1;
-            size_t sl = strlen(suf);
-            if (sl == 5 && memcmp(suf, "btree", 5) == 0) {
-                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
-                names[i][colon - fields[i]] = '\0';
-                continue;
-            }
-            if (sl == 6 && memcmp(suf, "bitmap", 6) == 0) {
+        ParsedIndexSpec ps;
+        if (parse_index_spec(fields[i], &ps) != 0) {
+            /* Malformed entry in index.conf — preserve as bare btree. */
+            strncpy(names[i], fields[i], 255); names[i][255] = '\0';
+            types[i] = IT_BTREE;
+            maxes[i] = 0;
+            continue;
+        }
+        types[i] = ps.type;
+        maxes[i] = ps.max_values;
+        strncpy(names[i], ps.name, 255); names[i][255] = '\0';
+
+        /* Auto-promote bare bool/enum names to bitmap (legacy index.conf
+           lines emitted before the rule existed). The rule lives in
+           config.c so create-object and reindex can never drift. */
+        if (!ps.is_composite && ts_for_idx) {
+            int fi_t = typed_field_index(ts_for_idx, ps.name);
+            if (fi_t >= 0 &&
+                idx_should_auto_bitmap(ps.had_explicit_type,
+                                       ts_for_idx->fields[fi_t].type)) {
                 types[i] = IT_BITMAP;
-                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
-                names[i][colon - fields[i]] = '\0';
-                continue;
-            }
-            if (sl > 7 && memcmp(suf, "bitmap(", 7) == 0 && suf[sl - 1] == ')') {
-                types[i] = IT_BITMAP;
-                /* Parse N out of bitmap(N). */
-                char numbuf[16] = {0};
-                size_t nl = sl - 8;
-                if (nl > 0 && nl < sizeof(numbuf)) {
-                    memcpy(numbuf, suf + 7, nl);
-                    long v = strtol(numbuf, NULL, 10);
-                    if (v > 0) maxes[i] = (uint32_t)v;
-                }
-                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
-                names[i][colon - fields[i]] = '\0';
-                continue;
-            }
-            if (sl == 7 && memcmp(suf, "trigram", 7) == 0) {
-                types[i] = IT_TRIGRAM;
-                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
-                names[i][colon - fields[i]] = '\0';
-                continue;
+                promoted++;
             }
         }
-        /* No recognised :type suffix → treat as bare btree name. */
-        memcpy(names[i], fields[i], 256);
     }
 
     /* Forward-declared further down (definition lives near the build
@@ -1664,22 +1650,51 @@ int cmd_add_indexes(const char *db_root, const char *object,
             object, actual_count, n_batches, live_count,
             budget / (1024 * 1024));
 
-    /* Add to index.conf */
+    /* Add to index.conf — for ANY promoted (bare → :bitmap) entries we
+       rewrite the whole file in canonical form so subsequent reads
+       (and another reindex) see the right type. Otherwise we just
+       append any new btree entries that weren't already present. */
     mkdirp(dirname_of(conf_path));
-    for (int fi = 0; fi < actual_count; fi++) {
-        int already = 0;
-        FILE *cf = fopen(conf_path, "r");
-        if (cf) {
-            char line[256];
-            while (fgets(line, sizeof(line), cf)) {
-                line[strcspn(line, "\n")] = '\0';
-                if (strcmp(line, actual_fields[fi]) == 0) { already = 1; break; }
+    if (promoted) {
+        /* Full rewrite from (names, types, maxes). Mirrors the writer
+           in cmd_create_object's index.conf-emission block. */
+        FILE *wf = fopen(conf_path, "w");
+        if (wf) {
+            for (int i = 0; i < nfields; i++) {
+                switch (types[i]) {
+                    case IT_BTREE:
+                        fprintf(wf, "%s\n", names[i]);
+                        break;
+                    case IT_BITMAP:
+                        if (maxes[i] && maxes[i] != BM_DEFAULT_MAX_VALUES)
+                            fprintf(wf, "%s:bitmap(%u)\n", names[i], maxes[i]);
+                        else
+                            fprintf(wf, "%s:bitmap\n", names[i]);
+                        break;
+                    case IT_TRIGRAM:
+                        fprintf(wf, "%s:trigram\n", names[i]);
+                        break;
+                }
             }
-            fclose(cf);
+            fclose(wf);
         }
-        if (!already) {
-            FILE *af = fopen(conf_path, "a");
-            if (af) { fprintf(af, "%s\n", actual_fields[fi]); fclose(af); }
+    } else {
+        /* Append-only path for legacy add-index-without-promotion. */
+        for (int fi = 0; fi < actual_count; fi++) {
+            int already = 0;
+            FILE *cf = fopen(conf_path, "r");
+            if (cf) {
+                char line[256];
+                while (fgets(line, sizeof(line), cf)) {
+                    line[strcspn(line, "\n")] = '\0';
+                    if (strcmp(line, actual_fields[fi]) == 0) { already = 1; break; }
+                }
+                fclose(cf);
+            }
+            if (!already) {
+                FILE *af = fopen(conf_path, "a");
+                if (af) { fprintf(af, "%s\n", actual_fields[fi]); fclose(af); }
+            }
         }
     }
 

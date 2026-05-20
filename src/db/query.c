@@ -14382,70 +14382,37 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                         return 1;
                     }
 
-                    char idx_spec[256];
-                    memcpy(idx_spec, istart, ilen);
-                    idx_spec[ilen] = '\0';
+                    char raw_spec[256];
+                    memcpy(raw_spec, istart, ilen);
+                    raw_spec[ilen] = '\0';
 
-                    /* Split on the LAST `:` — only if the suffix is a known
-                       index-type keyword. Otherwise treat as a plain name
-                       (covers hypothetical future field names with `:`).
-                       Bitmap accepts an optional `(N)` for the per-file
-                       cap; `bitmap` alone uses BM_DEFAULT_MAX_VALUES. */
-                    char *colon = strrchr(idx_spec, ':');
-                    enum IndexType itype = IT_BTREE;
-                    uint32_t imax = 0;
-                    if (colon) {
-                        const char *suffix = colon + 1;
-                        size_t slen = strlen(suffix);
-                        if (slen == 5 && memcmp(suffix, "btree", 5) == 0) {
-                            itype = IT_BTREE; *colon = '\0';
-                        } else if (slen >= 6 && memcmp(suffix, "bitmap", 6) == 0) {
-                            /* Either bare `bitmap` or `bitmap(N)`. */
-                            if (slen == 6) {
-                                itype = IT_BITMAP; *colon = '\0';
-                            } else if (suffix[6] == '(' && suffix[slen - 1] == ')') {
-                                /* Parse N. atoi is fine — we validate the
-                                   range right after. */
-                                char numbuf[16] = {0};
-                                size_t nlen = slen - 8;  /* exclude "bitmap(" + ")" */
-                                if (nlen == 0 || nlen >= sizeof(numbuf)) {
-                                    OUT("{\"error\":\"invalid bitmap cap in \\\"%s\\\"\"}\n", idx_spec);
-                                    return 1;
-                                }
-                                memcpy(numbuf, suffix + 7, nlen);
-                                long v = strtol(numbuf, NULL, 10);
-                                if (v < 2 || v > (long)BM_HARD_CEILING) {
-                                    OUT("{\"error\":\"bitmap cap %ld out of range [2, %u] in \\\"%s\\\"\"}\n",
-                                        v, BM_HARD_CEILING, idx_spec);
-                                    return 1;
-                                }
-                                itype = IT_BITMAP;
-                                imax = (uint32_t)v;
-                                *colon = '\0';
-                            }
-                            /* `bitmap...` that's neither bare nor `bitmap(N)` →
-                               leave unrecognised, fall through. */
-                        } else if (slen == 7 && memcmp(suffix, "trigram", 7) == 0) {
-                            itype = IT_TRIGRAM; *colon = '\0';
-                        }
-                        /* Unknown suffix → leave intact, treat whole string as a
-                           composite-aware field name. The composite walk below
-                           will fail-fast if the name doesn't resolve. */
+                    /* Canonical syntactic parse — same helper reindex uses
+                       (config.c::parse_index_spec). Errors out on
+                       unparsable `bitmap(N)`. */
+                    ParsedIndexSpec ps;
+                    if (parse_index_spec(raw_spec, &ps) != 0) {
+                        OUT("{\"error\":\"invalid index spec \\\"%s\\\"\"}\n", raw_spec);
+                        return 1;
                     }
-
-                    /* Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
-                    int is_composite = (strchr(idx_spec, '+') != NULL);
-                    if (is_composite && itype != IT_BTREE) {
+                    /* Cap range check (semantic, not syntactic). */
+                    if (ps.type == IT_BITMAP && ps.max_values != 0 &&
+                        (ps.max_values < 2 || ps.max_values > BM_HARD_CEILING)) {
+                        OUT("{\"error\":\"bitmap cap %u out of range [2, %u] in \\\"%s\\\"\"}\n",
+                            ps.max_values, BM_HARD_CEILING, raw_spec);
+                        return 1;
+                    }
+                    /* Composite indexes are btree-only in 2026.05.7. */
+                    if (ps.is_composite && ps.type != IT_BTREE) {
                         OUT("{\"error\":\"composite indexes are btree-only (got \\\"%s\\\"); declare each field separately if you need bitmap/trigram\"}\n",
-                            idx_spec);
+                            raw_spec);
                         return 1;
                     }
 
-                    /* Walk the composite — validate every part exists and, for
-                       non-btree types, that the field's storage type matches
-                       the index type's contract. */
+                    /* Walk the composite — validate every part exists and
+                       that the field's storage type matches the index
+                       type's contract. */
                     char check[256];
-                    strncpy(check, idx_spec, 255); check[255] = '\0';
+                    strncpy(check, ps.name, 255); check[255] = '\0';
                     char *_tok_save = NULL; char *tok = strtok_r(check, "+", &_tok_save);
                     while (tok) {
                         int tok_len = (int)strlen(tok);
@@ -14461,18 +14428,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             OUT("{\"error\":\"index field \\\"%s\\\" not found in fields\"}\n", tok);
                             return 1;
                         }
-                        /* Index-type ↔ field-type contract (single-field only;
-                           composites are btree-only above). */
-                        if (!is_composite) {
-                            if (itype == IT_BITMAP) {
-                                /* Bitmap is right for bool (auto-default) and
-                                   user-declared low-cardinality varchar enums. */
+                        if (!ps.is_composite) {
+                            if (ps.type == IT_BITMAP) {
                                 if (!FIELD_TYPE_IS(tok, tok_len, "bool") &&
                                     !FIELD_TYPE_IS(tok, tok_len, "varchar")) {
                                     OUT("{\"error\":\"bitmap index requires bool or varchar field (got \\\"%s\\\")\"}\n", tok);
                                     return 1;
                                 }
-                            } else if (itype == IT_TRIGRAM) {
+                            } else if (ps.type == IT_TRIGRAM) {
                                 if (!FIELD_TYPE_IS(tok, tok_len, "varchar")) {
                                     OUT("{\"error\":\"trigram index requires varchar field (got \\\"%s\\\")\"}\n", tok);
                                     return 1;
@@ -14482,33 +14445,29 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                         tok = strtok_r(NULL, "+", &_tok_save);
                     }
 
-                    /* Bool (and future enum) auto-bitmap rule:
-                       a bool field listed in `indexes` WITHOUT an explicit
-                       `:type` suffix becomes bitmap, not btree. The
-                       alternative — silently giving bool a btree — is almost
-                       always the wrong tool. Explicit `field:btree` still
-                       wins; the override only fires when the spec was bare. */
-                    int was_explicit_type = (colon != NULL);
-                    if (itype == IT_BTREE && !is_composite && !was_explicit_type) {
-                        int fnlen2 = (int)strlen(idx_spec);
+                    /* Auto-promote (single source of truth for the rule —
+                       config.c::idx_should_auto_bitmap). Find this field's
+                       FieldType from field_specs[], pass to the rule. */
+                    if (!ps.is_composite) {
+                        int fnlen2 = (int)strlen(ps.name);
                         for (int i = 0; i < nfields; i++) {
                             const char *c = strchr(field_specs[i], ':');
                             if (!c) continue;
                             int nl = (int)(c - field_specs[i]);
                             if (nl != fnlen2) continue;
-                            if (memcmp(field_specs[i], idx_spec, nl) != 0) continue;
-                            if (strncmp(c + 1, "bool", 4) == 0 &&
-                                (c[5] == '\0' || c[5] == ':')) {
-                                itype = IT_BITMAP;
-                            }
+                            if (memcmp(field_specs[i], ps.name, nl) != 0) continue;
+                            TypedField tf = {0};
+                            parse_field_type(c + 1, &tf);
+                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type))
+                                ps.type = IT_BITMAP;
                             break;
                         }
                     }
 
-                    strncpy(pidx[npidx].name, idx_spec, sizeof(pidx[npidx].name) - 1);
+                    strncpy(pidx[npidx].name, ps.name, sizeof(pidx[npidx].name) - 1);
                     pidx[npidx].name[sizeof(pidx[npidx].name) - 1] = '\0';
-                    pidx[npidx].type = itype;
-                    pidx[npidx].max_values = imax;  /* 0 for non-bitmap or default */
+                    pidx[npidx].type = ps.type;
+                    pidx[npidx].max_values = ps.max_values;
                     npidx++;
                 } else p++;
             }
