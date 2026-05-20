@@ -826,6 +826,99 @@ static int test_bitmap_index_run(void) {
     ASSERT_EQ_INT((int)bulk_true,  6, "bulk: 6 true bits across all shards");
     ASSERT_EQ_INT((int)bulk_false, 4, "bulk: 4 false bits across all shards");
 
+    /* === Operator coverage on bitmap-indexed bool field.
+           btree parity: every applicable op routes through the bitmap
+           index, never falls to a full data-shard scan. eq/IN go through
+           the popcount fast path; everything else (NEQ via subtraction,
+           range, len_*) goes through the dict-scan dispatch.
+           Schema: 10 records, flag=true ×6, flag=false ×4. === */
+
+    /* count eq */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "6", "count flag=true → 6");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"false\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag=false → 4");
+    free(resp); resp = NULL;
+
+    /* count neq — via the negation subtraction shortcut on bitmap.
+       Was the 956ms regression on the 25M bench before [[feedback-btree-pattern-reference]]. */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"neq\",\"value\":\"true\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag!=true → 4 (neq shortcut)");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"neq\",\"value\":\"false\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "6", "count flag!=false → 6 (neq shortcut)");
+    free(resp); resp = NULL;
+
+    /* count IN — single-value uses the per-value popcount fast path. */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"in\",\"value\":[\"true\"]}]}", &resp);
+    ASSERT_CONTAINS(resp, "6", "count flag in [true] → 6");
+    free(resp); resp = NULL;
+    /* count IN both → whole-domain shortcut returns live_count (10). */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"in\",\"value\":[\"true\",\"false\"]}]}", &resp);
+    ASSERT_CONTAINS(resp, "10", "count flag in [true,false] → 10");
+    free(resp); resp = NULL;
+
+    /* count NOT_IN — single-value via op_invert → IN. */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"not_in\",\"value\":[\"true\"]}]}", &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag not_in [true] → 4");
+    free(resp); resp = NULL;
+
+    /* count range on bool — exercises the generic dict-scan path.
+       bool false < true; the dict-scan iterates the 2-value dict,
+       runs match_criterion against each decoded value, sums bitmaps. */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"gt\",\"value\":\"false\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "6", "count flag > false → 6 (dict-scan range)");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"lt\",\"value\":\"true\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag < true → 4 (dict-scan range)");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"gte\",\"value\":\"true\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "6", "count flag >= true → 6 (dict-scan range)");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"lte\",\"value\":\"false\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "4", "count flag <= false → 4 (dict-scan range)");
+    free(resp); resp = NULL;
+
+    /* count exists on typed bool — already shortcut to live_count at
+       the planner level; assert it stays right. */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"exists\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "10", "count flag exists → 10");
+    free(resp); resp = NULL;
+
+    /* find via NEQ — routes through the keyset-from-bitmap path. */
+    tc_request(tc, "{\"mode\":\"find\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"neq\",\"value\":\"true\"}],"
+        "\"limit\":100}", &resp);
+    /* All 4 false-flag records must appear. Their keys are b4, b5, b8, b10. */
+    ASSERT_CONTAINS(resp, "\"b4\"",  "find flag!=true returns b4");
+    ASSERT_CONTAINS(resp, "\"b5\"",  "find flag!=true returns b5");
+    ASSERT_CONTAINS(resp, "\"b8\"",  "find flag!=true returns b8");
+    ASSERT_CONTAINS(resp, "\"b10\"", "find flag!=true returns b10");
+    free(resp); resp = NULL;
+
+    /* find via range — same set should appear via generic dict-scan. */
+    tc_request(tc, "{\"mode\":\"find\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"criteria\":[{\"field\":\"flag\",\"op\":\"lt\",\"value\":\"true\"}],"
+        "\"limit\":100}", &resp);
+    ASSERT_CONTAINS(resp, "\"b4\"",  "find flag<true returns b4 (range via dict)");
+    ASSERT_CONTAINS(resp, "\"b5\"",  "find flag<true returns b5 (range via dict)");
+    ASSERT_CONTAINS(resp, "\"b8\"",  "find flag<true returns b8 (range via dict)");
+    ASSERT_CONTAINS(resp, "\"b10\"", "find flag<true returns b10 (range via dict)");
+    free(resp); resp = NULL;
+
     /* === 5th distinct value past the per-file cap on the SAME data
            shard must fail. The cap is per-shard (not global), so the
            insert needs to target a shard that already has 4 distinct

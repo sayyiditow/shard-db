@@ -695,6 +695,39 @@ uint32_t bm_count(const BitmapShard *bm, const uint8_t *value, size_t vlen) {
     return total;
 }
 
+/* Iterate every (value, vlen) pair in the dictionary. Walks the on-disk
+   layout described at the top of this file; respects the bool fast-path
+   which doesn't have an explicit dict region. Used by the planner's
+   generic dict-scan dispatch — for ops without a direct popcount path
+   (range / LIKE / CONTAINS / REGEX / len_*) we evaluate the criterion
+   against each decoded dict value and union the matching value-bitmaps,
+   so the operator still routes through the index instead of falling
+   back to a full data-shard scan. */
+int bm_iter_values(const BitmapShard *bm,
+                   int (*cb)(const uint8_t *value, size_t vlen, void *ctx),
+                   void *ctx) {
+    if (!bm || !cb) return 0;
+    if (bm->hdr.flags & BM_FLAG_BOOL_FASTPATH) {
+        /* Hardcoded bool dict: 0x00, 0x01. */
+        uint8_t v0 = 0x00, v1 = 0x01;
+        if (cb(&v0, 1, ctx) != 0) return 1;
+        if (cb(&v1, 1, ctx) != 0) return 2;
+        return 2;
+    }
+    const uint8_t *p = (const uint8_t *)bm->mmap_ptr + bm->hdr.dict_off;
+    const uint8_t *end = (const uint8_t *)bm->mmap_ptr + bm->hdr.bitmaps_off;
+    int n = 0;
+    for (uint32_t i = 0; i < bm->hdr.n_values; i++) {
+        if (p + 2 > end) break;
+        uint16_t len = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        if (p + 2 + len > end) break;
+        n++;
+        if (cb(p + 2, len, ctx) != 0) return n;
+        p += 2 + len;
+    }
+    return n;
+}
+
 /* ─────────────────────── grow ─────────────────────── */
 
 int bm_grow(BitmapShard *bm, uint32_t new_slots) {

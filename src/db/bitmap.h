@@ -138,6 +138,17 @@ int  bm_test(const BitmapShard *bm, const uint8_t *value, size_t vlen, uint32_t 
 int  bm_walk(const BitmapShard *bm, const uint8_t *value, size_t vlen,
              int (*cb)(uint32_t slot, void *ctx), void *ctx);
 
+/* Iterate every (value, vlen) pair in the bitmap's dictionary.
+   `cb` returns 0 to continue, non-zero to stop. Used by the planner's
+   generic "any criterion → walk dict, evaluate per value, union matching
+   bitmaps" path so operators that don't have a direct popcount fast
+   path (LIKE / CONTAINS / range / regex / len_*) still route through
+   the bitmap instead of falling back to a full data-shard scan.
+   Returns the number of dict entries visited. */
+int  bm_iter_values(const BitmapShard *bm,
+                    int (*cb)(const uint8_t *value, size_t vlen, void *ctx),
+                    void *ctx);
+
 /* Population count for a value's bitmap — used by the query planner
    for selectivity-aware AND ordering. O(stride / 8). */
 uint32_t bm_count(const BitmapShard *bm, const uint8_t *value, size_t vlen);
