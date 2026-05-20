@@ -2220,12 +2220,46 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
     return NULL;
 }
 
+/* Helper: render an actionable "unknown enum value" error message into
+   err_buf. Truncates the legal-values list at ~150 chars so the message
+   stays readable even for large enums. Used by typed_encode_defaults
+   (insert/update path). */
+static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
+                                  size_t bad_len, char *err_buf, size_t err_buf_size) {
+    if (!err_buf || err_buf_size == 0) return;
+    int pos = snprintf(err_buf, err_buf_size,
+                       "unknown enum value \"%.*s\" for field [%s]; legal: [",
+                       (int)bad_len, bad_val, f->name);
+    if (pos < 0 || (size_t)pos >= err_buf_size) { err_buf[err_buf_size - 1] = '\0'; return; }
+    size_t budget = err_buf_size - (size_t)pos - 4;  /* room for "...]" */
+    for (int i = 0; i < f->n_enum_values; i++) {
+        const char *v = f->enum_values[i];
+        if (!v) continue;
+        size_t vl = strlen(v);
+        if ((size_t)pos + vl + 3 >= budget) {
+            pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos, "...");
+            break;
+        }
+        pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos,
+                        "%s%s", i ? "," : "", v);
+    }
+    snprintf(err_buf + pos, err_buf_size - (size_t)pos, "]");
+}
+
 /* Encode with field defaults applied. db_root+object needed for seq() defaults;
-   pass NULL if sequence defaults are not expected. */
+   pass NULL if sequence defaults are not expected.
+
+   Strict enum validation: any FT_ENUM field whose client-supplied value
+   is not in the declared list returns -2 and populates err_buf (if
+   provided) with an actionable message. Callers should emit a
+   {"error":"..."} response and abort the insert. NULL err_buf still
+   returns -2 on bad enum input — the caller just won't see details. */
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
-                          int out_size, const char *db_root, const char *object) {
+                          int out_size, const char *db_root, const char *object,
+                          char *err_buf, size_t err_buf_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
+    if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
 
     /* Same inline-match walk as typed_encode, but with a bitmap of which
        schema indices got a client value so we can apply defaults to the
@@ -2262,6 +2296,17 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 const char *ev = vstart; size_t el = vlen;
                 if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
                 if (el > 0) {
+                    /* Enum: strict membership check before the encode.
+                       Unknown values are silently zeroed by encode_field_len
+                       (legacy convention for other typed fields). For enum
+                       that would corrupt every record on a typo, so we
+                       reject at the wire layer instead. */
+                    if (ts->fields[i].type == FT_ENUM &&
+                        enum_value_index(&ts->fields[i], ev, el) < 0) {
+                        fmt_unknown_enum_err(&ts->fields[i], ev, el,
+                                              err_buf, err_buf_size);
+                        return -2;
+                    }
                     /* Same JSON-unescape pass typed_encode does for
                        varchars — keeps wire and stored bytes in sync. */
                     if (ts->fields[i].type == FT_VARCHAR) {

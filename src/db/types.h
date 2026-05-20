@@ -699,7 +699,8 @@ void build_effective_root(char *out, size_t outlen, const char *dir);
 TypedSchema *load_typed_schema(const char *db_root, const char *object);
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size);
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
-                          int out_size, const char *db_root, const char *object);
+                          int out_size, const char *db_root, const char *object,
+                          char *err_buf, size_t err_buf_size);
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
 /* Stream variant — writes the JSON object directly to `out` without
    allocating an intermediate string. Use on the GET hot path; saves one

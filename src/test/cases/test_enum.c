@@ -69,6 +69,23 @@ static int test_enum_run(void) {
     ASSERT_CONTAINS(resp, "\"error\"", "missing ) rejected");
     free(resp); resp = NULL;
 
+    /* Default value NOT in the declared list → rejected at create-object. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"baddefault\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"c:enum(red,green,blue):default=purple\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"",      "default-not-in-list: error");
+    ASSERT_CONTAINS(resp, "default value",  "default-not-in-list: explanatory message");
+    free(resp); resp = NULL;
+
+    /* Default value IN the list → accepted. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"gooddefault\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"c:enum(red,green,blue):default=red\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "default-in-list: created");
+    free(resp); resp = NULL;
+
     /* === CRUD round-trip === */
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"r1\","
@@ -149,11 +166,48 @@ static int test_enum_run(void) {
     ASSERT_CONTAINS(resp, "\"r3\"", "find in [green,blue]: r3 present");
     free(resp); resp = NULL;
 
-    /* === Unknown value handling: encode emits a sentinel; the bitmap
-       lookup misses cleanly. count returns 0. === */
+    /* === Unknown value handling on QUERY criteria: encode emits a
+       sentinel; the bitmap lookup misses cleanly. count returns 0. */
     tc_request(tc, "{\"mode\":\"count\",\"dir\":\"e\",\"object\":\"a\","
         "\"criteria\":[{\"field\":\"color\",\"op\":\"eq\",\"value\":\"purple\"}]}", &resp);
     ASSERT_CONTAINS(resp, "0", "count unknown value=purple → 0");
+    free(resp); resp = NULL;
+
+    /* === Strict insert-time rejection of unknown enum values === */
+
+    /* Single insert with an unknown value → error, no record inserted. */
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"bad1\","
+        "\"value\":{\"color\":\"purple\",\"name\":\"X\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"",         "single insert unknown: error");
+    ASSERT_CONTAINS(resp, "unknown enum value", "single insert unknown: actionable message");
+    ASSERT_CONTAINS(resp, "legal:",            "single insert unknown: legal list");
+    free(resp); resp = NULL;
+
+    /* Bulk insert with mixed valid + invalid: valid ones go in, invalid
+       counted in `errors`. Best-effort batch semantics. */
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"e\",\"object\":\"a\","
+        "\"records\":["
+          "{\"key\":\"b1\",\"value\":{\"color\":\"red\",\"name\":\"A\"}},"
+          "{\"key\":\"b2\",\"value\":{\"color\":\"purple\",\"name\":\"B\"}},"
+          "{\"key\":\"b3\",\"value\":{\"color\":\"blue\",\"name\":\"C\"}}"
+        "]}", &resp);
+    ASSERT_CONTAINS(resp, "\"inserted\":2", "bulk: 2 valid records inserted");
+    ASSERT_CONTAINS(resp, "\"errors\":1",   "bulk: 1 record rejected for bad enum");
+    free(resp); resp = NULL;
+
+    /* Verify the valid bulk records landed (b1 = red, b3 = blue). */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"b1\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"color\":\"red\"", "bulk valid b1: red");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"b3\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"color\":\"blue\"", "bulk valid b3: blue");
+    free(resp); resp = NULL;
+
+    /* And the rejected record is NOT in the store. */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"b2\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "bulk rejected b2: not found");
     free(resp); resp = NULL;
 
     /* === edit-field: append (no flag needed) === */

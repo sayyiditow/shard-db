@@ -1670,10 +1670,22 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 /* id lives in arena — dropped bytes are trivial, no free here */
             } else {
                 /* Allocate payload in arena up front and encode the record
-                   directly into it — skips the typed_tmp bounce + memcpy. */
+                   directly into it — skips the typed_tmp bounce + memcpy.
+                   Strict enum validation: -2 → record has an unknown
+                   enum value. Count as a per-record error + skip the
+                   insert (best-effort batch semantics, same as varchar-
+                   too-long), unlike auto-key parse failures which abort
+                   the whole bulk because the key isn't usable. */
                 uint8_t *payload = arena_alloc(&arena, ts->total_size);
-                typed_encode_defaults(ts, data_ptr, payload, ts->total_size,
-                                      db_root, object);
+                int _enc = typed_encode_defaults(ts, data_ptr, payload,
+                                                  ts->total_size,
+                                                  db_root, object, NULL, 0);
+                if (_enc == -2) {
+                    errors++;
+                    if (obj_heap) free(obj_str);
+                    free(wire_for_record);
+                    continue;
+                }
 
                 if (rec_count >= rec_cap) {
                     rec_cap *= 2;
@@ -14926,10 +14938,44 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, timestamp, uuid, currency, numeric:P,S\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, timestamp, uuid, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
                    field_specs[nfields]);
             return 1;
         }
+
+        /* enum + :default=X — refuse at create-object if X isn't in the
+           declared value list. The spec layout puts :default= AFTER the
+           enum's closing paren, so the strstr lookup is unambiguous. */
+        const char *spec = field_specs[nfields];
+        const char *enum_open = strstr(spec, ":enum(");
+        const char *dflt = strstr(spec, ":default=");
+        if (enum_open && dflt && dflt > enum_open) {
+            /* Default literal runs from after ":default=" to end of spec
+               (or to the next ':' modifier — but none follow :default in
+               the current grammar). */
+            const char *dval = dflt + 9;
+            size_t dlen = strlen(dval);
+            const char *close = strchr(enum_open + 6, ')');
+            if (!close) close = dval - 1;  /* defensive */
+            int in_list = 0;
+            const char *p = enum_open + 6;
+            while (p < close) {
+                const char *next = memchr(p, ',', (size_t)(close - p));
+                if (!next) next = close;
+                size_t vl = (size_t)(next - p);
+                if (vl == dlen && memcmp(p, dval, dlen) == 0) {
+                    in_list = 1;
+                    break;
+                }
+                p = (next < close) ? next + 1 : close;
+            }
+            if (!in_list) {
+                OUT("{\"error\":\"enum field [%s]: default value \\\"%.*s\\\" is not in the declared value list\"}\n",
+                    field_specs[nfields], (int)dlen, dval);
+                return 1;
+            }
+        }
+
         total_value_size += field_size;
         nfields++;
     }

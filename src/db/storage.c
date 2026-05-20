@@ -1248,8 +1248,17 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     uint8_t *typed_buf = malloc(ts->total_size);
     if (!typed_buf) { OUT("{\"error\":\"oom\"}\n"); return 1; }
+    char enc_err[512] = {0};
     int enc = typed_encode_defaults(ts, value, typed_buf, ts->total_size,
-                                    db_root, object);
+                                    db_root, object, enc_err, sizeof(enc_err));
+    if (enc == -2) {
+        /* Strict enum (or future typed) validation rejection — actionable
+           error already in enc_err. Caller never sees a successfully-
+           encoded but semantically-corrupt record. */
+        free(typed_buf);
+        OUT("{\"error\":\"%s\"}\n", enc_err);
+        return 1;
+    }
     if (enc < 0) {
         free(typed_buf);
         OUT("{\"error\":\"Typed encode failed\"}\n");
