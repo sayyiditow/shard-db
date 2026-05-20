@@ -3256,21 +3256,56 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     /* ===== Phase 3 — per-stream batched reserve + seg write. */
     bulk_phase3_seg_writes(db, recs, st, stream_counts, stream_idx);
 
-    /* ===== Phase 4 — per-record pre_commit + kf commit (under held kf wrlock). */
+    /* ===== Phase 4 — per-record kf commit + pre_commit (under held kf wrlock).
+       For UPDATES the slot index is known from Phase 1a (kf_lookup) — we
+       publish (shard, slot) and run pre_commit before kf_repoint. For
+       INSERTS the slot only exists after kf_put_new, so we commit the
+       kf entry first, publish (shard, slot), then run pre_commit; if it
+       returns non-zero we kf_tombstone the entry we just wrote. This
+       gives bitmap index hooks a stable (shard, slot) handle regardless
+       of insert vs update path. */
     for (size_t i = 0; i < n; i++) {
         if (recs[i].status != 0) continue;
         if (!st[i].needs_write) continue;
         SlotcaskBulkRec *r = &recs[i];
 
+        size_t pub_slot = 0;
+        int kf_committed = 0;
+        if (st[i].old_found) {
+            pub_slot = st[i].old_kf_slot;
+        } else {
+            size_t used_delta = 0;
+            int kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
+                                   st[i].target_fid, st[i].target_off,
+                                   r->key, r->klen, db->data_dir,
+                                   &used_delta, &pub_slot);
+            if (kf_rc == 1) kf_rc = -1;
+            if (kf_rc != 0) {
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
+                r->status = -1;
+                continue;
+            }
+            kf_committed = 1;
+        }
+
+        r->kf_shard = kf_shard_id;
+        r->kf_slot  = (uint32_t)pub_slot;
+
         if (opts->pre_commit) {
-            /* Prefer caller-supplied old_value (bulk-update path); fall back
-               to whatever Phase 1b loaded internally. */
             const void *old_v = r->old_value ? r->old_value : st[i].old_buf;
             size_t      old_l = r->old_value ? r->old_vlen  : st[i].old_vlen;
             SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
             int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
                                        r, st[i].old_found);
             if (rc != 0) {
+                /* Roll back: tombstone the kf entry we just wrote (if any)
+                   and the seg, push the free slot back. */
+                if (kf_committed) {
+                    kf_tombstone_at_slot(&kh, pub_slot);
+                }
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
                 pool_push_free(&db->streams[st[i].target_stream],
@@ -3289,11 +3324,8 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                 st[i].target_fid, st[i].target_off);
             kf_rc = 0;
         } else {
-            size_t used_delta = 0;
-            kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
-                                st[i].target_fid, st[i].target_off,
-                                r->key, r->klen, db->data_dir, &used_delta, NULL);
-            if (kf_rc == 1) kf_rc = -1;
+            /* Already committed in the pre_commit publish phase above. */
+            kf_rc = 0;
         }
         if (kf_rc != 0) {
             seg_write_flag(db, st[i].target_stream, st[i].target_fid,
@@ -3377,26 +3409,21 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         SlotcaskBulkRec *r = &recs[i];
 
         size_t used_delta = 0;
+        size_t put_slot = 0;
         int put_rc = kf_put_new(db, &kh, st[i].hash,
                                  st[i].target_stream, st[i].target_fid,
                                  st[i].target_off, r->key, r->klen,
-                                 db->data_dir, &used_delta, NULL);
+                                 db->data_dir, &used_delta, &put_slot);
 
         if (put_rc == 0) {
-            /* New key. Run pre_commit (with old=NULL). */
+            /* New key. Publish (shard, slot) then run pre_commit. */
+            r->kf_shard = kf_shard_id;
+            r->kf_slot  = (uint32_t)put_slot;
             if (opts->pre_commit) {
                 int rc = opts->pre_commit(NULL, r, 0);
                 if (rc != 0) {
-                    /* Rollback: tombstone seg + clear our just-inserted kf entry. */
-                    uint8_t  tmp_flag = 0, tmp_sid = 0;
-                    uint16_t tmp_fid = 0;
-                    uint32_t tmp_off = 0;
-                    size_t   tmp_slot = 0;
-                    if (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
-                                             db->data_dir, &tmp_flag, &tmp_sid,
-                                             &tmp_fid, &tmp_off, &tmp_slot) == 0) {
-                        kf_tombstone_at_slot(&kh, tmp_slot);
-                    }
+                    /* Rollback: tombstone the slot we just wrote + the seg. */
+                    kf_tombstone_at_slot(&kh, put_slot);
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
                     pool_push_free(&db->streams[st[i].target_stream],
@@ -3449,6 +3476,11 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 continue;
             }
             SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+            /* Publish (shard, slot) for bitmap hooks before pre_commit
+               fires. The slot is the existing kf entry's index — same
+               slot kf_repoint_at_slot below will overwrite. */
+            r->kf_shard = kf_shard_id;
+            r->kf_slot  = (uint32_t)ex_slot;
             if (opts->pre_commit) {
                 int rc = opts->pre_commit(&old_rec, r, 1);
                 if (rc != 0) {
@@ -3627,6 +3659,10 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         if (recs[i].status != 0) continue;
         if (!st[i].found) continue;
         SlotcaskBulkRec *r = &recs[i];
+
+        /* Publish (shard, slot) for bitmap hooks before pre_commit fires. */
+        r->kf_shard = kf_shard_id;
+        r->kf_slot  = (uint32_t)st[i].kf_slot;
 
         if (opts->pre_commit) {
             SlotcaskOldRecord old_rec = { st[i].old_buf, st[i].old_vlen };

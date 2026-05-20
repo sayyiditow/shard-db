@@ -918,6 +918,7 @@ typedef struct {
     const int     (*idx_field_indices)[16];
     const int      *idx_field_counts;
     const int      *idx_is_composite;
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM */
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
@@ -1057,6 +1058,7 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
     const uint8_t *new_value = (const uint8_t *)rec->value;
 
     for (int fi = 0; fi < sw->nidx; fi++) {
+        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
         uint8_t *key_buf = NULL;
         size_t   key_len = 0;
 
@@ -1093,6 +1095,33 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
         int unchanged = old_idx_have[fi] && have_new &&
                         key_len == old_idx_lens[fi] &&
                         memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
+
+        /* Bitmap fields: dispatch to update_idx_fn inline since the slot
+           is known (rec->kf_slot). Btree fields continue accumulating
+           into sw->idx_pairs for the batched post-wrlock write. */
+        if (itype == IT_BITMAP) {
+            if (!unchanged) {
+                UpdateIdxArg a = {0};
+                a.db_root = sw->db_root;
+                a.object  = sw->object;
+                a.field   = sw->idx_fields[fi];
+                a.splits  = sw->sch->splits;
+                a.new_key = have_new ? key_buf : NULL;
+                a.new_len = key_len;
+                a.old_key = old_idx_have[fi] ? old_idx_bufs[fi] : NULL;
+                a.old_len = old_idx_lens[fi];
+                a.hash    = r->hash;
+                a.type    = IT_BITMAP;
+                a.kf_shard = rec->kf_shard;
+                a.kf_slot  = rec->kf_slot;
+                update_idx_fn(&a);
+                /* a.out_error not propagated for bulk MVP — a single record
+                   over the cap won't fail the whole batch. Reindex catches it. */
+            }
+            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+            free(key_buf);
+            continue;
+        }
 
         if (old_idx_have[fi] && !unchanged) {
             delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
@@ -1354,6 +1383,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     int idx_field_indices[MAX_FIELDS][16];
     int idx_field_counts[MAX_FIELDS];
     int idx_is_composite[MAX_FIELDS];
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     for (int fi = 0; fi < nfields; fi++) {
         idx_is_composite[fi] = (strchr(idx_fields[fi], '+') != NULL);
         idx_field_counts[fi] = 0;
@@ -1736,6 +1767,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         ws->idx_field_indices = (const int (*)[16])idx_field_indices;
         ws->idx_field_counts = idx_field_counts;
         ws->idx_is_composite = idx_is_composite;
+        ws->idx_types = idx_types;
         ws->inserted = 0;
         ws->errors = 0;
         ws->skipped = 0;
@@ -1991,6 +2023,8 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     int idx_field_indices[MAX_FIELDS][16]; /* sub-field indices for each index */
     int idx_field_counts[MAX_FIELDS];
     int idx_is_composite[MAX_FIELDS];
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     for (int fi = 0; fi < nidx; fi++) {
         idx_is_composite[fi] = (strchr(idx_fields[fi], '+') != NULL);
         idx_field_counts[fi] = 0;
@@ -2379,6 +2413,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         ws->idx_field_indices = (const int (*)[16])idx_field_indices;
         ws->idx_field_counts = idx_field_counts;
         ws->idx_is_composite = idx_is_composite;
+        ws->idx_types = idx_types;
         ws->inserted = 0;
         ws->errors = 0;
         ws->skipped = 0;

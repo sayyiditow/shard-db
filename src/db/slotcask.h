@@ -366,6 +366,11 @@ typedef struct {
     /* output: callee fills */
     int         status;                /* 0=ok, -2=cond_not_met, -1=error */
     int         was_update;
+    /* Physical location of the kf entry (insert: slot kf_put_new chose;
+       update: slot kf_lookup found). Written BEFORE pre_commit fires so
+       per-record bitmap updates can address the slot. */
+    int         kf_shard;
+    uint32_t    kf_slot;
 } SlotcaskBulkRec;
 
 typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,

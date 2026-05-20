@@ -581,6 +581,46 @@ static int test_bitmap_index_run(void) {
     ASSERT_TRUE(total_n_values >= 1 && total_n_values <= 4,
                 "per-shard dict size within cap");
 
+    /* === Bulk-insert maintains bitmap shards. Insert 10 records via
+           one bulk-insert call; verify the on-disk bit counts match. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bulk\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bulk (auto-bitmap on flag)");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"bulk\",\"records\":["
+          "{\"key\":\"b1\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b2\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b3\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b4\",\"value\":{\"flag\":false}},"
+          "{\"key\":\"b5\",\"value\":{\"flag\":false}},"
+          "{\"key\":\"b6\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b7\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b8\",\"value\":{\"flag\":false}},"
+          "{\"key\":\"b9\",\"value\":{\"flag\":true}},"
+          "{\"key\":\"b10\",\"value\":{\"flag\":false}}"
+        "]}", &resp);
+    ASSERT_CONTAINS(resp, "\"inserted\":10", "bulk inserted 10");
+    free(resp); resp = NULL;
+
+    uint32_t bulk_true = 0, bulk_false = 0;
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/bulk/indexes/flag/%03x.bm", env.db_root, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        if (bm) {
+            uint8_t t = 0x01, f = 0x00;
+            bulk_true  += bm_count(bm, &t, 1);
+            bulk_false += bm_count(bm, &f, 1);
+            bm_close(bm);
+        }
+    }
+    ASSERT_EQ_INT((int)bulk_true,  6, "bulk: 6 true bits across all shards");
+    ASSERT_EQ_INT((int)bulk_false, 4, "bulk: 4 false bits across all shards");
+
     /* === 5th distinct value past the per-file cap on the SAME data
            shard must fail. The cap is per-shard (not global), so the
            insert needs to target a shard that already has 4 distinct
