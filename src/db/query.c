@@ -1,6 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "simd.h"
+#include "bitmap.h"
 #include <fnmatch.h>
 #include <math.h>
 
@@ -917,6 +918,16 @@ typedef struct {
     const int     (*idx_field_indices)[16];
     const int      *idx_field_counts;
     const int      *idx_is_composite;
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM */
+    /* Per-field bitmap accumulators — mirror btree's idx_pairs[] but
+       carry (slot, value) instead of (value, hash). Filled by
+       v2_bulk_ins_pre_commit_bulk under the kf wrlock; flushed AFTER
+       each per-shard slotcask_bulk_upsert call returns, holding the
+       bm wrlock once per (shard, field) instead of once per record.
+       Counts reset between shard iterations. */
+    struct BmPair **bm_pairs;        /* [nidx] */
+    size_t         *bm_pair_counts;  /* [nidx] */
+    size_t         *bm_pair_caps;    /* [nidx] */
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
@@ -998,6 +1009,16 @@ typedef struct {
     size_t            old_arena_slot;
 } V2BulkInsCtx;
 
+/* (slot, value) pair queued for batched bitmap flush. Inline value
+   buffer covers bool (1 B) + typical varchar enum values (≤32 B);
+   longer encodings fall back to the per-record bm_open path. */
+#define BM_PAIR_INLINE  64
+typedef struct BmPair {
+    uint32_t slot;
+    uint16_t vlen;
+    uint8_t  value[BM_PAIR_INLINE];
+} BmPair;
+
 /* Per-record pre_commit hook fired under the kf-shard wrlock by
    slotcask_bulk_upsert_in_kfshard. Reads the V2BulkInsCtx via
    rec->user_ctx and accumulates idx entries into sw->idx_pairs[fi]. */
@@ -1056,6 +1077,7 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
     const uint8_t *new_value = (const uint8_t *)rec->value;
 
     for (int fi = 0; fi < sw->nidx; fi++) {
+        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
         uint8_t *key_buf = NULL;
         size_t   key_len = 0;
 
@@ -1092,6 +1114,51 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
         int unchanged = old_idx_have[fi] && have_new &&
                         key_len == old_idx_lens[fi] &&
                         memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
+
+        /* Bitmap fields: enqueue (slot, value) into the per-field
+           accumulator. The post-shard flush (bulk_insert_shard_worker_v2)
+           opens the .bm shard with writer=1 once, applies all bm_set's,
+           then releases — same lock-amortisation pattern btree uses
+           via idx_pairs[] + btree_bulk_merge. */
+        if (itype == IT_BITMAP) {
+            if (!unchanged && have_new && key_len <= BM_PAIR_INLINE && sw->bm_pairs) {
+                if (sw->bm_pair_counts[fi] >= sw->bm_pair_caps[fi]) {
+                    size_t new_cap = sw->bm_pair_caps[fi]
+                                     ? sw->bm_pair_caps[fi] * 2 : 256;
+                    BmPair *t = xrealloc_or_free(sw->bm_pairs[fi],
+                                                  new_cap * sizeof(BmPair));
+                    if (!t) {
+                        log_msg(1, "INDEX_OOM shard=%d field=%s (dropped bitmap pair)",
+                                sw->shard_id, sw->idx_fields[fi]);
+                        sw->bm_pairs[fi] = NULL;
+                        sw->bm_pair_counts[fi] = 0;
+                        sw->bm_pair_caps[fi] = 0;
+                    } else {
+                        sw->bm_pairs[fi] = t;
+                        sw->bm_pair_caps[fi] = new_cap;
+                    }
+                }
+                if (sw->bm_pairs[fi]) {
+                    BmPair *p = &sw->bm_pairs[fi][sw->bm_pair_counts[fi]++];
+                    p->slot = rec->kf_slot;
+                    p->vlen = (uint16_t)key_len;
+                    memcpy(p->value, key_buf, key_len);
+                }
+            } else if (!unchanged && have_new) {
+                /* Oversized value or no accumulator — fall back to the
+                   per-record path. Same correctness, slower. */
+                UpdateIdxArg a = {0};
+                a.db_root = sw->db_root; a.object = sw->object;
+                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+                a.new_key = key_buf; a.new_len = key_len;
+                a.hash = r->hash; a.type = IT_BITMAP;
+                a.kf_shard = rec->kf_shard; a.kf_slot = rec->kf_slot;
+                update_idx_fn(&a);
+            }
+            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+            free(key_buf);
+            continue;
+        }
 
         if (old_idx_have[fi] && !unchanged) {
             delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
@@ -1181,6 +1248,22 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         ? malloc((size_t)sw->nidx * INDEX_KEY_MAX)
         : NULL;
 
+    /* Bitmap accumulators — per-field BmPair arrays. Reset between shard
+       iterations (each shard flushes its own pending bm_set's, then
+       counts go back to 0). Only allocated when there's at least one
+       bitmap-typed field. */
+    int has_bm_field = 0;
+    if (sw->idx_types) {
+        for (int fi = 0; fi < sw->nidx; fi++) {
+            if (sw->idx_types[fi] == IT_BITMAP) { has_bm_field = 1; break; }
+        }
+    }
+    if (has_bm_field) {
+        sw->bm_pairs       = calloc((size_t)sw->nidx, sizeof(BmPair *));
+        sw->bm_pair_counts = calloc((size_t)sw->nidx, sizeof(size_t));
+        sw->bm_pair_caps   = calloc((size_t)sw->nidx, sizeof(size_t));
+    }
+
     /* Pack records into [batch] grouped by kf shard, with [ctxs] mirrored. */
     for (size_t i = 0; i < sw->count; i++) {
         int s = kf_shards[i];
@@ -1221,6 +1304,51 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
                     batch[offsets[s] + k].status = -1;
             }
         }
+
+        /* Flush accumulated bitmap pairs for this shard. One bm_open
+           per (shard, field) — wrlock acquired once, all bm_set's
+           applied, wrlock released. Same amortisation pattern btree
+           uses with btree_insert_batch in the merge phase. */
+        if (has_bm_field && sw->bm_pairs) {
+            int slots_per_shard =
+                (int)slotcask_default_slots_for_splits(sw->sch->splits);
+            for (int fi = 0; fi < sw->nidx; fi++) {
+                if (sw->idx_types[fi] != IT_BITMAP) continue;
+                if (sw->bm_pair_counts[fi] == 0) continue;
+                if (!sw->bm_pairs[fi]) {
+                    sw->bm_pair_counts[fi] = 0;
+                    continue;
+                }
+                char bp[PATH_MAX];
+                bm_build_path(bp, sizeof(bp), sw->db_root, sw->object,
+                              sw->idx_fields[fi], s);
+                /* bool_fastpath autodetect: first queued pair is 1 byte? */
+                int bool_fast = (sw->bm_pair_counts[fi] > 0 &&
+                                 sw->bm_pairs[fi][0].vlen == 1);
+                BitmapShard *bm = bm_open(bp, slots_per_shard, 1,
+                                          bool_fast, 0, 1 /* writer */);
+                if (bm) {
+                    /* Auto-grow if any pair exceeds current stride. The
+                       largest slot in this batch bounds the requirement. */
+                    uint32_t max_slot = 0;
+                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
+                        if (sw->bm_pairs[fi][k].slot > max_slot)
+                            max_slot = sw->bm_pairs[fi][k].slot;
+                    }
+                    if (max_slot >= bm_slots(bm)) {
+                        uint32_t want = max_slot + 1, grown = 1;
+                        while (grown < want && grown < 0x80000000u) grown <<= 1;
+                        bm_grow(bm, grown);
+                    }
+                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
+                        BmPair *p = &sw->bm_pairs[fi][k];
+                        bm_set(bm, p->value, p->vlen, p->slot);
+                    }
+                    bm_close(bm);
+                }
+                sw->bm_pair_counts[fi] = 0;
+            }
+        }
     }
 
     for (size_t i = 0; i < sw->count; i++) {
@@ -1235,6 +1363,15 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     free(batch); free(ctxs); free(kf_shards);
     free(counts); free(offsets); free(cursors);
     free(old_arena);
+    /* Free per-field bitmap accumulators (all already flushed above). */
+    if (sw->bm_pairs) {
+        for (int fi = 0; fi < sw->nidx; fi++) free(sw->bm_pairs[fi]);
+        free(sw->bm_pairs); free(sw->bm_pair_counts); free(sw->bm_pair_caps);
+        sw->bm_pairs = NULL;
+        sw->bm_pair_counts = NULL;
+        sw->bm_pair_caps = NULL;
+    }
+    bm_flush_thread_bitmap_cache();  /* no-op shim, kept for symmetry */
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
 }
@@ -1353,6 +1490,8 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     int idx_field_indices[MAX_FIELDS][16];
     int idx_field_counts[MAX_FIELDS];
     int idx_is_composite[MAX_FIELDS];
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     for (int fi = 0; fi < nfields; fi++) {
         idx_is_composite[fi] = (strchr(idx_fields[fi], '+') != NULL);
         idx_field_counts[fi] = 0;
@@ -1735,6 +1874,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         ws->idx_field_indices = (const int (*)[16])idx_field_indices;
         ws->idx_field_counts = idx_field_counts;
         ws->idx_is_composite = idx_is_composite;
+        ws->idx_types = idx_types;
         ws->inserted = 0;
         ws->errors = 0;
         ws->skipped = 0;
@@ -1990,6 +2130,8 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     int idx_field_indices[MAX_FIELDS][16]; /* sub-field indices for each index */
     int idx_field_counts[MAX_FIELDS];
     int idx_is_composite[MAX_FIELDS];
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     for (int fi = 0; fi < nidx; fi++) {
         idx_is_composite[fi] = (strchr(idx_fields[fi], '+') != NULL);
         idx_field_counts[fi] = 0;
@@ -2378,6 +2520,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         ws->idx_field_indices = (const int (*)[16])idx_field_indices;
         ws->idx_field_counts = idx_field_counts;
         ws->idx_is_composite = idx_is_composite;
+        ws->idx_types = idx_types;
         ws->inserted = 0;
         ws->errors = 0;
         ws->skipped = 0;
@@ -6800,6 +6943,61 @@ typedef struct {
                               parallel shard scans */
 } AdvSearchCtx;
 
+/* Vlen-aware match. Identical semantics to match_criterion but
+   callers that already know the value's byte length (every cb on
+   the btree-scan hot path: idx_count_cb, collect_hash_cb,
+   stream_keyset_cb, agg's per-leaf path) can skip a per-entry
+   strlen scan on the haystack. Concretely OP_ENDS_WITH used to
+   compute strlen(val_str) per leaf entry; at 25M emails averaging
+   ~25 bytes that is ~625 MB of redundant memory scans just to
+   find string lengths the cb already has in hand. The win is
+   small on hot cache (~10% vs the libc strstr/strcmp paths which
+   are aggressively SIMD-optimised) but real and durable.
+
+   Implementation notes:
+   - Specialised for the four ops where vlen genuinely changes
+     the per-entry cost shape: ENDS_WITH, STARTS_WITH, CONTAINS,
+     NOT_CONTAINS. All four become a single memcmp / memmem call.
+   - Other ops still need C-string semantics — numeric coercion,
+     regex on NUL-terminated buffers, equality strcmp — so we
+     fall back to match_criterion. Callers on the cb hot path
+     already do tmp[vlen] = '\\0' before invoking, so val is
+     guaranteed NUL-terminated for the fallback.
+   - First-pass attempt of this helper appeared to regress ends
+     queries by ~10× in one bench run, leading to a revert.
+     Subsequent benches showed that was cold-page-cache jitter
+     between runs, not a real regression — re-applied here. */
+int match_criterion_vlen(const char *val, size_t vlen,
+                         const SearchCriterion *c) {
+    if (!val && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
+    switch (c->op) {
+    case OP_ENDS_WITH: {
+        size_t cl = strlen(c->value);
+        if (vlen < cl) return 0;
+        return memcmp(val + vlen - cl, c->value, cl) == 0;
+    }
+    case OP_STARTS_WITH: {
+        size_t cl = strlen(c->value);
+        if (vlen < cl) return 0;
+        return memcmp(val, c->value, cl) == 0;
+    }
+    case OP_CONTAINS: {
+        size_t cl = strlen(c->value);
+        if (cl == 0) return 1;
+        if (vlen < cl) return 0;
+        return memmem(val, vlen, c->value, cl) != NULL;
+    }
+    case OP_NOT_CONTAINS: {
+        size_t cl = strlen(c->value);
+        if (cl == 0) return 0;
+        if (vlen < cl) return 1;
+        return memmem(val, vlen, c->value, cl) == NULL;
+    }
+    default:
+        return match_criterion(val, c);
+    }
+}
+
 int match_criterion(const char *val_str, const SearchCriterion *c) {
     if (!val_str && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
 
@@ -7847,6 +8045,25 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         case OP_NOT_EXISTS: return 0;
         case OP_EQUAL: return v == q;
         case OP_NOT_EQUAL: return v != q;
+        case OP_LESS: return v < q;
+        case OP_GREATER: return v > q;
+        case OP_LESS_EQ: return v <= q;
+        case OP_GREATER_EQ: return v >= q;
+        case OP_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == cc->in_i64[i]) return 1;
+            return 0;
+        }
+        case OP_NOT_IN: {
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == cc->in_i64[i]) return 0;
+            return 1;
+        }
+        /* OP_BETWEEN on bool/byte not compiled — CompiledCriterion only
+           carries one byte bound; in practice bool BETWEEN is degenerate
+           (just IN [true,false]) and byte BETWEEN can be expressed as
+           a pair of GTE+LTE via the existing range coalescer. Falls
+           through to default → 0. */
         default: return 0;
         }
     }
@@ -8691,7 +8908,7 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, cc->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, cc->primary_crit)) return 0;
     }
 
     /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
@@ -8736,7 +8953,7 @@ static int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16,
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, sk->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, sk->primary_crit)) return 0;
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
@@ -8840,10 +9057,123 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
    the legacy ASCII storage of composite indexes). With the per-shard index
    layout each call fans out across index_splits_for(splits) shard files
    internally. */
+/* Forward decls — both definitions live near build_keyset_from_bitmap. */
+static enum IndexType field_index_type(const char *db_root, const char *object,
+                                       const char *field);
+
+/* Per-shard worker arg for parallel bitmap dispatch — mirrors btree's
+   ShardWalkArg in index.c. The shared atomic stop_flag lets a worker
+   that hits the caller's limit cancel its peers. */
+typedef struct BmShardWalkArg {
+    const char  *db_root;
+    const char  *object;
+    const char  *field;
+    int          shard_idx;
+    const uint8_t *value;
+    size_t       vlen;
+    bt_result_cb cb;
+    void        *ctx;
+    SlotcaskDb  *sdb;
+    int         *stop_flag;     /* manipulated via __atomic_* */
+} BmShardWalkArg;
+
+/* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
+   per live matching slot. */
+static int bitmap_emit_for_shard(const char *db_root, const char *object,
+                                 const char *field, int shard_idx,
+                                 const uint8_t *value, size_t vlen,
+                                 bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
+static void *bm_shard_walk_worker(void *arg);
+
+/* Type-aware front for the planner's per-leaf dispatch. Bitmap-indexed
+   eq leaves walk the bitmap shards directly and emit per-match
+   callbacks; everything else falls through to the existing btree path. */
+/* BmGenericShardArg's struct body is needed at btree_dispatch's call
+   site (sizeof + initialization). The worker function body lives near
+   the bitmap helpers (~L10990); we forward-declare it here. */
+typedef struct BmGenericShardArg {
+    const char       *db_root;
+    const char       *object;
+    const char       *field;
+    int               shard_idx;
+    SearchCriterion  *crit;
+    const TypedField *tf;
+    bt_result_cb      cb;
+    void             *ctx;
+    SlotcaskDb       *sdb;
+    int              *stop_flag;
+} BmGenericShardArg;
+static void *bm_generic_shard_worker(void *arg);
+
 static void btree_dispatch(const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
+    if (field_index_type(db_root, object, field) == IT_BITMAP) {
+        Schema sc = load_schema(db_root, object);
+        SlotcaskSchemaInfo info = {
+            .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb) return;
+
+        if (pc->op == OP_EQUAL || pc->op == OP_IN) {
+            /* Fast path. For OP_IN we loop once per value, parallel-fanning
+               each value across all shards. Per-value bitmaps are disjoint
+               so emitting across values produces no duplicates. The
+               stop_flag is shared across all per-value parallel_for
+               invocations so an early-stop (e.g. find's limit) propagates. */
+            int n_vals = (pc->op == OP_EQUAL) ? 1 : pc->in_count;
+            if (n_vals <= 0) return;
+
+            int stop_flag = 0;
+            BmShardWalkArg *args = malloc((size_t)splits * sizeof(BmShardWalkArg));
+            if (!args) return;
+
+            for (int vi = 0; vi < n_vals; vi++) {
+                if (__atomic_load_n(&stop_flag, __ATOMIC_RELAXED)) break;
+                uint8_t valbuf[1032];
+                size_t  vallen = 0;
+                const char *raw = (pc->op == OP_EQUAL) ? pc->value : pc->in_values[vi];
+                encode_criterion_value(tf, raw, strlen(raw), valbuf, &vallen);
+                if (vallen == 0) continue;
+                for (int s = 0; s < splits; s++) {
+                    args[s] = (BmShardWalkArg){
+                        .db_root = db_root, .object = object, .field = field,
+                        .shard_idx = s, .value = valbuf, .vlen = vallen,
+                        .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+                    };
+                }
+                parallel_for(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
+            }
+            free(args);
+            return;
+        }
+
+        /* Generic dict-scan path: any other op (range, LIKE, CONTAINS,
+           REGEX, len_X, exists, i-variants) iterates the dict per
+           shard, evaluates the criterion against each decoded value,
+           and walks the matching values bitmaps. Per-shard parallel
+           via bm_generic_shard_worker; shared stop_flag handles
+           early-out on limit. This is the btree-parity path:
+           btree default branch full-scans leaves for these ops,
+           bitmap dict-scans up to 256 dict entries instead. */
+        int stop_flag = 0;
+        BmGenericShardArg *gargs =
+            malloc((size_t)splits * sizeof(BmGenericShardArg));
+        if (!gargs) return;
+        for (int s = 0; s < splits; s++) {
+            gargs[s] = (BmGenericShardArg){
+                .db_root = db_root, .object = object, .field = field,
+                .shard_idx = s, .crit = pc, .tf = tf,
+                .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+            };
+        }
+        parallel_for(bm_generic_shard_worker, gargs, splits, sizeof(BmGenericShardArg));
+        free(gargs);
+        return;
+    }
+
     /* Stack buffers for encoded key bytes. Max fixed-type output is 8 B;
        varchar caps at f->size - 2 ≤ 65533 — BT_MAX_VAL_LEN = 512 in practice.
        Keep generous for the "contains text + 4 sentinel bytes" suffix cases. */
@@ -9049,7 +9379,7 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, ic->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, ic->primary_crit)) return 0;
     }
     idx_count_local.pending++;
     /* Cap residency so a freak query (millions of matches in one shard
@@ -9579,7 +9909,7 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, sc->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, sc->primary_crit)) return 0;
     }
 
     /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
@@ -10355,8 +10685,43 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
        index_splits_for(splits) shards. btree_idx_exists checks for any
        non-empty shard.
        Old single-file <field>.idx layout is gone; load_splits trips into
-       the schema cache so this stays cheap on the planner hot path. */
+       the schema cache so this stays cheap on the planner hot path.
+
+       Bitmap-indexed fields don't have .idx files — they have .bm files
+       at <obj>/indexes/<field>/<NNN>.bm. The planner picks them up only
+       for ops bitmap supports (OP_EQUAL for MVP). Other ops on a
+       bitmap-only field fall back to PRIMARY_NONE (full scan). */
+    enum IndexType itype = field_index_type(db_root, object, c->field);
     Schema sch = load_schema(db_root, object);
+    if (itype == IT_BITMAP) {
+        /* Bitmap serves every op the field's type supports — matches
+           btree's behaviour: the planner always picks the index path
+           when an index exists, and the dispatcher decides between a
+           direct value-walk (eq/IN) and a dict-scan (everything else).
+           Two narrow exceptions:
+             - eq_field / neq_field / lt_field / gt_field / lte_field /
+               gte_field: the RHS is per-record, so no static value to
+               compare against. btree falls to full scan for these too;
+               bitmap can't beat that. Return 0 → PRIMARY_NONE.
+             - Anything else: claim it. btree_dispatch's bitmap branch
+               routes eq/IN through the popcount-style fast path and
+               every other op through the generic dict-scan worker
+               (iterates ≤256 dict entries per shard, walks matching
+               value bitmaps). */
+        switch (c->op) {
+            case OP_EQ_FIELD:  case OP_NEQ_FIELD:
+            case OP_LT_FIELD:  case OP_GT_FIELD:
+            case OP_LTE_FIELD: case OP_GTE_FIELD:
+                return 0;
+            default:
+                break;
+        }
+        if (out_idx_path) {
+            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
+                     db_root, object, c->field);
+        }
+        return 1;
+    }
     if (!btree_idx_exists(db_root, object, c->field, sch.splits)) return 0;
     if (out_idx_path) {
         /* out_idx_path is now an opaque tag for callers that want a
@@ -10633,10 +10998,492 @@ static int intersect_collect_cb(const char *val, size_t vlen,
    field). Without the live_count floor, the file-size hint can underestimate
    by an order of magnitude on densely-compressed btrees and the inserts
    degrade to O(cap) once the table fills. */
+/* Bitmap-walk → bt_result_cb adapter. Bit positions emitted by bm_walk
+   are slot indices in the matching kf shard; the kf entry at that slot
+   holds the record's hash. Each live entry's hash gets emitted via the
+   shared callback as if it came from a btree walk — gives every
+   downstream consumer (count, find, intersect) the same shape. */
+typedef struct {
+    SlotcaskKfEntry *kf_map;
+    size_t           kf_capacity;
+    const uint8_t   *val;   /* encoded query value bytes — emitted to cb */
+    size_t           vlen;
+    bt_result_cb     cb;
+    void            *cb_ctx;
+    int              stop;  /* set when user cb returned non-zero —
+                                propagates out to the outer shard loop */
+} BmEmitCtx;
+
+static int bm_emit_cb(uint32_t slot, void *ctx) {
+    BmEmitCtx *c = (BmEmitCtx *)ctx;
+    if (slot >= c->kf_capacity) return 0;
+    SlotcaskKfEntry *e = &c->kf_map[slot];
+    if (e->flag != 1) return 0;  /* empty / tombstoned */
+    int rc = c->cb((const char *)c->val, c->vlen, e->hash, c->cb_ctx);
+    if (rc) c->stop = 1;
+    return rc;
+}
+
+/* Generic bitmap dispatch — handles every op the bitmap can answer
+   that isn't covered by the OP_EQUAL/OP_IN fast paths. Strategy:
+   iterate the on-disk dict, decode each value, evaluate the criterion
+   against it, collect the matching values, then walk each matching
+   value's bitmap and emit hashes via the normal kf-lookup path.
+
+   This is the "btree parity" path: btree's default dispatch is a full
+   leaf scan (one cb per leaf entry, ~25 M cb invocations at 25M scale).
+   The bitmap equivalent is ≤256 cb invocations (dict size cap) — much
+   less work — and still routes every op through the index instead of
+   falling back to a data-shard scan. */
+
+/* Forward decl — decode_idx_to_buf lives further down in the file
+   (~L15596) but the generic bitmap dict-scan path needs it. Static
+   to match the actual definition. */
+static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
+                              char *out, size_t outlen);
+
+/* Per-shard match collector. Walks the dict via bm_iter_values; for
+   each entry, decodes it to display form and applies match_criterion
+   (or match_length_vlen for len_* ops). Stops collecting at
+   BM_DEFAULT_MAX_VALUES — that's the hard ceiling for bitmap dicts. */
+#define BM_DICT_MATCH_CAP 256
+typedef struct {
+    SearchCriterion  *crit;
+    const TypedField *tf;
+    uint8_t  vals[BM_DICT_MATCH_CAP][1024];
+    size_t   vlens[BM_DICT_MATCH_CAP];
+    int      n_match;
+} BmDictMatchCtx;
+
+static int bm_dict_match_cb(const uint8_t *value, size_t vlen, void *ctx) {
+    BmDictMatchCtx *m = (BmDictMatchCtx *)ctx;
+    SearchCriterion *c = m->crit;
+    int matched;
+    if (op_is_length(c->op)) {
+        matched = match_length_vlen(vlen, c);
+    } else {
+        char buf[512];
+        int dlen = decode_idx_to_buf(m->tf, value, vlen, buf, sizeof(buf));
+        if (dlen <= 0) return 0;
+        matched = match_criterion(buf, c);
+    }
+    if (matched && m->n_match < BM_DICT_MATCH_CAP &&
+        vlen <= sizeof(m->vals[0])) {
+        memcpy(m->vals[m->n_match], value, vlen);
+        m->vlens[m->n_match] = vlen;
+        m->n_match++;
+    }
+    return 0;
+}
+
+/* Walk a single shard's bitmap dict-scan style. Returns 1 if cb
+   signalled stop. Mirrors bitmap_emit_for_shard's contract. */
+static int bitmap_emit_generic_for_shard(const char *db_root, const char *object,
+                                          const char *field, int shard_idx,
+                                          SearchCriterion *crit,
+                                          const TypedField *tf,
+                                          bt_result_cb cb, void *ctx,
+                                          SlotcaskDb *sdb) {
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) return 0;
+
+    BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+    bm_iter_values(bm, bm_dict_match_cb, &m);
+    if (m.n_match == 0) { bm_close(bm); return 0; }
+
+    char kfp[PATH_MAX];
+    slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+        bm_close(bm);
+        return 0;
+    }
+
+    int stop = 0;
+    for (int i = 0; i < m.n_match && !stop; i++) {
+        BmEmitCtx ec = { kh.map, kh.capacity, m.vals[i], m.vlens[i],
+                         cb, ctx, 0 };
+        bm_walk(bm, m.vals[i], m.vlens[i], bm_emit_cb, &ec);
+        if (ec.stop) stop = 1;
+    }
+    idx_count_cb_flush_thread();
+
+    kfcache_release(&kh);
+    bm_close(bm);
+    return stop;
+}
+
+/* Per-shard parallel worker for the generic dict-scan path.
+   Struct definition + forward decl live earlier in the file so
+   btree_dispatch can reference both. */
+static void *bm_generic_shard_worker(void *arg) {
+    BmGenericShardArg *a = (BmGenericShardArg *)arg;
+    if (a->stop_flag && __atomic_load_n(a->stop_flag, __ATOMIC_RELAXED))
+        return NULL;
+    int stopped = bitmap_emit_generic_for_shard(a->db_root, a->object,
+                                                 a->field, a->shard_idx,
+                                                 a->crit, a->tf,
+                                                 a->cb, a->ctx, a->sdb);
+    if (stopped && a->stop_flag) {
+        __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+
+/* bt_result_cb adapter for the generic dict-scan → KeySet path.
+   Inserts each emitted hash into the keyset, respects deadline. */
+typedef struct { KeySet *ks; QueryDeadline *dl; } BmKsEmitCtx;
+static int bm_ks_insert_cb(const char *v, size_t vl, const uint8_t *h, void *c) {
+    (void)v; (void)vl;
+    BmKsEmitCtx *kc = (BmKsEmitCtx *)c;
+    if (kc->dl && kc->dl->timed_out) return -1;
+    keyset_insert(kc->ks, h);
+    return 0;
+}
+
+/* Count fast path for any criterion: sum bm_count across (shard ×
+   matching dict value). Mirrors bm_popcount_for_crit but with
+   dict-scan + criterion-match instead of an explicit value list.
+   Used by count's PRIMARY_LEAF path for ops other than eq/IN. */
+static size_t bm_popcount_generic_for_crit(const char *db_root, const char *object,
+                                            const char *field, int splits,
+                                            SearchCriterion *crit,
+                                            const TypedField *tf) {
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) {
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+        bm_iter_values(bm, bm_dict_match_cb, &m);
+        for (int i = 0; i < m.n_match; i++) {
+            total += bm_count(bm, m.vals[i], m.vlens[i]);
+        }
+        bm_close(bm);
+    }
+    return total;
+}
+
+/* Walk a single shard's bitmap for `value`, emitting cb per live
+   matching slot. Returns 1 if cb signalled stop (limit reached), so
+   the outer shard loop can short-circuit and skip the remaining
+   kf_acquire + bm_open syscalls. */
+static int bitmap_emit_for_shard(const char *db_root, const char *object,
+                                 const char *field, int shard_idx,
+                                 const uint8_t *value, size_t vlen,
+                                 bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) return 0;
+
+    char kfp[PATH_MAX];
+    slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+        bm_close(bm);
+        return 0;
+    }
+
+    BmEmitCtx ec = { kh.map, kh.capacity, value, vlen, cb, ctx, 0 };
+    bm_walk(bm, value, vlen, bm_emit_cb, &ec);
+
+    idx_count_cb_flush_thread();
+
+    kfcache_release(&kh);
+    bm_close(bm);
+    return ec.stop;
+}
+
+/* parallel_for worker for shard fan-out. Checks the shared stop flag
+   before doing any I/O so a peer's limit-hit propagates immediately.
+   On a cb-driven stop, raises the flag so subsequent peers also bail. */
+static void *bm_shard_walk_worker(void *arg) {
+    BmShardWalkArg *a = (BmShardWalkArg *)arg;
+    if (a->stop_flag && __atomic_load_n(a->stop_flag, __ATOMIC_RELAXED)) {
+        return NULL;
+    }
+    int stopped = bitmap_emit_for_shard(a->db_root, a->object, a->field,
+                                        a->shard_idx, a->value, a->vlen,
+                                        a->cb, a->ctx, a->sdb);
+    if (stopped && a->stop_flag) {
+        __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+
+/* Bitmap-walk → KeySet collector. Kept for compatibility with the
+   build_keyset_from_bitmap helper that the planner uses for
+   intersect-leaf builds. */
+typedef struct {
+    SlotcaskKfEntry *kf_map;
+    size_t           kf_capacity;
+    KeySet          *ks;
+    QueryDeadline   *dl;
+} BmCollectCtx;
+
+static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
+    BmCollectCtx *c = (BmCollectCtx *)ctx;
+    if (c->dl && c->dl->timed_out) return 1;
+    if (slot >= c->kf_capacity) return 0;
+    SlotcaskKfEntry *e = &c->kf_map[slot];
+    if (e->flag != 1) return 0;
+    keyset_insert(c->ks, e->hash);
+    return 0;
+}
+
+/* Resolve a field's IndexType from the cached index.conf. Linear scan
+   over the cached arrays — cheap for the planner hot path. */
+static enum IndexType field_index_type(const char *db_root, const char *object,
+                                       const char *field) {
+    char fields[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
+    int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
+    int count = n < n2 ? n : n2;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(fields[i], field) == 0) return types[i];
+    }
+    return IT_BTREE;
+}
+
+/* Sum bm_count for a single encoded value across every data shard.
+   Cache-friendly stride-byte popcount in each shard. Cheap (~ms-scale
+   at 25M / 128 shards even cold). Shared between count's popcount
+   fast path, the negation-shortcut popcount, and IN-sum below. */
+static size_t bm_popcount_one_value(const char *db_root, const char *object,
+                                     const char *field, int splits,
+                                     const uint8_t *value, size_t vlen) {
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) {
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        total += bm_count(bm, value, vlen);
+        bm_close(bm);
+    }
+    return total;
+}
+
+/* Total bitmap match count for an OP_EQUAL / OP_IN criterion.
+   Per-value bitmaps are disjoint by construction (each record's value
+   sets exactly one bit across the per-value maps), so summing across
+   the IN values gives the exact match count without dedup. */
+static size_t bm_popcount_for_crit(const char *db_root, const char *object,
+                                    int splits, const SearchCriterion *crit,
+                                    const TypedField *tf) {
+    if (!crit) return 0;
+    uint8_t v[1024];
+    size_t  vl = 0;
+    if (crit->op == OP_EQUAL) {
+        encode_criterion_value(tf, crit->value, strlen(crit->value), v, &vl);
+        if (vl == 0) return 0;
+        return bm_popcount_one_value(db_root, object, crit->field, splits, v, vl);
+    }
+    if (crit->op == OP_IN) {
+        size_t total = 0;
+        for (int i = 0; i < crit->in_count; i++) {
+            vl = 0;
+            encode_criterion_value(tf, crit->in_values[i],
+                                   strlen(crit->in_values[i]), v, &vl);
+            if (vl == 0) continue;
+            total += bm_popcount_one_value(db_root, object, crit->field,
+                                            splits, v, vl);
+        }
+        return total;
+    }
+    return 0;
+}
+
+/* Walk every data shard's bitmap shard for the matching value, lift each
+   live record's hash into a KeySet. Returns NULL on timeout / failure
+   or when the projected keyset footprint exceeds the per-query memory
+   budget — caller falls through to full scan in either case.
+
+   Sizing: KeySet has no resize (see keyset.c). If the table fills,
+   every subsequent insert linear-probes the whole capacity uselessly.
+   The previous fixed `keyset_new(1024)` was a latent O(N × cap) trap
+   that turned `group by age where active=true` at 25M into a 41-second
+   query with silently-wrong results (only ~2048 hashes recorded out of
+   12.5M matches). We now popcount across all shards first (cheap —
+   bm_count is a byte popcount) to size the keyset exactly, mirroring
+   the btree path's leaf_capacity_hint behaviour. */
+static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
+                                        int splits,
+                                        const SearchCriterion *leaf,
+                                        const TypedField *tf,
+                                        QueryDeadline *dl) {
+    /* Bitmap serves eq and IN through the fast value-walk; everything
+       else (range, LIKE, CONTAINS, REGEX, len_X, exists, i-variants)
+       goes through the generic dict-scan path below — matches btree
+       parity: any indexed op routes through index files, never falls
+       back to a data-shard scan. NEQ + NOT_IN arrive here pre-inverted
+       by the count-mode subtraction shortcut (op_invert → eq/IN). */
+    if (leaf->op != OP_EQUAL && leaf->op != OP_IN) {
+        Schema sc_g = load_schema(db_root, object);
+        SlotcaskSchemaInfo info_g = {
+            .splits = sc_g.splits, .slot_size = sc_g.slot_size, .streams = sc_g.streams,
+        };
+        SlotcaskDb *sdb_g = slotcask_registry_get(db_root, object, &info_g);
+        if (!sdb_g) return NULL;
+
+        size_t tot_g = bm_popcount_generic_for_crit(db_root, object,
+                                                     leaf->field, splits,
+                                                     (SearchCriterion *)leaf, tf);
+
+        size_t ks_bytes_est_g = (tot_g ? tot_g : 1024)
+                                * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+        if (ks_bytes_est_g > g_query_buffer_max_bytes) return NULL;
+
+        KeySet *ks_g = keyset_new(tot_g > 0 ? tot_g : 1024);
+        if (!ks_g) return NULL;
+
+        BmKsEmitCtx kec = { ks_g, dl };
+        for (int s = 0; s < splits; s++) {
+            if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
+            bitmap_emit_generic_for_shard(db_root, object, leaf->field, s,
+                                           (SearchCriterion *)leaf, tf,
+                                           bm_ks_insert_cb, &kec, sdb_g);
+        }
+        if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
+        return ks_g;
+    }
+
+    /* Encode every query value up-front so we can both pre-count and
+       walk later without re-encoding. n_vals = 1 for OP_EQUAL, in_count
+       for OP_IN. Bool/byte/numeric values all fit in <= 8B; even
+       varchar bitmaps (future enum-text) cap at 1024 here. */
+    int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
+    if (n_vals <= 0) return NULL;
+    uint8_t (*vals)[1024] = calloc((size_t)n_vals, sizeof(*vals));
+    size_t *vlens = calloc((size_t)n_vals, sizeof(*vlens));
+    if (!vals || !vlens) { free(vals); free(vlens); return NULL; }
+    if (leaf->op == OP_EQUAL) {
+        encode_criterion_value(tf, leaf->value, strlen(leaf->value),
+                               vals[0], &vlens[0]);
+    } else {
+        for (int i = 0; i < n_vals; i++) {
+            encode_criterion_value(tf, leaf->in_values[i],
+                                   strlen(leaf->in_values[i]),
+                                   vals[i], &vlens[i]);
+        }
+    }
+    /* Drop any zero-length encodings (e.g. NULL/empty); they'd cause
+       bm_count/bm_walk to return 0/0 anyway but the explicit check
+       keeps the inner loop branchless. */
+    int n_kept = 0;
+    for (int i = 0; i < n_vals; i++) {
+        if (vlens[i] == 0) continue;
+        if (n_kept != i) {
+            memcpy(vals[n_kept], vals[i], vlens[i]);
+            vlens[n_kept] = vlens[i];
+        }
+        n_kept++;
+    }
+    if (n_kept == 0) { free(vals); free(vlens); return NULL; }
+
+    /* Need a slotcask handle to read kf entries. */
+    Schema sc = load_schema(db_root, object);
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { free(vals); free(vlens); return NULL; }
+
+    /* Pass A: sum bm_count across every (shard × value). Each bm_count
+       is a cache-friendly stride-byte popcount — ~ms-scale at 25M /
+       128 shards even cold. Worth it to size the keyset right.
+       Per-value bitmaps are disjoint by construction, so the sum is
+       exact match cardinality even for IN. */
+    size_t total_matches = 0;
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) {
+            free(vals); free(vlens); return NULL;
+        }
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        for (int i = 0; i < n_kept; i++) {
+            total_matches += bm_count(bm, vals[i], vlens[i]);
+        }
+        bm_close(bm);
+    }
+
+    /* Budget check: keyset_new rounds up to next_pow2(hint*2); each slot
+       is keys[16] + state[4] = 20 B. Match the btree path's guard so
+       monster keysets (e.g. 50%-selective bitmap on a billion-row table)
+       fall through to scan instead of OOM-ing the daemon. */
+    size_t ks_bytes_est = (total_matches ? total_matches : 1024)
+                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    if (ks_bytes_est > g_query_buffer_max_bytes) {
+        free(vals); free(vlens); return NULL;
+    }
+
+    KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
+    if (!ks) { free(vals); free(vlens); return NULL; }
+
+    /* Pass B: walk the bitmaps and lift matching hashes via kf lookup.
+       Serial across shards — the inserts themselves run lock-free
+       (keyset_insert uses per-bucket CAS) so a parallel-walk would be
+       safe, but kfcache_acquire / page faults on cold kf are the real
+       cost and that doesn't trivially parallelise. For each shard we
+       walk every value's bitmap into the same keyset; duplicates are
+       impossible (values are distinct → bitmaps disjoint) so no extra
+       check needed. */
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) {
+            keyset_free(ks); free(vals); free(vlens); return NULL;
+        }
+
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+
+        char kfp[PATH_MAX];
+        slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            bm_close(bm);
+            continue;
+        }
+
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
+        for (int i = 0; i < n_kept; i++) {
+            bm_walk(bm, vals[i], vlens[i], bm_collect_to_keyset_cb, &c);
+        }
+
+        kfcache_release(&kh);
+        bm_close(bm);
+    }
+    free(vals); free(vlens);
+    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    return ks;
+}
+
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
+    /* Dispatch by index type. Bitmap-indexed eq goes through the
+       bitmap walker; everything else stays on the existing btree path. */
+    enum IndexType itype = field_index_type(db_root, object, leaf->field);
+    if (itype == IT_BITMAP) {
+        TypedSchema *ts = load_typed_schema(db_root, object);
+        const TypedField *tf = resolve_idx_field(ts, leaf->field);
+        KeySet *ks = build_keyset_from_bitmap(db_root, object, splits,
+                                              leaf, tf, dl);
+        if (ks) return ks;
+        /* Fall through to btree path if bitmap couldn't help (op not eq,
+           timeout, etc.). For most bitmap leaves this just produces a
+           NULL since there's no btree to fall back to, and the caller
+           drops to full-scan — same effective behavior. */
+    }
     size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
     int live = get_live_count(db_root, object);
     if (live > 0 && (size_t)live > hint) hint = (size_t)live;
@@ -11568,6 +12415,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
              tree->children[0]->kind == CNODE_LEAF);
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
+
         if (is_single_leaf && op_is_negatable(op)) {
             /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
                where the positive match set is small; also the correct
@@ -11575,22 +12423,62 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                every indexed entry and returned count(exists) instead). */
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
-            int pos_cp = op_needs_check_primary(pos.op);
-            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
-            btree_dispatch(db_root, object, pc->field, sch.splits,
-                           &pos, pc_tf, idx_count_cb, &ic);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            size_t pos_count = 0;
+            int pos_ok = 1;
+            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+                /* Bitmap popcount fast path for the inverted positive.
+                   Eq/IN → per-value popcount sum. Anything else (the
+                   inverted form of NOT_LIKE / NOT_CONTAINS / NOT_REGEX
+                   / ...) → dict-scan popcount: iterate ≤256 dict
+                   entries, match each, sum bm_count for matching values.
+                   Either way avoids the full data-shard scan. */
+                if (pos.op == OP_EQUAL || pos.op == OP_IN) {
+                    pos_count = bm_popcount_for_crit(db_root, object, sch.splits,
+                                                      &pos, pc_tf);
+                } else {
+                    pos_count = bm_popcount_generic_for_crit(db_root, object,
+                                                              pc->field, sch.splits,
+                                                              &pos, pc_tf);
+                }
+            } else {
+                int pos_cp = op_needs_check_primary(pos.op);
+                IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
+                btree_dispatch(db_root, object, pc->field, sch.splits,
+                               &pos, pc_tf, idx_count_cb, &ic);
+                pos_count = ic.count;
+                pos_ok = !dl.timed_out;
+            }
+            if (!pos_ok) OUT("{\"error\":\"query_timeout\"}\n");
             else {
                 int total = get_live_count(db_root, object);
-                size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
+                size_t neg = ((size_t)total > pos_count) ? (size_t)total - pos_count : 0;
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
-            btree_dispatch(db_root, object, pc->field, sch.splits,
-                           pc, pc_tf, idx_count_cb, &ic);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%zu\n", ic.count);
+            /* Bitmap routes all single-leaf counts through a popcount-
+               style fast path: per-value sum for eq/IN, dict-scan +
+               per-matching-value sum for everything else. Both avoid
+               the per-record fan-out + per-bit cb invocations that the
+               default idx_count_cb path needs. */
+            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+                size_t total;
+                if (op == OP_EQUAL || op == OP_IN) {
+                    total = bm_popcount_for_crit(db_root, object,
+                                                  sch.splits, pc, pc_tf);
+                } else {
+                    total = bm_popcount_generic_for_crit(db_root, object,
+                                                          pc->field, sch.splits,
+                                                          pc, pc_tf);
+                }
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", total);
+            } else {
+                IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
+                btree_dispatch(db_root, object, pc->field, sch.splits,
+                               pc, pc_tf, idx_count_cb, &ic);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", ic.count);
+            }
         } else {
             CollectCtx cc;
             collect_ctx_init(&cc);
@@ -13894,7 +14782,47 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* Validate indexes reference defined field names */
+    /* Parse + validate `indexes` into an in-memory list of (name, type) so
+       we can:
+         1. Reject unknown types / type-field mismatches upfront.
+         2. Auto-default `IT_BITMAP` for `bool` fields not explicitly indexed.
+         3. Write `<obj>/indexes/index.conf` from the canonicalised list
+            rather than re-parsing the JSON.
+
+       Line format on disk is `name` (legacy → IT_BTREE) or `name:type`.
+       Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
+    struct ParsedIdx {
+        char name[256];
+        enum IndexType type;
+        uint32_t max_values;   /* bitmap-only: 0 = default (BM_DEFAULT_MAX_VALUES) */
+    };
+    struct ParsedIdx pidx[MAX_FIELDS];
+    int npidx = 0;
+
+    /* Helper closures aren't a thing in C — declare a small lambda-ish via
+       a macro so the field-type lookup is a single readable expression in
+       the hot loop below. Returns 1 if `fname` matches a field whose typed
+       name (the substring after the first `:`) equals `expected_tname`. */
+    #define FIELD_TYPE_IS(fname, fnlen, expected_tname)                       \
+        ({                                                                    \
+            int _matched = 0;                                                 \
+            for (int _i = 0; _i < nfields; _i++) {                            \
+                const char *_c = strchr(field_specs[_i], ':');                \
+                if (!_c) continue;                                            \
+                int _nlen = (int)(_c - field_specs[_i]);                      \
+                if (_nlen != (fnlen)) continue;                               \
+                if (memcmp(field_specs[_i], (fname), _nlen) != 0) continue;   \
+                /* Found field; check its type name */                        \
+                size_t _elen = strlen(expected_tname);                        \
+                if (strncmp(_c + 1, (expected_tname), _elen) == 0 &&          \
+                    (_c[1 + _elen] == '\0' || _c[1 + _elen] == ':')) {        \
+                    _matched = 1;                                             \
+                }                                                             \
+                break;                                                        \
+            }                                                                 \
+            _matched;                                                         \
+        })
+
     if (indexes_json && indexes_json[0]) {
         p = json_skip(indexes_json);
         if (*p == '[') {
@@ -13910,21 +14838,54 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                     int ilen = (int)(p - istart);
                     if (*p == '"') p++;
 
-                    char idx_name[512];
-                    memcpy(idx_name, istart, ilen < 511 ? ilen : 511);
-                    idx_name[ilen < 511 ? ilen : 511] = '\0';
+                    if (ilen <= 0 || ilen >= 256) {
+                        OUT("{\"error\":\"invalid index spec (empty or >255 chars)\"}\n");
+                        return 1;
+                    }
+                    if (npidx >= MAX_FIELDS) {
+                        OUT("{\"error\":\"too many index specs (max %d)\"}\n", MAX_FIELDS);
+                        return 1;
+                    }
 
-                    /* For composite indexes like "field1+field2", validate each part */
-                    char check[512];
-                    strncpy(check, idx_name, 511); check[511] = '\0';
+                    char raw_spec[256];
+                    memcpy(raw_spec, istart, ilen);
+                    raw_spec[ilen] = '\0';
+
+                    /* Canonical syntactic parse — same helper reindex uses
+                       (config.c::parse_index_spec). Errors out on
+                       unparsable `bitmap(N)`. */
+                    ParsedIndexSpec ps;
+                    if (parse_index_spec(raw_spec, &ps) != 0) {
+                        OUT("{\"error\":\"invalid index spec \\\"%s\\\"\"}\n", raw_spec);
+                        return 1;
+                    }
+                    /* Cap range check (semantic, not syntactic). */
+                    if (ps.type == IT_BITMAP && ps.max_values != 0 &&
+                        (ps.max_values < 2 || ps.max_values > BM_HARD_CEILING)) {
+                        OUT("{\"error\":\"bitmap cap %u out of range [2, %u] in \\\"%s\\\"\"}\n",
+                            ps.max_values, BM_HARD_CEILING, raw_spec);
+                        return 1;
+                    }
+                    /* Composite indexes are btree-only in 2026.05.7. */
+                    if (ps.is_composite && ps.type != IT_BTREE) {
+                        OUT("{\"error\":\"composite indexes are btree-only (got \\\"%s\\\"); declare each field separately if you need bitmap/trigram\"}\n",
+                            raw_spec);
+                        return 1;
+                    }
+
+                    /* Walk the composite — validate every part exists and
+                       that the field's storage type matches the index
+                       type's contract. */
+                    char check[256];
+                    strncpy(check, ps.name, 255); check[255] = '\0';
                     char *_tok_save = NULL; char *tok = strtok_r(check, "+", &_tok_save);
                     while (tok) {
+                        int tok_len = (int)strlen(tok);
                         int found = 0;
                         for (int i = 0; i < nfields; i++) {
-                            /* Extract field name (before first colon) */
                             const char *c = strchr(field_specs[i], ':');
                             int nlen = c ? (int)(c - field_specs[i]) : (int)strlen(field_specs[i]);
-                            if ((int)strlen(tok) == nlen && memcmp(tok, field_specs[i], nlen) == 0) {
+                            if (tok_len == nlen && memcmp(tok, field_specs[i], nlen) == 0) {
                                 found = 1; break;
                             }
                         }
@@ -13932,12 +14893,78 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             OUT("{\"error\":\"index field \\\"%s\\\" not found in fields\"}\n", tok);
                             return 1;
                         }
+                        if (!ps.is_composite) {
+                            if (ps.type == IT_BITMAP) {
+                                if (!FIELD_TYPE_IS(tok, tok_len, "bool") &&
+                                    !FIELD_TYPE_IS(tok, tok_len, "varchar")) {
+                                    OUT("{\"error\":\"bitmap index requires bool or varchar field (got \\\"%s\\\")\"}\n", tok);
+                                    return 1;
+                                }
+                            } else if (ps.type == IT_TRIGRAM) {
+                                if (!FIELD_TYPE_IS(tok, tok_len, "varchar")) {
+                                    OUT("{\"error\":\"trigram index requires varchar field (got \\\"%s\\\")\"}\n", tok);
+                                    return 1;
+                                }
+                            }
+                        }
                         tok = strtok_r(NULL, "+", &_tok_save);
                     }
+
+                    /* Auto-promote (single source of truth for the rule —
+                       config.c::idx_should_auto_bitmap). Find this field's
+                       FieldType from field_specs[], pass to the rule. */
+                    if (!ps.is_composite) {
+                        int fnlen2 = (int)strlen(ps.name);
+                        for (int i = 0; i < nfields; i++) {
+                            const char *c = strchr(field_specs[i], ':');
+                            if (!c) continue;
+                            int nl = (int)(c - field_specs[i]);
+                            if (nl != fnlen2) continue;
+                            if (memcmp(field_specs[i], ps.name, nl) != 0) continue;
+                            TypedField tf = {0};
+                            parse_field_type(c + 1, &tf);
+                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type))
+                                ps.type = IT_BITMAP;
+                            break;
+                        }
+                    }
+
+                    strncpy(pidx[npidx].name, ps.name, sizeof(pidx[npidx].name) - 1);
+                    pidx[npidx].name[sizeof(pidx[npidx].name) - 1] = '\0';
+                    pidx[npidx].type = ps.type;
+                    pidx[npidx].max_values = ps.max_values;
+                    npidx++;
                 } else p++;
             }
         }
     }
+
+    /* Auto-default: every `bool` field that isn't already declared as an
+       index gets IT_BITMAP. Single-field only; bool can't legally be in a
+       composite anyway since we reject non-btree composites above. */
+    for (int i = 0; i < nfields; i++) {
+        const char *c = strchr(field_specs[i], ':');
+        if (!c) continue;
+        int fnlen = (int)(c - field_specs[i]);
+        if (strncmp(c + 1, "bool", 4) != 0) continue;
+        if (c[5] != '\0' && c[5] != ':') continue;  /* exactly "bool" or "bool:..." */
+
+        int already = 0;
+        for (int j = 0; j < npidx; j++) {
+            if ((int)strlen(pidx[j].name) == fnlen &&
+                memcmp(pidx[j].name, field_specs[i], fnlen) == 0) {
+                already = 1; break;
+            }
+        }
+        if (already) continue;
+        if (npidx >= MAX_FIELDS) break;  /* full — drop the implicit; user can add later */
+        memcpy(pidx[npidx].name, field_specs[i], fnlen);
+        pidx[npidx].name[fnlen] = '\0';
+        pidx[npidx].type = IT_BITMAP;
+        pidx[npidx].max_values = 0;  /* bool auto-default uses BM_DEFAULT_MAX_VALUES */
+        npidx++;
+    }
+    #undef FIELD_TYPE_IS
 
     /* All validation passed — invalidate caches (in case object is being recreated) */
     invalidate_idx_cache(object);
@@ -14083,26 +15110,69 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         slotcask_close(&sdb);
     }
 
-    /* Write index.conf if indexes provided */
-    if (indexes_json && indexes_json[0]) {
+    /* Write index.conf from the parsed list — both explicit indexes and any
+       auto-defaulted bitmap entries on bool fields. Line format is `name`
+       for btree (back-compat with pre-2026.05.7 readers), `name:type` for
+       trigram, or `name:bitmap[(N)]` where the (N) is only emitted when a
+       non-default cap was declared. */
+    if (npidx > 0) {
         snprintf(path, sizeof(path), "%s/%s/indexes/index.conf", eff_root, object);
         f = fopen(path, "w");
         if (f) {
-            p = json_skip(indexes_json);
-            if (*p == '[') p++;
-            while (*p) {
-                p = json_skip(p);
-                if (*p == ']') break;
-                if (*p == ',') { p++; continue; }
-                if (*p == '"') {
-                    p++;
-                    const char *start = p;
-                    while (*p && *p != '"') p++;
-                    fprintf(f, "%.*s\n", (int)(p - start), start);
-                    if (*p == '"') p++;
-                } else p++;
+            for (int i = 0; i < npidx; i++) {
+                switch (pidx[i].type) {
+                    case IT_BTREE:
+                        fprintf(f, "%s\n", pidx[i].name);
+                        break;
+                    case IT_BITMAP:
+                        if (pidx[i].max_values && pidx[i].max_values != BM_DEFAULT_MAX_VALUES) {
+                            fprintf(f, "%s:bitmap(%u)\n", pidx[i].name, pidx[i].max_values);
+                        } else {
+                            fprintf(f, "%s:bitmap\n", pidx[i].name);
+                        }
+                        break;
+                    case IT_TRIGRAM:
+                        fprintf(f, "%s:trigram\n", pidx[i].name);
+                        break;
+                }
             }
             fclose(f);
+        }
+    }
+
+    /* Materialize bitmap shard files NOW so each file's header carries
+       the declared cap (default or override). Empty at create-time;
+       CRUD maintains bits on insert/update/delete, reindex backfills
+       any records that pre-existed the field. Per declared bitmap field,
+       create `splits` per-data-shard files. */
+    for (int i = 0; i < npidx; i++) {
+        if (pidx[i].type != IT_BITMAP) continue;
+        /* Skip composite — already rejected upstream, defensive only. */
+        if (strchr(pidx[i].name, '+')) continue;
+        /* Find field's storage type to set the bool fast-path flag. */
+        int is_bool = 0;
+        int fnlen = (int)strlen(pidx[i].name);
+        for (int j = 0; j < nfields; j++) {
+            const char *fc = strchr(field_specs[j], ':');
+            if (!fc) continue;
+            int jlen = (int)(fc - field_specs[j]);
+            if (jlen != fnlen) continue;
+            if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
+            if (strncmp(fc + 1, "bool", 4) == 0 && (fc[5] == '\0' || fc[5] == ':')) {
+                is_bool = 1;
+            }
+            break;
+        }
+        int slots_per_shard = (int)slotcask_default_slots_for_splits(splits);
+        for (int s = 0; s < splits; s++) {
+            char bm_path[PATH_MAX];
+            bm_build_path(bm_path, sizeof(bm_path), eff_root, object,
+                          pidx[i].name, s);
+            BitmapShard *bm = bm_open(bm_path, slots_per_shard, 1, is_bool,
+                                      pidx[i].max_values, 1 /* writer: materialise file */);
+            if (bm) bm_close(bm);
+            /* Best-effort: if a single shard fails to create, the next
+               insert will retry. Don't fail the whole create-object. */
         }
     }
 
@@ -15884,7 +16954,7 @@ static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void 
         char tmp[1028];
         size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
         memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion(tmp, ia->primary_crit)) return 0;
+        if (!match_criterion_vlen(tmp, cl, ia->primary_crit)) return 0;
     }
     /* Layout-agnostic fetch + invoke agg_scan_cb on the synthesized header. */
     RecordRef rr;
@@ -17829,7 +18899,10 @@ int cmd_aggregate(const char *db_root, const char *object,
         igb_done = 1;  /* ctx populated — skip the IGB block, emit below. */
         goto igb_skip;
     }
-vs_skip:
+vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
+               directly by a declaration. Trips -Wc23-extensions on
+               clang. The `;` keeps us valid C11/17 without changing
+               control flow. */
 
     /* Fast path: indexed group_by (single field, btree exists). Walks the
        group_by btree directly to bucket per encoded value; for any

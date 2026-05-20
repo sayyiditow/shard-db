@@ -120,6 +120,12 @@ int  kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                      size_t slots_capacity, int writer);
 void kfcache_release(SlotcaskKfHandle *h);
 
+/* Build the canonical kf shard path under a slotcask data_dir. Public
+   wrapper around the internal kf_path_for so query.c (bitmap index path)
+   can construct kf paths without duplicating the layout convention. */
+void slotcask_kf_path(char *out, size_t outlen,
+                      const char *data_dir, int shard_id);
+
 /* ============================================================ segcache */
 
 typedef struct {
@@ -322,6 +328,14 @@ typedef struct {
     void                     *check_ctx;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
+    /* Optional out-params: when non-NULL, slotcask writes the target kf
+       shard index + kf slot index here BEFORE invoking pre_commit. The
+       pre_commit ctx can read them via its own pointer to the same
+       storage. Used by bitmap-index updates which key by (shard, slot)
+       rather than by hash. Existing callers leave these NULL and the
+       fields are ignored — no behaviour change. */
+    int                      *out_kf_shard;
+    uint32_t                 *out_kf_slot;
 } SlotcaskUpsertOpts;
 
 /* ============================================================ Bulk upsert
@@ -358,6 +372,11 @@ typedef struct {
     /* output: callee fills */
     int         status;                /* 0=ok, -2=cond_not_met, -1=error */
     int         was_update;
+    /* Physical location of the kf entry (insert: slot kf_put_new chose;
+       update: slot kf_lookup found). Written BEFORE pre_commit fires so
+       per-record bitmap updates can address the slot. */
+    int         kf_shard;
+    uint32_t    kf_slot;
 } SlotcaskBulkRec;
 
 typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
@@ -504,6 +523,12 @@ typedef struct {
        original behavior (always read OLD when a hook is set). pre_commit
        still fires; old is passed as NULL when this flag is on. */
     int                 skip_old_read;
+    /* Optional out-params: when non-NULL, slotcask writes the kf shard
+       index + the slot of the record being deleted here BEFORE invoking
+       pre_commit. Used by bitmap-index updates which key by (shard,
+       slot). Existing callers leave these NULL — no behaviour change. */
+    int                *out_kf_shard;
+    uint32_t           *out_kf_slot;
 } SlotcaskDeleteOpts;
 
 typedef struct {
@@ -574,6 +599,16 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    internally; cb may run on multiple threads — caller's ctx is responsible
    for its own synchronization. */
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
+
+/* Same as slotcask_walk_one_shard but the callback also receives the
+   kf slot index. Used by the bitmap-index reindex path which needs to
+   key bit positions by (kf_shard, kf_slot). */
+typedef int (*SlotcaskScanSlotCb)(uint32_t slot, const uint8_t hash16[16],
+                                   const void *key, size_t klen,
+                                   const void *value, size_t vlen,
+                                   void *ctx);
+int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskScanSlotCb cb, void *ctx);
 
 /* Pre-grow all kf shards to absorb `total_new` upcoming inserts without
    triggering inline resplits mid-insert. Bulk-insert dispatchers should

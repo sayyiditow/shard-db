@@ -1059,10 +1059,19 @@ typedef struct {
     uint8_t           hash[16];
     char            (*fields)[256];
     int               nfields;
+    enum IndexType   *idx_types;       /* parallel to fields[], loaded once */
     const char       *value_json;
     TypedSchema      *idx_ts;
     SearchCriterion  *crit;
     int               ncrit;
+    /* Populated by slotcask BEFORE pre_commit so bitmap update_idx_fn can
+       address the just-written record by (shard, slot). */
+    int               kf_shard;
+    uint32_t          kf_slot;
+    /* Populated by pre_commit when a bitmap-index field's per-file cap
+       is exceeded. cmd_insert_v2 surfaces this as the wire-level error
+       so the operator gets an actionable message + the field name. */
+    char              err_buf[256];
 } V2InsertCtx;
 
 static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1133,24 +1142,91 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 args[n_args].old_key = have_old ? old_key : NULL;
                 args[n_args].old_len = old_len;
                 args[n_args].hash    = c->hash;
+                args[n_args].type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
+                args[n_args].kf_shard = c->kf_shard;
+                args[n_args].kf_slot  = c->kf_slot;
+                args[n_args].bm_max_values = 0;  /* default cap — header wins on existing */
                 n_args++;
             } else {
                 /* Unchanged — free immediately, nothing to dispatch. */
                 free(new_key); free(old_key);
             }
         }
+        int bm_overflow = 0;
         if (n_args > 0) {
             parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
             for (int i = 0; i < n_args; i++) {
+                if (args[i].out_error == -1 && !c->err_buf[0]) {
+                    bm_overflow = 1;
+                    snprintf(c->err_buf, sizeof(c->err_buf),
+                        "bitmap index on field '%s' exceeded distinct-value cap "
+                        "(this insert/update would push the dict past the per-file limit). "
+                        "Either declare a higher cap with field:bitmap(N), or switch to btree: "
+                        "remove-index then add-index without :bitmap.",
+                        args[i].field);
+                }
                 free(args[i].new_key);
                 free(args[i].old_key);
             }
         }
         free(old_json);
+        bm_flush_thread_bitmap_cache();
+        if (bm_overflow) return -1;
     } else {
-        /* Fresh insert: parallel write of all index entries. */
+        /* Fresh insert: parallel write of all index entries. Btree entries
+           still go through the original index_parallel path (which knows
+           about composites and shares unique-key extraction); bitmap
+           entries dispatch through update_idx_fn so the type-aware code
+           in index.c maintains them. */
         index_parallel(c->db_root, c->object, c->splits,
-                       c->value_json, c->hash, c->fields, c->nfields);
+                       c->value_json, c->hash, c->fields, c->nfields,
+                       c->idx_types);
+
+        if (c->idx_types) {
+            UpdateIdxArg bm_args[MAX_FIELDS];
+            int n_bm = 0;
+            for (int i = 0; i < c->nfields; i++) {
+                if (c->idx_types[i] != IT_BITMAP) continue;
+                /* Composite + bitmap is rejected at create-object; defensive. */
+                if (strchr(c->fields[i], '+')) continue;
+                uint8_t *nk = NULL;
+                size_t nl = 0;
+                if (!build_index_key_from_json(c->idx_ts, c->value_json,
+                                                c->fields[i], &nk, &nl))
+                    continue;
+                bm_args[n_bm].db_root = c->db_root;
+                bm_args[n_bm].object  = c->object;
+                bm_args[n_bm].field   = c->fields[i];
+                bm_args[n_bm].splits  = c->splits;
+                bm_args[n_bm].new_key = nk;
+                bm_args[n_bm].new_len = nl;
+                bm_args[n_bm].old_key = NULL;
+                bm_args[n_bm].old_len = 0;
+                bm_args[n_bm].hash    = c->hash;
+                bm_args[n_bm].type    = IT_BITMAP;
+                bm_args[n_bm].kf_shard = c->kf_shard;
+                bm_args[n_bm].kf_slot  = c->kf_slot;
+                bm_args[n_bm].bm_max_values = 0;
+                n_bm++;
+            }
+            int bm_overflow = 0;
+            if (n_bm > 0) {
+                parallel_for(update_idx_fn, bm_args, n_bm, sizeof(UpdateIdxArg));
+                for (int i = 0; i < n_bm; i++) {
+                    if (bm_args[i].out_error == -1 && !c->err_buf[0]) {
+                        bm_overflow = 1;
+                        snprintf(c->err_buf, sizeof(c->err_buf),
+                            "bitmap index on field '%s' exceeded distinct-value cap "
+                            "(this insert would push the dict past the per-file limit). "
+                            "Either declare a higher cap with field:bitmap(N), or switch to btree.",
+                            bm_args[i].field);
+                    }
+                    free(bm_args[i].new_key);
+                }
+            }
+            bm_flush_thread_bitmap_cache();
+            if (bm_overflow) return -1;
+        }
     }
     return 0;
 }
@@ -1202,6 +1278,9 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
     for (int _i = 0; _i < nfields; _i++) fields[_i][255] = '\0';
 
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
+
     SearchCriterion *crit = NULL;
     int ncrit = 0;
     if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
@@ -1209,6 +1288,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     V2InsertCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
         .fields = fields, .nfields = nfields,
+        .idx_types = idx_types,
         .value_json = value,
         .idx_ts = ts,
         .crit = crit, .ncrit = ncrit,
@@ -1221,6 +1301,11 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .check_ctx      = &ctx,
         .pre_commit     = v2_insert_pre_commit,
         .pre_commit_ctx = &ctx,
+        /* Bitmap index needs (shard, slot) — slotcask writes them here
+           before invoking pre_commit. update_idx_fn reads them via
+           V2InsertCtx (same struct, no second indirection). */
+        .out_kf_shard   = &ctx.kf_shard,
+        .out_kf_slot    = &ctx.kf_slot,
     };
     SlotcaskUpsertResult result = {0};
     int rc;
@@ -1254,7 +1339,11 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         free(result.current_value);
         free_criteria(crit, ncrit);
         free(typed_buf);
-        OUT("{\"error\":\"upsert failed\"}\n");
+        if (ctx.err_buf[0]) {
+            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+        } else {
+            OUT("{\"error\":\"upsert failed\"}\n");
+        }
         return 1;
     }
 
@@ -1298,12 +1387,19 @@ typedef struct {
     uint8_t           hash[16];
     char            (*idx_fields)[256];
     int               nidx;
+    enum IndexType   *idx_types;        /* parallel to idx_fields[] */
     TypedSchema      *idx_ts;
     /* CAS criteria — verified inside check_fn under the kf-shard wrlock
        so the check + commit are atomic against concurrent writers. NULL
        when the caller didn't pass `if`. */
     SearchCriterion  *crit;
     int               ncrit;
+    /* Populated by slotcask BEFORE pre_commit (bitmap addresses records
+       by physical slot, not by hash). */
+    int               kf_shard;
+    uint32_t          kf_slot;
+    /* Populated by pre_commit on bitmap-index cap overflow. */
+    char              err_buf[256];
 } V2UpdateCtx;
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1397,14 +1493,32 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
             args[n_args].old_key = have_old ? old_buf : NULL;
             args[n_args].old_len = old_len;
             args[n_args].hash    = c->hash;
+            args[n_args].type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
+            args[n_args].kf_shard = c->kf_shard;
+            args[n_args].kf_slot  = c->kf_slot;
+            args[n_args].bm_max_values = 0;
             n_args++;
         }
     }
 
-    if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+    int bm_overflow = 0;
+    if (n_args > 0) {
+        parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+        for (int i = 0; i < n_args; i++) {
+            if (args[i].out_error == -1 && !c->err_buf[0]) {
+                bm_overflow = 1;
+                snprintf(c->err_buf, sizeof(c->err_buf),
+                    "bitmap index on field '%s' exceeded distinct-value cap "
+                    "(this update would push the dict past the per-file limit). "
+                    "Either declare a higher cap with field:bitmap(N), or switch to btree.",
+                    args[i].field);
+            }
+        }
+    }
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
-    return 0;
+    bm_flush_thread_bitmap_cache();
+    return bm_overflow ? -1 : 0;
 }
 
 static int cmd_update_v2(const char *db_root, const char *object,
@@ -1506,6 +1620,9 @@ static int cmd_update_v2(const char *db_root, const char *object,
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
 
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
+
     /* Parse `if` once; check_fn runs cas_check under the kf-shard wrlock
        so the verify + commit are atomic against concurrent writers. */
     SearchCriterion *crit = NULL;
@@ -1515,6 +1632,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
     V2UpdateCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
         .idx_fields = idx_fields, .nidx = nidx,
+        .idx_types = idx_types,
         .idx_ts = ts,
         .crit = crit, .ncrit = ncrit,
     };
@@ -1526,6 +1644,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .check_ctx        = &ctx,
         .pre_commit       = v2_update_pre_commit,
         .pre_commit_ctx   = &ctx,
+        .out_kf_shard     = &ctx.kf_shard,
+        .out_kf_slot      = &ctx.kf_slot,
     };
     SlotcaskUpsertResult result = {0};
     int rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
@@ -1553,7 +1673,11 @@ static int cmd_update_v2(const char *db_root, const char *object,
     if (rc != 0) {
         free(result.current_value);
         free_criteria(crit, ncrit);
-        OUT("{\"error\":\"update failed\"}\n");
+        if (ctx.err_buf[0]) {
+            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+        } else {
+            OUT("{\"error\":\"update failed\"}\n");
+        }
         return 1;
     }
     free_criteria(crit, ncrit);
@@ -1586,9 +1710,12 @@ typedef struct {
     uint8_t           hash[16];
     char            (*idx_fields)[256];
     int               nidx;
+    enum IndexType   *idx_types;
     TypedSchema      *idx_ts;
     SearchCriterion  *crit;
     int               ncrit;
+    int               kf_shard;     /* populated by slotcask before pre_commit */
+    uint32_t          kf_slot;
 } V2DeleteCtx;
 
 static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1646,12 +1773,17 @@ static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
         args[n_args].old_key = ikey;
         args[n_args].old_len = ilen;
         args[n_args].hash    = c->hash;
+        args[n_args].type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
+        args[n_args].kf_shard = c->kf_shard;
+        args[n_args].kf_slot  = c->kf_slot;
+        args[n_args].bm_max_values = 0;
         n_args++;
     }
 
     if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
+    bm_flush_thread_bitmap_cache();
     return 0;
 }
 
@@ -1703,6 +1835,9 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
 
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
+
     SearchCriterion *crit = NULL;
     int ncrit = 0;
     if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
@@ -1710,6 +1845,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     V2DeleteCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
         .idx_fields = idx_fields, .nidx = nidx,
+        .idx_types = idx_types,
         .idx_ts = ts,
         .crit = crit, .ncrit = ncrit,
     };
@@ -1726,6 +1862,8 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         .check_ctx      = &ctx,
         .pre_commit     = v2_delete_pre_commit,
         .pre_commit_ctx = &ctx,
+        .out_kf_shard   = &ctx.kf_shard,
+        .out_kf_slot    = &ctx.kf_slot,
         /* pre_commit only dereferences old when there are index entries
            to drop. On non-indexed + non-CAS delete, opt out of
            read_record_value — saves a segcache_acquire + 100B memcpy +

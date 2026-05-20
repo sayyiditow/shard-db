@@ -158,6 +158,17 @@ enum FieldType {
     FT_UUID         /* uuid — 16 bytes binary */
 };
 
+/* Index types — declared per-field at create-object, persisted in
+   <obj>/indexes/index.conf as `field` (btree default) or `field:type`.
+   See [[index-types-roadmap]] for the design. */
+enum IndexType {
+    IT_BTREE   = 0,   /* default — sorted B+ tree, all 38 search operators */
+    IT_BITMAP  = 1,   /* one dense bitmap per distinct value; eq/AND only.
+                         Auto-default for bool fields at create-object. */
+    IT_TRIGRAM = 2,   /* 3-gram inverted; varchar substring/regex search.
+                         Always user-declared. Reserved for 2026.05.7 phase 2. */
+};
+
 enum DefaultKind {
     DK_NONE = 0,
     DK_LITERAL,       /* default=<value> — constant, INSERT only */
@@ -630,7 +641,36 @@ int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
 int load_splits(const char *db_root, const char *object);
 int load_index_fields(const char *db_root, const char *object, char fields[][256], int max_fields);
+/* Companion to load_index_fields — fills `types[i]` with the IndexType for
+   each indexed field at the same position. Returns the same count. Legacy
+   bare lines (no :type suffix) default to IT_BTREE. */
+int load_index_types(const char *db_root, const char *object, enum IndexType *types, int max_fields);
 void invalidate_idx_cache(const char *object);
+
+/* Parsed index spec from a wire string or index.conf line. Centralises
+   the suffix-recognition logic so create-object, add-index, and the
+   reindex path all agree on the same grammar:
+     "field"            → IT_BTREE,    max=0, explicit=0  (bare name)
+     "field:btree"      → IT_BTREE,    max=0, explicit=1
+     "field:bitmap"     → IT_BITMAP,   max=0, explicit=1
+     "field:bitmap(N)"  → IT_BITMAP,   max=N, explicit=1
+     "field:trigram"    → IT_TRIGRAM,  max=0, explicit=1
+     "a+b" / "a+b:btree" → composite, btree-only
+   Returns 0 on success, -1 on bad type token or unparsable cap. */
+typedef struct {
+    char           name[256];
+    enum IndexType type;
+    uint32_t       max_values;        /* bitmap-only; 0 means "default" */
+    int            had_explicit_type; /* 1 if input had a recognised :type suffix */
+    int            is_composite;      /* 1 if name contains '+' */
+} ParsedIndexSpec;
+int parse_index_spec(const char *spec, ParsedIndexSpec *out);
+
+/* The canonical auto-bitmap rule. Today: bool fields whose spec was
+   bare (no explicit :type) become bitmap. Enum will join the same
+   condition once that type lands. Single source of truth so the rule
+   can never drift between create-object and reindex. */
+int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
 void build_effective_root(char *out, size_t outlen, const char *dir);
@@ -875,9 +915,14 @@ void write_index_entry(const char *db_root, const char *object, const char *fiel
 void delete_index_entry(const char *db_root, const char *object, const char *field,
                         int splits,
                         const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
+/* `types` is optional — when non-NULL, fields whose type isn't IT_BTREE
+   are skipped (their index updates land via update_idx_fn in a separate
+   parallel pass). When NULL, every field gets a btree write — matches
+   legacy callers + the reindex builder path. */
 void index_parallel(const char *db_root, const char *object, int splits,
                     const char *value, const uint8_t hash16[16],
-                    char fields[][256], int nfields);
+                    char fields[][256], int nfields,
+                    const enum IndexType *types);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
 
@@ -1255,7 +1300,11 @@ int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *recor
 
 /* index.c — per-field index update worker. Either old_key or new_key may
    be NULL (pure insert / pure delete); both NULL = no-op. Dispatched
-   via parallel_for from every CRUD pre_commit. */
+   via parallel_for from every CRUD pre_commit.
+
+   The (type, shard, slot, max_values) tuple is consumed by bitmap and
+   trigram index types. For IT_BTREE callers can leave them zero — the
+   btree path keys by `hash` and ignores them entirely. */
 typedef struct {
     const char    *db_root;
     const char    *object;
@@ -1266,6 +1315,18 @@ typedef struct {
     uint8_t       *old_key;
     size_t         old_len;
     const uint8_t *hash;
+    enum IndexType type;          /* IT_BTREE (default) / IT_BITMAP / IT_TRIGRAM */
+    int            kf_shard;      /* bitmap-only: data shard index */
+    uint32_t       kf_slot;       /* bitmap-only: slot within data shard */
+    uint32_t       bm_max_values; /* bitmap-only: per-file cap (0 = default) */
+    int            out_error;     /* written by update_idx_fn: 0 ok, non-zero = abort.
+                                     -1 = bitmap dict cap exceeded; pre_commit walks
+                                     args[] after parallel_for and aborts the write. */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
+/* Release this thread's cached bitmap shard handle, if any. Called at
+   batch boundaries (end of bulk worker, end of pre_commit's parallel_for)
+   to drop fds and ensure subsequent reindex/wipe operations don't leave
+   stale TLS pointers. Safe no-op when nothing cached. */
+void bm_flush_thread_bitmap_cache(void);
 #endif

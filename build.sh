@@ -96,7 +96,7 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -189,6 +189,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_btree_value_hash_sort.c \
     src/test/cases/test_json_escape.c \
     src/test/cases/test_timestamp.c \
+    src/test/cases/test_bitmap_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_keyset.c \
@@ -209,6 +210,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/db/simd.c \
     src/db/tls.c \
     src/db/btree.c \
+    src/db/bitmap.c \
     src/db/objlock.c \
     src/db/query.c \
     src/db/server.c \
@@ -233,6 +235,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_joins.c \
     src/bench/bench_incremental.c \
     src/bench/bench_btree.c \
+    src/bench/bench_bitmap_vs_btree.c \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
@@ -242,6 +245,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/index.c \
     src/db/keyset.c \
     src/db/btree.c \
+    src/db/bitmap.c \
     src/db/objlock.c \
     src/db/tls.c \
     src/db/slotcask.c \

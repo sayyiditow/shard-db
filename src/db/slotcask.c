@@ -104,6 +104,13 @@ static int mkdirp_local(const char *path) {
 static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
     snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }
+
+/* Public wrapper for the bitmap-index read path in query.c. Same layout as
+   kf_path_for; exposed so callers don't duplicate the convention. */
+void slotcask_kf_path(char *out, size_t outlen,
+                      const char *data_dir, int shard_id) {
+    snprintf(out, outlen, "%s/data/kf/%03d.kf", data_dir, shard_id);
+}
 static void stream_dir_for(char out[PATH_MAX], const char *data_dir, int stream_id) {
     snprintf(out, PATH_MAX, "%s/data/streams/%03d", data_dir, stream_id);
 }
@@ -1112,7 +1119,7 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
 static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
                       uint8_t stream_id, uint16_t file_id, uint32_t offset,
                       const void *key, size_t klen, const char *data_dir,
-                      size_t *used_delta) {
+                      size_t *used_delta, size_t *out_slot) {
     (void)db;  /* db param retained for ABI; per-shard load lives in the header */
     /* Load-triggered resplit. The header tracks `total` (= live + tombstoned),
        which matches the linear-probe pressure that drives chain length —
@@ -1163,6 +1170,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
                 else             hdr->total++;    /* fresh slot occupied */
             }
             (*used_delta)++;
+            if (out_slot) *out_slot = target_idx;
             return 0;
         }
         if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
@@ -1180,6 +1188,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
             e->flag = 1;
             if (hdr) hdr->deleted--;  /* tombstone reclaimed; total unchanged */
             (*used_delta)++;
+            if (out_slot) *out_slot = slot;
             return 0;
         }
         if (e->flag == 2 && first_tomb == (size_t)-1) {
@@ -1198,6 +1207,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
         t->flag = 1;
         if (hdr) hdr->deleted--;  /* tombstone reclaimed */
         (*used_delta)++;
+        if (out_slot) *out_slot = first_tomb;
         return 0;
     }
     return -1;
@@ -1583,7 +1593,7 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     }
     size_t used_delta = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, NULL);
     kfcache_release(&kh);
     if (put_rc != 0) {
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
@@ -2276,11 +2286,17 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     }
 
     size_t used_delta = 0;
+    size_t put_slot = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, &put_slot);
 
     if (put_rc == 0) {
         /* NEW key path. Run check (with NULL old) and pre_commit. */
+        /* Publish (shard, slot) to opts out-params for index-update hooks
+           that key by physical location (bitmap). Done BEFORE check + pre_commit
+           so user code sees the location of the just-written kf entry. */
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
         if (opts->check && opts->check(NULL, opts->check_ctx) == 0) {
             /* Check rejected. Roll back: tombstone the seg + clear the
                kf entry we just wrote. We need to find our slot to clear it. */
@@ -2400,6 +2416,12 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             }
             return -2;
         }
+        /* Publish (shard, ex_slot) for index hooks that key by physical
+           location (bitmap). On an in-place update the slot doesn't
+           move — kf_repoint_at_slot below rewrites the entry without
+           changing its index. */
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)ex_slot;
         if (opts->pre_commit) {
             int rc = opts->pre_commit(&old_rec, value, vlen, 1, opts->pre_commit_ctx);
             if (rc != 0) {
@@ -2525,6 +2547,18 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         return -1;
     }
 
+    /* Publish (shard, slot) for index hooks that key by physical location
+       (bitmap). For updates kf_slot is the existing slot from
+       kf_lookup_with_slot. For inserts the slot isn't determined yet in
+       this slow path — kf_put_new below picks it. Callers using bitmap
+       through the slow path can't rely on the slot during pre_commit for
+       fresh inserts; that corner is currently rare (slow path runs only
+       when check_needs_old / require_existing is set). */
+    if (found) {
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
+    }
+
     /* Pre-commit hook (Option B index ordering). Caller updates indexes
        here; if it errors out we tombstone the new slot and bail. */
     if (opts->pre_commit) {
@@ -2548,7 +2582,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     } else {
         size_t used_delta = 0;
         kf_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                           key, klen, db->data_dir, &used_delta);
+                           key, klen, db->data_dir, &used_delta, NULL);
         /* Under wrlock; a "1 = already exists" return here would mean a race
            we haven't seen evidence of, but treat it as a hard error. */
         if (kf_rc == 1) kf_rc = -1;
@@ -2655,8 +2689,9 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     }
 
     size_t used_delta = 0;
+    size_t put_slot = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                            key, klen, db->data_dir, &used_delta);
+                            key, klen, db->data_dir, &used_delta, &put_slot);
     if (put_rc != 0) {
         if (put_rc == 1) {
             /* Duplicate — read the existing record so the caller can
@@ -2702,6 +2737,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        return error. The orphan kf entry will be cleaned up by vacuum's
        compact_kf pass. Same trade-off the existing upsert path makes for
        pre_commit failure (just on the opposite side of kf commit). */
+    if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+    if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
     if (opts->pre_commit) {
         int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
         if (rc != 0) {
@@ -3226,21 +3263,56 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     /* ===== Phase 3 — per-stream batched reserve + seg write. */
     bulk_phase3_seg_writes(db, recs, st, stream_counts, stream_idx);
 
-    /* ===== Phase 4 — per-record pre_commit + kf commit (under held kf wrlock). */
+    /* ===== Phase 4 — per-record kf commit + pre_commit (under held kf wrlock).
+       For UPDATES the slot index is known from Phase 1a (kf_lookup) — we
+       publish (shard, slot) and run pre_commit before kf_repoint. For
+       INSERTS the slot only exists after kf_put_new, so we commit the
+       kf entry first, publish (shard, slot), then run pre_commit; if it
+       returns non-zero we kf_tombstone the entry we just wrote. This
+       gives bitmap index hooks a stable (shard, slot) handle regardless
+       of insert vs update path. */
     for (size_t i = 0; i < n; i++) {
         if (recs[i].status != 0) continue;
         if (!st[i].needs_write) continue;
         SlotcaskBulkRec *r = &recs[i];
 
+        size_t pub_slot = 0;
+        int kf_committed = 0;
+        if (st[i].old_found) {
+            pub_slot = st[i].old_kf_slot;
+        } else {
+            size_t used_delta = 0;
+            int kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
+                                   st[i].target_fid, st[i].target_off,
+                                   r->key, r->klen, db->data_dir,
+                                   &used_delta, &pub_slot);
+            if (kf_rc == 1) kf_rc = -1;
+            if (kf_rc != 0) {
+                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                st[i].target_off, 2);
+                pool_push_free(&db->streams[st[i].target_stream],
+                                st[i].target_fid, st[i].target_off);
+                r->status = -1;
+                continue;
+            }
+            kf_committed = 1;
+        }
+
+        r->kf_shard = kf_shard_id;
+        r->kf_slot  = (uint32_t)pub_slot;
+
         if (opts->pre_commit) {
-            /* Prefer caller-supplied old_value (bulk-update path); fall back
-               to whatever Phase 1b loaded internally. */
             const void *old_v = r->old_value ? r->old_value : st[i].old_buf;
             size_t      old_l = r->old_value ? r->old_vlen  : st[i].old_vlen;
             SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
             int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
                                        r, st[i].old_found);
             if (rc != 0) {
+                /* Roll back: tombstone the kf entry we just wrote (if any)
+                   and the seg, push the free slot back. */
+                if (kf_committed) {
+                    kf_tombstone_at_slot(&kh, pub_slot);
+                }
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
                 pool_push_free(&db->streams[st[i].target_stream],
@@ -3259,11 +3331,8 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                 st[i].target_fid, st[i].target_off);
             kf_rc = 0;
         } else {
-            size_t used_delta = 0;
-            kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
-                                st[i].target_fid, st[i].target_off,
-                                r->key, r->klen, db->data_dir, &used_delta);
-            if (kf_rc == 1) kf_rc = -1;
+            /* Already committed in the pre_commit publish phase above. */
+            kf_rc = 0;
         }
         if (kf_rc != 0) {
             seg_write_flag(db, st[i].target_stream, st[i].target_fid,
@@ -3347,26 +3416,21 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         SlotcaskBulkRec *r = &recs[i];
 
         size_t used_delta = 0;
+        size_t put_slot = 0;
         int put_rc = kf_put_new(db, &kh, st[i].hash,
                                  st[i].target_stream, st[i].target_fid,
                                  st[i].target_off, r->key, r->klen,
-                                 db->data_dir, &used_delta);
+                                 db->data_dir, &used_delta, &put_slot);
 
         if (put_rc == 0) {
-            /* New key. Run pre_commit (with old=NULL). */
+            /* New key. Publish (shard, slot) then run pre_commit. */
+            r->kf_shard = kf_shard_id;
+            r->kf_slot  = (uint32_t)put_slot;
             if (opts->pre_commit) {
                 int rc = opts->pre_commit(NULL, r, 0);
                 if (rc != 0) {
-                    /* Rollback: tombstone seg + clear our just-inserted kf entry. */
-                    uint8_t  tmp_flag = 0, tmp_sid = 0;
-                    uint16_t tmp_fid = 0;
-                    uint32_t tmp_off = 0;
-                    size_t   tmp_slot = 0;
-                    if (kf_lookup_with_slot(&kh, st[i].hash, r->key, r->klen,
-                                             db->data_dir, &tmp_flag, &tmp_sid,
-                                             &tmp_fid, &tmp_off, &tmp_slot) == 0) {
-                        kf_tombstone_at_slot(&kh, tmp_slot);
-                    }
+                    /* Rollback: tombstone the slot we just wrote + the seg. */
+                    kf_tombstone_at_slot(&kh, put_slot);
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
                     pool_push_free(&db->streams[st[i].target_stream],
@@ -3419,6 +3483,11 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 continue;
             }
             SlotcaskOldRecord old_rec = { old_buf, old_vlen };
+            /* Publish (shard, slot) for bitmap hooks before pre_commit
+               fires. The slot is the existing kf entry's index — same
+               slot kf_repoint_at_slot below will overwrite. */
+            r->kf_shard = kf_shard_id;
+            r->kf_slot  = (uint32_t)ex_slot;
             if (opts->pre_commit) {
                 int rc = opts->pre_commit(&old_rec, r, 1);
                 if (rc != 0) {
@@ -3597,6 +3666,10 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         if (recs[i].status != 0) continue;
         if (!st[i].found) continue;
         SlotcaskBulkRec *r = &recs[i];
+
+        /* Publish (shard, slot) for bitmap hooks before pre_commit fires. */
+        r->kf_shard = kf_shard_id;
+        r->kf_slot  = (uint32_t)st[i].kf_slot;
 
         if (opts->pre_commit) {
             SlotcaskOldRecord old_rec = { st[i].old_buf, st[i].old_vlen };
@@ -3977,6 +4050,12 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         }
         return -2;
     }
+
+    /* Publish (shard, slot) for index hooks that key by physical location
+       (bitmap). Done before pre_commit so the bitmap branch of
+       update_idx_fn can address the slot we're about to tombstone. */
+    if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+    if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
 
     if (opts->pre_commit) {
         int rc = opts->pre_commit(needs_old ? &old_rec : NULL,
@@ -4410,6 +4489,59 @@ int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
     if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
         return -1;
     return walk_one_shard_inner(db, kf_shard_id, cb, ctx, stop_flag);
+}
+
+/* Slot-aware walker: iterates kf entries in slot order, calling cb per
+   live entry with the slot index alongside the usual (hash, key, value).
+   Used by the bitmap-index reindex path. Single-threaded — no fan-out;
+   reindex callers typically already parallel_for over shards externally. */
+int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskScanSlotCb cb, void *ctx) {
+    if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
+        return -1;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    int rc = 0;
+    for (size_t s = 0; s < kh.capacity; s++) {
+        SlotcaskKfEntry *e = &kh.map[s];
+        if (e->flag != 1) continue;
+        /* read_record_value verifies the key matches; for reindex we
+           trust the kf entry's pointer (kf is authoritative), so pass
+           the kf entry's known-good record header. We need the key to
+           call read_record_value, so we read the seg's key-prefix
+           first via a small inline buffer. */
+        uint8_t *vbuf = NULL;
+        size_t   vlen = 0;
+        /* The seg record header is 24B: 16B hash + 2B klen + 1B flag +
+           1B reserved + 4B vlen. The key starts at offset+24. We read
+           klen first, then call read_record_value with the in-seg key
+           bytes. To avoid that two-step, lean on segcache_acquire +
+           direct mmap read for simplicity. */
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0) != 0) continue;
+        const uint8_t *base = (const uint8_t *)h.map + (size_t)e->offset;
+        if ((size_t)e->offset + 24 > h.map_size) { segcache_release(&h); continue; }
+        uint16_t klen_be = (uint16_t)base[16] | ((uint16_t)base[17] << 8);
+        uint32_t vlen_be = (uint32_t)base[20] | ((uint32_t)base[21] << 8)
+                         | ((uint32_t)base[22] << 16) | ((uint32_t)base[23] << 24);
+        if ((size_t)e->offset + 24 + klen_be + vlen_be > h.map_size) {
+            segcache_release(&h); continue;
+        }
+        const uint8_t *key_p = base + 24;
+        const uint8_t *val_p = base + 24 + klen_be;
+        int crc = cb((uint32_t)s, e->hash, key_p, klen_be, val_p, vlen_be, ctx);
+        segcache_release(&h);
+        (void)vbuf; (void)vlen;
+        if (crc != 0) { rc = crc; break; }
+    }
+
+    kfcache_release(&kh);
+    return rc;
 }
 
 /* Streaming per-shard walker — fires cb() per record as kf is scanned, no
