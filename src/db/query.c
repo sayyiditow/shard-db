@@ -10570,7 +10570,18 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     enum IndexType itype = field_index_type(db_root, object, c->field);
     Schema sch = load_schema(db_root, object);
     if (itype == IT_BITMAP) {
-        if (c->op != OP_EQUAL) return 0;
+        /* Bitmap serves OP_EQUAL natively (popcount fast path) and
+           OP_NOT_EQUAL via the count-mode subtraction shortcut at
+           the PRIMARY_LEAF site (op_is_negatable → op_invert →
+           eq → popcount). Without claiming NEQ here, the planner
+           falls to PRIMARY_NONE for `neq <bool>=X` and degrades
+           to a full scan (~1s at 25M vs ~30ms via popcount —
+           that's the regression that prompted this fix).
+           OTHER negatable ops (NOT_LIKE / NOT_CONTAINS / NOT_IN /
+           NOT_EXISTS) invert to ops that bitmap does NOT serve;
+           those would re-dispatch into btree_idx_* against a
+           non-existent .idx file. They stay PRIMARY_NONE for now. */
+        if (c->op != OP_EQUAL && c->op != OP_NOT_EQUAL) return 0;
         if (out_idx_path) {
             snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
                      db_root, object, c->field);
@@ -11967,6 +11978,25 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
              tree->children[0]->kind == CNODE_LEAF);
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
+        /* Bitmap-eq popcount: lifted helper for both the negation
+           branch (neq via op_invert → eq) and the plain eq branch.
+           Cache-friendly stride-byte scan instead of per-bit cb. */
+        #define BM_POPCOUNT_EQ(dst_var, crit_ptr) do { \
+            uint8_t valbuf[1024]; size_t vallen = 0; \
+            encode_criterion_value(pc_tf, (crit_ptr)->value, \
+                                   strlen((crit_ptr)->value), valbuf, &vallen); \
+            (dst_var) = 0; \
+            for (int s = 0; s < sch.splits; s++) { \
+                char bp[1024]; \
+                bm_build_path(bp, sizeof(bp), db_root, object, \
+                              (crit_ptr)->field, s); \
+                BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */); \
+                if (!bm) continue; \
+                (dst_var) += bm_count(bm, valbuf, vallen); \
+                bm_close(bm); \
+            } \
+        } while (0)
+
         if (is_single_leaf && op_is_negatable(op)) {
             /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
                where the positive match set is small; also the correct
@@ -11974,14 +12004,27 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                every indexed entry and returned count(exists) instead). */
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
-            int pos_cp = op_needs_check_primary(pos.op);
-            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
-            btree_dispatch(db_root, object, pc->field, sch.splits,
-                           &pos, pc_tf, idx_count_cb, &ic);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            size_t pos_count = 0;
+            int pos_ok = 1;
+            if (pos.op == OP_EQUAL &&
+                field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+                /* Bitmap popcount fast path for the inverted positive.
+                   ~30 ms at 25M vs ~370 ms via per-bit cb fan-out — and
+                   vs ~1 s when leaf_is_indexed used to reject neq on
+                   bitmap entirely (full scan). */
+                BM_POPCOUNT_EQ(pos_count, &pos);
+            } else {
+                int pos_cp = op_needs_check_primary(pos.op);
+                IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
+                btree_dispatch(db_root, object, pc->field, sch.splits,
+                               &pos, pc_tf, idx_count_cb, &ic);
+                pos_count = ic.count;
+                pos_ok = !dl.timed_out;
+            }
+            if (!pos_ok) OUT("{\"error\":\"query_timeout\"}\n");
             else {
                 int total = get_live_count(db_root, object);
-                size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
+                size_t neg = ((size_t)total > pos_count) ? (size_t)total - pos_count : 0;
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
@@ -11992,19 +12035,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                per-bit callbacks). */
             if (op == OP_EQUAL &&
                 field_index_type(db_root, object, pc->field) == IT_BITMAP) {
-                uint8_t valbuf[1024];
-                size_t  vallen = 0;
-                encode_criterion_value(pc_tf, pc->value, strlen(pc->value),
-                                       valbuf, &vallen);
                 size_t total = 0;
-                for (int s = 0; s < sch.splits; s++) {
-                    char bp[1024];
-                    bm_build_path(bp, sizeof(bp), db_root, object, pc->field, s);
-                    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-                    if (!bm) continue;
-                    total += bm_count(bm, valbuf, vallen);
-                    bm_close(bm);
-                }
+                BM_POPCOUNT_EQ(total, pc);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", total);
             } else {
