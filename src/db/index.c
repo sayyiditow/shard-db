@@ -1292,6 +1292,87 @@ static size_t estimate_field_build_bytes(const TypedSchema *ts,
     return per_record * (live_count == 0 ? 1 : live_count);
 }
 
+/* Bitmap reindex pass — rebuilds every .bm shard for one field by
+   walking live records in their kf shards via slotcask_walk_one_shard_slots,
+   encoding the field value (matching the encoding bitmap_update uses on
+   the CRUD path), and bm_set'ing the bit at the record's kf slot. */
+typedef struct {
+    BitmapShard *bm;
+    int          field_index;     /* typed schema field index */
+    TypedSchema *ts;
+} BmRebuildCtx;
+
+static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
+                         const void *key, size_t klen,
+                         const void *value, size_t vlen,
+                         void *ctx) {
+    (void)hash16; (void)key; (void)klen; (void)vlen;
+    BmRebuildCtx *c = (BmRebuildCtx *)ctx;
+    if (c->field_index < 0) return 0;
+    const TypedField *f = &c->ts->fields[c->field_index];
+    /* Pull the raw field bytes out of the typed-record value. */
+    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    /* Encode via the same path bitmap_update uses on insert. For fixed
+       types the raw stored bytes are already the index-key form;
+       varchar carries a 2-byte length prefix in storage that we need
+       to strip. */
+    uint8_t key_buf[1024];
+    size_t  key_len = 0;
+    if (f->type == FT_VARCHAR) {
+        uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+        if (actual_len == 0 || actual_len > sizeof(key_buf)) return 0;
+        memcpy(key_buf, vbase + 2, actual_len);
+        key_len = actual_len;
+    } else {
+        size_t sz = (size_t)f->size;
+        if (sz == 0 || sz > sizeof(key_buf)) return 0;
+        memcpy(key_buf, vbase, sz);
+        key_len = sz;
+    }
+    bm_set(c->bm, key_buf, key_len, slot);
+    return 0;
+}
+
+int build_bitmap_pass(const char *db_root, const char *object,
+                      const Schema *sch, TypedSchema *ts,
+                      const char *field, uint32_t max_values, int force) {
+    (void)force;
+    if (!ts) return -1;
+    int fi = typed_field_index(ts, field);
+    if (fi < 0) return -1;
+    const TypedField *f = &ts->fields[fi];
+    int bool_fastpath = (f->type == FT_BOOL);
+
+    /* Wipe + re-create every shard's .bm file with the correct cap. */
+    int slots_per_shard = (int)slotcask_default_slots_for_splits(sch->splits);
+    for (int s = 0; s < sch->splits; s++) {
+        char bp[PATH_MAX];
+        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        unlink(bp);
+        BitmapShard *bm = bm_open(bp, slots_per_shard, 1, bool_fastpath, max_values);
+        if (bm) bm_close(bm);
+    }
+
+    /* Open the slotcask db for this object and walk every kf shard. */
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return -1;
+
+    for (int s = 0; s < sch->splits; s++) {
+        char bp[PATH_MAX];
+        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        BitmapShard *bm = bm_open(bp, slots_per_shard, 0, 0, 0);
+        if (!bm) continue;
+        BmRebuildCtx c = { bm, fi, ts };
+        slotcask_walk_one_shard_slots(sdb, s, bm_rebuild_cb, &c);
+        bm_close(bm);
+    }
+    return 0;
+}
+
 /* One batch of cmd_add_indexes: scan storage once, accumulate per-field
    BtEntry arrays, partition by idx_shard, parallel-build the (field, shard)
    btree files. Memory peak ≈ Σ estimate_field_build_bytes(field, live).
@@ -1419,6 +1500,96 @@ int cmd_add_indexes(const char *db_root, const char *object,
     if (nfields == 0) { OUT("{\"error\":\"No fields specified\"}\n"); return 1; }
 
     Schema sch = load_schema(db_root, object);
+
+    /* Split into (name, type, max_values) per field. Bitmap fields get
+       rebuilt via build_bitmap_pass (declared further down). Btree
+       fields continue through the existing batched-build path. */
+    char       names[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
+    uint32_t   maxes[MAX_FIELDS];
+    for (int i = 0; i < nfields; i++) {
+        const char *colon = strrchr(fields[i], ':');
+        types[i] = IT_BTREE;
+        maxes[i] = 0;
+        if (colon) {
+            const char *suf = colon + 1;
+            size_t sl = strlen(suf);
+            if (sl == 5 && memcmp(suf, "btree", 5) == 0) {
+                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
+                names[i][colon - fields[i]] = '\0';
+                continue;
+            }
+            if (sl == 6 && memcmp(suf, "bitmap", 6) == 0) {
+                types[i] = IT_BITMAP;
+                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
+                names[i][colon - fields[i]] = '\0';
+                continue;
+            }
+            if (sl > 7 && memcmp(suf, "bitmap(", 7) == 0 && suf[sl - 1] == ')') {
+                types[i] = IT_BITMAP;
+                /* Parse N out of bitmap(N). */
+                char numbuf[16] = {0};
+                size_t nl = sl - 8;
+                if (nl > 0 && nl < sizeof(numbuf)) {
+                    memcpy(numbuf, suf + 7, nl);
+                    long v = strtol(numbuf, NULL, 10);
+                    if (v > 0) maxes[i] = (uint32_t)v;
+                }
+                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
+                names[i][colon - fields[i]] = '\0';
+                continue;
+            }
+            if (sl == 7 && memcmp(suf, "trigram", 7) == 0) {
+                types[i] = IT_TRIGRAM;
+                memcpy(names[i], fields[i], (size_t)(colon - fields[i]));
+                names[i][colon - fields[i]] = '\0';
+                continue;
+            }
+        }
+        /* No recognised :type suffix → treat as bare btree name. */
+        memcpy(names[i], fields[i], 256);
+    }
+
+    /* Forward-declared further down (definition lives near the build
+       workers). Rebuilds every shard's .bm for a single field. */
+    int build_bitmap_pass(const char *db_root, const char *object,
+                          const Schema *sch, TypedSchema *ts,
+                          const char *field, uint32_t max_values, int force);
+
+    /* Bitmap-typed fields follow the same skip-if-exists semantic as
+       btree: with force, wipe + rebuild; without force, no-op when any
+       .bm shard already exists for the field. Trigram lands in a
+       future phase — silently skip for now. */
+    int btree_count = 0;
+    char btree_fields[MAX_FIELDS][256];
+    for (int i = 0; i < nfields; i++) {
+        if (types[i] == IT_BITMAP) {
+            if (!force) {
+                /* Probe shard 0's .bm — if it exists, treat the field
+                   as already-indexed and skip. */
+                char probe[PATH_MAX];
+                bm_build_path(probe, sizeof(probe), db_root, object, names[i], 0);
+                struct stat st;
+                if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
+            }
+            build_bitmap_pass(db_root, object, &sch,
+                              load_typed_schema(db_root, object),
+                              names[i], maxes[i], force);
+            continue;
+        }
+        if (types[i] == IT_TRIGRAM) {
+            continue;
+        }
+        memcpy(btree_fields[btree_count], names[i], 256);
+        btree_count++;
+    }
+    memcpy(fields, btree_fields, sizeof(btree_fields));
+    nfields = btree_count;
+    if (nfields == 0) {
+        OUT("{\"status\":\"ok\"}\n");
+        return 0;
+    }
+
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
@@ -1671,9 +1842,12 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
         snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
 
         if (S_ISDIR(st.st_mode)) {
-            /* Per-shard layout: indexes/<field>/<NNN>.idx. Drop every
-               cached btree mapping under this directory before rmrf so
-               ucache doesn't keep stale fds alive. */
+            /* Per-shard layout: indexes/<field>/<NNN>.{idx,bm,tg}.
+               Drop every cached btree mapping under this directory
+               before rmrf so ucache doesn't keep stale fds alive.
+               Bitmap (.bm) and trigram (.tg) files don't use ucache
+               but the rmrf cleans them too — they get rebuilt below
+               in the type-aware cmd_add_indexes path. */
             DIR *sub = opendir(path);
             if (sub) {
                 struct dirent *se;

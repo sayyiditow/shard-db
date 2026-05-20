@@ -4491,6 +4491,59 @@ int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
     return walk_one_shard_inner(db, kf_shard_id, cb, ctx, stop_flag);
 }
 
+/* Slot-aware walker: iterates kf entries in slot order, calling cb per
+   live entry with the slot index alongside the usual (hash, key, value).
+   Used by the bitmap-index reindex path. Single-threaded — no fan-out;
+   reindex callers typically already parallel_for over shards externally. */
+int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskScanSlotCb cb, void *ctx) {
+    if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
+        return -1;
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    int rc = 0;
+    for (size_t s = 0; s < kh.capacity; s++) {
+        SlotcaskKfEntry *e = &kh.map[s];
+        if (e->flag != 1) continue;
+        /* read_record_value verifies the key matches; for reindex we
+           trust the kf entry's pointer (kf is authoritative), so pass
+           the kf entry's known-good record header. We need the key to
+           call read_record_value, so we read the seg's key-prefix
+           first via a small inline buffer. */
+        uint8_t *vbuf = NULL;
+        size_t   vlen = 0;
+        /* The seg record header is 24B: 16B hash + 2B klen + 1B flag +
+           1B reserved + 4B vlen. The key starts at offset+24. We read
+           klen first, then call read_record_value with the in-seg key
+           bytes. To avoid that two-step, lean on segcache_acquire +
+           direct mmap read for simplicity. */
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0) != 0) continue;
+        const uint8_t *base = (const uint8_t *)h.map + (size_t)e->offset;
+        if ((size_t)e->offset + 24 > h.map_size) { segcache_release(&h); continue; }
+        uint16_t klen_be = (uint16_t)base[16] | ((uint16_t)base[17] << 8);
+        uint32_t vlen_be = (uint32_t)base[20] | ((uint32_t)base[21] << 8)
+                         | ((uint32_t)base[22] << 16) | ((uint32_t)base[23] << 24);
+        if ((size_t)e->offset + 24 + klen_be + vlen_be > h.map_size) {
+            segcache_release(&h); continue;
+        }
+        const uint8_t *key_p = base + 24;
+        const uint8_t *val_p = base + 24 + klen_be;
+        int crc = cb((uint32_t)s, e->hash, key_p, klen_be, val_p, vlen_be, ctx);
+        segcache_release(&h);
+        (void)vbuf; (void)vlen;
+        if (crc != 0) { rc = crc; break; }
+    }
+
+    kfcache_release(&kh);
+    return rc;
+}
+
 /* Streaming per-shard walker — fires cb() per record as kf is scanned, no
    Pass-1 ref-buffer. Better than slotcask_walk_one_shard for limit-bound
    queries: cb's stop signal propagates immediately (next iteration), so

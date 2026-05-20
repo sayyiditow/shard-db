@@ -483,6 +483,97 @@ static int test_bitmap_index_run(void) {
     ASSERT_EQ_INT((int)flag_true_count, 2, "post-delete: 2 true bits (k5 cleared)");
     ASSERT_EQ_INT((int)gamma_count,     1, "post-delete: 1 gamma bit (was 2)");
 
+    /* === Phase 5 reindex: rebuilds bitmap from existing records. Create
+           an object, insert records, manually wipe the .bm file, run
+           reindex via the CLI-equivalent query, verify the bitmap is
+           repopulated to match the inserted state. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"reix\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"label:varchar:16\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create reix");
+    free(resp); resp = NULL;
+
+    /* Insert 5 records: 3 flag=true, 2 flag=false. */
+    const char *reix_keys[] = { "r1", "r2", "r3", "r4", "r5" };
+    const char *reix_flags[] = { "true", "true", "false", "true", "false" };
+    for (int i = 0; i < 5; i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"reix\","
+            "\"key\":\"%s\",\"value\":{\"flag\":%s,\"label\":\"l%d\"}}",
+            reix_keys[i], reix_flags[i], i);
+        tc_request(tc, req, &resp);
+        free(resp); resp = NULL;
+    }
+
+    /* Sanity: bitmap should have 3 true + 2 false right after inserts. */
+    {
+        uint32_t pre_true = 0, pre_false = 0;
+        for (int s = 0; s < 8; s++) {
+            char bp[1024];
+            snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            if (bm) {
+                uint8_t t = 0x01, f = 0x00;
+                pre_true  += bm_count(bm, &t, 1);
+                pre_false += bm_count(bm, &f, 1);
+                bm_close(bm);
+            }
+        }
+        ASSERT_EQ_INT((int)pre_true,  3, "reix pre-wipe: 3 true bits");
+        ASSERT_EQ_INT((int)pre_false, 2, "reix pre-wipe: 2 false bits");
+    }
+
+    /* Wipe all .bm files for `flag` to simulate "index missing", then
+       run reindex via add-index force=true (which rebuilds). */
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+        unlink(bp);
+    }
+    /* Verify all wiped. */
+    {
+        uint32_t wiped_true = 0;
+        for (int s = 0; s < 8; s++) {
+            char bp[1024];
+            snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            if (bm) {
+                uint8_t t = 0x01;
+                wiped_true += bm_count(bm, &t, 1);
+                bm_close(bm);
+            }
+        }
+        ASSERT_EQ_INT((int)wiped_true, 0, "post-wipe: no true bits anywhere");
+    }
+
+    /* Rebuild via add-index force. */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"t\",\"object\":\"reix\","
+        "\"fields\":[\"flag:bitmap\"],\"force\":\"true\"}", &resp);
+    /* Either status:added or status:ok depending on the path taken. */
+    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "add-index force succeeded");
+    free(resp); resp = NULL;
+
+    /* Confirm bits repopulated. */
+    {
+        uint32_t post_true = 0, post_false = 0;
+        for (int s = 0; s < 8; s++) {
+            char bp[1024];
+            snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            if (bm) {
+                uint8_t t = 0x01, f = 0x00;
+                post_true  += bm_count(bm, &t, 1);
+                post_false += bm_count(bm, &f, 1);
+                bm_close(bm);
+            }
+        }
+        ASSERT_EQ_INT((int)post_true,  3, "reindex: 3 true bits restored");
+        ASSERT_EQ_INT((int)post_false, 2, "reindex: 2 false bits restored");
+    }
+
     /* === Phase 3.2 auto-grow: bitmap_update must extend the bitmap when
            a write lands at a slot beyond the current stride. Direct
            bitmap.c API exercise (no daemon) — create a tiny bitmap then

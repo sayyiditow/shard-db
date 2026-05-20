@@ -600,6 +600,16 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    for its own synchronization. */
 int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 
+/* Same as slotcask_walk_one_shard but the callback also receives the
+   kf slot index. Used by the bitmap-index reindex path which needs to
+   key bit positions by (kf_shard, kf_slot). */
+typedef int (*SlotcaskScanSlotCb)(uint32_t slot, const uint8_t hash16[16],
+                                   const void *key, size_t klen,
+                                   const void *value, size_t vlen,
+                                   void *ctx);
+int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
+                                   SlotcaskScanSlotCb cb, void *ctx);
+
 /* Pre-grow all kf shards to absorb `total_new` upcoming inserts without
    triggering inline resplits mid-insert. Bulk-insert dispatchers should
    call this once per request, before workers start writing segments. */
