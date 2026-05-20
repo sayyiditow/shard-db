@@ -1552,13 +1552,20 @@ int cmd_add_indexes(const char *db_root, const char *object,
 
         /* Auto-promote bare bool/enum names to bitmap (legacy index.conf
            lines emitted before the rule existed). The rule lives in
-           config.c so create-object and reindex can never drift. */
+           config.c so create-object and reindex can never drift. For
+           2-byte enums, bump max_values to 65535 so the bitmap cap
+           matches the enum's byte-width domain. */
         if (!ps.is_composite && ts_for_idx) {
             int fi_t = typed_field_index(ts_for_idx, ps.name);
             if (fi_t >= 0 &&
                 idx_should_auto_bitmap(ps.had_explicit_type,
                                        ts_for_idx->fields[fi_t].type)) {
                 types[i] = IT_BITMAP;
+                if (ts_for_idx->fields[fi_t].type == FT_ENUM &&
+                    ts_for_idx->fields[fi_t].enum_width == 2 &&
+                    maxes[i] == 0) {
+                    maxes[i] = 65535;
+                }
                 promoted++;
             }
         }

@@ -873,7 +873,7 @@ int parse_index_spec(const char *spec, ParsedIndexSpec *out) {
 int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type) {
     if (had_explicit_type) return 0;
     if (field_type == FT_BOOL) return 1;
-    /* Future: if (field_type == FT_ENUM) return 1; */
+    if (field_type == FT_ENUM) return 1;
     return 0;
 }
 
@@ -2427,6 +2427,29 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return snprintf(buf, buflen, "\"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\"",
                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    }
+    case FT_ENUM: {
+        /* Stored bytes are the byte index (1 or 2 BE). Always emit
+           (byte 0 is a legit enum index, not "unset"). Output is a
+           JSON-quoted string from enum_values[idx]. Out-of-range
+           index (data corruption) → empty string. */
+        if (!f->enum_values || f->n_enum_values <= 0) return 0;
+        int idx = (f->enum_width == 2)
+                    ? (int)(((uint16_t)data[0] << 8) | (uint16_t)data[1])
+                    : (int)data[0];
+        if (idx < 0 || idx >= f->n_enum_values) return snprintf(buf, buflen, "\"\"");
+        const char *s = f->enum_values[idx];
+        if (!s) return snprintf(buf, buflen, "\"\"");
+        /* Escape per RFC 8259 — enum value strings are user-supplied
+           at create-object, may carry quotes/backslashes/control chars.
+           Same buffer-sizing contract as FT_VARCHAR. */
+        if (buflen < 4) return -1;
+        buf[0] = '"';
+        int esc = json_escape_into(buf + 1, (size_t)buflen - 3, s, strlen(s));
+        if (esc < 0) return -1;
+        buf[1 + esc] = '"';
+        buf[2 + esc] = '\0';
+        return 2 + esc;
     }
     default:
         return 0;

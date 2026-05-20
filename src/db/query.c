@@ -8544,6 +8544,9 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     }
     case FT_DATE:
     case FT_DATETIME:
+    case FT_ENUM:
+        /* Enum's display string is a JSON string (quoted, escaped).
+           DATE/DATETIME are also strings on the wire. */
         n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
         if (n <= 0) return snprintf(buf, bufsz, "null");
         return snprintf(buf, bufsz, "\"%s\"", tmp);
@@ -15019,7 +15022,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
                     /* Auto-promote (single source of truth for the rule —
                        config.c::idx_should_auto_bitmap). Find this field's
-                       FieldType from field_specs[], pass to the rule. */
+                       FieldType from field_specs[], pass to the rule. For
+                       FT_ENUM also pick the right bitmap cap: 1-byte enum
+                       gets the default (256), 2-byte enum needs 65535 so
+                       the dict can grow to the enum's full domain. */
                     if (!ps.is_composite) {
                         int fnlen2 = (int)strlen(ps.name);
                         for (int i = 0; i < nfields; i++) {
@@ -15030,8 +15036,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             if (memcmp(field_specs[i], ps.name, nl) != 0) continue;
                             TypedField tf = {0};
                             parse_field_type(c + 1, &tf);
-                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type))
+                            if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type)) {
                                 ps.type = IT_BITMAP;
+                                if (tf.type == FT_ENUM && tf.enum_width == 2 &&
+                                    ps.max_values == 0) {
+                                    ps.max_values = 65535;
+                                }
+                            }
+                            free_enum_values(&tf);
                             break;
                         }
                     }
@@ -15046,15 +15058,22 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    /* Auto-default: every `bool` field that isn't already declared as an
-       index gets IT_BITMAP. Single-field only; bool can't legally be in a
-       composite anyway since we reject non-btree composites above. */
+    /* Auto-default: every `bool` or `enum(...)` field that isn't already
+       declared as an index gets IT_BITMAP. Single-field only; bool / enum
+       can't legally be in a composite anyway since we reject non-btree
+       composites above. For enum the bitmap cap matches the byte-width
+       ceiling: 1-byte (≤256 values) keeps the default (256), 2-byte
+       (257-65535 values) needs cap=65535 so the dict can grow to the
+       full enum domain. */
     for (int i = 0; i < nfields; i++) {
         const char *c = strchr(field_specs[i], ':');
         if (!c) continue;
         int fnlen = (int)(c - field_specs[i]);
-        if (strncmp(c + 1, "bool", 4) != 0) continue;
-        if (c[5] != '\0' && c[5] != ':') continue;  /* exactly "bool" or "bool:..." */
+
+        int is_bool = (strncmp(c + 1, "bool", 4) == 0 &&
+                       (c[5] == '\0' || c[5] == ':'));
+        int is_enum = (strncmp(c + 1, "enum(", 5) == 0);
+        if (!is_bool && !is_enum) continue;
 
         int already = 0;
         for (int j = 0; j < npidx; j++) {
@@ -15068,7 +15087,16 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         memcpy(pidx[npidx].name, field_specs[i], fnlen);
         pidx[npidx].name[fnlen] = '\0';
         pidx[npidx].type = IT_BITMAP;
-        pidx[npidx].max_values = 0;  /* bool auto-default uses BM_DEFAULT_MAX_VALUES */
+        pidx[npidx].max_values = 0;  /* bool/1B-enum: default 256 */
+        if (is_enum) {
+            /* Parse the enum spec once to learn enum_width. */
+            TypedField tf = {0};
+            parse_field_type(c + 1, &tf);
+            if (tf.type == FT_ENUM && tf.enum_width == 2) {
+                pidx[npidx].max_values = 65535;
+            }
+            free_enum_values(&tf);
+        }
         npidx++;
     }
     #undef FIELD_TYPE_IS
@@ -15416,6 +15444,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_TIME:     return "time";
         case FT_TIMESTAMP: return "timestamp";
         case FT_UUID:     return "uuid";
+        case FT_ENUM:     return "enum";
         default:          return "unknown";
     }
 }
