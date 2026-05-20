@@ -819,26 +819,6 @@ static int test_bitmap_index_run(void) {
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create capovf bitmap(2)");
     free(resp); resp = NULL;
 
-    /* Brute-force find 3 distinct keys whose xxh128 lands in the same
-       data shard, then insert 3 distinct values. The first 2 succeed;
-       the 3rd hits the cap=2 and fails. We try sequential keys until
-       we find a hash collision on shard 0. */
-    int collisions[3] = { -1, -1, -1 };
-    int found_n = 0;
-    {
-        uint8_t hash_buf[16];
-        for (int k = 0; k < 1024 && found_n < 3; k++) {
-            char keybuf[16];
-            int kl = snprintf(keybuf, sizeof(keybuf), "k%d", k);
-            /* xxh128 over the key. We don't have the helper exposed in
-               the test header, so probe by inserting then checking
-               which .bm shard now has the bit. That's slow but works
-               for a 3-key probe in test scope. Easier: keep inserting
-               distinct labels and stop when one fails. */
-            (void)hash_buf; (void)kl;
-            collisions[found_n++] = k;
-        }
-    }
     /* Use sequential keys k0..k2 with 3 distinct values; let the
        insert path tell us when the cap is hit. The 5th insert across
        ALL shards is fine because the cap is per-shard; what we test
