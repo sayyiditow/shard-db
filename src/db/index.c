@@ -314,6 +314,22 @@ static int bitmap_update(const char *db_root, const char *object,
                            failure. Cap-exceeded path lives below where the
                            file does exist. */
 
+    /* Auto-grow on slot overflow. Slotcask doubles a kf shard's
+       slots_per_shard on auto-resplit (80% load trigger); the bitmap
+       file was sized from the default slot tier so subsequent inserts
+       beyond that point would land at slots above bm->slots and silently
+       no-op. Detect and grow inline — cheap rewrite that happens at
+       most a few times over a shard's lifetime. */
+    if (kf_slot >= bm_slots(bm)) {
+        uint32_t want = kf_slot + 1;
+        /* Round up to next power of 2 so subsequent inserts don't keep
+           triggering grows. Cap at 2^31 — past that the index isn't
+           the bottleneck. */
+        uint32_t grown = 1;
+        while (grown < want && grown < 0x80000000u) grown <<= 1;
+        bm_grow(bm, grown);
+    }
+
     int rc = 0;
     if (old_val) bm_clear(bm, old_val, old_len, kf_slot);
     if (new_val) {

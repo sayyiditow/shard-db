@@ -483,6 +483,35 @@ static int test_bitmap_index_run(void) {
     ASSERT_EQ_INT((int)flag_true_count, 2, "post-delete: 2 true bits (k5 cleared)");
     ASSERT_EQ_INT((int)gamma_count,     1, "post-delete: 1 gamma bit (was 2)");
 
+    /* === Phase 3.2 auto-grow: bitmap_update must extend the bitmap when
+           a write lands at a slot beyond the current stride. Direct
+           bitmap.c API exercise (no daemon) — create a tiny bitmap then
+           call bm_set at slot > current_slots to confirm grow fires. */
+    {
+        const char *gp = "/tmp/shard-db-test-bm-autogrow.bm";
+        unlink(gp);
+        BitmapShard *gbm = bm_open(gp, 64, 1, 1, 0);
+        ASSERT_NOT_NULL(gbm, "autogrow: create at slots=64");
+        if (gbm) {
+            /* Simulate the bitmap_update auto-grow path manually: detect
+               OOB slot, grow, then set. */
+            uint8_t v_true[1] = { 0x01 };
+            uint32_t target_slot = 200;
+            if (target_slot >= bm_slots(gbm)) {
+                uint32_t grown = 1;
+                while (grown < target_slot + 1) grown <<= 1;
+                ASSERT_EQ_INT(bm_grow(gbm, grown), 0, "autogrow: bm_grow returns 0");
+                ASSERT_EQ_INT((int)bm_slots(gbm), 256, "autogrow: slots = 256 (rounded up)");
+            }
+            ASSERT_EQ_INT(bm_set(gbm, v_true, 1, target_slot), 0,
+                          "autogrow: set bit at high slot ok");
+            ASSERT_EQ_INT(bm_test(gbm, v_true, 1, target_slot), 1,
+                          "autogrow: bit reads back set");
+            bm_close(gbm);
+        }
+        unlink(gp);
+    }
+
     /* === Phase 4: read-side planner uses the bitmap. Find / count / find-with-AND
            on a bitmap-indexed bool field must return the same results as
            the equivalent full-scan query. === */
