@@ -8887,10 +8887,10 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
 
 /* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
    per live matching slot. */
-static void bitmap_emit_for_shard(const char *db_root, const char *object,
-                                  const char *field, int shard_idx,
-                                  const uint8_t *value, size_t vlen,
-                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
+static int bitmap_emit_for_shard(const char *db_root, const char *object,
+                                 const char *field, int shard_idx,
+                                 const uint8_t *value, size_t vlen,
+                                 bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
 
 /* Type-aware front for the planner's per-leaf dispatch. Bitmap-indexed
    eq leaves walk the bitmap shards directly and emit per-match
@@ -8912,8 +8912,12 @@ static void btree_dispatch(const char *db_root, const char *object,
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (!sdb) return;
         for (int s = 0; s < splits; s++) {
-            bitmap_emit_for_shard(db_root, object, field, s, valbuf, vallen,
-                                  cb, ctx, sdb);
+            if (bitmap_emit_for_shard(db_root, object, field, s, valbuf, vallen,
+                                      cb, ctx, sdb)) {
+                /* Caller hit its limit (e.g. find limit=1000) — skip the
+                   remaining shards' kf_acquire + bm_open. */
+                break;
+            }
         }
         return;
     }
@@ -10733,6 +10737,8 @@ typedef struct {
     size_t           vlen;
     bt_result_cb     cb;
     void            *cb_ctx;
+    int              stop;  /* set when user cb returned non-zero —
+                                propagates out to the outer shard loop */
 } BmEmitCtx;
 
 static int bm_emit_cb(uint32_t slot, void *ctx) {
@@ -10741,40 +10747,39 @@ static int bm_emit_cb(uint32_t slot, void *ctx) {
     SlotcaskKfEntry *e = &c->kf_map[slot];
     if (e->flag != 1) return 0;  /* empty / tombstoned */
     int rc = c->cb((const char *)c->val, c->vlen, e->hash, c->cb_ctx);
+    if (rc) c->stop = 1;
     return rc;
 }
 
 /* Walk a single shard's bitmap for `value`, emitting cb per live
-   matching slot (with the kf entry's hash). Used by btree_dispatch's
-   bitmap front. */
-static void bitmap_emit_for_shard(const char *db_root, const char *object,
-                                  const char *field, int shard_idx,
-                                  const uint8_t *value, size_t vlen,
-                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
+   matching slot. Returns 1 if cb signalled stop (limit reached), so
+   the outer shard loop can short-circuit and skip the remaining
+   kf_acquire + bm_open syscalls. */
+static int bitmap_emit_for_shard(const char *db_root, const char *object,
+                                 const char *field, int shard_idx,
+                                 const uint8_t *value, size_t vlen,
+                                 bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
     BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
-    if (!bm) return;
+    if (!bm) return 0;
 
     char kfp[PATH_MAX];
     slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
         bm_close(bm);
-        return;
+        return 0;
     }
 
-    BmEmitCtx ec = { kh.map, kh.capacity, value, vlen, cb, ctx };
+    BmEmitCtx ec = { kh.map, kh.capacity, value, vlen, cb, ctx, 0 };
     bm_walk(bm, value, vlen, bm_emit_cb, &ec);
 
-    /* idx_count_cb (and any other batched-thread-local consumer) accumulates
-       a per-thread pending count and only flushes at shard boundaries.
-       Mirror the btree shard walker's flush-after-shard convention here so
-       the count makes it into the caller's ctx. */
     idx_count_cb_flush_thread();
 
     kfcache_release(&kh);
     bm_close(bm);
+    return ec.stop;
 }
 
 /* Bitmap-walk → KeySet collector. Kept for compatibility with the

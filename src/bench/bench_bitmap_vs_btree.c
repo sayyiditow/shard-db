@@ -22,9 +22,42 @@
 #include "fixtures.h"
 #include "bench_stats.h"
 #include "bench_table.h"
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+/* Recursive total bytes under a path. Used to compare on-disk footprint
+   of bitmap vs btree index dirs. */
+static long long du_bytes(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) return (long long)st.st_size;
+        return 0;
+    }
+    long long total = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char sub[1024];
+        snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (stat(sub, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) total += du_bytes(sub);
+        else if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+static void fmt_bytes(long long b, char *out, size_t outlen) {
+    if (b < 1024)             snprintf(out, outlen, "%lld B",   b);
+    else if (b < 1024 * 1024) snprintf(out, outlen, "%.1f KB",  b / 1024.0);
+    else if (b < 1LL << 30)   snprintf(out, outlen, "%.1f MB",  b / (1024.0 * 1024));
+    else                      snprintf(out, outlen, "%.2f GB",  b / (1024.0 * 1024 * 1024));
+}
 
 static int create_object(TestClient *tc, const char *name, const char *type) {
     char req[512];
@@ -115,6 +148,27 @@ static int bench_bitmap_vs_btree_run(void) {
     snprintf(btr_extra, sizeof(btr_extra), "%.0f rec/s", N * 1e6 / (double)btr_ins_us);
     bench_table_record("bulk-insert btree",  btr_ins_us, 1, btr_extra);
     bench_table_section_end();
+
+    /* Index file footprint: walk the indexes/ dir for each object and
+       sum every shard file. The story bitmap wants to tell: for bool
+       at 10M records, btree carries every value in its leaves while
+       bitmap is just (slots/8) × n_values × num_shards. */
+    {
+        char bm_dir[1024], btr_dir[1024];
+        snprintf(bm_dir,  sizeof(bm_dir),  "%s/b/bm/indexes",  te.db_root);
+        snprintf(btr_dir, sizeof(btr_dir), "%s/b/btr/indexes", te.db_root);
+        long long bm_sz  = du_bytes(bm_dir);
+        long long btr_sz = du_bytes(btr_dir);
+        char bm_buf[32], btr_buf[32];
+        fmt_bytes(bm_sz,  bm_buf,  sizeof(bm_buf));
+        fmt_bytes(btr_sz, btr_buf, sizeof(btr_buf));
+        double ratio = bm_sz > 0 ? (double)btr_sz / (double)bm_sz : 0;
+        printf("\nindex on-disk footprint\n");
+        printf("--------------------------------------------------------------------------------------------------------------------\n");
+        printf("  bitmap   indexes/   %12s\n", bm_buf);
+        printf("  btree    indexes/   %12s   (%.1fx larger)\n", btr_buf, ratio);
+        printf("--------------------------------------------------------------------------------------------------------------------\n");
+    }
 
     /* Warm both indexes once so the first measured query isn't a
        page-fault-heavy outlier. */
