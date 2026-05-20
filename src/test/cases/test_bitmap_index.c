@@ -43,7 +43,7 @@ static int run_unit_assertions(void) {
     unlink(path);
 
     /* === Bool fast-path: 256 slots, 2 hardcoded values. === */
-    BitmapShard *bm = bm_open(path, 256, 1, 1, 0);
+    BitmapShard *bm = bm_open(path, 256, 1, 1, 0, 1);
     ASSERT_NOT_NULL(bm, "bm_open: bool create");
     if (!bm) return 1;
 
@@ -112,7 +112,7 @@ static int run_unit_assertions(void) {
     bm_close(bm);
 
     /* === Persistence across close/reopen. === */
-    bm = bm_open(path, 1024, 0, 0, 0);
+    bm = bm_open(path, 1024, 0, 0, 0, 0);
     ASSERT_NOT_NULL(bm, "bm_open: reopen no-create");
     if (bm) {
         ASSERT_EQ_INT((int)bm_slots(bm), 1024, "persisted slots");
@@ -126,7 +126,7 @@ static int run_unit_assertions(void) {
     unlink(path);
 
     /* === Varchar enum (no fast-path): dict grows on demand. === */
-    bm = bm_open(path, 64, 1, 0, 0);
+    bm = bm_open(path, 64, 1, 0, 0, 1);
     ASSERT_NOT_NULL(bm, "bm_open: varchar enum create");
     if (!bm) return 1;
     ASSERT_EQ_INT((int)bm_n_values(bm), 0, "varchar starts empty");
@@ -145,7 +145,7 @@ static int run_unit_assertions(void) {
 
     /* Persistence after dict growth. */
     bm_close(bm);
-    bm = bm_open(path, 64, 0, 0, 0);
+    bm = bm_open(path, 64, 0, 0, 0, 0);
     ASSERT_NOT_NULL(bm, "reopen after dict-grow");
     if (bm) {
         ASSERT_EQ_INT((int)bm_n_values(bm), 3, "persisted dict size");
@@ -159,7 +159,7 @@ static int run_unit_assertions(void) {
            contract is "bitmap is for bool + low-cardinality enums" —
            anyone declaring bitmap on a field with thousands of distinct
            values is mis-indexing and should reach for btree. === */
-    bm = bm_open(path, 64, 1, 0, 0);
+    bm = bm_open(path, 64, 1, 0, 0, 1);
     ASSERT_NOT_NULL(bm, "bm_open: cap test");
     if (bm) {
         /* Fill the dict to exactly BM_DEFAULT_MAX_VALUES distinct
@@ -194,7 +194,7 @@ static int run_unit_assertions(void) {
     unlink(path);
 
     /* === Per-file cap override: declare a custom cap at create. === */
-    bm = bm_open(path, 64, 1, 0, 4);   /* cap = 4 */
+    bm = bm_open(path, 64, 1, 0, 4, 1);   /* cap = 4 */
     ASSERT_NOT_NULL(bm, "bm_open: cap-override create");
     if (bm) {
         ASSERT_EQ_INT((int)bm_max_values(bm), 4, "header has custom cap=4");
@@ -207,7 +207,7 @@ static int run_unit_assertions(void) {
 
         /* Persistence of the custom cap. */
         bm_close(bm);
-        bm = bm_open(path, 64, 0, 0, 0);  /* arg ignored on existing file */
+        bm = bm_open(path, 64, 0, 0, 0, 0);  /* arg ignored on existing file */
         ASSERT_NOT_NULL(bm, "reopen with cap baked in");
         if (bm) {
             ASSERT_EQ_INT((int)bm_max_values(bm), 4, "cap survives reopen");
@@ -411,7 +411,7 @@ static int test_bitmap_index_run(void) {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm",
                  env.db_root, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             uint8_t t = 0x01, f = 0x00;
             flag_true_count  += bm_count(bm, &t, 1);
@@ -421,7 +421,7 @@ static int test_bitmap_index_run(void) {
 
         snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/label/%03x.bm",
                  env.db_root, s);
-        bm = bm_open(bp, 0, 0, 0, 0);
+        bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             alpha_count += bm_count(bm, (const uint8_t *)"alpha", 5);
             beta_count  += bm_count(bm, (const uint8_t *)"beta",  4);
@@ -446,7 +446,7 @@ static int test_bitmap_index_run(void) {
     for (int s = 0; s < 8; s++) {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm", env.db_root, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             uint8_t t = 0x01, f = 0x00;
             flag_true_count  += bm_count(bm, &t, 1);
@@ -467,14 +467,14 @@ static int test_bitmap_index_run(void) {
     for (int s = 0; s < 8; s++) {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/flag/%03x.bm", env.db_root, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             uint8_t t = 0x01;
             flag_true_count += bm_count(bm, &t, 1);
             bm_close(bm);
         }
         snprintf(bp, sizeof(bp), "%s/t/e2e/indexes/label/%03x.bm", env.db_root, s);
-        bm = bm_open(bp, 0, 0, 0, 0);
+        bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             gamma_count += bm_count(bm, (const uint8_t *)"gamma", 5);
             bm_close(bm);
@@ -513,7 +513,7 @@ static int test_bitmap_index_run(void) {
         for (int s = 0; s < 8; s++) {
             char bp[1024];
             snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
             if (bm) {
                 uint8_t t = 0x01, f = 0x00;
                 pre_true  += bm_count(bm, &t, 1);
@@ -538,7 +538,7 @@ static int test_bitmap_index_run(void) {
         for (int s = 0; s < 8; s++) {
             char bp[1024];
             snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
             if (bm) {
                 uint8_t t = 0x01;
                 wiped_true += bm_count(bm, &t, 1);
@@ -562,7 +562,7 @@ static int test_bitmap_index_run(void) {
         for (int s = 0; s < 8; s++) {
             char bp[1024];
             snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
             if (bm) {
                 uint8_t t = 0x01, f = 0x00;
                 post_true  += bm_count(bm, &t, 1);
@@ -581,7 +581,7 @@ static int test_bitmap_index_run(void) {
     {
         const char *gp = "/tmp/shard-db-test-bm-autogrow.bm";
         unlink(gp);
-        BitmapShard *gbm = bm_open(gp, 64, 1, 1, 0);
+        BitmapShard *gbm = bm_open(gp, 64, 1, 1, 0, 1);
         ASSERT_NOT_NULL(gbm, "autogrow: create at slots=64");
         if (gbm) {
             /* Simulate the bitmap_update auto-grow path manually: detect
@@ -717,7 +717,7 @@ static int test_bitmap_index_run(void) {
     {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/capcrud/indexes/col/000.bm", env.db_root);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         ASSERT_NOT_NULL(bm, "pre-materialised bitmap shard present");
         if (bm) {
             ASSERT_EQ_INT((int)bm_max_values(bm), 4, "header carries cap=4");
@@ -744,7 +744,7 @@ static int test_bitmap_index_run(void) {
     for (int s = 0; s < 8; s++) {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/capcrud/indexes/col/%03x.bm", env.db_root, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             total_n_values += (int)bm_n_values(bm);
             for (int i = 0; i < 4; i++) {
@@ -791,7 +791,7 @@ static int test_bitmap_index_run(void) {
     for (int s = 0; s < 8; s++) {
         char bp[1024];
         snprintf(bp, sizeof(bp), "%s/t/bulk/indexes/flag/%03x.bm", env.db_root, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
         if (bm) {
             uint8_t t = 0x01, f = 0x00;
             bulk_true  += bm_count(bm, &t, 1);

@@ -1,6 +1,7 @@
 #include "types.h"
 #include "tls.h"
 #include "slotcask.h"
+#include "bitmap.h"
 
 /* Forward decls for monitoring counters (defined lower in this file). */
 extern _Atomic int active_threads;
@@ -2685,6 +2686,9 @@ int cmd_server(const char *db_root, int daemonize) {
     }
     fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);
+    /* Bitmap shard cache — same sizing as bt_cache. Per-entry rwlock
+       lets concurrent readers share the mmap; writers serialise. */
+    bm_cache_init(g_btcache_cap);
     /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
        objects route reads/writes through these; v1 (legacy) objects continue
        to use ucache. Both engines coexist until migration. */

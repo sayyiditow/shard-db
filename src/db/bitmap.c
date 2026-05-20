@@ -18,6 +18,8 @@
 #include "bitmap.h"
 
 #include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,12 +51,121 @@ struct __attribute__((packed)) BmHeader {
     uint32_t max_values;
 };
 
+/* ─────────────────── global bm cache ───────────────────
+   Mirrors src/db/btree.c's bt_cache. Path-keyed open-addressed slot
+   table; per-entry rwlock; LRU eviction once half-full. The cache
+   keeps one mmap'd handle per .bm path, alive across requests.
+   Concurrent rdlock holders are fine (bitmap reads are mmap loads);
+   writers serialise via the per-entry wrlock.
+
+   Initialised by bm_cache_init() at daemon startup, mirroring
+   bt_cache_init(). If uninitialised, bm_open falls back to a fresh
+   mmap per call (test fixtures use this — no cache thrash). */
+typedef struct {
+    char     path[PATH_MAX];
+    int      fd;
+    uint8_t *map;
+    size_t   map_size;
+    pthread_rwlock_t rwlock;
+    int      used;
+    uint64_t last_access;
+} BmCacheEntry;
+
+static BmCacheEntry    *g_bm_cache = NULL;
+static int              g_bm_cache_slots = 0;
+static int              g_bm_cache_count = 0;
+static pthread_mutex_t  g_bm_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t g_bm_cache_clock = 0;
+
+static int bm_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+
+void bm_cache_init(int cap) {
+    if (g_bm_cache) return;
+    if (cap < 16) cap = 16;
+    g_bm_cache_slots = bm_next_pow2(cap * 2);
+    g_bm_cache = calloc((size_t)g_bm_cache_slots, sizeof(BmCacheEntry));
+    g_bm_cache_count = 0;
+    for (int i = 0; i < g_bm_cache_slots; i++) {
+        pthread_rwlock_init(&g_bm_cache[i].rwlock, NULL);
+        g_bm_cache[i].fd = -1;
+    }
+}
+
+void bm_cache_shutdown(void) {
+    pthread_mutex_lock(&g_bm_cache_lock);
+    if (g_bm_cache) {
+        for (int i = 0; i < g_bm_cache_slots; i++) {
+            BmCacheEntry *e = &g_bm_cache[i];
+            if (!e->used) continue;
+            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_SYNC);
+            if (e->map) munmap(e->map, e->map_size);
+            if (e->fd >= 0) close(e->fd);
+            pthread_rwlock_destroy(&e->rwlock);
+        }
+        free(g_bm_cache);
+        g_bm_cache = NULL;
+        g_bm_cache_slots = 0;
+        g_bm_cache_count = 0;
+    }
+    pthread_mutex_unlock(&g_bm_cache_lock);
+}
+
+static uint32_t bm_path_hash(const char *s) {
+    uint32_t h = 5381;
+    while (*s) h = h * 33u + (unsigned char)*s++;
+    return h;
+}
+
+static int bm_cache_probe(const char *path, int *out_found) {
+    uint32_t h = bm_path_hash(path);
+    int mask = g_bm_cache_slots - 1;
+    int idx = (int)(h & (uint32_t)mask);
+    for (int i = 0; i < g_bm_cache_slots; i++) {
+        int s = (idx + i) & mask;
+        if (!g_bm_cache[s].used) { *out_found = 0; return s; }
+        if (strcmp(g_bm_cache[s].path, path) == 0) { *out_found = 1; return s; }
+    }
+    *out_found = 0;
+    return -1;
+}
+
+/* Caller holds g_bm_cache_lock and has ensured no rwlock holder. */
+static void bm_cache_drop_slot(int slot) {
+    BmCacheEntry *e = &g_bm_cache[slot];
+    if (!e->used) return;
+    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+    if (e->map) munmap(e->map, e->map_size);
+    if (e->fd >= 0) close(e->fd);
+    e->map = NULL;
+    e->fd = -1;
+    e->map_size = 0;
+    e->used = 0;
+    e->path[0] = '\0';
+    g_bm_cache_count--;
+}
+
+void bm_cache_invalidate(const char *path) {
+    if (!g_bm_cache) return;
+    pthread_mutex_lock(&g_bm_cache_lock);
+    int found = 0;
+    int slot = bm_cache_probe(path, &found);
+    if (found && slot >= 0) {
+        /* Caller must ensure no rwlock holder — used by bm_grow's
+           rewrite-and-publish path. */
+        bm_cache_drop_slot(slot);
+    }
+    pthread_mutex_unlock(&g_bm_cache_lock);
+}
+
+/* ─────────────────── BitmapShard handle ─────────────────── */
+
 struct BitmapShard {
-    int fd;
-    void *mmap_ptr;
-    size_t mmap_size;
-    char path[1024];
-    /* Cached header view — re-loaded after every rewrite. */
+    int      slot;        /* cache slot index, or -1 if uncached fallback */
+    int      writer;      /* 1 = held wrlock, 0 = held rdlock; only when slot >= 0 */
+    int      fd;
+    void    *mmap_ptr;
+    size_t   mmap_size;
+    char     path[PATH_MAX];
     struct BmHeader hdr;
 };
 
@@ -69,6 +180,9 @@ static size_t bm_file_size(const struct BmHeader *h) {
     return (size_t)h->bitmaps_off + (size_t)h->n_values * (size_t)h->stride;
 }
 
+/* Remap the handle's fd. If `bm` is cached (slot>=0), the cache entry's
+   map/size are updated in lockstep — caller already holds the wrlock
+   that excludes readers/writers, so no one observes a torn map. */
 static int bm_remap(BitmapShard *bm) {
     if (bm->mmap_ptr && bm->mmap_size > 0) {
         munmap(bm->mmap_ptr, bm->mmap_size);
@@ -86,6 +200,15 @@ static int bm_remap(BitmapShard *bm) {
     }
     bm->mmap_size = st.st_size;
     memcpy(&bm->hdr, bm->mmap_ptr, sizeof(struct BmHeader));
+
+    /* Republish to the cache entry so future bm_acquire of this path
+       sees the new map/size. */
+    if (bm->slot >= 0 && g_bm_cache) {
+        BmCacheEntry *e = &g_bm_cache[bm->slot];
+        e->fd = bm->fd;
+        e->map = bm->mmap_ptr;
+        e->map_size = bm->mmap_size;
+    }
     return 0;
 }
 
@@ -226,44 +349,176 @@ static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath,
     return 0;
 }
 
+/* Open and mmap the on-disk file. Used by both the cached and uncached
+   paths. Reads the header into *out_hdr. Returns 0/fd on success. */
+static int bm_file_open_mmap(const char *path,
+                              int *out_fd, uint8_t **out_map, size_t *out_size,
+                              struct BmHeader *out_hdr) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct BmHeader)) {
+        close(fd); return -1;
+    }
+    uint8_t *map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { close(fd); return -1; }
+    memcpy(out_hdr, map, sizeof(struct BmHeader));
+    if (out_hdr->magic != BM_MAGIC) {
+        munmap(map, st.st_size); close(fd); return -1;
+    }
+    *out_fd = fd;
+    *out_map = map;
+    *out_size = (size_t)st.st_size;
+    return 0;
+}
+
 BitmapShard *bm_open(const char *path, int slots, int create,
-                     int bool_fastpath, uint32_t max_values) {
-    /* Ensure parent dir exists. The caller's `<obj>/indexes/<field>/`
-       layer might be brand new on first insert. */
+                     int bool_fastpath, uint32_t max_values, int writer) {
+    /* Ensure parent dir + the on-disk file exists if creation was asked. */
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        bm_mkdir_p(dir);
+    if (slash) { *slash = '\0'; bm_mkdir_p(dir); }
+    {
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            if (!create) return NULL;
+            if (bm_write_initial(path, (uint32_t)slots, bool_fastpath, max_values) != 0)
+                return NULL;
+        }
     }
 
-    int fd = open(path, O_RDWR);
-    if (fd < 0) {
-        if (!create) return NULL;
-        if (bm_write_initial(path, (uint32_t)slots, bool_fastpath, max_values) != 0)
-            return NULL;
-        fd = open(path, O_RDWR);
-        if (fd < 0) return NULL;
+    /* Uncached fallback: cache not initialised (test fixtures). Direct
+       mmap, no rwlock. */
+    if (!g_bm_cache) {
+        BitmapShard *bm = calloc(1, sizeof(*bm));
+        if (!bm) return NULL;
+        bm->slot = -1;
+        bm->writer = writer;
+        snprintf(bm->path, sizeof(bm->path), "%s", path);
+        if (bm_file_open_mmap(path, &bm->fd, (uint8_t **)&bm->mmap_ptr,
+                              &bm->mmap_size, &bm->hdr) != 0) {
+            free(bm); return NULL;
+        }
+        if (bm->hdr.max_values == 0) {
+            bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
+            memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
+        }
+        return bm;
+    }
+
+    /* Cached path — mirror bt_acquire's verify-and-retry pattern. */
+    int retries = 0;
+    int found = 0;
+    int slot = -1;
+    pthread_mutex_lock(&g_bm_cache_lock);
+    while (1) {
+        slot = bm_cache_probe(path, &found);
+        if (!found) break;
+
+        g_bm_cache[slot].last_access =
+            __atomic_add_fetch(&g_bm_cache_clock, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_t *lock = &g_bm_cache[slot].rwlock;
+        pthread_mutex_unlock(&g_bm_cache_lock);
+
+        if (writer) pthread_rwlock_wrlock(lock);
+        else        pthread_rwlock_rdlock(lock);
+
+        BmCacheEntry *e = &g_bm_cache[slot];
+        if (e->used && strcmp(e->path, path) == 0) {
+            /* Confirmed hit. Hand the rwlock + cached map to caller. */
+            BitmapShard *bm = calloc(1, sizeof(*bm));
+            if (!bm) { pthread_rwlock_unlock(lock); return NULL; }
+            bm->slot = slot;
+            bm->writer = writer;
+            bm->fd = e->fd;
+            bm->mmap_ptr = e->map;
+            bm->mmap_size = e->map_size;
+            snprintf(bm->path, sizeof(bm->path), "%s", path);
+            memcpy(&bm->hdr, e->map, sizeof(struct BmHeader));
+            if (bm->hdr.max_values == 0 && writer) {
+                bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
+                memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
+            }
+            return bm;
+        }
+
+        /* Slot was evicted+reused while we were blocked on the rwlock. */
+        pthread_rwlock_unlock(lock);
+        if (++retries >= 4) {
+            slot = -1; found = 0;
+            pthread_mutex_lock(&g_bm_cache_lock);
+            break;
+        }
+        pthread_mutex_lock(&g_bm_cache_lock);
+    }
+
+    /* Cache-miss path: load from disk + install into the slot. */
+    int fd; uint8_t *map; size_t sz; struct BmHeader hdr;
+    if (bm_file_open_mmap(path, &fd, &map, &sz, &hdr) != 0) {
+        pthread_mutex_unlock(&g_bm_cache_lock);
+        return NULL;
+    }
+
+    if (slot < 0 || g_bm_cache_count >= g_bm_cache_slots / 2) {
+        int lru = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < g_bm_cache_slots; i++) {
+            if (g_bm_cache[i].used && g_bm_cache[i].last_access < oldest) {
+                oldest = g_bm_cache[i].last_access;
+                lru = i;
+            }
+        }
+        if (lru >= 0) {
+            bm_cache_drop_slot(lru);
+            slot = lru;
+        }
     }
 
     BitmapShard *bm = calloc(1, sizeof(*bm));
-    if (!bm) { close(fd); return NULL; }
+    if (!bm) { munmap(map, sz); close(fd); pthread_mutex_unlock(&g_bm_cache_lock); return NULL; }
+
+    if (slot < 0) {
+        /* Cache full — uncached fallback. */
+        pthread_mutex_unlock(&g_bm_cache_lock);
+        bm->slot = -1;
+        bm->writer = writer;
+        bm->fd = fd;
+        bm->mmap_ptr = map;
+        bm->mmap_size = sz;
+        bm->hdr = hdr;
+        snprintf(bm->path, sizeof(bm->path), "%s", path);
+        if (bm->hdr.max_values == 0 && writer) {
+            bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
+            memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
+        }
+        return bm;
+    }
+
+    BmCacheEntry *e = &g_bm_cache[slot];
+    strncpy(e->path, path, PATH_MAX - 1);
+    e->path[PATH_MAX - 1] = '\0';
+    e->fd = fd;
+    e->map = map;
+    e->map_size = sz;
+    e->used = 1;
+    e->last_access = __atomic_add_fetch(&g_bm_cache_clock, 1, __ATOMIC_RELAXED);
+    g_bm_cache_count++;
+
+    pthread_rwlock_t *lock = &e->rwlock;
+    if (writer) pthread_rwlock_wrlock(lock);
+    else        pthread_rwlock_rdlock(lock);
+    pthread_mutex_unlock(&g_bm_cache_lock);
+
+    bm->slot = slot;
+    bm->writer = writer;
     bm->fd = fd;
+    bm->mmap_ptr = map;
+    bm->mmap_size = sz;
+    bm->hdr = hdr;
     snprintf(bm->path, sizeof(bm->path), "%s", path);
-    if (bm_remap(bm) != 0) {
-        close(fd);
-        free(bm);
-        return NULL;
-    }
-    /* Sanity check magic. */
-    if (bm->hdr.magic != BM_MAGIC) {
-        bm_close(bm);
-        return NULL;
-    }
-    /* Back-compat: header from pre-cap builds has max_values=0. Treat
-       as the default so old files don't suddenly refuse new inserts. */
-    if (bm->hdr.max_values == 0) {
+    if (bm->hdr.max_values == 0 && writer) {
         bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
         memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
     }
@@ -276,10 +531,15 @@ uint32_t bm_max_values(const BitmapShard *bm) {
 
 void bm_close(BitmapShard *bm) {
     if (!bm) return;
-    if (bm->mmap_ptr && bm->mmap_size > 0) {
-        munmap(bm->mmap_ptr, bm->mmap_size);
+    if (bm->slot >= 0 && g_bm_cache) {
+        /* Cached: release the rwlock — the cache keeps the mmap + fd
+           alive across releases (LRU evicts later under memory pressure). */
+        pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
+    } else {
+        /* Uncached fallback: tear the mapping down per call. */
+        if (bm->mmap_ptr && bm->mmap_size > 0) munmap(bm->mmap_ptr, bm->mmap_size);
+        if (bm->fd >= 0) close(bm->fd);
     }
-    if (bm->fd >= 0) close(bm->fd);
     free(bm);
 }
 

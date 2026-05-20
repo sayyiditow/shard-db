@@ -287,33 +287,16 @@ static void bitmap_shard_path(char *out, size_t outlen,
     bm_build_path(out, outlen, db_root, object, field, shard_idx);
 }
 
-/* Thread-local bitmap handle cache. Bulk paths process N records under
-   one kf wrlock — they all hit the SAME .bm file path (same field, same
-   kf_shard). Opening+closing the bitmap per record is mmap+ftruncate
-   overhead × N which dominated 10M-bench wall time. The TLS cache keeps
-   one handle open per worker thread; a path-mismatch evicts the cached
-   one and opens the new one. Calls bm_flush_thread_bitmap_cache() (below)
-   at safe seams to release.
-
-   Concurrency: each worker thread has its own slot — no cross-thread
-   sharing. Per-shard kf wrlock serialises writes against other workers
-   touching the same .bm file. */
-static __thread struct {
-    BitmapShard *bm;
-    char         path[1024];
-    int          dirty;     /* unused today; reserved for batched-flush */
-} tls_bm_cache = { NULL, {0}, 0 };
-
-/* Drop the cached handle if any. Callers invoke this at the end of a
-   batch (e.g. after a parallel-for finishes) so the file isn't held
-   open across long-lived requests, and to ensure any subsequent
-   reindex that wipes the .bm file doesn't leave stale TLS pointers. */
+/* The earlier thread-local bitmap cache was replaced by the global
+   path-keyed bm_cache (bitmap.c). Callers now bm_open(writer=1) for
+   each write and bm_close to release — the rwlock is held only across
+   the per-write critical section, and the cache keeps the mmap alive
+   so subsequent same-shard writes pay just the rwlock cost. The flush
+   API is kept as a no-op shim so existing batch-boundary callers (CRUD
+   pre_commits, bulk worker) don't break — they're effectively no-ops
+   now that there's no TLS state to release. */
 void bm_flush_thread_bitmap_cache(void) {
-    if (tls_bm_cache.bm) {
-        bm_close(tls_bm_cache.bm);
-        tls_bm_cache.bm = NULL;
-        tls_bm_cache.path[0] = '\0';
-    }
+    /* no-op — see comment above. */
 }
 
 /* Bitmap insert/delete: open the per-data-shard `.bm` file, flip the
@@ -337,22 +320,11 @@ static int bitmap_update(const char *db_root, const char *object,
 
     int slots = (int)slotcask_default_slots_for_splits(splits);
 
-    /* Hit the TLS cache when the path matches; reuse without
-       re-mmap'ing. Evict on mismatch (different field or shard than the
-       previous call from this thread). */
-    BitmapShard *bm;
-    if (tls_bm_cache.bm && strcmp(tls_bm_cache.path, path) == 0) {
-        bm = tls_bm_cache.bm;
-    } else {
-        if (tls_bm_cache.bm) {
-            bm_close(tls_bm_cache.bm);
-            tls_bm_cache.bm = NULL;
-        }
-        bm = bm_open(path, slots, 1, bool_fastpath, max_values);
-        if (!bm) return 0;
-        tls_bm_cache.bm = bm;
-        snprintf(tls_bm_cache.path, sizeof(tls_bm_cache.path), "%s", path);
-    }
+    /* The global bm_cache (bitmap.c) keeps the mmap alive across calls;
+       bm_open / bm_close just acquire + release the per-entry rwlock. */
+    BitmapShard *bm = bm_open(path, slots, 1, bool_fastpath, max_values,
+                              1 /* writer */);
+    if (!bm) return 0;
 
     /* Auto-grow on slot overflow. Slotcask doubles a kf shard's
        slots_per_shard on auto-resplit (80% load trigger); the bitmap
@@ -377,9 +349,9 @@ static int bitmap_update(const char *db_root, const char *object,
             rc = -1;
         }
     }
-    /* Don't bm_close — the TLS cache holds the handle for the next
-       same-path call. Eviction happens on path mismatch above, or
-       explicitly via bm_flush_thread_bitmap_cache() at batch boundaries. */
+    /* Release the per-entry rwlock. The cache keeps fd + mmap alive
+       so a same-path follow-up call pays just the rwlock acquire. */
+    bm_close(bm);
     return rc;
 }
 
@@ -1385,13 +1357,17 @@ int build_bitmap_pass(const char *db_root, const char *object,
     const TypedField *f = &ts->fields[fi];
     int bool_fastpath = (f->type == FT_BOOL);
 
-    /* Wipe + re-create every shard's .bm file with the correct cap. */
+    /* Wipe + re-create every shard's .bm file with the correct cap.
+       Invalidate the global bm_cache entry for each path BEFORE the
+       unlink + recreate so a stale mmap on the old inode doesn't
+       linger and serve later acquires. */
     int slots_per_shard = (int)slotcask_default_slots_for_splits(sch->splits);
     for (int s = 0; s < sch->splits; s++) {
         char bp[PATH_MAX];
         bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+        bm_cache_invalidate(bp);
         unlink(bp);
-        BitmapShard *bm = bm_open(bp, slots_per_shard, 1, bool_fastpath, max_values);
+        BitmapShard *bm = bm_open(bp, slots_per_shard, 1, bool_fastpath, max_values, 1);
         if (bm) bm_close(bm);
     }
 
@@ -1406,7 +1382,7 @@ int build_bitmap_pass(const char *db_root, const char *object,
     for (int s = 0; s < sch->splits; s++) {
         char bp[PATH_MAX];
         bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, slots_per_shard, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, slots_per_shard, 0, 0, 0, 1 /* writer: reindex bm_set's */);
         if (!bm) continue;
         BmRebuildCtx c = { bm, fi, ts };
         slotcask_walk_one_shard_slots(sdb, s, bm_rebuild_cb, &c);

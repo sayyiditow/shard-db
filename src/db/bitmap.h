@@ -87,6 +87,18 @@ void bm_build_path(char *out, size_t outlen,
                    const char *db_root, const char *object,
                    const char *field, int shard_idx);
 
+/* Global bitmap shard cache (mirrors bt_cache / kfcache). Path-keyed
+   slot table with per-entry rwlock and LRU eviction. Initialise once
+   at daemon startup with the desired capacity (number of cached .bm
+   files); leave uninitialised in test fixtures to fall back to fresh
+   mmap-per-call. */
+void bm_cache_init(int cap);
+void bm_cache_shutdown(void);
+
+/* Drop the cache entry for `path` (e.g. after a reindex unlinks it).
+   Caller must ensure no thread holds the entry's rwlock. */
+void bm_cache_invalidate(const char *path);
+
 /* Open the bitmap shard file. If it doesn't exist:
      - If `create == 0`, returns NULL.
      - If `create == 1` and `bool_fastpath == 1`, creates a bool-flavoured
@@ -99,8 +111,11 @@ void bm_build_path(char *out, size_t outlen,
    [2, BM_HARD_CEILING] to override. When opening an existing file
    (create == 0), the `max_values` arg is ignored — the value baked
    into the header wins. The file is mmap'd MAP_SHARED, writable. */
+/* `writer`: 0 takes an rdlock on the cache slot (multiple concurrent
+   readers allowed), 1 takes a wrlock (exclusive). Writers must use 1
+   so bm_set / bm_clear / bm_grow are serialised. */
 BitmapShard *bm_open(const char *path, int slots, int create,
-                     int bool_fastpath, uint32_t max_values);
+                     int bool_fastpath, uint32_t max_values, int writer);
 
 /* Read the per-file cap baked into the header. Returns the resolved
    value (never 0 — defaults to BM_DEFAULT_MAX_VALUES). */

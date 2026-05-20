@@ -8885,12 +8885,29 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
 static enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field);
 
+/* Per-shard worker arg for parallel bitmap dispatch — mirrors btree's
+   ShardWalkArg in index.c. The shared atomic stop_flag lets a worker
+   that hits the caller's limit cancel its peers. */
+typedef struct BmShardWalkArg {
+    const char  *db_root;
+    const char  *object;
+    const char  *field;
+    int          shard_idx;
+    const uint8_t *value;
+    size_t       vlen;
+    bt_result_cb cb;
+    void        *ctx;
+    SlotcaskDb  *sdb;
+    int         *stop_flag;     /* manipulated via __atomic_* */
+} BmShardWalkArg;
+
 /* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
    per live matching slot. */
 static int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
+static void *bm_shard_walk_worker(void *arg);
 
 /* Type-aware front for the planner's per-leaf dispatch. Bitmap-indexed
    eq leaves walk the bitmap shards directly and emit per-match
@@ -8911,14 +8928,23 @@ static void btree_dispatch(const char *db_root, const char *object,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (!sdb) return;
+        /* Parallel shard fan-out — mirrors btree's shard_walk_dispatch.
+           Each worker grabs one shard. A shared atomic stop_flag lets
+           a worker that hits the caller's limit cancel the rest mid-
+           flight. The cb (collect_hash_cb / idx_count_cb) is already
+           thread-safe via atomic counter + TLS batching. */
+        int stop_flag = 0;
+        BmShardWalkArg *args = malloc((size_t)splits * sizeof(BmShardWalkArg));
+        if (!args) return;
         for (int s = 0; s < splits; s++) {
-            if (bitmap_emit_for_shard(db_root, object, field, s, valbuf, vallen,
-                                      cb, ctx, sdb)) {
-                /* Caller hit its limit (e.g. find limit=1000) — skip the
-                   remaining shards' kf_acquire + bm_open. */
-                break;
-            }
+            args[s] = (BmShardWalkArg){
+                .db_root = db_root, .object = object, .field = field,
+                .shard_idx = s, .value = valbuf, .vlen = vallen,
+                .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+            };
         }
+        parallel_for(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
+        free(args);
         return;
     }
 
@@ -10761,7 +10787,7 @@ static int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
     if (!bm) return 0;
 
     char kfp[PATH_MAX];
@@ -10780,6 +10806,23 @@ static int bitmap_emit_for_shard(const char *db_root, const char *object,
     kfcache_release(&kh);
     bm_close(bm);
     return ec.stop;
+}
+
+/* parallel_for worker for shard fan-out. Checks the shared stop flag
+   before doing any I/O so a peer's limit-hit propagates immediately.
+   On a cb-driven stop, raises the flag so subsequent peers also bail. */
+static void *bm_shard_walk_worker(void *arg) {
+    BmShardWalkArg *a = (BmShardWalkArg *)arg;
+    if (a->stop_flag && __atomic_load_n(a->stop_flag, __ATOMIC_RELAXED)) {
+        return NULL;
+    }
+    int stopped = bitmap_emit_for_shard(a->db_root, a->object, a->field,
+                                        a->shard_idx, a->value, a->vlen,
+                                        a->cb, a->ctx, a->sdb);
+    if (stopped && a->stop_flag) {
+        __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
 }
 
 /* Bitmap-walk → KeySet collector. Kept for compatibility with the
@@ -10852,7 +10895,7 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
         if (!bm) continue;
 
         char kfp[PATH_MAX];
@@ -11855,7 +11898,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 for (int s = 0; s < sch.splits; s++) {
                     char bp[1024];
                     bm_build_path(bp, sizeof(bp), db_root, object, pc->field, s);
-                    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0);
+                    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
                     if (!bm) continue;
                     total += bm_count(bm, valbuf, vallen);
                     bm_close(bm);
@@ -14577,7 +14620,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             bm_build_path(bm_path, sizeof(bm_path), eff_root, object,
                           pidx[i].name, s);
             BitmapShard *bm = bm_open(bm_path, slots_per_shard, 1, is_bool,
-                                      pidx[i].max_values);
+                                      pidx[i].max_values, 1 /* writer: materialise file */);
             if (bm) bm_close(bm);
             /* Best-effort: if a single shard fails to create, the next
                insert will retry. Don't fail the whole create-object. */
