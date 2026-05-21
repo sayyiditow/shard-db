@@ -1041,41 +1041,6 @@ static void *shard_build_worker(void *arg) {
     return NULL;
 }
 
-/* Per-shard incremental merge worker — same shape as ShardBuildArg.
-   Used by the trigram build pipeline which batches kf shards. The
-   first batch writes into an empty file (or one wiped by force-rebuild)
-   so it can use the tight bulk_build path; later batches must NOT use
-   bulk_merge's rebuild path because it allocates `existing + new`
-   BtEntry buffers during the merge — at multi-GB existing trees with
-   8 parallel workers, that's tens of GB of peak memory → OOM. Instead
-   we fall through to btree_insert_batch, which point-inserts under a
-   single write lock with O(1) memory per insert. Slower per byte than
-   a tight bulk_build, but memory-bounded regardless of total volume. */
-typedef struct {
-    char     ipath[PATH_MAX];
-    BtEntry *pairs;        /* slice — caller owns backing memory */
-    size_t   pair_count;
-} ShardMergeArg;
-
-static void *shard_merge_worker(void *arg) {
-    ShardMergeArg *sm = (ShardMergeArg *)arg;
-    struct stat st;
-    int is_fresh = (stat(sm->ipath, &st) != 0 || st.st_size == 0);
-    if (is_fresh) {
-        /* First batch into an empty .tg — clean bulk_build with tight
-           prefix-compressed leaves. Memory: sort in place + write. */
-        qsort(sm->pairs, sm->pair_count, sizeof(BtEntry), cmp_btentry_fn);
-        btree_bulk_build(sm->ipath, sm->pairs, sm->pair_count);
-    } else {
-        /* Subsequent batch — point-insert each entry under a single
-           write lock. O(count × log existing) time but O(1) extra
-           memory. Avoids bulk_merge's "extract everything + combine"
-           path which is what blew the budget at 25M trigram scale. */
-        btree_insert_batch(sm->ipath, sm->pairs, sm->pair_count);
-    }
-    return NULL;
-}
-
 /* Bucket-sort `pairs` (of total `count`) into `nshards` partitions by
    idx_shard_for_hash(pair.hash, splits). Returns a malloc'd contiguous
    BtEntry array of length `count` (caller frees) plus per-shard offset/length
@@ -1537,114 +1502,279 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     return 0;
 }
 
-/* Trigram reindex — walks every record of the object, extracts
-   distinct trigrams per varchar field, and writes one (trigram, hash)
-   leaf entry per (trigram, record). Mirrors btree's `cmd_add_index`
-   pipeline: parallel per-kf-shard walk → contiguous concat →
-   partition by `idx_shard_for_hash` → parallel qsort + btree_bulk_build
-   per .tg shard. Each .tg file shares the BTRH format with .idx, so
-   shard_build_worker is reused unchanged.
+/* === Streaming-flush index build ============================================
+ *
+ * Bounded per-worker memory regardless of dataset size. Used by trigram
+ * (always) and large-scale btree (when single-pass would exceed budget).
+ *
+ * Each worker walks ONE kf shard. It maintains a fixed-size buffer of
+ * BtEntry + arena. When the buffer fills it FLUSHES:
+ *   - counting-sort current pairs by idx_shard_for_hash(record_hash, splits)
+ *   - for each idx_shard slice:
+ *       * if target file empty → qsort + btree_bulk_build  (tight leaves)
+ *       * else                → btree_insert_batch         (point-insert under
+ *                                                             single bt_acquire)
+ *   - reset buffers (memory is reused, not freed)
+ * After the walk finishes, do a final flush.
+ *
+ * Memory bound: pool_size × (pairs + flush_out + arena) ≈ budget total.
+ * Works at any scale — 25M, 100M, 1B — peak memory is constant per worker. */
 
-   Per-kf-shard parallel build worker. Each worker walks ONE kf shard,
-   extracts distinct trigrams per record, and appends (trigram, hash)
-   pairs to its own buffer + arena (lock-free). After all workers finish,
-   the main thread fixes up the BtEntry.value pointers (which carried
-   into-arena offsets to survive realloc), concatenates the per-worker
-   pair arrays, partitions by .tg shard, then runs shard_build_worker
-   in parallel — exactly the pipeline cmd_add_index uses for btree. */
+enum { STREAM_BTREE = 0, STREAM_TRIGRAM = 1 };
+
 typedef struct {
-    SlotcaskDb  *sdb;
-    int          kf_shard;          /* which kf shard to walk */
-    int          field_index;       /* typed schema field index */
+    /* Inputs (read-only). */
+    int          type;
+    const char  *db_root;
+    const char  *object;
+    const char  *field;             /* spec name for path-build; composite "a+b" stays intact */
+    int          splits;
+    int          idx_n;
+    int          field_index;
+    int          is_composite;
+    int          field_indices[16];
+    int          field_index_count;
     TypedSchema *ts;
+    SlotcaskDb  *sdb;
+    int          kf_shard;
 
+    /* Pre-allocated bounded buffers (allocated once at worker init,
+       reused across flushes). NEVER realloc-grow during the walk —
+       overflow triggers a flush instead. */
     BtEntry     *pairs;
-    size_t       pair_cap;
+    size_t       pairs_cap;
     size_t       pair_count;
 
-    uint8_t     *arena;             /* grows during walk; pairs[i].value
-                                       carries an offset into this arena
-                                       (cast to char*) until the
-                                       post-walk fix-up step. */
+    uint8_t     *arena;
     size_t       arena_cap;
     size_t       arena_used;
-} TgWorkerCtx;
 
-static int tg_build_per_record_cb(uint32_t slot, const uint8_t hash16[16],
-                                  const void *key, size_t klen,
-                                  const void *value, size_t vlen,
-                                  void *ctx) {
+    /* Reusable per-flush scratch (avoids realloc churn). */
+    BtEntry     *flush_out;
+    size_t      *flush_counts;
+    size_t      *flush_offsets;
+    size_t      *flush_cursors;
+
+    /* Per-output-shard mutex array, SHARED across all workers building
+       the same field. Required because each worker scatters its flush
+       to ALL output shards, so multiple workers can target the same
+       file concurrently — without this lock, two parallel bulk_builds
+       on the same path race on the unlink+create sequence and corrupt
+       state. Owned by the build entry point; workers hold pointers. */
+    pthread_mutex_t *shard_locks;
+
+    /* Stats / state. */
+    size_t       flushes;
+    int          had_error;
+} StreamWorker;
+
+/* Build the right per-type output path. */
+static void stream_path(const StreamWorker *w, int shard, char *out, size_t outlen) {
+    if (w->type == STREAM_TRIGRAM)
+        tg_build_path(out, outlen, w->db_root, w->object, w->field, shard);
+    else
+        build_idx_path(out, outlen, w->db_root, w->object, w->field, shard);
+}
+
+/* Drain the current buffer to output files. Reusable buffers stay
+   allocated — only pair_count + arena_used reset. */
+static void stream_flush(StreamWorker *w) {
+    if (w->pair_count == 0) return;
+
+    /* Rebase offset → real arena pointer for every accumulated pair. */
+    for (size_t i = 0; i < w->pair_count; i++) {
+        uintptr_t off = (uintptr_t)w->pairs[i].value;
+        w->pairs[i].value = (const char *)(w->arena + off);
+    }
+
+    /* Counting sort by idx_shard. */
+    memset(w->flush_counts, 0, (size_t)w->idx_n * sizeof(size_t));
+    for (size_t i = 0; i < w->pair_count; i++) {
+        int s = idx_shard_for_hash(w->pairs[i].hash, w->splits);
+        w->flush_counts[s]++;
+    }
+    w->flush_offsets[0] = 0;
+    for (int i = 1; i < w->idx_n; i++)
+        w->flush_offsets[i] = w->flush_offsets[i - 1] + w->flush_counts[i - 1];
+    memcpy(w->flush_cursors, w->flush_offsets,
+           (size_t)w->idx_n * sizeof(size_t));
+
+    /* Scatter into flush_out. */
+    for (size_t i = 0; i < w->pair_count; i++) {
+        int s = idx_shard_for_hash(w->pairs[i].hash, w->splits);
+        w->flush_out[w->flush_cursors[s]++] = w->pairs[i];
+    }
+
+    /* Write each shard's slice. Per-shard mutex prevents two parallel
+       workers from racing on (stat → bulk_build's unlink+create) for
+       the same file. First writer per shard gets bulk_build (tight
+       prefix-compressed leaves); subsequent writers append via
+       insert_batch (point-insert under one bt_acquire). */
+    for (int s = 0; s < w->idx_n; s++) {
+        if (w->flush_counts[s] == 0) continue;
+        char path[PATH_MAX];
+        stream_path(w, s, path, sizeof(path));
+        BtEntry *slice = w->flush_out + w->flush_offsets[s];
+        size_t   n     = w->flush_counts[s];
+
+        pthread_mutex_lock(&w->shard_locks[s]);
+        struct stat st;
+        if (stat(path, &st) != 0 || st.st_size == 0) {
+            qsort(slice, n, sizeof(BtEntry), cmp_btentry_fn);
+            btree_bulk_build(path, slice, n);
+        } else {
+            btree_insert_batch(path, slice, n);
+        }
+        pthread_mutex_unlock(&w->shard_locks[s]);
+    }
+
+    w->pair_count = 0;
+    w->arena_used = 0;
+    w->flushes++;
+}
+
+/* Per-record callback. Dispatches to trigram or btree extraction by
+   w->type. Triggers a flush BEFORE appending if buffer would overflow. */
+static int stream_record_cb(uint32_t slot, const uint8_t hash16[16],
+                            const void *key, size_t klen,
+                            const void *value, size_t vlen,
+                            void *ctx) {
     (void)slot; (void)key; (void)klen; (void)vlen;
-    TgWorkerCtx *w = (TgWorkerCtx *)ctx;
-    const TypedField *f = &w->ts->fields[w->field_index];
-    if (f->type != FT_VARCHAR) return 0;
+    StreamWorker *w = (StreamWorker *)ctx;
 
-    const uint8_t *vbase = (const uint8_t *)value + f->offset;
-    uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
-    if (actual_len == 0) return 0;
+    if (w->type == STREAM_TRIGRAM) {
+        const TypedField *f = &w->ts->fields[w->field_index];
+        if (f->type != FT_VARCHAR) return 0;
+        const uint8_t *vbase = (const uint8_t *)value + f->offset;
+        uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+        if (actual_len == 0) return 0;
 
-    uint8_t trigrams[TG_MAX_DISTINCT][3];
-    size_t n = tg_extract_distinct(vbase + 2, actual_len, trigrams, TG_MAX_DISTINCT);
-    if (n == 0) return 0;
+        uint8_t trigrams[TG_MAX_DISTINCT][3];
+        size_t n = tg_extract_distinct(vbase + 2, actual_len, trigrams, TG_MAX_DISTINCT);
+        if (n == 0) return 0;
 
-    /* Grow pairs[] geometrically. */
-    if (w->pair_count + n > w->pair_cap) {
-        size_t new_cap = w->pair_cap == 0 ? 4096 : w->pair_cap * 2;
-        while (new_cap < w->pair_count + n) new_cap *= 2;
-        BtEntry *p = xrealloc_or_free(w->pairs, new_cap * sizeof(BtEntry));
-        if (!p) {
-            /* xrealloc_or_free dropped the old block on failure — clear
-               the now-dangling fields so subsequent callbacks no-op
-               instead of double-freeing. */
-            w->pairs = NULL; w->pair_cap = 0; w->pair_count = 0;
-            return 0;
+        /* Flush before append if would overflow. */
+        if (w->pair_count + n > w->pairs_cap ||
+            w->arena_used + n * 3 > w->arena_cap) {
+            stream_flush(w);
         }
-        w->pairs = p;
-        w->pair_cap = new_cap;
+        /* If a single record alone exceeds buffer, skip — buffer was
+           sized generously; this only triggers on pathological data. */
+        if (n > w->pairs_cap || n * 3 > w->arena_cap) return 0;
+
+        for (size_t i = 0; i < n; i++) {
+            size_t off = w->arena_used;
+            memcpy(w->arena + off, trigrams[i], 3);
+            w->arena_used += 3;
+            w->pairs[w->pair_count].value = (const char *)(uintptr_t)off;
+            w->pairs[w->pair_count].vlen  = 3;
+            memcpy(w->pairs[w->pair_count].hash, hash16, BT_HASH_SIZE);
+            w->pair_count++;
+        }
+        return 0;
     }
 
-    /* Grow arena geometrically. Pair value pointers carry the OFFSET
-       into the arena (cast to char *); they get rewritten to real
-       pointers after the parallel walk finishes — so any realloc move
-       here is safe. */
-    size_t need = n * 3;
-    if (w->arena_used + need > w->arena_cap) {
-        size_t new_size = w->arena_cap == 0 ? 65536 : w->arena_cap * 2;
-        while (new_size < w->arena_used + need) new_size *= 2;
-        uint8_t *a = xrealloc_or_free(w->arena, new_size);
-        if (!a) {
-            w->arena = NULL; w->arena_cap = 0; w->arena_used = 0;
-            /* pairs we already recorded carry stale offsets into a
-               freed arena — abandon them too to keep the fix-up step
-               safe. */
-            free(w->pairs);
-            w->pairs = NULL; w->pair_cap = 0; w->pair_count = 0;
-            return 0;
+    /* === btree === */
+    /* Build the index key into a small stack buffer, copy into arena. */
+    uint8_t key_buf[4096];
+    size_t  key_len = 0;
+    if (w->is_composite) {
+        char cat[4096]; int cpos = 0; int ok = 1;
+        for (int i = 0; i < w->field_index_count; i++) {
+            char *v = typed_get_field_str(w->ts, (const uint8_t *)value,
+                                          w->field_indices[i]);
+            if (v) {
+                int sl = (int)strlen(v);
+                if (cpos + sl >= (int)sizeof(cat)) { free(v); ok = 0; break; }
+                memcpy(cat + cpos, v, (size_t)sl);
+                cpos += sl;
+                free(v);
+            } else { ok = 0; break; }
         }
-        w->arena = a;
-        w->arena_cap = new_size;
+        if (!ok || cpos == 0) return 0;
+        key_len = (size_t)cpos;
+        if (key_len > sizeof(key_buf)) return 0;
+        memcpy(key_buf, cat, key_len);
+    } else {
+        int fidx = w->field_indices[0];
+        if (fidx < 0) return 0;
+        typed_field_to_index_key(w->ts, (const uint8_t *)value, fidx,
+                                 key_buf, &key_len);
+        if (key_len == 0) return 0;
     }
 
-    for (size_t i = 0; i < n; i++) {
-        size_t off = w->arena_used;
-        memcpy(w->arena + off, trigrams[i], 3);
-        w->arena_used += 3;
-        /* Store offset in .value — cast to const char* for now; the
-           main thread re-bases to (arena + off) once the arena is
-           guaranteed to no longer move. */
-        w->pairs[w->pair_count].value = (const char *)(uintptr_t)off;
-        w->pairs[w->pair_count].vlen  = 3;
-        memcpy(w->pairs[w->pair_count].hash, hash16, BT_HASH_SIZE);
-        w->pair_count++;
+    /* Flush before append if would overflow. */
+    if (w->pair_count + 1 > w->pairs_cap ||
+        w->arena_used + key_len > w->arena_cap) {
+        stream_flush(w);
+    }
+    if (key_len > w->arena_cap || 1 > w->pairs_cap) return 0;
+
+    size_t off = w->arena_used;
+    memcpy(w->arena + off, key_buf, key_len);
+    w->arena_used += key_len;
+    w->pairs[w->pair_count].value = (const char *)(uintptr_t)off;
+    w->pairs[w->pair_count].vlen  = key_len;
+    memcpy(w->pairs[w->pair_count].hash, hash16, BT_HASH_SIZE);
+    w->pair_count++;
+    return 0;
+}
+
+static void *stream_walk_worker(void *arg) {
+    StreamWorker *w = (StreamWorker *)arg;
+    slotcask_walk_one_shard_slots(w->sdb, w->kf_shard, stream_record_cb, w);
+    stream_flush(w);   /* final flush */
+    return NULL;
+}
+
+/* Compute per-worker buffer sizing from the global budget and pool size.
+   `est_value_bytes` = avg bytes per BtEntry value (for trigram, 3; for
+   btree, depends on field — pass a generous estimate). Returns 0 on
+   alloc failure. */
+static int stream_worker_alloc(StreamWorker *w, size_t budget,
+                               int pool_size, size_t est_value_bytes) {
+    if (pool_size < 1) pool_size = 1;
+    /* Per-worker budget: budget / pool_size. Flush doubles peak
+       (pairs + flush_out alive simultaneously), so halve again. */
+    size_t per_worker = budget / (size_t)pool_size / 2;
+    if (per_worker < 4ULL * 1024 * 1024) per_worker = 4ULL * 1024 * 1024;
+
+    size_t per_pair = 2 * sizeof(BtEntry) + est_value_bytes;
+    size_t cap = per_worker / per_pair;
+    if (cap < 4096) cap = 4096;
+    /* Hard upper bound to prevent runaway sizing on huge budgets. */
+    if (cap > 2000000) cap = 2000000;
+
+    w->pairs_cap   = cap;
+    w->pair_count  = 0;
+    w->arena_cap   = cap * est_value_bytes;
+    if (w->arena_cap < 65536) w->arena_cap = 65536;
+    w->arena_used  = 0;
+
+    w->pairs         = calloc(w->pairs_cap, sizeof(BtEntry));
+    w->arena         = calloc(w->arena_cap, 1);
+    w->flush_out     = calloc(w->pairs_cap, sizeof(BtEntry));
+    w->flush_counts  = calloc((size_t)w->idx_n, sizeof(size_t));
+    w->flush_offsets = calloc((size_t)w->idx_n, sizeof(size_t));
+    w->flush_cursors = calloc((size_t)w->idx_n, sizeof(size_t));
+
+    if (!w->pairs || !w->arena || !w->flush_out ||
+        !w->flush_counts || !w->flush_offsets || !w->flush_cursors) {
+        free(w->pairs); free(w->arena); free(w->flush_out);
+        free(w->flush_counts); free(w->flush_offsets); free(w->flush_cursors);
+        memset(&w->pairs, 0, sizeof(void*) * 6);
+        return -1;
     }
     return 0;
 }
 
-static void *tg_worker_walk(void *arg) {
-    TgWorkerCtx *w = (TgWorkerCtx *)arg;
-    slotcask_walk_one_shard_slots(w->sdb, w->kf_shard,
-                                  tg_build_per_record_cb, w);
-    return NULL;
+static void stream_worker_free(StreamWorker *w) {
+    free(w->pairs);
+    free(w->arena);
+    free(w->flush_out);
+    free(w->flush_counts);
+    free(w->flush_offsets);
+    free(w->flush_cursors);
 }
 
 int build_trigram_pass(const char *db_root, const char *object,
@@ -1679,127 +1809,67 @@ int build_trigram_pass(const char *db_root, const char *object,
     if (!sdb) return -1;
 
     int n_kf = sch->splits;
-
-    /* Adaptive batching across kf shards — mirrors the budget logic
-       cmd_add_indexes uses across fields, but trigram only has one
-       field so we batch the kf-shard dimension instead. At ~8 trigrams
-       per record, accumulating ALL records' (trigram, hash) pairs at
-       once for a 25M object would spike to 6+ GB — past any reasonable
-       budget. Each batch: parallel walk → concat → partition → parallel
-       qsort + btree_bulk_merge into the .tg files. */
-    int live = get_live_count(db_root, object);
-    if (live < 0) live = 0;
     size_t budget = g_index_build_budget_bytes;
     if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
+    int pool_size = parallel_pool_size();
+    if (pool_size < 1) pool_size = 1;
 
-    /* Per-kf-shard estimate: records_in_shard × TG_AVG × (BtEntry + 3-byte
-       arena cell) × 2 (partition_by_shard copy). TG_AVG=16 is a generous
-       upper bound for short English text; longer / denser fields will
-       just produce smaller batch sizes from a higher estimate. */
-    const size_t TG_AVG = 16;
-    const size_t PER_ENTRY_BYTES = sizeof(BtEntry) + 3;
-    size_t per_shard_records = (n_kf > 0) ? ((size_t)live + (size_t)n_kf - 1) / (size_t)n_kf : 0;
-    if (per_shard_records < 1024) per_shard_records = 1024;
-    size_t per_shard_bytes = per_shard_records * TG_AVG * PER_ENTRY_BYTES * 2;
-    int batch_size = (per_shard_bytes > 0) ? (int)(budget / per_shard_bytes) : n_kf;
-    if (batch_size < 1) batch_size = 1;
-    if (batch_size > n_kf) batch_size = n_kf;
+    log_msg(2, "BUILD-TRIGRAM %s/%s: streaming, %d kf shards, pool=%d, budget=%zu MB",
+            db_root, object, n_kf, pool_size, budget / (1024 * 1024));
 
-    log_msg(2, "BUILD-TRIGRAM %s/%s: %d kf shards, %d per batch (~%zu MB/batch budget)",
-            db_root, object, n_kf, batch_size, budget / (1024 * 1024));
+    /* One mutex per output (.tg) shard, shared across all workers so
+       the (stat → bulk_build's unlink+create) sequence is atomic. */
+    pthread_mutex_t *shard_locks = calloc((size_t)idx_n, sizeof(pthread_mutex_t));
+    if (!shard_locks) return -1;
+    for (int s = 0; s < idx_n; s++) pthread_mutex_init(&shard_locks[s], NULL);
 
-    for (int batch_start = 0; batch_start < n_kf; batch_start += batch_size) {
-        int batch_end = batch_start + batch_size;
-        if (batch_end > n_kf) batch_end = n_kf;
-        int batch_n = batch_end - batch_start;
-
-        TgWorkerCtx *workers = calloc((size_t)batch_n, sizeof(TgWorkerCtx));
-        if (!workers) return -1;
-        for (int i = 0; i < batch_n; i++) {
-            workers[i].sdb         = sdb;
-            workers[i].kf_shard    = batch_start + i;
-            workers[i].field_index = fi;
-            workers[i].ts          = ts;
-        }
-
-        /* Phase 1 — parallel walk over this batch's kf shards. */
-        parallel_for(tg_worker_walk, workers, batch_n, sizeof(TgWorkerCtx));
-
-        /* Phase 2 — rebase offset → arena pointer. */
-        size_t total = 0;
-        for (int i = 0; i < batch_n; i++) {
-            TgWorkerCtx *w = &workers[i];
-            for (size_t j = 0; j < w->pair_count; j++) {
-                uintptr_t off = (uintptr_t)w->pairs[j].value;
-                w->pairs[j].value = (const char *)(w->arena + off);
-            }
-            total += w->pair_count;
-        }
-
-        if (total == 0) {
-            for (int i = 0; i < batch_n; i++) {
-                free(workers[i].pairs);
-                free(workers[i].arena);
-            }
-            free(workers);
-            continue;
-        }
-
-        /* Phase 3 — concat per-worker arrays. */
-        BtEntry *all = malloc(total * sizeof(BtEntry));
-        if (!all) {
-            for (int i = 0; i < batch_n; i++) {
-                free(workers[i].pairs);
-                free(workers[i].arena);
-            }
-            free(workers);
-            return -1;
-        }
-        size_t off = 0;
-        for (int i = 0; i < batch_n; i++) {
-            memcpy(all + off, workers[i].pairs,
-                   workers[i].pair_count * sizeof(BtEntry));
-            off += workers[i].pair_count;
-            free(workers[i].pairs);
-            workers[i].pairs = NULL;
-        }
-
-        /* Phase 4 — partition by .tg shard, then parallel
-           qsort + btree_bulk_merge per shard. Merge (not bulk_build)
-           because subsequent batches must accumulate into the same
-           .tg files; bulk_merge handles the empty-existing case as
-           a clean build internally. */
-        size_t *offsets = NULL, *counts = NULL;
-        BtEntry *parted = partition_by_shard(all, total, sch->splits, idx_n,
-                                             &offsets, &counts);
-        free(all);
-
-        if (parted) {
-            ShardMergeArg *sm = malloc((size_t)idx_n * sizeof(ShardMergeArg));
-            int sm_count = 0;
-            for (int s = 0; s < idx_n; s++) {
-                if (counts[s] == 0) continue;
-                tg_build_path(sm[sm_count].ipath, sizeof(sm[sm_count].ipath),
-                              db_root, object, field, s);
-                sm[sm_count].pairs = parted + offsets[s];
-                sm[sm_count].pair_count = counts[s];
-                sm_count++;
-            }
-            parallel_for(shard_merge_worker, sm, sm_count, sizeof(ShardMergeArg));
-            free(sm);
-            free(parted);
-            free(offsets);
-            free(counts);
-        }
-
-        /* Free this batch's arenas (no live readers of value pointers
-           — bulk_merge already extracted what it needed). */
-        for (int i = 0; i < batch_n; i++) {
-            free(workers[i].arena);
-        }
-        free(workers);
+    /* Allocate one worker context per kf shard. parallel_for runs only
+       `pool_size` concurrently, so total peak memory is bounded by
+       pool_size × per-worker, not n_kf × per-worker. Setup is cheap
+       per worker (pre-sized buffers from the budget). */
+    StreamWorker *workers = calloc((size_t)n_kf, sizeof(StreamWorker));
+    if (!workers) {
+        for (int s = 0; s < idx_n; s++) pthread_mutex_destroy(&shard_locks[s]);
+        free(shard_locks);
+        return -1;
     }
 
+    int alloc_ok = 1;
+    for (int s = 0; s < n_kf; s++) {
+        workers[s].type             = STREAM_TRIGRAM;
+        workers[s].db_root          = db_root;
+        workers[s].object           = object;
+        workers[s].field            = field;
+        workers[s].splits           = sch->splits;
+        workers[s].idx_n            = idx_n;
+        workers[s].field_index      = fi;
+        workers[s].is_composite     = 0;
+        workers[s].field_index_count = 1;
+        workers[s].field_indices[0] = fi;
+        workers[s].ts               = ts;
+        workers[s].sdb              = sdb;
+        workers[s].kf_shard         = s;
+        workers[s].shard_locks      = shard_locks;
+        if (stream_worker_alloc(&workers[s], budget, pool_size, 3) != 0) {
+            alloc_ok = 0;
+            break;
+        }
+    }
+    if (!alloc_ok) {
+        for (int s = 0; s < n_kf; s++) stream_worker_free(&workers[s]);
+        free(workers);
+        for (int s = 0; s < idx_n; s++) pthread_mutex_destroy(&shard_locks[s]);
+        free(shard_locks);
+        return -1;
+    }
+
+    /* Run all walks. pool_size workers active at once; the rest queue. */
+    parallel_for(stream_walk_worker, workers, n_kf, sizeof(StreamWorker));
+
+    for (int s = 0; s < n_kf; s++) stream_worker_free(&workers[s]);
+    free(workers);
+    for (int s = 0; s < idx_n; s++) pthread_mutex_destroy(&shard_locks[s]);
+    free(shard_locks);
     return 0;
 }
 
