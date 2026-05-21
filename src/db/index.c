@@ -1079,102 +1079,173 @@ static BtEntry *partition_by_shard(BtEntry *pairs, size_t count, int splits,
     return out;
 }
 
+/* Forward decls — full definitions live near the multi-index builder. */
+int build_bitmap_pass(const char *db_root, const char *object,
+                      const Schema *sch, TypedSchema *ts,
+                      const char *field, uint32_t max_values, int force);
+int build_trigram_pass(const char *db_root, const char *object,
+                       const Schema *sch, TypedSchema *ts,
+                       const char *field, int force);
+
 int cmd_add_index(const char *db_root, const char *object,
                          const char *field, int force) {
+    /* Parse the spec via the canonical helper so `name`, `name:btree`,
+       `name:bitmap[(N)]`, `name:trigram`, and composite `a+b` all funnel
+       through one grammar. Auto-promote bare bool/enum names to bitmap
+       (same rule as create-object + cmd_add_indexes). */
+    ParsedIndexSpec ps;
+    enum IndexType type = IT_BTREE;
+    uint32_t max_values = 0;
+    const char *eff = field;
+    if (parse_index_spec(field, &ps) == 0) {
+        type = ps.type;
+        max_values = ps.max_values;
+        eff = ps.name;
+        if (!ps.is_composite) {
+            TypedSchema *ts_chk = load_typed_schema(db_root, object);
+            if (ts_chk) {
+                int fi = typed_field_index(ts_chk, ps.name);
+                if (fi >= 0 && idx_should_auto_bitmap(ps.had_explicit_type,
+                                                     ts_chk->fields[fi].type)) {
+                    type = IT_BITMAP;
+                    if (ts_chk->fields[fi].type == FT_ENUM &&
+                        ts_chk->fields[fi].enum_width == 2 && max_values == 0)
+                        max_values = 65535;
+                }
+            }
+        }
+    }
+
+    /* Compose the canonical index.conf line for dedupe + write. */
+    char canon[300];
+    if (type == IT_BITMAP) {
+        if (max_values > 0)
+            snprintf(canon, sizeof(canon), "%s:bitmap(%u)", eff, max_values);
+        else
+            snprintf(canon, sizeof(canon), "%s:bitmap", eff);
+    } else if (type == IT_TRIGRAM) {
+        snprintf(canon, sizeof(canon), "%s:trigram", eff);
+    } else {
+        snprintf(canon, sizeof(canon), "%s", eff);
+    }
+
     Schema sch = load_schema(db_root, object);
-    int idx_n = index_splits_for(sch.splits);
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
+    /* Skip-if-exists: bitmap/trigram probe shard-0 of their respective
+       on-disk file (matches cmd_add_indexes); btree walks index.conf. */
     if (!force) {
-        FILE *cf = fopen(conf_path, "r");
-        if (cf) {
-            char line[256];
-            while (fgets(line, sizeof(line), cf)) {
-                line[strcspn(line, "\n")] = '\0';
-                if (strcmp(line, field) == 0) {
-                    OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
-                    fclose(cf); return 0;
-                }
+        if (type == IT_BITMAP || type == IT_TRIGRAM) {
+            char probe[PATH_MAX];
+            struct stat st;
+            if (type == IT_BITMAP)
+                bm_build_path(probe, sizeof(probe), db_root, object, eff, 0);
+            else
+                tg_build_path(probe, sizeof(probe), db_root, object, eff, 0);
+            if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+                OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
+                return 0;
             }
-            fclose(cf);
+        } else {
+            FILE *cf = fopen(conf_path, "r");
+            if (cf) {
+                char line[256];
+                while (fgets(line, sizeof(line), cf)) {
+                    line[strcspn(line, "\n")] = '\0';
+                    if (strcmp(line, canon) == 0) {
+                        OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
+                        fclose(cf); return 0;
+                    }
+                }
+                fclose(cf);
+            }
         }
     }
-    if (force) btree_idx_unlink_all(db_root, object, field, sch.splits);
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
-    IndexScanCtx ic;
-    memset(&ic, 0, sizeof(ic));
-    ic.field = field;
-    ic.ts = ts;
-    /* Pre-size from live_count to skip exponential doubling on big objects.
-       4096 floor for small / empty objects; 1 Gi cap so a corrupted count
-       can't request an absurd allocation. Scan cb's xrealloc fallback still
-       handles concurrent inserts that push past the estimate. */
-    {
-        int live = get_live_count(db_root, object);
-        if (live < 0) live = 0;
-        size_t initial = (size_t)live + 4096;
-        if (initial > (1ULL << 30)) initial = (1ULL << 30);
-        ic.pair_cap = initial;
-        ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
-        if (!ic.pairs) {
-            ic.pair_cap = 4096;
-            ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
-        }
-    }
-    ic.is_composite = (strchr(field, '+') != NULL);
-    pthread_mutex_init(&ic.lock, NULL);
-
-    if (ic.is_composite) {
-        char fbuf[256]; strncpy(fbuf, field, 255); fbuf[255] = '\0';
-        char *_t_save = NULL; char *t = strtok_r(fbuf, "+", &_t_save);
-        while (t && ic.field_index_count < 16) {
-            ic.field_indices[ic.field_index_count++] = typed_field_index(ts, t);
-            t = strtok_r(NULL, "+", &_t_save);
-        }
+    if (type == IT_BITMAP) {
+        build_bitmap_pass(db_root, object, &sch, ts, eff, max_values, force);
+    } else if (type == IT_TRIGRAM) {
+        build_trigram_pass(db_root, object, &sch, ts, eff, force);
     } else {
-        ic.field_indices[0] = typed_field_index(ts, field);
-        ic.field_index_count = 1;
-    }
+        /* === btree build (legacy path, now using parsed name) === */
+        if (force) btree_idx_unlink_all(db_root, object, eff, sch.splits);
+        int idx_n = index_splits_for(sch.splits);
 
-    /* Parallel shard scan — collects all (value, hash) pairs.
-       scan_dispatch routes v1 vs v2 (Phase 3B). */
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    scan_dispatch(db_root, object, &sch, data_dir, index_scan_cb, &ic);
-
-    /* Partition by idx_shard, then sort+build per shard in parallel. */
-    if (ic.pair_count > 0) {
-        size_t *offsets = NULL, *counts = NULL;
-        BtEntry *parted = partition_by_shard(ic.pairs, ic.pair_count,
-                                             sch.splits, idx_n,
-                                             &offsets, &counts);
-        if (parted) {
-            ShardBuildArg *sb = malloc((size_t)idx_n * sizeof(ShardBuildArg));
-            int sb_count = 0;
-            for (int s = 0; s < idx_n; s++) {
-                if (counts[s] == 0) continue;
-                build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
-                               db_root, object, field, s);
-                sb[sb_count].pairs = parted + offsets[s];
-                sb[sb_count].pair_count = counts[s];
-                sb_count++;
+        IndexScanCtx ic;
+        memset(&ic, 0, sizeof(ic));
+        ic.field = eff;
+        ic.ts = ts;
+        /* Pre-size from live_count to skip exponential doubling on big objects.
+           4096 floor for small / empty objects; 1 Gi cap so a corrupted count
+           can't request an absurd allocation. Scan cb's xrealloc fallback still
+           handles concurrent inserts that push past the estimate. */
+        {
+            int live = get_live_count(db_root, object);
+            if (live < 0) live = 0;
+            size_t initial = (size_t)live + 4096;
+            if (initial > (1ULL << 30)) initial = (1ULL << 30);
+            ic.pair_cap = initial;
+            ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
+            if (!ic.pairs) {
+                ic.pair_cap = 4096;
+                ic.pairs = malloc(ic.pair_cap * sizeof(BtEntry));
             }
-            parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
-            free(sb);
-            free(parted);
-            free(offsets);
-            free(counts);
         }
+        ic.is_composite = (strchr(eff, '+') != NULL);
+        pthread_mutex_init(&ic.lock, NULL);
+
+        if (ic.is_composite) {
+            char fbuf[256]; strncpy(fbuf, eff, 255); fbuf[255] = '\0';
+            char *_t_save = NULL; char *t = strtok_r(fbuf, "+", &_t_save);
+            while (t && ic.field_index_count < 16) {
+                ic.field_indices[ic.field_index_count++] = typed_field_index(ts, t);
+                t = strtok_r(NULL, "+", &_t_save);
+            }
+        } else {
+            ic.field_indices[0] = typed_field_index(ts, eff);
+            ic.field_index_count = 1;
+        }
+
+        /* Parallel shard scan — collects all (value, hash) pairs.
+           scan_dispatch routes v1 vs v2 (Phase 3B). */
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
+        scan_dispatch(db_root, object, &sch, data_dir, index_scan_cb, &ic);
+
+        /* Partition by idx_shard, then sort+build per shard in parallel. */
+        if (ic.pair_count > 0) {
+            size_t *offsets = NULL, *counts = NULL;
+            BtEntry *parted = partition_by_shard(ic.pairs, ic.pair_count,
+                                                 sch.splits, idx_n,
+                                                 &offsets, &counts);
+            if (parted) {
+                ShardBuildArg *sb = malloc((size_t)idx_n * sizeof(ShardBuildArg));
+                int sb_count = 0;
+                for (int s = 0; s < idx_n; s++) {
+                    if (counts[s] == 0) continue;
+                    build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
+                                   db_root, object, eff, s);
+                    sb[sb_count].pairs = parted + offsets[s];
+                    sb[sb_count].pair_count = counts[s];
+                    sb_count++;
+                }
+                parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
+                free(sb);
+                free(parted);
+                free(offsets);
+                free(counts);
+            }
+        }
+
+        for (size_t i = 0; i < ic.pair_count; i++) free((char *)ic.pairs[i].value);
+        free(ic.pairs);
+        pthread_mutex_destroy(&ic.lock);
     }
 
-    for (size_t i = 0; i < ic.pair_count; i++) free((char *)ic.pairs[i].value);
-    free(ic.pairs);
-    pthread_mutex_destroy(&ic.lock);
-
-    /* Add to index.conf */
+    /* Add canonical line to index.conf (idempotent). */
     mkdirp(dirname_of(conf_path));
     int already = 0;
     FILE *cf = fopen(conf_path, "r");
@@ -1182,13 +1253,13 @@ int cmd_add_index(const char *db_root, const char *object,
         char line[256];
         while (fgets(line, sizeof(line), cf)) {
             line[strcspn(line, "\n")] = '\0';
-            if (strcmp(line, field) == 0) { already = 1; break; }
+            if (strcmp(line, canon) == 0) { already = 1; break; }
         }
         fclose(cf);
     }
     if (!already) {
         FILE *af = fopen(conf_path, "a");
-        if (af) { fprintf(af, "%s\n", field); fclose(af); }
+        if (af) { fprintf(af, "%s\n", canon); fclose(af); }
     }
 
     invalidate_idx_cache(object);

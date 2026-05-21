@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* Locate trigram `needle` in `out[0..n)`. Returns 1 if found, 0 otherwise. */
 static int tg_in(const uint8_t (*out)[3], size_t n, const char *needle) {
@@ -460,6 +461,155 @@ static int run_planner_assertions(TestEnv *env) {
     return 0;
 }
 
+/* Singular add-index path. Pre-fix cmd_add_index was btree-only:
+   passing `field:trigram` via the CLI / JSON-singular form silently
+   appended a bogus literal to index.conf and wrote zero .tg files.
+   Tests exercise the typed dispatch for all three index kinds via
+   the singular `field:` JSON form. */
+static int run_singular_add_index_assertions(TestEnv *env) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return 1;
+
+    char *resp = NULL;
+
+    /* Create object with NO indexes; we'll add them one at a time
+       through the singular path. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"s\",\"object\":\"items\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"body:varchar:256\",\"category:varchar:32\","
+                    "\"active:bool\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "singular: create-object");
+    free(resp); resp = NULL;
+
+    /* Insert a few records so build passes have data to walk. */
+    for (int i = 0; i < 5; i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"s\",\"object\":\"items\","
+            "\"key\":\"k%d\",\"value\":{\"body\":\"the quick brown fox %d\","
+            "\"category\":\"animals\",\"active\":true}}", i, i);
+        tc_request(tc, req, &resp);
+        free(resp); resp = NULL;
+    }
+
+    /* === Singular path: trigram === */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"", "singular trigram: response");
+    ASSERT_CONTAINS(resp, "\"field\":\"body:trigram\"", "singular trigram: echoes spec");
+    free(resp); resp = NULL;
+
+    /* Probe shard-0 .tg actually exists (not just an index.conf line). */
+    {
+        char tg0[512];
+        snprintf(tg0, sizeof(tg0), "%s/s/items/indexes/body/000.tg", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(tg0, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0,
+                    "singular trigram: 000.tg materialised on disk");
+    }
+
+    /* Idempotent: second call returns "exists". */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"exists\"", "singular trigram: idempotent");
+    free(resp); resp = NULL;
+
+    /* Index actually used by contains (not full-scan): query must hit
+       the trigram path and find all 5 records containing "fox". */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"s\",\"object\":\"items\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"fox\"}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "5", "singular trigram: contains hits all 5");
+    free(resp); resp = NULL;
+
+    /* === Singular path: bitmap (explicit :bitmap on a varchar) === */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"category:bitmap\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"", "singular bitmap: response");
+    free(resp); resp = NULL;
+    {
+        char bm0[512];
+        snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/category/000.bm", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(bm0, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0,
+                    "singular bitmap: 000.bm materialised on disk");
+    }
+
+    /* === Singular path: bare bool. create-object auto-defaults bool to
+       bitmap (query.c:15677), so the .bm is already on disk and the
+       singular add-index correctly returns "exists" via the typed
+       skip-probe — proving the typed dispatch fires (pre-fix it would
+       have hit the btree branch and silently no-op'd). Force-rebuild
+       confirms the auto-promote rule runs on the same path. */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"active\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"exists\"",
+                    "singular bare bool: typed skip-probe sees existing .bm");
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"active\",\"force\":\"true\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"",
+                    "singular bare bool + force: auto-promotes + rebuilds");
+    free(resp); resp = NULL;
+    {
+        char bm0[512];
+        snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/active/000.bm", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(bm0, &st) == 0 && S_ISREG(st.st_mode),
+                    "singular bool: 000.bm present after rebuild");
+    }
+
+    /* === Singular path: plain btree (regression — must still work) === */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"", "singular btree: response");
+    free(resp); resp = NULL;
+    {
+        char idx0[512];
+        snprintf(idx0, sizeof(idx0), "%s/s/items/indexes/body/000.idx", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(idx0, &st) == 0 && S_ISREG(st.st_mode),
+                    "singular btree: 000.idx materialised alongside trigram");
+    }
+
+    /* index.conf reflects canonical forms — no bogus `body:trigram` line
+       as a plain field name; each line is the parsed-canonical form. */
+    {
+        char conf[512];
+        snprintf(conf, sizeof(conf), "%s/s/items/indexes/index.conf", env->db_root);
+        FILE *f = fopen(conf, "r");
+        ASSERT_TRUE(f != NULL, "singular: index.conf readable");
+        int saw_trigram = 0, saw_bitmap_cat = 0, saw_bitmap_active = 0, saw_btree_body = 0;
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = '\0';
+                if (strcmp(line, "body:trigram") == 0)      saw_trigram = 1;
+                if (strcmp(line, "category:bitmap") == 0)   saw_bitmap_cat = 1;
+                if (strcmp(line, "active:bitmap") == 0)     saw_bitmap_active = 1;
+                if (strcmp(line, "body") == 0)              saw_btree_body = 1;
+            }
+            fclose(f);
+        }
+        ASSERT_TRUE(saw_trigram,       "index.conf: body:trigram canonical line");
+        ASSERT_TRUE(saw_bitmap_cat,    "index.conf: category:bitmap canonical line");
+        ASSERT_TRUE(saw_bitmap_active, "index.conf: active:bitmap canonical line (auto-promoted)");
+        ASSERT_TRUE(saw_btree_body,    "index.conf: bare body btree line");
+    }
+
+    tc_close(tc);
+    return 0;
+}
+
 static int test_trigram_index_run(void) {
     /* Phase 1 unit assertions: pure helpers, no daemon. */
     if (run_unit_assertions() != 0) return 1;
@@ -470,6 +620,7 @@ static int test_trigram_index_run(void) {
     int rc = run_crud_assertions(&env);
     if (rc == 0) rc = run_reindex_assertions(&env);
     if (rc == 0) rc = run_planner_assertions(&env);
+    if (rc == 0) rc = run_singular_add_index_assertions(&env);
     test_env_stop(&env);
     return rc;
 }
