@@ -1,5 +1,6 @@
 #include "types.h"
 #include "tls.h"
+#include "connio.h"
 #include "slotcask.h"
 #include "bitmap.h"
 
@@ -2938,36 +2939,11 @@ static int client_connect(int port, ClientConn *c) {
 }
 
 static int client_send_all(ClientConn *c, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t w = 0;
-    while (w < len) {
-        int chunk = (int)((len - w) > 0x7FFFFFFF ? 0x7FFFFFFF : (len - w));
-        int n;
-        if (c->ssl) {
-            n = SSL_write(c->ssl, p + w, chunk);
-            if (n <= 0) return -1;
-        } else {
-            ssize_t r = write(c->fd, p + w, (size_t)chunk);
-            if (r < 0) { if (errno == EINTR) continue; return -1; }
-            if (r == 0) return -1;
-            n = (int)r;
-        }
-        w += (size_t)n;
-    }
-    return 0;
+    return connio_send_all(c->fd, c->ssl, buf, len);
 }
 
 static ssize_t client_recv(ClientConn *c, void *buf, size_t len) {
-    if (c->ssl) {
-        int chunk = (int)(len > 0x7FFFFFFF ? 0x7FFFFFFF : len);
-        int n = SSL_read(c->ssl, buf, chunk);
-        if (n > 0) return n;
-        int err = SSL_get_error(c->ssl, n);
-        if (err == SSL_ERROR_ZERO_RETURN) return 0;
-        if (err == SSL_ERROR_SYSCALL && n == 0) return 0;
-        return -1;
-    }
-    return read(c->fd, buf, len);
+    return connio_recv(c->fd, c->ssl, buf, len);
 }
 
 static void client_close(ClientConn *c) {
