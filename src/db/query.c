@@ -15876,13 +15876,8 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     case FT_UUID: {
         /* Same as decode_field_to_buf - canonical form */
         const uint8_t *b = (const uint8_t *)p;
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        return uuid_format_canonical(buf, bufsz, b);
     }
     case FT_ENUM: {
         /* Stored bytes are the byte index. Look up enum_values[idx]
@@ -16111,14 +16106,8 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         /* Index stores raw 16 bytes - decode to canonical form */
         if (plen < 16) return 0;
         const uint8_t *b = p;
-        /* Check if all zeros */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        return uuid_format_canonical(buf, bufsz, b);
     }
     case FT_NUMERIC: {
         if (plen < 8) return 0;

@@ -2487,16 +2487,14 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return snprintf(buf, buflen, "\"%02d:%02d:%02d\"", hh, mm, ss); /* "HH:MM:SS" */
     }
     case FT_UUID: {
-        /* Emit canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+        /* Emit JSON-quoted canonical form ("xxxxxxxx-...-xxxxxxxxxxxx").
+           All-zero bytes = unset; skip empty. */
         const uint8_t *b = data;
-        /* Check if all zeros - skip empty */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, buflen, "\"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\"",
-                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        if (buflen < 39) return 0; /* 36 hex + 2 quotes + NUL */
+        char inner[37];
+        uuid_format_canonical(inner, sizeof(inner), b);
+        return snprintf(buf, buflen, "\"%s\"", inner);
     }
     case FT_ENUM: {
         /* Stored bytes are the byte index (1 or 2 BE). Always emit
@@ -2672,15 +2670,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
     }
     case FT_UUID: {
         const uint8_t *b = data + f->offset;
-        /* Check if all zeros - skip empty */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return NULL;
+        if (uuid_is_zero(b)) return NULL;
         char *out = malloc(37);
-        snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        uuid_format_canonical(out, 37, b);
         return out;
     }
     default:
