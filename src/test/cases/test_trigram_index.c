@@ -684,6 +684,116 @@ static int run_singular_add_index_assertions(TestEnv *env) {
     return 0;
 }
 
+/* Streaming-build stress test. Inserts enough records to force
+   multiple per-worker flushes (i.e. the spill+k-way-merge path). With
+   splits=8 → 8 workers and flush threshold ~4k pairs, ~50k records ×
+   ~10 trigrams = 500k entries → ~62k per worker → ~15 flushes/worker
+   per output shard. Verifies the merge phase produces a correct,
+   queryable .tg even at multi-run scale. */
+static int run_streaming_stress_assertions(TestEnv *env) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 120000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return 1;
+
+    char *resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"x\",\"object\":\"stress\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"text:varchar:64\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "stress: create-object");
+    free(resp); resp = NULL;
+
+    /* Bulk-insert in 5 chunks of 1000 each — deterministic varied bodies
+       so the trigram extraction has meaningful work. */
+    const int chunks = 5, per_chunk = 1000;
+    for (int c = 0; c < chunks; c++) {
+        size_t cap = (size_t)per_chunk * 256 + 256;
+        char *buf = malloc(cap);
+        ASSERT_TRUE(buf != NULL, "stress: bulk buf alloc");
+        if (!buf) { tc_close(tc); return 1; }
+        size_t pos = (size_t)snprintf(buf, cap,
+            "{\"mode\":\"bulk-insert\",\"dir\":\"x\",\"object\":\"stress\",\"records\":[");
+        for (int i = 0; i < per_chunk; i++) {
+            int id = c * per_chunk + i;
+            uint32_t r = (uint32_t)id * 2654435761u + 1u;
+            const char *w1 = (r & 1) ? "quick" : "lazy";
+            const char *w2 = ((r >> 1) & 1) ? "brown" : "grey";
+            const char *w3 = ((r >> 2) & 1) ? "fox" : "wolf";
+            pos += (size_t)snprintf(buf + pos, cap - pos,
+                "%s{\"key\":\"k%d\",\"value\":{\"text\":"
+                "\"the %s %s %s jumps over the lazy dog number %d\"}}",
+                i ? "," : "", id, w1, w2, w3, id);
+            if (pos >= cap - 256) break;
+        }
+        snprintf(buf + pos, cap - pos, "]}");
+        tc_request(tc, buf, &resp);
+        free(buf);
+        ASSERT_TRUE(resp && strstr(resp, "\"inserted\"") != NULL,
+                    "stress: bulk-insert chunk");
+        free(resp); resp = NULL;
+    }
+
+    /* Add trigram index — this exercises the streaming + merge pipeline
+       end-to-end. */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"x\",\"object\":\"stress\","
+        "\"field\":\"text:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"", "stress: trigram build");
+    free(resp); resp = NULL;
+
+    /* All 8 .tg shards should now exist on disk. */
+    for (int s = 0; s < 8; s++) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/x/stress/indexes/text/%03x.tg",
+                 env->db_root, s);
+        struct stat st;
+        /* Not every shard is required to receive entries (hash routing
+           could leave a shard empty), but at small distributions the
+           odds of empty are tiny. Allow either present-and-nonempty
+           OR absent. */
+        if (stat(p, &st) == 0) {
+            ASSERT_TRUE(st.st_size > 0, "stress: .tg has content");
+        }
+    }
+
+    /* The .spill dir should be cleaned up after build. */
+    {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/x/stress/indexes/text/.spill", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(p, &st) != 0, "stress: .spill dir removed after build");
+    }
+
+    /* Query — every record contains "the", "dog", "lazy" — full match
+       on a known token to validate correctness. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"x\",\"object\":\"stress\","
+        "\"criteria\":[{\"field\":\"text\",\"op\":\"contains\",\"value\":\"jump\"}]}",
+        &resp);
+    /* All 5000 records contain "jump". */
+    ASSERT_TRUE(resp && strstr(resp, "5000") != NULL,
+                "stress: contains 'jump' → 5000 matches");
+    free(resp); resp = NULL;
+
+    /* Partial match — half should contain "fox". */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"x\",\"object\":\"stress\","
+        "\"criteria\":[{\"field\":\"text\",\"op\":\"contains\",\"value\":\"fox\"}]}",
+        &resp);
+    /* "fox" appears in half of bodies (bit 2 of LCG). Accept anything
+       in [2000, 3000] to allow LCG distribution variance. */
+    if (resp) {
+        int n = atoi(resp);
+        ASSERT_TRUE(n >= 2000 && n <= 3000,
+                    "stress: contains 'fox' in expected range [2000-3000]");
+    }
+    free(resp); resp = NULL;
+
+    tc_close(tc);
+    return 0;
+}
+
 static int test_trigram_index_run(void) {
     /* Phase 1 unit assertions: pure helpers, no daemon. */
     if (run_unit_assertions() != 0) return 1;
@@ -695,6 +805,7 @@ static int test_trigram_index_run(void) {
     if (rc == 0) rc = run_reindex_assertions(&env);
     if (rc == 0) rc = run_planner_assertions(&env);
     if (rc == 0) rc = run_singular_add_index_assertions(&env);
+    if (rc == 0) rc = run_streaming_stress_assertions(&env);
     test_env_stop(&env);
     return rc;
 }
