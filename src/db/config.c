@@ -2221,29 +2221,54 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
 }
 
 /* Helper: render an actionable "unknown enum value" error message into
-   err_buf. Truncates the legal-values list at ~150 chars so the message
-   stays readable even for large enums. Used by typed_encode_defaults
-   (insert/update path). */
+   err_buf. Truncates the legal-values list cleanly when there's no room
+   left, keeping the message readable for large enums.
+
+   CodeQL #91 ("potentially overflowing call to snprintf"): the previous
+   implementation accumulated snprintf's *would-have-written* return
+   value into `pos`, then passed `err_buf_size - pos` as the next call's
+   remaining-size. If snprintf returned a value larger than the actual
+   space, `pos` walked past `err_buf_size` and the next subtraction
+   underflowed (size_t), letting subsequent snprintf calls write
+   unbounded. Fixed by clamping the running offset after every snprintf
+   so it never exceeds err_buf_size − 1 (the NUL terminator slot). */
 static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
                                   size_t bad_len, char *err_buf, size_t err_buf_size) {
     if (!err_buf || err_buf_size == 0) return;
-    int pos = snprintf(err_buf, err_buf_size,
-                       "unknown enum value \"%.*s\" for field [%s]; legal: [",
-                       (int)bad_len, bad_val, f->name);
-    if (pos < 0 || (size_t)pos >= err_buf_size) { err_buf[err_buf_size - 1] = '\0'; return; }
-    size_t budget = err_buf_size - (size_t)pos - 4;  /* room for "...]" */
+    err_buf[0] = '\0';
+
+    #define APPEND(...) do {                                         \
+        if (pos + 1 >= err_buf_size) break;                          \
+        int _n = snprintf(err_buf + pos, err_buf_size - pos,         \
+                          __VA_ARGS__);                              \
+        if (_n < 0) { err_buf[pos] = '\0'; break; }                  \
+        if ((size_t)_n >= err_buf_size - pos) {                      \
+            pos = err_buf_size - 1; /* clamped + NUL-terminated */   \
+            err_buf[pos] = '\0';                                     \
+            break;                                                   \
+        }                                                            \
+        pos += (size_t)_n;                                           \
+    } while (0)
+
+    size_t pos = 0;
+    APPEND("unknown enum value \"%.*s\" for field [%s]; legal: [",
+           (int)bad_len, bad_val, f->name);
+
     for (int i = 0; i < f->n_enum_values; i++) {
         const char *v = f->enum_values[i];
         if (!v) continue;
         size_t vl = strlen(v);
-        if ((size_t)pos + vl + 3 >= budget) {
-            pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos, "...");
+        /* Reserve 5 bytes for ",..." + "]" + NUL so the truncation
+           marker always fits, even if we have to bail mid-loop. */
+        if (pos + vl + 5 >= err_buf_size) {
+            APPEND("...");
             break;
         }
-        pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos,
-                        "%s%s", i ? "," : "", v);
+        APPEND("%s%s", i ? "," : "", v);
     }
-    snprintf(err_buf + pos, err_buf_size - (size_t)pos, "]");
+    APPEND("]");
+
+    #undef APPEND
 }
 
 /* Encode with field defaults applied. db_root+object needed for seq() defaults;
