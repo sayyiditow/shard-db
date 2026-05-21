@@ -1426,6 +1426,92 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     return 0;
 }
 
+/* Trigram reindex — walk every record of the object, extract distinct
+   trigrams from the varchar field, and write one (trigram, hash) leaf
+   entry per (trigram, record). Mirrors build_bitmap_pass shape but
+   targets .tg btree files instead of .bm. Force=1 wipes existing .tg
+   shards first; force=0 leaves them and falls back to incremental
+   insert (caller already gates on this).
+
+   Routing by record xxh128 (same as btree on the same field) means
+   each .tg shard receives only the records that hashed to it, so the
+   per-shard btree_insert call sequence is contiguous and the
+   prefix-compressed leaves stay tight. */
+typedef struct {
+    const char  *db_root;
+    const char  *object;
+    int          splits;
+    const char  *field;
+    int          field_index;     /* typed schema field index */
+    TypedSchema *ts;
+} TgRebuildCtx;
+
+static int tg_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
+                         const void *key, size_t klen,
+                         const void *value, size_t vlen,
+                         void *ctx) {
+    (void)slot; (void)key; (void)klen; (void)vlen;
+    TgRebuildCtx *c = (TgRebuildCtx *)ctx;
+    if (c->field_index < 0) return 0;
+    const TypedField *f = &c->ts->fields[c->field_index];
+    if (f->type != FT_VARCHAR) return 0;  /* validated at create-object; defensive */
+
+    /* Strip the 2-byte varchar length prefix the same way bm_rebuild_cb
+       does — those bytes are the storage encoding, not the raw value. */
+    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+    if (actual_len == 0) return 0;
+
+    uint8_t trigrams[TG_MAX_DISTINCT][3];
+    size_t n = tg_extract_distinct(vbase + 2, actual_len, trigrams, TG_MAX_DISTINCT);
+    for (size_t i = 0; i < n; i++) {
+        tg_idx_insert(c->db_root, c->object, c->field, c->splits,
+                      trigrams[i], hash16);
+    }
+    return 0;
+}
+
+int build_trigram_pass(const char *db_root, const char *object,
+                       const Schema *sch, TypedSchema *ts,
+                       const char *field, int force);
+int build_trigram_pass(const char *db_root, const char *object,
+                       const Schema *sch, TypedSchema *ts,
+                       const char *field, int force) {
+    if (!ts) return -1;
+    int fi = typed_field_index(ts, field);
+    if (fi < 0) return -1;
+
+    /* Unlink existing .tg shards when forced (same skip-if-exists
+       semantics btree's cmd_add_indexes uses). bt_cache is path-keyed,
+       so unlink + immediate recreate is safe — any cached handle on
+       the old inode dies on next bt_acquire (the inode mismatch
+       triggers a reopen). */
+    int idx_n = index_splits_for(sch->splits);
+    if (force) {
+        for (int s = 0; s < idx_n; s++) {
+            char tp[PATH_MAX];
+            tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+            unlink(tp);
+        }
+    }
+
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return -1;
+
+    TgRebuildCtx c = {
+        .db_root = db_root, .object = object, .splits = sch->splits,
+        .field = field, .field_index = fi, .ts = ts,
+    };
+    for (int s = 0; s < sch->splits; s++) {
+        slotcask_walk_one_shard_slots(sdb, s, tg_rebuild_cb, &c);
+    }
+    return 0;
+}
+
 int build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
                       const char *field, uint32_t max_values, int force) {
@@ -1646,10 +1732,9 @@ int cmd_add_indexes(const char *db_root, const char *object,
                           const Schema *sch, TypedSchema *ts,
                           const char *field, uint32_t max_values, int force);
 
-    /* Bitmap-typed fields follow the same skip-if-exists semantic as
-       btree: with force, wipe + rebuild; without force, no-op when any
-       .bm shard already exists for the field. Trigram lands in a
-       future phase — silently skip for now. */
+    /* Bitmap- and trigram-typed fields follow the same skip-if-exists
+       semantic as btree: with force, wipe + rebuild; without force,
+       no-op when any shard file already exists for the field. */
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
     for (int i = 0; i < nfields; i++) {
@@ -1668,6 +1753,17 @@ int cmd_add_indexes(const char *db_root, const char *object,
             continue;
         }
         if (types[i] == IT_TRIGRAM) {
+            if (!force) {
+                /* Probe shard 0's .tg — same skip-if-exists rule the
+                   btree and bitmap branches use. */
+                char probe[PATH_MAX];
+                tg_build_path(probe, sizeof(probe), db_root, object, names[i], 0);
+                struct stat st;
+                if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
+            }
+            build_trigram_pass(db_root, object, &sch,
+                               load_typed_schema(db_root, object),
+                               names[i], force);
             continue;
         }
         memcpy(btree_fields[btree_count], names[i], 256);
