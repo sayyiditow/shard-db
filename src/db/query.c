@@ -11928,6 +11928,14 @@ static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
    drops inserts when the table fills, which used to truncate common-
    prefix trigrams ("ali", "the", ...) to 8192 hashes and produce wrong
    intersections downstream. */
+/* Per-shard count cap. Counts above this are clamped to "≥ cap" — we
+   only need approximate counts to order trigrams rarest-first, not
+   exact ones. Walking every entry of a common trigram (could be
+   500k+) just to count it was paying full I/O twice (count + collect),
+   regressing common-substring queries from 160ms → 1200ms. With
+   capped counts: ~24 ms walk overhead regardless of posting size. */
+#define TG_COUNT_CAP_PER_SHARD 10000
+
 typedef struct {
     size_t         count;
     QueryDeadline *dl;
@@ -11940,6 +11948,7 @@ static int tg_count_cb(const char *value, size_t vlen,
     TgCountCtx *c = (TgCountCtx *)ctx;
     if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
     c->count++;
+    if (c->count >= TG_COUNT_CAP_PER_SHARD) return 1;  /* early-exit */
     return 0;
 }
 
