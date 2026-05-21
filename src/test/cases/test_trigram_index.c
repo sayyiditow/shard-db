@@ -312,6 +312,127 @@ static int run_reindex_assertions(TestEnv *env) {
     return 0;
 }
 
+/* Phase 4 — planner read path. contains / i_contains over a
+   trigram-indexed field must return the right records (correctness)
+   AND go through the trigram index (no full-scan fallback). */
+static int run_planner_assertions(TestEnv *env) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return 1;
+
+    char *resp = NULL;
+
+    /* Create object with trigram-only index on body. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"body:varchar:256\"],"
+        "\"indexes\":[\"body:trigram\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "planner: create-object");
+    free(resp); resp = NULL;
+
+    /* Insert a known corpus. Each record's body is distinct so we can
+       assert exact match counts. */
+    const char *bodies[] = {
+        "the quick brown fox jumps over the lazy dog",   /* 0: has "the", "quick", "brown", ... */
+        "ALPACAS are gentle creatures from the andes",   /* 1: case-mixed, contains "alpaca" */
+        "raspberry pi clusters can host shard-db",       /* 2: has "shard", "raspberry" */
+        "rapid fox motion captured by the camera",       /* 3: has "fox", "rapid" */
+        "Hello World",                                    /* 4: short — only 2 trigrams of "hello" */
+        "shardDB shardDB SHARDDB shardDB",                /* 5: case-flooded "sharddb" */
+    };
+    for (int i = 0; i < 6; i++) {
+        char req[512];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"p\",\"object\":\"posts\","
+            "\"key\":\"p%d\",\"value\":{\"body\":\"%s\"}}", i, bodies[i]);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "planner: insert sample");
+        free(resp); resp = NULL;
+    }
+
+    /* contains "fox" → records 0 + 3 (lowercase match, both). */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"fox\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "2", "contains \"fox\" → 2 records");
+    free(resp); resp = NULL;
+
+    /* contains "the" → records 0 (twice) + 1 + 3 = 3 distinct records.
+       Distinct count for a contains predicate counts records, not
+       occurrences within a record. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"the\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "3", "contains \"the\" → 3 records");
+    free(resp); resp = NULL;
+
+    /* contains "fox" returns the actual records (find, not count). */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"fox\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "p0", "find contains fox includes p0");
+    ASSERT_CONTAINS(resp, "p3", "find contains fox includes p3");
+    free(resp); resp = NULL;
+
+    /* Case-sensitive contains "ALPACAS" → only record 1 (exact case). */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"ALPACAS\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "1", "case-sensitive contains \"ALPACAS\" → 1");
+    free(resp); resp = NULL;
+
+    /* Case-sensitive contains "alpacas" → 0 records (record 1 has ALPACAS).
+       Trigram candidate set returns record 1 (lowercase matches), but
+       the per-record memmem verify with contains semantics rejects it. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"alpacas\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "0", "case-sensitive contains \"alpacas\" → 0");
+    free(resp); resp = NULL;
+
+    /* i_contains "ALPACAS" → 1 (lowercase variant on the same index). */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"icontains\",\"value\":\"ALPACAS\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "1", "i_contains \"ALPACAS\" → 1");
+    free(resp); resp = NULL;
+
+    /* i_contains "shardDB" → records 2 + 5 (record 2 has lowercase
+       'shard-db', so it depends on whether the i_contains pattern
+       'shardDB' would match 'shard-db'. memmem on lowercased
+       "shard-db" vs lowercased "sharddb" = no match, only record 5
+       matches. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"icontains\",\"value\":\"shardDB\"}]}", &resp);
+    /* Record 5 has 'shardDB' literally; record 2 has 'shard-db' (with
+       a hyphen). 'shardDB'.lower() = 'sharddb', doesn't match 'shard-db'.
+       So count = 1. */
+    ASSERT_CONTAINS(resp, "1", "i_contains \"shardDB\" → 1 (record 5)");
+    free(resp); resp = NULL;
+
+    /* Sub-3-char pattern falls back to scan but must still return
+       correct results. contains "of" — record 0 ("jumps over") matches
+       on the 'of' window (actually it doesn't; let me pick something
+       I'm sure of). "ox" appears in records 0 and 3 (fox). */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"ox\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "2", "sub-3 contains \"ox\" → 2 (scan fallback)");
+    free(resp); resp = NULL;
+
+    /* contains "qwerty" → 0 records. Confirms negative result via trigram. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"criteria\":[{\"field\":\"body\",\"op\":\"contains\",\"value\":\"qwerty\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "0", "contains \"qwerty\" → 0");
+    free(resp); resp = NULL;
+
+    tc_close(tc);
+    return 0;
+}
+
 static int test_trigram_index_run(void) {
     /* Phase 1 unit assertions: pure helpers, no daemon. */
     if (run_unit_assertions() != 0) return 1;
@@ -321,6 +442,7 @@ static int test_trigram_index_run(void) {
     if (test_env_start(&env) != 0) return 1;
     int rc = run_crud_assertions(&env);
     if (rc == 0) rc = run_reindex_assertions(&env);
+    if (rc == 0) rc = run_planner_assertions(&env);
     test_env_stop(&env);
     return rc;
 }

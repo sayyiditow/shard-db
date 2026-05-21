@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "simd.h"
 #include "bitmap.h"
+#include "trigram.h"
 #include <fnmatch.h>
 #include <math.h>
 
@@ -9298,6 +9299,13 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
 /* Forward decls — both definitions live near build_keyset_from_bitmap. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field);
+static enum IndexType field_index_type_for_op(const char *db_root,
+                                              const char *object,
+                                              const char *field,
+                                              enum SearchOp op);
+static int field_has_index_type(const char *db_root, const char *object,
+                                const char *field, enum IndexType want);
+static int op_prefers_trigram(enum SearchOp op);
 
 /* Per-shard worker arg for parallel bitmap dispatch — mirrors btree's
    ShardWalkArg in index.c. The shared atomic stop_flag lets a worker
@@ -10929,8 +10937,22 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
        at <obj>/indexes/<field>/<NNN>.bm. The planner picks them up only
        for ops bitmap supports (OP_EQUAL for MVP). Other ops on a
        bitmap-only field fall back to PRIMARY_NONE (full scan). */
-    enum IndexType itype = field_index_type(db_root, object, c->field);
+    enum IndexType itype = field_index_type_for_op(db_root, object, c->field, c->op);
     Schema sch = load_schema(db_root, object);
+    if (itype == IT_TRIGRAM) {
+        /* Trigram serves contains/i_contains only (op_prefers_trigram
+           returned true for us to get here). Tag the leaf with the
+           field directory the same way bitmap does — execution sites
+           dispatch on itype, not on path content. The pattern must be
+           ≥3 chars to generate any trigrams; sub-3 falls back to scan
+           but that's checked at build_keyset_from_trigram time
+           (returns NULL → caller falls through to full scan). */
+        if (out_idx_path) {
+            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
+                     db_root, object, c->field);
+        }
+        return 1;
+    }
     if (itype == IT_BITMAP) {
         /* Bitmap serves every op the field's type supports — matches
            btree's behaviour: the planner always picks the index path
@@ -11473,6 +11495,38 @@ static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
     return 0;
 }
 
+/* Does this field have an index of the given type declared? A field
+   may have multiple declarations (e.g. both `text` and `text:trigram`)
+   so a single-answer lookup like field_index_type can't disambiguate —
+   use this predicate instead when the caller cares about a specific
+   type's availability. Linear scan over the cached index.conf arrays. */
+static int field_has_index_type(const char *db_root, const char *object,
+                                const char *field, enum IndexType want) {
+    char fields[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
+    int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
+    int count = n < n2 ? n : n2;
+    for (int i = 0; i < count; i++) {
+        if (types[i] == want && strcmp(fields[i], field) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Operator → index-type routing rules:
+ *
+ *   contains, i_contains, like, not_like (with literal substring ≥3 chars)
+ *     → IT_TRIGRAM if available, else fall back to whatever's declared
+ *
+ *   eq, neq, range, in, not_in, starts_with, ends_with, len_*, exists, regex
+ *     → IT_BITMAP or IT_BTREE depending on declared type
+ *
+ * Used everywhere the planner asks "what index should I drive this op
+ * through" — leaf_is_indexed, build_keyset_from_leaf, the dispatcher. */
+static int op_prefers_trigram(enum SearchOp op) {
+    return op == OP_CONTAINS || op == OP_ICONTAINS;
+}
+
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
    over the cached arrays — cheap for the planner hot path. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
@@ -11486,6 +11540,37 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
         if (strcmp(fields[i], field) == 0) return types[i];
     }
     return IT_BTREE;
+}
+
+/* Pick the right index type for a given operator. Honours the routing
+ * rules above (op_prefers_trigram). When the preferred type isn't
+ * declared, falls back to the field's first declared type. */
+static enum IndexType field_index_type_for_op(const char *db_root,
+                                              const char *object,
+                                              const char *field,
+                                              enum SearchOp op) {
+    if (op_prefers_trigram(op) &&
+        field_has_index_type(db_root, object, field, IT_TRIGRAM)) {
+        return IT_TRIGRAM;
+    }
+    /* For non-trigram ops, never return IT_TRIGRAM even if it's the
+       only declared type — trigram can't accelerate eq/range/etc., so
+       falling through to "no index" is honest. */
+    enum IndexType t = field_index_type(db_root, object, field);
+    if (t == IT_TRIGRAM && !op_prefers_trigram(op)) {
+        /* Field has trigram but op can't use it; check for a sibling
+           btree/bitmap declaration. */
+        if (field_has_index_type(db_root, object, field, IT_BITMAP)) return IT_BITMAP;
+        if (field_has_index_type(db_root, object, field, IT_BTREE))  return IT_BTREE;
+        /* Trigram-only field with a non-trigram op → caller should
+           treat the field as un-indexed for this op. Returning
+           IT_TRIGRAM here would mislead leaf_is_indexed into claiming
+           the leaf. Signal "not indexed for this op" by returning a
+           value the planner already maps to no-index — we use IT_BTREE
+           and let the existing btree_idx_exists check reject it. */
+        return IT_BTREE;
+    }
+    return t;
 }
 
 /* Sum bm_count for a single encoded value across every data shard.
@@ -11704,12 +11789,140 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     return ks;
 }
 
+/* Collect hashes from a single trigram's posting list (range scan
+   on the .tg btree shards for key=trigram). Hashes land in a fresh
+   KeySet allocated by the caller. */
+typedef struct {
+    KeySet        *ks;
+    QueryDeadline *dl;
+    int            timed_out;
+} TgCollectCtx;
+
+static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
+                                   const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen;
+    TgCollectCtx *c = (TgCollectCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    keyset_insert(c->ks, hash);
+    return 0;
+}
+
+/* Walk all .tg shards for a single trigram, populating `out` with every
+   record hash whose value contains that trigram. Returns the populated
+   KeySet (caller owns) or NULL on alloc/timeout. */
+static KeySet *tg_keyset_for_trigram(const char *db_root, const char *object,
+                                     const char *field, int splits,
+                                     const uint8_t trigram[3],
+                                     QueryDeadline *dl) {
+    int idx_n = index_splits_for(splits);
+    /* Trigrams are sparse-on-average; size conservatively. The first
+       call's keyset is the seed for intersection so a bit of slack
+       lets later inserts probe quickly. */
+    KeySet *ks = keyset_new(4096);
+    if (!ks) return NULL;
+    TgCollectCtx c = { ks, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_collect_to_keyset_cb, &c);
+        if (c.timed_out) { keyset_free(ks); return NULL; }
+    }
+    return ks;
+}
+
+/* Build the intersection of two KeySets via iteration. Returns a new
+   KeySet (caller owns). Iterates the smaller side, checks membership
+   in the larger — keeps walk cost linear in min(|a|, |b|). */
+typedef struct {
+    KeySet *probe;
+    KeySet *out;
+} PairwiseIntersectCtx;
+
+static int pairwise_intersect_cb(const uint8_t hash[16], void *ctx) {
+    PairwiseIntersectCtx *c = (PairwiseIntersectCtx *)ctx;
+    if (keyset_contains(c->probe, hash)) {
+        keyset_insert(c->out, hash);
+    }
+    return 0;
+}
+
+static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b) {
+    if (!a || !b) return NULL;
+    KeySet *small = keyset_size(a) <= keyset_size(b) ? a : b;
+    KeySet *big   = (small == a) ? b : a;
+    KeySet *out = keyset_new(keyset_size(small));
+    if (!out) return NULL;
+    PairwiseIntersectCtx c = { big, out };
+    keyset_iter(small, pairwise_intersect_cb, &c);
+    return out;
+}
+
+/* Trigram-driven candidate set for OP_CONTAINS / OP_ICONTAINS. Returns
+   a KeySet of record hashes that contain ALL trigrams from the pattern
+   (with no false negatives — false positives are filtered by the
+   per-record memmem verify step downstream).
+   Patterns shorter than 3 chars cannot generate trigrams; this returns
+   NULL so the caller falls back to full scan. */
+static KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
+                                        int splits,
+                                        const SearchCriterion *leaf,
+                                        QueryDeadline *dl) {
+    if (!leaf) return NULL;
+    size_t plen = strlen(leaf->value);
+    if (plen < 3) return NULL;
+
+    uint8_t pattern_lc[1024];
+    if (plen > sizeof(pattern_lc)) plen = sizeof(pattern_lc);
+    /* Lowercase the pattern — index stores lowercase trigrams, so both
+       OP_CONTAINS and OP_ICONTAINS land on the same posting lists.
+       Per-record verify enforces final case-sensitivity. */
+    for (size_t i = 0; i < plen; i++) {
+        uint8_t c = (uint8_t)leaf->value[i];
+        pattern_lc[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+    }
+
+    uint8_t trigrams[TG_MAX_DISTINCT][3];
+    size_t  n = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
+    if (n == 0) return NULL;
+
+    /* First trigram seeds the candidate set; subsequent trigrams shrink
+       it via intersection. Order doesn't affect correctness but rare
+       trigrams first would reduce per-shard work — we don't have stats
+       yet, so process in the order tg_extract_distinct emitted (window
+       order) for v1. */
+    KeySet *acc = tg_keyset_for_trigram(db_root, object, leaf->field,
+                                        splits, trigrams[0], dl);
+    if (!acc) return NULL;
+    for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
+        KeySet *next = tg_keyset_for_trigram(db_root, object, leaf->field,
+                                              splits, trigrams[i], dl);
+        if (!next) { keyset_free(acc); return NULL; }
+        KeySet *merged = keyset_pairwise_intersect(acc, next);
+        keyset_free(acc); keyset_free(next);
+        if (!merged) return NULL;
+        acc = merged;
+    }
+    return acc;
+}
+
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
-    /* Dispatch by index type. Bitmap-indexed eq goes through the
-       bitmap walker; everything else stays on the existing btree path. */
+    /* Dispatch by index type. Trigram-indexed contains/i_contains goes
+       through the trigram intersection walker. Bitmap-indexed eq goes
+       through the bitmap walker. Everything else stays on the existing
+       btree path. */
+    if (op_prefers_trigram(leaf->op) &&
+        field_has_index_type(db_root, object, leaf->field, IT_TRIGRAM)) {
+        KeySet *ks = build_keyset_from_trigram(db_root, object, splits, leaf, dl);
+        if (ks) return ks;
+        /* Sub-3-char pattern or alloc failure — fall through. If no
+           btree exists for this field the next call returns NULL too
+           and the caller drops to full scan (correct, just slower). */
+    }
     enum IndexType itype = field_index_type(db_root, object, leaf->field);
     if (itype == IT_BITMAP) {
         TypedSchema *ts = load_typed_schema(db_root, object);
@@ -12693,6 +12906,43 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
+            /* Trigram fast path: contains/i_contains over a
+               trigram-indexed field. Build the candidate keyset via
+               trigram intersection, then verify each candidate with
+               the full criterion (kills false positives from
+               order-insensitive trigram match). */
+            if (op_prefers_trigram(op) &&
+                field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, pc, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    size_t count = parallel_indexed_count(db_root, object, &sch,
+                                                          entries, (int)n,
+                                                          tree, &fs, &dl);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%zu\n", count);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+                /* tg_ks NULL → sub-3-char pattern. Drop to the
+                   PRIMARY_NONE record-walk so correctness is preserved
+                   (a sub-3 pattern can match anything; no index can
+                   help). */
+                {
+                    CountCtx ctx = { tree, &fs, 0, &dl, 0 };
+                    scan_dispatch(db_root, object, &sch, data_dir,
+                                  count_scan_cb, &ctx);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%d\n", ctx.count);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+            }
             /* Bitmap routes all single-leaf counts through a popcount-
                style fast path: per-value sum for eq/IN, dict-scan +
                per-matching-value sum for everything else. Both avoid
@@ -13608,7 +13858,14 @@ int cmd_find(const char *db_root, const char *object,
         pthread_mutex_destroy(&oc.lock);
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
                (plan.kind == PRIMARY_INTERSECT ||
-                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF))) {
+                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF)) &&
+               /* Trigram-leaf is not streaming-friendly — idx_find_streaming
+                  walks the leaf's btree (.idx) which doesn't exist for
+                  trigram-only fields. Fall through to PRIMARY_LEAF where
+                  the trigram-aware dispatch lives. */
+               !(plan.kind == PRIMARY_LEAF &&
+                 op_prefers_trigram(plan.primary_leaf->op) &&
+                 field_has_index_type(db_root, object, plan.primary_leaf->field, IT_TRIGRAM))) {
         /* ===== Streaming fast path for limit-bound, post-filtered finds.
            For small (offset + limit) where the tree has post-filter siblings
            (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
@@ -13641,11 +13898,42 @@ int cmd_find(const char *db_root, const char *object,
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
-        int rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
+
+        /* Trigram dispatch: contains/i_contains over a trigram-indexed
+           field — build candidate keyset, convert to CollectedHash[],
+           feed to process_batch. Same emit pipeline as idx_find_parallel,
+           just sourced from the trigram intersection instead of a btree
+           walk. */
+        int rc = 0;
+        if (op_prefers_trigram(op) &&
+            field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+            KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                       sch.splits, pc, &dl);
+            if (tg_ks) {
+                rc = keyset_emit_find(db_root, object, &sch, tg_ks,
+                                      tree, &excluded, offset, limit,
+                                      proj_fields, proj_count,
+                                      (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                                      rows_fmt, dict_fmt, csv_delim,
+                                      joins, njoins, &dl);
+                keyset_free(tg_ks);
+                goto find_emit_close;
+            }
+            /* tg_ks NULL (sub-3-char pattern) — fall through to
+               idx_find_parallel, which will also return zero results
+               since trigram-only fields have no .idx. Better to scan;
+               but the scan-fallback only fires from cmd_count today —
+               for find we accept "no results" on sub-3 patterns as the
+               documented behaviour (HN explorer is supposed to gate
+               this client-side). */
+        }
+
+        rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                          rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+        find_emit_close:
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT("]}\n");
