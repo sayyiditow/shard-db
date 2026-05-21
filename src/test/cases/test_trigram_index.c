@@ -606,6 +606,80 @@ static int run_singular_add_index_assertions(TestEnv *env) {
         ASSERT_TRUE(saw_btree_body,    "index.conf: bare body btree line");
     }
 
+    /* === Singular remove-index by type ===
+       Pre-fix cmd_remove_index always called btree_idx_unlink_all
+       regardless of the matched line's type, leaving .bm / .tg files
+       orphaned. Verify each kind cleans up the right files. */
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"removed\"", "remove trigram: response");
+    free(resp); resp = NULL;
+    {
+        char tg0[512];
+        snprintf(tg0, sizeof(tg0), "%s/s/items/indexes/body/000.tg", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(tg0, &st) != 0, "remove trigram: 000.tg unlinked");
+    }
+
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"category:bitmap\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"removed\"", "remove bitmap: response");
+    free(resp); resp = NULL;
+    {
+        char bm0[512];
+        snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/category/000.bm", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(bm0, &st) != 0, "remove bitmap: 000.bm unlinked");
+    }
+
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"removed\"", "remove btree: response");
+    free(resp); resp = NULL;
+    {
+        char idx0[512];
+        snprintf(idx0, sizeof(idx0), "%s/s/items/indexes/body/000.idx", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(idx0, &st) != 0, "remove btree: 000.idx unlinked");
+    }
+
+    /* Idempotent: removing a removed index returns not_indexed, not error. */
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"field\":\"body:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"not_indexed\"",
+                    "remove trigram (already gone): idempotent not_indexed");
+    free(resp); resp = NULL;
+
+    /* === Plural remove-index by type ===
+       Re-add bitmap + trigram, then remove both in one call via the
+       plural fields:[] form. Verifies cmd_remove_indexes also dispatches
+       by type. */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"fields\":[\"body:trigram\",\"category:bitmap\"]}", &resp);
+    /* All-typed plural returns {"status":"ok"} (no btree fields to
+       count); the index.conf write fix means the canonical lines do
+       land — verified by the remove-and-unlinked assertions below. */
+    ASSERT_CONTAINS(resp, "\"status\":\"ok\"", "plural re-add: setup");
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"s\",\"object\":\"items\","
+        "\"fields\":[\"body:trigram\",\"category:bitmap\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"count\":2", "plural remove: removed both");
+    free(resp); resp = NULL;
+    {
+        char tg0[512], bm0[512];
+        snprintf(tg0, sizeof(tg0), "%s/s/items/indexes/body/000.tg",     env->db_root);
+        snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/category/000.bm", env->db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(tg0, &st) != 0, "plural remove: trigram 000.tg unlinked");
+        ASSERT_TRUE(stat(bm0, &st) != 0, "plural remove: bitmap 000.bm unlinked");
+    }
+
     tc_close(tc);
     return 0;
 }

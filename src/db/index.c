@@ -1497,49 +1497,114 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     return 0;
 }
 
-/* Trigram reindex — walk every record of the object, extract distinct
-   trigrams from the varchar field, and write one (trigram, hash) leaf
-   entry per (trigram, record). Mirrors build_bitmap_pass shape but
-   targets .tg btree files instead of .bm. Force=1 wipes existing .tg
-   shards first; force=0 leaves them and falls back to incremental
-   insert (caller already gates on this).
+/* Trigram reindex — walks every record of the object, extracts
+   distinct trigrams per varchar field, and writes one (trigram, hash)
+   leaf entry per (trigram, record). Mirrors btree's `cmd_add_index`
+   pipeline: parallel per-kf-shard walk → contiguous concat →
+   partition by `idx_shard_for_hash` → parallel qsort + btree_bulk_build
+   per .tg shard. Each .tg file shares the BTRH format with .idx, so
+   shard_build_worker is reused unchanged.
 
-   Routing by record xxh128 (same as btree on the same field) means
-   each .tg shard receives only the records that hashed to it, so the
-   per-shard btree_insert call sequence is contiguous and the
-   prefix-compressed leaves stay tight. */
+   Per-kf-shard parallel build worker. Each worker walks ONE kf shard,
+   extracts distinct trigrams per record, and appends (trigram, hash)
+   pairs to its own buffer + arena (lock-free). After all workers finish,
+   the main thread fixes up the BtEntry.value pointers (which carried
+   into-arena offsets to survive realloc), concatenates the per-worker
+   pair arrays, partitions by .tg shard, then runs shard_build_worker
+   in parallel — exactly the pipeline cmd_add_index uses for btree. */
 typedef struct {
-    const char  *db_root;
-    const char  *object;
-    int          splits;
-    const char  *field;
-    int          field_index;     /* typed schema field index */
+    SlotcaskDb  *sdb;
+    int          kf_shard;          /* which kf shard to walk */
+    int          field_index;       /* typed schema field index */
     TypedSchema *ts;
-} TgRebuildCtx;
 
-static int tg_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
-                         const void *key, size_t klen,
-                         const void *value, size_t vlen,
-                         void *ctx) {
+    BtEntry     *pairs;
+    size_t       pair_cap;
+    size_t       pair_count;
+
+    uint8_t     *arena;             /* grows during walk; pairs[i].value
+                                       carries an offset into this arena
+                                       (cast to char*) until the
+                                       post-walk fix-up step. */
+    size_t       arena_cap;
+    size_t       arena_used;
+} TgWorkerCtx;
+
+static int tg_build_per_record_cb(uint32_t slot, const uint8_t hash16[16],
+                                  const void *key, size_t klen,
+                                  const void *value, size_t vlen,
+                                  void *ctx) {
     (void)slot; (void)key; (void)klen; (void)vlen;
-    TgRebuildCtx *c = (TgRebuildCtx *)ctx;
-    if (c->field_index < 0) return 0;
-    const TypedField *f = &c->ts->fields[c->field_index];
-    if (f->type != FT_VARCHAR) return 0;  /* validated at create-object; defensive */
+    TgWorkerCtx *w = (TgWorkerCtx *)ctx;
+    const TypedField *f = &w->ts->fields[w->field_index];
+    if (f->type != FT_VARCHAR) return 0;
 
-    /* Strip the 2-byte varchar length prefix the same way bm_rebuild_cb
-       does — those bytes are the storage encoding, not the raw value. */
     const uint8_t *vbase = (const uint8_t *)value + f->offset;
     uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
     if (actual_len == 0) return 0;
 
     uint8_t trigrams[TG_MAX_DISTINCT][3];
     size_t n = tg_extract_distinct(vbase + 2, actual_len, trigrams, TG_MAX_DISTINCT);
+    if (n == 0) return 0;
+
+    /* Grow pairs[] geometrically. */
+    if (w->pair_count + n > w->pair_cap) {
+        size_t new_cap = w->pair_cap == 0 ? 4096 : w->pair_cap * 2;
+        while (new_cap < w->pair_count + n) new_cap *= 2;
+        BtEntry *p = xrealloc_or_free(w->pairs, new_cap * sizeof(BtEntry));
+        if (!p) {
+            /* xrealloc_or_free dropped the old block on failure — clear
+               the now-dangling fields so subsequent callbacks no-op
+               instead of double-freeing. */
+            w->pairs = NULL; w->pair_cap = 0; w->pair_count = 0;
+            return 0;
+        }
+        w->pairs = p;
+        w->pair_cap = new_cap;
+    }
+
+    /* Grow arena geometrically. Pair value pointers carry the OFFSET
+       into the arena (cast to char *); they get rewritten to real
+       pointers after the parallel walk finishes — so any realloc move
+       here is safe. */
+    size_t need = n * 3;
+    if (w->arena_used + need > w->arena_cap) {
+        size_t new_size = w->arena_cap == 0 ? 65536 : w->arena_cap * 2;
+        while (new_size < w->arena_used + need) new_size *= 2;
+        uint8_t *a = xrealloc_or_free(w->arena, new_size);
+        if (!a) {
+            w->arena = NULL; w->arena_cap = 0; w->arena_used = 0;
+            /* pairs we already recorded carry stale offsets into a
+               freed arena — abandon them too to keep the fix-up step
+               safe. */
+            free(w->pairs);
+            w->pairs = NULL; w->pair_cap = 0; w->pair_count = 0;
+            return 0;
+        }
+        w->arena = a;
+        w->arena_cap = new_size;
+    }
+
     for (size_t i = 0; i < n; i++) {
-        tg_idx_insert(c->db_root, c->object, c->field, c->splits,
-                      trigrams[i], hash16);
+        size_t off = w->arena_used;
+        memcpy(w->arena + off, trigrams[i], 3);
+        w->arena_used += 3;
+        /* Store offset in .value — cast to const char* for now; the
+           main thread re-bases to (arena + off) once the arena is
+           guaranteed to no longer move. */
+        w->pairs[w->pair_count].value = (const char *)(uintptr_t)off;
+        w->pairs[w->pair_count].vlen  = 3;
+        memcpy(w->pairs[w->pair_count].hash, hash16, BT_HASH_SIZE);
+        w->pair_count++;
     }
     return 0;
+}
+
+static void *tg_worker_walk(void *arg) {
+    TgWorkerCtx *w = (TgWorkerCtx *)arg;
+    slotcask_walk_one_shard_slots(w->sdb, w->kf_shard,
+                                  tg_build_per_record_cb, w);
+    return NULL;
 }
 
 int build_trigram_pass(const char *db_root, const char *object,
@@ -1552,16 +1617,16 @@ int build_trigram_pass(const char *db_root, const char *object,
     int fi = typed_field_index(ts, field);
     if (fi < 0) return -1;
 
-    /* Unlink existing .tg shards when forced (same skip-if-exists
-       semantics btree's cmd_add_indexes uses). bt_cache is path-keyed,
-       so unlink + immediate recreate is safe — any cached handle on
-       the old inode dies on next bt_acquire (the inode mismatch
-       triggers a reopen). */
     int idx_n = index_splits_for(sch->splits);
+
+    /* Force: unlink existing .tg shards before rebuild (matches btree's
+       force semantics). bt_cache is path-keyed, so cached handles on the
+       orphaned inode die on next bt_acquire via inode-mismatch reopen. */
     if (force) {
         for (int s = 0; s < idx_n; s++) {
             char tp[PATH_MAX];
             tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+            btree_cache_invalidate(tp);
             unlink(tp);
         }
     }
@@ -1573,13 +1638,97 @@ int build_trigram_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
 
-    TgRebuildCtx c = {
-        .db_root = db_root, .object = object, .splits = sch->splits,
-        .field = field, .field_index = fi, .ts = ts,
-    };
-    for (int s = 0; s < sch->splits; s++) {
-        slotcask_walk_one_shard_slots(sdb, s, tg_rebuild_cb, &c);
+    int n_kf = sch->splits;
+    TgWorkerCtx *workers = calloc((size_t)n_kf, sizeof(TgWorkerCtx));
+    if (!workers) return -1;
+    for (int s = 0; s < n_kf; s++) {
+        workers[s].sdb         = sdb;
+        workers[s].kf_shard    = s;
+        workers[s].field_index = fi;
+        workers[s].ts          = ts;
     }
+
+    /* Phase 1 — parallel walk. Each worker fills its own pairs+arena
+       lock-free. */
+    parallel_for(tg_worker_walk, workers, n_kf, sizeof(TgWorkerCtx));
+
+    /* Phase 2 — rebase value pointers from offsets to real arena
+       addresses now that no further reallocs happen. Total up the
+       global pair count for the concat below. */
+    size_t total = 0;
+    for (int s = 0; s < n_kf; s++) {
+        TgWorkerCtx *w = &workers[s];
+        for (size_t i = 0; i < w->pair_count; i++) {
+            uintptr_t off = (uintptr_t)w->pairs[i].value;
+            w->pairs[i].value = (const char *)(w->arena + off);
+        }
+        total += w->pair_count;
+    }
+
+    if (total == 0) {
+        for (int s = 0; s < n_kf; s++) {
+            free(workers[s].pairs);
+            free(workers[s].arena);
+        }
+        free(workers);
+        return 0;
+    }
+
+    /* Phase 3 — concat all worker pair arrays into one contiguous
+       buffer for partitioning. BtEntry.value still points into each
+       worker's arena, so the arenas must live until shard_build_worker
+       finishes consuming them. */
+    BtEntry *all = malloc(total * sizeof(BtEntry));
+    if (!all) {
+        for (int s = 0; s < n_kf; s++) {
+            free(workers[s].pairs);
+            free(workers[s].arena);
+        }
+        free(workers);
+        return -1;
+    }
+    size_t off = 0;
+    for (int s = 0; s < n_kf; s++) {
+        memcpy(all + off, workers[s].pairs,
+               workers[s].pair_count * sizeof(BtEntry));
+        off += workers[s].pair_count;
+        free(workers[s].pairs);
+        workers[s].pairs = NULL;
+    }
+
+    /* Phase 4 — bucket by .tg shard via idx_shard_for_hash, then
+       parallel sort + bulk-build per shard. Identical to cmd_add_index's
+       btree path — the .tg files share the BTRH format with .idx so
+       shard_build_worker (qsort + btree_bulk_build) works unchanged. */
+    size_t *offsets = NULL, *counts = NULL;
+    BtEntry *parted = partition_by_shard(all, total, sch->splits, idx_n,
+                                         &offsets, &counts);
+    free(all);
+
+    if (parted) {
+        ShardBuildArg *sb = malloc((size_t)idx_n * sizeof(ShardBuildArg));
+        int sb_count = 0;
+        for (int s = 0; s < idx_n; s++) {
+            if (counts[s] == 0) continue;
+            tg_build_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
+                          db_root, object, field, s);
+            sb[sb_count].pairs = parted + offsets[s];
+            sb[sb_count].pair_count = counts[s];
+            sb_count++;
+        }
+        parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
+        free(sb);
+        free(parted);
+        free(offsets);
+        free(counts);
+    }
+
+    /* Now safe to free the per-worker arenas (no more readers of
+       BtEntry.value pointers). */
+    for (int s = 0; s < n_kf; s++) {
+        free(workers[s].arena);
+    }
+    free(workers);
     return 0;
 }
 
@@ -1806,6 +1955,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
     /* Bitmap- and trigram-typed fields follow the same skip-if-exists
        semantic as btree: with force, wipe + rebuild; without force,
        no-op when any shard file already exists for the field. */
+    int total_fields = nfields;  /* preserved across the btree-only reduction below */
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
     for (int i = 0; i < nfields; i++) {
@@ -1842,78 +1992,83 @@ int cmd_add_indexes(const char *db_root, const char *object,
     }
     memcpy(fields, btree_fields, sizeof(btree_fields));
     nfields = btree_count;
-    if (nfields == 0) {
-        OUT("{\"status\":\"ok\"}\n");
-        return 0;
-    }
 
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
-    /* Filter out already-existing indexes (unless force) */
+    /* === Btree batched-build path (only when btree fields remain after
+       the typed-dispatch loop above). Typed builds already ran inline
+       — this block handles only IT_BTREE. */
     char actual_fields[MAX_FIELDS][256];
     int actual_count = 0;
-    for (int i = 0; i < nfields; i++) {
-        if (force) {
-            btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
-        } else if (btree_idx_exists(db_root, object, fields[i], sch.splits)) {
-            continue; /* skip existing */
+    if (nfields > 0) {
+        /* Filter out already-existing btree indexes (unless force). */
+        for (int i = 0; i < nfields; i++) {
+            if (force) {
+                btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
+            } else if (btree_idx_exists(db_root, object, fields[i], sch.splits)) {
+                continue; /* skip existing */
+            }
+            memcpy(actual_fields[actual_count], fields[i], 256);
+            actual_count++;
         }
-        memcpy(actual_fields[actual_count], fields[i], 256);
-        actual_count++;
-    }
-    if (actual_count == 0) { OUT("{\"status\":\"all_exist\"}\n"); return 0; }
 
-    TypedSchema *ts = load_typed_schema(db_root, object);
+        if (actual_count > 0) {
+            TypedSchema *ts = load_typed_schema(db_root, object);
 
-    /* Adaptive batching: group fields into passes whose combined estimated
-       memory fits g_index_build_budget_bytes. Each pass keeps the existing
-       parallel scan + parallel build machinery — we just bound peak memory
-       so reindex on 25 M× 12-field schemas doesn't OOM the host. A single
-       field that alone exceeds the budget is still processed alone (the
-       "always include at least one" rule below). */
-    int live_count = get_live_count(db_root, object);
-    if (live_count < 0) live_count = 0;
-    size_t budget = g_index_build_budget_bytes;
-    if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
+            /* Adaptive batching: group fields into passes whose combined estimated
+               memory fits g_index_build_budget_bytes. Each pass keeps the existing
+               parallel scan + parallel build machinery — we just bound peak memory
+               so reindex on 25 M× 12-field schemas doesn't OOM the host. A single
+               field that alone exceeds the budget is still processed alone (the
+               "always include at least one" rule below). */
+            int live_count = get_live_count(db_root, object);
+            if (live_count < 0) live_count = 0;
+            size_t budget = g_index_build_budget_bytes;
+            if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
 
-    size_t per_field_bytes[MAX_FIELDS];
-    for (int i = 0; i < actual_count; i++)
-        per_field_bytes[i] = estimate_field_build_bytes(ts, actual_fields[i],
-                                                        (size_t)live_count);
+            size_t per_field_bytes[MAX_FIELDS];
+            for (int i = 0; i < actual_count; i++)
+                per_field_bytes[i] = estimate_field_build_bytes(ts, actual_fields[i],
+                                                                (size_t)live_count);
 
-    int n_batches = 0;
-    int batch_start = 0;
-    while (batch_start < actual_count) {
-        size_t batch_bytes = 0;
-        int batch_end = batch_start;
-        while (batch_end < actual_count) {
-            size_t next = per_field_bytes[batch_end];
-            if (batch_end > batch_start && batch_bytes + next > budget) break;
-            batch_bytes += next;
-            batch_end++;
+            int n_batches = 0;
+            int batch_start = 0;
+            while (batch_start < actual_count) {
+                size_t batch_bytes = 0;
+                int batch_end = batch_start;
+                while (batch_end < actual_count) {
+                    size_t next = per_field_bytes[batch_end];
+                    if (batch_end > batch_start && batch_bytes + next > budget) break;
+                    batch_bytes += next;
+                    batch_end++;
+                }
+                build_indexes_pass(db_root, object, &sch, ts, actual_fields,
+                                   batch_start, batch_end - batch_start,
+                                   (size_t)live_count);
+                n_batches++;
+                batch_start = batch_end;
+            }
+            log_msg(2, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
+                    object, actual_count, n_batches, live_count,
+                    budget / (1024 * 1024));
         }
-        build_indexes_pass(db_root, object, &sch, ts, actual_fields,
-                           batch_start, batch_end - batch_start,
-                           (size_t)live_count);
-        n_batches++;
-        batch_start = batch_end;
     }
-    log_msg(2, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
-            object, actual_count, n_batches, live_count,
-            budget / (1024 * 1024));
 
-    /* Add to index.conf — for ANY promoted (bare → :bitmap) entries we
-       rewrite the whole file in canonical form so subsequent reads
-       (and another reindex) see the right type. Otherwise we just
-       append any new btree entries that weren't already present. */
+    /* === Write canonical index.conf for ALL original fields (typed +
+       btree). Pre-fix this only ran for btree fields, so a plural
+       add-index with only :bitmap / :trigram entries left index.conf
+       unchanged — reindex saw no record of the field, and remove-index
+       couldn't match it. Iterates `total_fields` (saved before the
+       btree-only reduction) using the canonical names/types/maxes
+       arrays populated at parse time. */
     mkdirp(dirname_of(conf_path));
     if (promoted) {
         /* Full rewrite from (names, types, maxes). Mirrors the writer
            in cmd_create_object's index.conf-emission block. */
         FILE *wf = fopen(conf_path, "w");
         if (wf) {
-            for (int i = 0; i < nfields; i++) {
+            for (int i = 0; i < total_fields; i++) {
                 switch (types[i]) {
                     case IT_BTREE:
                         fprintf(wf, "%s\n", names[i]);
@@ -1932,27 +2087,52 @@ int cmd_add_indexes(const char *db_root, const char *object,
             fclose(wf);
         }
     } else {
-        /* Append-only path for legacy add-index-without-promotion. */
-        for (int fi = 0; fi < actual_count; fi++) {
+        /* Append-with-dedupe for every original field (typed lines too). */
+        for (int i = 0; i < total_fields; i++) {
+            char canon[300];
+            switch (types[i]) {
+                case IT_BITMAP:
+                    if (maxes[i] && maxes[i] != BM_DEFAULT_MAX_VALUES)
+                        snprintf(canon, sizeof(canon), "%s:bitmap(%u)", names[i], maxes[i]);
+                    else
+                        snprintf(canon, sizeof(canon), "%s:bitmap", names[i]);
+                    break;
+                case IT_TRIGRAM:
+                    snprintf(canon, sizeof(canon), "%s:trigram", names[i]);
+                    break;
+                default:
+                    snprintf(canon, sizeof(canon), "%s", names[i]);
+                    break;
+            }
             int already = 0;
             FILE *cf = fopen(conf_path, "r");
             if (cf) {
                 char line[256];
                 while (fgets(line, sizeof(line), cf)) {
                     line[strcspn(line, "\n")] = '\0';
-                    if (strcmp(line, actual_fields[fi]) == 0) { already = 1; break; }
+                    if (strcmp(line, canon) == 0) { already = 1; break; }
                 }
                 fclose(cf);
             }
             if (!already) {
                 FILE *af = fopen(conf_path, "a");
-                if (af) { fprintf(af, "%s\n", actual_fields[fi]); fclose(af); }
+                if (af) { fprintf(af, "%s\n", canon); fclose(af); }
             }
         }
     }
 
     invalidate_idx_cache(object);
-    OUT("{\"status\":\"indexed\",\"count\":%d}\n", actual_count);
+    /* Response semantics:
+         all-typed-only            → {"status":"ok"} (legacy)
+         btree present, all exist  → {"status":"all_exist"}
+         btree built (>=1)         → {"status":"indexed","count":N}      */
+    if (btree_count == 0) {
+        OUT("{\"status\":\"ok\"}\n");
+    } else if (actual_count == 0) {
+        OUT("{\"status\":\"all_exist\"}\n");
+    } else {
+        OUT("{\"status\":\"indexed\",\"count\":%d}\n", actual_count);
+    }
     return 0;
 }
 
@@ -1960,6 +2140,49 @@ int cmd_add_indexes(const char *db_root, const char *object,
    Drops a single index by exact name (matches whatever was passed to
    add-index, including composite "a+b" forms). Unlinks the .idx file,
    removes its line from index.conf, and invalidates caches. */
+
+/* Unlink the on-disk index files for one canonical index.conf line,
+   dispatched by type. Btree, bitmap, and trigram each live in
+   `indexes/<field>/NNN.{idx,bm,tg}` — same directory, different
+   extension — so we also rmdir the (now-empty) field directory after
+   typed unlinks. */
+static void unlink_index_by_line(const char *db_root, const char *object,
+                                 const char *conf_line, int splits) {
+    ParsedIndexSpec ps;
+    if (parse_index_spec(conf_line, &ps) != 0) {
+        /* Malformed entry — best-effort btree unlink so a botched
+           pre-fix line like `username:trigram` (treated as a bare
+           field) at least frees any stray btree leftovers. */
+        btree_idx_unlink_all(db_root, object, conf_line, splits);
+        return;
+    }
+    int idx_n = index_splits_for(splits);
+    if (ps.type == IT_TRIGRAM) {
+        for (int s = 0; s < idx_n; s++) {
+            char tp[PATH_MAX];
+            tg_build_path(tp, sizeof(tp), db_root, object, ps.name, s);
+            btree_cache_invalidate(tp);
+            unlink(tp);
+        }
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s/indexes/%s",
+                 db_root, object, ps.name);
+        rmdir(dir_path);
+    } else if (ps.type == IT_BITMAP) {
+        for (int s = 0; s < idx_n; s++) {
+            char bp[PATH_MAX];
+            bm_build_path(bp, sizeof(bp), db_root, object, ps.name, s);
+            bm_cache_invalidate(bp);
+            unlink(bp);
+        }
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s/indexes/%s",
+                 db_root, object, ps.name);
+        rmdir(dir_path);
+    } else {
+        btree_idx_unlink_all(db_root, object, ps.name, splits);
+    }
+}
 
 int cmd_remove_index(const char *db_root, const char *object, const char *field) {
     if (!field || !field[0]) {
@@ -1971,8 +2194,11 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
-    /* Rewrite index.conf without the target line. */
+    /* Rewrite index.conf without the target line; capture the matched
+       line so the typed unlink below sees the canonical form (and can
+       distinguish btree / bitmap / trigram). */
     int found = 0;
+    char matched_line[256] = {0};
     FILE *cf = fopen(conf_path, "r");
     if (cf) {
         char tmp_path[PATH_MAX];
@@ -1986,7 +2212,12 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
             strncpy(stripped, line, sizeof(stripped) - 1);
             stripped[sizeof(stripped) - 1] = '\0';
             stripped[strcspn(stripped, "\n")] = '\0';
-            if (strcmp(stripped, field) == 0) { found = 1; continue; }
+            if (strcmp(stripped, field) == 0) {
+                found = 1;
+                strncpy(matched_line, stripped, sizeof(matched_line) - 1);
+                matched_line[sizeof(matched_line) - 1] = '\0';
+                continue;
+            }
             fprintf(nf, "%s", line);
         }
         fclose(cf);
@@ -2003,7 +2234,7 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
         return 0;
     }
 
-    btree_idx_unlink_all(db_root, object, field, sch.splits);
+    unlink_index_by_line(db_root, object, matched_line, sch.splits);
     invalidate_idx_cache(object);
 
     log_msg(3, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
@@ -2052,6 +2283,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
         snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
         int found = 0;
+        char matched_line[256] = {0};
         FILE *cf = fopen(conf_path, "r");
         if (cf) {
             char tmp_path[PATH_MAX];
@@ -2064,7 +2296,12 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
                 strncpy(stripped, line, sizeof(stripped) - 1);
                 stripped[sizeof(stripped) - 1] = '\0';
                 stripped[strcspn(stripped, "\n")] = '\0';
-                if (strcmp(stripped, fields[i]) == 0) { found = 1; continue; }
+                if (strcmp(stripped, fields[i]) == 0) {
+                    found = 1;
+                    strncpy(matched_line, stripped, sizeof(matched_line) - 1);
+                    matched_line[sizeof(matched_line) - 1] = '\0';
+                    continue;
+                }
                 fprintf(nf, "%s", line);
             }
             fclose(cf);
@@ -2073,7 +2310,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
         }
 
         if (found) {
-            btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
+            unlink_index_by_line(db_root, object, matched_line, sch.splits);
             removed++;
         } else {
             missing++;
