@@ -1732,70 +1732,22 @@ static int merge_spills_into_index(int type,
     if (!heap.idx) { rc = -1; goto cleanup; }
     for (size_t i = 0; i < reader_count; i++) mh_push(&heap, (int)i);
 
-    /* Collect the entire merged sorted stream into ONE in-memory
-       array, then call btree_bulk_build once. This produces tight
-       prefix-compressed leaves at 100% fill — the only way to do
-       this without extending btree.c with a new streaming primitive,
-       since bt_insert_rec splits leaves 50/50 even on sorted input.
-       Memory bound: one shard's worth of BtEntries + value bytes.
-       Phase 2 processes shards in parallel up to pool_size; the
-       outer caller is responsible for the total fitting in budget. */
-    size_t total_entries = 0;
-    for (size_t i = 0; i < reader_count; i++)
-        total_entries += readers[i].entries_remaining + (readers[i].has_entry ? 1 : 0);
-
-    BtEntry *merged = malloc(total_entries * sizeof(BtEntry));
-    if (!merged) { rc = -1; free(heap.idx); goto cleanup; }
-
-    /* Arena: sum of all value bytes across all runs. Bounded by the
-       sum of body lengths we already enumerated, but we don't track
-       that here — use total_entries × 32 as a generous initial
-       estimate and realloc if exceeded. For trigram, values are
-       always 3 bytes (≪32). For btree the schema's max field size
-       caps it; 32 covers most cases without realloc. */
-    size_t arena_cap = total_entries * 32 + 4096;
-    uint8_t *arena = malloc(arena_cap);
-    if (!arena) { rc = -1; free(merged); free(heap.idx); goto cleanup; }
-    size_t arena_use = 0;
-    size_t out_n = 0;
+    /* Stream the merged sorted output directly into a btree_stream
+       builder — no in-memory materialisation of the per-shard data.
+       Memory per-shard merge is now O(spill_read_buffers + leaf_buffer)
+       — a few MB regardless of how many entries flow through. Safe at
+       any scale; phase 2 concurrency cap below is now effectively
+       just bounded by pool_size. */
+    BtStreamBuilder *builder = bt_stream_build_open(target);
+    if (!builder) { rc = -1; free(heap.idx); goto cleanup; }
 
     while (heap.size > 0) {
         SpillRunReader *r = &readers[heap.idx[0]];
-
-        if (arena_use + r->vlen > arena_cap) {
-            size_t new_cap = arena_cap * 2;
-            if (new_cap < arena_use + r->vlen) new_cap = arena_use + r->vlen + 4096;
-            uint8_t *na = realloc(arena, new_cap);
-            if (!na) { rc = -1; break; }
-            /* IMPORTANT: existing merged[*].value pointers were into the
-               OLD arena. realloc may have moved it — rebase them. */
-            if (na != arena) {
-                for (size_t i = 0; i < out_n; i++) {
-                    size_t off = (const uint8_t *)merged[i].value - arena;
-                    merged[i].value = (const char *)(na + off);
-                }
-            }
-            arena = na;
-            arena_cap = new_cap;
-        }
-
-        memcpy(arena + arena_use, r->value, r->vlen);
-        merged[out_n].value = (const char *)(arena + arena_use);
-        merged[out_n].vlen  = r->vlen;
-        memcpy((void *)merged[out_n].hash, r->hash, BT_HASH_SIZE);
-        arena_use += r->vlen;
-        out_n++;
-
+        bt_stream_build_add(builder, (const char *)r->value, r->vlen, r->hash);
         mh_advance_top(&heap);
     }
 
-    /* Single tight bulk_build on the fully-sorted merged stream. */
-    if (rc == 0 && out_n > 0) {
-        btree_bulk_build(target, merged, out_n);
-    }
-
-    free(merged);
-    free(arena);
+    if (bt_stream_build_finish(builder) != 0) rc = -1;
     free(heap.idx);
 
 cleanup:
@@ -1931,38 +1883,14 @@ static int run_streaming_build(int type,
            best-effort. */
     }
 
-    /* Phase 2: merge across output shards. Each shard's merge
-       materialises that shard's full entry stream into RAM for a
-       single tight bulk_build — so we MUST cap concurrency by
-       budget, otherwise pool_size parallel merges OOM at scale.
-
-       Per-shard memory ≈ spill_disk × 5/3 (strip the 2-byte vlen
-       prefix from disk size, add 32 B BtEntry + arena per entry —
-       conservative estimate). */
-    size_t max_shard_disk = 0;
-    for (int s = 0; s < idx_n; s++) {
-        size_t shard_disk = 0;
-        for (int w = 0; w < n_kf; w++) {
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/w%d_s%d.bin", spill_dir, w, s);
-            struct stat st;
-            if (stat(path, &st) == 0) shard_disk += (size_t)st.st_size;
-        }
-        if (shard_disk > max_shard_disk) max_shard_disk = shard_disk;
-    }
-    size_t max_shard_mem = max_shard_disk + max_shard_disk * 2 / 3;
-    int merge_concurrency = 1;
-    if (max_shard_mem > 0) {
-        merge_concurrency = (int)(budget / max_shard_mem);
-    } else {
-        merge_concurrency = idx_n;
-    }
-    if (merge_concurrency < 1)     merge_concurrency = 1;
-    if (merge_concurrency > idx_n) merge_concurrency = idx_n;
-
-    log_msg(2, "streaming-merge %s/%s/%s: max-shard ≈%zu MB → concurrency=%d",
-            db_root, object, field,
-            max_shard_mem / (1024 * 1024), merge_concurrency);
+    /* Phase 2: merge across output shards. With the streaming btree
+       builder (bt_stream_build_*), per-shard memory is O(read buffers
+       + active leaf) — a few MB regardless of shard size — so we no
+       longer need to cap concurrency by per-shard data volume.
+       Concurrency is now capped only by the pool size; idx_n shards
+       run in parallel up to that. */
+    log_msg(2, "streaming-merge %s/%s/%s: %d shards, streaming bt builder",
+            db_root, object, field, idx_n);
 
     MergeShardArg *margs = calloc((size_t)idx_n, sizeof(MergeShardArg));
     if (!margs) return -1;
@@ -1976,15 +1904,10 @@ static int run_streaming_build(int type,
         margs[s].shard     = s;
         margs[s].spill_dir = spill_dir;
     }
-    /* Run idx_n merges in batches of merge_concurrency so peak RAM
-       stays under budget. */
+    /* All output shards in parallel — bounded by pool_size. Streaming
+       builder keeps per-merge memory at O(few MB). */
     int merge_rc = 0;
-    for (int s_start = 0; s_start < idx_n; s_start += merge_concurrency) {
-        int batch_n = idx_n - s_start;
-        if (batch_n > merge_concurrency) batch_n = merge_concurrency;
-        parallel_for(merge_shard_worker_fn, margs + s_start, batch_n,
-                     sizeof(MergeShardArg));
-    }
+    parallel_for(merge_shard_worker_fn, margs, idx_n, sizeof(MergeShardArg));
     for (int s = 0; s < idx_n; s++) if (margs[s].rc != 0) merge_rc = -1;
     free(margs);
 

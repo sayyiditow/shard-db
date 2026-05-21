@@ -155,6 +155,21 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count);
    Use for bulk insert operations instead of btree_insert_batch. */
 void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count);
 
+/* Streaming bulk build — same output as btree_bulk_build but accepts entries
+   one-at-a-time so the caller never materialises the full sorted input array
+   in memory. Used by the streaming external-merge-sort index pipeline: k-way
+   merge of per-worker spill files feeds directly into bt_stream_build_add,
+   so per-output-shard memory stays O(leaf_buffer + leaf_id_list) — a few MB
+   — regardless of how many entries pass through.
+
+   Caller must call entries in ASCENDING sorted order (by value, then hash).
+   Out-of-order adds corrupt the on-disk tree silently. */
+typedef struct BtStreamBuilder BtStreamBuilder;
+BtStreamBuilder *bt_stream_build_open(const char *path);
+int  bt_stream_build_add(BtStreamBuilder *b, const char *value, size_t vlen,
+                         const uint8_t hash[BT_HASH_SIZE]);
+int  bt_stream_build_finish(BtStreamBuilder *b);
+
 /* Streaming range iterator. Pulls one entry at a time so callers can drive a
    k-way merge across multiple btree files without buffering everything per
    file. desc=1 walks DESC, otherwise ASC. Bounds match btree_range_ex /
