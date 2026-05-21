@@ -1115,6 +1115,28 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
                         key_len == old_idx_lens[fi] &&
                         memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
 
+        /* Trigram fields: dispatch via update_idx_fn so the IT_TRIGRAM
+           branch in index.c extracts distinct trigrams and writes one
+           .tg leaf entry per (trigram, hash). No accumulator like
+           bitmap — each trigram is already its own btree_insert at the
+           index.c layer, and per-shard bt_acquire amortises the file
+           lock automatically. */
+        if (itype == IT_TRIGRAM) {
+            if (!unchanged && have_new) {
+                UpdateIdxArg a = {0};
+                a.db_root = sw->db_root; a.object = sw->object;
+                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+                a.new_key = key_buf; a.new_len = key_len;
+                a.old_key = old_idx_have[fi] ? old_idx_bufs[fi] : NULL;
+                a.old_len = old_idx_have[fi] ? old_idx_lens[fi] : 0;
+                a.hash = r->hash; a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            }
+            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+            free(key_buf);
+            continue;
+        }
+
         /* Bitmap fields: enqueue (slot, value) into the per-field
            accumulator. The post-shard flush (bulk_insert_shard_worker_v2)
            opens the .bm shard with writer=1 once, applies all bm_set's,
@@ -2732,6 +2754,7 @@ typedef struct {
     int key_count;
     /* Index info */
     char (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int nidx;
     TypedSchema *ts;
     /* Results */
@@ -2786,8 +2809,19 @@ static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
                                               &buf, &blen))
                 continue;
         }
-        delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                            sw->sch->splits, buf, blen, sw->hashes[ki]);
+        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
+        if (itype == IT_TRIGRAM) {
+            UpdateIdxArg a = {0};
+            a.db_root = sw->db_root; a.object = sw->object;
+            a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+            a.new_key = NULL; a.new_len = 0;
+            a.old_key = buf;  a.old_len = blen;
+            a.hash = sw->hashes[ki]; a.type = IT_TRIGRAM;
+            update_idx_fn(&a);
+        } else {
+            delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
+                                sw->sch->splits, buf, blen, sw->hashes[ki]);
+        }
         if (!from_arena) free(buf);
     }
     return 0;
@@ -2934,6 +2968,8 @@ static int bulk_delete_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     TypedSchema *ts = load_typed_schema(db_root, object);
 
     /* Compute hashes + shard_ids; bucket-sort into per-shard worker arrays.
@@ -2969,6 +3005,7 @@ static int bulk_delete_run(const char *db_root, const char *object,
         workers[g].shard_slots = malloc(cnt * sizeof(int));
         workers[g].key_count = 0;
         workers[g].idx_fields = idx_fields;
+        workers[g].idx_types = idx_types;
         workers[g].nidx = nidx;
         workers[g].ts = ts;
         workers[g].deleted = 0;
@@ -3161,6 +3198,7 @@ typedef struct {
     FieldSchema   *fs;
     const char    *value_json;
     const char   (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM (NULL = all btree, legacy) */
     int            nidx;
     int            shard_id;
     BulkUpdRec    *recs;
@@ -3336,6 +3374,7 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
             args[n_args].old_key = have_old ? old_buf : NULL;
             args[n_args].old_len = old_len;
             args[n_args].hash    = upd_rec->hash;
+            args[n_args].type    = w->idx_types ? w->idx_types[fi] : IT_BTREE;
             n_args++;
         }
     }
@@ -3495,6 +3534,8 @@ int cmd_bulk_update(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     int updated = 0, skipped = 0;
 
     /* Pre-compute each matched key's hash + shard placement so bucketing
@@ -3541,6 +3582,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].fs = &fs;
         workers[wi].value_json = value_json;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
         workers[wi].cas_crit = cas_crit;
         workers[wi].cas_ncrit = cas_ncrit;
@@ -3591,6 +3633,7 @@ typedef struct {
     const Schema     *sch;
     TypedSchema      *ts;
     const char      (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM (NULL = legacy all-btree) */
     int               nidx;
     const int        *active_indices;
     int               active_count;
@@ -3645,12 +3688,29 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, delim_rec->hash);
-            if (have_new)
-                write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, delim_rec->hash);
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            if (itype == IT_TRIGRAM) {
+                /* Trigram needs the diff (new ∪ old → both sets) — route
+                   through update_idx_fn so the IT_TRIGRAM branch handles
+                   per-trigram insert/delete in one shot. */
+                UpdateIdxArg a = {0};
+                a.db_root = w->db_root; a.object = w->object;
+                a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                a.new_key = have_new ? new_buf : NULL;
+                a.new_len = new_len;
+                a.old_key = have_old ? old_buf : NULL;
+                a.old_len = old_len;
+                a.hash = delim_rec->hash;
+                a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            } else {
+                if (have_old)
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, old_buf, old_len, delim_rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits, new_buf, new_len, delim_rec->hash);
+            }
         }
         free(old_buf); free(new_buf);
     }
@@ -3798,6 +3858,8 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     /* Synthesise the same struct fields the body used to expect. */
     struct stat st = { .st_size = (off_t)size };
@@ -3918,6 +3980,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
         workers[wi].sch = &sch;
         workers[wi].ts = ts;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
         workers[wi].active_indices = active_indices;
         workers[wi].active_count = active_count;
@@ -4021,6 +4084,7 @@ typedef struct {
     const Schema     *sch;
     TypedSchema      *ts;
     const char      (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int               nidx;
     int               shard_id;
     BulkUpdJsonRec   *recs;
@@ -4079,12 +4143,26 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, json_rec->hash);
-            if (have_new)
-                write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, json_rec->hash);
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            if (itype == IT_TRIGRAM) {
+                UpdateIdxArg a = {0};
+                a.db_root = w->db_root; a.object = w->object;
+                a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                a.new_key = have_new ? new_buf : NULL;
+                a.new_len = new_len;
+                a.old_key = have_old ? old_buf : NULL;
+                a.old_len = old_len;
+                a.hash = json_rec->hash;
+                a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            } else {
+                if (have_old)
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, old_buf, old_len, json_rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits, new_buf, new_len, json_rec->hash);
+            }
         }
         free(old_buf); free(new_buf);
     }
@@ -4216,6 +4294,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     char *json = NULL;
     size_t len = 0;
@@ -4472,6 +4552,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             workers[wi].sch = &sch;
             workers[wi].ts = ts;
             workers[wi].idx_fields = idx_fields;
+            workers[wi].idx_types = idx_types;
             workers[wi].nidx = nidx;
             workers[wi].shard_id = s;
             workers[wi].recs = malloc(shard_counts[s] * sizeof(BulkUpdJsonRec));
@@ -4559,6 +4640,7 @@ typedef struct {
     SearchCriterion *cas_crit;
     int             cas_ncrit;
     char          (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int             nidx;
     /* per-shard records */
     char          **keys;
@@ -4589,8 +4671,19 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
             uint8_t *buf = NULL; size_t blen = 0;
             if (build_index_key_from_record(w->ts, old->value,
                                               w->idx_fields[fi], &buf, &blen)) {
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, buf, blen, w->hashes[ki]);
+                enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+                if (itype == IT_TRIGRAM) {
+                    UpdateIdxArg a = {0};
+                    a.db_root = w->db_root; a.object = w->object;
+                    a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                    a.new_key = NULL; a.new_len = 0;
+                    a.old_key = buf;  a.old_len = blen;
+                    a.hash = w->hashes[ki]; a.type = IT_TRIGRAM;
+                    update_idx_fn(&a);
+                } else {
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, buf, blen, w->hashes[ki]);
+                }
                 free(buf);
             }
         }
@@ -4721,6 +4814,8 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     if (!sdb || matched == 0) {
         log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
@@ -4789,6 +4884,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         workers[g].cas_crit  = cas_crit;
         workers[g].cas_ncrit = cas_ncrit;
         workers[g].idx_fields = idx_fields;
+        workers[g].idx_types  = idx_types;
         workers[g].nidx       = nidx;
         workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
         workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));

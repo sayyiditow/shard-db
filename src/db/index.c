@@ -1,5 +1,6 @@
 #include "types.h"
 #include "bitmap.h"
+#include "trigram.h"
 #include "slotcask.h"
 
 /* Per-shard build worker shared by cmd_add_index and cmd_add_indexes; defined
@@ -56,6 +57,31 @@ void btree_idx_delete(const char *db_root, const char *object,
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
     btree_delete(idx_path, value, vlen, hash);
+}
+
+/* Trigram index entry insert/delete. Mirror of btree_idx_* but routes
+   to .tg files instead of .idx — both extensions share the BTRH btree
+   format, so the underlying primitives (btree_insert/btree_delete) are
+   reused unchanged. A field may carry BOTH .idx and .tg simultaneously;
+   bt_cache treats them as independent path-keyed cache entries. */
+void tg_idx_insert(const char *db_root, const char *object,
+                   const char *field, int splits,
+                   const uint8_t trigram[3],
+                   const uint8_t hash[BT_HASH_SIZE]) {
+    int idx_shard = idx_shard_for_hash(hash, splits);
+    char tg_path[PATH_MAX];
+    tg_build_path(tg_path, sizeof(tg_path), db_root, object, field, idx_shard);
+    btree_insert(tg_path, (const char *)trigram, 3, hash);
+}
+
+void tg_idx_delete(const char *db_root, const char *object,
+                   const char *field, int splits,
+                   const uint8_t trigram[3],
+                   const uint8_t hash[BT_HASH_SIZE]) {
+    int idx_shard = idx_shard_for_hash(hash, splits);
+    char tg_path[PATH_MAX];
+    tg_build_path(tg_path, sizeof(tg_path), db_root, object, field, idx_shard);
+    btree_delete(tg_path, (const char *)trigram, 3, hash);
 }
 
 /* Per-shard parallel-walk machinery. parallel_for spawns one task per shard,
@@ -367,7 +393,6 @@ void *update_idx_fn(void *arg) {
 
     switch (a->type) {
         case IT_BTREE:
-        case IT_TRIGRAM: /* trigram lands in a later phase; fall back to btree-style for now */
             if (a->old_key)
                 delete_index_entry(a->db_root, a->object, a->field, a->splits,
                                    a->old_key, a->old_len, a->hash);
@@ -375,6 +400,50 @@ void *update_idx_fn(void *arg) {
                 write_index_entry(a->db_root, a->object, a->field, a->splits,
                                   a->new_key, a->new_len, a->hash);
             break;
+
+        case IT_TRIGRAM: {
+            /* Diff the two distinct-trigram sets. For every trigram in
+               old but not in new → delete its leaf entry. For every in
+               new but not in old → insert. Trigrams in both stay put
+               (record still contains them). Nested-loop comparison is
+               O(n_old × n_new); fine at typical short-field sizes. For
+               very long varchars the diff cost grows but stays bounded
+               by TG_MAX_DISTINCT² ≈ 16M memcmps worst case ~30ms — the
+               record's own write cost dominates anyway. */
+            uint8_t old_tg[TG_MAX_DISTINCT][3];
+            uint8_t new_tg[TG_MAX_DISTINCT][3];
+            size_t n_old = a->old_key
+                ? tg_extract_distinct(a->old_key, a->old_len, old_tg, TG_MAX_DISTINCT)
+                : 0;
+            size_t n_new = a->new_key
+                ? tg_extract_distinct(a->new_key, a->new_len, new_tg, TG_MAX_DISTINCT)
+                : 0;
+
+            /* Delete old-only trigrams. */
+            for (size_t i = 0; i < n_old; i++) {
+                int in_new = 0;
+                for (size_t j = 0; j < n_new; j++) {
+                    if (memcmp(old_tg[i], new_tg[j], 3) == 0) { in_new = 1; break; }
+                }
+                if (!in_new) {
+                    tg_idx_delete(a->db_root, a->object, a->field, a->splits,
+                                  old_tg[i], a->hash);
+                }
+            }
+
+            /* Insert new-only trigrams. */
+            for (size_t i = 0; i < n_new; i++) {
+                int in_old = 0;
+                for (size_t j = 0; j < n_old; j++) {
+                    if (memcmp(new_tg[i], old_tg[j], 3) == 0) { in_old = 1; break; }
+                }
+                if (!in_old) {
+                    tg_idx_insert(a->db_root, a->object, a->field, a->splits,
+                                  new_tg[i], a->hash);
+                }
+            }
+            break;
+        }
 
         case IT_BITMAP:
             /* The slow-path insert case can call us with kf_slot=0 and

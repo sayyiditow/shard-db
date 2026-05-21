@@ -1226,6 +1226,40 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             }
             bm_flush_thread_bitmap_cache();
             if (bm_overflow) return -1;
+
+            /* Trigram indexes — same dispatch shape as bitmap above, but
+               no overflow path (no per-file cap). update_idx_fn's
+               IT_TRIGRAM branch extracts distinct trigrams from new_key
+               and writes one .tg leaf entry per (trigram, record hash). */
+            UpdateIdxArg tg_args[MAX_FIELDS];
+            int n_tg = 0;
+            for (int i = 0; i < c->nfields; i++) {
+                if (c->idx_types[i] != IT_TRIGRAM) continue;
+                if (strchr(c->fields[i], '+')) continue;  /* composite + trigram = rejected upstream */
+                uint8_t *nk = NULL;
+                size_t nl = 0;
+                if (!build_index_key_from_json(c->idx_ts, c->value_json,
+                                                c->fields[i], &nk, &nl))
+                    continue;
+                tg_args[n_tg].db_root  = c->db_root;
+                tg_args[n_tg].object   = c->object;
+                tg_args[n_tg].field    = c->fields[i];
+                tg_args[n_tg].splits   = c->splits;
+                tg_args[n_tg].new_key  = nk;
+                tg_args[n_tg].new_len  = nl;
+                tg_args[n_tg].old_key  = NULL;
+                tg_args[n_tg].old_len  = 0;
+                tg_args[n_tg].hash     = c->hash;
+                tg_args[n_tg].type     = IT_TRIGRAM;
+                tg_args[n_tg].kf_shard = c->kf_shard;
+                tg_args[n_tg].kf_slot  = c->kf_slot;
+                tg_args[n_tg].bm_max_values = 0;
+                n_tg++;
+            }
+            if (n_tg > 0) {
+                parallel_for(update_idx_fn, tg_args, n_tg, sizeof(UpdateIdxArg));
+                for (int i = 0; i < n_tg; i++) free(tg_args[i].new_key);
+            }
         }
     }
     return 0;

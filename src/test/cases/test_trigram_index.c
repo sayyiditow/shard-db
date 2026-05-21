@@ -125,13 +125,135 @@ static int run_unit_assertions(void) {
     return 0;
 }
 
+/* Phase 2 — daemon-backed CRUD. Insert/update/delete records, verify the
+   .tg shard file materialises and grows / shrinks. Functional verification
+   (does `contains "x"` return the right records) lands in Phase 4 when the
+   planner read path goes in. */
+static int run_crud_assertions(TestEnv *env) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "client connect");
+    if (!tc) return 1;
+
+    char *resp = NULL;
+
+    /* === create-object with text:trigram. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"notes\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"body:varchar:256\"],"
+        "\"indexes\":[\"body:trigram\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object with trigram");
+    free(resp); resp = NULL;
+
+    /* index.conf has the :trigram line. */
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"notes\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"body:trigram\"", "describe-object emits :trigram");
+    free(resp); resp = NULL;
+
+    /* === Insert a record. === */
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"notes\","
+        "\"key\":\"k1\",\"value\":{\"body\":\"hello world\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "insert k1");
+    free(resp); resp = NULL;
+
+    /* The CRUD hook should have materialised at least one .tg shard. The
+       routing is by record hash; we don't know which shard, so check all
+       8. At least one must be non-empty. */
+    char tg_dir[512];
+    snprintf(tg_dir, sizeof(tg_dir), "%s/t/notes/indexes/body", env->db_root);
+    int total_size = 0;
+    for (int s = 0; s < 8; s++) {
+        char p[600];
+        snprintf(p, sizeof(p), "%s/%03x.tg", tg_dir, s);
+        if (tu_file_exists(p)) {
+            FILE *f = fopen(p, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                total_size += (int)ftell(f);
+                fclose(f);
+            }
+        }
+    }
+    ASSERT_TRUE(total_size > 0, "at least one .tg shard non-empty after insert");
+
+    /* === Update the record (different body). === */
+    tc_request(tc,
+        "{\"mode\":\"update\",\"dir\":\"t\",\"object\":\"notes\","
+        "\"key\":\"k1\",\"value\":{\"body\":\"hello earth\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"updated\"", "update k1");
+    free(resp); resp = NULL;
+
+    /* === Insert a second record with shared trigrams. === */
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"notes\","
+        "\"key\":\"k2\",\"value\":{\"body\":\"hello there\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "insert k2 (shares hello)");
+    free(resp); resp = NULL;
+
+    /* Index should have grown — both records contribute distinct trigrams. */
+    int total_size_after = 0;
+    for (int s = 0; s < 8; s++) {
+        char p[600];
+        snprintf(p, sizeof(p), "%s/%03x.tg", tg_dir, s);
+        if (tu_file_exists(p)) {
+            FILE *f = fopen(p, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                total_size_after += (int)ftell(f);
+                fclose(f);
+            }
+        }
+    }
+    ASSERT_TRUE(total_size_after >= total_size, ".tg total bytes monotonic after second insert");
+
+    /* === Delete a record. === */
+    tc_request(tc,
+        "{\"mode\":\"delete\",\"dir\":\"t\",\"object\":\"notes\","
+        "\"key\":\"k1\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"deleted\"", "delete k1");
+    free(resp); resp = NULL;
+
+    /* Subsequent get returns the not-found error sentinel — sanity
+       check that the delete went through end-to-end (and the trigram
+       CRUD hook didn't panic). */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"t\",\"object\":\"notes\",\"key\":\"k1\"}", &resp);
+    ASSERT_CONTAINS(resp, "Not found", "k1 gone after delete");
+    free(resp); resp = NULL;
+
+    /* === Bulk insert: 50 records, varied bodies. Confirms the bulk
+       path also dispatches the trigram CRUD hook. === */
+    {
+        char *bulk = malloc(8192);
+        int off = snprintf(bulk, 8192,
+            "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"notes\",\"records\":[");
+        for (int i = 0; i < 50; i++) {
+            off += snprintf(bulk + off, 8192 - off,
+                "%s{\"key\":\"bk%d\",\"value\":{\"body\":\"sample body number %d about cats\"}}",
+                i ? "," : "", i, i);
+        }
+        snprintf(bulk + off, 8192 - off, "]}");
+        tc_request(tc, bulk, &resp);
+        ASSERT_CONTAINS(resp, "\"inserted\":", "bulk-insert returned inserted count");
+        free(bulk);
+        free(resp); resp = NULL;
+    }
+
+    tc_close(tc);
+    return 0;
+}
+
 static int test_trigram_index_run(void) {
     /* Phase 1 unit assertions: pure helpers, no daemon. */
     if (run_unit_assertions() != 0) return 1;
 
-    /* Phase 2+ daemon-backed assertions land here in later commits. */
-
-    return 0;
+    /* Phase 2: daemon-backed CRUD. */
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int rc = run_crud_assertions(&env);
+    test_env_stop(&env);
+    return rc;
 }
 
 TEST_REGISTER("test-trigram-index", test_trigram_index_run)
