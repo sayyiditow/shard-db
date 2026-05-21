@@ -1041,11 +1041,16 @@ static void *shard_build_worker(void *arg) {
     return NULL;
 }
 
-/* Per-shard incremental merge worker — same shape as ShardBuildArg but
-   uses btree_bulk_merge so successive batches accumulate into the same
-   .idx/.tg file without destroying earlier batches' entries. Used by
-   the trigram build pipeline, which batches kf shards to keep peak
-   memory bounded by g_index_build_budget_bytes. */
+/* Per-shard incremental merge worker — same shape as ShardBuildArg.
+   Used by the trigram build pipeline which batches kf shards. The
+   first batch writes into an empty file (or one wiped by force-rebuild)
+   so it can use the tight bulk_build path; later batches must NOT use
+   bulk_merge's rebuild path because it allocates `existing + new`
+   BtEntry buffers during the merge — at multi-GB existing trees with
+   8 parallel workers, that's tens of GB of peak memory → OOM. Instead
+   we fall through to btree_insert_batch, which point-inserts under a
+   single write lock with O(1) memory per insert. Slower per byte than
+   a tight bulk_build, but memory-bounded regardless of total volume. */
 typedef struct {
     char     ipath[PATH_MAX];
     BtEntry *pairs;        /* slice — caller owns backing memory */
@@ -1054,9 +1059,20 @@ typedef struct {
 
 static void *shard_merge_worker(void *arg) {
     ShardMergeArg *sm = (ShardMergeArg *)arg;
-    /* btree_bulk_merge sorts new_entries internally; no qsort needed
-       here. It also handles the empty-existing case as a clean build. */
-    btree_bulk_merge(sm->ipath, sm->pairs, sm->pair_count);
+    struct stat st;
+    int is_fresh = (stat(sm->ipath, &st) != 0 || st.st_size == 0);
+    if (is_fresh) {
+        /* First batch into an empty .tg — clean bulk_build with tight
+           prefix-compressed leaves. Memory: sort in place + write. */
+        qsort(sm->pairs, sm->pair_count, sizeof(BtEntry), cmp_btentry_fn);
+        btree_bulk_build(sm->ipath, sm->pairs, sm->pair_count);
+    } else {
+        /* Subsequent batch — point-insert each entry under a single
+           write lock. O(count × log existing) time but O(1) extra
+           memory. Avoids bulk_merge's "extract everything + combine"
+           path which is what blew the budget at 25M trigram scale. */
+        btree_insert_batch(sm->ipath, sm->pairs, sm->pair_count);
+    }
     return NULL;
 }
 
@@ -1108,6 +1124,7 @@ int build_trigram_pass(const char *db_root, const char *object,
 
 int cmd_add_index(const char *db_root, const char *object,
                          const char *field, int force) {
+    uint64_t t_start = now_ms();
     /* Parse the spec via the canonical helper so `name`, `name:btree`,
        `name:bitmap[(N)]`, `name:trigram`, and composite `a+b` all funnel
        through one grammar. Auto-promote bare bool/enum names to bitmap
@@ -1282,7 +1299,11 @@ int cmd_add_index(const char *db_root, const char *object,
     }
 
     invalidate_idx_cache(object);
-    OUT("{\"status\":\"indexed\",\"field\":\"%s\"}\n", field);
+    uint64_t duration_ms = now_ms() - t_start;
+    int records = get_live_count(db_root, object);
+    if (records < 0) records = 0;
+    OUT("{\"status\":\"indexed\",\"field\":\"%s\",\"records\":%d,\"duration_ms\":%llu}\n",
+        field, records, (unsigned long long)duration_ms);
     return 0;
 }
 
@@ -1960,6 +1981,7 @@ static void build_indexes_pass(const char *db_root, const char *object,
 
 int cmd_add_indexes(const char *db_root, const char *object,
                     const char *fields_json, int force) {
+    uint64_t t_start = now_ms();
     /* Parse fields array */
     char fields[MAX_FIELDS][256];
     int nfields = 0;
@@ -2204,16 +2226,21 @@ int cmd_add_indexes(const char *db_root, const char *object,
     }
 
     invalidate_idx_cache(object);
+    uint64_t duration_ms = now_ms() - t_start;
+    int records = get_live_count(db_root, object);
+    if (records < 0) records = 0;
     /* Response semantics:
-         all-typed-only            → {"status":"ok"} (legacy)
+         all-typed-only            → {"status":"ok","records":..,"duration_ms":..}
          btree present, all exist  → {"status":"all_exist"}
-         btree built (>=1)         → {"status":"indexed","count":N}      */
+         btree built (>=1)         → {"status":"indexed","count":N,"records":..,"duration_ms":..} */
     if (btree_count == 0) {
-        OUT("{\"status\":\"ok\"}\n");
+        OUT("{\"status\":\"ok\",\"records\":%d,\"duration_ms\":%llu}\n",
+            records, (unsigned long long)duration_ms);
     } else if (actual_count == 0) {
         OUT("{\"status\":\"all_exist\"}\n");
     } else {
-        OUT("{\"status\":\"indexed\",\"count\":%d}\n", actual_count);
+        OUT("{\"status\":\"indexed\",\"count\":%d,\"records\":%d,\"duration_ms\":%llu}\n",
+            actual_count, records, (unsigned long long)duration_ms);
     }
     return 0;
 }
