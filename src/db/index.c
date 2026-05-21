@@ -1041,6 +1041,25 @@ static void *shard_build_worker(void *arg) {
     return NULL;
 }
 
+/* Per-shard incremental merge worker — same shape as ShardBuildArg but
+   uses btree_bulk_merge so successive batches accumulate into the same
+   .idx/.tg file without destroying earlier batches' entries. Used by
+   the trigram build pipeline, which batches kf shards to keep peak
+   memory bounded by g_index_build_budget_bytes. */
+typedef struct {
+    char     ipath[PATH_MAX];
+    BtEntry *pairs;        /* slice — caller owns backing memory */
+    size_t   pair_count;
+} ShardMergeArg;
+
+static void *shard_merge_worker(void *arg) {
+    ShardMergeArg *sm = (ShardMergeArg *)arg;
+    /* btree_bulk_merge sorts new_entries internally; no qsort needed
+       here. It also handles the empty-existing case as a clean build. */
+    btree_bulk_merge(sm->ipath, sm->pairs, sm->pair_count);
+    return NULL;
+}
+
 /* Bucket-sort `pairs` (of total `count`) into `nshards` partitions by
    idx_shard_for_hash(pair.hash, splits). Returns a malloc'd contiguous
    BtEntry array of length `count` (caller frees) plus per-shard offset/length
@@ -1639,97 +1658,152 @@ int build_trigram_pass(const char *db_root, const char *object,
     if (!sdb) return -1;
 
     int n_kf = sch->splits;
-    TgWorkerCtx *workers = calloc((size_t)n_kf, sizeof(TgWorkerCtx));
-    if (!workers) return -1;
-    for (int s = 0; s < n_kf; s++) {
-        workers[s].sdb         = sdb;
-        workers[s].kf_shard    = s;
-        workers[s].field_index = fi;
-        workers[s].ts          = ts;
-    }
 
-    /* Phase 1 — parallel walk. Each worker fills its own pairs+arena
-       lock-free. */
-    parallel_for(tg_worker_walk, workers, n_kf, sizeof(TgWorkerCtx));
+    /* Adaptive batching across kf shards — mirrors the budget logic
+       cmd_add_indexes uses across fields, but trigram only has one
+       field so we batch the kf-shard dimension instead. At ~8 trigrams
+       per record, accumulating ALL records' (trigram, hash) pairs at
+       once for a 25M object would spike to 6+ GB — past any reasonable
+       budget. Each batch: parallel walk → concat → partition → parallel
+       qsort + btree_bulk_merge into the .tg files. */
+    int live = get_live_count(db_root, object);
+    if (live < 0) live = 0;
+    size_t budget = g_index_build_budget_bytes;
+    if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
 
-    /* Phase 2 — rebase value pointers from offsets to real arena
-       addresses now that no further reallocs happen. Total up the
-       global pair count for the concat below. */
-    size_t total = 0;
-    for (int s = 0; s < n_kf; s++) {
-        TgWorkerCtx *w = &workers[s];
-        for (size_t i = 0; i < w->pair_count; i++) {
-            uintptr_t off = (uintptr_t)w->pairs[i].value;
-            w->pairs[i].value = (const char *)(w->arena + off);
+    /* Per-kf-shard estimate: records_in_shard × TG_AVG × (BtEntry + 3-byte
+       arena cell) × 2 (partition_by_shard copy). TG_AVG=16 is a generous
+       upper bound for short English text; longer / denser fields will
+       just produce smaller batch sizes from a higher estimate. */
+    const size_t TG_AVG = 16;
+    const size_t PER_ENTRY_BYTES = sizeof(BtEntry) + 3;
+    size_t per_shard_records = (n_kf > 0) ? ((size_t)live + (size_t)n_kf - 1) / (size_t)n_kf : 0;
+    if (per_shard_records < 1024) per_shard_records = 1024;
+    size_t per_shard_bytes = per_shard_records * TG_AVG * PER_ENTRY_BYTES * 2;
+    int batch_size = (per_shard_bytes > 0) ? (int)(budget / per_shard_bytes) : n_kf;
+    if (batch_size < 1) batch_size = 1;
+    if (batch_size > n_kf) batch_size = n_kf;
+
+    log_msg(2, "BUILD-TRIGRAM %s/%s: %d kf shards, %d per batch (~%zu MB/batch budget)",
+            db_root, object, n_kf, batch_size, budget / (1024 * 1024));
+
+    for (int batch_start = 0; batch_start < n_kf; batch_start += batch_size) {
+        int batch_end = batch_start + batch_size;
+        if (batch_end > n_kf) batch_end = n_kf;
+        int batch_n = batch_end - batch_start;
+
+        TgWorkerCtx *workers = calloc((size_t)batch_n, sizeof(TgWorkerCtx));
+        if (!workers) return -1;
+        for (int i = 0; i < batch_n; i++) {
+            workers[i].sdb         = sdb;
+            workers[i].kf_shard    = batch_start + i;
+            workers[i].field_index = fi;
+            workers[i].ts          = ts;
         }
-        total += w->pair_count;
-    }
 
-    if (total == 0) {
-        for (int s = 0; s < n_kf; s++) {
-            free(workers[s].pairs);
-            free(workers[s].arena);
+        /* Phase 1 — parallel walk over this batch's kf shards. */
+        parallel_for(tg_worker_walk, workers, batch_n, sizeof(TgWorkerCtx));
+
+        /* Phase 2 — rebase offset → arena pointer. */
+        size_t total = 0;
+        for (int i = 0; i < batch_n; i++) {
+            TgWorkerCtx *w = &workers[i];
+            for (size_t j = 0; j < w->pair_count; j++) {
+                uintptr_t off = (uintptr_t)w->pairs[j].value;
+                w->pairs[j].value = (const char *)(w->arena + off);
+            }
+            total += w->pair_count;
+        }
+
+        if (total == 0) {
+            for (int i = 0; i < batch_n; i++) {
+                free(workers[i].pairs);
+                free(workers[i].arena);
+            }
+            free(workers);
+            continue;
+        }
+
+        /* Phase 3 — concat per-worker arrays. */
+        BtEntry *all = malloc(total * sizeof(BtEntry));
+        if (!all) {
+            for (int i = 0; i < batch_n; i++) {
+                free(workers[i].pairs);
+                free(workers[i].arena);
+            }
+            free(workers);
+            return -1;
+        }
+        size_t off = 0;
+        for (int i = 0; i < batch_n; i++) {
+            memcpy(all + off, workers[i].pairs,
+                   workers[i].pair_count * sizeof(BtEntry));
+            off += workers[i].pair_count;
+            free(workers[i].pairs);
+            workers[i].pairs = NULL;
+        }
+
+        /* Phase 4 — partition by .tg shard, then parallel
+           qsort + btree_bulk_merge per shard. Merge (not bulk_build)
+           because subsequent batches must accumulate into the same
+           .tg files; bulk_merge handles the empty-existing case as
+           a clean build internally. */
+        size_t *offsets = NULL, *counts = NULL;
+        BtEntry *parted = partition_by_shard(all, total, sch->splits, idx_n,
+                                             &offsets, &counts);
+        free(all);
+
+        if (parted) {
+            ShardMergeArg *sm = malloc((size_t)idx_n * sizeof(ShardMergeArg));
+            int sm_count = 0;
+            for (int s = 0; s < idx_n; s++) {
+                if (counts[s] == 0) continue;
+                tg_build_path(sm[sm_count].ipath, sizeof(sm[sm_count].ipath),
+                              db_root, object, field, s);
+                sm[sm_count].pairs = parted + offsets[s];
+                sm[sm_count].pair_count = counts[s];
+                sm_count++;
+            }
+            parallel_for(shard_merge_worker, sm, sm_count, sizeof(ShardMergeArg));
+            free(sm);
+            free(parted);
+            free(offsets);
+            free(counts);
+        }
+
+        /* Free this batch's arenas (no live readers of value pointers
+           — bulk_merge already extracted what it needed). */
+        for (int i = 0; i < batch_n; i++) {
+            free(workers[i].arena);
         }
         free(workers);
-        return 0;
     }
 
-    /* Phase 3 — concat all worker pair arrays into one contiguous
-       buffer for partitioning. BtEntry.value still points into each
-       worker's arena, so the arenas must live until shard_build_worker
-       finishes consuming them. */
-    BtEntry *all = malloc(total * sizeof(BtEntry));
-    if (!all) {
-        for (int s = 0; s < n_kf; s++) {
-            free(workers[s].pairs);
-            free(workers[s].arena);
-        }
-        free(workers);
-        return -1;
-    }
-    size_t off = 0;
-    for (int s = 0; s < n_kf; s++) {
-        memcpy(all + off, workers[s].pairs,
-               workers[s].pair_count * sizeof(BtEntry));
-        off += workers[s].pair_count;
-        free(workers[s].pairs);
-        workers[s].pairs = NULL;
-    }
-
-    /* Phase 4 — bucket by .tg shard via idx_shard_for_hash, then
-       parallel sort + bulk-build per shard. Identical to cmd_add_index's
-       btree path — the .tg files share the BTRH format with .idx so
-       shard_build_worker (qsort + btree_bulk_build) works unchanged. */
-    size_t *offsets = NULL, *counts = NULL;
-    BtEntry *parted = partition_by_shard(all, total, sch->splits, idx_n,
-                                         &offsets, &counts);
-    free(all);
-
-    if (parted) {
-        ShardBuildArg *sb = malloc((size_t)idx_n * sizeof(ShardBuildArg));
-        int sb_count = 0;
-        for (int s = 0; s < idx_n; s++) {
-            if (counts[s] == 0) continue;
-            tg_build_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
-                          db_root, object, field, s);
-            sb[sb_count].pairs = parted + offsets[s];
-            sb[sb_count].pair_count = counts[s];
-            sb_count++;
-        }
-        parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
-        free(sb);
-        free(parted);
-        free(offsets);
-        free(counts);
-    }
-
-    /* Now safe to free the per-worker arenas (no more readers of
-       BtEntry.value pointers). */
-    for (int s = 0; s < n_kf; s++) {
-        free(workers[s].arena);
-    }
-    free(workers);
     return 0;
+}
+
+/* Per-kf-shard worker for parallel bitmap rebuild. Each worker handles
+   one (kf_shard, .bm) pair — opens its own .bm writer, walks the
+   matching kf shard, and bm_sets per record. Files don't overlap, so
+   no locking; mmap absorbs the writes directly. */
+typedef struct {
+    char         path[PATH_MAX];
+    int          kf_shard;
+    int          slots_per_shard;
+    int          fi;
+    TypedSchema *ts;
+    SlotcaskDb  *sdb;
+} BmShardWalkArg;
+
+static void *bm_shard_walk_worker(void *arg) {
+    BmShardWalkArg *a = (BmShardWalkArg *)arg;
+    BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 0, 0, 0,
+                              1 /* writer: reindex bm_set's */);
+    if (!bm) return NULL;
+    BmRebuildCtx c = { bm, a->fi, a->ts };
+    slotcask_walk_one_shard_slots(a->sdb, a->kf_shard, bm_rebuild_cb, &c);
+    bm_close(bm);
+    return NULL;
 }
 
 int build_bitmap_pass(const char *db_root, const char *object,
@@ -1764,15 +1838,23 @@ int build_bitmap_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
 
+    /* Parallel kf-shard walks: each worker opens its own .bm (paths are
+       unique per kf shard), walks its assigned kf shard, and bm_sets
+       directly into the mmap'd file. Zero file contention; no memory
+       accumulation (mmap is the persistent store). Matches the
+       phase-1-parallel shape used by btree/trigram. */
+    BmShardWalkArg *args = malloc((size_t)sch->splits * sizeof(BmShardWalkArg));
+    if (!args) return -1;
     for (int s = 0; s < sch->splits; s++) {
-        char bp[PATH_MAX];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, slots_per_shard, 0, 0, 0, 1 /* writer: reindex bm_set's */);
-        if (!bm) continue;
-        BmRebuildCtx c = { bm, fi, ts };
-        slotcask_walk_one_shard_slots(sdb, s, bm_rebuild_cb, &c);
-        bm_close(bm);
+        bm_build_path(args[s].path, sizeof(args[s].path), db_root, object, field, s);
+        args[s].kf_shard       = s;
+        args[s].slots_per_shard= slots_per_shard;
+        args[s].fi             = fi;
+        args[s].ts             = ts;
+        args[s].sdb            = sdb;
     }
+    parallel_for(bm_shard_walk_worker, args, sch->splits, sizeof(BmShardWalkArg));
+    free(args);
     return 0;
 }
 
