@@ -429,6 +429,33 @@ static int run_planner_assertions(TestEnv *env) {
     ASSERT_CONTAINS(resp, "0", "contains \"qwerty\" → 0");
     free(resp); resp = NULL;
 
+    /* estimate-index — sample records, project disk size. We have 6
+       records inserted earlier in this block; the estimator should
+       return non-zero records + avg_distinct_trigrams (since bodies
+       are non-trivial) + an estimated_disk_bytes proportional to it. */
+    tc_request(tc,
+        "{\"mode\":\"estimate-index\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"spec\":\"body:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"records\":6", "estimate: records=6");
+    ASSERT_CONTAINS(resp, "\"sample_size\":6", "estimate: sample=6");
+    ASSERT_TRUE(strstr(resp, "\"avg_distinct_trigrams\":0.0") == NULL,
+                "estimate: non-zero avg_distinct_trigrams");
+    free(resp); resp = NULL;
+
+    /* estimate-index rejects non-:trigram specs. */
+    tc_request(tc,
+        "{\"mode\":\"estimate-index\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"spec\":\"body\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "estimate: missing :trigram → error");
+    free(resp); resp = NULL;
+
+    /* estimate-index rejects non-existent field. */
+    tc_request(tc,
+        "{\"mode\":\"estimate-index\",\"dir\":\"p\",\"object\":\"posts\","
+        "\"spec\":\"nosuch:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "estimate: bad field → error");
+    free(resp); resp = NULL;
+
     tc_close(tc);
     return 0;
 }

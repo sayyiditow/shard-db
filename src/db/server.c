@@ -1412,6 +1412,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         cmd_size(db_root, object);
     } else if (strcmp(mode, "orphaned") == 0) {
         cmd_orphaned(db_root, object);
+    } else if (strcmp(mode, "estimate-index") == 0) {
+        char *spec = json_obj_strdup(&req, "spec");
+        cmd_estimate_index(db_root, object, spec ? spec : "");
+        free(spec);
     } else if (strcmp(mode, "count") == 0) {
         char *criteria = json_obj_strdup_raw(&req, "criteria");
         cmd_count(db_root, object, criteria);

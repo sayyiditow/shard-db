@@ -353,6 +353,121 @@ int cmd_orphaned(const char *db_root, const char *object) {
     return 0;
 }
 
+/* ========== ESTIMATE-INDEX ==========
+ * Sample N records, project on-disk index size for a hypothetical
+ * trigram index on the given field. Lets operators budget honestly
+ * before committing to `add-index foo:trigram` — see
+ * [[trigram-impl-map]] phase 5. Wire: spec like "body:trigram". */
+
+#define TG_ESTIMATE_SAMPLE 1024     /* sample size; trades accuracy vs ms cost */
+#define TG_BYTES_PER_ENTRY 20       /* btree leaf cost: 16B hash + ~4B encoded key */
+
+typedef struct {
+    int                field_index;
+    TypedSchema       *ts;
+    size_t             sampled;
+    size_t             distinct_sum;     /* Σ distinct trigrams per record */
+    size_t             max_sample;
+} TgEstimateCtx;
+
+static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
+                          const void *key, size_t klen,
+                          const void *value, size_t vlen,
+                          void *ctx) {
+    (void)slot; (void)hash16; (void)key; (void)klen; (void)vlen;
+    TgEstimateCtx *c = (TgEstimateCtx *)ctx;
+    if (c->sampled >= c->max_sample) return -1;
+    const TypedField *f = &c->ts->fields[c->field_index];
+    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+    if (actual_len > 0) {
+        uint8_t trigrams[TG_MAX_DISTINCT][3];
+        size_t n = tg_extract_distinct(vbase + 2, actual_len,
+                                       trigrams, TG_MAX_DISTINCT);
+        c->distinct_sum += n;
+    }
+    c->sampled++;
+    return 0;
+}
+
+int cmd_estimate_index(const char *db_root, const char *object,
+                        const char *spec) {
+    /* Parse `<field>:<type>`. Only `trigram` is supported in this
+       release — `btree` and `bitmap` would need their own projection
+       formulas; the on-disk size models differ. */
+    if (!spec || !*spec) {
+        OUT("{\"error\":\"missing spec; expected <field>:trigram\"}\n");
+        return 1;
+    }
+    const char *colon = strrchr(spec, ':');
+    if (!colon || strcmp(colon + 1, "trigram") != 0) {
+        OUT("{\"error\":\"only :trigram supported (got '%s')\"}\n", spec);
+        return 1;
+    }
+    char field[256] = {0};
+    size_t flen = (size_t)(colon - spec);
+    if (flen == 0 || flen >= sizeof(field)) {
+        OUT("{\"error\":\"invalid field name in spec\"}\n");
+        return 1;
+    }
+    memcpy(field, spec, flen);
+
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"object has no typed schema\"}\n");
+        return 1;
+    }
+    int fi = typed_field_index(ts, field);
+    if (fi < 0) {
+        OUT("{\"error\":\"field '%s' not in object\"}\n", field);
+        return 1;
+    }
+    if (ts->fields[fi].type != FT_VARCHAR) {
+        OUT("{\"error\":\"trigram requires varchar; field '%s' is type %d\"}\n",
+            field, ts->fields[fi].type);
+        return 1;
+    }
+
+    Schema sch = load_schema(db_root, object);
+    int live = get_live_count(db_root, object);
+    if (live <= 0) {
+        OUT("{\"records\":0,\"sample_size\":0,\"avg_distinct_trigrams\":0,"
+            "\"estimated_entries\":0,\"estimated_disk_bytes\":0}\n");
+        return 0;
+    }
+
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size, .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        OUT("{\"error\":\"slotcask open failed\"}\n");
+        return 1;
+    }
+
+    /* Walk shards in order, accumulating up to TG_ESTIMATE_SAMPLE
+       records. Stops early once the cap is hit. */
+    TgEstimateCtx c = {
+        .field_index = fi, .ts = ts,
+        .sampled = 0, .distinct_sum = 0, .max_sample = TG_ESTIMATE_SAMPLE,
+    };
+    for (int s = 0; s < sch.splits && c.sampled < c.max_sample; s++) {
+        slotcask_walk_one_shard_slots(sdb, s, tg_estimate_cb, &c);
+    }
+
+    double avg_distinct = c.sampled > 0
+        ? (double)c.distinct_sum / (double)c.sampled : 0.0;
+    long long est_entries = (long long)((double)live * avg_distinct);
+    long long est_disk = est_entries * TG_BYTES_PER_ENTRY;
+
+    OUT("{\"records\":%d,\"sample_size\":%zu,"
+        "\"avg_distinct_trigrams\":%.1f,"
+        "\"estimated_entries\":%lld,"
+        "\"estimated_disk_bytes\":%lld}\n",
+        live, c.sampled, avg_distinct, est_entries, est_disk);
+    return 0;
+}
+
 /* ========== FIELD DECODE ========== */
 
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object) {

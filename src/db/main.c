@@ -158,6 +158,21 @@ int main(int argc, char *argv[]) {
             snprintf(json, sizeof(json), "{\"mode\":\"reindex\"}");
         return cmd_query_json(port, json);
     }
+    /* estimate-index <dir> <obj> <field>:trigram — sample 1024 records,
+       project on-disk size for a hypothetical trigram index. Lets ops
+       budget honestly before committing to add-index. */
+    if (strcmp(cmd, "estimate-index") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "Usage: shard-db estimate-index <dir> <obj> <field>:trigram\n");
+            return 1;
+        }
+        char json[1024];
+        snprintf(json, sizeof(json),
+            "{\"mode\":\"estimate-index\",\"dir\":\"%s\",\"object\":\"%s\",\"spec\":\"%s\"}",
+            argv[2], argv[3], argv[4]);
+        return cmd_query_json(port, json);
+    }
+
     /* drop <dir> <obj>  [--if-exists]   — remove object data + config entirely */
     if (strcmp(cmd, "drop") == 0 || strcmp(cmd, "drop-object") == 0) {
         if (argc < 4) {
