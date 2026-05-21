@@ -11943,50 +11943,10 @@ static int tg_count_cb(const char *value, size_t vlen,
     return 0;
 }
 
-/* Walk all .tg shards for a single trigram, populating `out` with every
-   record hash whose value contains that trigram. Returns the populated
-   KeySet (caller owns) or NULL on alloc/timeout.
-
-   Two-pass: first pass counts entries across shards so we can size the
-   KeySet exactly. The KeySet has no resize, so under-sizing it would
-   silently drop entries past capacity — at 25M scale a common trigram
-   like "ali" has ~800k posting entries, far past the previous 4096
-   hint that produced an 8192-slot table. */
-static KeySet *tg_keyset_for_trigram(const char *db_root, const char *object,
-                                     const char *field, int splits,
-                                     const uint8_t trigram[3],
-                                     QueryDeadline *dl) {
-    int idx_n = index_splits_for(splits);
-
-    /* Pass 1 — count posting-list size across all .tg shards. */
-    size_t total = 0;
-    for (int s = 0; s < idx_n; s++) {
-        char tp[PATH_MAX];
-        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
-        TgCountCtx cc = { 0, dl, 0 };
-        btree_range(tp, (const char *)trigram, 3,
-                    (const char *)trigram, 3,
-                    tg_count_cb, &cc);
-        if (cc.timed_out) return NULL;
-        total += cc.count;
-    }
-
-    /* Pass 2 — allocate keyset sized to fit, then populate. floor 256
-       to avoid zero-cap; keyset_new internally rounds up to next pow2
-       of hint*2 so the load factor stays under 0.5. */
-    KeySet *ks = keyset_new(total > 0 ? total : 256);
-    if (!ks) return NULL;
-    TgCollectCtx c = { ks, dl, 0 };
-    for (int s = 0; s < idx_n; s++) {
-        char tp[PATH_MAX];
-        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
-        btree_range(tp, (const char *)trigram, 3,
-                    (const char *)trigram, 3,
-                    tg_collect_to_keyset_cb, &c);
-        if (c.timed_out) { keyset_free(ks); return NULL; }
-    }
-    return ks;
-}
+/* (tg_keyset_for_trigram used to materialise a full per-trigram keyset
+   via two passes — replaced by tg_intersect_streaming below which only
+   materialises the seed (rarest trigram) and streams subsequent
+   intersections via membership tests. Saves N-1 keyset allocations.) */
 
 /* Build the intersection of two KeySets via iteration. Returns a new
    KeySet (caller owns). Iterates the smaller side, checks membership
@@ -12004,6 +11964,8 @@ static int pairwise_intersect_cb(const uint8_t hash[16], void *ctx) {
     return 0;
 }
 
+static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b)
+    __attribute__((unused));
 static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b) {
     if (!a || !b) return NULL;
     KeySet *small = keyset_size(a) <= keyset_size(b) ? a : b;
@@ -12021,6 +11983,74 @@ static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b) {
    per-record memmem verify step downstream).
    Patterns shorter than 3 chars cannot generate trigrams; this returns
    NULL so the caller falls back to full scan. */
+/* Streaming-filter callback: keep only hashes that ARE in the running
+   keyset, accumulating matches into a new keyset. Replaces building
+   the full posting-set for every subsequent trigram. */
+typedef struct {
+    KeySet        *running;   /* hashes still alive after previous trigrams */
+    KeySet        *next;      /* matches accumulate here */
+    QueryDeadline *dl;
+    int            timed_out;
+} TgFilterCtx;
+
+static int tg_filter_cb(const char *value, size_t vlen,
+                        const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen;
+    TgFilterCtx *c = (TgFilterCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    if (keyset_contains(c->running, hash)) keyset_insert(c->next, hash);
+    return 0;
+}
+
+/* Count a single trigram's posting-list size across all shards. Used
+   to pick the rarest trigram first for the streaming-intersect loop
+   below — gives a small seed keyset and dramatic speedup on long
+   patterns whose extracted trigrams have wildly varying selectivity
+   (e.g. "alice.smith0" has common "ali" and rare "h0X"). */
+static size_t tg_posting_count(const char *db_root, const char *object,
+                               const char *field, int splits,
+                               const uint8_t trigram[3],
+                               QueryDeadline *dl) {
+    int idx_n = index_splits_for(splits);
+    size_t total = 0;
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        TgCountCtx cc = { 0, dl, 0 };
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_count_cb, &cc);
+        if (cc.timed_out) return 0;
+        total += cc.count;
+    }
+    return total;
+}
+
+/* Walk all .tg shards for `trigram`, filtering `running` via membership
+   test. Result keyset contains the intersection. `running` is freed. */
+static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
+                                      const char *field, int splits,
+                                      const uint8_t trigram[3],
+                                      KeySet *running, QueryDeadline *dl) {
+    if (!running || keyset_size(running) == 0) return running;
+    int idx_n = index_splits_for(splits);
+
+    /* Result size ≤ |running|. Size to fit. */
+    KeySet *next = keyset_new(keyset_size(running));
+    if (!next) { keyset_free(running); return NULL; }
+    TgFilterCtx c = { running, next, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_filter_cb, &c);
+        if (c.timed_out) { keyset_free(running); keyset_free(next); return NULL; }
+    }
+    keyset_free(running);
+    return next;
+}
+
 static KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
                                         int splits,
                                         const SearchCriterion *leaf,
@@ -12043,23 +12073,59 @@ static KeySet *build_keyset_from_trigram(const char *db_root, const char *object
     size_t  n = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
     if (n == 0) return NULL;
 
-    /* First trigram seeds the candidate set; subsequent trigrams shrink
-       it via intersection. Order doesn't affect correctness but rare
-       trigrams first would reduce per-shard work — we don't have stats
-       yet, so process in the order tg_extract_distinct emitted (window
-       order) for v1. */
-    KeySet *acc = tg_keyset_for_trigram(db_root, object, leaf->field,
-                                        splits, trigrams[0], dl);
-    if (!acc) return NULL;
-    for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
-        KeySet *next = tg_keyset_for_trigram(db_root, object, leaf->field,
-                                              splits, trigrams[i], dl);
-        if (!next) { keyset_free(acc); return NULL; }
-        KeySet *merged = keyset_pairwise_intersect(acc, next);
-        keyset_free(acc); keyset_free(next);
-        if (!merged) return NULL;
-        acc = merged;
+    /* Sort trigrams by posting size ascending — rarest first. The
+       seed keyset is the smallest posting list (saves allocation +
+       avoids the worst-case bloat); subsequent trigrams stream-
+       filter via membership instead of materialising their own full
+       keyset. For "alice.smith0" (10 trigrams of varying selectivity),
+       this is the difference between materialising 10 × 800k
+       keysets vs 1 × tiny + 9 stream walks that mostly early-out. */
+    typedef struct { uint8_t tg[3]; size_t count; } TgEntry;
+    TgEntry *order = malloc(n * sizeof(TgEntry));
+    if (!order) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(order[i].tg, trigrams[i], 3);
+        order[i].count = tg_posting_count(db_root, object, leaf->field,
+                                          splits, trigrams[i], dl);
+        if (dl && dl->timed_out) { free(order); return NULL; }
+        /* Any zero-posting trigram → intersection is empty. */
+        if (order[i].count == 0) {
+            free(order);
+            return keyset_new(16);  /* empty */
+        }
     }
+    /* Simple insertion sort — n ≤ TG_MAX_DISTINCT (4096) but typically <50. */
+    for (size_t i = 1; i < n; i++) {
+        TgEntry key = order[i];
+        size_t j = i;
+        while (j > 0 && order[j-1].count > key.count) {
+            order[j] = order[j-1]; j--;
+        }
+        order[j] = key;
+    }
+
+    /* Seed from rarest trigram — sized exactly to its posting count. */
+    KeySet *acc = keyset_new(order[0].count);
+    if (!acc) { free(order); return NULL; }
+    int idx_n = index_splits_for(splits);
+    TgCollectCtx cc = { acc, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
+        btree_range(tp, (const char *)order[0].tg, 3,
+                    (const char *)order[0].tg, 3,
+                    tg_collect_to_keyset_cb, &cc);
+        if (cc.timed_out) { keyset_free(acc); free(order); return NULL; }
+    }
+
+    /* Streaming intersect against each subsequent trigram. Early-exit
+       once running is empty. */
+    for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
+        acc = tg_intersect_streaming(db_root, object, leaf->field, splits,
+                                     order[i].tg, acc, dl);
+        if (!acc) { free(order); return NULL; }
+    }
+    free(order);
     return acc;
 }
 
