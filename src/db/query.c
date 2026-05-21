@@ -11922,18 +11922,59 @@ static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
     return 0;
 }
 
+/* Counting callback for the sizing pass below — counts posting-list
+   entries WITHOUT building the keyset, so we can allocate the keyset
+   exactly to fit. KeySet is non-resizable; under-sizing silently
+   drops inserts when the table fills, which used to truncate common-
+   prefix trigrams ("ali", "the", ...) to 8192 hashes and produce wrong
+   intersections downstream. */
+typedef struct {
+    size_t         count;
+    QueryDeadline *dl;
+    int            timed_out;
+} TgCountCtx;
+
+static int tg_count_cb(const char *value, size_t vlen,
+                       const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen; (void)hash;
+    TgCountCtx *c = (TgCountCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    c->count++;
+    return 0;
+}
+
 /* Walk all .tg shards for a single trigram, populating `out` with every
    record hash whose value contains that trigram. Returns the populated
-   KeySet (caller owns) or NULL on alloc/timeout. */
+   KeySet (caller owns) or NULL on alloc/timeout.
+
+   Two-pass: first pass counts entries across shards so we can size the
+   KeySet exactly. The KeySet has no resize, so under-sizing it would
+   silently drop entries past capacity — at 25M scale a common trigram
+   like "ali" has ~800k posting entries, far past the previous 4096
+   hint that produced an 8192-slot table. */
 static KeySet *tg_keyset_for_trigram(const char *db_root, const char *object,
                                      const char *field, int splits,
                                      const uint8_t trigram[3],
                                      QueryDeadline *dl) {
     int idx_n = index_splits_for(splits);
-    /* Trigrams are sparse-on-average; size conservatively. The first
-       call's keyset is the seed for intersection so a bit of slack
-       lets later inserts probe quickly. */
-    KeySet *ks = keyset_new(4096);
+
+    /* Pass 1 — count posting-list size across all .tg shards. */
+    size_t total = 0;
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        TgCountCtx cc = { 0, dl, 0 };
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_count_cb, &cc);
+        if (cc.timed_out) return NULL;
+        total += cc.count;
+    }
+
+    /* Pass 2 — allocate keyset sized to fit, then populate. floor 256
+       to avoid zero-cap; keyset_new internally rounds up to next pow2
+       of hint*2 so the load factor stays under 0.5. */
+    KeySet *ks = keyset_new(total > 0 ? total : 256);
     if (!ks) return NULL;
     TgCollectCtx c = { ks, dl, 0 };
     for (int s = 0; s < idx_n; s++) {
