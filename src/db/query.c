@@ -11642,6 +11642,33 @@ static int op_prefers_trigram(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_ICONTAINS;
 }
 
+/* Planner heuristic — for short contains/i_contains patterns on a
+ * field that also has a btree, the btree-leaf walk wins over trigram
+ * because the trigram path's verify step is O(candidates × per-record
+ * fetch) while btree-leaf is O(total_leaves × per-leaf memmem). At
+ * 25M scale on small-vocab data: "baker" (5 char, 833k hits)
+ * costs ~160ms via btree-leaf vs ~740ms via trigram (verify-bound).
+ *
+ * Threshold 6 is empirical: 5-char patterns regress to ~700ms+ via
+ * trigram, 6-char rare patterns (e.g. "qwerty") win via trigram (6ms
+ * vs 200ms btree-leaf). Above 6 chars trigram intersection prunes
+ * fast and verify cost stays manageable for typical result sizes.
+ *
+ * Pre-condition: caller has already established op is trigram-able
+ * and the field has a trigram index. */
+#define TG_PREFER_BTREE_LEN 6
+static int planner_prefer_btree_leaf(const char *db_root, const char *object,
+                                     const SearchCriterion *leaf) {
+    if (!leaf) return 0;
+    size_t plen = strlen(leaf->value);
+    if (plen >= TG_PREFER_BTREE_LEN) return 0;
+    /* Order-independent — field_index_type returns first-declared type
+       only, so a field with both btree+trigram could return IT_TRIGRAM
+       depending on index.conf order. field_has_index_type checks for
+       any matching type, which is what we want here. */
+    return field_has_index_type(db_root, object, leaf->field, IT_BTREE);
+}
+
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
    over the cached arrays — cheap for the planner hot path. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
@@ -12147,6 +12174,7 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
        through the bitmap walker. Everything else stays on the existing
        btree path. */
     if (op_prefers_trigram(leaf->op) &&
+        !planner_prefer_btree_leaf(db_root, object, leaf) &&
         field_has_index_type(db_root, object, leaf->field, IT_TRIGRAM)) {
         KeySet *ks = build_keyset_from_trigram(db_root, object, splits, leaf, dl);
         if (ks) return ks;
@@ -13143,6 +13171,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                the full criterion (kills false positives from
                order-insensitive trigram match). */
             if (op_prefers_trigram(op) &&
+                !planner_prefer_btree_leaf(db_root, object, pc) &&
                 field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
                 KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                            sch.splits, pc, &dl);
@@ -14137,6 +14166,7 @@ int cmd_find(const char *db_root, const char *object,
            walk. */
         int rc = 0;
         if (op_prefers_trigram(op) &&
+            !planner_prefer_btree_leaf(db_root, object, pc) &&
             field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
             KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                        sch.splits, pc, &dl);
