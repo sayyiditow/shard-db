@@ -240,6 +240,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_incremental.c \
     src/bench/bench_btree.c \
     src/bench/bench_bitmap_vs_btree.c \
+    src/bench/bench_trigram_sizing.c \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
