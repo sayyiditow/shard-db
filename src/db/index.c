@@ -1345,7 +1345,7 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     uint8_t key_buf[1024];
     size_t  key_len = 0;
     if (f->type == FT_VARCHAR) {
-        uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+        uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
         if (actual_len == 0 || actual_len > sizeof(key_buf)) return 0;
         memcpy(key_buf, vbase + 2, actual_len);
         key_len = actual_len;
@@ -2054,7 +2054,7 @@ static int stream_record_cb(uint32_t slot, const uint8_t hash16[16],
         const TypedField *f = &w->ts->fields[w->field_index];
         if (f->type != FT_VARCHAR) return 0;
         const uint8_t *vbase = (const uint8_t *)value + f->offset;
-        uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+        uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
         if (actual_len == 0) return 0;
 
         uint8_t trigrams[TG_MAX_DISTINCT][3];

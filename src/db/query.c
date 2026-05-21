@@ -379,7 +379,7 @@ static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
     if (c->sampled >= c->max_sample) return -1;
     const TypedField *f = &c->ts->fields[c->field_index];
     const uint8_t *vbase = (const uint8_t *)value + f->offset;
-    uint16_t actual_len = (uint16_t)vbase[0] | ((uint16_t)vbase[1] << 8);
+    uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
     if (actual_len > 0) {
         uint8_t trigrams[TG_MAX_DISTINCT][3];
         size_t n = tg_extract_distinct(vbase + 2, actual_len,
