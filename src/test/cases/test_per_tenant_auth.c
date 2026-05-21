@@ -21,18 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
 static int file_size(const char *path) {
     struct stat st;
@@ -50,20 +39,6 @@ static int file_contains(const char *path, const char *needle) {
     return found;
 }
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
 static int spawn_daemon(const char *base, const char *db_root, int port,
                         const char *shard_db_abs, const char *gtok,
@@ -97,19 +72,19 @@ static int test_per_tenant_auth_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-pta-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755); mkdir(db_root, 0755);
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* dirs.conf: default + tenant_a + tenant_b. */
     char p[400];
     snprintf(p, sizeof(p), "%s/dirs.conf", db_root);
     FILE *f = fopen(p, "w");
     if (f) { fputs("default\ntenant_a\ntenant_b\n", f); fclose(f); }
-    run_cmd("mkdir -p %s/tenant_a %s/tenant_b", db_root, db_root);
-    run_cmd("touch %s/allowed_ips.conf", db_root);
+    tu_run_cmd("mkdir -p %s/tenant_a %s/tenant_b", db_root, db_root);
+    tu_run_cmd("touch %s/allowed_ips.conf", db_root);
 
     char gtok[64]; snprintf(gtok, sizeof(gtok), "sdb_global_admin_%d", (int)time(NULL));
     snprintf(p, sizeof(p), "%s/tokens.conf", db_root);
@@ -117,7 +92,7 @@ static int test_per_tenant_auth_run(void) {
 
     char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
     f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); run_cmd("rm -rf %s", base); return 1; }
+    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
     fprintf(f,
         "export DB_ROOT=\"%s\"\n"
         "export PORT=%d\n"
@@ -137,18 +112,18 @@ static int test_per_tenant_auth_run(void) {
     const char *sdb_rel = "./build/bin/shard-db";
     if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
     if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     TestEnv env = {0};
     if (spawn_daemon(base, db_root, port, shard_db_abs, gtok, &env) != 0) {
-        ASSERT_TRUE(0, "spawn daemon"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "spawn daemon"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { stop_no_wipe(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL; char req[1024];
     snprintf(req, sizeof(req),
@@ -281,7 +256,7 @@ static int test_per_tenant_auth_run(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"remove-token\",\"auth\":\"%s\",\"token\":\"%s\"}", gtok, tatok);
     tc_request(tc, req, &resp); free(resp); resp = NULL;
-    ASSERT_TRUE(!file_exists(ta_path) || file_size(ta_path) == 0,
+    ASSERT_TRUE(!tu_file_exists(ta_path) || file_size(ta_path) == 0,
                 "tenant_a tokens.conf empty after removal");
     ASSERT_TRUE(file_contains(glb_path, gtok), "global tokens.conf still has admin token");
 
@@ -294,14 +269,14 @@ static int test_per_tenant_auth_run(void) {
 
     /* Persistence across restart. */
     tc_close(tc); tc = NULL;
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     char rtok[64]; snprintf(rtok, sizeof(rtok), "sdb_restart_test_%d", (int)time(NULL));
     char tbpath[400]; snprintf(tbpath, sizeof(tbpath), "%s/tenant_b/tokens.conf", db_root);
     f = fopen(tbpath, "w"); if (f) { fprintf(f, "%s\n", rtok); fclose(f); }
 
     if (spawn_daemon(base, db_root, port, shard_db_abs, gtok, &env) != 0) {
-        ASSERT_TRUE(0, "respawn daemon"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "respawn daemon"); tu_run_cmd("rm -rf %s", base); return 1;
     }
     cfg.port = port;
     tc = tc_connect(&cfg);
@@ -322,8 +297,8 @@ static int test_per_tenant_auth_run(void) {
         tc_close(tc);
     }
 
-    stop_no_wipe(&env);
-    run_cmd("rm -rf %s", base);
+    test_env_stop_keep(&env);
+    tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

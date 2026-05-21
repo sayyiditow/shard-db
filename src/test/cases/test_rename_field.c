@@ -17,25 +17,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
-
-/* Read file contents into a heap buffer; caller frees. */
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f);
-    buf[sz] = '\0';
-    fclose(f);
-    return buf;
-}
 
 static int test_rename_field_run(void) {
     TestEnv env = {0};
@@ -67,11 +48,11 @@ static int test_rename_field_run(void) {
     char path[400];
 
     snprintf(path, sizeof(path), "%s/indexes/email", obj);
-    ASSERT_TRUE(file_exists(path), "email index exists");
+    ASSERT_TRUE(tu_file_exists(path), "email index exists");
     snprintf(path, sizeof(path), "%s/indexes/age", obj);
-    ASSERT_TRUE(file_exists(path), "age index exists");
+    ASSERT_TRUE(tu_file_exists(path), "age index exists");
     snprintf(path, sizeof(path), "%s/indexes/fullName+age", obj);
-    ASSERT_TRUE(file_exists(path), "composite index exists");
+    ASSERT_TRUE(tu_file_exists(path), "composite index exists");
 
     /* Happy path: rename email → contact. */
     tc_request(tc, "{\"mode\":\"rename-field\",\"dir\":\"default\",\"object\":\"leads\","
@@ -79,19 +60,19 @@ static int test_rename_field_run(void) {
     ASSERT_CONTAINS(resp, "\"status\":\"renamed\"", "rename-field status"); free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/indexes/contact", obj);
-    ASSERT_TRUE(file_exists(path), "new index file");
+    ASSERT_TRUE(tu_file_exists(path), "new index file");
     snprintf(path, sizeof(path), "%s/indexes/email", obj);
-    ASSERT_TRUE(!file_exists(path), "old index file gone");
+    ASSERT_TRUE(!tu_file_exists(path), "old index file gone");
 
     snprintf(path, sizeof(path), "%s/fields.conf", obj);
-    char *fconf = read_file(path);
+    char *fconf = tu_read_file(path);
     ASSERT_TRUE(fconf && strstr(fconf, "contact:varchar:40") != NULL, "fields.conf has new name");
     ASSERT_TRUE(fconf && strstr(fconf, "\nemail:") == NULL && strncmp(fconf, "email:", 6) != 0,
                 "fields.conf old name gone");
     free(fconf);
 
     snprintf(path, sizeof(path), "%s/indexes/index.conf", obj);
-    char *idxconf = read_file(path);
+    char *idxconf = tu_read_file(path);
     ASSERT_TRUE(idxconf && strstr(idxconf, "contact") != NULL, "index.conf has new name");
     free(idxconf);
 
@@ -115,12 +96,12 @@ static int test_rename_field_run(void) {
     ASSERT_CONTAINS(resp, "\"status\":\"renamed\"", "composite rename status"); free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/indexes/fn+age", obj);
-    ASSERT_TRUE(file_exists(path), "composite index renamed");
+    ASSERT_TRUE(tu_file_exists(path), "composite index renamed");
     snprintf(path, sizeof(path), "%s/indexes/fullName+age", obj);
-    ASSERT_TRUE(!file_exists(path), "old composite index gone");
+    ASSERT_TRUE(!tu_file_exists(path), "old composite index gone");
 
     snprintf(path, sizeof(path), "%s/fields.conf", obj);
-    fconf = read_file(path);
+    fconf = tu_read_file(path);
     ASSERT_TRUE(fconf && strstr(fconf, "fn:varchar:32") != NULL, "fields.conf has fn");
     free(fconf);
 

@@ -553,3 +553,20 @@ int json_escape_into(char *dst, size_t dst_cap,
     }
     return (int)out;
 }
+
+/* ========== FT_UUID helpers ==========
+ * Shared by config.c (decode_field_to_buf, typed_get_field_str) and
+ * query.c (typed_field_to_buf_raw, decode_idx_to_buf). The all-zero
+ * sentinel is the on-disk "unset" marker for a UUID column. */
+
+int uuid_is_zero(const uint8_t b[16]) {
+    return (b[0]|b[1]|b[2]|b[3]|b[4]|b[5]|b[6]|b[7]
+          | b[8]|b[9]|b[10]|b[11]|b[12]|b[13]|b[14]|b[15]) == 0;
+}
+
+int uuid_format_canonical(char *buf, size_t buflen, const uint8_t b[16]) {
+    return snprintf(buf, buflen,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}

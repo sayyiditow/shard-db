@@ -27,28 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
 static int file_contains(const char *path, const char *needle) {
     FILE *f = fopen(path, "r");
@@ -66,12 +45,12 @@ static int test_token_perms_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-tp-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755);
     mkdir(db_root, 0755);
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* Pre-seed: dirs.conf with default + tp_acme + tp_beta.
        Pre-seed tokens.conf with a global admin token (must be readable BEFORE
@@ -79,8 +58,8 @@ static int test_token_perms_run(void) {
     char dirs_path[300]; snprintf(dirs_path, sizeof(dirs_path), "%s/dirs.conf", db_root);
     FILE *f = fopen(dirs_path, "w");
     if (f) { fputs("default\ntp_acme\ntp_beta\n", f); fclose(f); }
-    run_cmd("mkdir -p %s/tp_acme %s/tp_beta", db_root, db_root);
-    run_cmd("touch %s/allowed_ips.conf", db_root);
+    tu_run_cmd("mkdir -p %s/tp_acme %s/tp_beta", db_root, db_root);
+    tu_run_cmd("touch %s/allowed_ips.conf", db_root);
 
     char gtok[64]; snprintf(gtok, sizeof(gtok), "sdb_tp_admin_%d", (int)time(NULL));
     char gtok_path[300]; snprintf(gtok_path, sizeof(gtok_path), "%s/tokens.conf", db_root);
@@ -90,7 +69,7 @@ static int test_token_perms_run(void) {
     /* Write db.env. We replicate fixture's content but add DISABLE_LOCALHOST_TRUST=1. */
     char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
     f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); run_cmd("rm -rf %s", base); return 1; }
+    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
     fprintf(f,
         "export DB_ROOT=\"%s\"\n"
         "export PORT=%d\n"
@@ -111,11 +90,11 @@ static int test_token_perms_run(void) {
     const char *sdb_rel = "./build/bin/shard-db";
     if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
     if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     pid_t pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); run_cmd("rm -rf %s", base); return 1; }
+    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
         chdir(base);
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
@@ -145,13 +124,13 @@ static int test_token_perms_run(void) {
     if (!ready) {
         ASSERT_TRUE(0, "daemon ready");
         kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-        run_cmd("rm -rf %s", base); return 1;
+        tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { stop_no_wipe(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL; char req[1024];
     /* Setup: 3 objects across 2 tenants. */
@@ -428,7 +407,7 @@ static int test_token_perms_run(void) {
 
     /* === backward compat: bare-line token = rwx === */
     tc_close(tc); tc = NULL;
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     char ltok[64]; snprintf(ltok, sizeof(ltok), "sdb_tp_legacy_%d", (int)time(NULL));
     f = fopen(gtok_path, "w");
@@ -439,7 +418,7 @@ static int test_token_perms_run(void) {
 
     /* Restart manually. */
     pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork restart"); run_cmd("rm -rf %s", base); return 1; }
+    if (pid < 0) { ASSERT_TRUE(0, "fork restart"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
         chdir(base);
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
@@ -473,13 +452,13 @@ static int test_token_perms_run(void) {
 
     /* === TOKEN_CAP smoke === */
     if (tc) { tc_close(tc); tc = NULL; }
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     f = fopen(env_path, "a");
     if (f) { fputs("export TOKEN_CAP=4096\n", f); fclose(f); }
 
     pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork TOKEN_CAP"); run_cmd("rm -rf %s", base); return 1; }
+    if (pid < 0) { ASSERT_TRUE(0, "fork TOKEN_CAP"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
         chdir(base);
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
@@ -510,8 +489,8 @@ static int test_token_perms_run(void) {
         tc_close(tc);
     }
 
-    stop_no_wipe(&env);
-    run_cmd("rm -rf %s", base);
+    test_env_stop_keep(&env);
+    tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

@@ -77,11 +77,6 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n') resp++;
-    return atoi(resp);
-}
 
 static int find_count_keys(TestClient *tc, const char *crit) {
     /* Use count via separate query to avoid huge find responses. */
@@ -91,7 +86,7 @@ static int find_count_keys(TestClient *tc, const char *crit) {
         "\"criteria\":%s}", crit);
     char *resp = NULL;
     tc_request(tc, req, &resp);
-    int n = parse_count(resp);
+    int n = tu_parse_count(resp);
     free(resp);
     return n;
 }
@@ -135,7 +130,7 @@ static int test_parallel_index_integrity_run(void) {
 
     /* Total record count. */
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"idxtest\"}", &resp);
-    ASSERT_EQ_INT(parse_count(resp), TOTAL, "100000 records present");
+    ASSERT_EQ_INT(tu_parse_count(resp), TOTAL, "100000 records present");
     free(resp); resp = NULL;
 
     /* status: 4 values × 25000. */

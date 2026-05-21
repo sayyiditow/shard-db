@@ -43,4 +43,13 @@ void test_env_kill(TestEnv *env);
    sequences) but want to keep the on-disk tree. */
 void test_env_stop_keep(TestEnv *env);
 
+
+/* Shared test utilities — formerly duplicated as `static` in 20+ case
+   files. Prefix `tu_` is "test utility". */
+int   tu_run_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+char *tu_capture_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+char *tu_read_file(const char *path);
+int   tu_file_exists(const char *path);
+int   tu_parse_count(const char *resp);
+
 #endif

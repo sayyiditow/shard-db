@@ -19,10 +19,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
-}
 static int dir_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
@@ -90,7 +86,7 @@ static int test_slotcask_v2_object_run(void) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/kf/000.kf",
              env.db_root);
-    ASSERT_TRUE(file_exists(path), "data/kf/000.kf created");
+    ASSERT_TRUE(tu_file_exists(path), "data/kf/000.kf created");
 
     snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/streams/000",
              env.db_root);
@@ -98,7 +94,7 @@ static int test_slotcask_v2_object_run(void) {
 
     snprintf(path, sizeof(path), "%s/v2tenant/sc_users/data/streams/000/000000.dat",
              env.db_root);
-    ASSERT_TRUE(file_exists(path), "data/streams/000/000000.dat created");
+    ASSERT_TRUE(tu_file_exists(path), "data/streams/000/000000.dat created");
 
     /* `.dirty` is a runtime crash marker — touched on slotcask_open, removed
        on slotcask_close. cmd_create_object opens+closes immediately, so the
@@ -125,7 +121,7 @@ static int test_slotcask_v2_object_run(void) {
 
     snprintf(path, sizeof(path), "%s/v2tenant/default_users/data/kf/000.kf",
              env.db_root);
-    ASSERT_TRUE(file_exists(path),
+    ASSERT_TRUE(tu_file_exists(path),
                 "default lands on v2 layout (data/kf/000.kf present)");
 
     /* --- any explicit storage_version is rejected (field removed from API) --- */

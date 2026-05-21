@@ -2221,29 +2221,54 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
 }
 
 /* Helper: render an actionable "unknown enum value" error message into
-   err_buf. Truncates the legal-values list at ~150 chars so the message
-   stays readable even for large enums. Used by typed_encode_defaults
-   (insert/update path). */
+   err_buf. Truncates the legal-values list cleanly when there's no room
+   left, keeping the message readable for large enums.
+
+   CodeQL #91 ("potentially overflowing call to snprintf"): the previous
+   implementation accumulated snprintf's *would-have-written* return
+   value into `pos`, then passed `err_buf_size - pos` as the next call's
+   remaining-size. If snprintf returned a value larger than the actual
+   space, `pos` walked past `err_buf_size` and the next subtraction
+   underflowed (size_t), letting subsequent snprintf calls write
+   unbounded. Fixed by clamping the running offset after every snprintf
+   so it never exceeds err_buf_size − 1 (the NUL terminator slot). */
 static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
                                   size_t bad_len, char *err_buf, size_t err_buf_size) {
     if (!err_buf || err_buf_size == 0) return;
-    int pos = snprintf(err_buf, err_buf_size,
-                       "unknown enum value \"%.*s\" for field [%s]; legal: [",
-                       (int)bad_len, bad_val, f->name);
-    if (pos < 0 || (size_t)pos >= err_buf_size) { err_buf[err_buf_size - 1] = '\0'; return; }
-    size_t budget = err_buf_size - (size_t)pos - 4;  /* room for "...]" */
+    err_buf[0] = '\0';
+
+    #define APPEND(...) do {                                         \
+        if (pos + 1 >= err_buf_size) break;                          \
+        int _n = snprintf(err_buf + pos, err_buf_size - pos,         \
+                          __VA_ARGS__);                              \
+        if (_n < 0) { err_buf[pos] = '\0'; break; }                  \
+        if ((size_t)_n >= err_buf_size - pos) {                      \
+            pos = err_buf_size - 1; /* clamped + NUL-terminated */   \
+            err_buf[pos] = '\0';                                     \
+            break;                                                   \
+        }                                                            \
+        pos += (size_t)_n;                                           \
+    } while (0)
+
+    size_t pos = 0;
+    APPEND("unknown enum value \"%.*s\" for field [%s]; legal: [",
+           (int)bad_len, bad_val, f->name);
+
     for (int i = 0; i < f->n_enum_values; i++) {
         const char *v = f->enum_values[i];
         if (!v) continue;
         size_t vl = strlen(v);
-        if ((size_t)pos + vl + 3 >= budget) {
-            pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos, "...");
+        /* Reserve 5 bytes for ",..." + "]" + NUL so the truncation
+           marker always fits, even if we have to bail mid-loop. */
+        if (pos + vl + 5 >= err_buf_size) {
+            APPEND("...");
             break;
         }
-        pos += snprintf(err_buf + pos, err_buf_size - (size_t)pos,
-                        "%s%s", i ? "," : "", v);
+        APPEND("%s%s", i ? "," : "", v);
     }
-    snprintf(err_buf + pos, err_buf_size - (size_t)pos, "]");
+    APPEND("]");
+
+    #undef APPEND
 }
 
 /* Encode with field defaults applied. db_root+object needed for seq() defaults;
@@ -2462,16 +2487,14 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return snprintf(buf, buflen, "\"%02d:%02d:%02d\"", hh, mm, ss); /* "HH:MM:SS" */
     }
     case FT_UUID: {
-        /* Emit canonical form: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
+        /* Emit JSON-quoted canonical form ("xxxxxxxx-...-xxxxxxxxxxxx").
+           All-zero bytes = unset; skip empty. */
         const uint8_t *b = data;
-        /* Check if all zeros - skip empty */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, buflen, "\"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\"",
-                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        if (buflen < 39) return 0; /* 36 hex + 2 quotes + NUL */
+        char inner[37];
+        uuid_format_canonical(inner, sizeof(inner), b);
+        return snprintf(buf, buflen, "\"%s\"", inner);
     }
     case FT_ENUM: {
         /* Stored bytes are the byte index (1 or 2 BE). Always emit
@@ -2647,15 +2670,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
     }
     case FT_UUID: {
         const uint8_t *b = data + f->offset;
-        /* Check if all zeros - skip empty */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return NULL;
+        if (uuid_is_zero(b)) return NULL;
         char *out = malloc(37);
-        snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        uuid_format_canonical(out, 37, b);
         return out;
     }
     default:

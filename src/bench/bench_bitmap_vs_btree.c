@@ -82,16 +82,37 @@ static int bulk_insert_chunk(TestClient *tc, const char *object,
     size_t cap = (size_t)batch_size * 64 + 256;
     char *buf = malloc(cap);
     if (!buf) return -1;
-    int pos = snprintf(buf, cap,
-        "{\"mode\":\"bulk-insert\",\"dir\":\"b\",\"object\":\"%s\",\"records\":[",
-        object);
+
+    /* CodeQL #90: previous code accumulated snprintf's *would-have-
+       written* return into `pos`, then passed `cap - pos` as the next
+       call's size. If a single record output exceeded the remaining
+       buffer, `pos` walked past `cap` and subsequent (size_t) subtraction
+       underflowed → snprintf got an enormous "remaining" and could
+       overrun the heap allocation. Fixed by clamping pos after every
+       snprintf and breaking the loop on truncation. */
+    size_t pos = 0;
+    #define APPEND(...) do {                                          \
+        if (pos + 1 >= cap) break;                                    \
+        int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__);         \
+        if (_n < 0) { buf[pos] = '\0'; goto out; }                    \
+        if ((size_t)_n >= cap - pos) {                                \
+            pos = cap - 1; buf[pos] = '\0';                           \
+            goto out;                                                 \
+        }                                                             \
+        pos += (size_t)_n;                                            \
+    } while (0)
+
+    APPEND("{\"mode\":\"bulk-insert\",\"dir\":\"b\",\"object\":\"%s\",\"records\":[",
+           object);
     for (int i = 0; i < batch_size; i++) {
         int id = start_id + i;
-        pos += snprintf(buf + pos, cap - pos,
-            "%s{\"key\":\"k%d\",\"value\":{\"flag\":%s}}",
-            i ? "," : "", id, (id % 2 == 0) ? "true" : "false");
+        APPEND("%s{\"key\":\"k%d\",\"value\":{\"flag\":%s}}",
+               i ? "," : "", id, (id % 2 == 0) ? "true" : "false");
     }
-    pos += snprintf(buf + pos, cap - pos, "]}");
+    APPEND("]}");
+out: ;  /* empty statement — pre-C23 label needs a statement, not a
+           directly-following declaration. */
+    #undef APPEND
 
     char *resp = NULL;
     tc_request(tc, buf, &resp);

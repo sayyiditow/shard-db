@@ -19,19 +19,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f);
-    buf[sz] = '\0';
-    fclose(f);
-    return buf;
-}
 
 static int test_edit_field_run(void) {
     TestEnv env = {0};
@@ -75,7 +62,7 @@ static int test_edit_field_run(void) {
     free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/fields.conf", obj);
-    char *fconf = read_file(path);
+    char *fconf = tu_read_file(path);
     ASSERT_TRUE(fconf && strstr(fconf, "name:varchar:64") != NULL,
                 "fields.conf has new varchar:64");
     ASSERT_TRUE(fconf && strstr(fconf, "name:varchar:32") == NULL,
@@ -116,7 +103,7 @@ static int test_edit_field_run(void) {
     free(resp); resp = NULL;
 
     /* Record + schema unchanged after refusal. */
-    fconf = read_file(path);
+    fconf = tu_read_file(path);
     ASSERT_TRUE(fconf && strstr(fconf, "bio:varchar:16") != NULL,
                 "fields.conf unchanged after failed shrink");
     free(fconf);

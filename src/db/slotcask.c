@@ -54,6 +54,33 @@ extern void compute_hash_raw(const char *key, size_t key_len,
 
 /* ============================================================ Helpers */
 
+/* Sort an int[] index array such that the indexed entries' (old_sid,
+   old_fid) tuples are non-decreasing. Used by every bulk path (upsert
+   + delete) to batch seg-file reads / writes by physical locality —
+   one batch hits one segment file once instead of scattering. Different
+   bulk paths use slightly different state structs (different field
+   names beyond old_sid/old_fid), so this is a macro that takes the
+   state-array variable name. Insertion sort because typical batch
+   sizes are <200K records and qsort's callback overhead loses by ~2×
+   at that scale (measured during 2026.05 perf passes). */
+#define SLOTCASK_SORT_IDX_BY_SEG_LOC(idx, n, st) do {              \
+    for (int _a = 1; _a < (n); _a++) {                             \
+        int _tmp = (idx)[_a];                                      \
+        uint8_t  _ta_sid = (st)[_tmp].old_sid;                     \
+        uint16_t _ta_fid = (st)[_tmp].old_fid;                     \
+        int _b = _a - 1;                                           \
+        while (_b >= 0) {                                          \
+            int _bi = (idx)[_b];                                   \
+            if ((st)[_bi].old_sid <  _ta_sid ||                    \
+                ((st)[_bi].old_sid == _ta_sid &&                   \
+                 (st)[_bi].old_fid <= _ta_fid)) break;             \
+            (idx)[_b + 1] = (idx)[_b];                             \
+            _b--;                                                  \
+        }                                                          \
+        (idx)[_b + 1] = _tmp;                                      \
+    }                                                              \
+} while (0)
+
 static int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
 static uint32_t path_hash(const char *s) {
@@ -3009,24 +3036,7 @@ static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
         tomb_idx[tcount++] = (int)i;
     }
 
-    /* Insertion sort by (old_sid, old_fid). Batches at this scale are
-       per-kf-shard slices (typically <200K records), so insertion sort
-       is fine and matches the pattern bulk-delete + Phase 1b use. */
-    for (int a = 1; a < tcount; a++) {
-        int tmp = tomb_idx[a];
-        uint8_t  ta_sid = st[tmp].old_sid;
-        uint16_t ta_fid = st[tmp].old_fid;
-        int b = a - 1;
-        while (b >= 0) {
-            int bi = tomb_idx[b];
-            if (st[bi].old_sid < ta_sid ||
-                (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
-                break;
-            tomb_idx[b + 1] = tomb_idx[b];
-            b--;
-        }
-        tomb_idx[b + 1] = tmp;
-    }
+    SLOTCASK_SORT_IDX_BY_SEG_LOC(tomb_idx, tcount, st);
 
     int k = 0;
     while (k < tcount) {
@@ -3174,24 +3184,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     recs[i].old_value == NULL)
                     read_idx[rcount++] = (int)i;
             }
-            /* Insertion sort by (old_sid, old_fid). For typical batches
-               rcount <= n_per_kf_shard (~78 K); insertion sort is fine
-               vs allocating a callback for qsort. */
-            for (int a = 1; a < rcount; a++) {
-                int tmp = read_idx[a];
-                uint8_t  ta_sid = st[tmp].old_sid;
-                uint16_t ta_fid = st[tmp].old_fid;
-                int b = a - 1;
-                while (b >= 0) {
-                    int bi = read_idx[b];
-                    if (st[bi].old_sid < ta_sid ||
-                        (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
-                        break;
-                    read_idx[b + 1] = read_idx[b];
-                    b--;
-                }
-                read_idx[b + 1] = tmp;
-            }
+            SLOTCASK_SORT_IDX_BY_SEG_LOC(read_idx, rcount, st);
 
             int k = 0;
             while (k < rcount) {
@@ -3605,21 +3598,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 if (recs[i].status == 0 && st[i].found)
                     read_idx[rcount++] = (int)i;
             }
-            for (int a = 1; a < rcount; a++) {
-                int tmp = read_idx[a];
-                uint8_t  ta_sid = st[tmp].old_sid;
-                uint16_t ta_fid = st[tmp].old_fid;
-                int b = a - 1;
-                while (b >= 0) {
-                    int bi = read_idx[b];
-                    if (st[bi].old_sid < ta_sid ||
-                        (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
-                        break;
-                    read_idx[b + 1] = read_idx[b];
-                    b--;
-                }
-                read_idx[b + 1] = tmp;
-            }
+            SLOTCASK_SORT_IDX_BY_SEG_LOC(read_idx, rcount, st);
             int k = 0;
             while (k < rcount) {
                 int run_end = k + 1;
@@ -3696,21 +3675,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         for (size_t i = 0; i < n; i++) {
             if (st[i].committed) tomb_idx[tcount++] = (int)i;
         }
-        for (int a = 1; a < tcount; a++) {
-            int tmp = tomb_idx[a];
-            uint8_t  ta_sid = st[tmp].old_sid;
-            uint16_t ta_fid = st[tmp].old_fid;
-            int b = a - 1;
-            while (b >= 0) {
-                int bi = tomb_idx[b];
-                if (st[bi].old_sid < ta_sid ||
-                    (st[bi].old_sid == ta_sid && st[bi].old_fid <= ta_fid))
-                    break;
-                tomb_idx[b + 1] = tomb_idx[b];
-                b--;
-            }
-            tomb_idx[b + 1] = tmp;
-        }
+        SLOTCASK_SORT_IDX_BY_SEG_LOC(tomb_idx, tcount, st);
         int k = 0;
         while (k < tcount) {
             int run_end = k + 1;

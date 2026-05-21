@@ -26,28 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[4096];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
 /* Write a fresh db.env in <base> with the given TLS knobs. */
 static void write_dbenv(const char *base, const char *db_root, int port,
@@ -120,10 +99,6 @@ static int spawn_tls_daemon(const char *base, const char *shard_db_abs,
     return -1;
 }
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
 static int test_tls_run(void) {
     /* openssl CLI required. */
@@ -142,7 +117,7 @@ static int test_tls_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-tls-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755); mkdir(db_root, 0755);
     char logs_dir[300]; snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
     mkdir(logs_dir, 0755);
@@ -151,7 +126,7 @@ static int test_tls_run(void) {
     if (f) { fputs("default\n", f); fclose(f); }
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char cert[300], key[300], wrong_cert[300], wrong_key[300];
     snprintf(cert, sizeof(cert), "%s/cert.pem", base);
@@ -159,21 +134,21 @@ static int test_tls_run(void) {
     snprintf(wrong_cert, sizeof(wrong_cert), "%s/wrong-cert.pem", base);
     snprintf(wrong_key, sizeof(wrong_key), "%s/wrong-key.pem", base);
 
-    int rc = run_cmd(
+    int rc = tu_run_cmd(
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout '%s' -out '%s' -days 30 "
         "-subj '/CN=localhost' "
         "-addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' >/dev/null 2>&1",
         key, cert);
     ASSERT_EQ_INT(rc, 0, "primary cert generated");
-    rc = run_cmd(
+    rc = tu_run_cmd(
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout '%s' -out '%s' -days 30 "
         "-subj '/CN=other' -addext 'subjectAltName=DNS:other' >/dev/null 2>&1",
         wrong_key, wrong_cert);
     ASSERT_EQ_INT(rc, 0, "wrong cert generated");
 
-    if (!file_exists(cert) || !file_exists(key) ||
-        !file_exists(wrong_cert) || !file_exists(wrong_key)) {
-        ASSERT_TRUE(0, "all certs exist"); run_cmd("rm -rf %s", base); return 1;
+    if (!tu_file_exists(cert) || !tu_file_exists(key) ||
+        !tu_file_exists(wrong_cert) || !tu_file_exists(wrong_key)) {
+        ASSERT_TRUE(0, "all certs exist"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     /* === TLS_ENABLE=1 round-trip === */
@@ -182,13 +157,13 @@ static int test_tls_run(void) {
     snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
     int sr = spawn_tls_daemon(base, shard_db_abs, port, 1, &env);
     ASSERT_EQ_INT(sr, 0, "server started in TLS mode");
-    if (sr != 0) { run_cmd("rm -rf %s", base); return 1; }
+    if (sr != 0) { tu_run_cmd("rm -rf %s", base); return 1; }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000,
                           .use_tls = 1, .tls_ca = cert };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "TLS client connect");
-    if (!tc) { stop_no_wipe(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"db-dirs\"}", &resp);
@@ -211,7 +186,7 @@ static int test_tls_run(void) {
        Actually — easier — skip the CLI roundtrip; just test the JSON probe
        was successful, since `put-file` exercises the same TCP/TLS path. */
     tc_close(tc); tc = NULL;
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
     /* That covers the positive path. */
 
     /* === Server rejects bad clients (TLS 1.2 ClientHello) === */
@@ -219,7 +194,7 @@ static int test_tls_run(void) {
     write_dbenv(base, db_root, port, 1, cert, key, cert);
     if (spawn_tls_daemon(base, shard_db_abs, port, 1, &env) != 0) {
         ASSERT_TRUE(0, "daemon ready for negative tests");
-        run_cmd("rm -rf %s", base); return 1;
+        tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     /* TLS 1.2 ClientHello must be rejected. We use openssl s_client
@@ -231,7 +206,7 @@ static int test_tls_run(void) {
        play. (Earlier regex attempts kept matching false-positive
        strings like 'Protocol  : TLSv1.2', which openssl prints based on
        the REQUESTED protocol whether or not the handshake succeeded.) */
-    rc = run_cmd(
+    rc = tu_run_cmd(
         "echo QUIT | timeout 3 openssl s_client -connect 127.0.0.1:%d "
         "-tls1_2 -CAfile '%s' -servername localhost > /dev/null 2>&1",
         port, cert);
@@ -288,7 +263,7 @@ static int test_tls_run(void) {
         }
     }
 
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     /* === server-side misconfig refusal === */
     /* Missing TLS_CERT. */
@@ -307,7 +282,7 @@ static int test_tls_run(void) {
     sr = spawn_tls_daemon(base, shard_db_abs, port, 0, &env);
     ASSERT_EQ_INT(sr, 1, "server refuses mismatched cert/key");
 
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

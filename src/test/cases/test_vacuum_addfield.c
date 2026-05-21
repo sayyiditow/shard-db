@@ -14,21 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f); buf[sz] = '\0'; fclose(f);
-    return buf;
-}
 
 static int test_vacuum_addfield_run(void) {
     TestEnv env = {0};
@@ -94,7 +80,7 @@ static int test_vacuum_addfield_run(void) {
 
     char fields_path[400];
     snprintf(fields_path, sizeof(fields_path), "%s/default/vac2/fields.conf", env.db_root);
-    char *fields = read_file(fields_path);
+    char *fields = tu_read_file(fields_path);
     ASSERT_TRUE(fields && strstr(fields, "email:varchar:40:removed") != NULL,
                 "vac2: email tombstoned");
     ASSERT_TRUE(fields && strstr(fields, "score:int:removed") != NULL,
@@ -108,7 +94,7 @@ static int test_vacuum_addfield_run(void) {
     ASSERT_CONTAINS(resp, "\"compact\":true", "compact flag in output");
     free(resp); resp = NULL;
 
-    fields = read_file(fields_path);
+    fields = tu_read_file(fields_path);
     ASSERT_TRUE(fields && strstr(fields, "email") == NULL, "fields.conf: no email");
     ASSERT_TRUE(fields && strstr(fields, "score") == NULL, "fields.conf: no score");
     ASSERT_TRUE(fields && strstr(fields, "name:varchar:32") != NULL, "fields.conf: name kept");
@@ -125,9 +111,9 @@ static int test_vacuum_addfield_run(void) {
 
     char path[400];
     snprintf(path, sizeof(path), "%s/default/vac2/data.new", env.db_root);
-    ASSERT_TRUE(!file_exists(path), "data.new cleaned");
+    ASSERT_TRUE(!tu_file_exists(path), "data.new cleaned");
     snprintf(path, sizeof(path), "%s/default/vac2/data.old", env.db_root);
-    ASSERT_TRUE(!file_exists(path), "data.old cleaned");
+    ASSERT_TRUE(!tu_file_exists(path), "data.old cleaned");
 
     /* vacuum --splits N reshards. */
     tc_request(tc,
@@ -191,7 +177,7 @@ static int test_vacuum_addfield_run(void) {
     free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/default/add1/fields.conf", env.db_root);
-    fields = read_file(path);
+    fields = tu_read_file(path);
     ASSERT_TRUE(fields && strstr(fields, "age:int") != NULL, "fields.conf has age");
     ASSERT_TRUE(fields && strstr(fields, "email:varchar:40") != NULL, "fields.conf has email");
     ASSERT_TRUE(fields && strstr(fields, "name:varchar:16") != NULL, "fields.conf keeps name");
@@ -258,7 +244,7 @@ static int test_vacuum_addfield_run(void) {
         "\"fields\":[\"d:varchar:8\"]}", &resp); free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/default/integ/fields.conf", env.db_root);
-    fields = read_file(path);
+    fields = tu_read_file(path);
     ASSERT_TRUE(fields && strstr(fields, "a:varchar:16") != NULL, "integ: a kept");
     ASSERT_TRUE(fields && strstr(fields, "b:") == NULL, "integ: b gone");
     ASSERT_TRUE(fields && strstr(fields, "c:int") != NULL, "integ: c kept");

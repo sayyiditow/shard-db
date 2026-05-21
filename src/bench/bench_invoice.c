@@ -12,6 +12,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include "bench_invoice_schema.h"
 #include <pthread.h>
@@ -37,33 +38,11 @@ static const char *SOURCES[]       = { "API","PORTAL","BATCH","IMPORT" };
 
 /* ------------------------------------------------ memfd bulk-insert helper */
 
-static int make_memfd(const char *name, const char *data, size_t size)
-{
-#if defined(__x86_64__)
-    int fd = (int)syscall(319, name, 0);
-#elif defined(__aarch64__)
-    int fd = (int)syscall(279, name, 0);
-#else
-    char path[] = "/tmp/bench-invoice-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd >= 0) unlink(path);
-#endif
-    if (fd < 0) { perror("memfd_create"); return -1; }
-
-    size_t written = 0;
-    while (written < size) {
-        ssize_t r = write(fd, data + written, size - written);
-        if (r <= 0) { perror("write memfd"); close(fd); return -1; }
-        written += (size_t)r;
-    }
-    if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
-    return fd;
-}
 
 /* Send bulk-insert from in-memory buffer via memfd path. */
 static char *bulk_insert_memfd(TestClient *tc, const char *data, size_t data_size)
 {
-    int fd = make_memfd("inv-blob", data, data_size);
+    int fd = bench_make_memfd("inv-blob", data, data_size);
     if (fd < 0) return NULL;
 
     char path[64];

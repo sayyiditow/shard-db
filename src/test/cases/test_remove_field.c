@@ -14,21 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f); buf[sz] = '\0'; fclose(f);
-    return buf;
-}
 
 static int test_remove_field_run(void) {
     TestEnv env = {0};
@@ -54,11 +40,11 @@ static int test_remove_field_run(void) {
     char obj[300]; snprintf(obj, sizeof(obj), "%s/default/leads", env.db_root);
     char path[400];
     snprintf(path, sizeof(path), "%s/indexes/email", obj);
-    ASSERT_TRUE(file_exists(path), "email/ exists");
+    ASSERT_TRUE(tu_file_exists(path), "email/ exists");
     snprintf(path, sizeof(path), "%s/indexes/age", obj);
-    ASSERT_TRUE(file_exists(path), "age/ exists");
+    ASSERT_TRUE(tu_file_exists(path), "age/ exists");
     snprintf(path, sizeof(path), "%s/indexes/fullName+age", obj);
-    ASSERT_TRUE(file_exists(path), "fullName+age/ exists");
+    ASSERT_TRUE(tu_file_exists(path), "fullName+age/ exists");
 
     /* Remove email */
     tc_request(tc,
@@ -70,16 +56,16 @@ static int test_remove_field_run(void) {
     free(resp); resp = NULL;
 
     snprintf(path, sizeof(path), "%s/fields.conf", obj);
-    char *fconf = read_file(path);
+    char *fconf = tu_read_file(path);
     ASSERT_TRUE(fconf && strstr(fconf, "email:varchar:40:removed") != NULL,
                 "fields.conf has email:removed");
     free(fconf);
     snprintf(path, sizeof(path), "%s/indexes/email", obj);
-    ASSERT_TRUE(!file_exists(path), "email/ dropped");
+    ASSERT_TRUE(!tu_file_exists(path), "email/ dropped");
     snprintf(path, sizeof(path), "%s/indexes/age", obj);
-    ASSERT_TRUE(file_exists(path), "age/ still exists");
+    ASSERT_TRUE(tu_file_exists(path), "age/ still exists");
     snprintf(path, sizeof(path), "%s/indexes/fullName+age", obj);
-    ASSERT_TRUE(file_exists(path), "fullName+age/ still exists");
+    ASSERT_TRUE(tu_file_exists(path), "fullName+age/ still exists");
 
     /* Reads exclude tombstoned */
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
@@ -121,9 +107,9 @@ static int test_remove_field_run(void) {
     ASSERT_CONTAINS(resp, "\"fields\":2", "multi-remove count 2");
     free(resp); resp = NULL;
     snprintf(path, sizeof(path), "%s/indexes/age", obj);
-    ASSERT_TRUE(!file_exists(path), "age/ dropped");
+    ASSERT_TRUE(!tu_file_exists(path), "age/ dropped");
     snprintf(path, sizeof(path), "%s/indexes/fullName+age", obj);
-    ASSERT_TRUE(!file_exists(path), "fullName+age/ dropped");
+    ASSERT_TRUE(!tu_file_exists(path), "fullName+age/ dropped");
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
     ASSERT_TRUE(strstr(resp, "\"age\"") == NULL, "GET no age");

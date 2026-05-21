@@ -17,13 +17,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
 /* Pull "total":N out of a list-files response. */
 static int parse_total(const char *resp) {
@@ -50,7 +43,7 @@ static int test_list_files_run(void) {
     /* Stage 6 files in /tmp, put-file into the object. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/lft_test_%d", (int)getpid());
-    run_cmd("rm -rf %s && mkdir -p %s", tmpdir, tmpdir);
+    tu_run_cmd("rm -rf %s && mkdir -p %s", tmpdir, tmpdir);
     const char *names[] = {"alpha.pdf","alpha2.pdf","beta.pdf","delta.pdf","gamma.txt","zeta.png"};
     for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
         char path[400];
@@ -62,7 +55,7 @@ static int test_list_files_run(void) {
             "\"path\":\"%s\"}", path);
         tc_request(tc, req, &resp); free(resp); resp = NULL;
     }
-    run_cmd("rm -rf %s", tmpdir);
+    tu_run_cmd("rm -rf %s", tmpdir);
 
     /* Full listing alphabetical */
     tc_request(tc, "{\"mode\":\"list-files\",\"dir\":\"default\",\"object\":\"lft\"}", &resp);

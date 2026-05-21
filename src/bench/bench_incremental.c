@@ -20,6 +20,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,24 +32,6 @@
 static const int BATCHES[] = { 1000, 10000, 50000, 100000, 200000 };
 #define N_BATCHES (int)(sizeof(BATCHES) / sizeof(BATCHES[0]))
 
-static int make_memfd(const char *name, const char *data, size_t size) {
-#if defined(__x86_64__)
-    long sysno = 319;
-#elif defined(__aarch64__)
-    long sysno = 279;
-#else
-# error "memfd_create syscall number unknown for this arch"
-#endif
-    int fd = (int)syscall(sysno, name, 0u);
-    if (fd < 0) return -1;
-    size_t written = 0;
-    while (written < size) {
-        ssize_t n = write(fd, data + written, size - written);
-        if (n <= 0) { close(fd); return -1; }
-        written += (size_t)n;
-    }
-    return fd;
-}
 
 /* Build INV-NNNNNNNN range [from, to) as a JSON array bulk-insert payload.
    Each record: {"key":"INV-00000123","value":{"status":..,"region":..,"amount":..}} */
@@ -139,7 +122,7 @@ static int run_strategy(const char *label, const char *ratio_value,
         if (build_inc_range(0, BASELINE, &buf, &sz) != 0) {
             tc_close(tc); test_env_stop(&env); return -1;
         }
-        int fd = make_memfd("inc-baseline", buf, sz);
+        int fd = bench_make_memfd("inc-baseline", buf, sz);
         free(buf);
         char req[256];
         snprintf(req, sizeof(req),
@@ -179,7 +162,7 @@ static int run_strategy(const char *label, const char *ratio_value,
         }
 
         for (int iter = 0; iter < 3; iter++) {
-            int ins_fd = make_memfd("inc-ins", ins_buf, ins_sz);
+            int ins_fd = bench_make_memfd("inc-ins", ins_buf, ins_sz);
             char req[256];
             snprintf(req, sizeof(req),
                 "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"inc\","
@@ -195,7 +178,7 @@ static int run_strategy(const char *label, const char *ratio_value,
             if (secs < best) best = secs;
 
             /* Remove added records so the next iteration starts from baseline. */
-            int del_fd = make_memfd("inc-del", del_buf, del_sz);
+            int del_fd = bench_make_memfd("inc-del", del_buf, del_sz);
             snprintf(req, sizeof(req),
                 "{\"mode\":\"bulk-delete\",\"dir\":\"default\",\"object\":\"inc\","
                 "\"file\":\"/proc/%d/fd/%d\"}", (int)getpid(), del_fd);

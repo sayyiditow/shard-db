@@ -15,6 +15,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include "bench_invoice_schema.h"
 #include <pthread.h>
@@ -31,31 +32,6 @@
 #define NCHUNKS (TOTAL / CHUNK)
 
 /* ----------------------------------------------------------------- helpers */
-
-/* Write data into a Linux memfd, return the open fd (caller closes).
-   The daemon reads it via /proc/<bench-pid>/fd/<n>. */
-static int make_memfd(const char *name, const char *data, size_t size)
-{
-#if defined(__x86_64__)
-    int fd = (int)syscall(319, name, 0);
-#elif defined(__aarch64__)
-    int fd = (int)syscall(279, name, 0);
-#else
-    char path[] = "/tmp/bench-par-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd >= 0) unlink(path);
-#endif
-    if (fd < 0) { perror("memfd_create"); return -1; }
-
-    size_t written = 0;
-    while (written < size) {
-        ssize_t r = write(fd, data + written, size - written);
-        if (r <= 0) { perror("write memfd"); close(fd); return -1; }
-        written += (size_t)r;
-    }
-    if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
-    return fd;
-}
 
 /* Pools for synthetic field values — same cardinalities as the bash bench. */
 static const char *STATUSES[]      = { "DRAFT","PENDING","APPROVED","REJECTED","CANCELLED" };
@@ -437,7 +413,7 @@ static int build_json_memfds(int *out_fds)
             for (int j = 0; j < c; j++) close(out_fds[j]);
             return -1;
         }
-        out_fds[c] = make_memfd("inv-par-json", buf, sz);
+        out_fds[c] = bench_make_memfd("inv-par-json", buf, sz);
         free(buf);
         if (out_fds[c] < 0) {
             for (int j = 0; j < c; j++) close(out_fds[j]);
@@ -458,7 +434,7 @@ static int build_csv_memfds(int *out_fds)
             for (int j = 0; j < c; j++) close(out_fds[j]);
             return -1;
         }
-        out_fds[c] = make_memfd("inv-par-csv", buf, sz);
+        out_fds[c] = bench_make_memfd("inv-par-csv", buf, sz);
         free(buf);
         if (out_fds[c] < 0) {
             for (int j = 0; j < c; j++) close(out_fds[j]);
@@ -515,7 +491,7 @@ static int bench_parallel_run(void)
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  single JSON: %.1f MB\n", (double)sz / 1048576.0);
-        single_json_fd = make_memfd("inv-par-json-single", buf, sz);
+        single_json_fd = bench_make_memfd("inv-par-json-single", buf, sz);
         free(buf);
     }
     {
@@ -526,7 +502,7 @@ static int bench_parallel_run(void)
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  single CSV:  %.1f MB\n\n", (double)sz / 1048576.0);
-        single_csv_fd = make_memfd("inv-par-csv-single", buf, sz);
+        single_csv_fd = bench_make_memfd("inv-par-csv-single", buf, sz);
         free(buf);
     }
 

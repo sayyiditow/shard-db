@@ -16,13 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* count returns a bare integer per 2026.05.1+. Strip whitespace, atoi. */
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n' || *resp == '\r') resp++;
-    return atoi(resp);
-}
-
 static int count_where(TestClient *tc, const char *criteria) {
     char req[1024];
     snprintf(req, sizeof(req),
@@ -30,7 +23,7 @@ static int count_where(TestClient *tc, const char *criteria) {
         "\"criteria\":%s}", criteria);
     char *resp = NULL;
     tc_request(tc, req, &resp);
-    int n = parse_count(resp);
+    int n = tu_parse_count(resp);
     free(resp);
     return n;
 }

@@ -16,6 +16,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,35 +25,6 @@
 #include <unistd.h>
 
 /* ------------------------------------------------ memfd bulk-insert helper */
-
-/*
- * Write data into a Linux memfd, return the open fd (caller closes).
- * The daemon child reads it via /proc/<bench-pid>/fd/<n>.
- */
-static int make_memfd(const char *name, const char *data, size_t size)
-{
-    /* memfd_create syscall number on x86_64 = 319, aarch64 = 279 */
-#if defined(__x86_64__)
-    int fd = (int)syscall(319, name, 0);
-#elif defined(__aarch64__)
-    int fd = (int)syscall(279, name, 0);
-#else
-    /* Fallback: anonymous tmpfs via mkstemp */
-    char path[] = "/tmp/bench-grow-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd >= 0) unlink(path);
-#endif
-    if (fd < 0) { perror("memfd_create"); return -1; }
-
-    size_t written = 0;
-    while (written < size) {
-        ssize_t r = write(fd, data + written, size - written);
-        if (r <= 0) { perror("write memfd"); close(fd); return -1; }
-        written += (size_t)r;
-    }
-    if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
-    return fd;
-}
 
 /* ---------------------------------------------------------------- scenario */
 
@@ -104,7 +76,7 @@ static void run_scenario(TestClient *tc, const char *label, int splits, int rows
     printf("  CSV: %.1f MB\n\n", (double)csv_size / 1048576.0);
 
     /* Write to memfd. */
-    int memfd = make_memfd("bench-grow", csv_buf, csv_size);
+    int memfd = bench_make_memfd("bench-grow", csv_buf, csv_size);
     free(csv_buf);
     csv_buf = NULL;
 

@@ -18,49 +18,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static char *capture_cmd(const char *fmt, ...) {
-    char cmd[4096];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return NULL;
-    size_t cap = 4096, len = 0;
-    char *buf = malloc(cap);
-    if (!buf) { pclose(fp); return NULL; }
-    int c;
-    while ((c = fgetc(fp)) != EOF) {
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); pclose(fp); return NULL; }
-            buf = nb;
-        }
-        buf[len++] = (char)c;
-    }
-    buf[len] = '\0';
-    pclose(fp);
-    return buf;
-}
 
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f); buf[sz] = '\0'; fclose(f);
-    return buf;
-}
 
 static void base_of(const char *db_root, char *out, size_t out_sz) {
     const char *slash = strrchr(db_root, '/');
@@ -128,7 +87,7 @@ static int test_schema_export_run(void) {
     char out_path[300];
     snprintf(out_path, sizeof(out_path), "%s/manifest.json", base);
     unlink(out_path);
-    char *out = capture_cmd("cd %s && %s export-schema '%s' 2>&1",
+    char *out = tu_capture_cmd("cd %s && %s export-schema '%s' 2>&1",
                             base, shard_db_abs, out_path);
     ASSERT_TRUE(out && strstr(out, "exported") != NULL, "export-schema reported success");
     free(out);
@@ -136,7 +95,7 @@ static int test_schema_export_run(void) {
     struct stat st;
     ASSERT_TRUE(stat(out_path, &st) == 0 && st.st_size > 0,
                 "manifest file is non-empty");
-    char *manifest = read_file(out_path);
+    char *manifest = tu_read_file(out_path);
     ASSERT_NOT_NULL(manifest, "manifest read");
     if (!manifest) { tc_close(tc); test_env_stop(&env); return 1; }
 
@@ -161,7 +120,7 @@ static int test_schema_export_run(void) {
     free(manifest);
 
     /* === STDOUT FORM === */
-    char *stdout_man = capture_cmd("cd %s && %s export-schema 2>/dev/null",
+    char *stdout_man = tu_capture_cmd("cd %s && %s export-schema 2>/dev/null",
                                    base, shard_db_abs);
     ASSERT_TRUE(stdout_man && strstr(stdout_man, "\"version\"") != NULL,
                 "stdout export contains version");
@@ -186,7 +145,7 @@ static int test_schema_export_run(void) {
                 "wipe: mig_events gone from migtest");
     free(resp); resp = NULL;
 
-    out = capture_cmd("cd %s && %s import-schema '%s' --if-not-exists 2>&1",
+    out = tu_capture_cmd("cd %s && %s import-schema '%s' --if-not-exists 2>&1",
                       base, shard_db_abs, out_path);
     ASSERT_TRUE(out && strstr(out, "created=3") != NULL, "import: created=3");
     ASSERT_TRUE(out && strstr(out, "failed=0") != NULL, "import: failed=0");
@@ -221,20 +180,20 @@ static int test_schema_export_run(void) {
     free(resp); resp = NULL;
 
     /* === --if-not-exists IS IDEMPOTENT === */
-    out = capture_cmd("cd %s && %s import-schema '%s' --if-not-exists 2>&1",
+    out = tu_capture_cmd("cd %s && %s import-schema '%s' --if-not-exists 2>&1",
                       base, shard_db_abs, out_path);
     ASSERT_TRUE(out && strstr(out, "created=0") != NULL, "rerun: created=0");
     ASSERT_TRUE(out && strstr(out, "failed=0") != NULL, "rerun: failed=0");
     free(out);
 
     /* Without --if-not-exists, re-import should report created=0. */
-    out = capture_cmd("cd %s && %s import-schema '%s' 2>&1",
+    out = tu_capture_cmd("cd %s && %s import-schema '%s' 2>&1",
                       base, shard_db_abs, out_path);
     ASSERT_TRUE(out && strstr(out, "created=0") != NULL, "no-flag rerun: created=0");
     free(out);
 
     /* === ERROR HANDLING === */
-    out = capture_cmd("cd %s && %s import-schema /tmp/shard-db_does_not_exist.json 2>&1",
+    out = tu_capture_cmd("cd %s && %s import-schema /tmp/shard-db_does_not_exist.json 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "cannot open") != NULL,
                 "missing manifest reports error");
@@ -244,7 +203,7 @@ static int test_schema_export_run(void) {
     snprintf(bad_manifest, sizeof(bad_manifest), "%s/bad_manifest.json", base);
     FILE *bf = fopen(bad_manifest, "w");
     if (bf) { fputs("{\"version\":\"x\"}", bf); fclose(bf); }
-    out = capture_cmd("cd %s && %s import-schema '%s' 2>&1",
+    out = tu_capture_cmd("cd %s && %s import-schema '%s' 2>&1",
                       base, shard_db_abs, bad_manifest);
     ASSERT_TRUE(out && strstr(out, "objects") != NULL,
                 "no-objects manifest reports error");
@@ -252,7 +211,7 @@ static int test_schema_export_run(void) {
 
     unlink(out_path);
     unlink(bad_manifest);
-    (void)run_cmd; /* unused if not needed; kept for future cleanup helpers */
+    (void)tu_run_cmd; /* unused if not needed; kept for future cleanup helpers */
     tc_close(tc);
     test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;

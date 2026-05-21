@@ -20,6 +20,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include <openssl/sha.h>
 #include <stdio.h>
@@ -98,27 +99,6 @@ static void make_user_key(int i, char out[33]) {
         out[2 * j + 1] = hex[digest[j] & 0xF];
     }
     out[32] = '\0';
-}
-
-/* memfd_create wrapper — matches the syscall pattern used in bench_kv.c
-   and friends. Returns fd; caller closes. */
-static int make_memfd(const char *name, const char *data, size_t size) {
-#if defined(__x86_64__)
-    long sysno = 319;
-#elif defined(__aarch64__)
-    long sysno = 279;
-#else
-# error "memfd_create syscall number unknown for this arch"
-#endif
-    int fd = (int)syscall(sysno, name, 0u);
-    if (fd < 0) return -1;
-    size_t written = 0;
-    while (written < size) {
-        ssize_t n = write(fd, data + written, size - written);
-        if (n <= 0) { close(fd); return -1; }
-        written += (size_t)n;
-    }
-    return fd;
 }
 
 /* -------- dataset generation (~700 bytes / record at the 1M-record scale) */
@@ -407,7 +387,7 @@ static int bench_queries_run(void) {
                 return 1;
             }
 
-            int data_fd = make_memfd("queries-users", buf, sz);
+            int data_fd = bench_make_memfd("queries-users", buf, sz);
             free(buf);
             if (data_fd < 0) {
                 tc_close(tc);

@@ -19,35 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static char *capture_cmd(const char *fmt, ...) {
-    char cmd[4096];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return NULL;
-    size_t cap = 4096, len = 0;
-    char *buf = malloc(cap);
-    if (!buf) { pclose(fp); return NULL; }
-    int c;
-    while ((c = fgetc(fp)) != EOF) {
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); pclose(fp); return NULL; }
-            buf = nb;
-        }
-        buf[len++] = (char)c;
-    }
-    buf[len] = '\0';
-    pclose(fp);
-    return buf;
-}
 
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
 /* base = parent(db_root). The fixture wrote db.env there. */
 static void base_of(const char *db_root, char *out, size_t out_sz) {
@@ -101,39 +73,39 @@ static int test_cli_shortcuts_run(void) {
     }
 
     /* count CLI. */
-    char *out = capture_cmd("cd %s && %s count default cli_orders 2>&1", base, shard_db_abs);
+    char *out = tu_capture_cmd("cd %s && %s count default cli_orders 2>&1", base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "5") != NULL, "count no-criteria returns total");
     free(out);
 
-    out = capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}]' 2>&1",
+    out = tu_capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}]' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "3") != NULL, "count with eq criteria returns 3");
     free(out);
 
-    out = capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"amount\",\"op\":\"gte\",\"value\":\"100\"}]' 2>&1",
+    out = tu_capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"amount\",\"op\":\"gte\",\"value\":\"100\"}]' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "2") != NULL, "count with gte criteria returns 2");
     free(out);
 
-    out = capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"nope\"}]' 2>&1",
+    out = tu_capture_cmd("cd %s && %s count default cli_orders '[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"nope\"}]' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "0") != NULL, "count no-match returns 0");
     free(out);
 
-    out = capture_cmd("cd %s && %s count default 2>&1", base, shard_db_abs);
+    out = tu_capture_cmd("cd %s && %s count default 2>&1", base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "Usage: shard-db count") != NULL,
                 "count usage when too few args");
     free(out);
 
     /* aggregate CLI. */
-    out = capture_cmd("cd %s && %s aggregate default cli_orders "
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders "
                       "'[{\"fn\":\"count\",\"alias\":\"n\"},{\"fn\":\"sum\",\"field\":\"amount\",\"alias\":\"total\"}]' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "\"n\":5") != NULL, "aggregate bare: count=5");
     ASSERT_TRUE(out && strstr(out, "\"total\":465") != NULL, "aggregate bare: sum=465");
     free(out);
 
-    out = capture_cmd("cd %s && %s aggregate default cli_orders "
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders "
                       "'[{\"fn\":\"count\",\"alias\":\"n\"}]' 'status' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "\"status\":\"paid\",\"n\":3") != NULL, "group_by status: paid=3");
@@ -141,7 +113,7 @@ static int test_cli_shortcuts_run(void) {
     ASSERT_TRUE(out && strstr(out, "\"status\":\"cancelled\",\"n\":1") != NULL, "group_by status: cancelled=1");
     free(out);
 
-    out = capture_cmd("cd %s && %s aggregate default cli_orders "
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders "
                       "'[{\"fn\":\"count\",\"alias\":\"n\"}]' 'status, region' 2>&1",
                       base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "\"status\":\"paid\",\"region\":\"us\",\"n\":2") != NULL,
@@ -150,7 +122,7 @@ static int test_cli_shortcuts_run(void) {
                 "multi-group: paid+eu");
     free(out);
 
-    out = capture_cmd("cd %s && %s aggregate default cli_orders "
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders "
                       "'[{\"fn\":\"count\",\"alias\":\"n\"}]' 'status' "
                       "'[{\"field\":\"region\",\"op\":\"eq\",\"value\":\"us\"}]' 2>&1",
                       base, shard_db_abs);
@@ -160,7 +132,7 @@ static int test_cli_shortcuts_run(void) {
                 "aggregate criteria: pending excluded");
     free(out);
 
-    out = capture_cmd("cd %s && %s aggregate default cli_orders "
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders "
                       "'[{\"fn\":\"count\",\"alias\":\"n\"}]' 'status' '' "
                       "'[{\"field\":\"n\",\"op\":\"gte\",\"value\":\"2\"}]' 2>&1",
                       base, shard_db_abs);
@@ -168,7 +140,7 @@ static int test_cli_shortcuts_run(void) {
     ASSERT_TRUE(out && strstr(out, "\"status\":\"pending\"") == NULL, "having: pending dropped");
     free(out);
 
-    out = capture_cmd("cd %s && %s aggregate default cli_orders 2>&1", base, shard_db_abs);
+    out = tu_capture_cmd("cd %s && %s aggregate default cli_orders 2>&1", base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "Usage: shard-db aggregate") != NULL, "aggregate usage when too few args");
     free(out);
 
@@ -181,7 +153,7 @@ static int test_cli_shortcuts_run(void) {
     /* basename — we just use the chosen filename. */
     const char *basename = strrchr(tmpfile, '/'); basename = basename ? basename + 1 : tmpfile;
 
-    out = capture_cmd("cd %s && %s put-file default cli_files %s 2>&1", base, shard_db_abs, tmpfile);
+    out = tu_capture_cmd("cd %s && %s put-file default cli_files %s 2>&1", base, shard_db_abs, tmpfile);
     free(out);
 
     /* Resolve on-disk store path via get-file-path JSON. */
@@ -201,26 +173,26 @@ static int test_cli_shortcuts_run(void) {
         }
         free(resp); resp = NULL;
     }
-    ASSERT_TRUE(store_path[0] != '\0' && file_exists(store_path),
+    ASSERT_TRUE(store_path[0] != '\0' && tu_file_exists(store_path),
                 "put-file stored file exists on disk");
 
-    out = capture_cmd("cd %s && %s delete-file default cli_files '%s' 2>&1", base, shard_db_abs, basename);
+    out = tu_capture_cmd("cd %s && %s delete-file default cli_files '%s' 2>&1", base, shard_db_abs, basename);
     ASSERT_TRUE(out && strstr(out, "\"status\":\"deleted\"") != NULL, "delete-file success status");
     {
         char want[128]; snprintf(want, sizeof(want), "\"filename\":\"%s\"", basename);
         ASSERT_TRUE(out && strstr(out, want) != NULL, "delete-file echoes filename");
     }
     free(out);
-    ASSERT_TRUE(!file_exists(store_path), "delete-file removed file from disk");
+    ASSERT_TRUE(!tu_file_exists(store_path), "delete-file removed file from disk");
 
     /* Second delete → not found. */
-    out = capture_cmd("cd %s && %s delete-file default cli_files '%s' 2>&1", base, shard_db_abs, basename);
+    out = tu_capture_cmd("cd %s && %s delete-file default cli_files '%s' 2>&1", base, shard_db_abs, basename);
     ASSERT_TRUE(out && strstr(out, "\"error\":\"file not found\"") != NULL,
                 "delete-file on missing returns error");
     free(out);
 
     /* Filename traversal rejected. */
-    out = capture_cmd("cd %s && %s delete-file default cli_files '../evil.txt' 2>&1", base, shard_db_abs);
+    out = tu_capture_cmd("cd %s && %s delete-file default cli_files '../evil.txt' 2>&1", base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "\"error\":\"invalid filename\"") != NULL,
                 "delete-file rejects traversal");
     free(out);
@@ -232,9 +204,9 @@ static int test_cli_shortcuts_run(void) {
     free(resp); resp = NULL;
 
     /* JSON mode happy path: re-upload, delete via JSON. */
-    out = capture_cmd("cd %s && %s put-file default cli_files %s 2>&1", base, shard_db_abs, tmpfile);
+    out = tu_capture_cmd("cd %s && %s put-file default cli_files %s 2>&1", base, shard_db_abs, tmpfile);
     free(out);
-    ASSERT_TRUE(file_exists(store_path), "re-upload present before JSON delete");
+    ASSERT_TRUE(tu_file_exists(store_path), "re-upload present before JSON delete");
 
     snprintf(req, sizeof(req),
         "{\"mode\":\"delete-file\",\"dir\":\"default\",\"object\":\"cli_files\","
@@ -242,10 +214,10 @@ static int test_cli_shortcuts_run(void) {
     tc_request(tc, req, &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"deleted\"", "delete-file JSON succeeds");
     free(resp); resp = NULL;
-    ASSERT_TRUE(!file_exists(store_path), "JSON delete removed file");
+    ASSERT_TRUE(!tu_file_exists(store_path), "JSON delete removed file");
 
     /* CLI usage. */
-    out = capture_cmd("cd %s && %s delete-file default cli_files 2>&1", base, shard_db_abs);
+    out = tu_capture_cmd("cd %s && %s delete-file default cli_files 2>&1", base, shard_db_abs);
     ASSERT_TRUE(out && strstr(out, "Usage: shard-db delete-file") != NULL,
                 "delete-file usage when missing args");
     free(out);

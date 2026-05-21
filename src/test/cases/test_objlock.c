@@ -20,28 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
 static int path_exists(const char *path) {
     struct stat st;
@@ -53,24 +32,24 @@ static int test_objlock_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-objlock-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755);
     mkdir(db_root, 0755);
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     TestEnv env = {0};
     if (test_env_start_at(&env, db_root, port) != 0) {
         ASSERT_TRUE(0, "first daemon spawn");
-        run_cmd("rm -rf %s", base);
+        tu_run_cmd("rm -rf %s", base);
         return 1;
     }
 
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { test_env_kill(&env); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
@@ -91,19 +70,19 @@ static int test_objlock_run(void) {
 
     /* Stop daemon (graceful, no wipe), inject stale crash-recovery artifacts. */
     tc_close(tc); tc = NULL;
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     char obj[300];
     snprintf(obj, sizeof(obj), "%s/default/leads", db_root);
 
-    run_cmd("mkdir -p %s/data.new/00", obj);
-    run_cmd("echo 'stale shard' > %s/data.new/00/00.bin", obj);
-    run_cmd("mkdir -p %s/indexes.new", obj);
-    run_cmd("echo 'stale idx' > %s/indexes.new/stale.idx", obj);
-    run_cmd("echo 'stale fields' > %s/fields.conf.new", obj);
-    run_cmd("echo 'stale schema' > %s/schema.conf.new", obj);
-    run_cmd("mkdir -p %s/data.old", obj);
-    run_cmd("echo 'stale old' > %s/data.old/leftover", obj);
+    tu_run_cmd("mkdir -p %s/data.new/00", obj);
+    tu_run_cmd("echo 'stale shard' > %s/data.new/00/00.bin", obj);
+    tu_run_cmd("mkdir -p %s/indexes.new", obj);
+    tu_run_cmd("echo 'stale idx' > %s/indexes.new/stale.idx", obj);
+    tu_run_cmd("echo 'stale fields' > %s/fields.conf.new", obj);
+    tu_run_cmd("echo 'stale schema' > %s/schema.conf.new", obj);
+    tu_run_cmd("mkdir -p %s/data.old", obj);
+    tu_run_cmd("echo 'stale old' > %s/data.old/leftover", obj);
 
     snprintf(path, sizeof(path), "%s/data.new", obj);
     ASSERT_TRUE(path_exists(path), "injected data.new before recovery");
@@ -120,13 +99,13 @@ static int test_objlock_run(void) {
     TestEnv env2 = {0};
     if (test_env_start_at(&env2, db_root, port) != 0) {
         ASSERT_TRUE(0, "respawn at same db_root");
-        run_cmd("rm -rf %s", base);
+        tu_run_cmd("rm -rf %s", base);
         return 1;
     }
     cfg.port = env2.port;
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "reconnect after restart");
-    if (!tc) { test_env_kill(&env2); run_cmd("rm -rf %s", base); return 1; }
+    if (!tc) { test_env_kill(&env2); tu_run_cmd("rm -rf %s", base); return 1; }
 
     snprintf(path, sizeof(path), "%s/data.new", obj);
     ASSERT_TRUE(!path_exists(path), "data.new removed after startup");
@@ -183,8 +162,8 @@ static int test_objlock_run(void) {
     free(resp); resp = NULL;
 
     tc_close(tc);
-    stop_no_wipe(&env2);
-    run_cmd("rm -rf %s", base);
+    test_env_stop_keep(&env2);
+    tu_run_cmd("rm -rf %s", base);
 
     return t_ctx->failed > 0 ? 1 : 0;
 }

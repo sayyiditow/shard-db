@@ -40,6 +40,9 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #   slotcask.c, simd.c — added 2026.06: query.c and storage.c now have
 #       v2-engine call sites and SIMD scan helpers. Linker needs the
 #       symbol bodies even though the fuzzer never enters those paths.
+#   bitmap.c — added 2026.05.7: query.c and index.c reference bm_*
+#       symbols for the bitmap index type. Same rationale as above —
+#       linked for symbol resolution, never entered by the fuzzer.
 # server.c, tls.c are NOT linked: the parser never reaches them; trying
 # to link tls.c without OpenSSL would fail the cleaner subset.
 echo "==> fuzz_criteria"
@@ -51,6 +54,7 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/util.c src/db/keyset.c src/db/query.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/bitmap.c \
     -lpthread -latomic
 
 echo

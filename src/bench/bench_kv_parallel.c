@@ -14,6 +14,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include <openssl/sha.h>
 #include <pthread.h>
@@ -61,35 +62,6 @@ static void make_val(int i, char out[VAL_LEN + 1])
 }
 
 /* -------------------------------------------------------- memfd helper */
-
-/*
- * Write data into a Linux memfd, return the open fd (caller closes).
- * The daemon child reads it via /proc/<bench-pid>/fd/<n>.
- */
-static int make_memfd(const char *name, const char *data, size_t size)
-{
-    /* memfd_create syscall number on x86_64 = 319, aarch64 = 279 */
-#if defined(__x86_64__)
-    int fd = (int)syscall(319, name, 0);
-#elif defined(__aarch64__)
-    int fd = (int)syscall(279, name, 0);
-#else
-    /* Fallback: anonymous tmpfs via mkstemp */
-    char path[] = "/tmp/bench-kv-par-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd >= 0) unlink(path);
-#endif
-    if (fd < 0) { perror("memfd_create"); return -1; }
-
-    size_t written = 0;
-    while (written < size) {
-        ssize_t r = write(fd, data + written, size - written);
-        if (r <= 0) { perror("write memfd"); close(fd); return -1; }
-        written += (size_t)r;
-    }
-    if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
-    return fd;
-}
 
 /* ----------------------------------------- chunk buffer builders */
 
@@ -307,14 +279,14 @@ static int bench_kv_parallel_run(void)
             fprintf(stderr, "bench-kv-parallel: OOM building JSON chunk %d\n", c);
             tc_close(tc); test_env_stop(&env); return 1;
         }
-        chunk_json[c] = make_memfd("kv-par-json", buf, sz);
+        chunk_json[c] = bench_make_memfd("kv-par-json", buf, sz);
         free(buf);
 
         if (build_csv_chunk(from, to, &buf, &sz) != 0) {
             fprintf(stderr, "bench-kv-parallel: OOM building CSV chunk %d\n", c);
             tc_close(tc); test_env_stop(&env); return 1;
         }
-        chunk_csv[c] = make_memfd("kv-par-csv", buf, sz);
+        chunk_csv[c] = bench_make_memfd("kv-par-csv", buf, sz);
         free(buf);
     }
 
@@ -326,7 +298,7 @@ static int bench_kv_parallel_run(void)
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  single JSON: %.1f MB\n", (double)sz / 1048576.0);
-        int single_json = make_memfd("kv-par-json-single", buf, sz);
+        int single_json = bench_make_memfd("kv-par-json-single", buf, sz);
         free(buf);
 
         if (build_csv_chunk(0, TOTAL, &buf, &sz) != 0) {
@@ -335,7 +307,7 @@ static int bench_kv_parallel_run(void)
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  single CSV:  %.1f MB\n\n", (double)sz / 1048576.0);
-        int single_csv = make_memfd("kv-par-csv-single", buf, sz);
+        int single_csv = bench_make_memfd("kv-par-csv-single", buf, sz);
         free(buf);
 
         long us_1a = 0, us_1b = 0, us_2 = 0, us_3 = 0;

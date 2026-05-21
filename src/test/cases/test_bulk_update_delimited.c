@@ -13,11 +13,6 @@
 #include <string.h>
 #include <unistd.h>
 
-static int parse_count(const char *resp) {
-    if (!resp) return -1;
-    while (*resp == ' ' || *resp == '\n') resp++;
-    return atoi(resp);
-}
 
 static int do_count(TestClient *tc, const char *crit) {
     char req[1024];
@@ -26,7 +21,7 @@ static int do_count(TestClient *tc, const char *crit) {
         "\"criteria\":%s}", crit);
     char *resp = NULL;
     tc_request(tc, req, &resp);
-    int n = parse_count(resp);
+    int n = tu_parse_count(resp);
     free(resp);
     return n;
 }

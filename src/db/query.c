@@ -15876,13 +15876,8 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     case FT_UUID: {
         /* Same as decode_field_to_buf - canonical form */
         const uint8_t *b = (const uint8_t *)p;
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        return uuid_format_canonical(buf, bufsz, b);
     }
     case FT_ENUM: {
         /* Stored bytes are the byte index. Look up enum_values[idx]
@@ -16111,14 +16106,8 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         /* Index stores raw 16 bytes - decode to canonical form */
         if (plen < 16) return 0;
         const uint8_t *b = p;
-        /* Check if all zeros */
-        if (b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0 &&
-            b[4]==0 && b[5]==0 && b[6]==0 && b[7]==0 &&
-            b[8]==0 && b[9]==0 && b[10]==0 && b[11]==0 &&
-            b[12]==0 && b[13]==0 && b[14]==0 && b[15]==0) return 0;
-        return snprintf(buf, bufsz, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        if (uuid_is_zero(b)) return 0;
+        return uuid_format_canonical(buf, bufsz, b);
     }
     case FT_NUMERIC: {
         if (plen < 8) return 0;
@@ -17218,6 +17207,106 @@ static void fmt_double(char *buf, size_t sz, double v) {
     }
 }
 
+/* Same-field MIN/MAX fast path: when the agg field == the (single,
+   rangeable) criterion field, we can walk the agg field's btree in
+   MIN/MAX direction inside the criterion's bounds and take the first
+   leaf entry per shard. No KeySet, no record fetch — answer comes
+   straight from the index key.
+   Two planner branches arrived at the same code (CPD flagged this as
+   a 77-line dup). Centralised here.
+
+   Returns 1 if the criterion shape qualified (caller treats it as
+   "answered, return 0"). Returns 0 if not (caller falls through to a
+   later plan). Encodes bounds into the caller-supplied buf1/buf2 stack
+   buffers since the btree iter holds spans into them across the loop. */
+static int agg_minmax_same_field_btree(
+        const char *db_root, const char *object, const char *field,
+        const char *alias, const TypedField *agg_tf, int splits,
+        int is_max, const SearchCriterion *crit,
+        const char *format, const char *delimiter) {
+    int rangeable = (crit->op == OP_EQUAL ||
+                     crit->op == OP_GREATER ||
+                     crit->op == OP_GREATER_EQ ||
+                     crit->op == OP_LESS ||
+                     crit->op == OP_LESS_EQ ||
+                     crit->op == OP_BETWEEN);
+    if (!rangeable || strcmp(crit->field, field) != 0) return 0;
+
+    uint8_t buf1[1032], buf2[1032];
+    size_t len1 = 0, len2 = 0;
+    const char *min_v = "";    size_t min_l = 0; int min_x = 0;
+    const char *max_v = "\xff\xff\xff\xff"; size_t max_l = 4; int max_x = 0;
+    switch (crit->op) {
+    case OP_EQUAL:
+        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        min_v = (const char *)buf1; min_l = len1;
+        max_v = (const char *)buf1; max_l = len1;
+        break;
+    case OP_GREATER:
+        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        min_v = (const char *)buf1; min_l = len1; min_x = 1;
+        break;
+    case OP_GREATER_EQ:
+        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        min_v = (const char *)buf1; min_l = len1;
+        break;
+    case OP_LESS:
+        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        max_v = (const char *)buf1; max_l = len1; max_x = 1;
+        break;
+    case OP_LESS_EQ:
+        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        max_v = (const char *)buf1; max_l = len1;
+        break;
+    case OP_BETWEEN:
+        encode_criterion_value(agg_tf, crit->value,  strlen(crit->value),  buf1, &len1);
+        encode_criterion_value(agg_tf, crit->value2, strlen(crit->value2), buf2, &len2);
+        min_v = (const char *)buf1; min_l = len1; min_x = crit->min_exclusive;
+        max_v = (const char *)buf2; max_l = len2; max_x = crit->max_exclusive;
+        break;
+    default: break;
+    }
+
+    int n_idx = index_splits_for(splits);
+    int desc = is_max ? 1 : 0;
+    double best = 0.0;
+    int have = 0;
+    for (int s = 0; s < n_idx; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
+        BtRangeIter *it = btree_range_iter_open(
+            idx_path, min_v, min_l, min_x,
+            max_v, max_l, max_x, desc);
+        if (!it) continue;
+        const char *val; size_t vlen; const uint8_t *hash16;
+        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+            double v;
+            if (decode_index_key_to_double(agg_tf,
+                                            (const uint8_t *)val, vlen, &v)) {
+                if (!have)        { best = v; have = 1; }
+                else if (desc)    { if (v > best) best = v; }
+                else              { if (v < best) best = v; }
+                break;
+            }
+        }
+        btree_range_iter_close(it);
+    }
+
+    char vbuf[64];
+    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                             ? parse_csv_delim(delimiter) : 0;
+    if (csv_delim_local) {
+        csv_emit_cell(alias, csv_delim_local);
+        OUT("\n");
+        csv_emit_cell(vbuf, csv_delim_local);
+        OUT("\n");
+    } else {
+        OUT("{\"%s\":%s}\n", alias, vbuf);
+    }
+    return 1;
+}
+
 /* Indexed aggregate callback — fetches record inline + accumulates. No hash storage. */
 typedef struct {
     AggCtx *agg;
@@ -18082,85 +18171,10 @@ int cmd_aggregate(const char *db_root, const char *object,
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[sf_agg_fi];
             SearchCriterion *crit = &sf_leaf_node->leaf;
-            int rangeable = (crit->op == OP_EQUAL ||
-                             crit->op == OP_GREATER ||
-                             crit->op == OP_GREATER_EQ ||
-                             crit->op == OP_LESS ||
-                             crit->op == OP_LESS_EQ ||
-                             crit->op == OP_BETWEEN);
-            if (rangeable && strcmp(crit->field, specs[0].field) == 0) {
-                uint8_t buf1[1032], buf2[1032];
-                size_t len1 = 0, len2 = 0;
-                const char *min_v = "";    size_t min_l = 0; int min_x = 0;
-                const char *max_v = "\xff\xff\xff\xff"; size_t max_l = 4; int max_x = 0;
-                switch (crit->op) {
-                case OP_EQUAL:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1;
-                    max_v = (const char *)buf1; max_l = len1;
-                    break;
-                case OP_GREATER:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1; min_x = 1;
-                    break;
-                case OP_GREATER_EQ:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1;
-                    break;
-                case OP_LESS:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    max_v = (const char *)buf1; max_l = len1; max_x = 1;
-                    break;
-                case OP_LESS_EQ:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    max_v = (const char *)buf1; max_l = len1;
-                    break;
-                case OP_BETWEEN:
-                    encode_criterion_value(agg_tf, crit->value,  strlen(crit->value),  buf1, &len1);
-                    encode_criterion_value(agg_tf, crit->value2, strlen(crit->value2), buf2, &len2);
-                    min_v = (const char *)buf1; min_l = len1; min_x = crit->min_exclusive;
-                    max_v = (const char *)buf2; max_l = len2; max_x = crit->max_exclusive;
-                    break;
-                default: break;
-                }
-                int n_idx = index_splits_for(sch.splits);
-                int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
-                double best = 0.0;
-                int have = 0;
-                for (int s = 0; s < n_idx; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                   object, specs[0].field, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, min_v, min_l, min_x,
-                        max_v, max_l, max_x, desc);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        double v;
-                        if (decode_index_key_to_double(agg_tf,
-                                                       (const uint8_t *)val,
-                                                       vlen, &v)) {
-                            if (!have) { best = v; have = 1; }
-                            else if (desc) { if (v > best) best = v; }
-                            else           { if (v < best) best = v; }
-                            break;
-                        }
-                    }
-                    btree_range_iter_close(it);
-                }
-                char vbuf[64];
-                fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
-                char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                         ? parse_csv_delim(delimiter) : 0;
-                if (csv_delim_local) {
-                    csv_emit_cell(specs[0].alias, csv_delim_local);
-                    OUT("\n");
-                    csv_emit_cell(vbuf, csv_delim_local);
-                    OUT("\n");
-                } else {
-                    OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                }
+            if (agg_minmax_same_field_btree(
+                    db_root, object, specs[0].field, specs[0].alias,
+                    agg_tf, sch.splits,
+                    specs[0].fn == AGG_MAX, crit, format, delimiter)) {
                 free_criteria_tree(tree);
                 free(specs);
                 return 0;
@@ -18273,90 +18287,11 @@ int cmd_aggregate(const char *db_root, const char *object,
 
             /* Same-field shortcut: when crit->field == specs[0].field, the
                criterion's btree IS the agg field's btree. No KeySet needed —
-               walk the agg btree directly within the criterion's bounds,
-               take the first leaf entry per shard (ASC for MIN, DESC for
-               MAX). Pure btree-only; per-shard early-exit after one entry. */
-            int same_field_op = (crit->op == OP_EQUAL ||
-                                 crit->op == OP_GREATER ||
-                                 crit->op == OP_GREATER_EQ ||
-                                 crit->op == OP_LESS ||
-                                 crit->op == OP_LESS_EQ ||
-                                 crit->op == OP_BETWEEN);
-            if (same_field_op &&
-                strcmp(crit->field, specs[0].field) == 0) {
-                uint8_t buf1[1032], buf2[1032];
-                size_t len1 = 0, len2 = 0;
-                const char *min_v = "";    size_t min_l = 0; int min_x = 0;
-                const char *max_v = "\xff\xff\xff\xff"; size_t max_l = 4; int max_x = 0;
-                switch (crit->op) {
-                case OP_EQUAL:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1;
-                    max_v = (const char *)buf1; max_l = len1;
-                    break;
-                case OP_GREATER:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1; min_x = 1;
-                    break;
-                case OP_GREATER_EQ:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    min_v = (const char *)buf1; min_l = len1;
-                    break;
-                case OP_LESS:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    max_v = (const char *)buf1; max_l = len1; max_x = 1;
-                    break;
-                case OP_LESS_EQ:
-                    encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
-                    max_v = (const char *)buf1; max_l = len1;
-                    break;
-                case OP_BETWEEN:
-                    encode_criterion_value(agg_tf, crit->value,  strlen(crit->value),  buf1, &len1);
-                    encode_criterion_value(agg_tf, crit->value2, strlen(crit->value2), buf2, &len2);
-                    min_v = (const char *)buf1; min_l = len1; min_x = crit->min_exclusive;
-                    max_v = (const char *)buf2; max_l = len2; max_x = crit->max_exclusive;
-                    break;
-                default: break;
-                }
-                int n_idx = index_splits_for(sch.splits);
-                int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
-                double best = 0.0;
-                int have = 0;
-                for (int s = 0; s < n_idx; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                   object, specs[0].field, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, min_v, min_l, min_x,
-                        max_v, max_l, max_x, desc);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        double v;
-                        if (decode_index_key_to_double(agg_tf,
-                                                       (const uint8_t *)val,
-                                                       vlen, &v)) {
-                            if (!have) { best = v; have = 1; }
-                            else if (desc) { if (v > best) best = v; }
-                            else           { if (v < best) best = v; }
-                            break;
-                        }
-                    }
-                    btree_range_iter_close(it);
-                }
-
-                char vbuf[64];
-                fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
-                char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                         ? parse_csv_delim(delimiter) : 0;
-                if (csv_delim_local) {
-                    csv_emit_cell(specs[0].alias, csv_delim_local);
-                    OUT("\n");
-                    csv_emit_cell(vbuf, csv_delim_local);
-                    OUT("\n");
-                } else {
-                    OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                }
+               see agg_minmax_same_field_btree for the full walk. */
+            if (agg_minmax_same_field_btree(
+                    db_root, object, specs[0].field, specs[0].alias,
+                    agg_tf, sch.splits,
+                    specs[0].fn == AGG_MAX, crit, format, delimiter)) {
                 free_criteria_tree(tree);
                 free(specs);
                 return 0;

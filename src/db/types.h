@@ -1350,4 +1350,11 @@ void *update_idx_fn(void *arg);
    to drop fds and ensure subsequent reindex/wipe operations don't leave
    stale TLS pointers. Safe no-op when nothing cached. */
 void bm_flush_thread_bitmap_cache(void);
+
+/* util.c — FT_UUID helpers. The on-disk "unset" marker for a 16-byte UUID
+   is all-zero bytes; canonical wire form is the 36-char dashed lowercase
+   hex. Used by decode_field_to_buf, typed_get_field_str,
+   typed_field_to_buf_raw, and decode_idx_to_buf. */
+int  uuid_is_zero(const uint8_t b[16]);
+int  uuid_format_canonical(char *buf, size_t buflen, const uint8_t b[16]);
 #endif

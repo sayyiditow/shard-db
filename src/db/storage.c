@@ -1944,6 +1944,60 @@ typedef struct {
     int count;
 } MultiExistsShardWork;
 
+/* Parse one wire-form key from a JSON array element into its storage
+   form, computing hash + kf-shard id along the way. Shared by every
+   multi-key path (bulk_exists, bulk_get). Auto-key UUID/seq forms get
+   parsed to binary; otherwise the storage form is verbatim bytes.
+   On malformed auto-key forms returns 0 — caller treats the row as a
+   miss (found=0 / result_json=NULL) so clients see the same "missing"
+   shape as a non-existent key. Returns 1 on success.
+   Heap allocations land in *out_wire_key and *out_storage_key — caller
+   owns both. */
+static int parse_multi_key(const char *src, size_t klen, const Schema *sc,
+                            char  **out_wire_key,
+                            uint8_t **out_storage_key, size_t *out_storage_klen,
+                            uint8_t out_hash[16], int *out_shard_id) {
+    char *wire = malloc(klen + 1);
+    if (!wire) return -1;
+    memcpy(wire, src, klen);
+    wire[klen] = '\0';
+    *out_wire_key = wire;
+
+    uint8_t *skey = NULL;
+    size_t   slen = 0;
+    if (sc->auto_key == AK_UUID) {
+        uint8_t bin[16];
+        if (parse_uuid_string(wire, bin) == 0) {
+            skey = malloc(16);
+            if (skey) { memcpy(skey, bin, 16); slen = 16; }
+        }
+    } else if (sc->auto_key == AK_SEQ) {
+        int64_t v;
+        if (parse_seq_key(wire, &v) == 0) {
+            skey = malloc(8);
+            if (skey) {
+                for (int b = 7; b >= 0; b--) { skey[b] = (uint8_t)(v & 0xFF); v >>= 8; }
+                slen = 8;
+            }
+        }
+    } else {
+        skey = malloc(klen + 1);
+        if (skey) { memcpy(skey, src, klen); skey[klen] = '\0'; slen = klen; }
+    }
+    *out_storage_key = skey;
+    *out_storage_klen = slen;
+    if (skey) {
+        compute_hash_raw((const char *)skey, slen, out_hash);
+        *out_shard_id = compute_record_shard(out_hash, sc->splits);
+    } else {
+        /* Malformed auto-key wire form → never matches; keep shard
+           deterministic so bucket-sort works. */
+        memset(out_hash, 0, 16);
+        *out_shard_id = 0;
+    }
+    return 1;
+}
+
 static void *multi_exists_shard_worker(void *arg) {
     MultiExistsShardWork *sw = (MultiExistsShardWork *)arg;
     if (sw->count == 0) return NULL;
@@ -2018,33 +2072,11 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->wire_key = malloc(klen + 1);
-            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
-            if (sc.auto_key == AK_UUID) {
-                uint8_t bin[16];
-                if (parse_uuid_string(e->wire_key, bin) == 0) {
-                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
-                } else { e->key = NULL; e->klen = 0; }
-            } else if (sc.auto_key == AK_SEQ) {
-                int64_t v;
-                if (parse_seq_key(e->wire_key, &v) == 0) {
-                    e->key = malloc(8);
-                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
-                    e->klen = 8;
-                } else { e->key = NULL; e->klen = 0; }
-            } else {
-                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-                e->klen = klen;
-            }
-            if (e->key) {
-                compute_hash_raw(e->key, e->klen, e->hash);
-                e->shard_id = compute_record_shard(e->hash, sc.splits);
-                e->start_slot = 0;
-            } else {
-                e->shard_id = 0;
-                e->start_slot = 0;
-                memset(e->hash, 0, 16);
-            }
+            parse_multi_key(start, klen, &sc,
+                             &e->wire_key,
+                             (uint8_t **)&e->key, &e->klen,
+                             e->hash, &e->shard_id);
+            e->start_slot = 0;
             e->found = 0;
         } else p++;
     }
@@ -2209,33 +2241,11 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
                 entries = t;
             }
             MultiExistsEntry *e = &entries[key_count++];
-            e->wire_key = malloc(klen + 1);
-            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
-            if (sc.auto_key == AK_UUID) {
-                uint8_t bin[16];
-                if (parse_uuid_string(e->wire_key, bin) == 0) {
-                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
-                } else { e->key = NULL; e->klen = 0; }
-            } else if (sc.auto_key == AK_SEQ) {
-                int64_t v;
-                if (parse_seq_key(e->wire_key, &v) == 0) {
-                    e->key = malloc(8);
-                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
-                    e->klen = 8;
-                } else { e->key = NULL; e->klen = 0; }
-            } else {
-                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-                e->klen = klen;
-            }
-            if (e->key) {
-                compute_hash_raw(e->key, e->klen, e->hash);
-                e->shard_id = compute_record_shard(e->hash, sc.splits);
-                e->start_slot = 0;
-            } else {
-                e->shard_id = 0;
-                e->start_slot = 0;
-                memset(e->hash, 0, 16);
-            }
+            parse_multi_key(start, klen, &sc,
+                             &e->wire_key,
+                             (uint8_t **)&e->key, &e->klen,
+                             e->hash, &e->shard_id);
+            e->start_slot = 0;
             e->found = 0;
         } else p++;
     }
@@ -2421,48 +2431,14 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 entries = t;
             }
             MultiGetEntry *e = &entries[key_count++];
-            /* Wire form (always a printable string) — used in response output. */
-            e->wire_key = malloc(klen + 1);
-            memcpy(e->wire_key, start, klen); e->wire_key[klen] = '\0';
-
-            /* Storage form — binary for auto_key=uuid/seq, verbatim otherwise.
-               Parse failures for AK_UUID/SEQ are caught here and the entry's
-               result_json is left NULL → renders as `null` in the response,
-               which matches the "missing key" shape clients already handle. */
-            if (sc.auto_key == AK_UUID) {
-                uint8_t bin[16];
-                if (parse_uuid_string(e->wire_key, bin) == 0) {
-                    e->key = malloc(16); memcpy(e->key, bin, 16); e->klen = 16;
-                } else {
-                    e->key = NULL; e->klen = 0;
-                }
-            } else if (sc.auto_key == AK_SEQ) {
-                int64_t v;
-                if (parse_seq_key(e->wire_key, &v) == 0) {
-                    e->key = malloc(8);
-                    for (int b = 7; b >= 0; b--) { e->key[b] = (char)(v & 0xFF); v >>= 8; }
-                    e->klen = 8;
-                } else {
-                    e->key = NULL; e->klen = 0;
-                }
-            } else {
-                e->key = malloc(klen + 1); memcpy(e->key, start, klen); e->key[klen] = '\0';
-                e->klen = klen;
-            }
-            if (e->key) {
-                /* Bucket by slotcask's kf-shard mapping so each parallel_for
-                   worker owns one kf shard and doesn't queue on cross-worker
-                   kf-cache contention. */
-                compute_hash_raw(e->key, e->klen, e->hash);
-                e->shard_id = compute_record_shard(e->hash, sc.splits);
-                e->start_slot = 0;
-            } else {
-                /* Malformed auto-key wire form → never matches, but keep the
-                   shard_id deterministic so bucket-sort works. */
-                e->shard_id = 0;
-                e->start_slot = 0;
-                memset(e->hash, 0, 16);
-            }
+            /* Wire form for response output; storage form (binary for
+               auto_key=uuid/seq, verbatim otherwise); hash + kf-shard
+               bucket — see parse_multi_key. */
+            parse_multi_key(start, klen, &sc,
+                             &e->wire_key,
+                             (uint8_t **)&e->key, &e->klen,
+                             e->hash, &e->shard_id);
+            e->start_slot = 0;
             e->result_json = NULL;
         } else p++;
     }

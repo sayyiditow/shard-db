@@ -15,6 +15,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bench_stats.h"
+#include "bench_common.h"
 #include "bench_table.h"
 #include <openssl/sha.h>
 #include <stdio.h>
@@ -37,24 +38,6 @@ static void make_sha32(const char *prefix, int i, char out[33]) {
     out[32] = '\0';
 }
 
-static int make_memfd(const char *name, const char *data, size_t size) {
-#if defined(__x86_64__)
-    long sysno = 319;
-#elif defined(__aarch64__)
-    long sysno = 279;
-#else
-# error "memfd_create syscall number unknown for this arch"
-#endif
-    int fd = (int)syscall(sysno, name, 0u);
-    if (fd < 0) return -1;
-    size_t written = 0;
-    while (written < size) {
-        ssize_t n = write(fd, data + written, size - written);
-        if (n <= 0) { close(fd); return -1; }
-        written += (size_t)n;
-    }
-    return fd;
-}
 
 /* Wrapper preserved as a thin alias so call sites stay readable. */
 static void run_one(TestClient *tc, const char *label, const char *json) {
@@ -226,7 +209,7 @@ static int bench_joins_run(void) {
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  users dataset: %.1f MB\n", (double)sz / (1024.0 * 1024.0));
-        int fd = make_memfd("joins-users", buf, sz);
+        int fd = bench_make_memfd("joins-users", buf, sz);
         free(buf);
         char req[256];
         snprintf(req, sizeof(req),
@@ -252,7 +235,7 @@ static int bench_joins_run(void) {
             tc_close(tc); test_env_stop(&env); return 1;
         }
         printf("  orders dataset: %.1f MB\n", (double)sz / (1024.0 * 1024.0));
-        int fd = make_memfd("joins-orders", buf, sz);
+        int fd = bench_make_memfd("joins-orders", buf, sz);
         free(buf);
         char req[256];
         snprintf(req, sizeof(req),

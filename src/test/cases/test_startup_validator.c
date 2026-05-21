@@ -22,28 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[2048];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
 
-static void stop_no_wipe(TestEnv *env) {
-    if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
-            env->daemon_pid = -1; return;
-        }
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
-    }
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
-}
 
 /* Try to spawn a daemon that's expected to FAIL. Polls for up to 3s
    waiting for the child to exit non-zero. Returns:
@@ -82,17 +61,17 @@ static int test_startup_validator_run(void) {
     char base[256], db_root[256];
     snprintf(base,    sizeof(base),    "/tmp/shard-db-val-%d", (int)getpid());
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     mkdir(base, 0755); mkdir(db_root, 0755);
     char logs_dir[300]; snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
     mkdir(logs_dir, 0755);
 
     int port = test_pick_port();
-    if (port < 0) { ASSERT_TRUE(0, "pick port"); run_cmd("rm -rf %s", base); return 1; }
+    if (port < 0) { ASSERT_TRUE(0, "pick port"); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
     FILE *f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); run_cmd("rm -rf %s", base); return 1; }
+    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
     fprintf(f,
         "export DB_ROOT=\"%s\"\n"
         "export PORT=%d\n"
@@ -106,14 +85,14 @@ static int test_startup_validator_run(void) {
     const char *sdb_rel = "./build/bin/shard-db";
     if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
     if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); run_cmd("rm -rf %s", base); return 1;
+        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
     }
 
     /* === Phase 1: clean startup. Empty DB_ROOT, no objects, no problems. */
     TestEnv env = {0};
     snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
     pid_t pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); run_cmd("rm -rf %s", base); return 1; }
+    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
         chdir(base);
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
@@ -136,13 +115,13 @@ static int test_startup_validator_run(void) {
     }
     ASSERT_TRUE(ready, "clean DB starts (validator passes empty-DB)");
     if (!ready) { kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-                  run_cmd("rm -rf %s", base); return 1; }
+                  tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* Create one object to give the validator something to validate. */
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) { kill(pid, SIGKILL); waitpid(pid, NULL, 0);
-               run_cmd("rm -rf %s", base); return 1; }
+               tu_run_cmd("rm -rf %s", base); return 1; }
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
@@ -153,7 +132,7 @@ static int test_startup_validator_run(void) {
         "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"v\","
         "\"key\":\"k1\",\"value\":{\"n\":42}}", &resp); free(resp); resp = NULL;
     tc_close(tc);
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     /* === Phase 2: restart cleanly. Same metadata, validator passes. */
     pid = fork();
@@ -173,7 +152,7 @@ static int test_startup_validator_run(void) {
         struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL);
     }
     ASSERT_TRUE(ready, "restart with intact metadata: validator passes");
-    stop_no_wipe(&env);
+    test_env_stop_keep(&env);
 
     /* === Phase 3: delete the schema.conf line, restart should refuse. */
     {
@@ -231,7 +210,7 @@ static int test_startup_validator_run(void) {
     refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
     ASSERT_TRUE(!refused, "stale schema.conf dir is warned, not refused");
 
-    run_cmd("rm -rf %s", base);
+    tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
