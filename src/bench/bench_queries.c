@@ -678,6 +678,37 @@ static int bench_queries_run(void) {
     BR("bio ends 'startup'",           "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"ends\",\"value\":\"startup\"}],\"limit\":10,\"fields\":[\"username\"]}");
     bench_table_section_end();
 
+    /* ---------- FIND — selective filter + order_by (filter-first regression) ----------
+       Catches the 2026.05.7.x bug class where `find indexed_filter +
+       order_by_other_field + limit` walked the order_by btree
+       end-to-end when matches were rare or zero (HN explorer found
+       it at 789K comments — `find contains 'kubernetes' order_by
+       time desc limit 25` took 14s before the filter-first KeySet
+       pre-filter shipped). Pre-fix these queries would have taken
+       seconds; post-fix they should be sub-100ms warm cache.
+
+       Each case picks a filter whose KeySet build is selective
+       enough to dominate the order_by walk:
+         - eq on UNIQUE username       → 1 candidate (btree-eq build)
+         - eq on NONEXISTENT username  → 0 candidates (empty short-circuit)
+         - eq on RARE category         → ~1/5 of records (bitmap-eq)
+         - eq on COMMON bool active    → ~1/2 of records (bitmap, falls
+                                          back to walk-ordered above the
+                                          ORDERED_FIND_KEYSET_MAX cap;
+                                          existing path)
+       If any of these regress past ~250ms warm, the planner has
+       almost certainly lost the filter-first dispatch. */
+    bench_table_section_begin("FIND — selective filter + order_by (filter-first regression)");
+    BR("eq username='user_5000000' order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_5000000\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"age\"]}");
+    BR("eq username='__no_such_user__' order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"__no_such_user__\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"age\"]}");
+    BR("eq category='books'        order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"eq\",\"value\":\"books\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"category\"]}");
+    BR("eq active=true             order_by age desc limit 10 (broad — falls back)",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"active\"]}");
+    bench_table_section_end();
+
     /* ---------- AGGREGATE — single-fn standalone (per numeric type) ---------- */
     bench_table_section_begin("AGGREGATE — single-fn standalone");
     BR("count all",                "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
