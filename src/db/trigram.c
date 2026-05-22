@@ -12,7 +12,7 @@
 #include "trigram.h"
 
 #include <stdio.h>
-#include <linux/limits.h>
+#include <limits.h>   /* PATH_MAX — portable, works on both Linux and macOS */
 
 /* Fibonacci hashing constant — spreads 24-bit keys across power-of-two
  * tables evenly. 0x9E3779B9 = floor(2^32 / phi). */
