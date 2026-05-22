@@ -18408,6 +18408,65 @@ static int vs_lookup_cb(const uint8_t hash16[16],
     return 1;
 }
 
+/* Single-spec MIN/MAX driven by a KeySet over an indexed field.
+   Walks each .idx shard ASC/DESC seeking the first hash contained in
+   `ks` per shard (yields that shard's min/max), then aggregates across
+   shards. Emits the formatted response (CSV or JSON) and FREES `ks`
+   on return. Caller still frees criteria_tree + specs and returns 0.
+
+   Two cmd_aggregate planner branches need this exact loop+emit logic
+   (single-leaf KeySet path and AND-intersect KeySet path) — extracted
+   to avoid the 45-line duplication CPD flagged. */
+static void emit_min_max_via_keyset(const char *db_root, const char *object,
+                                    const Schema *sch,
+                                    const AggSpec *spec,
+                                    const TypedField *agg_tf,
+                                    KeySet *ks,
+                                    const char *format,
+                                    const char *delimiter) {
+    int n_idx = index_splits_for(sch->splits);
+    int desc  = (spec->fn == AGG_MAX) ? 1 : 0;
+    double best = 0.0;
+    int have = 0;
+    for (int s = 0; s < n_idx; s++) {
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root,
+                       object, spec->field, s);
+        BtRangeIter *it = btree_range_iter_open(
+            idx_path, "", 0, 0,
+            "\xff\xff\xff\xff", 4, 0, desc);
+        if (!it) continue;
+        const char *val; size_t vlen; const uint8_t *hash16;
+        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+            if (!keyset_contains(ks, hash16)) continue;
+            double v;
+            if (decode_index_key_to_double(agg_tf,
+                                           (const uint8_t *)val,
+                                           vlen, &v)) {
+                if (!have) { best = v; have = 1; }
+                else if (desc) { if (v > best) best = v; }
+                else           { if (v < best) best = v; }
+                break; /* per-shard min/max found */
+            }
+        }
+        btree_range_iter_close(it);
+    }
+    keyset_free(ks);
+
+    char vbuf[64];
+    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+    char csv_delim_local = (format && strcmp(format, "csv") == 0)
+                             ? parse_csv_delim(delimiter) : 0;
+    if (csv_delim_local) {
+        csv_emit_cell(spec->alias, csv_delim_local);
+        OUT("\n");
+        csv_emit_cell(vbuf, csv_delim_local);
+        OUT("\n");
+    } else {
+        OUT("{\"%s\":%s}\n", spec->alias, vbuf);
+    }
+}
+
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
@@ -18961,49 +19020,9 @@ int cmd_aggregate(const char *db_root, const char *object,
 
                 if (!atomic_load_explicit(&sk.full, memory_order_relaxed) &&
                     !dl.timed_out && keyset_size(ks) > 0) {
-                    /* Walk agg field btree in order; first in-KeySet hash
-                       per shard wins, take global min/max. */
-                    int n_idx = index_splits_for(sch.splits);
-                    int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
-                    double best = 0.0;
-                    int have = 0;
-                    for (int s = 0; s < n_idx; s++) {
-                        char idx_path[PATH_MAX];
-                        build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                       object, specs[0].field, s);
-                        BtRangeIter *it = btree_range_iter_open(
-                            idx_path, "", 0, 0,
-                            "\xff\xff\xff\xff", 4, 0, desc);
-                        if (!it) continue;
-                        const char *val; size_t vlen; const uint8_t *hash16;
-                        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                            if (!keyset_contains(ks, hash16)) continue;
-                            double v;
-                            if (decode_index_key_to_double(agg_tf,
-                                                           (const uint8_t *)val,
-                                                           vlen, &v)) {
-                                if (!have) { best = v; have = 1; }
-                                else if (desc) { if (v > best) best = v; }
-                                else           { if (v < best) best = v; }
-                                break; /* per-shard min/max found */
-                            }
-                        }
-                        btree_range_iter_close(it);
-                    }
-                    keyset_free(ks);
-
-                    char vbuf[64];
-                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
-                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                             ? parse_csv_delim(delimiter) : 0;
-                    if (csv_delim_local) {
-                        csv_emit_cell(specs[0].alias, csv_delim_local);
-                        OUT("\n");
-                        csv_emit_cell(vbuf, csv_delim_local);
-                        OUT("\n");
-                    } else {
-                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                    }
+                    emit_min_max_via_keyset(db_root, object, &sch,
+                                            &specs[0], agg_tf, ks,
+                                            format, delimiter);
                     free_criteria_tree(tree);
                     free(specs);
                     return 0;
@@ -19044,47 +19063,9 @@ int cmd_aggregate(const char *db_root, const char *object,
                                                       &dl, &small_primary);
                 if (ks && !small_primary && !dl.timed_out &&
                     keyset_size(ks) > 0) {
-                    int n_idx = index_splits_for(sch.splits);
-                    int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
-                    double best = 0.0;
-                    int have = 0;
-                    for (int s = 0; s < n_idx; s++) {
-                        char idx_path[PATH_MAX];
-                        build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                       object, specs[0].field, s);
-                        BtRangeIter *it = btree_range_iter_open(
-                            idx_path, "", 0, 0,
-                            "\xff\xff\xff\xff", 4, 0, desc);
-                        if (!it) continue;
-                        const char *val; size_t vlen; const uint8_t *hash16;
-                        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                            if (!keyset_contains(ks, hash16)) continue;
-                            double v;
-                            if (decode_index_key_to_double(agg_tf,
-                                                           (const uint8_t *)val,
-                                                           vlen, &v)) {
-                                if (!have) { best = v; have = 1; }
-                                else if (desc) { if (v > best) best = v; }
-                                else           { if (v < best) best = v; }
-                                break;
-                            }
-                        }
-                        btree_range_iter_close(it);
-                    }
-                    keyset_free(ks);
-
-                    char vbuf[64];
-                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
-                    char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                             ? parse_csv_delim(delimiter) : 0;
-                    if (csv_delim_local) {
-                        csv_emit_cell(specs[0].alias, csv_delim_local);
-                        OUT("\n");
-                        csv_emit_cell(vbuf, csv_delim_local);
-                        OUT("\n");
-                    } else {
-                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                    }
+                    emit_min_max_via_keyset(db_root, object, &sch,
+                                            &specs[0], agg_tf, ks,
+                                            format, delimiter);
                     free_criteria_tree(tree);
                     free(specs);
                     return 0;

@@ -2070,6 +2070,63 @@ static void *multi_exists_shard_worker(void *arg) {
     return NULL;
 }
 
+/* Bucket-sort entries by shard_id, dispatch multi_exists_shard_worker
+   in parallel across shards, copy `.found` results back into `entries`
+   in original order. Shared by cmd_exists_multi, cmd_not_exists, and
+   cmd_get_multi — they each parse their key list into `entries[]` then
+   call this; afterwards they format their type-specific response from
+   the populated `entries[].found`.
+
+   Replaces the O(n²) insertion sort that previously dominated BULK
+   EXISTS / BULK GET: at 10K keys × ~128 shards the sort was ~50M
+   swaps before parallel_for even started. The bucket-sort is a
+   single pass over entries plus one pass to fan out into per-shard
+   buckets. */
+static void multi_bucket_dispatch(MultiExistsEntry *entries, int key_count,
+                                  const Schema *sc,
+                                  const char *db_root, const char *object) {
+    for (int i = 0; i < key_count; i++) entries[i].orig_idx = i;
+    int *shard_counts    = calloc(sc->splits, sizeof(int));
+    int *shard_to_worker = malloc(sc->splits * sizeof(int));
+    for (int i = 0; i < key_count; i++) shard_counts[entries[i].shard_id]++;
+    int nshard = 0;
+    for (int s = 0; s < sc->splits; s++) if (shard_counts[s] > 0) nshard++;
+
+    MultiExistsShardWork *workers = calloc(nshard, sizeof(MultiExistsShardWork));
+    {
+        int g = 0;
+        for (int s = 0; s < sc->splits; s++) {
+            if (shard_counts[s] > 0) {
+                workers[g].db_root = db_root;
+                workers[g].object  = object;
+                workers[g].sch     = sc;
+                workers[g].count   = 0;
+                workers[g].entries = malloc(shard_counts[s] * sizeof(MultiExistsEntry));
+                shard_to_worker[s] = g;
+                g++;
+            } else {
+                shard_to_worker[s] = -1;
+            }
+        }
+    }
+    for (int i = 0; i < key_count; i++) {
+        int w = shard_to_worker[entries[i].shard_id];
+        workers[w].entries[workers[w].count++] = entries[i];
+    }
+
+    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
+
+    /* Copy results back via orig_idx (no sorted[] indirection). */
+    for (int g = 0; g < nshard; g++)
+        for (int i = 0; i < workers[g].count; i++)
+            entries[workers[g].entries[i].orig_idx].found = workers[g].entries[i].found;
+
+    for (int g = 0; g < nshard; g++) free(workers[g].entries);
+    free(workers);
+    free(shard_counts);
+    free(shard_to_worker);
+}
+
 /* mode=exists with keys[], returns {"k1":true,"k2":false,...} */
 int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json,
                      const char *format, const char *delimiter) {
@@ -2117,46 +2174,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
 
     if (key_count == 0) { free(entries); OUT("{}\n"); return 0; }
 
-    /* Bucket-sort by shard_id — replaces O(n²) insertion sort. For 10K
-       keys with ~128 shards that's ~50M swaps before parallel_for even
-       starts (was the dominant cost in BULK EXISTS / BULK GET). */
-    for (int i = 0; i < key_count; i++) entries[i].orig_idx = i;
-    int *shard_counts = calloc(sc.splits, sizeof(int));
-    int *shard_to_worker = malloc(sc.splits * sizeof(int));
-    for (int i = 0; i < key_count; i++) shard_counts[entries[i].shard_id]++;
-    int nshard = 0;
-    for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard++;
-
-    MultiExistsShardWork *workers = calloc(nshard, sizeof(MultiExistsShardWork));
-    {
-        int g = 0;
-        for (int s = 0; s < sc.splits; s++) {
-            if (shard_counts[s] > 0) {
-                workers[g].db_root = db_root;
-                workers[g].object = object;
-                workers[g].sch = &sc;
-                workers[g].count = 0;
-                workers[g].entries = malloc(shard_counts[s] * sizeof(MultiExistsEntry));
-                shard_to_worker[s] = g;
-                g++;
-            } else {
-                shard_to_worker[s] = -1;
-            }
-        }
-    }
-    /* Single pass — place each entry into its bucket. */
-    for (int i = 0; i < key_count; i++) {
-        int w = shard_to_worker[entries[i].shard_id];
-        workers[w].entries[workers[w].count++] = entries[i];
-    }
-
-    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
-
-    /* Copy results back via orig_idx (no sorted[] indirection needed). */
-    for (int g = 0; g < nshard; g++)
-        for (int i = 0; i < workers[g].count; i++)
-            entries[workers[g].entries[i].orig_idx].found = workers[g].entries[i].found;
-    free(shard_counts); free(shard_to_worker);
+    multi_bucket_dispatch(entries, key_count, &sc, db_root, object);
 
     /* Output in original order — build the response in a single buffer
        and OUT it once. Was 10K fprintf() calls in a loop, each taking
@@ -2238,8 +2256,7 @@ int cmd_exists_multi(const char *db_root, const char *object, const char *keys_j
         }
     }
 
-    for (int g = 0; g < nshard; g++) free(workers[g].entries);
-    free(workers);
+    /* (workers + per-worker entries freed inside multi_bucket_dispatch.) */
     for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
@@ -2286,42 +2303,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 
     if (key_count == 0) { free(entries); OUT("[]\n"); return 0; }
 
-    /* Bucket-sort by shard_id — same fix as cmd_exists_multi above. */
-    for (int i = 0; i < key_count; i++) entries[i].orig_idx = i;
-    int *shard_counts = calloc(sc.splits, sizeof(int));
-    int *shard_to_worker = malloc(sc.splits * sizeof(int));
-    for (int i = 0; i < key_count; i++) shard_counts[entries[i].shard_id]++;
-    int nshard = 0;
-    for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard++;
-
-    MultiExistsShardWork *workers = calloc(nshard, sizeof(MultiExistsShardWork));
-    {
-        int g = 0;
-        for (int s = 0; s < sc.splits; s++) {
-            if (shard_counts[s] > 0) {
-                workers[g].db_root = db_root;
-                workers[g].object = object;
-                workers[g].sch = &sc;
-                workers[g].count = 0;
-                workers[g].entries = malloc(shard_counts[s] * sizeof(MultiExistsEntry));
-                shard_to_worker[s] = g;
-                g++;
-            } else {
-                shard_to_worker[s] = -1;
-            }
-        }
-    }
-    for (int i = 0; i < key_count; i++) {
-        int w = shard_to_worker[entries[i].shard_id];
-        workers[w].entries[workers[w].count++] = entries[i];
-    }
-
-    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
-
-    for (int g = 0; g < nshard; g++)
-        for (int i = 0; i < workers[g].count; i++)
-            entries[workers[g].entries[i].orig_idx].found = workers[g].entries[i].found;
-    free(shard_counts); free(shard_to_worker);
+    multi_bucket_dispatch(entries, key_count, &sc, db_root, object);
 
     /* Build output in one buffer; one fwrite. */
     size_t cap = (size_t)key_count * 32 + 16;
@@ -2357,8 +2339,7 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
     }
     if (!buf) OUT("[]\n");
 
-    for (int g = 0; g < nshard; g++) free(workers[g].entries);
-    free(workers);
+    /* (workers + per-worker entries freed inside multi_bucket_dispatch.) */
     for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
     free(entries);
     return 0;
@@ -2614,6 +2595,10 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
         }
     }
 
+    /* cmd_get_multi has its own MultiGetEntry/MultiGetShardWork types
+       (extra `fs` FieldSchema field, different result type) so it can't
+       share the multi_bucket_dispatch helper used by exists/not_exists;
+       clean up workers explicitly. */
     for (int g = 0; g < nshard; g++) free(workers[g].entries);
     free(workers);
     for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
