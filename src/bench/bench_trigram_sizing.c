@@ -29,40 +29,12 @@
 #include "fixtures.h"
 #include "bench_stats.h"
 #include "bench_table.h"
-#include <dirent.h>
+#include "bench_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-
-static long long du_bytes(const char *path) {
-    DIR *d = opendir(path);
-    if (!d) {
-        struct stat st;
-        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) return (long long)st.st_size;
-        return 0;
-    }
-    long long total = 0;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char sub[1024];
-        snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
-        struct stat st;
-        if (stat(sub, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) total += du_bytes(sub);
-        else if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
-    }
-    closedir(d);
-    return total;
-}
-
-static void fmt_bytes(long long b, char *out, size_t outlen) {
-    if (b < 1024)             snprintf(out, outlen, "%lld B",   b);
-    else if (b < 1024 * 1024) snprintf(out, outlen, "%.1f KB",  b / 1024.0);
-    else if (b < 1LL << 30)   snprintf(out, outlen, "%.1f MB",  b / (1024.0 * 1024));
-    else                      snprintf(out, outlen, "%.2f GB",  b / (1024.0 * 1024 * 1024));
-}
+/* bench_du_bytes / bench_fmt_bytes — see bench_common.h. */
 
 /* Deterministic HN-comment-shaped body: avg ~500 chars, distribution
    skewed toward shorter; uses a fixed dictionary of common words so
@@ -207,11 +179,11 @@ static int bench_trigram_sizing_run(void) {
              "%s/b/with_tg/indexes/body", env.db_root);
     snprintf(no_idx_dir, sizeof(no_idx_dir),
              "%s/b/no_idx/indexes/body",  env.db_root);
-    long long tg_bytes = du_bytes(tg_idx_dir);
-    long long no_bytes = du_bytes(no_idx_dir);   /* should be 0 (no index dir) */
+    long long tg_bytes = bench_du_bytes(tg_idx_dir);
+    long long no_bytes = bench_du_bytes(no_idx_dir);   /* should be 0 (no index dir) */
     char tg_sz[32], no_sz[32];
-    fmt_bytes(tg_bytes, tg_sz, sizeof(tg_sz));
-    fmt_bytes(no_bytes, no_sz, sizeof(no_sz));
+    bench_fmt_bytes(tg_bytes, tg_sz, sizeof(tg_sz));
+    bench_fmt_bytes(no_bytes, no_sz, sizeof(no_sz));
 
     fprintf(stderr,
         "\nResults:\n"

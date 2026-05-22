@@ -18,4 +18,13 @@
    server via splice/sendfile. */
 int bench_make_memfd(const char *name, const char *data, size_t size);
 
+/* Sum every regular file's size under `path`, recursing into
+   subdirectories. Used by sizing benches to measure on-disk footprint
+   of index directories. Returns 0 if path doesn't exist. */
+long long bench_du_bytes(const char *path);
+
+/* Human-readable byte size formatter — chooses B / KB / MB / GB
+   automatically. Writes a NUL-terminated string into `out`. */
+void bench_fmt_bytes(long long bytes, char *out, size_t outlen);
+
 #endif
