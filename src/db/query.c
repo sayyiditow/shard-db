@@ -6062,6 +6062,27 @@ static int edit_valid_name(const char *name) {
     return 1;
 }
 
+/* Extract the trailing default-modifier suffix from a fields.conf line.
+   Modifiers recognised: :default=<…>, :auto_create, :auto_update.
+   The suffix is everything from the first such modifier to end-of-line.
+   Returns 0 and writes "" to out_buf if no modifier present, 1 if found.
+   out_buf must be ≥ 256 bytes. */
+static int default_modifiers_for_line(const char *line, char *out_buf, size_t out_cap) {
+    out_buf[0] = '\0';
+    static const char *mods[] = { ":default=", ":auto_create", ":auto_update", NULL };
+    const char *earliest = NULL;
+    for (int i = 0; mods[i]; i++) {
+        const char *p = strstr(line, mods[i]);
+        if (p && (!earliest || p < earliest)) earliest = p;
+    }
+    if (!earliest) return 0;
+    size_t need = strlen(earliest);
+    if (need >= out_cap) need = out_cap - 1;
+    memcpy(out_buf, earliest, need);
+    out_buf[need] = '\0';
+    return 1;
+}
+
 /* Rewrite fields.conf in place, replacing each edited line with its new
    spec. Edited lines preserve the trailing :removed marker if present
    (edit-field rejects tombstoned fields up front, so this is defensive).
