@@ -6330,17 +6330,21 @@ int cmd_edit_fields(const char *db_root, const char *object,
     }
     new_ts.total_size = noff;
 
-    /* Detect no-op: every edited field's encoding is identical to its old
-       encoding. In that case fields.conf may still change (default modifier
-       differences, etc.) but no data rebuild is required. */
-    int needs_rebuild = 0;
+    /* Per-edit dirty tracking. A field is dirty when its encoding actually
+       changed; only those fields' indexes need to be rebuilt. */
+    char dirty_names[MAX_FIELDS][128];
+    int n_dirty = 0;
     for (int e = 0; e < n_edits; e++) {
         int oi = edited_old_idx[e];
         if (field_needs_transform(&old_ts->fields[oi], &new_ts.fields[oi])) {
-            needs_rebuild = 1;
-            break;
+            size_t nlen = strlen(parsed[e].name);
+            if (nlen >= sizeof(dirty_names[0])) nlen = sizeof(dirty_names[0]) - 1;
+            memcpy(dirty_names[n_dirty], parsed[e].name, nlen);
+            dirty_names[n_dirty][nlen] = '\0';
+            n_dirty++;
         }
     }
+    int needs_rebuild = (n_dirty > 0);
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
