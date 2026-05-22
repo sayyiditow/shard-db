@@ -226,15 +226,35 @@ static int run_crud_assertions(TestEnv *env) {
     /* === Bulk insert: 50 records, varied bodies. Confirms the bulk
        path also dispatches the trigram CRUD hook. === */
     {
-        char *bulk = malloc(8192);
-        int off = snprintf(bulk, 8192,
-            "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"notes\",\"records\":[");
+        /* Bulk-payload builder with explicit underflow guard on the
+           remaining-bytes calculation — CodeQL flags the bare
+           `off += snprintf(buf + off, cap - off, …)` idiom as
+           potentially overflowing because snprintf returns the
+           would-have-written count, which can drive `off` past `cap`
+           on truncation. Bound payload size by sizing `cap`
+           generously for 50 short records (~120 B each → ~6 KB
+           total, well under 16 KB). */
+        const size_t cap = 16384;
+        char *bulk = malloc(cap);
+        ASSERT_TRUE(bulk != NULL, "bulk: alloc payload");
+        size_t off = 0;
+        int n;
+        #define APPEND(...) do {                                              \
+            size_t rem = (off < cap) ? (cap - off) : 0;                       \
+            if (rem == 0) break;                                              \
+            n = snprintf(bulk + off, rem, __VA_ARGS__);                       \
+            if (n < 0 || (size_t)n >= rem) { off = cap - 1; break; }          \
+            off += (size_t)n;                                                 \
+        } while (0)
+
+        APPEND("{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"notes\",\"records\":[");
         for (int i = 0; i < 50; i++) {
-            off += snprintf(bulk + off, 8192 - off,
-                "%s{\"key\":\"bk%d\",\"value\":{\"body\":\"sample body number %d about cats\"}}",
-                i ? "," : "", i, i);
+            APPEND("%s{\"key\":\"bk%d\",\"value\":{\"body\":\"sample body number %d about cats\"}}",
+                   i ? "," : "", i, i);
         }
-        snprintf(bulk + off, 8192 - off, "]}");
+        APPEND("]}");
+        #undef APPEND
+
         tc_request(tc, bulk, &resp);
         ASSERT_CONTAINS(resp, "\"inserted\":", "bulk-insert returned inserted count");
         free(bulk);

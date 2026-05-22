@@ -12,14 +12,25 @@ int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
+/* MAX_CONCURRENT_QUERIES — hard cap on simultaneously-running queries.
+   When the cap is reached, additional requests get an immediate
+   {"error":"server at capacity"} response so clients can retry. Bounded
+   concurrency means worst-case query RAM = max_concurrent × QUERY_BUFFER_MB
+   is predictable, which is the prerequisite for sane sizing on multi-
+   tenant deployments. 0 = auto, resolved at cmd_server startup to
+   max(4, min(nproc, 32)). */
+int g_max_concurrent_queries = 0;
 int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via FCACHE_MAX
                                    to one of {4096, 8192, 12288, 16384} */
 int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 4
                                    (derived, not separately configurable) */
-/* 500 MB default keeps non-server callers (CLI, tests) safe. cmd_server
-   detects the unchanged-default case and auto-tunes to
-   min(25% of total RAM, 4 GB) for typical VPS shapes — see server.c. */
-size_t g_query_buffer_max_bytes = 500ULL * 1024 * 1024;
+/* 256 MB default — conservative cap that fits comfortably even with
+   MAX_CONCURRENT_QUERIES at its auto ceiling (32). cmd_server detects
+   the unchanged-default case and auto-tunes upward IF the per-slot
+   share of (25% of RAM, 4 GB cap) is bigger — i.e. when slot count
+   is low and host RAM is generous. Worst-case RAM for query buffers
+   stays bounded by max_concurrent × QUERY_BUFFER_MB regardless. */
+size_t g_query_buffer_max_bytes = 256ULL * 1024 * 1024;
 /* 1 GiB default keeps reindex memory bounded on modest VPS shapes. Big
    prod servers with lots of indexed fields can raise this to fit more
    fields per scan pass (INDEX_BUILD_BUDGET_MB in db.env). */
@@ -305,6 +316,9 @@ int load_db_root(char *out, size_t outlen) {
             g_workers = atoi(p + 8);
         } else if (strncmp(p, "GLOBAL_LIMIT=", 13) == 0) {
             g_global_limit = atoi(p + 13);
+        } else if (strncmp(p, "MAX_CONCURRENT_QUERIES=", 23) == 0) {
+            g_max_concurrent_queries = atoi(p + 23);
+            if (g_max_concurrent_queries < 0) g_max_concurrent_queries = 0;
         } else if (strncmp(p, "MAX_REQUEST_SIZE=", 17) == 0) {
             int sz = atoi(p + 17);
             if (sz >= 1024) g_max_request_size = sz;
@@ -3191,5 +3205,61 @@ int cmd_rename_field(const char *db_root, const char *object,
     log_msg(3, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
     OUT("{\"status\":\"renamed\",\"old\":\"%s\",\"new\":\"%s\"}\n", old_name, new_name);
     return 0;
+}
+
+
+/* ========== Query concurrency cap ========================================
+ * Semaphore-based slot allocator. Each query takes a slot at dispatch
+ * entry; releases on dispatch exit (success or error). When the cap is
+ * reached, slot_try_acquire returns -1 immediately and the dispatcher
+ * emits {"error":"server at capacity"} so clients can retry.
+ *
+ * Bounded concurrency makes peak RAM predictable:
+ *   worst_case_query_buffers = MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB
+ *
+ * Slot count resolved at cmd_server startup (slot_init): operator value
+ * if set in db.env, else auto = max(4, min(nproc, 32)). Auto-scaling
+ * keeps the cap right for both tiny dev boxes and big servers without
+ * tuning required out-of-box. */
+
+#include <semaphore.h>
+
+static sem_t g_query_slots;
+static int   g_slots_inited = 0;
+
+void slot_init(void) {
+    if (g_slots_inited) return;
+    int n = g_max_concurrent_queries;
+    if (n <= 0) {
+        n = parallel_threads();
+        if (n < 4)  n = 4;
+        if (n > 32) n = 32;
+    }
+    g_max_concurrent_queries = n;
+    if (sem_init(&g_query_slots, 0, (unsigned)n) != 0) {
+        fprintf(stderr, "config: sem_init failed: %s - slot cap disabled\n",
+                strerror(errno));
+        g_max_concurrent_queries = 0;
+        return;
+    }
+    g_slots_inited = 1;
+}
+
+/* Returns 0 if a slot was acquired, -1 if at capacity. Non-blocking. */
+int slot_try_acquire(void) {
+    if (!g_slots_inited) return 0;            /* cap disabled — pass-through */
+    if (sem_trywait(&g_query_slots) == 0) return 0;
+    return -1;
+}
+
+void slot_release(void) {
+    if (!g_slots_inited) return;
+    sem_post(&g_query_slots);
+}
+
+/* Used with __attribute__((cleanup)) to release the slot on any
+   function exit path. Pointer arg is treated as a 0/1 held flag. */
+void slot_cleanup(int *held) {
+    if (held && *held) slot_release();
 }
 

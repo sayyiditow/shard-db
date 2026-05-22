@@ -19,10 +19,11 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `WORKERS` | `0` (auto) | Server-worker pool that accepts connections + dispatches request handlers. `0` = auto (CPU count, minimum 4). |
 | `POOL_CHUNK` | `0` (auto) | parallel_for submission chunk size. `0` = `nproc`. Tasks are enqueued in chunks of this many; larger chunks reduce queue-lock contention but serialise concurrent submitters. Rarely needs tuning. |
 | `GLOBAL_LIMIT` | `100000` | Default `limit` applied when a query omits one. Per-query `limit` is **not clamped** — pass any value to override. |
+| `MAX_CONCURRENT_QUERIES` | `0` (auto) | Hard cap on queries in-flight simultaneously. `0` = `max(4, min(nproc, 32))`. When the cap is reached, additional requests get `{"error":"server at capacity","max_concurrent_queries":N}` and the client should retry. Worst-case query-buffer RAM = `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB`. |
 | `MAX_REQUEST_SIZE` | `33554432` (32 MB) | Maximum JSON request size per line. Oversized requests get `{"error":"Request too large (max N bytes)"}`. Every connection allocates a read buffer of this size, so total per-conn memory = N × `MAX_REQUEST_SIZE`. |
 | `FCACHE_MAX` | `4096` | Unified shard-mmap cache capacity (entries). **Strict allow-list:** `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning. See [Tuning](../operations/tuning.md). |
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
-| `QUERY_BUFFER_MB` | `500` | Per-query intermediate buffer cap. Protects the daemon from one bad query monopolising RAM. The collect-hash buffer is a single mmap MAP_NORESERVE reservation up to this cap; pages lazy-commit on write. |
+| `QUERY_BUFFER_MB` | `256` | Per-query intermediate buffer cap. With `MAX_CONCURRENT_QUERIES` bounding fan-in, worst-case RAM stays predictable. Auto-tunes upward on big-RAM hosts with low slot counts (floor: 256 MB). |
 | `INDEX_BUILD_BUDGET_MB` | `1024` | Peak per-pass memory budget for `reindex` / multi-field `add-index` / `migrate`'s phase-2 rebuild. Floor 64 MB. Multi-field builds group fields into passes that fit this cap; an oversized single field still runs alone. See [Tuning → INDEX_BUILD_BUDGET_MB](../operations/tuning.md). |
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
 | `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
@@ -50,10 +51,11 @@ export INDEX_PAGE_SIZE=4096
 export THREADS=0
 export WORKERS=0
 export GLOBAL_LIMIT=100000
+export MAX_CONCURRENT_QUERIES=0
 export MAX_REQUEST_SIZE=33554432
 export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
-export QUERY_BUFFER_MB=500
+export QUERY_BUFFER_MB=256
 export INDEX_BUILD_BUDGET_MB=1024
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
