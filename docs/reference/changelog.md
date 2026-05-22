@@ -4,6 +4,36 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.7
+
+Feature release bundling **three new index types**, a **bounded query concurrency cap**, and a **CPD-driven dedup sweep**.
+
+### Index types
+
+- **Bitmap index** (PR #56). Default for `bool` and `enum` fields; opt-in via `field:bitmap` / `field:bitmap(N)` for low-cardinality varchar. Dense one-bit-per-slot layout at `<obj>/indexes/<field>/<NNN>.bm`, 1:1 with data shards. Popcount fast paths for `eq` / `in` / `neq` / `not_in`; dict-scan for every other op. Default cap 256 distinct values per (shard, field), override up to 65535.
+- **Enum field type** (PR #57). New typed field `field:enum(a,b,c,...)`. Width-adaptive storage (1 byte for ≤256 values, 2 bytes for >256). Auto-promote to bitmap index. Strict create-object default — unknown values rejected at insert (PR #58).
+- **Trigram index** (PR #60). New opt-in `field:trigram` on varchar for substring search (`contains` / `i_contains`). Extracts distinct 3-byte lowercased trigrams per record into `<obj>/indexes/<field>/<NNN>.tg` (BTRH btree format — shares cache + tooling with `.idx`). Queries intersect per-trigram posting lists rarest-first, then per-record verify the substring. **Planner heuristic**: when a field has both btree AND trigram, short patterns (< 6 chars) use btree-leaf scan (faster on common substrings), long patterns use trigram (faster on selective queries). Field-only trigram (no btree) uses trigram regardless of pattern length.
+- **Bounded-memory index build pipeline.** External-merge sort with per-worker spill files + k-way merge feeds streaming `bt_stream_build_*` into the final btree. Per-output-shard memory stays at a few MB regardless of input size — verified at 25M records (was OOMing pre-fix). Same pipeline powers btree and trigram builds; bitmap builds write directly into mmap'd `.bm` files (no accumulation needed).
+
+### Bounded query concurrency
+
+- **New `MAX_CONCURRENT_QUERIES` knob** (PR #61). Hard cap on simultaneously-running queries via sem_trywait semaphore at dispatch entry; cleanup-attribute release on any exit path. Default `0` = auto = `max(4, min(nproc, 32))`. Exceeded → immediate `{"error":"server at capacity","max_concurrent_queries":N}` so clients retry without holding the TCP thread.
+- **Worst-case query-buffer RAM is now predictable**: `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB`. Pair with cgroup / systemd `MemoryMax` as the final OS-level guard.
+- **`QUERY_BUFFER_MB` default lowered 500 → 256.** Auto-tune still kicks in but now divides the process-wide query budget (min 25% RAM, 4 GB ceiling) by the resolved slot count instead of letting a single query grab all of it.
+
+### Code quality
+
+- **CPD-driven dedup sweep** (PR #59, PR #62). Consolidated benchmark utilities (`bench_du_bytes` / `bench_fmt_bytes`), `storage.c` bucket-dispatch (3 callers → 1 helper), `query.c` aggregate min/max via KeySet (2 callers → 1 helper). 130 LOC removed, no behavior change.
+- **CodeQL #94 snprintf safety fix** (PR #61). Test bulk-insert builder no longer uses the `off += snprintf(buf+off, cap-off, ...)` antipattern that can drive `off` past `cap` on truncation.
+
+### Migration
+
+Wire-format and on-disk format unchanged from 2026.05.5 / 2026.05.6. **No `./migrate` required.** Existing objects continue to work; opt into the new index types via `add-index` on the fields where it makes sense.
+
+Test coverage: **84 cases / 3464 assertions, 0 failures.**
+
+Full notes: [release-notes/2026.05.7.md](../release-notes/2026.05.7.md).
+
 ## 2026.05.6
 
 Hotfix release for two latent JSON-escape bugs in the typed-record
