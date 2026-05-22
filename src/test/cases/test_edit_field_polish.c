@@ -110,6 +110,62 @@ static int t_auto_update_carryover(TestClient *tc) {
     return 0;
 }
 
+/* Smart reindex: editing one indexed field's encoding should only rebuild
+   indexes that actually reference that field. Object has two indexes
+   (age, name); editing age:int → age:long must rebuild exactly 1 and skip
+   exactly 1. The skipped (name) index must still be functional. */
+static int t_smart_reindex(TestClient *tc) {
+    char *resp = NULL;
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"polish\"}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"polish\",\"object\":\"smartidx\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"id:varchar:16\",\"age:int\",\"name:varchar:64\"],"
+        "\"indexes\":[\"age\",\"name\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object smartidx");
+    free(resp); resp = NULL;
+
+    for (int i = 0; i < 5; i++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"polish\",\"object\":\"smartidx\","
+            "\"key\":\"k%d\",\"value\":{\"id\":\"k%d\",\"age\":%d,\"name\":\"n%d\"}}",
+            i, i, 20 + i, i);
+        tc_request(tc, req, &resp);
+        free(resp); resp = NULL;
+    }
+
+    /* Edit-field age:int → age:long. Encoding changes (4 → 8 bytes BE). */
+    tc_request(tc,
+        "{\"mode\":\"edit-field\",\"dir\":\"polish\",\"object\":\"smartidx\","
+        "\"fields\":[\"age:long\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"edited\"",      "smart reindex edit-field status");
+    ASSERT_CONTAINS(resp, "\"indexes_rebuilt\":1",      "indexes_rebuilt is 1 (age only)");
+    ASSERT_CONTAINS(resp, "\"indexes_skipped\":1",      "indexes_skipped is 1 (name)");
+    free(resp); resp = NULL;
+
+    /* Functional check: indexed find by age (the rebuilt index). */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"polish\",\"object\":\"smartidx\","
+        "\"criteria\":[{\"field\":\"age\",\"op\":\"gte\",\"value\":22}]}", &resp);
+    ASSERT_CONTAINS(resp, "\"key\":\"k2\"", "find age gte 22 returns k2");
+    ASSERT_CONTAINS(resp, "\"key\":\"k3\"", "find age gte 22 returns k3");
+    ASSERT_CONTAINS(resp, "\"key\":\"k4\"", "find age gte 22 returns k4");
+    free(resp); resp = NULL;
+
+    /* Functional check: indexed find by name (the skipped index — must still work). */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"polish\",\"object\":\"smartidx\","
+        "\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"n2\"}]}", &resp);
+    ASSERT_CONTAINS(resp, "\"key\":\"k2\"", "find name eq n2 still works (skipped index)");
+    free(resp); resp = NULL;
+
+    return 0;
+}
+
 /* NOTE: the "new spec overrides old default" path is implemented inside
    default_modifiers_for_line / rewrite_fields_conf_for_edit (the `new_has`
    branch) but is currently unreachable end-to-end: parse_field_line —
@@ -138,6 +194,7 @@ static int test_edit_field_polish_run(void) {
     t_default_carryover(tc);
     t_auto_create_carryover(tc);
     t_auto_update_carryover(tc);
+    t_smart_reindex(tc);
 
     tc_close(tc);
     test_env_stop(&env);

@@ -6161,6 +6161,79 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
     return 0;
 }
 
+/* Selective reindex driver — walks index.conf and only rebuilds indexes
+   whose referenced fields appear in dirty_names[]. Returns (rebuilt,
+   skipped) via out params. */
+static void selective_reindex_dirty(const char *db_root, const char *object,
+                                    char dirty_names[][128], int n_dirty,
+                                    int *out_rebuilt, int *out_skipped) {
+    *out_rebuilt = 0; *out_skipped = 0;
+    if (n_dirty <= 0) return;
+    char ic_path[PATH_MAX];
+    snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf", db_root, object);
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) return;
+
+    char affected_specs[MAX_FIELDS][256];
+    int n_aff = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), ic)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0]) continue;
+        /* Index spec form: <fname>[+<fname>...][':' index-type-tail].
+           Match any '+'-separated token against dirty_names[]. */
+        int hit = 0;
+        const char *p = line;
+        while (*p && !hit) {
+            const char *next = p;
+            while (*next && *next != '+' && *next != ':') next++;
+            size_t toklen = (size_t)(next - p);
+            for (int d = 0; d < n_dirty; d++) {
+                size_t dn = strlen(dirty_names[d]);
+                if (toklen == dn && memcmp(p, dirty_names[d], dn) == 0) { hit = 1; break; }
+            }
+            if (*next == '+') p = next + 1;
+            else break;
+        }
+        if (hit) {
+            strncpy(affected_specs[n_aff], line, sizeof(affected_specs[0]) - 1);
+            affected_specs[n_aff][sizeof(affected_specs[0]) - 1] = '\0';
+            n_aff++;
+        } else (*out_skipped)++;
+    }
+    fclose(ic);
+
+    if (n_aff == 0) return;
+
+    Schema sch = load_schema(db_root, object);
+    for (int i = 0; i < n_aff; i++) {
+        /* Strip ':<type>' tail to get the field-only name for unlink. */
+        char field_only[256];
+        strncpy(field_only, affected_specs[i], sizeof(field_only) - 1);
+        field_only[sizeof(field_only) - 1] = '\0';
+        char *col = strchr(field_only, ':');
+        if (col) *col = '\0';
+        btree_idx_unlink_all(db_root, object, field_only, sch.splits);
+    }
+
+    /* Hand the affected list to cmd_add_indexes(force=1). */
+    char fields_json[8192];
+    int pos = snprintf(fields_json, sizeof(fields_json), "[");
+    for (int i = 0; i < n_aff; i++) {
+        pos += snprintf(fields_json + pos, sizeof(fields_json) - pos,
+                        "%s\"%s\"", i ? "," : "", affected_specs[i]);
+    }
+    snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
+
+    FILE *saved_out = g_out;
+    FILE *devnull = fopen("/dev/null", "w");
+    g_out = devnull ? devnull : saved_out;
+    cmd_add_indexes(db_root, object, fields_json, 1);
+    g_out = saved_out;
+    if (devnull) fclose(devnull);
+    *out_rebuilt = n_aff;
+}
+
 int cmd_edit_fields(const char *db_root, const char *object,
                     char lines[][256], int n_edits, int allow_rename) {
     if (n_edits <= 0) {
@@ -6419,17 +6492,19 @@ int cmd_edit_fields(const char *db_root, const char *object,
     }
     invalidate_schema_caches(db_root, object);
 
-    /* Wipe + rebuild every index — the edited fields' encoded bytes have
-       changed, so any index touching them is stale. We rebuild all (not
-       just affected ones) to keep this code path simple. */
-    int idx_rebuilt = reindex_object(db_root, object);
+    /* Wipe + rebuild only indexes whose referenced fields actually had
+       their encoding change. Skipped indexes remain intact and functional. */
+    int idx_rebuilt = 0, idx_skipped = 0;
+    selective_reindex_dirty(db_root, object, dirty_names, n_dirty,
+                            &idx_rebuilt, &idx_skipped);
 
-    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, idx_rebuilt=%d",
+    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
+               "idx_rebuilt=%d, idx_skipped=%d",
             db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
-            idx_rebuilt);
+            idx_rebuilt, idx_skipped);
     OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
-        "\"slot_size\":%d,\"indexes_rebuilt\":%d}\n",
-        n_edits, new_sch.slot_size, idx_rebuilt);
+        "\"slot_size\":%d,\"indexes_rebuilt\":%d,\"indexes_skipped\":%d}\n",
+        n_edits, new_sch.slot_size, idx_rebuilt, idx_skipped);
     for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
     return 0;
 }
