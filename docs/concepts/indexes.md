@@ -1,9 +1,10 @@
 # Indexes
 
-shard-db ships two index types:
+shard-db ships three index types:
 
 - **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).
 - **Bitmap** (auto-default for `bool` and `enum` fields since 2026.05.7; opt-in via `"field:bitmap"` or `"field:bitmap(N)"` for low-cardinality `varchar`) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
+- **Trigram** (opt-in via `"field:trigram"` on `varchar`; new in 2026.05.7) — substring index for `contains` and `i_contains` queries. Each record contributes one entry per distinct 3-byte lowercased trigram extracted from the field's value into `<object>/indexes/<field>/<NNN>.tg` (uses the same BTRH btree format as `.idx` so existing infrastructure handles caching, range scans, and reads). Queries extract trigrams from the pattern, look up posting lists per trigram, intersect rarest-first, then per-record verify the substring (kills false positives from order-insensitive trigram matching). When a field has both btree AND trigram, the planner auto-picks btree-leaf scan for short patterns (`< 6` chars — verify cost dominates trigram for non-selective common substrings) and trigram for longer patterns. Build uses external-merge sort: bounded per-worker memory + tight prefix-compressed leaves at any scale (25M, 100M, 1B records).
 
 ## When to add an index
 
@@ -30,19 +31,28 @@ Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`index_splits_f
 
 ### Explicit type
 
-`add-index` / `create-object` accept an explicit type suffix when you want bitmap (or future trigram) on a field that wouldn't auto-default to it:
+`add-index` / `create-object` accept an explicit type suffix when you want bitmap or trigram on a field that wouldn't auto-default to that type:
 
 ```json
 {"mode":"add-index","dir":"acme","object":"users","field":"status:bitmap"}
-```
-
-```json
 {"mode":"add-index","dir":"acme","object":"users","field":"status:bitmap(32)"}
+{"mode":"add-index","dir":"acme","object":"posts","field":"body:trigram"}
 ```
 
-Files created: `<obj>/indexes/status/<NNN>.bm` (one per data shard, not the btree fan-out curve). The bitmap-shard layout is 1:1 with data shards because each bit maps directly to a slot.
+| spec | files created (per data shard) | use case |
+|---|---|---|
+| `field` (no suffix) | `<obj>/indexes/<field>/<NNN>.idx` (btree fan-out curve) | default — every field type |
+| `field:btree` | same as above (explicit) | force btree on a bool/enum (suppresses auto-bitmap) |
+| `field:bitmap` | `<obj>/indexes/<field>/<NNN>.bm` (1:1 with data shards) | low-cardinality varchar; `eq` / `in` / `neq` hot paths |
+| `field:bitmap(N)` | same, with cap `N ∈ [2, 65535]` | override the default 256-value cap |
+| `field:trigram` | `<obj>/indexes/<field>/<NNN>.tg` (btree fan-out curve, BTRH format) | substring search on varchar — `contains` / `i_contains` |
 
-Allowed suffixes today: `field:btree` (default), `field:bitmap`, `field:bitmap(N)` where `N ∈ [2, 65535]`. Without a suffix, `bool` fields auto-default to bitmap; every other type defaults to btree.
+Auto-defaults: `bool` and `enum` fields → bitmap. Everything else → btree. To override an auto-default, declare the type explicitly (e.g., `active:btree` keeps a bool on btree). Multiple types on the same field are allowed and useful — e.g., `email` declared as both `email` (btree, for eq lookups) AND `email:trigram` (for substring search) — the planner picks per-query.
+
+Trigram cost notes:
+- Disk: ~5× the btree's footprint on the same field (one entry per (record × distinct trigram in value) vs btree's one per record), but still bounded — see `estimate-index` to project before committing.
+- Build: external-merge sort (bounded memory at any scale). Per-shard merge runs in parallel up to pool size.
+- Query: rarest-trigram-first intersect skips full posting walks when patterns are selective. For non-selective common short patterns where btree also exists on the field, the planner auto-picks btree-leaf scan instead (configurable threshold at 6 chars).
 
 ### Composite
 
