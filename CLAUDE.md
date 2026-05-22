@@ -47,7 +47,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 
 ## Configuration files
 
-- `db.env` — `DB_ROOT`, `PORT`, `TIMEOUT`, `LOG_*`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX = FCACHE_MAX/4`, `QUERY_BUFFER_MB`, `INDEX_BUILD_BUDGET_MB`, `DISABLE_LOCALHOST_TRUST`, `TOKEN_CAP`, `SLOW_QUERY_MS`, TLS knobs (`TLS_ENABLE`, `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`). Full reference: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
+- `db.env` — `DB_ROOT`, `PORT`, `TIMEOUT`, `LOG_*`, `THREADS`, `WORKERS`, `GLOBAL_LIMIT`, `MAX_CONCURRENT_QUERIES`, `MAX_REQUEST_SIZE`, `FCACHE_MAX`, `BT_CACHE_MAX = FCACHE_MAX/4`, `QUERY_BUFFER_MB`, `INDEX_BUILD_BUDGET_MB`, `DISABLE_LOCALHOST_TRUST`, `TOKEN_CAP`, `SLOW_QUERY_MS`, TLS knobs (`TLS_ENABLE`, `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `TLS_SKIP_VERIFY`, `TLS_SERVER_NAME`). Full reference: [docs/getting-started/configuration.md](docs/getting-started/configuration.md).
 - `$DB_ROOT/tokens.conf` — global tokens. Line format `token[:perm]`, `perm ∈ {r, rw, rwx}`, no suffix = `rwx`.
 - `$DB_ROOT/<dir>/tokens.conf` — per-tenant tokens (same format).
 - `$DB_ROOT/<dir>/<obj>/tokens.conf` — per-object tokens (same format).
@@ -228,7 +228,9 @@ Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single
 
 ### Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 500) bounds intermediate buffers any single query can hold. 8 collection sites checked (ordered find buffer, aggregate buckets, bulk-delete/update key list, OR KeySet, `CollectCtx.entries`, `ShardWorkCtx.results`, per-worker agg hash tables, list-files names buffer). Exceeded → query aborts with `{"error":"query memory buffer exceeded; ..."}`; server keeps serving. Pair with whole-process containment (systemd MemoryMax, cgroup, ulimit -v). See [docs/reference/limits.md](docs/reference/limits.md).
+`QUERY_BUFFER_MB` (default 256) bounds intermediate buffers any single query can hold. 8 collection sites checked (ordered find buffer, aggregate buckets, bulk-delete/update key list, OR KeySet, `CollectCtx.entries`, `ShardWorkCtx.results`, per-worker agg hash tables, list-files names buffer). Exceeded → query aborts with `{"error":"query memory buffer exceeded; ..."}`; server keeps serving.
+
+`MAX_CONCURRENT_QUERIES` (default 0 = auto = `max(4, min(nproc, 32))`) hard-caps simultaneously-running queries. Implemented via a sem_trywait semaphore in `dispatch_json_query` — every request takes a slot at entry and releases via `__attribute__((cleanup))` on any return path. Exceeded → immediate `{"error":"server at capacity"}`, client retries. Worst-case query-buffer RAM = `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB` (predictable peak for sizing). Pair with whole-process containment (systemd MemoryMax, cgroup, ulimit -v) as a final backstop. See [docs/reference/limits.md](docs/reference/limits.md).
 
 ## Limits / constants
 

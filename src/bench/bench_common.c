@@ -8,6 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
 int bench_make_memfd(const char *name, const char *data, size_t size) {
     /* memfd_create syscall number on x86_64 = 319, aarch64 = 279 */
@@ -32,4 +34,33 @@ int bench_make_memfd(const char *name, const char *data, size_t size) {
     }
     if (lseek(fd, 0, SEEK_SET) != 0) { perror("lseek"); close(fd); return -1; }
     return fd;
+}
+
+long long bench_du_bytes(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) return (long long)st.st_size;
+        return 0;
+    }
+    long long total = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char sub[1024];
+        snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (stat(sub, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) total += bench_du_bytes(sub);
+        else if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+void bench_fmt_bytes(long long b, char *out, size_t outlen) {
+    if (b < 1024)             snprintf(out, outlen, "%lld B",  b);
+    else if (b < 1024 * 1024) snprintf(out, outlen, "%.1f KB", b / 1024.0);
+    else if (b < 1LL << 30)   snprintf(out, outlen, "%.1f MB", b / (1024.0 * 1024));
+    else                      snprintf(out, outlen, "%.2f GB", b / (1024.0 * 1024 * 1024));
 }

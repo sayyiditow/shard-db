@@ -11,7 +11,8 @@ export WORKERS=0            # auto = max(CPU count, 4)
 export FCACHE_MAX=4096      # raise if shard-mmap cache hit rate < 90%; allow-list {4096, 8192, 12288, 16384}
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX/4 (2026.05.1+)
 export MAX_REQUEST_SIZE=33554432   # 32 MB; per-connection read buffer (memory planning!)
-export QUERY_BUFFER_MB=500         # per-query intermediate buffer cap (collect-hash, KeySet, etc.)
+export MAX_CONCURRENT_QUERIES=0    # 0 = auto: max(4, min(nproc, 32))
+export QUERY_BUFFER_MB=256         # per-query intermediate buffer cap (collect-hash, KeySet, etc.)
 export INDEX_BUILD_BUDGET_MB=1024   # reindex/add-indexes peak memory per pass (default 1 GiB)
 export GLOBAL_LIMIT=100000         # soft result-set cap
 export SLOW_QUERY_MS=500           # slow query threshold (floor 100 ms)
@@ -109,15 +110,33 @@ Seconds before a long-running query is cancelled cooperatively. Checked every 10
 
 Response on timeout: `{"error":"query_timeout"}`.
 
+## MAX_CONCURRENT_QUERIES — bounded query fan-in
+
+Hard cap on the number of queries in flight at once. Each query takes a slot at dispatch entry and releases on exit (any return path). When all slots are taken, additional requests get an immediate `{"error":"server at capacity","max_concurrent_queries":N}` so the client can retry without holding the TCP thread.
+
+- **Default 0** = auto = `max(4, min(nproc, 32))`.
+- Worst-case query-buffer RAM = `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB`. Pick the pair so the product fits comfortably in your host's free RAM — leaving room for OS page cache (mmap'd `.bin`, `.idx`, `.bm`, `.tg` files) is what makes shard-db's working set bounded by hot-data size, not total dataset size.
+- Slots are global (process-wide), not per-tenant. A noisy tenant can fill all slots; per-tenant fairness is a deferred follow-up.
+
+| host RAM | recommended `MAX_CONCURRENT_QUERIES` | `QUERY_BUFFER_MB` | worst-case query RAM | OS cache headroom |
+|---|---|---|---|---|
+| 4 GB | `4` | `128` | 0.5 GB | 3 GB |
+| 8 GB | `8` | `256` | 2 GB | 5.5 GB |
+| **16 GB** (default target) | `16` | `256` | 4 GB | 11 GB |
+| 32 GB | `24` | `256` or `512` | 6–12 GB | 18–25 GB |
+| 64 GB+ | `32` (auto ceiling) | `512` or higher | 16+ GB | 45+ GB |
+
 ## QUERY_BUFFER_MB — per-query memory cap
 
-Upper bound on intermediate buffers any single query can hold — collect-hash arrays, KeySets (OR union, AND intersection), aggregate hash tables, ordered-find sort buffers, bulk-delete/update key lists.
+Upper bound on intermediate buffers any single query can hold — collect-hash arrays, KeySets (OR union, AND intersection, trigram intersect), aggregate hash tables, ordered-find sort buffers, bulk-delete/update key lists.
 
-- **Default 500 MB**.
+- **Default 256 MB**.
 - Checked at every collection site. Exceeding triggers `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}` and the server keeps serving.
 - Peak RAM per query ≈ `QUERY_BUFFER_MB × 1` (true RSS ~10–15% higher from malloc overhead).
+- Worst-case TOTAL RAM for query buffers ≈ `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB` — see the table above.
+- Auto-tune: at server startup, if `QUERY_BUFFER_MB` is at the unchanged default (256), it auto-tunes upward to `min(25% of total RAM, 4 GB) / MAX_CONCURRENT_QUERIES` (floor 256 MB). This gives heavy ad-hoc analytics breathing room on big-RAM hosts with few slots, while keeping the multiplicative peak bounded.
 
-When to care: heavy ad-hoc analytics that legitimately need bigger working sets. Multiply by expected concurrent heavy queries when sizing the host. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, `ulimit -v`) as a backstop.
+When to care: heavy ad-hoc analytics that legitimately need bigger working sets. Pair with whole-process containment (systemd `MemoryMax=`, cgroup `memory.max`, `ulimit -v`) as a final backstop — `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB` is the predicted ceiling, but the OS-level cap protects against unforeseen growth (mmap'd file pages, daemon overhead, etc.).
 
 ## INDEX_BUILD_BUDGET_MB — reindex peak memory cap
 

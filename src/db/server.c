@@ -552,6 +552,21 @@ static int auto_key_generate(const Schema *sc, const char *db_root,
 
 /* Dispatch a JSON query object: {"mode":"get","object":"users","key":"k1",...} */
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
+    /* Concurrency cap: take a slot up-front; release on any return path
+       via the cleanup attribute. Bounds peak query-buffer RAM at
+       max_concurrent × QUERY_BUFFER_MB regardless of how many TCP
+       threads accept connections at once. Try-acquire is non-blocking
+       — clients get an immediate retry-please response rather than
+       holding the TCP thread under load. */
+    int slot_held __attribute__((cleanup(slot_cleanup))) = 0;
+    if (slot_try_acquire() == 0) {
+        slot_held = 1;
+    } else {
+        OUT("{\"error\":\"server at capacity\",\"max_concurrent_queries\":%d}\n",
+            g_max_concurrent_queries);
+        return;
+    }
+
     /* Parse the request JSON top-level fields in a single pass. Every
        json_obj_strdup() below is an O(n) lookup over this ~10-20 entry
        array instead of an O(|json|) walk from the beginning — the whole
@@ -2676,26 +2691,41 @@ int cmd_server(const char *db_root, int daemonize) {
     write_pid_file(db_root, port);
     g_server_start_ms = now_ms();
     bt_page_size = g_index_page_size;
-    /* QUERY_BUFFER_MB auto-tune. config.c initialises to 500 MB; if the
+    /* Initialise the query-concurrency slot allocator BEFORE the
+       QUERY_BUFFER_MB auto-tune below — the auto-tune divides the
+       process-wide query memory budget by the resolved slot count so
+       per-query and per-process caps multiply to a predictable peak. */
+    slot_init();
+
+    /* QUERY_BUFFER_MB auto-tune. config.c initialises to 256 MB; if the
        value is still at that default after db.env load, the user didn't
-       override it and we auto-tune to min(25% of total RAM, 4 GB) so
-       index-walk paths (KeySet builds in agg-with-criteria, group_by,
-       intersect) get enough headroom on typical VPS shapes (4 GB /
-       8 GB) to avoid falling back to slower per-record scans. The 4 GB
-       ceiling prevents a single query monopolising big-RAM boxes. */
-    if (g_query_buffer_max_bytes == 500ULL * 1024 * 1024) {
+       override it and we auto-tune. With MAX_CONCURRENT_QUERIES in
+       play, the worst-case RAM for query buffers is
+         max_concurrent × QUERY_BUFFER_MB.
+       We pick a process-wide budget of min(25% of RAM, 4 GB) and divide
+       by the resolved slot count — operators get headroom for heavy
+       agg/group_by/intersect paths on generous VPS shapes WITHOUT the
+       multiplicative blow-up under concurrent load that the pre-2026.05.8
+       single-query tuning had. Floor at the static 256 MB default so
+       tight VPS shapes don't shrink any further. */
+    if (g_query_buffer_max_bytes == 256ULL * 1024 * 1024) {
         long pages = sysconf(_SC_PHYS_PAGES);
         long page_sz = sysconf(_SC_PAGE_SIZE);
         if (pages > 0 && page_sz > 0) {
             size_t total_ram = (size_t)pages * (size_t)page_sz;
-            size_t quarter = total_ram / 4;
+            size_t budget = total_ram / 4;
             size_t cap = 4ULL * 1024 * 1024 * 1024;  /* 4 GB ceiling */
-            if (quarter > cap) quarter = cap;
-            if (quarter > g_query_buffer_max_bytes)
-                g_query_buffer_max_bytes = quarter;
+            if (budget > cap) budget = cap;
+            int slots = g_max_concurrent_queries > 0
+                            ? g_max_concurrent_queries : 1;
+            size_t per_slot = budget / (size_t)slots;
+            if (per_slot > g_query_buffer_max_bytes)
+                g_query_buffer_max_bytes = per_slot;
         }
-        log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB",
-                g_query_buffer_max_bytes / (1024 * 1024));
+        log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB (× %d slots = %zu MB peak)",
+                g_query_buffer_max_bytes / (1024 * 1024),
+                g_max_concurrent_queries,
+                (g_query_buffer_max_bytes * (size_t)g_max_concurrent_queries) / (1024 * 1024));
     }
     fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);

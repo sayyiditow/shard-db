@@ -377,6 +377,12 @@ extern int g_workers;
 extern int g_pool_chunk;
 extern int g_index_page_size;
 extern int g_global_limit;
+extern int g_max_concurrent_queries;
+/* Query concurrency slot allocator — see config.c. */
+void slot_init(void);
+int  slot_try_acquire(void);
+void slot_release(void);
+void slot_cleanup(int *held);
 extern size_t g_query_buffer_max_bytes;
 /* Peak per-pass memory budget for cmd_add_indexes / reindex. Multi-field
    builds estimate per-field cost (BtEntry arrays + partition copy + key
