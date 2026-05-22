@@ -18,15 +18,18 @@ A high-performance database in C. Single static binary, single process, no exter
 
 ## Highlights
 
-- **~5M / ~8.4M K/V ops/sec** single-thread / 5-conn parallel bulk insert (CSV, 10M records); **5.7M / 1.9M / 1.4M / 822k op/s** bulk EXISTS / DELETE / GET / UPDATE (10K keys per TCP request); sub-5ms indexed find / count / aggregate at 1M rows
-- **38 search operators** (eq/neq/range, like/contains/starts/ends, in/not_in, regex, exists, len_*, ilike/icontains, eq_field…) — every one indexed when an index is available
-- **AND-intersection planner** + **lock-free OR-union KeySet** — 2+ indexed criteria intersect candidate sets without per-record fetch for `count`
-- **Joins** (inner, left), **aggregations** (count/sum/avg/min/max with group_by + having), **cursor pagination**, **CAS** (if/if_not_exists, dry-run bulk ops)
-- **Per-shard btree layout** (2026.05.1+): writes route by hash, reads fan out across `splits/4` shards in parallel; k-way streaming merge for ordered queries
-- **Multi-tenancy**: `dir` parameter + tokens scoped global/per-tenant/per-object × `r`/`rw`/`rwx` permissions
-- **Native TLS 1.3** (single binary, single port, OpenSSL-backed) or reverse-proxy termination — both first-class
-- **Crash-safe**: atomic flag-flip writes, msync on shutdown, recovery sweep at startup
-- **shard-cli TUI** — separate ncurses client over the same TCP+TLS wire
+| Area | Highlights |
+|---|---|
+| **Throughput** | ~5M / ~8.4M K/V ops/sec single-thread / 5-conn parallel bulk insert (CSV, 10M records). 5.7M / 1.9M / 1.4M / 822k op/s bulk EXISTS / DELETE / GET / UPDATE (10K keys per TCP request). Sub-5ms indexed find / count / aggregate at 1M rows. |
+| **Indexes** | B+ tree (eq, range, prefix, all 38 operators), bitmap (auto-promote for bool + enum, popcount fast paths), trigram (substring search on varchar; planner auto-picks btree-leaf for short patterns, trigram for long). |
+| **Operators (38)** | eq / neq / range / between, like / contains / starts / ends, in / not_in, regex, exists, len_*, ilike / icontains, eq_field — all use the index when one is available. |
+| **Planner** | AND-intersection across 2+ indexed leaves without per-record fetch for `count`. Lock-free OR-union via KeySet. Rarest-first selection for trigram intersect. |
+| **Query features** | Inner + left joins, count/sum/avg/min/max aggregations with `group_by` + `having`, cursor pagination, CAS (`if` / `if_not_exists`, dry-run bulk ops). |
+| **Storage** | Per-shard btree layout (2026.05.1+) — writes route by hash, reads fan out across `splits/4` shards in parallel; k-way streaming merge for ordered queries. |
+| **Multi-tenancy** | `dir` parameter + tokens scoped global / per-tenant / per-object × `r` / `rw` / `rwx` permissions. |
+| **Transport** | Native TLS 1.3 (single binary, single port, OpenSSL-backed) or reverse-proxy termination — both first-class. |
+| **Reliability** | Crash-safe (atomic flag-flip writes, msync on shutdown, recovery sweep at startup). External-merge-sort index build — bounded memory at any scale. |
+| **Tools** | `shard-cli` ncurses TUI over the same TCP+TLS wire (separate binary, no daemon source linked). |
 
 Detailed feature reference: [docs/index.md](docs/index.md).
 

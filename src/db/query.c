@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "simd.h"
 #include "bitmap.h"
+#include "trigram.h"
 #include <fnmatch.h>
 #include <math.h>
 
@@ -349,6 +350,121 @@ int cmd_size(const char *db_root, const char *object) {
 
 int cmd_orphaned(const char *db_root, const char *object) {
     OUT("%d\n", get_deleted_count(db_root, object));
+    return 0;
+}
+
+/* ========== ESTIMATE-INDEX ==========
+ * Sample N records, project on-disk index size for a hypothetical
+ * trigram index on the given field. Lets operators budget honestly
+ * before committing to `add-index foo:trigram` — see
+ * [[trigram-impl-map]] phase 5. Wire: spec like "body:trigram". */
+
+#define TG_ESTIMATE_SAMPLE 1024     /* sample size; trades accuracy vs ms cost */
+#define TG_BYTES_PER_ENTRY 20       /* btree leaf cost: 16B hash + ~4B encoded key */
+
+typedef struct {
+    int                field_index;
+    TypedSchema       *ts;
+    size_t             sampled;
+    size_t             distinct_sum;     /* Σ distinct trigrams per record */
+    size_t             max_sample;
+} TgEstimateCtx;
+
+static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
+                          const void *key, size_t klen,
+                          const void *value, size_t vlen,
+                          void *ctx) {
+    (void)slot; (void)hash16; (void)key; (void)klen; (void)vlen;
+    TgEstimateCtx *c = (TgEstimateCtx *)ctx;
+    if (c->sampled >= c->max_sample) return -1;
+    const TypedField *f = &c->ts->fields[c->field_index];
+    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
+    if (actual_len > 0) {
+        uint8_t trigrams[TG_MAX_DISTINCT][3];
+        size_t n = tg_extract_distinct(vbase + 2, actual_len,
+                                       trigrams, TG_MAX_DISTINCT);
+        c->distinct_sum += n;
+    }
+    c->sampled++;
+    return 0;
+}
+
+int cmd_estimate_index(const char *db_root, const char *object,
+                        const char *spec) {
+    /* Parse `<field>:<type>`. Only `trigram` is supported in this
+       release — `btree` and `bitmap` would need their own projection
+       formulas; the on-disk size models differ. */
+    if (!spec || !*spec) {
+        OUT("{\"error\":\"missing spec; expected <field>:trigram\"}\n");
+        return 1;
+    }
+    const char *colon = strrchr(spec, ':');
+    if (!colon || strcmp(colon + 1, "trigram") != 0) {
+        OUT("{\"error\":\"only :trigram supported (got '%s')\"}\n", spec);
+        return 1;
+    }
+    char field[256] = {0};
+    size_t flen = (size_t)(colon - spec);
+    if (flen == 0 || flen >= sizeof(field)) {
+        OUT("{\"error\":\"invalid field name in spec\"}\n");
+        return 1;
+    }
+    memcpy(field, spec, flen);
+
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"object has no typed schema\"}\n");
+        return 1;
+    }
+    int fi = typed_field_index(ts, field);
+    if (fi < 0) {
+        OUT("{\"error\":\"field '%s' not in object\"}\n", field);
+        return 1;
+    }
+    if (ts->fields[fi].type != FT_VARCHAR) {
+        OUT("{\"error\":\"trigram requires varchar; field '%s' is type %d\"}\n",
+            field, ts->fields[fi].type);
+        return 1;
+    }
+
+    Schema sch = load_schema(db_root, object);
+    int live = get_live_count(db_root, object);
+    if (live <= 0) {
+        OUT("{\"records\":0,\"sample_size\":0,\"avg_distinct_trigrams\":0,"
+            "\"estimated_entries\":0,\"estimated_disk_bytes\":0}\n");
+        return 0;
+    }
+
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size, .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        OUT("{\"error\":\"slotcask open failed\"}\n");
+        return 1;
+    }
+
+    /* Walk shards in order, accumulating up to TG_ESTIMATE_SAMPLE
+       records. Stops early once the cap is hit. */
+    TgEstimateCtx c = {
+        .field_index = fi, .ts = ts,
+        .sampled = 0, .distinct_sum = 0, .max_sample = TG_ESTIMATE_SAMPLE,
+    };
+    for (int s = 0; s < sch.splits && c.sampled < c.max_sample; s++) {
+        slotcask_walk_one_shard_slots(sdb, s, tg_estimate_cb, &c);
+    }
+
+    double avg_distinct = c.sampled > 0
+        ? (double)c.distinct_sum / (double)c.sampled : 0.0;
+    long long est_entries = (long long)((double)live * avg_distinct);
+    long long est_disk = est_entries * TG_BYTES_PER_ENTRY;
+
+    OUT("{\"records\":%d,\"sample_size\":%zu,"
+        "\"avg_distinct_trigrams\":%.1f,"
+        "\"estimated_entries\":%lld,"
+        "\"estimated_disk_bytes\":%lld}\n",
+        live, c.sampled, avg_distinct, est_entries, est_disk);
     return 0;
 }
 
@@ -1114,6 +1230,28 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
         int unchanged = old_idx_have[fi] && have_new &&
                         key_len == old_idx_lens[fi] &&
                         memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
+
+        /* Trigram fields: dispatch via update_idx_fn so the IT_TRIGRAM
+           branch in index.c extracts distinct trigrams and writes one
+           .tg leaf entry per (trigram, hash). No accumulator like
+           bitmap — each trigram is already its own btree_insert at the
+           index.c layer, and per-shard bt_acquire amortises the file
+           lock automatically. */
+        if (itype == IT_TRIGRAM) {
+            if (!unchanged && have_new) {
+                UpdateIdxArg a = {0};
+                a.db_root = sw->db_root; a.object = sw->object;
+                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+                a.new_key = key_buf; a.new_len = key_len;
+                a.old_key = old_idx_have[fi] ? old_idx_bufs[fi] : NULL;
+                a.old_len = old_idx_have[fi] ? old_idx_lens[fi] : 0;
+                a.hash = r->hash; a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            }
+            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+            free(key_buf);
+            continue;
+        }
 
         /* Bitmap fields: enqueue (slot, value) into the per-field
            accumulator. The post-shard flush (bulk_insert_shard_worker_v2)
@@ -2732,6 +2870,7 @@ typedef struct {
     int key_count;
     /* Index info */
     char (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int nidx;
     TypedSchema *ts;
     /* Results */
@@ -2786,8 +2925,19 @@ static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
                                               &buf, &blen))
                 continue;
         }
-        delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                            sw->sch->splits, buf, blen, sw->hashes[ki]);
+        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
+        if (itype == IT_TRIGRAM) {
+            UpdateIdxArg a = {0};
+            a.db_root = sw->db_root; a.object = sw->object;
+            a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
+            a.new_key = NULL; a.new_len = 0;
+            a.old_key = buf;  a.old_len = blen;
+            a.hash = sw->hashes[ki]; a.type = IT_TRIGRAM;
+            update_idx_fn(&a);
+        } else {
+            delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
+                                sw->sch->splits, buf, blen, sw->hashes[ki]);
+        }
         if (!from_arena) free(buf);
     }
     return 0;
@@ -2934,6 +3084,8 @@ static int bulk_delete_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     TypedSchema *ts = load_typed_schema(db_root, object);
 
     /* Compute hashes + shard_ids; bucket-sort into per-shard worker arrays.
@@ -2969,6 +3121,7 @@ static int bulk_delete_run(const char *db_root, const char *object,
         workers[g].shard_slots = malloc(cnt * sizeof(int));
         workers[g].key_count = 0;
         workers[g].idx_fields = idx_fields;
+        workers[g].idx_types = idx_types;
         workers[g].nidx = nidx;
         workers[g].ts = ts;
         workers[g].deleted = 0;
@@ -3161,6 +3314,7 @@ typedef struct {
     FieldSchema   *fs;
     const char    *value_json;
     const char   (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM (NULL = all btree, legacy) */
     int            nidx;
     int            shard_id;
     BulkUpdRec    *recs;
@@ -3336,6 +3490,7 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
             args[n_args].old_key = have_old ? old_buf : NULL;
             args[n_args].old_len = old_len;
             args[n_args].hash    = upd_rec->hash;
+            args[n_args].type    = w->idx_types ? w->idx_types[fi] : IT_BTREE;
             n_args++;
         }
     }
@@ -3495,6 +3650,8 @@ int cmd_bulk_update(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
     int updated = 0, skipped = 0;
 
     /* Pre-compute each matched key's hash + shard placement so bucketing
@@ -3541,6 +3698,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].fs = &fs;
         workers[wi].value_json = value_json;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
         workers[wi].cas_crit = cas_crit;
         workers[wi].cas_ncrit = cas_ncrit;
@@ -3591,6 +3749,7 @@ typedef struct {
     const Schema     *sch;
     TypedSchema      *ts;
     const char      (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM (NULL = legacy all-btree) */
     int               nidx;
     const int        *active_indices;
     int               active_count;
@@ -3645,12 +3804,29 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, delim_rec->hash);
-            if (have_new)
-                write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, delim_rec->hash);
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            if (itype == IT_TRIGRAM) {
+                /* Trigram needs the diff (new ∪ old → both sets) — route
+                   through update_idx_fn so the IT_TRIGRAM branch handles
+                   per-trigram insert/delete in one shot. */
+                UpdateIdxArg a = {0};
+                a.db_root = w->db_root; a.object = w->object;
+                a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                a.new_key = have_new ? new_buf : NULL;
+                a.new_len = new_len;
+                a.old_key = have_old ? old_buf : NULL;
+                a.old_len = old_len;
+                a.hash = delim_rec->hash;
+                a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            } else {
+                if (have_old)
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, old_buf, old_len, delim_rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits, new_buf, new_len, delim_rec->hash);
+            }
         }
         free(old_buf); free(new_buf);
     }
@@ -3798,6 +3974,8 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     /* Synthesise the same struct fields the body used to expect. */
     struct stat st = { .st_size = (off_t)size };
@@ -3918,6 +4096,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
         workers[wi].sch = &sch;
         workers[wi].ts = ts;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
+        workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
         workers[wi].active_indices = active_indices;
         workers[wi].active_count = active_count;
@@ -4021,6 +4200,7 @@ typedef struct {
     const Schema     *sch;
     TypedSchema      *ts;
     const char      (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int               nidx;
     int               shard_id;
     BulkUpdJsonRec   *recs;
@@ -4079,12 +4259,26 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
                 memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
         }
         if (changed) {
-            if (have_old)
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, old_buf, old_len, json_rec->hash);
-            if (have_new)
-                write_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                   w->sch->splits, new_buf, new_len, json_rec->hash);
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            if (itype == IT_TRIGRAM) {
+                UpdateIdxArg a = {0};
+                a.db_root = w->db_root; a.object = w->object;
+                a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                a.new_key = have_new ? new_buf : NULL;
+                a.new_len = new_len;
+                a.old_key = have_old ? old_buf : NULL;
+                a.old_len = old_len;
+                a.hash = json_rec->hash;
+                a.type = IT_TRIGRAM;
+                update_idx_fn(&a);
+            } else {
+                if (have_old)
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, old_buf, old_len, json_rec->hash);
+                if (have_new)
+                    write_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                       w->sch->splits, new_buf, new_len, json_rec->hash);
+            }
         }
         free(old_buf); free(new_buf);
     }
@@ -4216,6 +4410,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     char *json = NULL;
     size_t len = 0;
@@ -4472,6 +4668,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             workers[wi].sch = &sch;
             workers[wi].ts = ts;
             workers[wi].idx_fields = idx_fields;
+            workers[wi].idx_types = idx_types;
             workers[wi].nidx = nidx;
             workers[wi].shard_id = s;
             workers[wi].recs = malloc(shard_counts[s] * sizeof(BulkUpdJsonRec));
@@ -4559,6 +4756,7 @@ typedef struct {
     SearchCriterion *cas_crit;
     int             cas_ncrit;
     char          (*idx_fields)[256];
+    const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int             nidx;
     /* per-shard records */
     char          **keys;
@@ -4589,8 +4787,19 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
             uint8_t *buf = NULL; size_t blen = 0;
             if (build_index_key_from_record(w->ts, old->value,
                                               w->idx_fields[fi], &buf, &blen)) {
-                delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                    w->sch->splits, buf, blen, w->hashes[ki]);
+                enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+                if (itype == IT_TRIGRAM) {
+                    UpdateIdxArg a = {0};
+                    a.db_root = w->db_root; a.object = w->object;
+                    a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
+                    a.new_key = NULL; a.new_len = 0;
+                    a.old_key = buf;  a.old_len = blen;
+                    a.hash = w->hashes[ki]; a.type = IT_TRIGRAM;
+                    update_idx_fn(&a);
+                } else {
+                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
+                                        w->sch->splits, buf, blen, w->hashes[ki]);
+                }
                 free(buf);
             }
         }
@@ -4721,6 +4930,8 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     if (!sdb || matched == 0) {
         log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
@@ -4789,6 +5000,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         workers[g].cas_crit  = cas_crit;
         workers[g].cas_ncrit = cas_ncrit;
         workers[g].idx_fields = idx_fields;
+        workers[g].idx_types  = idx_types;
         workers[g].nidx       = nidx;
         workers[g].keys   = malloc((size_t)cnt * sizeof(char *));
         workers[g].hashes = malloc((size_t)cnt * sizeof(uint8_t[16]));
@@ -9202,6 +9414,13 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
 /* Forward decls — both definitions live near build_keyset_from_bitmap. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field);
+static enum IndexType field_index_type_for_op(const char *db_root,
+                                              const char *object,
+                                              const char *field,
+                                              enum SearchOp op);
+static int field_has_index_type(const char *db_root, const char *object,
+                                const char *field, enum IndexType want);
+static int op_prefers_trigram(enum SearchOp op);
 
 /* Per-shard worker arg for parallel bitmap dispatch — mirrors btree's
    ShardWalkArg in index.c. The shared atomic stop_flag lets a worker
@@ -10833,8 +11052,22 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
        at <obj>/indexes/<field>/<NNN>.bm. The planner picks them up only
        for ops bitmap supports (OP_EQUAL for MVP). Other ops on a
        bitmap-only field fall back to PRIMARY_NONE (full scan). */
-    enum IndexType itype = field_index_type(db_root, object, c->field);
+    enum IndexType itype = field_index_type_for_op(db_root, object, c->field, c->op);
     Schema sch = load_schema(db_root, object);
+    if (itype == IT_TRIGRAM) {
+        /* Trigram serves contains/i_contains only (op_prefers_trigram
+           returned true for us to get here). Tag the leaf with the
+           field directory the same way bitmap does — execution sites
+           dispatch on itype, not on path content. The pattern must be
+           ≥3 chars to generate any trigrams; sub-3 falls back to scan
+           but that's checked at build_keyset_from_trigram time
+           (returns NULL → caller falls through to full scan). */
+        if (out_idx_path) {
+            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
+                     db_root, object, c->field);
+        }
+        return 1;
+    }
     if (itype == IT_BITMAP) {
         /* Bitmap serves every op the field's type supports — matches
            btree's behaviour: the planner always picks the index path
@@ -11377,6 +11610,65 @@ static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
     return 0;
 }
 
+/* Does this field have an index of the given type declared? A field
+   may have multiple declarations (e.g. both `text` and `text:trigram`)
+   so a single-answer lookup like field_index_type can't disambiguate —
+   use this predicate instead when the caller cares about a specific
+   type's availability. Linear scan over the cached index.conf arrays. */
+static int field_has_index_type(const char *db_root, const char *object,
+                                const char *field, enum IndexType want) {
+    char fields[MAX_FIELDS][256];
+    enum IndexType types[MAX_FIELDS];
+    int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
+    int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
+    int count = n < n2 ? n : n2;
+    for (int i = 0; i < count; i++) {
+        if (types[i] == want && strcmp(fields[i], field) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Operator → index-type routing rules:
+ *
+ *   contains, i_contains, like, not_like (with literal substring ≥3 chars)
+ *     → IT_TRIGRAM if available, else fall back to whatever's declared
+ *
+ *   eq, neq, range, in, not_in, starts_with, ends_with, len_*, exists, regex
+ *     → IT_BITMAP or IT_BTREE depending on declared type
+ *
+ * Used everywhere the planner asks "what index should I drive this op
+ * through" — leaf_is_indexed, build_keyset_from_leaf, the dispatcher. */
+static int op_prefers_trigram(enum SearchOp op) {
+    return op == OP_CONTAINS || op == OP_ICONTAINS;
+}
+
+/* Planner heuristic — for short contains/i_contains patterns on a
+ * field that also has a btree, the btree-leaf walk wins over trigram
+ * because the trigram path's verify step is O(candidates × per-record
+ * fetch) while btree-leaf is O(total_leaves × per-leaf memmem). At
+ * 25M scale on small-vocab data: "baker" (5 char, 833k hits)
+ * costs ~160ms via btree-leaf vs ~740ms via trigram (verify-bound).
+ *
+ * Threshold 6 is empirical: 5-char patterns regress to ~700ms+ via
+ * trigram, 6-char rare patterns (e.g. "qwerty") win via trigram (6ms
+ * vs 200ms btree-leaf). Above 6 chars trigram intersection prunes
+ * fast and verify cost stays manageable for typical result sizes.
+ *
+ * Pre-condition: caller has already established op is trigram-able
+ * and the field has a trigram index. */
+#define TG_PREFER_BTREE_LEN 6
+static int planner_prefer_btree_leaf(const char *db_root, const char *object,
+                                     const SearchCriterion *leaf) {
+    if (!leaf) return 0;
+    size_t plen = strlen(leaf->value);
+    if (plen >= TG_PREFER_BTREE_LEN) return 0;
+    /* Order-independent — field_index_type returns first-declared type
+       only, so a field with both btree+trigram could return IT_TRIGRAM
+       depending on index.conf order. field_has_index_type checks for
+       any matching type, which is what we want here. */
+    return field_has_index_type(db_root, object, leaf->field, IT_BTREE);
+}
+
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
    over the cached arrays — cheap for the planner hot path. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
@@ -11390,6 +11682,37 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
         if (strcmp(fields[i], field) == 0) return types[i];
     }
     return IT_BTREE;
+}
+
+/* Pick the right index type for a given operator. Honours the routing
+ * rules above (op_prefers_trigram). When the preferred type isn't
+ * declared, falls back to the field's first declared type. */
+static enum IndexType field_index_type_for_op(const char *db_root,
+                                              const char *object,
+                                              const char *field,
+                                              enum SearchOp op) {
+    if (op_prefers_trigram(op) &&
+        field_has_index_type(db_root, object, field, IT_TRIGRAM)) {
+        return IT_TRIGRAM;
+    }
+    /* For non-trigram ops, never return IT_TRIGRAM even if it's the
+       only declared type — trigram can't accelerate eq/range/etc., so
+       falling through to "no index" is honest. */
+    enum IndexType t = field_index_type(db_root, object, field);
+    if (t == IT_TRIGRAM && !op_prefers_trigram(op)) {
+        /* Field has trigram but op can't use it; check for a sibling
+           btree/bitmap declaration. */
+        if (field_has_index_type(db_root, object, field, IT_BITMAP)) return IT_BITMAP;
+        if (field_has_index_type(db_root, object, field, IT_BTREE))  return IT_BTREE;
+        /* Trigram-only field with a non-trigram op → caller should
+           treat the field as un-indexed for this op. Returning
+           IT_TRIGRAM here would mislead leaf_is_indexed into claiming
+           the leaf. Signal "not indexed for this op" by returning a
+           value the planner already maps to no-index — we use IT_BTREE
+           and let the existing btree_idx_exists check reject it. */
+        return IT_BTREE;
+    }
+    return t;
 }
 
 /* Sum bm_count for a single encoded value across every data shard.
@@ -11608,12 +11931,257 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     return ks;
 }
 
+/* Collect hashes from a single trigram's posting list (range scan
+   on the .tg btree shards for key=trigram). Hashes land in a fresh
+   KeySet allocated by the caller. */
+typedef struct {
+    KeySet        *ks;
+    QueryDeadline *dl;
+    int            timed_out;
+} TgCollectCtx;
+
+static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
+                                   const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen;
+    TgCollectCtx *c = (TgCollectCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    keyset_insert(c->ks, hash);
+    return 0;
+}
+
+/* Counting callback for the sizing pass below — counts posting-list
+   entries WITHOUT building the keyset, so we can allocate the keyset
+   exactly to fit. KeySet is non-resizable; under-sizing silently
+   drops inserts when the table fills, which used to truncate common-
+   prefix trigrams ("ali", "the", ...) to 8192 hashes and produce wrong
+   intersections downstream. */
+/* Per-shard count cap. Counts above this are clamped to "≥ cap" — we
+   only need approximate counts to order trigrams rarest-first, not
+   exact ones. Walking every entry of a common trigram (could be
+   500k+) just to count it was paying full I/O twice (count + collect),
+   regressing common-substring queries from 160ms → 1200ms. With
+   capped counts: ~24 ms walk overhead regardless of posting size. */
+#define TG_COUNT_CAP_PER_SHARD 10000
+
+typedef struct {
+    size_t         count;
+    QueryDeadline *dl;
+    int            timed_out;
+} TgCountCtx;
+
+static int tg_count_cb(const char *value, size_t vlen,
+                       const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen; (void)hash;
+    TgCountCtx *c = (TgCountCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    c->count++;
+    if (c->count >= TG_COUNT_CAP_PER_SHARD) return 1;  /* early-exit */
+    return 0;
+}
+
+/* (tg_keyset_for_trigram used to materialise a full per-trigram keyset
+   via two passes — replaced by tg_intersect_streaming below which only
+   materialises the seed (rarest trigram) and streams subsequent
+   intersections via membership tests. Saves N-1 keyset allocations.) */
+
+/* Build the intersection of two KeySets via iteration. Returns a new
+   KeySet (caller owns). Iterates the smaller side, checks membership
+   in the larger — keeps walk cost linear in min(|a|, |b|). */
+typedef struct {
+    KeySet *probe;
+    KeySet *out;
+} PairwiseIntersectCtx;
+
+static int pairwise_intersect_cb(const uint8_t hash[16], void *ctx) {
+    PairwiseIntersectCtx *c = (PairwiseIntersectCtx *)ctx;
+    if (keyset_contains(c->probe, hash)) {
+        keyset_insert(c->out, hash);
+    }
+    return 0;
+}
+
+static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b)
+    __attribute__((unused));
+static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b) {
+    if (!a || !b) return NULL;
+    KeySet *small = keyset_size(a) <= keyset_size(b) ? a : b;
+    KeySet *big   = (small == a) ? b : a;
+    KeySet *out = keyset_new(keyset_size(small));
+    if (!out) return NULL;
+    PairwiseIntersectCtx c = { big, out };
+    keyset_iter(small, pairwise_intersect_cb, &c);
+    return out;
+}
+
+/* Trigram-driven candidate set for OP_CONTAINS / OP_ICONTAINS. Returns
+   a KeySet of record hashes that contain ALL trigrams from the pattern
+   (with no false negatives — false positives are filtered by the
+   per-record memmem verify step downstream).
+   Patterns shorter than 3 chars cannot generate trigrams; this returns
+   NULL so the caller falls back to full scan. */
+/* Streaming-filter callback: keep only hashes that ARE in the running
+   keyset, accumulating matches into a new keyset. Replaces building
+   the full posting-set for every subsequent trigram. */
+typedef struct {
+    KeySet        *running;   /* hashes still alive after previous trigrams */
+    KeySet        *next;      /* matches accumulate here */
+    QueryDeadline *dl;
+    int            timed_out;
+} TgFilterCtx;
+
+static int tg_filter_cb(const char *value, size_t vlen,
+                        const uint8_t hash[16], void *ctx) {
+    (void)value; (void)vlen;
+    TgFilterCtx *c = (TgFilterCtx *)ctx;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
+    if (keyset_contains(c->running, hash)) keyset_insert(c->next, hash);
+    return 0;
+}
+
+/* Count a single trigram's posting-list size across all shards. Used
+   to pick the rarest trigram first for the streaming-intersect loop
+   below — gives a small seed keyset and dramatic speedup on long
+   patterns whose extracted trigrams have wildly varying selectivity
+   (e.g. "alice.smith0" has common "ali" and rare "h0X"). */
+static size_t tg_posting_count(const char *db_root, const char *object,
+                               const char *field, int splits,
+                               const uint8_t trigram[3],
+                               QueryDeadline *dl) {
+    int idx_n = index_splits_for(splits);
+    size_t total = 0;
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        TgCountCtx cc = { 0, dl, 0 };
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_count_cb, &cc);
+        if (cc.timed_out) return 0;
+        total += cc.count;
+    }
+    return total;
+}
+
+/* Walk all .tg shards for `trigram`, filtering `running` via membership
+   test. Result keyset contains the intersection. `running` is freed. */
+static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
+                                      const char *field, int splits,
+                                      const uint8_t trigram[3],
+                                      KeySet *running, QueryDeadline *dl) {
+    if (!running || keyset_size(running) == 0) return running;
+    int idx_n = index_splits_for(splits);
+
+    /* Result size ≤ |running|. Size to fit. */
+    KeySet *next = keyset_new(keyset_size(running));
+    if (!next) { keyset_free(running); return NULL; }
+    TgFilterCtx c = { running, next, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        btree_range(tp, (const char *)trigram, 3,
+                    (const char *)trigram, 3,
+                    tg_filter_cb, &c);
+        if (c.timed_out) { keyset_free(running); keyset_free(next); return NULL; }
+    }
+    keyset_free(running);
+    return next;
+}
+
+static KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
+                                        int splits,
+                                        const SearchCriterion *leaf,
+                                        QueryDeadline *dl) {
+    if (!leaf) return NULL;
+    size_t plen = strlen(leaf->value);
+    if (plen < 3) return NULL;
+
+    uint8_t pattern_lc[1024];
+    if (plen > sizeof(pattern_lc)) plen = sizeof(pattern_lc);
+    /* Lowercase the pattern — index stores lowercase trigrams, so both
+       OP_CONTAINS and OP_ICONTAINS land on the same posting lists.
+       Per-record verify enforces final case-sensitivity. */
+    for (size_t i = 0; i < plen; i++) {
+        uint8_t c = (uint8_t)leaf->value[i];
+        pattern_lc[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+    }
+
+    uint8_t trigrams[TG_MAX_DISTINCT][3];
+    size_t  n = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
+    if (n == 0) return NULL;
+
+    /* Sort trigrams by posting size ascending — rarest first. The
+       seed keyset is the smallest posting list (saves allocation +
+       avoids the worst-case bloat); subsequent trigrams stream-
+       filter via membership instead of materialising their own full
+       keyset. For "alice.smith0" (10 trigrams of varying selectivity),
+       this is the difference between materialising 10 × 800k
+       keysets vs 1 × tiny + 9 stream walks that mostly early-out. */
+    typedef struct { uint8_t tg[3]; size_t count; } TgEntry;
+    TgEntry *order = malloc(n * sizeof(TgEntry));
+    if (!order) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(order[i].tg, trigrams[i], 3);
+        order[i].count = tg_posting_count(db_root, object, leaf->field,
+                                          splits, trigrams[i], dl);
+        if (dl && dl->timed_out) { free(order); return NULL; }
+        /* Any zero-posting trigram → intersection is empty. */
+        if (order[i].count == 0) {
+            free(order);
+            return keyset_new(16);  /* empty */
+        }
+    }
+    /* Simple insertion sort — n ≤ TG_MAX_DISTINCT (4096) but typically <50. */
+    for (size_t i = 1; i < n; i++) {
+        TgEntry key = order[i];
+        size_t j = i;
+        while (j > 0 && order[j-1].count > key.count) {
+            order[j] = order[j-1]; j--;
+        }
+        order[j] = key;
+    }
+
+    /* Seed from rarest trigram — sized exactly to its posting count. */
+    KeySet *acc = keyset_new(order[0].count);
+    if (!acc) { free(order); return NULL; }
+    int idx_n = index_splits_for(splits);
+    TgCollectCtx cc = { acc, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
+        btree_range(tp, (const char *)order[0].tg, 3,
+                    (const char *)order[0].tg, 3,
+                    tg_collect_to_keyset_cb, &cc);
+        if (cc.timed_out) { keyset_free(acc); free(order); return NULL; }
+    }
+
+    /* Streaming intersect against each subsequent trigram. Early-exit
+       once running is empty. */
+    for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
+        acc = tg_intersect_streaming(db_root, object, leaf->field, splits,
+                                     order[i].tg, acc, dl);
+        if (!acc) { free(order); return NULL; }
+    }
+    free(order);
+    return acc;
+}
+
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
-    /* Dispatch by index type. Bitmap-indexed eq goes through the
-       bitmap walker; everything else stays on the existing btree path. */
+    /* Dispatch by index type. Trigram-indexed contains/i_contains goes
+       through the trigram intersection walker. Bitmap-indexed eq goes
+       through the bitmap walker. Everything else stays on the existing
+       btree path. */
+    if (op_prefers_trigram(leaf->op) &&
+        !planner_prefer_btree_leaf(db_root, object, leaf) &&
+        field_has_index_type(db_root, object, leaf->field, IT_TRIGRAM)) {
+        KeySet *ks = build_keyset_from_trigram(db_root, object, splits, leaf, dl);
+        if (ks) return ks;
+        /* Sub-3-char pattern or alloc failure — fall through. If no
+           btree exists for this field the next call returns NULL too
+           and the caller drops to full scan (correct, just slower). */
+    }
     enum IndexType itype = field_index_type(db_root, object, leaf->field);
     if (itype == IT_BITMAP) {
         TypedSchema *ts = load_typed_schema(db_root, object);
@@ -12597,6 +13165,44 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
+            /* Trigram fast path: contains/i_contains over a
+               trigram-indexed field. Build the candidate keyset via
+               trigram intersection, then verify each candidate with
+               the full criterion (kills false positives from
+               order-insensitive trigram match). */
+            if (op_prefers_trigram(op) &&
+                !planner_prefer_btree_leaf(db_root, object, pc) &&
+                field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, pc, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    size_t count = parallel_indexed_count(db_root, object, &sch,
+                                                          entries, (int)n,
+                                                          tree, &fs, &dl);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%zu\n", count);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+                /* tg_ks NULL → sub-3-char pattern. Drop to the
+                   PRIMARY_NONE record-walk so correctness is preserved
+                   (a sub-3 pattern can match anything; no index can
+                   help). */
+                {
+                    CountCtx ctx = { tree, &fs, 0, &dl, 0 };
+                    scan_dispatch(db_root, object, &sch, data_dir,
+                                  count_scan_cb, &ctx);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%d\n", ctx.count);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+            }
             /* Bitmap routes all single-leaf counts through a popcount-
                style fast path: per-value sum for eq/IN, dict-scan +
                per-matching-value sum for everything else. Both avoid
@@ -13512,7 +14118,14 @@ int cmd_find(const char *db_root, const char *object,
         pthread_mutex_destroy(&oc.lock);
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
                (plan.kind == PRIMARY_INTERSECT ||
-                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF))) {
+                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF)) &&
+               /* Trigram-leaf is not streaming-friendly — idx_find_streaming
+                  walks the leaf's btree (.idx) which doesn't exist for
+                  trigram-only fields. Fall through to PRIMARY_LEAF where
+                  the trigram-aware dispatch lives. */
+               !(plan.kind == PRIMARY_LEAF &&
+                 op_prefers_trigram(plan.primary_leaf->op) &&
+                 field_has_index_type(db_root, object, plan.primary_leaf->field, IT_TRIGRAM))) {
         /* ===== Streaming fast path for limit-bound, post-filtered finds.
            For small (offset + limit) where the tree has post-filter siblings
            (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
@@ -13545,11 +14158,43 @@ int cmd_find(const char *db_root, const char *object,
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
-        int rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
+
+        /* Trigram dispatch: contains/i_contains over a trigram-indexed
+           field — build candidate keyset, convert to CollectedHash[],
+           feed to process_batch. Same emit pipeline as idx_find_parallel,
+           just sourced from the trigram intersection instead of a btree
+           walk. */
+        int rc = 0;
+        if (op_prefers_trigram(op) &&
+            !planner_prefer_btree_leaf(db_root, object, pc) &&
+            field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+            KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                       sch.splits, pc, &dl);
+            if (tg_ks) {
+                rc = keyset_emit_find(db_root, object, &sch, tg_ks,
+                                      tree, &excluded, offset, limit,
+                                      proj_fields, proj_count,
+                                      (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                                      rows_fmt, dict_fmt, csv_delim,
+                                      joins, njoins, &dl);
+                keyset_free(tg_ks);
+                goto find_emit_close;
+            }
+            /* tg_ks NULL (sub-3-char pattern) — fall through to
+               idx_find_parallel, which will also return zero results
+               since trigram-only fields have no .idx. Better to scan;
+               but the scan-fallback only fires from cmd_count today —
+               for find we accept "no results" on sub-3 patterns as the
+               documented behaviour (HN explorer is supposed to gate
+               this client-side). */
+        }
+
+        rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                          rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+        find_emit_close:
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT("]}\n");

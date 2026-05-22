@@ -1,12 +1,15 @@
 # shard-db
 
-A high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3.
+A high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, three index types (B+ tree / bitmap / trigram), joins, aggregates, CAS, and a multi-threaded TCP server with optional native TLS 1.3.
 
 ## What it is
 
 - **Typed records** — varchar, int/long/short, double/float, bool/byte, date, datetime, time, uuid, numeric (fixed-point), currency.
 - **Slotcask storage engine (v2)** — bitcask-style: per-object keyfile shards (`data/kf/NNN.kf`) hold 24-byte slot headers; values live in append-only segment files (`data/streams/NNN/NNNNNN.dat`) split across nproc-derived streams. Commits are a single atomic 8-byte store into the keyfile after the value lands on disk. Tombstoned slots feed a per-stream free pool so inline overwrites reuse holes (snake-game). Keyfile shards auto-resplit in-place at 75 % load; no global rehash, no per-shard ceiling.
-- **B+ tree indexes** — single and composite (`field1+field2`), prefix-compressed leaves, per-shard layout (`indexes/<field>/NNN.idx`). Each field's btree is split into `index_splits_for(splits)` files (non-linear curve, capped at 128 for `splits=4096`) for read parallelism. Reads fan out across all shards via the worker pool; writes route by record hash to one shard.
+- **Three index types** — pick one per field:
+    - **B+ tree** (default) — eq, range, prefix, all 38 operators. Single + composite (`field1+field2`). Per-shard prefix-compressed leaves at `indexes/<field>/NNN.idx`, `index_splits_for(splits)` files (non-linear curve, capped at 128 for `splits=4096`). Reads fan out across shards via the worker pool; writes route by record hash.
+    - **Bitmap** (auto-default for `bool` + `enum`; opt-in via `field:bitmap` / `field:bitmap(N)` for low-cardinality varchar) — one dense bit per slot, per-distinct-value, at `indexes/<field>/NNN.bm`. Popcount fast paths for `eq`/`in`/`neq`/`not_in`; dict-scan for every other op. 1:1 shard layout with data.
+    - **Trigram** (opt-in via `field:trigram` on varchar) — substring index for `contains` / `i_contains`. Each record contributes one entry per distinct 3-byte lowercased trigram to `indexes/<field>/NNN.tg`. Planner intersects per-trigram posting lists rarest-first, then verifies candidates. For fields with both btree + trigram, planner auto-picks btree-leaf for short patterns (<6 chars) and trigram for longer.
 - **38 search operators** — eq/neq/lt/gt/lte/gte/between/in/not_in, like/not_like, contains/not_contains, starts/ends, exists/not_exists, len_eq/len_neq/len_lt/len_gt/len_lte/len_gte/len_between (varchar-length filters answered from btree leaf metadata, no record fetch), ilike/not_ilike/icontains/not_icontains/istarts/iends (case-insensitive variants), eq_field/neq_field/lt_field/gt_field/lte_field/gte_field (field-vs-field on same record), regex/not_regex (POSIX extended regex on varchar). Indexes used when available.
 - **Aggregations** — `count`, `sum`, `avg`, `min`, `max` with `group_by`, `having`, `order_by`. NEQ shortcut algebraically rewrites `count(*) - count(eq)` for indexed fields.
 - **Joins** — inner and left, by primary key or any indexed field; composite locals supported. Tabular output.

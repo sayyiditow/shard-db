@@ -1357,4 +1357,10 @@ void bm_flush_thread_bitmap_cache(void);
    typed_field_to_buf_raw, and decode_idx_to_buf. */
 int  uuid_is_zero(const uint8_t b[16]);
 int  uuid_format_canonical(char *buf, size_t buflen, const uint8_t b[16]);
+
+/* query.c — estimate-index. Sample N records, project on-disk size for
+   a hypothetical trigram index on the given field. Spec format
+   "<field>:trigram". See [[trigram-impl-map]] phase 5. */
+int cmd_estimate_index(const char *db_root, const char *object,
+                       const char *spec);
 #endif

@@ -2317,6 +2317,204 @@ leaf_oom:
     bt_release(&bt);
 }
 
+/* ========== Streaming bulk build =========================================
+ * Same on-disk format as btree_bulk_build but written incrementally so the
+ * caller can drive arbitrary-size inputs without holding a single sorted
+ * BtEntry[] array in memory. Used by the index-rebuild merge phase to fold
+ * a k-way merge of spill files directly into the output btree.
+ *
+ * Internal state is just the in-progress leaf page + the running leaf-id
+ * list — both bounded (leaf is ≤bt_page_size; leaf-id list is one uint32
+ * per leaf, doubled on grow). Internal-node construction at finish() mirrors
+ * btree_bulk_build's bottom-up loop exactly. */
+
+struct BtStreamBuilder {
+    BtFile    bt;            /* owned; released on finish */
+    uint32_t  cur_leaf;
+    uint32_t *leaf_ids;
+    size_t    leaf_count;
+    size_t    leaf_cap;
+    char      last_key[BT_MAX_VAL_LEN];
+    size_t    last_key_len;
+    size_t    total_entries;
+    int       fatal;         /* set on alloc failure — finish becomes a no-op release */
+};
+
+BtStreamBuilder *bt_stream_build_open(const char *path) {
+    btree_cache_invalidate(path);
+    unlink(path);
+
+    BtStreamBuilder *b = calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    if (bt_acquire(&b->bt, path, 1) != 0) { free(b); return NULL; }
+
+    b->leaf_cap = 256;
+    b->leaf_ids = malloc(b->leaf_cap * sizeof(uint32_t));
+    if (!b->leaf_ids) { bt_release(&b->bt); free(b); return NULL; }
+
+    /* First leaf is page 1 (pre-allocated by bt_acquire). */
+    b->cur_leaf = 1;
+    b->leaf_ids[b->leaf_count++] = b->cur_leaf;
+    return b;
+}
+
+int bt_stream_build_add(BtStreamBuilder *b,
+                        const char *value, size_t vlen,
+                        const uint8_t hash[BT_HASH_SIZE]) {
+    if (!b || b->fatal) return -1;
+
+    uint8_t *page = bt_page(&b->bt, b->cur_leaf);
+    int rc = leaf_append(page, value, vlen, hash,
+                         b->last_key, &b->last_key_len);
+    if (rc == -1) {
+        /* Leaf full — allocate a new one, link it in, retry. */
+        uint32_t new_leaf = bt_alloc_page(&b->bt);
+        /* bt_alloc_page may have remapped — re-fetch the old leaf for
+           the next_leaf write. */
+        page = bt_page(&b->bt, b->cur_leaf);
+        BtPageHeader *ph = (BtPageHeader *)page;
+        ph->next_leaf = new_leaf;
+
+        uint8_t *new_pg = bt_page(&b->bt, new_leaf);
+        BtPageHeader *nh = (BtPageHeader *)new_pg;
+        nh->page_type = 1;
+        nh->count = 0;
+        nh->next_leaf = 0;
+        nh->prev_leaf = b->cur_leaf;
+        nh->data_end = bt_page_size;
+
+        b->cur_leaf = new_leaf;
+        if (b->leaf_count >= b->leaf_cap) {
+            size_t new_cap = b->leaf_cap * 2;
+            uint32_t *t = realloc(b->leaf_ids, new_cap * sizeof(uint32_t));
+            if (!t) { b->fatal = 1; return -1; }
+            b->leaf_ids = t;
+            b->leaf_cap = new_cap;
+        }
+        b->leaf_ids[b->leaf_count++] = b->cur_leaf;
+
+        /* Reset prefix compression — first slot of a new leaf is an anchor. */
+        b->last_key_len = 0;
+
+        /* Second attempt on fresh leaf. If THIS still fails the entry is
+           larger than bt_page_size; we silently skip it (same policy as
+           btree_bulk_build). */
+        (void)leaf_append(bt_page(&b->bt, b->cur_leaf),
+                          value, vlen, hash,
+                          b->last_key, &b->last_key_len);
+    }
+    b->total_entries++;
+    return 0;
+}
+
+int bt_stream_build_finish(BtStreamBuilder *b) {
+    if (!b) return -1;
+    if (b->fatal) { bt_release(&b->bt); free(b->leaf_ids); free(b); return -1; }
+
+    /* No entries → leave the file as an empty (header-only) btree.
+       Header has page_type=1, count=0 on page 1 from bt_acquire. */
+    if (b->total_entries == 0) {
+        BtFileHeader *fh0 = (BtFileHeader *)b->bt.map;
+        fh0->root_page = 1;
+        fh0->entry_count = 0;
+        fh0->last_leaf_page = 1;
+        fh0->height = 1;
+        bt_release(&b->bt);
+        free(b->leaf_ids);
+        free(b);
+        return 0;
+    }
+
+    /* === Build internal nodes bottom-up — identical to bulk_build. === */
+    uint32_t *child_ids = b->leaf_ids;
+    size_t    child_count = b->leaf_count;
+
+    while (child_count > 1) {
+        size_t parent_cap = (child_count + 1) / 2 + 1;
+        uint32_t *parent_ids = malloc(parent_cap * sizeof(uint32_t));
+        if (!parent_ids) {
+            if (child_ids != b->leaf_ids) free(child_ids);
+            bt_release(&b->bt);
+            free(b->leaf_ids);
+            free(b);
+            return -1;
+        }
+        size_t parent_count = 0;
+
+        uint32_t cur_parent = bt_alloc_page(&b->bt);
+        uint8_t *ppg = bt_page(&b->bt, cur_parent);
+        BtPageHeader *pph = (BtPageHeader *)ppg;
+        pph->page_type = 0;
+        pph->count = 0;
+        pph->next_leaf = child_ids[0];
+        pph->data_end = bt_page_size;
+        parent_ids[parent_count++] = cur_parent;
+
+        for (size_t i = 1; i < child_count; i++) {
+            uint8_t *child_pg = bt_page(&b->bt, child_ids[i]);
+            BtPageHeader *ch = (BtPageHeader *)child_pg;
+            if (ch->count == 0) continue;
+            uint8_t *first_e = page_entry(child_pg, 0);
+            int child_is_leaf = (ch->page_type == 1);
+            size_t kvlen;
+            char    key_buf[BT_MAX_VAL_LEN];
+            uint8_t key_hash[BT_HASH_SIZE];
+            if (child_is_leaf) {
+                kvlen = leaf_entry_suffix_len(first_e);
+                if (kvlen > BT_MAX_VAL_LEN) kvlen = BT_MAX_VAL_LEN;
+                memcpy(key_buf, leaf_entry_suffix(first_e), kvlen);
+                memcpy(key_hash, leaf_entry_hash(first_e), BT_HASH_SIZE);
+            } else {
+                kvlen = int_entry_vlen(first_e);
+                if (kvlen > BT_MAX_VAL_LEN) kvlen = BT_MAX_VAL_LEN;
+                memcpy(key_buf, int_entry_value(first_e), kvlen);
+                memcpy(key_hash, int_entry_hash(first_e), BT_HASH_SIZE);
+            }
+
+            ppg = bt_page(&b->bt, cur_parent);
+            pph = (BtPageHeader *)ppg;
+            if (page_insert_at_internal(ppg, pph->count,
+                                        key_buf, kvlen,
+                                        key_hash, child_ids[i]) == -1) {
+                cur_parent = bt_alloc_page(&b->bt);
+                ppg = bt_page(&b->bt, cur_parent);
+                pph = (BtPageHeader *)ppg;
+                pph->page_type = 0;
+                pph->count = 0;
+                pph->next_leaf = child_ids[i];
+                pph->data_end = bt_page_size;
+                parent_ids[parent_count++] = cur_parent;
+            }
+        }
+
+        if (child_ids != b->leaf_ids) free(child_ids);
+        child_ids = parent_ids;
+        child_count = parent_count;
+    }
+
+    /* Write header. */
+    BtFileHeader *fh = (BtFileHeader *)b->bt.map;
+    fh->root_page = child_ids[0];
+    fh->entry_count = b->total_entries;
+    if (b->leaf_count > 0) fh->last_leaf_page = b->leaf_ids[b->leaf_count - 1];
+
+    uint32_t pg = fh->root_page;
+    fh->height = 0;
+    while (1) {
+        fh->height++;
+        BtPageHeader *ph = (BtPageHeader *)bt_page(&b->bt, pg);
+        if (ph->page_type == 1) break;
+        if (ph->count == 0) break;
+        pg = entry_child(page_entry(bt_page(&b->bt, pg), 0));
+    }
+
+    if (child_ids != b->leaf_ids) free(child_ids);
+    free(b->leaf_ids);
+    bt_release(&b->bt);
+    free(b);
+    return 0;
+}
+
 /* ========== Merge-rebuild: extract existing + merge + bulk_build ========== */
 
 /* Extract all entries from an existing B+ tree via sequential leaf scan.

@@ -1,6 +1,6 @@
 # Index management
 
-Create and drop B+ tree indexes. For the conceptual model, see [Concepts → Indexes](../concepts/indexes.md).
+Create and drop btree, bitmap, and trigram indexes. For the conceptual model and type trade-offs, see [Concepts → Indexes](../concepts/indexes.md).
 
 ## add-index
 
@@ -11,6 +11,26 @@ Create and drop B+ tree indexes. For the conceptual model, see [Concepts → Ind
 ```
 
 Optional `"force":true` rebuilds even if the index already exists (useful after suspected corruption).
+
+### Explicit type suffix
+
+Suffix the field name to pick a non-default index type:
+
+```json
+{"mode":"add-index","dir":"<dir>","object":"<obj>","field":"status:bitmap"}
+{"mode":"add-index","dir":"<dir>","object":"<obj>","field":"status:bitmap(32)"}
+{"mode":"add-index","dir":"<dir>","object":"<obj>","field":"body:trigram"}
+```
+
+| spec | type | files written | use for |
+|---|---|---|---|
+| `field` | btree (or bitmap if bool/enum auto-default) | `<field>/<NNN>.idx` | default — every field type |
+| `field:btree` | btree (explicit) | same | force btree on bool/enum (suppresses auto-bitmap) |
+| `field:bitmap` | bitmap, cap=256 | `<field>/<NNN>.bm` (1:1 with data shards) | low-cardinality varchar, fast eq/in/neq |
+| `field:bitmap(N)` | bitmap, cap=`N` | same | override default cap (`N ∈ [2, 65535]`) |
+| `field:trigram` | trigram | `<field>/<NNN>.tg` (btree fan-out curve) | varchar substring search (`contains` / `i_contains`) |
+
+A field may have multiple index types simultaneously (e.g. both `username` and `username:trigram`). The planner picks per-query.
 
 ### Multiple fields (parallel build)
 
@@ -34,13 +54,31 @@ Stores the concatenation of `country` + `zip` as the index key. Accelerates quer
 ### Behavior
 
 - If the index already exists and `force:true` is not set: `{"status":"exists","field":"..."}`.
-- Builds via a single shard scan that fans out to per-field workers — each indexed field becomes one task in the parallel-for pool. The worker buckets entries by idx-shard and merges them sequentially per shard (per-shard btree layout, 2026.05.1+).
-- Creates `<obj>/indexes/<field>/<NNN>.idx` — `index_splits_for(splits)` files per indexed field.
+- Build pipeline by type:
+    - **btree** — external-merge sort: per-kf-shard parallel walks spill sorted runs to temp files; per-output-shard k-way merge feeds a streaming `bulk_build`. Bounded per-worker memory (`INDEX_BUILD_BUDGET_MB`), tight prefix-compressed leaves. Files: `<obj>/indexes/<field>/<NNN>.idx` (`index_splits_for(splits)` shards).
+    - **bitmap** — parallel kf-shard walks write `bm_set` directly into mmap'd `.bm` files. No accumulation (mmap is the durable store). Files: `<obj>/indexes/<field>/<NNN>.bm` (1:1 with data shards).
+    - **trigram** — same external-merge pipeline as btree, but each record contributes one entry per distinct trigram. Files: `<obj>/indexes/<field>/<NNN>.tg` (BTRH btree format, `index_splits_for(splits)` shards).
 - Updates `<obj>/indexes/index.conf`.
 - Invalidates `g_idx_cache` for the object.
 
-Response (single): `{"status":"indexed","field":"email"}`.
-Response (multi): `{"status":"indexed","count":3}`.
+Response (single): `{"status":"indexed","field":"email","records":N,"duration_ms":T}`.
+Response (multi): `{"status":"indexed","count":3,"records":N,"duration_ms":T}` (or `{"status":"ok",...}` if all fields were typed and no btree work happened).
+
+## estimate-index
+
+Projects the on-disk size and per-record trigram count for a hypothetical trigram index before committing to the build. Useful for capacity planning on large objects.
+
+```json
+{"mode":"estimate-index","dir":"<dir>","object":"<obj>","spec":"body:trigram"}
+```
+
+Samples up to 1024 live records, extracts distinct trigrams per record, returns aggregated stats:
+
+```json
+{"records":N,"sample_size":S,"avg_distinct_trigrams":A,"projected_entries":E,"projected_bytes":B}
+```
+
+Only `:trigram` specs are supported today (btree and bitmap sizes are derivable from `live × per_entry` directly). See [Concepts → Indexes](../concepts/indexes.md#trigram-cost-notes) for the cost model.
 
 ## remove-index
 
@@ -58,9 +96,13 @@ Response (multi): `{"status":"indexed","count":3}`.
 
 ### Behavior
 
-- Unlinks every `<NNN>.idx` file under `indexes/<field>/` and removes the directory.
+- Looks up the matched line in `index.conf` to determine the index type, then unlinks the appropriate files:
+    - **btree** → `<NNN>.idx` files + the `<field>/` directory
+    - **bitmap** → `<NNN>.bm` files + bm_cache invalidation + the `<field>/` directory
+    - **trigram** → `<NNN>.tg` files + btree_cache invalidation + the `<field>/` directory
+- For fields with multiple index types, pass the explicit suffix to drop just one: `"field":"email:trigram"` drops only the trigram, leaving any btree intact.
 - Rewrites `index.conf` without the removed entry.
-- Invalidates `g_idx_cache` and the B+ tree mmap cache for those files.
+- Invalidates `g_idx_cache` for the object.
 - Safe on non-existent index: returns `{"status":"not_indexed","field":"..."}` — not an error. Idempotent.
 
 Response (single): `{"status":"removed","field":"email"}` or `{"status":"not_indexed","field":"..."}`.
@@ -96,12 +138,12 @@ For batch adds/removes, use the JSON mode above.
 ## Inspection
 
 ```bash
-cat $DB_ROOT/<dir>/<obj>/indexes/index.conf      # registered indexes (one per line)
+cat $DB_ROOT/<dir>/<obj>/indexes/index.conf      # registered indexes (one per line, canonical form)
 ls  $DB_ROOT/<dir>/<obj>/indexes/                # one directory per indexed field
-ls  $DB_ROOT/<dir>/<obj>/indexes/<field>/        # per-shard NNN.idx files (index_splits_for(splits) of them)
+ls  $DB_ROOT/<dir>/<obj>/indexes/<field>/        # per-shard files: NNN.idx (btree), NNN.bm (bitmap), NNN.tg (trigram)
 ```
 
-Index file format is binary (B+ tree with prefix-compressed leaves, page size = `INDEX_PAGE_SIZE`). Use [`stats`](diagnostics.md) to see the B+ tree mmap cache hit rate (`bt_cache.hits / misses`).
+`index.conf` lines are canonical specs: bare `field` for btree, `field:bitmap`, `field:bitmap(N)`, or `field:trigram`. A field with multiple index types appears on multiple lines. Use [`stats`](diagnostics.md) to see the B+ tree mmap cache hit rate (`bt_cache.hits / misses`) which covers both `.idx` and `.tg` files; bitmap cache stats appear under `bm_cache.*`.
 
 Stale orphan files from a previous, higher `splits` value would survive `add-index` (it only writes `0..index_splits_for(splits)-1`); use `./shard-db reindex <dir> <obj>` to wipe and rebuild every per-field idx directory cleanly.
 
