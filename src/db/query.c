@@ -6134,7 +6134,18 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
             fputs(line, fout);
             continue;
         }
-        fprintf(fout, "%s\n", edit_lines[matched]);
+        /* Carry default modifiers (:default=…, :auto_create, :auto_update)
+           from the OLD line to the new line when the user's new spec omits
+           them. Lets `edit-field age:long` change the type without wiping
+           an existing `:default=42`. */
+        char old_mods[256] = "";
+        default_modifiers_for_line(stripped, old_mods, sizeof(old_mods));
+        char new_mods[256] = "";
+        int new_has = default_modifiers_for_line(edit_lines[matched], new_mods, sizeof(new_mods));
+        if (!new_has && old_mods[0])
+            fprintf(fout, "%s%s\n", edit_lines[matched], old_mods);
+        else
+            fprintf(fout, "%s\n", edit_lines[matched]);
     }
     fclose(fin);
     fclose(fout);
