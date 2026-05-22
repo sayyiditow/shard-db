@@ -14108,13 +14108,17 @@ int cmd_find(const char *db_root, const char *object,
             }
 
             /* Empty KeySet → no candidate could possibly match.
-               Emit the empty envelope and skip the walk entirely.
+               The opening envelope is ALREADY emitted upstream (line
+               14045/14047: `{` for dict, `[` for default, the rows
+               header for rows_fmt). We just need to CLOSE that
+               envelope and return — don't emit a fresh `[]` or `{}`
+               here or you double-open and produce `[[]` / `{{}`.
                Turns 14s "scan all, find nothing" into ~constant time
                on selective filters with zero hits. */
             if (prefilter_ks && keyset_size(prefilter_ks) == 0) {
-                if (dict_fmt) OUT("{}\n");
-                else if (rows_fmt) OUT("[]\n");
-                else OUT("[]\n");
+                if (dict_fmt) OUT("}\n");
+                else if (rows_fmt) OUT("]\n");
+                else OUT("]\n");
                 keyset_free(prefilter_ks);
                 free_joins(joins, njoins);
                 free_criteria_tree(tree);
