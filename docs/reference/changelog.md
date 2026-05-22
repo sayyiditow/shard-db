@@ -6,7 +6,7 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.05.7
 
-Feature release bundling **three new index types**, a **bounded query concurrency cap**, and a **CPD-driven dedup sweep**.
+Feature release bundling **three new index types**, a **bounded query concurrency cap**, a **filter-first planner for `find + order_by`** (194× wins on zero-match selective queries surfaced by real-app testing), and a **CPD-driven dedup sweep**.
 
 ### Index types
 
@@ -21,6 +21,13 @@ Feature release bundling **three new index types**, a **bounded query concurrenc
 - **Worst-case query-buffer RAM is now predictable**: `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB`. Pair with cgroup / systemd `MemoryMax` as the final OS-level guard.
 - **`QUERY_BUFFER_MB` default lowered 500 → 256.** Auto-tune still kicks in but now divides the process-wide query budget (min 25% RAM, 4 GB ceiling) by the resolved slot count instead of letting a single query grab all of it.
 
+### Filter-first planner for `find + order_by` (PR #63)
+
+- New `build_keyset_from_plan` dispatcher wraps all existing KeySet builders (trigram, bitmap, btree-leaf, AND-intersect, OR-union) behind one entry point. `cursor_find_cb` gains a `prefilter_ks` field — skips fetch + criteria_match for entries not in the KeySet.
+- Applies to both the cursor pagination path and the non-cursor ordered-walk fast path. Threshold `ORDERED_FIND_KEYSET_MAX = 100K`; broader filters fall back to legacy walk-ordered.
+- Closes the regression where `find icontains 'kubernetes' order_by time desc limit 25` over 789K comments took 14 seconds (planner walked the entire `time` btree to confirm 0 matches). Now **73 ms warm** — **194× faster**. Discovered via the HN explorer showcase exercising real query shapes that the bench-queries suite didn't compose.
+- Empty-KeySet short-circuit emit-fix: previously emitted `[]` after the caller already emitted `[`, producing malformed `[[]`. Fixed to emit envelope-close only.
+
 ### Code quality
 
 - **CPD-driven dedup sweep** (PR #59, PR #62). Consolidated benchmark utilities (`bench_du_bytes` / `bench_fmt_bytes`), `storage.c` bucket-dispatch (3 callers → 1 helper), `query.c` aggregate min/max via KeySet (2 callers → 1 helper). 130 LOC removed, no behavior change.
@@ -30,7 +37,7 @@ Feature release bundling **three new index types**, a **bounded query concurrenc
 
 Wire-format and on-disk format unchanged from 2026.05.5 / 2026.05.6. **No `./migrate` required.** Existing objects continue to work; opt into the new index types via `add-index` on the fields where it makes sense.
 
-Test coverage: **84 cases / 3464 assertions, 0 failures.**
+Test coverage: **85 cases / 3483 assertions, 0 failures.**
 
 Full notes: [release-notes/2026.05.7.md](../release-notes/2026.05.7.md).
 
