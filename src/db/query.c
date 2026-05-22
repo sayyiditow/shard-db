@@ -6065,9 +6065,14 @@ static int edit_valid_name(const char *name) {
 /* Extract the trailing default-modifier suffix from a fields.conf line.
    Modifiers recognised: :default=<…>, :auto_create, :auto_update.
    The suffix is everything from the first such modifier to end-of-line.
-   Returns 0 and writes "" to out_buf if no modifier present, 1 if found.
-   out_buf must be ≥ 256 bytes. */
+   Returns 1 and copies the suffix into out_buf when a modifier is found
+   AND fits in out_cap (NUL-terminator included). Returns 0 in every other
+   case: no modifier present, or the modifier wouldn't fit. Refusing to
+   truncate is intentional — a half-modifier written into fields.conf
+   would corrupt the schema on reload, so callers that get 0 here just
+   drop the carry rather than write a wrong value. */
 static int default_modifiers_for_line(const char *line, char *out_buf, size_t out_cap) {
+    if (out_cap == 0) return 0;
     out_buf[0] = '\0';
     static const char *mods[] = { ":default=", ":auto_create", ":auto_update", NULL };
     const char *earliest = NULL;
@@ -6077,7 +6082,7 @@ static int default_modifiers_for_line(const char *line, char *out_buf, size_t ou
     }
     if (!earliest) return 0;
     size_t need = strlen(earliest);
-    if (need >= out_cap) need = out_cap - 1;
+    if (need >= out_cap) return 0;   /* refuse to truncate — safer than half-modifier */
     memcpy(out_buf, earliest, need);
     out_buf[need] = '\0';
     return 1;
