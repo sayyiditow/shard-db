@@ -13531,6 +13531,20 @@ typedef struct {
 
     QueryDeadline *deadline;
     int            dl_counter;
+
+    /* Pre-filter KeySet — when non-NULL, the cursor walk skips any
+       entry whose hash16 is not in this set without paying the
+       per-record fetch + criteria_match cost. Built once before the
+       walk from the indexed criteria leaves (any of trigram, bitmap,
+       btree-eq/range, AND-intersect, OR-union — all the planner
+       branches in choose_primary_source). Lets selective filters
+       short-circuit: `find contains 'kubernetes' order_by time desc
+       limit 25` with 0 matches over 789K records drops from 15s to
+       ~5ms because the empty KeySet rejects every walk entry. Falls
+       back to NULL + per-record criteria_match for broad filters
+       where KeySet build would exceed the threshold or PRIMARY_NONE
+       (no indexed leaves at all). */
+    KeySet        *prefilter_ks;
 } CursorFindCtx;
 
 static int cursor_find_cb(const char *val, size_t vlen,
@@ -13565,6 +13579,16 @@ static int cursor_find_cb(const char *val, size_t vlen,
                 if (hcmp >= 0) return 0;
             }
         }
+    }
+
+    /* Pre-filter via KeySet built from indexed criteria leaves. The
+       prefilter_ks check happens BEFORE the record fetch because the
+       whole point is to skip the fetch when the indexed criteria
+       rejects the entry — that's the win over the legacy "fetch
+       every entry, run criteria_match" path. For empty KeySet the
+       loop short-circuits at the first call. */
+    if (c->prefilter_ks && !keyset_contains(c->prefilter_ks, hash16)) {
+        return 0;
     }
 
     /* Skip-without-fetch: when offset_mode AND no remaining criteria, every
@@ -13679,6 +13703,72 @@ static int cursor_find_cb(const char *val, size_t vlen,
     c->printed++;
     release_record_ref(&rr);
     return 0;
+}
+
+/* Maximum candidate count before we fall back from filter-first to
+   walk-ordered + per-record criteria_match. The threshold is set to
+   100K because:
+
+   - Below 100K: filter-first wins decisively. The KeySet build cost
+     is bounded (each indexed source caps its own build by
+     QUERY_BUFFER_MB) and per-walk-entry keyset_contains is O(1).
+     For 0-match criteria the empty KeySet rejects every entry
+     without a record fetch — turns 15s into 5ms (HN explorer
+     `find contains 'kubernetes' order_by time desc limit 25`
+     across 789K comments).
+
+   - Above 100K: walk-ordered + criteria_match early-exits at limit
+     because matches are dense in the order_by sweep. The KeySet
+     build itself becomes expensive for very-broad criteria, and the
+     KeySet would dominate per-query memory. We hand control to the
+     existing walk path which already handles this case well.
+
+   Tunable in db.env if a user finds their workload sits in the
+   "100K candidates, scattered across the order_by range" regime
+   where filter-first still wins (rare in practice). */
+#define ORDERED_FIND_KEYSET_MAX 100000
+
+/* Build a candidate KeySet from any indexed-source query plan.
+   Returns NULL if no indexed plan applies (PRIMARY_NONE), or if the
+   underlying builder fails (OOM, budget exceeded, trigram sub-3-char
+   pattern, etc.).
+
+   Wraps the existing builders (build_keyset_from_leaf — which itself
+   dispatches by index type to trigram/bitmap/btree —
+   intersect_indexed_leaves, build_or_keyset) behind a single
+   plan-kind-driven entry point. Used by the cursor + ordered-walk
+   paths in cmd_find to pre-filter records by hash16 before paying
+   the per-record fetch + criteria_match cost. Mirrors the dispatch
+   table in cmd_find's primary-source switch but isolated so the
+   ordered paths can size-check the candidate set and choose
+   filter-first vs walk-ordered. */
+static KeySet *build_keyset_from_plan(QueryPlan *plan,
+                                      const char *db_root,
+                                      const char *object,
+                                      const Schema *sch,
+                                      QueryDeadline *dl) {
+    if (!plan) return NULL;
+    switch (plan->kind) {
+    case PRIMARY_LEAF:
+        return build_keyset_from_leaf(db_root, object, sch->splits,
+                                      plan->primary_leaf, dl);
+    case PRIMARY_INTERSECT: {
+        int small_primary = 0;
+        return intersect_indexed_leaves(db_root, object, sch->splits,
+                                        plan->intersect_leaves,
+                                        plan->intersect_count,
+                                        dl, &small_primary);
+    }
+    case PRIMARY_KEYSET: {
+        int budget_exceeded = 0;
+        return build_or_keyset(db_root, object, sch->splits,
+                               plan->or_node, dl,
+                               &budget_exceeded, 0);
+    }
+    case PRIMARY_NONE:
+    default:
+        return NULL;
+    }
 }
 
 int cmd_find(const char *db_root, const char *object,
@@ -13826,6 +13916,36 @@ int cmd_find(const char *db_root, const char *object,
 
         /* Derive cursor hash16 from the primary key for tiebreak. */
         QueryDeadline cdl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+
+        /* Filter-first pre-build for cursor path. Same rationale as
+           the ordered-walk fast path below: a KeySet built from
+           indexed criteria leaves lets the walk reject entries
+           without paying the fetch + criteria_match per record. The
+           threshold falls back to the legacy per-record path when
+           the candidate set is too broad to materialise. */
+        QueryPlan cursor_plan = choose_primary_source(tree, db_root, object);
+        KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_plan,
+                                                            db_root, object,
+                                                            &sch, &cdl);
+        if (cursor_prefilter_ks &&
+            keyset_size(cursor_prefilter_ks) > ORDERED_FIND_KEYSET_MAX) {
+            keyset_free(cursor_prefilter_ks);
+            cursor_prefilter_ks = NULL;
+        }
+
+        /* Empty KeySet → no possible matches. Emit empty page +
+           null cursor and return. */
+        if (cursor_prefilter_ks &&
+            keyset_size(cursor_prefilter_ks) == 0) {
+            OUT(dict_fmt ? "{\"rows\":{},\"cursor\":null}\n"
+                         : "{\"rows\":[],\"cursor\":null}\n");
+            keyset_free(cursor_prefilter_ks);
+            free_joins(joins, njoins);
+            free_criteria_tree(tree);
+            free_excluded(&excluded);
+            return 0;
+        }
+
         CursorFindCtx cc;
         memset(&cc, 0, sizeof(cc));
         cc.cursor_value_bytes = has_cur_bytes ? cur_value_buf : NULL;
@@ -13849,6 +13969,7 @@ int cmd_find(const char *db_root, const char *object,
         cc.order_tf    = order_tf;
         cc.order_field_idx = order_field_idx;
         cc.deadline    = &cdl;
+        cc.prefilter_ks = cursor_prefilter_ks;
 
         /* Cursor response always uses the {rows:..., cursor:...} wrapper so
            clients get a single stable shape regardless of format. dict_fmt
@@ -13887,6 +14008,7 @@ int cmd_find(const char *db_root, const char *object,
         }
         OUT("\n");
 
+        if (cursor_prefilter_ks) keyset_free(cursor_prefilter_ks);
         free(cc.last_value_str);
         free(cc.last_key_str);
         free_joins(joins, njoins);
@@ -13940,7 +14062,19 @@ int cmd_find(const char *db_root, const char *object,
        to evaluate the tree, so the win shrinks with selectivity — but we
        still skip the qsort + the buffering, which is usually a strict
        improvement. Falls through to the buffered path for unsupported
-       formats / excluded keys / non-indexed order_by. */
+       formats / excluded keys / non-indexed order_by.
+
+       FILTER-FIRST (2026.05.7.x+): when criteria has indexed leaves
+       (PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET), build a
+       candidate KeySet once via build_keyset_from_plan and pass it
+       into the walk callback. cursor_find_cb skips entries whose
+       hash16 isn't in the KeySet WITHOUT a record fetch — the per-
+       walk-entry cost drops from ~10µs (fetch + decode + match) to
+       ~100ns (hash check). For 0-match criteria the empty KeySet
+       short-circuits the walk entirely. Falls back to no-KeySet
+       walk (per-record criteria_match) when criteria is too broad
+       (KeySet build would exceed ORDERED_FIND_KEYSET_MAX) or
+       PRIMARY_NONE (no indexed leaves). */
     if (has_order && btree_idx_exists(db_root, object, order_by, sch.splits) &&
         excluded.count == 0) {
         const TypedField *order_tf = NULL;
@@ -13955,27 +14089,64 @@ int cmd_find(const char *db_root, const char *object,
 
         int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
                                   strcmp(order_dir, "DESC") == 0));
-        CursorFindCtx cc;
-        memset(&cc, 0, sizeof(cc));
-        cc.db_root         = db_root;
-        cc.object          = object;
-        cc.sch             = &sch;
-        cc.fs              = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
-        cc.remaining       = tree;
-        cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
-        cc.proj_count      = proj_count;
-        cc.rows_fmt        = rows_fmt;
-        cc.dict_fmt        = dict_fmt;
-        cc.limit           = limit;
-        cc.printed         = 0;
-        cc.order_tf        = order_tf;
-        cc.has_cursor      = 0;
-        cc.desc            = desc;
-        cc.skip_remaining  = offset > 0 ? offset : 0;
-        cc.offset_mode     = 1;
-        cc.deadline        = &dl;
 
         if (!csv_delim) {
+            /* Build the pre-filter KeySet from the planner-chosen
+               source. NULL when PRIMARY_NONE or builder failed —
+               that's fine, the walk falls back to per-record
+               criteria_match. When size exceeds threshold, free and
+               use the legacy path (broad filters early-exit at
+               limit). When size is zero, short-circuit the walk
+               entirely. Built inside the !csv_delim branch so the
+               CSV fallback path doesn't waste a build. */
+            KeySet *prefilter_ks = build_keyset_from_plan(&plan, db_root,
+                                                         object, &sch, &dl);
+            if (prefilter_ks &&
+                keyset_size(prefilter_ks) > ORDERED_FIND_KEYSET_MAX) {
+                keyset_free(prefilter_ks);
+                prefilter_ks = NULL;
+            }
+
+            /* Empty KeySet → no candidate could possibly match.
+               The opening envelope is ALREADY emitted upstream (line
+               14045/14047: `{` for dict, `[` for default, the rows
+               header for rows_fmt). We just need to CLOSE that
+               envelope and return — don't emit a fresh `[]` or `{}`
+               here or you double-open and produce `[[]` / `{{}`.
+               Turns 14s "scan all, find nothing" into ~constant time
+               on selective filters with zero hits. */
+            if (prefilter_ks && keyset_size(prefilter_ks) == 0) {
+                if (dict_fmt) OUT("}\n");
+                else if (rows_fmt) OUT("]\n");
+                else OUT("]\n");
+                keyset_free(prefilter_ks);
+                free_joins(joins, njoins);
+                free_criteria_tree(tree);
+                free_excluded(&excluded);
+                return 0;
+            }
+
+            CursorFindCtx cc;
+            memset(&cc, 0, sizeof(cc));
+            cc.db_root         = db_root;
+            cc.object          = object;
+            cc.sch             = &sch;
+            cc.fs              = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+            cc.remaining       = tree;
+            cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
+            cc.proj_count      = proj_count;
+            cc.rows_fmt        = rows_fmt;
+            cc.dict_fmt        = dict_fmt;
+            cc.limit           = limit;
+            cc.printed         = 0;
+            cc.order_tf        = order_tf;
+            cc.has_cursor      = 0;
+            cc.desc            = desc;
+            cc.skip_remaining  = offset > 0 ? offset : 0;
+            cc.offset_mode     = 1;
+            cc.deadline        = &dl;
+            cc.prefilter_ks    = prefilter_ks;
+
             btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
                                    "", 0, 0,
                                    "\xff\xff\xff\xff", 4, 0,
@@ -13984,6 +14155,7 @@ int cmd_find(const char *db_root, const char *object,
             else if (rows_fmt) OUT("]\n");   /* rows_fmt closing handled below normally */
             else OUT("]\n");
 
+            if (prefilter_ks) keyset_free(prefilter_ks);
             free(cc.last_value_str);
             free(cc.last_key_str);
             free_joins(joins, njoins);
