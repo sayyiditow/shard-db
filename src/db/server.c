@@ -2295,23 +2295,45 @@ typedef struct {
     char db_root[PATH_MAX];
 } WarmupArg;
 
+/* Total bytes touched per file during warmup. The original 4 KB only
+   primed the on-disk header / btree root, which left the first real
+   query paying disk-fault cost on inner btree pages and KF probe
+   pages.  Bumping to 64 KB covers the typical inner-node depth (256
+   splits → btrees have a few small pages above the leaves) and the
+   KF probe-chain region around the header without ballooning the
+   total work.  Budget: 256 KF shards × 64 KB = 16 MB; 1024 idx files
+   × 64 KB = 64 MB; well under any host RAM ceiling.  Files smaller
+   than this (e.g. .bm shards at ~33 KB) read up to EOF and stop —
+   read(2) returns short on EOF, no harm. Stream segment files (.dat)
+   are still NOT touched here — they live under data/streams/ which
+   warmup_walk_dir doesn't recurse into. */
+#define WARMUP_FILE_BYTES (64 * 1024)
+
 static int warmup_touch_file(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     /* Hint to the kernel: pre-fault this file's pages. Linux-only —
        macOS has F_RDADVISE/fcntl as an equivalent but the synchronous
-       first-page read below is what actually guarantees residency
-       anyway, so the macOS path skips the hint. The kernel still does
-       its own read-ahead heuristics on a sequential file open. */
+       reads below are what actually guarantee residency anyway, so
+       the macOS path skips the hint. The kernel still does its own
+       read-ahead heuristics on a sequential file open. */
 #ifdef __linux__
-    posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    posix_fadvise(fd, 0, WARMUP_FILE_BYTES, POSIX_FADV_WILLNEED);
 #endif
-    /* Force the first page in synchronously so subsequent lookups don't
-       page-fault. One page (~4 KB) is enough for every header-driven
-       lookup (kf 24-byte header, btree root, bitmap dict, trigram root). */
-    char buf[4096];
-    ssize_t r = read(fd, buf, sizeof(buf));
-    (void)r;
+    /* Force pages in synchronously so subsequent lookups don't
+       page-fault. We loop because read(2) is allowed to return short
+       even when more data is available; sticking with a single read
+       call would leave most of the requested region unwarmed on the
+       short-read path. EOF naturally ends the loop via r == 0. */
+    char buf[16 * 1024];
+    size_t total = 0;
+    while (total < WARMUP_FILE_BYTES) {
+        size_t want = WARMUP_FILE_BYTES - total;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        ssize_t r = read(fd, buf, want);
+        if (r <= 0) break;  /* EOF or unrecoverable error — either way, done */
+        total += (size_t)r;
+    }
     close(fd);
     return 0;
 }
