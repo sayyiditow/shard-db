@@ -2141,6 +2141,19 @@ int slotcask_sum_kf_totals(SlotcaskDb *db,
     for (int s = 0; s < db->num_shards; s++) {
         char kf_path[PATH_MAX];
         kf_path_for(kf_path, db->data_dir, s);
+        /* Intentionally unsynchronized open + pread, NOT kfcache_acquire.
+           The cache path takes the per-shard rwlock which serialises
+           against the writer that every insert/update/delete holds —
+           under heavy concurrent write load (stress test, real OLTP) a
+           bare-count probe would block waiting for every in-flight
+           writer on every shard.  The header read here is 24 B at byte
+           0; on x86_64 the total/deleted u64s are aligned so we tolerate
+           a single-update tear (worst case we read a sizing decision
+           off by one record).  The original lazy-cold cost (256 open+
+           pread+close on cold disk = ~10 s) is now amortised by warmup
+           populating the OS page cache for these kf headers — see
+           warmup_object_via_caches in server.c.  Warm-cache cost here
+           is ~50 µs per shard. */
         int fd = open(kf_path, O_RDONLY);
         if (fd < 0) continue;
         SlotcaskKfHeader hdr;

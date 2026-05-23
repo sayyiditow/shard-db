@@ -15331,6 +15331,11 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         if (nl < 4 || strcmp(e1->d_name + nl - 3, ".kf") != 0) continue;
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", kf_dir, e1->d_name);
+        /* Lock-free open+pread+close — same rationale as
+           slotcask_sum_kf_totals (slotcask.c): the cache path's
+           per-shard rwlock serialises against in-flight writers, which
+           is the wrong trade-off for an admin diagnostic that wants
+           best-effort reads.  Header reads tolerate one-update tears. */
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
         struct stat st; if (fstat(fd, &st) < 0) { close(fd); continue; }
