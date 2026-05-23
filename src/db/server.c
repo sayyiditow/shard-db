@@ -2280,6 +2280,138 @@ typedef struct {
     char db_root[PATH_MAX];
 } AutoVacuumArg;
 
+/* Startup warmup — pulls every kf header + index shard file (.idx/.bm/.tg)
+   into the OS page cache so the first user query doesn't pay a cold disk
+   read. See config.c (g_warmup_mode) for the mode knob (async/sync/off).
+
+   Mechanism: open(O_RDONLY) + posix_fadvise(POSIX_FADV_WILLNEED) + a
+   single read of the first page. fadvise WILLNEED is non-blocking — the
+   kernel queues background read-ahead — but a sync first-page read is
+   what actually guarantees that the file's start is resident by the time
+   subsequent lookups arrive. Stream segment files (data/streams/) are
+   intentionally NOT touched: those can be GBs on populated objects and
+   warming them all evicts smaller, hotter index pages. */
+typedef struct {
+    char db_root[PATH_MAX];
+} WarmupArg;
+
+static int warmup_touch_file(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    /* Hint to the kernel: pre-fault this file's pages. Async. */
+    posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    /* Force the first page in synchronously so subsequent lookups don't
+       page-fault. One page (~4 KB) is enough for every header-driven
+       lookup (kf 24-byte header, btree root, bitmap dict, trigram root). */
+    char buf[4096];
+    ssize_t r = read(fd, buf, sizeof(buf));
+    (void)r;
+    close(fd);
+    return 0;
+}
+
+/* Recursively walks `dir` and calls warmup_touch_file on every regular
+   file whose name ends with one of the suffixes in ext_list[] (NULL-
+   terminated). Increments *count for each touched file. Bounded
+   recursion — only descends into subdirectories whose name doesn't
+   start with `.`. */
+static void warmup_walk_dir(const char *dir, const char **ext_list, int *count) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && server_running) {
+        if (e->d_name[0] == '.') continue;
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(path)) continue;
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            warmup_walk_dir(path, ext_list, count);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t nlen = strlen(e->d_name);
+        for (int i = 0; ext_list[i]; i++) {
+            size_t elen = strlen(ext_list[i]);
+            if (nlen > elen &&
+                strcmp(e->d_name + nlen - elen, ext_list[i]) == 0) {
+                if (warmup_touch_file(path) == 0) (*count)++;
+                break;
+            }
+        }
+    }
+    closedir(d);
+}
+
+static void *warmup_thread(void *arg) {
+    WarmupArg *a = (WarmupArg *)arg;
+
+    /* g_out only matters if the warmup ever emitted via OUT(); it doesn't.
+       But pool worker threads (which this one is NOT) carry __thread g_out
+       state, so we set it defensively in case any helper we call adopts
+       OUT() later. */
+    g_out = fopen("/dev/null", "w");
+    if (!g_out) g_out = stderr;
+
+    uint64_t t0 = now_ms();
+    int kf = 0, idx = 0, objects = 0;
+    /* On-disk extensions (per src/db/slotcask.c and index layout):
+         .kf  — slotcask keyfile shard (`data/kf/NNN.kf`, ~3 MB each)
+         .idx — btree index shard (`indexes/<field>/NNN.idx`)
+         .bm  — bitmap shard
+         .tg  — trigram shard
+       Stream seg files `.dat` are deliberately omitted — they're the bulk
+       of the on-disk footprint (128 MB each × many) and warming them all
+       would evict the smaller hot index pages from the OS page cache. */
+    static const char *kf_ext[]  = { ".kf", NULL };
+    static const char *idx_ext[] = { ".idx", ".bm", ".tg", NULL };
+
+    /* Snapshot dirs (same pattern as auto_vacuum_thread). */
+    char dirs_copy[DIRS_BUCKETS][256];
+    int  used_copy[DIRS_BUCKETS];
+    pthread_mutex_lock(&g_dirs_lock);
+    memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
+    memcpy(used_copy, g_dirs_used, sizeof(used_copy));
+    pthread_mutex_unlock(&g_dirs_lock);
+
+    for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
+        if (!used_copy[di]) continue;
+        char dir_path[PATH_MAX];
+        int n = snprintf(dir_path, sizeof(dir_path), "%s/%s",
+                         a->db_root, dirs_copy[di]);
+        if (n <= 0 || (size_t)n >= sizeof(dir_path)) continue;
+        DIR *dd = opendir(dir_path);
+        if (!dd) continue;
+        struct dirent *de;
+        while ((de = readdir(dd)) && server_running) {
+            if (de->d_name[0] == '.') continue;
+            char obj_check[PATH_MAX];
+            int m = snprintf(obj_check, sizeof(obj_check),
+                             "%s/%s/fields.conf", dir_path, de->d_name);
+            if (m <= 0 || (size_t)m >= sizeof(obj_check)) continue;
+            struct stat ost;
+            if (stat(obj_check, &ost) != 0) continue;
+
+            char kf_dir[PATH_MAX], idx_dir[PATH_MAX];
+            snprintf(kf_dir,  sizeof(kf_dir),  "%s/%s/data/kf",
+                     dir_path, de->d_name);
+            snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes",
+                     dir_path, de->d_name);
+            warmup_walk_dir(kf_dir,  kf_ext,  &kf);
+            warmup_walk_dir(idx_dir, idx_ext, &idx);
+            objects++;
+        }
+        closedir(dd);
+    }
+
+    log_msg(1, "WARMUP done: %d objects, %d kf files + %d index files in %lums",
+            objects, kf, idx,
+            (unsigned long)(now_ms() - t0));
+    free(a);
+    return NULL;
+}
+
 static void *auto_vacuum_thread(void *arg) {
     AutoVacuumArg *a = (AutoVacuumArg *)arg;
 
@@ -2799,6 +2931,32 @@ int cmd_server(const char *db_root, int daemonize) {
                 pthread_detach(auto_vac_tid);
             else
                 free(av);
+        }
+    }
+
+    /* Startup warmup. async (default) spawns a detached thread that primes
+       the OS page cache for every kf header + index shard. sync runs the
+       same work inline before we return from cmd_server (caller blocks until
+       done). off skips it. The async path is what makes restart-while-
+       explorer-running fast: the daemon accepts connections immediately,
+       and the warmup thread races the first user queries to populate the
+       cache. See config.c (g_warmup_mode) for the env knob WARMUP=. */
+    if (strcmp(g_warmup_mode, "off") != 0) {
+        WarmupArg *wa = malloc(sizeof(WarmupArg));
+        if (wa) {
+            strncpy(wa->db_root, db_root, PATH_MAX - 1);
+            wa->db_root[PATH_MAX - 1] = '\0';
+            if (strcmp(g_warmup_mode, "sync") == 0) {
+                /* Synchronous mode — block here until warmup completes.
+                   Frees wa internally. */
+                warmup_thread(wa);
+            } else {
+                pthread_t warmup_tid;
+                if (db_thread_create(&warmup_tid, warmup_thread, wa) == 0)
+                    pthread_detach(warmup_tid);
+                else
+                    free(wa);
+            }
         }
     }
 
