@@ -2298,8 +2298,14 @@ typedef struct {
 static int warmup_touch_file(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
-    /* Hint to the kernel: pre-fault this file's pages. Async. */
+    /* Hint to the kernel: pre-fault this file's pages. Linux-only —
+       macOS has F_RDADVISE/fcntl as an equivalent but the synchronous
+       first-page read below is what actually guarantees residency
+       anyway, so the macOS path skips the hint. The kernel still does
+       its own read-ahead heuristics on a sequential file open. */
+#ifdef __linux__
     posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+#endif
     /* Force the first page in synchronously so subsequent lookups don't
        page-fault. One page (~4 KB) is enough for every header-driven
        lookup (kf 24-byte header, btree root, bitmap dict, trigram root). */
