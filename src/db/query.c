@@ -10260,8 +10260,13 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
     StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
     if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
 
-    /* Worker thread inherits the caller's output stream. */
-    if (!g_out) g_out = sc->parent_out;
+    /* Worker thread must always point at the CALLER's output stream — `if
+       (!g_out)` was wrong, because pool workers retain g_out across
+       requests (thread-local, only set when first used). On a reused
+       worker, g_out points to a *previous* request's socket and OUT()
+       writes to a closed/wrong fd, giving the current client a silent
+       []. Setting unconditionally is the only correct choice. */
+    g_out = sc->parent_out;
 
     /* Primary check (LEN_*, like patterns where check_primary == 1). */
     if (sc->primary_crit && op_is_length(sc->primary_crit->op)) {
@@ -13545,11 +13550,22 @@ typedef struct {
        where KeySet build would exceed the threshold or PRIMARY_NONE
        (no indexed leaves at all). */
     KeySet        *prefilter_ks;
+
+    /* Caller's request-thread output stream. The cursor walk runs on
+       pool worker threads whose own g_out is thread-local and may
+       carry a stale FILE* from a previous request. The callback must
+       set g_out = parent_out unconditionally at entry so OUT() writes
+       reach THIS request's socket. */
+    FILE          *parent_out;
 } CursorFindCtx;
 
 static int cursor_find_cb(const char *val, size_t vlen,
                           const uint8_t *hash16, void *ctx) {
     CursorFindCtx *c = (CursorFindCtx *)ctx;
+    /* Pool worker threads carry a thread-local g_out across requests.
+       Force this request's socket so OUT() reaches the right client —
+       same bug class as stream_find_cb. */
+    g_out = c->parent_out;
     if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
     if (c->printed >= c->limit) return -1;
 
@@ -13970,6 +13986,7 @@ int cmd_find(const char *db_root, const char *object,
         cc.order_field_idx = order_field_idx;
         cc.deadline    = &cdl;
         cc.prefilter_ks = cursor_prefilter_ks;
+        cc.parent_out   = g_out;
 
         /* Cursor response always uses the {rows:..., cursor:...} wrapper so
            clients get a single stable shape regardless of format. dict_fmt
@@ -14146,6 +14163,7 @@ int cmd_find(const char *db_root, const char *object,
             cc.offset_mode     = 1;
             cc.deadline        = &dl;
             cc.prefilter_ks    = prefilter_ks;
+            cc.parent_out      = g_out;
 
             btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
                                    "", 0, 0,
