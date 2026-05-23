@@ -2280,20 +2280,82 @@ typedef struct {
     char db_root[PATH_MAX];
 } AutoVacuumArg;
 
-/* Startup warmup — pulls every kf header + index shard file (.idx/.bm/.tg)
-   into the OS page cache so the first user query doesn't pay a cold disk
-   read. See config.c (g_warmup_mode) for the mode knob (async/sync/off).
+/* Startup warmup — drives the daemon's userspace caches into "warm
+   enough that the first user query is O(1)" state. See config.c
+   (g_warmup_mode) for the mode knob (async/sync/off).
 
-   Mechanism: open(O_RDONLY) + posix_fadvise(POSIX_FADV_WILLNEED) + a
-   single read of the first page. fadvise WILLNEED is non-blocking — the
-   kernel queues background read-ahead — but a sync first-page read is
-   what actually guarantees that the file's start is resident by the time
-   subsequent lookups arrive. Stream segment files (data/streams/) are
-   intentionally NOT touched: those can be GBs on populated objects and
-   warming them all evicts smaller, hotter index pages. */
+   Two distinct populations:
+
+   1. Slotcask: load_schema + slotcask_registry_get + per-shard
+      kfcache_acquire(reader) on every (dir, object).  This is the
+      load-bearing part:
+        - registry_get triggers slotcask_open which eagerly opens +
+          mmaps every stream's file_000 (so the first insert path
+          doesn't race the create path through segcache).
+        - kfcache_acquire mmaps + caches the kf shard; touching
+          hdr->total faults the first page in, so subsequent
+          slotcask_sum_kf_totals calls (bare count + size) hit a
+          cached mmap + already-resident page.  Pre-fix, this
+          function did open + pread + close per shard (256 cold
+          syscalls per bare count = ~10s on 256-split objects).
+
+   2. Indexes (.idx / .bm / .tg): byte-read first 4 KB to populate the
+      OS page cache.  No userspace cache populate here — bt_cache and
+      bm_cache populate lazily on first use, and that lazy mmap is
+      cheap once the OS page cache is warm.  Stream seg files (.dat
+      under data/streams/) are deliberately NOT touched: they can be
+      GBs on populated objects and warming them all evicts hotter
+      index pages. */
 typedef struct {
     char db_root[PATH_MAX];
 } WarmupArg;
+
+/* Drive caches for one (dir, object) — schema cache, slotcask registry,
+   kfcache for every shard. Increments *out_kf for each kf shard
+   successfully cached. Returns 1 on success (object exists), 0 on skip. */
+static int warmup_object_via_caches(const char *db_root, const char *dir,
+                                    const char *obj, int *out_kf) {
+    char eff[PATH_MAX];
+    int n = snprintf(eff, sizeof(eff), "%s/%s", db_root, dir);
+    if (n <= 0 || (size_t)n >= sizeof(eff)) return 0;
+
+    /* fields.conf gate — only proceed for real objects */
+    char obj_check[PATH_MAX];
+    int m = snprintf(obj_check, sizeof(obj_check), "%s/%s/fields.conf", eff, obj);
+    if (m <= 0 || (size_t)m >= sizeof(obj_check)) return 0;
+    struct stat ost;
+    if (stat(obj_check, &ost) != 0) return 0;
+
+    /* schema cache populate (load_schema is internally cached) */
+    Schema sch = load_schema(eff, obj);
+    if (sch.splits <= 0) return 0;
+
+    /* registry + eager seg_000 mmap per stream */
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits,
+        .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(eff, obj, &info);
+    if (!sdb) return 0;
+
+    /* Per-shard kfcache populate + first-page fault */
+    for (int s = 0; s < sdb->num_shards && server_running; s++) {
+        char kf_path[PATH_MAX];
+        slotcask_kf_path(kf_path, sizeof(kf_path), sdb->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, sdb->slots_per_shard, 0) != 0) continue;
+        /* Touch the header to force the first page in. The volatile
+           read prevents the compiler from optimizing away the load. */
+        if (kh.hdr) {
+            volatile uint64_t t = kh.hdr->total;
+            (void)t;
+        }
+        kfcache_release(&kh);
+        (*out_kf)++;
+    }
+    return 1;
+}
 
 static int warmup_touch_file(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -2362,15 +2424,11 @@ static void *warmup_thread(void *arg) {
 
     uint64_t t0 = now_ms();
     int kf = 0, idx = 0, objects = 0;
-    /* On-disk extensions (per src/db/slotcask.c and index layout):
-         .kf  — slotcask keyfile shard (`data/kf/NNN.kf`, ~3 MB each)
-         .idx — btree index shard (`indexes/<field>/NNN.idx`)
-         .bm  — bitmap shard
-         .tg  — trigram shard
-       Stream seg files `.dat` are deliberately omitted — they're the bulk
-       of the on-disk footprint (128 MB each × many) and warming them all
-       would evict the smaller hot index pages from the OS page cache. */
-    static const char *kf_ext[]  = { ".kf", NULL };
+    /* Index extensions still warmed via byte-read into OS page cache —
+       bt_cache + bm_cache populate lazily on first use, but the OS page
+       cache priming makes that lazy mmap cheap.  Stream seg files
+       (.dat under data/streams/) are deliberately NOT touched — see
+       the warmup comment block above for the rationale. */
     static const char *idx_ext[] = { ".idx", ".bm", ".tg", NULL };
 
     /* Snapshot dirs (same pattern as auto_vacuum_thread). */
@@ -2399,14 +2457,22 @@ static void *warmup_thread(void *arg) {
             struct stat ost;
             if (stat(obj_check, &ost) != 0) continue;
 
-            char kf_dir[PATH_MAX], idx_dir[PATH_MAX];
-            snprintf(kf_dir,  sizeof(kf_dir),  "%s/%s/data/kf",
-                     dir_path, de->d_name);
+            /* Cache-API populate: schema + registry + kfcache per shard.
+               Replaces the prior file-walk of data/kf NNN.kf files which
+               only primed OS pages. Now bare count / size queries are
+               O(1) from cold restart. */
+            if (warmup_object_via_caches(a->db_root, dirs_copy[di],
+                                          de->d_name, &kf)) {
+                objects++;
+            }
+
+            /* Indexes — keep the byte-read approach. bt_cache/bm_cache
+               populate themselves on first use; OS page-cache priming
+               keeps that first use fast. */
+            char idx_dir[PATH_MAX];
             snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes",
                      dir_path, de->d_name);
-            warmup_walk_dir(kf_dir,  kf_ext,  &kf);
             warmup_walk_dir(idx_dir, idx_ext, &idx);
-            objects++;
         }
         closedir(dd);
     }
