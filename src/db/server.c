@@ -2412,6 +2412,45 @@ static void warmup_walk_dir(const char *dir, const char **ext_list, int *count) 
     closedir(d);
 }
 
+/* Per-object warmup task — one entry per (dir, object) pair fanned
+   out via parallel_for so the global pool drives the cold-start
+   priming.  Each task owns its strings (snprintf'd at collection
+   time); the counters point at the warmup_thread's atomic locals so
+   the final log line sees the aggregate without per-task locking. */
+typedef struct {
+    char db_root[PATH_MAX];
+    char dir[256];
+    char obj[256];
+    _Atomic int *kf_count;
+    _Atomic int *idx_count;
+    _Atomic int *obj_count;
+} WarmupTask;
+
+static void *warmup_task_fn(void *arg) {
+    WarmupTask *t = (WarmupTask *)arg;
+    if (!server_running) return NULL;
+
+    int kf_local = 0;
+    int got = warmup_object_via_caches(t->db_root, t->dir, t->obj, &kf_local);
+
+    /* Index extensions warmed via byte-read into OS page cache —
+       bt_cache + bm_cache populate lazily on first use, but the OS
+       page cache priming makes that lazy mmap cheap.  Stream seg
+       files (.dat under data/streams/) are deliberately NOT touched —
+       see the warmup comment block above for the rationale. */
+    static const char *idx_ext[] = { ".idx", ".bm", ".tg", NULL };
+    char idx_dir[PATH_MAX];
+    snprintf(idx_dir, sizeof(idx_dir), "%s/%s/%s/indexes",
+             t->db_root, t->dir, t->obj);
+    int idx_local = 0;
+    warmup_walk_dir(idx_dir, idx_ext, &idx_local);
+
+    if (got) atomic_fetch_add(t->obj_count, 1);
+    if (kf_local)  atomic_fetch_add(t->kf_count,  kf_local);
+    if (idx_local) atomic_fetch_add(t->idx_count, idx_local);
+    return NULL;
+}
+
 static void *warmup_thread(void *arg) {
     WarmupArg *a = (WarmupArg *)arg;
 
@@ -2423,13 +2462,7 @@ static void *warmup_thread(void *arg) {
     if (!g_out) g_out = stderr;
 
     uint64_t t0 = now_ms();
-    int kf = 0, idx = 0, objects = 0;
-    /* Index extensions still warmed via byte-read into OS page cache —
-       bt_cache + bm_cache populate lazily on first use, but the OS page
-       cache priming makes that lazy mmap cheap.  Stream seg files
-       (.dat under data/streams/) are deliberately NOT touched — see
-       the warmup comment block above for the rationale. */
-    static const char *idx_ext[] = { ".idx", ".bm", ".tg", NULL };
+    _Atomic int kf = 0, idx = 0, objects = 0;
 
     /* Snapshot dirs (same pattern as auto_vacuum_thread). */
     char dirs_copy[DIRS_BUCKETS][256];
@@ -2439,6 +2472,12 @@ static void *warmup_thread(void *arg) {
     memcpy(used_copy, g_dirs_used, sizeof(used_copy));
     pthread_mutex_unlock(&g_dirs_lock);
 
+    /* Pass 1: collect every (dir, object) into a flat task array.
+       The directory walk itself is cheap and inherently serial (one
+       readdir stream per tenant dir), so we keep it on this thread
+       and feed the pool a single batch. */
+    WarmupTask *tasks = NULL;
+    size_t n_tasks = 0, cap = 0;
     for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
         if (!used_copy[di]) continue;
         char dir_path[PATH_MAX];
@@ -2457,28 +2496,34 @@ static void *warmup_thread(void *arg) {
             struct stat ost;
             if (stat(obj_check, &ost) != 0) continue;
 
-            /* Cache-API populate: schema + registry + kfcache per shard.
-               Replaces the prior file-walk of data/kf NNN.kf files which
-               only primed OS pages. Now bare count / size queries are
-               O(1) from cold restart. */
-            if (warmup_object_via_caches(a->db_root, dirs_copy[di],
-                                          de->d_name, &kf)) {
-                objects++;
+            if (n_tasks == cap) {
+                size_t new_cap = cap ? cap * 2 : 16;
+                WarmupTask *nt = realloc(tasks, new_cap * sizeof(WarmupTask));
+                if (!nt) break;
+                tasks = nt;
+                cap = new_cap;
             }
-
-            /* Indexes — keep the byte-read approach. bt_cache/bm_cache
-               populate themselves on first use; OS page-cache priming
-               keeps that first use fast. */
-            char idx_dir[PATH_MAX];
-            snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes",
-                     dir_path, de->d_name);
-            warmup_walk_dir(idx_dir, idx_ext, &idx);
+            WarmupTask *t = &tasks[n_tasks++];
+            snprintf(t->db_root, sizeof(t->db_root), "%s", a->db_root);
+            snprintf(t->dir, sizeof(t->dir), "%s", dirs_copy[di]);
+            snprintf(t->obj, sizeof(t->obj), "%s", de->d_name);
+            t->kf_count  = &kf;
+            t->idx_count = &idx;
+            t->obj_count = &objects;
         }
         closedir(dd);
     }
 
+    /* Pass 2: fan out per-object cache priming through the global
+       pool.  parallel_for blocks until every task is done; the
+       startup thread therefore reports accurate aggregate counts. */
+    if (n_tasks > 0 && server_running) {
+        parallel_for(warmup_task_fn, tasks, (int)n_tasks, sizeof(WarmupTask));
+    }
+    free(tasks);
+
     log_msg(1, "WARMUP done: %d objects, %d kf files + %d index files in %lums",
-            objects, kf, idx,
+            atomic_load(&objects), atomic_load(&kf), atomic_load(&idx),
             (unsigned long)(now_ms() - t0));
     free(a);
     return NULL;
