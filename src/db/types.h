@@ -621,7 +621,7 @@ int  json_unescape_string(const char *in, size_t in_len,
    The returned length excludes the trailing NUL; use the optional
    *out_len pointer if you need the byte length for the binary content
    (escapes may decode to bytes including embedded NULs is not
-   supported — we treat   as malformed for storage safety). */
+   supported — we treat \0 as malformed for storage safety). */
 char *json_obj_strdup_unescaped(const JsonObj *o, const char *key,
                                 size_t *out_len);
 
