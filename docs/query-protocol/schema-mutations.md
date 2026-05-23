@@ -120,7 +120,13 @@ Append new fields to an existing object.
   "mode": "add-field",
   "dir": "<dir>",
   "object": "<obj>",
-  "fields": ["phone:varchar:20","verified:bool:default=false"]
+  "fields": [
+    "phone:varchar:20",
+    "verified:bool:default=false",
+    "rowid:long:default=seq(rowid)",
+    "trace_id:varchar:36:default=uuid()",
+    "nonce:varchar:18:default=random(8)"
+  ]
 }
 ```
 
@@ -128,16 +134,29 @@ Append new fields to an existing object.
 
 1. Takes the object's **write lock** (`objlock_wrlock`).
 2. Builds a new shard layout with the extra fields appended.
-3. Re-encodes every record: existing field values preserved, new fields filled with their defaults (or empty).
+3. **Backfill pass** — re-encodes every existing record: prior field values preserved, new fields stamped with their computed default (see table below).
 4. Atomically swaps (`.new` → original rename).
 5. Rebuilds indexes (none referencing the new field yet; existing indexes are preserved).
 6. Releases the write lock.
 
+### Computed defaults on backfill
+
+When the new field's spec includes a default modifier, the rebuild walk applies it to every existing record:
+
+| Modifier | Backfill behaviour |
+|---|---|
+| `:default=<literal>` | Stamped verbatim on every existing record. Goes through the same type-aware encoder used at insert time (int BE, varchar length prefix, numeric scaling, etc.). |
+| `:default=seq(<name>)` | The server **reserves a contiguous range** `[start, start+live_count)` from the named sequence in one flock, then assigns the values sequentially as the walk progresses. After the rebuild, the next insert-time `seq(<name>)` call resumes from `start+live_count`. |
+| `:default=uuid()` | Fresh UUIDv4 generated per record (`/dev/urandom`). For `varchar:36` fields the canonical 36-char dashed string is stored; for the native `uuid` type the raw 16 bytes are stored. |
+| `:default=random(<N>)` | Fresh `N` random bytes per record (`/dev/urandom`), hex-encoded to `2N` characters. The request is **refused pre-flight** if `2N` exceeds the field's storage cap — no rebuild is started in that case. |
+| `:auto_create` / `:auto_update` | **Inert during backfill.** These are insert/update-time generators — the original record's creation timestamp is unknown, so stamping `now()` on every row would lie about history. Existing records keep zero bytes for this field; future inserts/updates fire the generator as normal. |
+| (no modifier) | Existing records' bytes for the new field are zero. Decoders render that as the type's "absent" form (empty string for varchar, `0` for int, etc.). |
+
 ### Notes
 
-- Default values for new fields are applied at rebuild time. If a field has no default, its bytes are zeroed.
 - Existing record count and hash routing are preserved.
 - Full object rebuild — scales with object size. Not instantaneous on millions of records.
+- Sequence allocation is exact at walk start: the live count is read from the kf-header summary on the legacy slotcask handle, which is the authoritative source of record counts in v2.
 
 ## edit-field
 
@@ -223,7 +242,8 @@ Pass `"dry_run":true` to run every validation step (cross-type refusal, FT_ENUM 
 
 ### Notes
 
-- **Default modifier carry-through**: when a new edit spec OMITS `:default=...` / `:auto_create` / `:auto_update`, the modifier from the OLD `fields.conf` line is preserved. `edit-field age:long` against an existing `age:int:default=42` keeps `:default=42`. Today there is no way to *change* a default via `edit-field` because the upstream field-line parser rejects spec strings carrying defaults — pair `add-field` + `remove-field` to swap a default.
+- **Default modifier carry-through**: when a new edit spec OMITS `:default=...` / `:auto_create` / `:auto_update`, the modifier from the OLD `fields.conf` line is preserved — `edit-field age:long` against an existing `age:int:default=42` keeps `:default=42`.
+- **Changing a default**: include the new modifier on the edit spec, e.g. `edit-field age:int:default=99`. Supported forms: `:default=<literal>`, `:default=seq(<name>)`, `:default=uuid()`, `:default=random(N)`, `:auto_create`, `:auto_update`. The new modifier affects **future inserts only** — existing records keep their stored values. For a one-shot backfill of existing records, use `add-field <new-name>` with the modifier, then `bulk-update` and `remove-field <old-name>`.
 - **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field rebuilds only that index (smart reindex). Queries on the indexed field continue to resolve to the same records post-edit.
 - Full object rebuild — scales with object size, not slot count. Not instantaneous on millions of records. Holds the wrlock for the duration.
 
