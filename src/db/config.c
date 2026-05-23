@@ -68,6 +68,25 @@ int g_vacuum_recommend_min_deleted = 1000;/* AND deleted ≥ N */
    or --splits (both are heavy + need exclusive objlock). */
 int g_auto_vacuum_enable = 0;
 int g_auto_vacuum_interval_sec = 3600;
+
+/* Startup warmup — pulls every kf header + index shard file (.idx/.bm/.tg)
+   into the OS page cache on daemon start so the first user query doesn't
+   pay a cold disk read.
+   Modes:
+     async (default) — daemon accepts connections immediately, warmup runs
+                       in a detached background thread. First queries that
+                       race ahead of the warmup still pay cold cost for
+                       whatever the thread hasn't reached yet, but the
+                       wall-clock time to fully-warm drops drastically
+                       because the warmup runs in parallel with serving.
+     sync            — block startup until warmup completes. Restart blocks
+                       the listening socket for the full warmup time;
+                       useful for "warm before serving" production posture.
+     off             — no warmup. Lazy cold reads as before.
+   Stream segment files are intentionally NOT touched — they can be GBs
+   on populated objects and warming them all evicts the small/medium index
+   files that drive every find. Segs get warmed naturally by first queries. */
+char g_warmup_mode[16] = "async";
 SlowQueryEntry g_slow_queries[SLOW_QUERY_RING] = {0};
 int g_slow_query_head = 0;
 pthread_mutex_t g_slow_query_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -375,6 +394,15 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "AUTO_VACUUM_INTERVAL_SEC=", 25) == 0) {
             int n = atoi(p + 25);
             if (n >= 60) g_auto_vacuum_interval_sec = n; /* 1-min floor */
+        } else if (strncmp(p, "WARMUP=", 7) == 0) {
+            const char *v = p + 7;
+            if (strcmp(v, "async") == 0 || strcmp(v, "sync") == 0 ||
+                strcmp(v, "off") == 0) {
+                strncpy(g_warmup_mode, v, sizeof(g_warmup_mode) - 1);
+                g_warmup_mode[sizeof(g_warmup_mode) - 1] = '\0';
+            }
+            /* Unknown value silently keeps the previous (default) mode —
+               same forgiveness pattern as the other knobs. */
         } else if (strncmp(p, "TLS_ENABLE=", 11) == 0) {
             g_tls_enable = (atoi(p + 11) != 0);
         } else if (strncmp(p, "TLS_SKIP_VERIFY=", 16) == 0) {

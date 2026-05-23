@@ -487,6 +487,7 @@ extern int g_vacuum_recommend_pct;
 extern int g_vacuum_recommend_min_deleted;
 extern int g_auto_vacuum_enable;
 extern int g_auto_vacuum_interval_sec;
+extern char g_warmup_mode[16];
 
 #define SLOW_QUERY_RING 64
 typedef struct {
