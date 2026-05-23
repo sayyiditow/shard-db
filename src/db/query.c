@@ -6216,14 +6216,24 @@ static void selective_reindex_dirty(const char *db_root, const char *object,
         btree_idx_unlink_all(db_root, object, field_only, sch.splits);
     }
 
-    /* Hand the affected list to cmd_add_indexes(force=1). */
+    /* Hand the affected list to cmd_add_indexes(force=1). snprintf returns
+       the *would-have-written* length even on truncation, so the running
+       pos can outrun the buffer. Clamp after every accumulation so the
+       final "]" snprintf can't see an underflowed remaining-size. */
     char fields_json[8192];
-    int pos = snprintf(fields_json, sizeof(fields_json), "[");
+    size_t cap = sizeof(fields_json);
+    size_t pos = (size_t)snprintf(fields_json, cap, "[");
+    if (pos >= cap) pos = cap - 1;
     for (int i = 0; i < n_aff; i++) {
-        pos += snprintf(fields_json + pos, sizeof(fields_json) - pos,
-                        "%s\"%s\"", i ? "," : "", affected_specs[i]);
+        size_t rem = cap - pos;
+        int n = snprintf(fields_json + pos, rem, "%s\"%s\"",
+                         i ? "," : "", affected_specs[i]);
+        if (n < 0) break;
+        if ((size_t)n >= rem) { pos = cap - 1; break; }
+        pos += (size_t)n;
     }
-    snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
+    if (pos < cap - 1) snprintf(fields_json + pos, cap - pos, "]");
+    else fields_json[cap - 1] = '\0';
 
     FILE *saved_out = g_out;
     FILE *devnull = fopen("/dev/null", "w");
