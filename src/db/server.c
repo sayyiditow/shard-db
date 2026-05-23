@@ -1675,8 +1675,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                                 (strcmp(allow_rename_str, "true") == 0 ||
                                  strcmp(allow_rename_str, "1") == 0));
             free(allow_rename_str);
+            char *dry_s = json_obj_strdup(&req, "dry_run");
+            int dry = (dry_s && (strcmp(dry_s, "true") == 0 || strcmp(dry_s, "1") == 0));
+            free(dry_s);
             if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-            else cmd_edit_fields(db_root, object, lines, nlines, allow_rename);
+            else cmd_edit_fields(db_root, object, lines, nlines, allow_rename, dry);
             free(fields_arr);
         }
     } else if (strcmp(mode, "remove-field") == 0) {

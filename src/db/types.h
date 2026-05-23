@@ -621,7 +621,7 @@ int  json_unescape_string(const char *in, size_t in_len,
    The returned length excludes the trailing NUL; use the optional
    *out_len pointer if you need the byte length for the binary content
    (escapes may decode to bytes including embedded NULs is not
-   supported — we treat   as malformed for storage safety). */
+   supported — we treat \0 as malformed for storage safety). */
 char *json_obj_strdup_unescaped(const JsonObj *o, const char *key,
                                 size_t *out_len);
 
@@ -1229,7 +1229,8 @@ int cmd_add_fields(const char *db_root, const char *object,
    at the cost of touching unaffected indexes). Caller holds
    objlock_wrlock. */
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int nlines, int allow_rename);
+                    char lines[][256], int nlines,
+                    int allow_rename, int dry_run);
 void invalidate_schema_caches(const char *db_root, const char *object);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */

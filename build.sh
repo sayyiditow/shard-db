@@ -123,6 +123,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_crash_safety.c \
     src/test/cases/test_rename_field.c \
     src/test/cases/test_edit_field.c \
+    src/test/cases/test_edit_field_polish.c \
     src/test/cases/test_auto_key.c \
     src/test/cases/test_auto_key_multi.c \
     src/test/cases/test_bulk_upsert.c \

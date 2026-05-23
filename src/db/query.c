@@ -6062,6 +6062,32 @@ static int edit_valid_name(const char *name) {
     return 1;
 }
 
+/* Extract the trailing default-modifier suffix from a fields.conf line.
+   Modifiers recognised: :default=<…>, :auto_create, :auto_update.
+   The suffix is everything from the first such modifier to end-of-line.
+   Returns 1 and copies the suffix into out_buf when a modifier is found
+   AND fits in out_cap (NUL-terminator included). Returns 0 in every other
+   case: no modifier present, or the modifier wouldn't fit. Refusing to
+   truncate is intentional — a half-modifier written into fields.conf
+   would corrupt the schema on reload, so callers that get 0 here just
+   drop the carry rather than write a wrong value. */
+static int default_modifiers_for_line(const char *line, char *out_buf, size_t out_cap) {
+    if (out_cap == 0) return 0;
+    out_buf[0] = '\0';
+    static const char *mods[] = { ":default=", ":auto_create", ":auto_update", NULL };
+    const char *earliest = NULL;
+    for (int i = 0; mods[i]; i++) {
+        const char *p = strstr(line, mods[i]);
+        if (p && (!earliest || p < earliest)) earliest = p;
+    }
+    if (!earliest) return 0;
+    size_t need = strlen(earliest);
+    if (need >= out_cap) return 0;   /* refuse to truncate — safer than half-modifier */
+    memcpy(out_buf, earliest, need);
+    out_buf[need] = '\0';
+    return 1;
+}
+
 /* Rewrite fields.conf in place, replacing each edited line with its new
    spec. Edited lines preserve the trailing :removed marker if present
    (edit-field rejects tombstoned fields up front, so this is defensive).
@@ -6113,7 +6139,18 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
             fputs(line, fout);
             continue;
         }
-        fprintf(fout, "%s\n", edit_lines[matched]);
+        /* Carry default modifiers (:default=…, :auto_create, :auto_update)
+           from the OLD line to the new line when the user's new spec omits
+           them. Lets `edit-field age:long` change the type without wiping
+           an existing `:default=42`. */
+        char old_mods[256] = "";
+        default_modifiers_for_line(stripped, old_mods, sizeof(old_mods));
+        char new_mods[256] = "";
+        int new_has = default_modifiers_for_line(edit_lines[matched], new_mods, sizeof(new_mods));
+        if (!new_has && old_mods[0])
+            fprintf(fout, "%s%s\n", edit_lines[matched], old_mods);
+        else
+            fprintf(fout, "%s\n", edit_lines[matched]);
     }
     fclose(fin);
     fclose(fout);
@@ -6124,8 +6161,92 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
     return 0;
 }
 
+/* Selective reindex driver — walks index.conf and only rebuilds indexes
+   whose referenced fields appear in dirty_names[]. Returns (rebuilt,
+   skipped) via out params. */
+static void selective_reindex_dirty(const char *db_root, const char *object,
+                                    char dirty_names[][128], int n_dirty,
+                                    int *out_rebuilt, int *out_skipped) {
+    *out_rebuilt = 0; *out_skipped = 0;
+    if (n_dirty <= 0) return;
+    char ic_path[PATH_MAX];
+    snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf", db_root, object);
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) return;
+
+    char affected_specs[MAX_FIELDS][256];
+    int n_aff = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), ic)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0]) continue;
+        /* Index spec form: <fname>[+<fname>...][':' index-type-tail].
+           Match any '+'-separated token against dirty_names[]. */
+        int hit = 0;
+        const char *p = line;
+        while (*p && !hit) {
+            const char *next = p;
+            while (*next && *next != '+' && *next != ':') next++;
+            size_t toklen = (size_t)(next - p);
+            for (int d = 0; d < n_dirty; d++) {
+                size_t dn = strlen(dirty_names[d]);
+                if (toklen == dn && memcmp(p, dirty_names[d], dn) == 0) { hit = 1; break; }
+            }
+            if (*next == '+') p = next + 1;
+            else break;
+        }
+        if (hit) {
+            strncpy(affected_specs[n_aff], line, sizeof(affected_specs[0]) - 1);
+            affected_specs[n_aff][sizeof(affected_specs[0]) - 1] = '\0';
+            n_aff++;
+        } else (*out_skipped)++;
+    }
+    fclose(ic);
+
+    if (n_aff == 0) return;
+
+    Schema sch = load_schema(db_root, object);
+    for (int i = 0; i < n_aff; i++) {
+        /* Strip ':<type>' tail to get the field-only name for unlink. */
+        char field_only[256];
+        strncpy(field_only, affected_specs[i], sizeof(field_only) - 1);
+        field_only[sizeof(field_only) - 1] = '\0';
+        char *col = strchr(field_only, ':');
+        if (col) *col = '\0';
+        btree_idx_unlink_all(db_root, object, field_only, sch.splits);
+    }
+
+    /* Hand the affected list to cmd_add_indexes(force=1). snprintf returns
+       the *would-have-written* length even on truncation, so the running
+       pos can outrun the buffer. Clamp after every accumulation so the
+       final "]" snprintf can't see an underflowed remaining-size. */
+    char fields_json[8192];
+    size_t cap = sizeof(fields_json);
+    size_t pos = (size_t)snprintf(fields_json, cap, "[");
+    if (pos >= cap) pos = cap - 1;
+    for (int i = 0; i < n_aff; i++) {
+        size_t rem = cap - pos;
+        int n = snprintf(fields_json + pos, rem, "%s\"%s\"",
+                         i ? "," : "", affected_specs[i]);
+        if (n < 0) break;
+        if ((size_t)n >= rem) { pos = cap - 1; break; }
+        pos += (size_t)n;
+    }
+    if (pos < cap - 1) snprintf(fields_json + pos, cap - pos, "]");
+    else fields_json[cap - 1] = '\0';
+
+    FILE *saved_out = g_out;
+    FILE *devnull = fopen("/dev/null", "w");
+    g_out = devnull ? devnull : saved_out;
+    cmd_add_indexes(db_root, object, fields_json, 1);
+    g_out = saved_out;
+    if (devnull) fclose(devnull);
+    *out_rebuilt = n_aff;
+}
+
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int n_edits, int allow_rename) {
+                    char lines[][256], int n_edits,
+                    int allow_rename, int dry_run) {
     if (n_edits <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
         return 1;
@@ -6293,22 +6414,32 @@ int cmd_edit_fields(const char *db_root, const char *object,
     }
     new_ts.total_size = noff;
 
-    /* Detect no-op: every edited field's encoding is identical to its old
-       encoding. In that case fields.conf may still change (default modifier
-       differences, etc.) but no data rebuild is required. */
-    int needs_rebuild = 0;
+    /* Per-edit dirty tracking. A field is dirty when its encoding actually
+       changed; only those fields' indexes need to be rebuilt. */
+    char dirty_names[MAX_FIELDS][128];
+    int n_dirty = 0;
     for (int e = 0; e < n_edits; e++) {
         int oi = edited_old_idx[e];
         if (field_needs_transform(&old_ts->fields[oi], &new_ts.fields[oi])) {
-            needs_rebuild = 1;
-            break;
+            size_t nlen = strlen(parsed[e].name);
+            if (nlen >= sizeof(dirty_names[0])) nlen = sizeof(dirty_names[0]) - 1;
+            memcpy(dirty_names[n_dirty], parsed[e].name, nlen);
+            dirty_names[n_dirty][nlen] = '\0';
+            n_dirty++;
         }
     }
+    int needs_rebuild = (n_dirty > 0);
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
 
     if (!needs_rebuild) {
+        if (dry_run) {
+            OUT("{\"status\":\"ok\",\"dry_run\":true,\"fields\":%d,"
+                "\"would_rebuild\":false}\n", n_edits);
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 0;
+        }
         if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
             OUT("{\"error\":\"Failed to rewrite fields.conf\"}\n");
             return 1;
@@ -6342,6 +6473,18 @@ int cmd_edit_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
             pf.fail_field, pf.fail_reason);
         return 1;
+    }
+
+    /* Dry-run short-circuit: all validation + pre-flight scan passed, but
+       the caller only wanted a preview. Don't run the rebuild, don't
+       rewrite fields.conf, don't touch indexes. Report what *would* have
+       happened so operators can preview a same-type narrow / widen before
+       committing to it. */
+    if (dry_run) {
+        OUT("{\"status\":\"ok\",\"dry_run\":true,\"fields\":%d,"
+            "\"would_rebuild\":true}\n", n_edits);
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+        return 0;
     }
 
     /* Compute the new slot_size and run the v2 rebuild. */
@@ -6378,17 +6521,19 @@ int cmd_edit_fields(const char *db_root, const char *object,
     }
     invalidate_schema_caches(db_root, object);
 
-    /* Wipe + rebuild every index — the edited fields' encoded bytes have
-       changed, so any index touching them is stale. We rebuild all (not
-       just affected ones) to keep this code path simple. */
-    int idx_rebuilt = reindex_object(db_root, object);
+    /* Wipe + rebuild only indexes whose referenced fields actually had
+       their encoding change. Skipped indexes remain intact and functional. */
+    int idx_rebuilt = 0, idx_skipped = 0;
+    selective_reindex_dirty(db_root, object, dirty_names, n_dirty,
+                            &idx_rebuilt, &idx_skipped);
 
-    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, idx_rebuilt=%d",
+    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
+               "idx_rebuilt=%d, idx_skipped=%d",
             db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
-            idx_rebuilt);
+            idx_rebuilt, idx_skipped);
     OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
-        "\"slot_size\":%d,\"indexes_rebuilt\":%d}\n",
-        n_edits, new_sch.slot_size, idx_rebuilt);
+        "\"slot_size\":%d,\"indexes_rebuilt\":%d,\"indexes_skipped\":%d}\n",
+        n_edits, new_sch.slot_size, idx_rebuilt, idx_skipped);
     for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
     return 0;
 }
