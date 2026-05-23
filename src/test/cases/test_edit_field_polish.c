@@ -178,6 +178,53 @@ static int t_smart_reindex(TestClient *tc) {
    review-fix commit. Once that lands, a t_new_default_overrides sub-test
    should be added here. */
 
+/* dry_run: with `dry_run:true`, edit-field must run all validation
+   (including the per-record pre-flight scan) but write nothing —
+   neither fields.conf nor the data slot — and report
+   `dry_run:true` + `would_rebuild:bool` in the response. */
+static int t_dry_run(TestClient *tc) {
+    char *resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"polish\",\"object\":\"dryrun\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"id:varchar:16\",\"age:int\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object dryrun");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"polish\",\"object\":\"dryrun\","
+        "\"key\":\"k1\",\"value\":{\"id\":\"k1\",\"age\":7}}", &resp);
+    free(resp); resp = NULL;
+
+    /* Dry run an age:int → age:long widen. Encoding changes (4 → 8 bytes BE)
+       so would_rebuild must be true. */
+    tc_request(tc,
+        "{\"mode\":\"edit-field\",\"dir\":\"polish\",\"object\":\"dryrun\","
+        "\"fields\":[\"age:long\"],\"dry_run\":true}", &resp);
+    ASSERT_CONTAINS(resp, "\"dry_run\":true",       "dry_run flag echoed");
+    ASSERT_CONTAINS(resp, "\"would_rebuild\":true", "would_rebuild reflects encoding change");
+    free(resp); resp = NULL;
+
+    /* describe-object must still report the old type — nothing was written. */
+    tc_request(tc,
+        "{\"mode\":\"describe-object\",\"dir\":\"polish\",\"object\":\"dryrun\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"type\":\"int\"",
+                    "describe-object still shows age:int after dry_run");
+    free(resp); resp = NULL;
+
+    /* The data slot must still hold the original int-encoded value. */
+    tc_request(tc,
+        "{\"mode\":\"get\",\"dir\":\"polish\",\"object\":\"dryrun\",\"key\":\"k1\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"age\":7",
+                    "get k1 still returns age=7 (record uncorrupted)");
+    free(resp); resp = NULL;
+
+    return 0;
+}
+
 static int test_edit_field_polish_run(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
@@ -195,6 +242,7 @@ static int test_edit_field_polish_run(void) {
     t_auto_create_carryover(tc);
     t_auto_update_carryover(tc);
     t_smart_reindex(tc);
+    t_dry_run(tc);
 
     tc_close(tc);
     test_env_stop(&env);

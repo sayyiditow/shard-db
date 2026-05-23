@@ -6245,7 +6245,8 @@ static void selective_reindex_dirty(const char *db_root, const char *object,
 }
 
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int n_edits, int allow_rename) {
+                    char lines[][256], int n_edits,
+                    int allow_rename, int dry_run) {
     if (n_edits <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
         return 1;
@@ -6433,6 +6434,12 @@ int cmd_edit_fields(const char *db_root, const char *object,
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
 
     if (!needs_rebuild) {
+        if (dry_run) {
+            OUT("{\"status\":\"ok\",\"dry_run\":true,\"fields\":%d,"
+                "\"would_rebuild\":false}\n", n_edits);
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 0;
+        }
         if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
             OUT("{\"error\":\"Failed to rewrite fields.conf\"}\n");
             return 1;
@@ -6466,6 +6473,18 @@ int cmd_edit_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
             pf.fail_field, pf.fail_reason);
         return 1;
+    }
+
+    /* Dry-run short-circuit: all validation + pre-flight scan passed, but
+       the caller only wanted a preview. Don't run the rebuild, don't
+       rewrite fields.conf, don't touch indexes. Report what *would* have
+       happened so operators can preview a same-type narrow / widen before
+       committing to it. */
+    if (dry_run) {
+        OUT("{\"status\":\"ok\",\"dry_run\":true,\"fields\":%d,"
+            "\"would_rebuild\":true}\n", n_edits);
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+        return 0;
     }
 
     /* Compute the new slot_size and run the v2 rebuild. */
