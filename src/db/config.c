@@ -1082,6 +1082,74 @@ void free_enum_values(TypedField *f) {
     f->enum_width = 0;
 }
 
+/* Strip a trailing default-modifier suffix from `type_spec_inout` and set
+   the matching default_kind / default_val on `tf`. Recognised suffixes:
+       :auto_update      DK_AUTO_UPDATE  (insert + update)
+       :auto_create      DK_AUTO_CREATE  (insert only)
+       :default=<lit>    DK_LITERAL      (verbatim string)
+       :default=seq(NM)  DK_SEQ          (named sequence)
+       :default=uuid()   DK_UUID         (uuidv4 per row)
+       :default=random(N)DK_RANDOM       (N random bytes, hex-encoded)
+   On match the suffix is replaced with a NUL so the caller can pass the
+   cleaned spec to parse_field_type. Returns 1 if a modifier was stripped,
+   0 otherwise. Safe to call on a spec with no modifier — leaves the spec
+   untouched and tf->default_kind unchanged.
+
+   Centralises the parse rules that used to live inline inside
+   load_typed_schema (config.c) — and were therefore skipped by
+   cmd_add_fields / cmd_edit_fields, which called parse_field_type
+   directly and rejected every :default=... spec.
+
+   IMPORTANT: this function does NOT initialise tf->default_kind or
+   tf->default_val on entry; on a no-modifier call it leaves them
+   alone. Callers that want a guaranteed clean slate should zero those
+   fields before invoking. */
+int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
+    if (!type_spec_inout || !tf) return 0;
+    char *dflt;
+    if ((dflt = strstr(type_spec_inout, ":auto_update")) != NULL &&
+        dflt[12] == '\0') {
+        tf->default_kind = DK_AUTO_UPDATE;
+        *dflt = '\0';
+        return 1;
+    }
+    if ((dflt = strstr(type_spec_inout, ":auto_create")) != NULL &&
+        dflt[12] == '\0') {
+        tf->default_kind = DK_AUTO_CREATE;
+        *dflt = '\0';
+        return 1;
+    }
+    if ((dflt = strstr(type_spec_inout, ":default=")) != NULL) {
+        const char *dval = dflt + 9;
+        if (strncmp(dval, "seq(", 4) == 0 && strchr(dval, ')')) {
+            tf->default_kind = DK_SEQ;
+            const char *ns = dval + 4;
+            const char *ne = strchr(ns, ')');
+            size_t nl = (size_t)(ne - ns);
+            if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
+            memcpy(tf->default_val, ns, nl);
+            tf->default_val[nl] = '\0';
+        } else if (strcmp(dval, "uuid()") == 0) {
+            tf->default_kind = DK_UUID;
+        } else if (strncmp(dval, "random(", 7) == 0 && strchr(dval, ')')) {
+            tf->default_kind = DK_RANDOM;
+            const char *ns = dval + 7;
+            const char *ne = strchr(ns, ')');
+            size_t nl = (size_t)(ne - ns);
+            if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
+            memcpy(tf->default_val, ns, nl);
+            tf->default_val[nl] = '\0';
+        } else {
+            tf->default_kind = DK_LITERAL;
+            strncpy(tf->default_val, dval, sizeof(tf->default_val) - 1);
+            tf->default_val[sizeof(tf->default_val) - 1] = '\0';
+        }
+        *dflt = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 void parse_field_type(const char *spec, TypedField *f) {
     /* Defensive cleanup — if the same TypedField is re-parsed in place,
        drop the old enum value list before overwriting. */
@@ -1305,43 +1373,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         /* Default modifiers — strip from type_spec before parse_field_type.
            Format: :auto_create, :auto_update, :default=<val>
            These are always the last colon-segment (before :removed). */
-        char *dflt;
-        if ((dflt = strstr(type_spec, ":auto_update")) != NULL &&
-            dflt[12] == '\0') {
-            tf->default_kind = DK_AUTO_UPDATE;
-            *dflt = '\0';
-        } else if ((dflt = strstr(type_spec, ":auto_create")) != NULL &&
-                   dflt[12] == '\0') {
-            tf->default_kind = DK_AUTO_CREATE;
-            *dflt = '\0';
-        } else if ((dflt = strstr(type_spec, ":default=")) != NULL) {
-            const char *dval = dflt + 9;
-            if (strncmp(dval, "seq(", 4) == 0 && strchr(dval, ')')) {
-                tf->default_kind = DK_SEQ;
-                /* Extract seq name from seq(name) */
-                const char *ns = dval + 4;
-                const char *ne = strchr(ns, ')');
-                size_t nl = ne - ns;
-                if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
-                memcpy(tf->default_val, ns, nl);
-                tf->default_val[nl] = '\0';
-            } else if (strcmp(dval, "uuid()") == 0) {
-                tf->default_kind = DK_UUID;
-            } else if (strncmp(dval, "random(", 7) == 0 && strchr(dval, ')')) {
-                tf->default_kind = DK_RANDOM;
-                const char *ns = dval + 7;
-                const char *ne = strchr(ns, ')');
-                size_t nl = ne - ns;
-                if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
-                memcpy(tf->default_val, ns, nl);
-                tf->default_val[nl] = '\0';
-            } else {
-                tf->default_kind = DK_LITERAL;
-                strncpy(tf->default_val, dval, sizeof(tf->default_val) - 1);
-                tf->default_val[sizeof(tf->default_val) - 1] = '\0';
-            }
-            *dflt = '\0';
-        }
+        parse_default_modifier(type_spec, tf);
 
         parse_field_type(type_spec, tf);
         if (tf->type == FT_NONE || tf->size <= 0) continue;
@@ -2953,13 +2985,41 @@ int cmd_add_fields(const char *db_root, const char *object,
                 return 1;
             }
         }
-        /* Type parseability — use a throwaway TypedField */
+        /* Type parseability — use a throwaway TypedField. parse_default_modifier
+           strips any trailing :default=... / :auto_* suffix so parse_field_type
+           sees a clean spec ("int", "varchar:32", etc.) and the default kind
+           is captured on tf for the backfill pass (see rebuild_object_v2). */
         TypedField tf;
         memset(&tf, 0, sizeof(tf));
-        parse_field_type(colon + 1, &tf);
+        char clean_spec[256];
+        strncpy(clean_spec, colon + 1, sizeof(clean_spec) - 1);
+        clean_spec[sizeof(clean_spec) - 1] = '\0';
+        parse_default_modifier(clean_spec, &tf);
+        parse_field_type(clean_spec, &tf);
         if (tf.type == FT_NONE || tf.size <= 0) {
             OUT("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
             return 1;
+        }
+        /* Pre-flight: refuse random(N) with hex output that exceeds the
+           field's storage. random(N) generates 2*N hex chars; for varchar
+           the on-disk content cap is f->size - 2. For other types the
+           encoded representation is rendered through encode_field which
+           takes a string — best-effort is to refuse if the raw hex won't
+           fit a varchar. Non-varchar destinations are caller error. */
+        if (tf.default_kind == DK_RANDOM) {
+            int n_bytes = atoi(tf.default_val);
+            int hex_chars = n_bytes * 2;
+            if (tf.type == FT_VARCHAR) {
+                int cap = tf.size - 2;  /* uint16 length prefix */
+                if (n_bytes <= 0 || hex_chars > cap) {
+                    OUT("{\"error\":\"random(%d) produces %d hex chars but field [%s] holds only %d\"}\n",
+                        n_bytes, hex_chars, name, cap);
+                    return 1;
+                }
+            } else if (n_bytes <= 0) {
+                OUT("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
+                return 1;
+            }
         }
     }
 

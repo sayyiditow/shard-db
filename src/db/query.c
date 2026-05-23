@@ -5235,8 +5235,17 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
     return update_schema_conf_splits_streams(db_root, object, new_splits, 0);
 }
 
-/* Parse a single fields.conf-style line "name:type[:param]" into a TypedField.
-   Returns 1 on success, 0 on failure (bad line). Does NOT set offset. */
+/* Defined in config.c — see header doc-comment there. Declared locally
+   because config.c's helpers live across the layering boundary and the
+   project's convention is to forward-declare at the point of use rather
+   than introduce a cross-cutting header for two functions. */
+extern int parse_default_modifier(char *type_spec_inout, TypedField *tf);
+
+/* Parse a single fields.conf-style line "name:type[:param][:default=...]"
+   into a TypedField. Returns 1 on success, 0 on failure (bad line). Does
+   NOT set offset. Default-modifier suffix is captured on out->default_kind
+   / default_val so both add-field's rebuild append and edit-field carry
+   the new default through end-to-end. */
 static int parse_field_line(const char *line, TypedField *out) {
     const char *colon = strchr(line, ':');
     if (!colon || colon == line) return 0;
@@ -5244,7 +5253,16 @@ static int parse_field_line(const char *line, TypedField *out) {
     if (nlen >= 256) nlen = 255;
     memcpy(out->name, line, nlen);
     out->name[nlen] = '\0';
-    parse_field_type(colon + 1, out);
+    /* Strip default-modifier suffix into out->default_kind/default_val so
+       both add-field's rebuild append AND edit-field carry computed
+       defaults through end-to-end. Without this, parse_field_type would
+       see "int:default=99" and return FT_NONE (no exact-match), making
+       cmd_edit_fields reject every :default= edit. */
+    char clean_spec[256];
+    strncpy(clean_spec, colon + 1, sizeof(clean_spec) - 1);
+    clean_spec[sizeof(clean_spec) - 1] = '\0';
+    parse_default_modifier(clean_spec, out);
+    parse_field_type(clean_spec, out);
     return out->type != FT_NONE && out->size > 0;
 }
 
@@ -6401,12 +6419,16 @@ int cmd_edit_fields(const char *db_root, const char *object,
             new_ts.fields[i].enum_values    = parsed[edit_for_i].enum_values;
             new_ts.fields[i].n_enum_values  = parsed[edit_for_i].n_enum_values;
             new_ts.fields[i].enum_width     = parsed[edit_for_i].enum_width;
-            /* default_kind / default_val: re-parse from the spec — but
-               parse_field_line via parse_field_type doesn't currently
-               carry defaults through (those are parsed by load_typed_schema's
-               extended parsing). Leave the existing default modifier intact
-               unless the on-disk fields.conf rewrite changes it — which it
-               will, by replacing the whole line. */
+            /* default_kind / default_val: as of PR #66 parse_field_line
+               strips the default-modifier suffix into parsed[].default_kind
+               / default_val, so we can carry the edit's new default through
+               into the in-memory new_ts. The on-disk fields.conf rewrite
+               replaces the whole line below, so load_typed_schema will
+               re-read the same default on the next request. */
+            new_ts.fields[i].default_kind = parsed[edit_for_i].default_kind;
+            memcpy(new_ts.fields[i].default_val,
+                   parsed[edit_for_i].default_val,
+                   sizeof(new_ts.fields[i].default_val));
         }
         new_ts.fields[i].offset = noff;
         noff += new_ts.fields[i].size;
