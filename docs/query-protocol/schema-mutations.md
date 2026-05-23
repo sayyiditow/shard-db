@@ -200,21 +200,31 @@ CLI shortcut (single-field — JSON form covers batch):
 6. Otherwise **pre-flight scan**: walks every live record across all keyfile shards and verifies each edited field's value fits the new shape. First violation aborts with `{"error":"Pre-flight failed on field [<name>]: <reason>"}` — no data or schema change.
 7. **Rebuild**: runs the same v2 rebuild path used by `add-field` / `vacuum --compact`, but with `transform_field_value()` re-encoding the edited fields per record. Atomic — the legacy data tree is preserved until the rebuild succeeds.
 8. Rewrites `fields.conf` to lock in the new spec.
-9. Wipes and rebuilds every index in `index.conf` — affected indexes have stale leaf bytes, and v1 of the feature rebuilds all of them for simplicity (acceptable: optimise to "only affected" later if it becomes a hot path).
+9. **Smart reindex**: walks `index.conf` and only rebuilds indexes whose referenced fields actually changed encoding. Indexes referencing untouched fields are skipped — the response carries `indexes_skipped:N` alongside `indexes_rebuilt:N` so operators can verify.
 10. Releases the write lock.
 
 ### Response
 
 ```json
-{"status":"edited","fields":N,"rebuilt":true,"slot_size":N,"indexes_rebuilt":N}
+{"status":"edited","fields":N,"rebuilt":true,"slot_size":N,"indexes_rebuilt":R,"indexes_skipped":S}
 ```
 
 No-op fast path returns `{"status":"edited","fields":N,"rebuilt":false}` — fields.conf updated but no data rebuild ran.
 
+### dry_run
+
+Pass `"dry_run":true` to run every validation step (cross-type refusal, FT_ENUM prefix check, per-record varchar overflow + integer narrowing pre-flight) without writing anything.
+
+```json
+{"status":"ok","dry_run":true,"fields":N,"would_rebuild":true}
+```
+
+`would_rebuild:false` means every edit is encoding-equivalent — the change would only touch `fields.conf` (e.g. carrying through a new default modifier on an unchanged type). Useful before running a same-type narrow on a large object.
+
 ### Notes
 
-- **Default modifiers**: if the new spec includes a different `:default=...` / `:auto_create` / `:auto_update`, that affects future inserts only — existing records keep their stored values.
-- **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field still rebuilds the index (the on-disk leaf bytes change). Queries on the indexed field continue to resolve to the same records post-edit.
+- **Default modifier carry-through**: when a new edit spec OMITS `:default=...` / `:auto_create` / `:auto_update`, the modifier from the OLD `fields.conf` line is preserved. `edit-field age:long` against an existing `age:int:default=42` keeps `:default=42`. Today there is no way to *change* a default via `edit-field` because the upstream field-line parser rejects spec strings carrying defaults — pair `add-field` + `remove-field` to swap a default.
+- **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field rebuilds only that index (smart reindex). Queries on the indexed field continue to resolve to the same records post-edit.
 - Full object rebuild — scales with object size, not slot count. Not instantaneous on millions of records. Holds the wrlock for the duration.
 
 ## rename-field
