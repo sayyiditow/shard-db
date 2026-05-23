@@ -4,6 +4,34 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.05.7.1
+
+Patch release on the 2026.05.7 line. Headline is a **critical correctness fix in `cmd_find`** that returned `[]` non-deterministically on indexed queries served by a busy daemon. Bundled with **edit-field polish**, **add-field computed-defaults backfill**, and **startup warmup**.
+
+Wire format and on-disk format unchanged. No `./migrate` required.
+
+### Bug fixes
+
+- **`cmd_find` stale `g_out` on reused pool workers (#64).** `stream_find_cb` and `cursor_find_cb` wrote to the thread-local `g_out` left in the worker by a previous request, so OUT() reached a closed fd and the current client got `[]` even though records matched. Non-deterministic — fresh workers worked; reused workers silently dropped output. Forced `g_out = sc->parent_out` unconditionally at every callback entry. `CursorFindCtx` gains a `parent_out` field. Surfaced via the HN explorer at 789K rows.
+- **`FT_TIMESTAMP` missing from `compile_one` switch (#64).** Every typed kind had a case except FT_TIMESTAMP (added in 2026.05.6). `cc->i1` stayed at the memset-zero default → `time eq X` matched 0 rows, `time gte X` matched ALL rows (filter silently ignored), AND-intersect with a timestamp sibling collapsed to 0. `count` was unaffected because it goes through `encode_criterion_value` (config.c) which DID handle FT_TIMESTAMP. Anything that runs `criteria_match_tree` (find, aggregate post-filter, AND-intersect) was wrong. Fixed by adding `case FT_TIMESTAMP:` next to `case FT_LONG:` (same int64 BE encoding) in both the scalar and IN-list switches.
+- **`add-field` slot-write latent bug (#67).** When the new field happened to fit within 8-byte slot-size padding, `slot_changed` was 0 and the rebuild walk took the verbatim re-insert path that wrote only the OLD value length — the new field bytes were silently never written for existing records. Now `slot_changed = (size changed) || (n_added > 0)`. Existing `add-field` benches in the slot-padding regime measured "add-field that silently skipped writing the new field"; re-bench.
+- **macOS build fix for warmup (#69).** `posix_fadvise` is Linux-only; gated behind `#ifdef __linux__`. The explicit 4 KB `read(2)` after the fadvise is what actually pages the file in, so the macOS path keeps the synchronous priming intact and just skips the async read-ahead hint.
+
+### Features
+
+- **`edit-field` polish (#65).** Default-modifier carry-through: omitting `:default=…` / `:auto_create` / `:auto_update` preserves the modifier from the old `fields.conf` line. Smart reindex: only rebuilds indexes whose referenced fields actually changed encoding (response carries `indexes_rebuilt` + `indexes_skipped`). `dry_run` flag: validation + pre-flight scan with no writes, returns `{"status":"ok","dry_run":true,"would_rebuild":bool}`.
+- **`add-field` computed-defaults backfill (#67).** Parser now accepts `:default=<literal>` / `:default=seq(<name>)` / `:default=uuid()` / `:default=random(N)` on both `add-field` and `edit-field` (was rejecting most spec forms outright). Backfill during rebuild: literal stamped on every existing record; seq pre-reserves a range and assigns sequentially; uuid generates UUIDv4 per record; random reads `getrandom` bytes per record. `:auto_create` / `:auto_update` are inert during backfill (they only fire at insert/update). Also closes the documented "no way to *change* a default via edit-field" gap from #65 — same parser fix applies to both code paths.
+- **Startup warmup (#68).** New env knob `WARMUP=async|sync|off` (default `async`). On startup, a detached thread walks every `(dir, object)` and primes the OS page cache for every `.kf` + `.idx` + `.bm` + `.tg` file. Stream segment files (`.dat`) are deliberately NOT warmed — they can be GBs each and warming them all would evict the smaller, hotter index pages. Restart-while-explorer-running goes from ~15 s cold-render to instant.
+
+### Tests
+
+- `test_find_timestamp_criteria` (new, 31 assertions) — covers FT_TIMESTAMP scalar + IN + AND-intersect + count parity.
+- `test_edit_field_polish` (new, 26 assertions) — default carryover, auto_create / auto_update carryover, smart reindex, dry_run.
+- `test_add_field_computed_defaults` (new, 34 assertions) — DK_LITERAL / DK_SEQ / DK_UUID / DK_RANDOM backfill + edit-field default change + random-too-big rejection.
+- `test_auto_key_multi` (new, 29 assertions) — regression coverage for `parse_multi_key` on `auto_key=uuid|seq` objects (#66).
+
+Full suite: **3603 / 3603 across 89 cases.**
+
 ## 2026.05.7
 
 Feature release bundling **three new index types**, a **bounded query concurrency cap**, a **filter-first planner for `find + order_by`** (194× wins on zero-match selective queries surfaced by real-app testing), and a **CPD-driven dedup sweep**.
