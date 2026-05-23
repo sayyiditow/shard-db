@@ -5240,6 +5240,10 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
    project's convention is to forward-declare at the point of use rather
    than introduce a cross-cutting header for two functions. */
 extern int parse_default_modifier(char *type_spec_inout, TypedField *tf);
+extern void gen_uuid4_raw(uint8_t out[16]);
+extern long long seq_next_val_batch(const char *db_root, const char *object,
+                                     const char *seq_name, int n);
+extern void encode_field(const TypedField *f, const char *val, uint8_t *out);
 
 /* Parse a single fields.conf-style line "name:type[:param][:default=...]"
    into a TypedField. Returns 1 on success, 0 on failure (bad line). Does
@@ -5280,6 +5284,23 @@ static int parse_field_line(const char *line, TypedField *out) {
  * new. fields.conf and schema.conf rewrites mirror v1. .legacy/ is
  * removed on success; on crash mid-rebuild the operator restores
  * the .legacy contents back into the object root. */
+/* Per-new-field backfill state for the rebuild walk. Only populated for
+   fields with new_to_old==-1 AND default_kind not in {DK_NONE, DK_AUTO_*}.
+   DK_AUTO_CREATE / DK_AUTO_UPDATE stay inert during backfill — they're
+   insert/update-time generators, not "stamp on every existing record"
+   semantics. (Existing records' creation time is unknown; setting it to
+   "now" would lie about history.) */
+typedef struct {
+    int kind;              /* DK_LITERAL / DK_SEQ / DK_UUID / DK_RANDOM */
+    /* DK_SEQ pre-allocated range [seq_start, seq_start+seq_count-1].
+       Walk worker atomically claims via fetch_add on seq_next. */
+    _Atomic int64_t seq_next;
+    int64_t         seq_start;
+    int64_t         seq_count;
+    /* DK_RANDOM byte count (parsed from default_val once up-front). */
+    int random_bytes;
+} BackfillSpec;
+
 typedef struct {
     SlotcaskDb        *new_db;
     const TypedSchema *old_ts;
@@ -5288,6 +5309,11 @@ typedef struct {
     int                slot_changed;
     int                live_count;
     int                error;
+    /* Per-new-field backfill state; indexed by new_ts field index.
+       Entries for fields that don't need backfill have kind=DK_NONE. */
+    BackfillSpec      *backfill;     /* malloc'd in rebuild_object_v2; size = new_ts->nfields */
+    const char        *db_root;       /* for seq_next_val_batch (DK_SEQ pre-reserve) */
+    const char        *object;
 } V2RebuildCtx;
 
 /* Re-encode one field's bytes from old size/scale to new. Same-type only;
@@ -5421,19 +5447,94 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
 
     /* Slot layout changed (compact, add-field, edit-field, or any combo):
        recompose typed payload by mapping new field offsets ← old field
-       offsets. New fields (new_to_old == -1) stay zero from calloc. Edited
-       fields (size or numeric scale changed) go through transform_field_value;
+       offsets. New fields (new_to_old == -1) get backfilled from
+       ctx->backfill[k] when default_kind is set; otherwise they stay
+       zero (matches the historical behaviour). Edited fields (size or
+       numeric scale changed) go through transform_field_value;
        same-shape fields take the fast memcpy path. */
     uint8_t *buf = calloc(1, ctx->new_ts->total_size);
     if (!buf) { ctx->error = 1; return 1; }
     for (int k = 0; k < ctx->new_ts->nfields; k++) {
         int oi = ctx->new_to_old[k];
-        if (oi < 0) continue;
+        const TypedField *nf = &ctx->new_ts->fields[k];
+        if (oi < 0) {
+            /* Newly-added field — apply computed default if any.
+               DK_AUTO_CREATE / DK_AUTO_UPDATE stay zero by design: they're
+               insert/update-time generators, not backfill stamps. The
+               original record's creation time is unknown so backfilling
+               "now" would lie. Same reasoning for explicit DK_NONE. */
+            BackfillSpec *bf = ctx->backfill ? &ctx->backfill[k] : NULL;
+            if (!bf || bf->kind == DK_NONE) continue;
+            switch (bf->kind) {
+            case DK_LITERAL:
+                /* Re-use the insert-time encoder so the literal goes
+                   through the same type-aware path (varchar length
+                   prefix, int BE, numeric scaling, etc.). */
+                encode_field(nf, nf->default_val, buf + nf->offset);
+                break;
+            case DK_SEQ: {
+                int64_t v = atomic_fetch_add_explicit(&bf->seq_next, 1,
+                                                       memory_order_relaxed);
+                /* Render to decimal then run through encode_field so the
+                   bytes match what an insert-time DK_SEQ generates
+                   (consistency between backfilled and freshly-inserted
+                   rows). */
+                char numbuf[24];
+                snprintf(numbuf, sizeof(numbuf), "%lld", (long long)v);
+                encode_field(nf, numbuf, buf + nf->offset);
+                break;
+            }
+            case DK_UUID: {
+                uint8_t raw[16];
+                gen_uuid4_raw(raw);
+                if (nf->type == FT_UUID && nf->size == 16) {
+                    /* Native uuid type: store raw 16 bytes. */
+                    memcpy(buf + nf->offset, raw, 16);
+                } else {
+                    /* varchar:36 (or wider) — render as dashed 36-char
+                       string and run through encode_field so the
+                       uint16 length prefix is set. */
+                    char uuidstr[37];
+                    snprintf(uuidstr, sizeof(uuidstr),
+                             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                             raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+                             raw[12], raw[13], raw[14], raw[15]);
+                    encode_field(nf, uuidstr, buf + nf->offset);
+                }
+                break;
+            }
+            case DK_RANDOM: {
+                /* N raw bytes → 2N hex chars. The pre-flight check in
+                   cmd_add_fields already refused a config that would
+                   overflow the field's storage. */
+                int nbytes = bf->random_bytes;
+                if (nbytes <= 0 || nbytes > 256) break; /* defensive */
+                uint8_t raw[256];
+                FILE *rf = fopen("/dev/urandom", "r");
+                if (!rf) break;
+                if ((int)fread(raw, 1, (size_t)nbytes, rf) != nbytes) {
+                    fclose(rf);
+                    break;
+                }
+                fclose(rf);
+                char hexbuf[513];
+                for (int b = 0; b < nbytes; b++)
+                    snprintf(hexbuf + b * 2, 3, "%02x", raw[b]);
+                hexbuf[nbytes * 2] = '\0';
+                encode_field(nf, hexbuf, buf + nf->offset);
+                break;
+            }
+            default:
+                /* DK_AUTO_CREATE / DK_AUTO_UPDATE / DK_NONE — leave zero. */
+                break;
+            }
+            continue;
+        }
         size_t off = ctx->old_ts->fields[oi].offset;
         size_t sz  = ctx->old_ts->fields[oi].size;
         if (off + sz > vlen) continue;  /* defensive */
         const TypedField *of = &ctx->old_ts->fields[oi];
-        const TypedField *nf = &ctx->new_ts->fields[k];
         if (field_needs_transform(of, nf)) {
             transform_field_value(of, nf,
                                    (const uint8_t *)value + off,
@@ -5528,9 +5629,56 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     walk_ctx.new_ts        = new_ts;
     walk_ctx.new_to_old    = new_to_old;
     walk_ctx.slot_changed  = slot_changed;
+    walk_ctx.db_root       = db_root;
+    walk_ctx.object        = object;
+
+    /* Pre-flight an existing live count so DK_SEQ ranges can be reserved
+       up-front (one flock per field rather than per record). The walk
+       below is sequential so this count is exact at walk time. */
+    long long pf_live = 0;
+    if (slot_changed) {
+        uint64_t pf_total = 0, pf_deleted = 0;
+        if (slotcask_sum_kf_totals(&legacy_db, &pf_total, &pf_deleted) == 0) {
+            pf_live = (long long)(pf_total - pf_deleted);
+        }
+    }
+
+    /* Allocate per-new-field backfill specs. Only fields with new_to_old==-1
+       AND a computed default kind need anything; the rest stay DK_NONE. */
+    walk_ctx.backfill = NULL;
+    if (slot_changed && new_ts->nfields > 0) {
+        walk_ctx.backfill = (BackfillSpec *)calloc((size_t)new_ts->nfields,
+                                                    sizeof(BackfillSpec));
+        if (!walk_ctx.backfill) {
+            slotcask_close(&legacy_db);
+            slotcask_close(&new_db);
+            OUT("{\"error\":\"Failed to allocate backfill state\"}\n");
+            return 1;
+        }
+        for (int k = 0; k < new_ts->nfields; k++) {
+            if (new_to_old[k] != -1) continue;  /* not a new field */
+            const TypedField *nf = &new_ts->fields[k];
+            walk_ctx.backfill[k].kind = nf->default_kind;
+            if (nf->default_kind == DK_SEQ && pf_live > 0) {
+                long long start = seq_next_val_batch(db_root, object,
+                                                      nf->default_val,
+                                                      (int)pf_live);
+                if (start < 0) start = 1;
+                walk_ctx.backfill[k].seq_start = start;
+                walk_ctx.backfill[k].seq_count = pf_live;
+                atomic_store_explicit(&walk_ctx.backfill[k].seq_next,
+                                       start, memory_order_relaxed);
+            } else if (nf->default_kind == DK_RANDOM) {
+                walk_ctx.backfill[k].random_bytes = atoi(nf->default_val);
+            }
+        }
+    }
+
     slotcask_walk_live(&legacy_db, v2_rebuild_walk_cb, &walk_ctx);
     int live_count = walk_ctx.live_count;
     int walk_err   = walk_ctx.error;
+    free(walk_ctx.backfill);
+    walk_ctx.backfill = NULL;
 
     slotcask_close(&legacy_db);
     slotcask_close(&new_db);
@@ -5694,7 +5842,13 @@ int rebuild_object(const char *db_root, const char *object,
     new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
     if (new_sch.slot_size < 32) new_sch.slot_size = 32;
 
-    int slot_changed = (new_sch.slot_size != old_sch.slot_size);
+    /* slot_changed drives v2_rebuild_walk_cb's "recompose typed payload"
+       branch vs. the fast "verbatim re-insert" branch. Any add-field call
+       must force the recompose path even when the new fields happen to
+       fit within the existing 8-byte-aligned slot_size — without that,
+       the new fields are never written (verbatim re-insert truncates at
+       the old vlen) AND computed defaults are never stamped. */
+    int slot_changed = (new_sch.slot_size != old_sch.slot_size) || (n_added > 0);
 
     /* Nothing to do — caller probably called rebuild without flags */
     if (!splits_changed && !slot_changed && !streams_changed && n_added == 0) {
