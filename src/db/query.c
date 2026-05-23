@@ -7782,6 +7782,7 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
     /* Type-specific parsing of scalar rvalue */
     switch (cc->ftype) {
     case FT_LONG:
+    case FT_TIMESTAMP:   /* Unix epoch ms — same int64 BE encoding as FT_LONG. */
     case FT_INT:
     case FT_SHORT:
         cc->i1 = (int64_t)strtoll(c->value, NULL, 10);
@@ -7909,7 +7910,7 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
     if ((cc->op == OP_IN || cc->op == OP_NOT_IN) && c->in_count > 0) {
         cc->in_count = c->in_count;
         switch (cc->ftype) {
-        case FT_LONG: case FT_INT: case FT_SHORT:
+        case FT_LONG: case FT_TIMESTAMP: case FT_INT: case FT_SHORT:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)strtoll(c->in_values[i], NULL, 10);
