@@ -1530,73 +1530,15 @@ static void *bulk_insert_shard_worker(void *arg) {
 /* Internal: bulk insert from a json string already in memory (no file I/O) */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str, int if_not_exists);
 
-int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
-                    int if_not_exists) {
+/* ---- bulk_ins_run: shared parser + write body --------------------------
+   Caller owns `data` (null-terminated, len bytes). This helper never
+   frees or munmaps it — all cleanup of the buffer belongs to the caller.
+   Returns 0 on success, 1 on parse/insert error (JSON error already
+   written via OUT() before returning). */
+static int bulk_ins_run(const char *db_root, const char *object,
+                        const char *data, size_t len, int if_not_exists) {
+    const char *json = data;
     uint64_t t0 = now_ms_coarse();
-    size_t len;
-    char *json;
-    int json_mmaped = 0;
-    if (input) {
-        /* mmap the file instead of malloc — OS pages in/out as we scan */
-        int ifd = open(input, O_RDONLY);
-        if (ifd < 0) { fprintf(stderr, "Error: Cannot open %s\n", input); return 1; }
-        struct stat st;
-        if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
-        len = st.st_size;
-        if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
-        /* MAP_PRIVATE on a file fd lets us write the trailing NUL into
-           the partial last page (zero-filled slack, copy-on-write). But
-           if `len` is *exactly* page-aligned, there is no partial last
-           page — byte [len] lives on a NEW page that the kernel does
-           NOT back. Writing there SIGBUSes. Skip the mmap path in that
-           case and fall through to alloc+read, which owns its memory.
-           Reproduced via ASan when a 5000-row bulk-insert chunk landed
-           on exactly 0x86000 bytes (548 KB) after schema-shrink. */
-        long pgsize_l = sysconf(_SC_PAGESIZE);
-        size_t pgsize = (pgsize_l > 0) ? (size_t)pgsize_l : 4096;
-        int try_mmap = (len % pgsize) != 0;
-        json = try_mmap
-            ? mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0)
-            : MAP_FAILED;
-        if (json == MAP_FAILED) {
-            /* Fallback: allocate and read */
-            json = malloc(len + 1);
-            if (!json) { close(ifd); fprintf(stderr, "Error: Cannot allocate\n"); return 1; }
-            lseek(ifd, 0, SEEK_SET);
-            size_t rd = 0;
-            while (rd < len) {
-                ssize_t n = read(ifd, json + rd, len - rd);
-                if (n <= 0) break;
-                rd += n;
-            }
-            json[len] = '\0';
-        } else {
-            json_mmaped = 1;
-            madvise(json, len, MADV_SEQUENTIAL);
-            /* Null-terminate — MAP_PRIVATE so write is COW on last page only */
-            json[len] = '\0';
-        }
-        close(ifd);
-    } else {
-        size_t cap = 65536, pos = 0;
-        json = malloc(cap);
-        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
-        int c;
-        while ((c = fgetc(stdin)) != EOF) {
-            if (pos >= cap - 1) {
-                cap *= 2;
-                char *t = xrealloc_or_free(json, cap);
-                if (!t) { json = NULL; break; }
-                json = t;
-            }
-            json[pos++] = c;
-        }
-        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
-        json[pos] = '\0'; len = pos;
-    }
-    /* json is non-NULL on all paths reaching here: the file branch (988-1015)
-       returns early on every alloc failure; the stdin branch (1016-1032)
-       returns at the initial-malloc and post-realloc NULL guards. */
 
     /* Load config ONCE */
     Schema sc = load_schema(db_root, object);
@@ -1612,7 +1554,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     if (ts && ts->total_size > sc.max_value) {
         fprintf(stderr, "Error: typed record size %d exceeds max_value %d\n",
                 ts->total_size, sc.max_value);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         return 1;
     }
 
@@ -1666,7 +1607,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     if (!is_object_format && !is_array_format) {
         fprintf(stderr, "Error: Expected JSON object or array\n");
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
         return 1;
@@ -1887,7 +1827,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
             validation_failed_idx);
         return 1;
@@ -1942,7 +1881,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"query_timeout\"}\n");
         return 1;
     }
@@ -1959,7 +1897,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"oom: bulk_insert shard_counts\"}\n");
         return 1;
     }
@@ -2000,7 +1937,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"oom: bulk_insert workers\"}\n");
         return 1;
     }
@@ -2119,8 +2055,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     /* ucache keeps mmaps open — OS flushes dirty pages */
-    if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
-    else free(json);
+    /* (caller owns the json buffer — no free/munmap here) */
 
     /* Bulk write indexes — one worker per field; the worker streams the per-
        shard merges sequentially. Halves dispatch overhead vs the old
@@ -2190,49 +2125,80 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     return errors > 0 ? 1 : 0;
 }
 
-/* Bulk insert from a string already in memory — no temp file needed.
-   On Linux the fast path uses memfd_create + /proc/self/fd/N so the
-   downstream mmap reader is page-cache only with no real filesystem
-   round-trip. macOS has neither memfd_create nor /proc/self/fd/N, so
-   it takes the /tmp fallback unconditionally (same code path that
-   already handles memfd_create failure on Linux). */
+int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
+                    int if_not_exists) {
+    size_t len;
+    char *json;
+    int json_mmaped = 0;
+    if (input) {
+        /* mmap the file instead of malloc — OS pages in/out as we scan */
+        int ifd = open(input, O_RDONLY);
+        if (ifd < 0) { fprintf(stderr, "Error: Cannot open %s\n", input); return 1; }
+        struct stat st;
+        if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
+        len = st.st_size;
+        if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
+        /* MAP_PRIVATE on a file fd lets us write the trailing NUL into
+           the partial last page (zero-filled slack, copy-on-write). But
+           if `len` is *exactly* page-aligned, there is no partial last
+           page — byte [len] lives on a NEW page that the kernel does
+           NOT back. Writing there SIGBUSes. Skip the mmap path in that
+           case and fall through to alloc+read, which owns its memory.
+           Reproduced via ASan when a 5000-row bulk-insert chunk landed
+           on exactly 0x86000 bytes (548 KB) after schema-shrink. */
+        long pgsize_l = sysconf(_SC_PAGESIZE);
+        size_t pgsize = (pgsize_l > 0) ? (size_t)pgsize_l : 4096;
+        int try_mmap = (len % pgsize) != 0;
+        json = try_mmap
+            ? mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0)
+            : MAP_FAILED;
+        if (json == MAP_FAILED) {
+            /* Fallback: allocate and read */
+            json = malloc(len + 1);
+            if (!json) { close(ifd); fprintf(stderr, "Error: Cannot allocate\n"); return 1; }
+            lseek(ifd, 0, SEEK_SET);
+            size_t rd = 0;
+            while (rd < len) {
+                ssize_t n = read(ifd, json + rd, len - rd);
+                if (n <= 0) break;
+                rd += n;
+            }
+            json[len] = '\0';
+        } else {
+            json_mmaped = 1;
+            madvise(json, len, MADV_SEQUENTIAL);
+            /* Null-terminate — MAP_PRIVATE so write is COW on last page only */
+            json[len] = '\0';
+        }
+        close(ifd);
+    } else {
+        size_t cap = 65536, pos = 0;
+        json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
+        int c;
+        while ((c = fgetc(stdin)) != EOF) {
+            if (pos >= cap - 1) {
+                cap *= 2;
+                char *t = xrealloc_or_free(json, cap);
+                if (!t) { json = NULL; break; }
+                json = t;
+            }
+            json[pos++] = c;
+        }
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
+        json[pos] = '\0'; len = pos;
+    }
+
+    int rc = bulk_ins_run(db_root, object, json, len, if_not_exists);
+    if (json_mmaped) munmap(json, len + 1); else free(json);
+    return rc;
+}
+
+/* Bulk insert from a string already in memory — calls bulk_ins_run directly,
+   no memfd/mmap dance needed. */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str,
                            int if_not_exists) {
-    size_t slen = strlen(json_str);
-#ifdef __linux__
-    int memfd = memfd_create("shard-db_bulk", 0);
-#else
-    int memfd = -1;  /* macOS / non-Linux: skip straight to /tmp fallback */
-#endif
-    if (memfd < 0) {
-        /* Fallback: temp file. Also the macOS path. */
-        char tmp[PATH_MAX];
-        snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bulk_%d_%d.json", getpid(), (int)pthread_self());
-        FILE *tf = fopen(tmp, "w");
-        if (tf) { fwrite(json_str, 1, slen, tf); fclose(tf); }
-        int r = cmd_bulk_insert(db_root, object, tmp, if_not_exists);
-        unlink(tmp);
-        return r;
-    }
-    /* Coverity CID 1693846: check ftruncate + write returns. Silent
-       failure here would feed an empty file to cmd_bulk_insert and
-       silently process zero records. */
-    if (ftruncate(memfd, (off_t)slen) < 0) {
-        close(memfd);
-        OUT("{\"error\":\"memfd ftruncate failed: %s\"}\n", strerror(errno));
-        return 1;
-    }
-    ssize_t wrote = write(memfd, json_str, slen);
-    if (wrote != (ssize_t)slen) {
-        close(memfd);
-        OUT("{\"error\":\"memfd short write: %zd of %zu\"}\n", wrote, slen);
-        return 1;
-    }
-    char fdpath[64];
-    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", memfd);
-    int r = cmd_bulk_insert(db_root, object, fdpath, if_not_exists);
-    close(memfd);
-    return r;
+    return bulk_ins_run(db_root, object, json_str, strlen(json_str), if_not_exists);
 }
 
 /* ========== BULK INSERT (DELIMITED TEXT FILE) ========== */
