@@ -647,7 +647,7 @@ int dirs_add(const char *db_root, const char *dir) {
     char dir_path[PATH_MAX];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dir);
     if (mkdir(dir_path, 0755) != 0 && errno != EEXIST)
-        log_msg(1, "add_dir: mkdir(%s): %s", dir_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "add_dir: mkdir(%s): %s", dir_path, strerror(errno));
 
     pthread_mutex_unlock(&g_dirs_lock);
     return 0;
@@ -708,7 +708,7 @@ int dirs_remove(const char *db_root, const char *dir, int check_empty) {
         }
         fclose(in); fclose(out);
         if (rename(tmp, path) != 0) {
-            log_msg(1, "remove_dir: rename(%s → %s): %s", tmp, path, strerror(errno));
+            LOG_ERROR(LOG_SUB_CONFIG, "remove_dir: rename(%s → %s): %s", tmp, path, strerror(errno));
             unlink(tmp);
         }
     } else {
@@ -2988,7 +2988,7 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
         }
 
         if (renameat(dfd, e->d_name, dfd, newbase) != 0) {
-            log_msg(1, "rename-field: failed to rename %s/%s -> %s: %s",
+            LOG_ERROR(LOG_SUB_CONFIG, "rename-field: failed to rename %s/%s -> %s: %s",
                     idx_dir, e->d_name, newbase, strerror(errno));
         }
     }
@@ -3015,7 +3015,7 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
     fclose(f);
     fclose(nf);
     if (rename(newconf_path, conf_path) != 0) {  /* atomic swap */
-        log_msg(1, "rename_field: rename(%s → %s): %s", newconf_path, conf_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "rename_field: rename(%s → %s): %s", newconf_path, conf_path, strerror(errno));
         unlink(newconf_path);
     }
     return 0;
@@ -3217,7 +3217,7 @@ static int drop_indexes_for_fields(const char *db_root, const char *object,
     fclose(f);
     fclose(nf);
     if (rename(tmp_path, conf_path) != 0) {
-        log_msg(1, "remove_field: rename(%s → %s): %s", tmp_path, conf_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "remove_field: rename(%s → %s): %s", tmp_path, conf_path, strerror(errno));
         unlink(tmp_path);
     }
     return dropped;
@@ -3308,7 +3308,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    log_msg(3, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
+    LOG_INFO(LOG_SUB_CONFIG, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
             db_root, object, nnames, dropped);
     OUT("{\"status\":\"removed\",\"fields\":%d,\"indexes_dropped\":%d}\n", nnames, dropped);
     return 0;
@@ -3396,7 +3396,7 @@ int cmd_rename_field(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    log_msg(3, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
+    LOG_INFO(LOG_SUB_CONFIG, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
     OUT("{\"status\":\"renamed\",\"old\":\"%s\",\"new\":\"%s\"}\n", old_name, new_name);
     return 0;
 }
