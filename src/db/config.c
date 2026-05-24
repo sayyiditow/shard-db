@@ -216,18 +216,46 @@ void *log_writer_thread(void *arg) {
             pthread_cond_wait(&g_log_cond, &g_log_lock);
 
         /* Batch flush */
-        FILE *info_f = NULL, *err_f = NULL;
+        FILE *info_f = NULL, *err_f = NULL, *audit_f = NULL, *slow_f = NULL;
         while (g_log_head != g_log_tail) {
             LogEntry *e = &g_log_ring[g_log_tail];
-            FILE **target = (e->level <= 1) ? &err_f : &info_f;
-            if (!*target) *target = open_log_for_level(e->level);
+            FILE **target;
+            if (e->is_audit) {
+                /* Route to <date>-audit.log, bypassing level filter */
+                if (!audit_f) {
+                    time_t now2 = time(NULL);
+                    struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
+                    char date2[16], path2[PATH_MAX];
+                    strftime(date2, sizeof(date2), "%Y-%m-%d", t2);
+                    snprintf(path2, sizeof(path2), "%s/%s-audit.log", g_log_dir, date2);
+                    audit_f = fopen(path2, "a");
+                }
+                target = &audit_f;
+            } else if (e->is_slow) {
+                /* Route to slow-<date>.log (Task 4 sets is_slow=1) */
+                if (!slow_f) {
+                    time_t now2 = time(NULL);
+                    struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
+                    char date2[16], path2[PATH_MAX];
+                    strftime(date2, sizeof(date2), "%Y-%m-%d", t2);
+                    snprintf(path2, sizeof(path2), "%s/slow-%s.log", g_log_dir, date2);
+                    slow_f = fopen(path2, "a");
+                }
+                target = &slow_f;
+            } else {
+                /* Normal level-based routing */
+                target = (e->level <= 1) ? &err_f : &info_f;
+                if (!*target) *target = open_log_for_level(e->level);
+            }
             if (*target) fputs(e->msg, *target);
             g_log_tail = (g_log_tail + 1) % LOG_RING_SIZE;
         }
         pthread_mutex_unlock(&g_log_lock);
 
-        if (info_f) { fflush(info_f); fclose(info_f); }
-        if (err_f) { fflush(err_f); fclose(err_f); }
+        if (info_f)  { fflush(info_f);  fclose(info_f);  }
+        if (err_f)   { fflush(err_f);   fclose(err_f);   }
+        if (audit_f) { fflush(audit_f); fclose(audit_f); }
+        if (slow_f)  { fflush(slow_f);  fclose(slow_f);  }
 
         /* Purge old logs every ~1000 flushes */
         if (++flush_counter % 1000 == 0) purge_old_logs();
@@ -318,6 +346,39 @@ void log_msg(int level, const char *fmt, ...) {
     log_msg_sub(level, "core", "%s", buf);
 }
 _Pragma("GCC diagnostic pop")
+
+void log_audit_sub(const char *subsystem, const char *fmt, ...) {
+    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    const char *sub = subsystem ? subsystem : "unknown";
+
+    time_t now = time(NULL);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+
+    LogEntry entry;
+    entry.level    = LOG_LVL_INFO;   /* for the displayed line shape */
+    entry.is_audit = 1;
+    entry.is_slow  = 0;
+    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s INFO [%s] ", ts, sub);
+    va_list ap;
+    va_start(ap, fmt);
+    pos += vsnprintf(entry.msg + pos, sizeof(entry.msg) - pos, fmt, ap);
+    va_end(ap);
+    if (pos < (int)sizeof(entry.msg) - 1) {
+        entry.msg[pos]   = '\n';
+        entry.msg[pos+1] = '\0';
+    }
+
+    pthread_mutex_lock(&g_log_lock);
+    int next = (g_log_head + 1) % LOG_RING_SIZE;
+    if (next != g_log_tail) {
+        g_log_ring[g_log_head] = entry;
+        g_log_head = next;
+    }
+    pthread_cond_signal(&g_log_cond);
+    pthread_mutex_unlock(&g_log_lock);
+}
 
 int load_db_root(char *out, size_t outlen) {
     FILE *f = fopen("db.env", "r");
