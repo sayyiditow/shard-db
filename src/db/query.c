@@ -16038,6 +16038,25 @@ static int parse_auto_key_spec(const char *spec, char *out_seq_name, size_t seq_
     return -1;
 }
 
+/* Worker for parallel bitmap-shard materialisation inside cmd_create_object.
+   Each task creates one (field, shard) bitmap file; tasks are independent so
+   no locking is needed beyond what bm_open already provides internally. */
+typedef struct {
+    char    path[PATH_MAX];
+    int     slots_per_shard;
+    int     is_bool;
+    uint32_t max_values;
+} CreateBmArg;
+
+static void *create_bm_worker(void *raw) {
+    CreateBmArg *a = (CreateBmArg *)raw;
+    BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 1, a->is_bool,
+                               a->max_values, 1 /* writer: materialise file */);
+    if (bm) bm_close(bm);
+    /* Best-effort — same policy as the old serial loop. */
+    return NULL;
+}
+
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
@@ -16565,35 +16584,61 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
        the declared cap (default or override). Empty at create-time;
        CRUD maintains bits on insert/update/delete, reindex backfills
        any records that pre-existed the field. Per declared bitmap field,
-       create `splits` per-data-shard files. */
-    for (int i = 0; i < npidx; i++) {
-        if (pidx[i].type != IT_BITMAP) continue;
-        /* Skip composite — already rejected upstream, defensive only. */
-        if (strchr(pidx[i].name, '+')) continue;
-        /* Find field's storage type to set the bool fast-path flag. */
-        int is_bool = 0;
-        int fnlen = (int)strlen(pidx[i].name);
-        for (int j = 0; j < nfields; j++) {
-            const char *fc = strchr(field_specs[j], ':');
-            if (!fc) continue;
-            int jlen = (int)(fc - field_specs[j]);
-            if (jlen != fnlen) continue;
-            if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
-            if (strncmp(fc + 1, "bool", 4) == 0 && (fc[5] == '\0' || fc[5] == ':')) {
-                is_bool = 1;
-            }
-            break;
-        }
+       create `splits` per-data-shard files.
+
+       Fan out via parallel_for: flatten (bitmap-field × shard) into one
+       task array, then let the thread pool do the ftruncate+mmap calls
+       concurrently.  At 256 splits × 1 bool field this is 256 independent
+       file-creates that previously ran serially (~2.4 s cold). */
+    {
         int slots_per_shard = (int)slotcask_default_slots_for_splits(splits);
-        for (int s = 0; s < splits; s++) {
-            char bm_path[PATH_MAX];
-            bm_build_path(bm_path, sizeof(bm_path), eff_root, object,
-                          pidx[i].name, s);
-            BitmapShard *bm = bm_open(bm_path, slots_per_shard, 1, is_bool,
-                                      pidx[i].max_values, 1 /* writer: materialise file */);
-            if (bm) bm_close(bm);
-            /* Best-effort: if a single shard fails to create, the next
-               insert will retry. Don't fail the whole create-object. */
+
+        /* First pass: count tasks so we can size the array exactly. */
+        int total_bm_tasks = 0;
+        for (int i = 0; i < npidx; i++) {
+            if (pidx[i].type != IT_BITMAP) continue;
+            if (strchr(pidx[i].name, '+')) continue;
+            total_bm_tasks += splits;
+        }
+
+        if (total_bm_tasks > 0) {
+            CreateBmArg *bm_args = malloc((size_t)total_bm_tasks * sizeof(CreateBmArg));
+            if (!bm_args) {
+                OUT("{\"error\":\"OOM building bitmap prealloc task list\"}\n");
+                return 1;
+            }
+            int idx = 0;
+            for (int i = 0; i < npidx; i++) {
+                if (pidx[i].type != IT_BITMAP) continue;
+                if (strchr(pidx[i].name, '+')) continue;
+
+                /* Find field's storage type to set the bool fast-path flag. */
+                int is_bool = 0;
+                int fnlen = (int)strlen(pidx[i].name);
+                for (int j = 0; j < nfields; j++) {
+                    const char *fc = strchr(field_specs[j], ':');
+                    if (!fc) continue;
+                    int jlen = (int)(fc - field_specs[j]);
+                    if (jlen != fnlen) continue;
+                    if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
+                    if (strncmp(fc + 1, "bool", 4) == 0 &&
+                        (fc[5] == '\0' || fc[5] == ':')) {
+                        is_bool = 1;
+                    }
+                    break;
+                }
+
+                for (int s = 0; s < splits; s++) {
+                    bm_build_path(bm_args[idx].path, sizeof(bm_args[idx].path),
+                                  eff_root, object, pidx[i].name, s);
+                    bm_args[idx].slots_per_shard = slots_per_shard;
+                    bm_args[idx].is_bool         = is_bool;
+                    bm_args[idx].max_values      = pidx[i].max_values;
+                    idx++;
+                }
+            }
+            parallel_for(create_bm_worker, bm_args, total_bm_tasks, sizeof(CreateBmArg));
+            free(bm_args);
         }
     }
 
