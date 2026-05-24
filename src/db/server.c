@@ -2280,20 +2280,75 @@ typedef struct {
     char db_root[PATH_MAX];
 } AutoVacuumArg;
 
-/* Startup warmup — pulls every kf header + index shard file (.idx/.bm/.tg)
-   into the OS page cache so the first user query doesn't pay a cold disk
-   read. See config.c (g_warmup_mode) for the mode knob (async/sync/off).
+/* Startup warmup — drives the daemon's userspace caches into "warm
+   enough that the first user query is O(1)" state. See config.c
+   (g_warmup_mode) for the mode knob (async/sync/off).
 
-   Mechanism: open(O_RDONLY) + posix_fadvise(POSIX_FADV_WILLNEED) + a
-   single read of the first page. fadvise WILLNEED is non-blocking — the
-   kernel queues background read-ahead — but a sync first-page read is
-   what actually guarantees that the file's start is resident by the time
-   subsequent lookups arrive. Stream segment files (data/streams/) are
-   intentionally NOT touched: those can be GBs on populated objects and
-   warming them all evicts smaller, hotter index pages. */
+   Two distinct populations:
+
+   1. Slotcask: load_schema + slotcask_registry_get + per-shard
+      kfcache_acquire(reader) on every (dir, object).  This is the
+      load-bearing part:
+        - registry_get triggers slotcask_open which eagerly opens +
+          mmaps every stream's file_000 (so the first insert path
+          doesn't race the create path through segcache).
+        - kfcache_acquire mmaps + caches the kf shard; touching
+          hdr->total faults the first page in, so subsequent
+          slotcask_sum_kf_totals calls (bare count + size) hit a
+          cached mmap + already-resident page.  Pre-fix, this
+          function did open + pread + close per shard (256 cold
+          syscalls per bare count = ~10s on 256-split objects).
+
+   2. Indexes (.idx / .bm / .tg): byte-read first 4 KB to populate the
+      OS page cache.  No userspace cache populate here — bt_cache and
+      bm_cache populate lazily on first use, and that lazy mmap is
+      cheap once the OS page cache is warm.  Stream seg files (.dat
+      under data/streams/) are deliberately NOT touched: they can be
+      GBs on populated objects and warming them all evicts hotter
+      index pages.
+
+   Phasing: phase 1 walks the dir tree serially on this thread (cheap
+   mmap-only operations: schema load + registry get + readdir) and
+   collects every kf shard and every index file into two flat task
+   arrays.  Phase 2 fans the kf shard tasks out through the global
+   parallel pool.  Phase 3 does the same for index files.  Per-shard
+   /per-file granularity gives thousands-wide fan-out on installs
+   with few but large objects (e.g. one 256-split table → 256 cold
+   page-faults that the disk's NCQ can pipeline). */
 typedef struct {
     char db_root[PATH_MAX];
 } WarmupArg;
+
+/* Phase-1 setup for one (dir, object) — schema load + slotcask
+   registry populate.  Returns the per-object SlotcaskDb* on success
+   (caller fans out per-shard kfcache work over sdb->num_shards) or
+   NULL if the object is missing/invalid.  The returned pointer is
+   owned by the slotcask registry and lives until shutdown. */
+static SlotcaskDb *warmup_object_open(const char *db_root,
+                                      const char *dir, const char *obj) {
+    char eff[PATH_MAX];
+    int n = snprintf(eff, sizeof(eff), "%s/%s", db_root, dir);
+    if (n <= 0 || (size_t)n >= sizeof(eff)) return NULL;
+
+    /* fields.conf gate — only proceed for real objects */
+    char obj_check[PATH_MAX];
+    int m = snprintf(obj_check, sizeof(obj_check), "%s/%s/fields.conf", eff, obj);
+    if (m <= 0 || (size_t)m >= sizeof(obj_check)) return NULL;
+    struct stat ost;
+    if (stat(obj_check, &ost) != 0) return NULL;
+
+    /* schema cache populate (load_schema is internally cached) */
+    Schema sch = load_schema(eff, obj);
+    if (sch.splits <= 0) return NULL;
+
+    /* registry + eager seg_000 mmap per stream */
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits,
+        .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    return slotcask_registry_get(eff, obj, &info);
+}
 
 static int warmup_touch_file(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -2316,24 +2371,71 @@ static int warmup_touch_file(const char *path) {
     return 0;
 }
 
-/* Recursively walks `dir` and calls warmup_touch_file on every regular
-   file whose name ends with one of the suffixes in ext_list[] (NULL-
-   terminated). Increments *count for each touched file. Bounded
-   recursion — only descends into subdirectories whose name doesn't
-   start with `.`. */
-static void warmup_walk_dir(const char *dir, const char **ext_list, int *count) {
+/* Per-shard kfcache prime task — mmaps the kf shard via kfcache and
+   forces its first page resident.  One task per kf shard so the pool
+   gets thousands-wide fan-out instead of per-object granularity. */
+typedef struct {
+    SlotcaskDb *sdb;
+    int shard_idx;
+    _Atomic int *kf_count;
+} WarmupKfTask;
+
+static void *warmup_kf_task_fn(void *arg) {
+    WarmupKfTask *t = (WarmupKfTask *)arg;
+    if (!server_running) return NULL;
+
+    char kf_path[PATH_MAX];
+    slotcask_kf_path(kf_path, sizeof(kf_path), t->sdb->data_dir, t->shard_idx);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, t->sdb->slots_per_shard, 0) != 0) return NULL;
+    /* Touch the header to force the first page in. The volatile
+       read prevents the compiler from optimizing away the load. */
+    if (kh.hdr) {
+        volatile uint64_t v = kh.hdr->total;
+        (void)v;
+    }
+    kfcache_release(&kh);
+    atomic_fetch_add(t->kf_count, 1);
+    return NULL;
+}
+
+/* Per-file index touch task — open + first-page read to prime the OS
+   page cache.  bt_cache / bm_cache stay lazy; the page-cache hit
+   makes their first-use mmap cheap. */
+typedef struct {
+    char path[PATH_MAX];
+    _Atomic int *idx_count;
+} WarmupIdxTask;
+
+static void *warmup_idx_task_fn(void *arg) {
+    WarmupIdxTask *t = (WarmupIdxTask *)arg;
+    if (!server_running) return NULL;
+    if (warmup_touch_file(t->path) == 0) {
+        atomic_fetch_add(t->idx_count, 1);
+    }
+    return NULL;
+}
+
+/* Recursively walks `dir`, appending one WarmupIdxTask to *tasks for
+   every regular file whose name ends with one of the suffixes in
+   ext_list[] (NULL-terminated).  Grows the array geometrically.  No
+   I/O on the files themselves — that happens during phase 2 via the
+   pool.  Bounded recursion: skips entries whose name starts with `.`. */
+static void warmup_collect_idx(const char *dir, const char **ext_list,
+                               WarmupIdxTask **tasks, size_t *n, size_t *cap,
+                               _Atomic int *idx_count) {
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && server_running) {
         if (e->d_name[0] == '.') continue;
         char path[PATH_MAX];
-        int n = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        if (n <= 0 || (size_t)n >= sizeof(path)) continue;
+        int len = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (len <= 0 || (size_t)len >= sizeof(path)) continue;
         struct stat st;
         if (stat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            warmup_walk_dir(path, ext_list, count);
+            warmup_collect_idx(path, ext_list, tasks, n, cap, idx_count);
             continue;
         }
         if (!S_ISREG(st.st_mode)) continue;
@@ -2342,7 +2444,16 @@ static void warmup_walk_dir(const char *dir, const char **ext_list, int *count) 
             size_t elen = strlen(ext_list[i]);
             if (nlen > elen &&
                 strcmp(e->d_name + nlen - elen, ext_list[i]) == 0) {
-                if (warmup_touch_file(path) == 0) (*count)++;
+                if (*n == *cap) {
+                    size_t new_cap = *cap ? *cap * 2 : 64;
+                    WarmupIdxTask *nt = realloc(*tasks, new_cap * sizeof(WarmupIdxTask));
+                    if (!nt) { closedir(d); return; }
+                    *tasks = nt;
+                    *cap = new_cap;
+                }
+                WarmupIdxTask *it = &(*tasks)[(*n)++];
+                memcpy(it->path, path, (size_t)len + 1);
+                it->idx_count = idx_count;
                 break;
             }
         }
@@ -2361,16 +2472,14 @@ static void *warmup_thread(void *arg) {
     if (!g_out) g_out = stderr;
 
     uint64_t t0 = now_ms();
-    int kf = 0, idx = 0, objects = 0;
-    /* On-disk extensions (per src/db/slotcask.c and index layout):
-         .kf  — slotcask keyfile shard (`data/kf/NNN.kf`, ~3 MB each)
-         .idx — btree index shard (`indexes/<field>/NNN.idx`)
-         .bm  — bitmap shard
-         .tg  — trigram shard
-       Stream seg files `.dat` are deliberately omitted — they're the bulk
-       of the on-disk footprint (128 MB each × many) and warming them all
-       would evict the smaller hot index pages from the OS page cache. */
-    static const char *kf_ext[]  = { ".kf", NULL };
+    _Atomic int kf_count = 0, idx_count = 0;
+    int objects = 0;
+
+    /* Index extensions warmed via byte-read into OS page cache —
+       bt_cache + bm_cache populate lazily on first use, but the OS
+       page cache priming makes that lazy mmap cheap.  Stream seg
+       files (.dat under data/streams/) are deliberately NOT touched —
+       see the warmup comment block above for the rationale. */
     static const char *idx_ext[] = { ".idx", ".bm", ".tg", NULL };
 
     /* Snapshot dirs (same pattern as auto_vacuum_thread). */
@@ -2380,6 +2489,17 @@ static void *warmup_thread(void *arg) {
     memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
     memcpy(used_copy, g_dirs_used, sizeof(used_copy));
     pthread_mutex_unlock(&g_dirs_lock);
+
+    /* Phase 1 (serial on this thread): for every (dir, object),
+       populate schema + slotcask registry (cheap — mmap-only), then
+       flatten the kf shards and indexes/ tree into two task arrays.
+       Doing this serially is fine: registry_get is cached + mmap-
+       only, and readdir is naturally serial per stream.  The pool
+       only fires up in phase 2/3 once we have many small tasks. */
+    WarmupKfTask  *kf_tasks  = NULL;
+    WarmupIdxTask *idx_tasks = NULL;
+    size_t n_kf = 0, kf_cap = 0;
+    size_t n_idx = 0, idx_cap = 0;
 
     for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
         if (!used_copy[di]) continue;
@@ -2392,27 +2512,57 @@ static void *warmup_thread(void *arg) {
         struct dirent *de;
         while ((de = readdir(dd)) && server_running) {
             if (de->d_name[0] == '.') continue;
-            char obj_check[PATH_MAX];
-            int m = snprintf(obj_check, sizeof(obj_check),
-                             "%s/%s/fields.conf", dir_path, de->d_name);
-            if (m <= 0 || (size_t)m >= sizeof(obj_check)) continue;
-            struct stat ost;
-            if (stat(obj_check, &ost) != 0) continue;
 
-            char kf_dir[PATH_MAX], idx_dir[PATH_MAX];
-            snprintf(kf_dir,  sizeof(kf_dir),  "%s/%s/data/kf",
-                     dir_path, de->d_name);
+            SlotcaskDb *sdb = warmup_object_open(a->db_root,
+                                                 dirs_copy[di], de->d_name);
+            if (!sdb) continue;
+            objects++;
+
+            /* Per-shard kf tasks for this object */
+            for (int s = 0; s < sdb->num_shards; s++) {
+                if (n_kf == kf_cap) {
+                    size_t new_cap = kf_cap ? kf_cap * 2 : 64;
+                    WarmupKfTask *nt = realloc(kf_tasks, new_cap * sizeof(WarmupKfTask));
+                    if (!nt) goto done_collect;
+                    kf_tasks = nt;
+                    kf_cap = new_cap;
+                }
+                kf_tasks[n_kf++] = (WarmupKfTask){
+                    .sdb = sdb,
+                    .shard_idx = s,
+                    .kf_count = &kf_count,
+                };
+            }
+
+            /* Recursively collect index file paths for this object */
+            char idx_dir[PATH_MAX];
             snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes",
                      dir_path, de->d_name);
-            warmup_walk_dir(kf_dir,  kf_ext,  &kf);
-            warmup_walk_dir(idx_dir, idx_ext, &idx);
-            objects++;
+            warmup_collect_idx(idx_dir, idx_ext, &idx_tasks, &n_idx, &idx_cap,
+                               &idx_count);
         }
         closedir(dd);
     }
 
+done_collect:
+    /* Phase 2: fan out kf shard priming.  Each task is mmap + 1 page
+       fault — granular enough that the pool can saturate the disk's
+       queue depth even on a single tenant with one object. */
+    if (n_kf > 0 && server_running) {
+        parallel_for(warmup_kf_task_fn, kf_tasks, (int)n_kf, sizeof(WarmupKfTask));
+    }
+    free(kf_tasks);
+
+    /* Phase 3: fan out index page-cache priming.  Same shape as
+       phase 2; runs after kf so the most latency-sensitive caches
+       (count/size queries) are ready first. */
+    if (n_idx > 0 && server_running) {
+        parallel_for(warmup_idx_task_fn, idx_tasks, (int)n_idx, sizeof(WarmupIdxTask));
+    }
+    free(idx_tasks);
+
     log_msg(1, "WARMUP done: %d objects, %d kf files + %d index files in %lums",
-            objects, kf, idx,
+            objects, atomic_load(&kf_count), atomic_load(&idx_count),
             (unsigned long)(now_ms() - t0));
     free(a);
     return NULL;
