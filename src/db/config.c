@@ -306,20 +306,6 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     pthread_mutex_unlock(&g_log_lock);
 }
 
-/* Legacy shim — routes through log_msg_sub so existing callers transparently
-   emit the new "LEVEL [core] msg" format. Suppress the self-deprecation
-   warning at this definition site; callers still see it. */
-_Pragma("GCC diagnostic push")
-_Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
-void log_msg(int level, const char *fmt, ...) {
-    char buf[LOG_MSG_MAX];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    log_msg_sub(level, "core", "%s", buf);
-}
-_Pragma("GCC diagnostic pop")
 
 void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;

@@ -62,10 +62,5 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...)
 void log_slow_query(const char *mode, const char *dir,
                     const char *object, uint32_t duration_ms);
 
-/* Legacy shim — kept temporarily for transition. Marked deprecated;
-   migration in later tasks removes every call. */
-void log_msg(int level, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)))
-    __attribute__((deprecated("use LOG_ERROR/WARN/INFO/DEBUG with a LOG_SUB_* constant")));
 
 #endif /* SHARD_DB_LOG_H */
