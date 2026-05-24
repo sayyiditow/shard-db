@@ -128,7 +128,7 @@ static void recover_one_object(const char *obj_dir) {
         struct stat st;
         if (stat(path, &st) == 0) {
             rmrf(path);
-            log_msg(2, "RECOVERY cleaned up %s", path);
+            LOG_WARN(LOG_SUB_SLOTCASK, "RECOVERY cleaned up %s", path);
         }
     }
 }
