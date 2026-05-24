@@ -1809,7 +1809,7 @@ static int run_streaming_build(int type,
     mkdirp(spill_dir);
     struct stat sst;
     if (stat(spill_dir, &sst) != 0 || !S_ISDIR(sst.st_mode)) {
-        log_msg(0, "streaming-build: cannot create spill dir %s", spill_dir);
+        LOG_ERROR(LOG_SUB_INDEX, "streaming-build: cannot create spill dir %s", spill_dir);
         return -1;
     }
 
@@ -1877,7 +1877,7 @@ static int run_streaming_build(int type,
     free(workers);
 
     if (any_worker_err) {
-        log_msg(0, "streaming-build %s/%s/%s: worker error during spill phase",
+        LOG_ERROR(LOG_SUB_INDEX, "streaming-build %s/%s/%s: worker error during spill phase",
                 db_root, object, field);
         /* Continue to merge anyway — partial data is still usable as
            best-effort. */
@@ -1889,7 +1889,7 @@ static int run_streaming_build(int type,
        longer need to cap concurrency by per-shard data volume.
        Concurrency is now capped only by the pool size; idx_n shards
        run in parallel up to that. */
-    log_msg(2, "streaming-merge %s/%s/%s: %d shards, streaming bt builder",
+    LOG_WARN(LOG_SUB_INDEX, "streaming-merge %s/%s/%s: %d shards, streaming bt builder",
             db_root, object, field, idx_n);
 
     MergeShardArg *margs = calloc((size_t)idx_n, sizeof(MergeShardArg));
@@ -2145,7 +2145,7 @@ int build_trigram_pass(const char *db_root, const char *object,
     int pool_size = parallel_pool_size();
     if (pool_size < 1) pool_size = 1;
 
-    log_msg(2, "BUILD-TRIGRAM %s/%s: streaming + external-merge, %d kf, pool=%d, budget=%zu MB",
+    LOG_WARN(LOG_SUB_TRIGRAM, "BUILD-TRIGRAM %s/%s: streaming + external-merge, %d kf, pool=%d, budget=%zu MB",
             db_root, object, n_kf, pool_size, budget / (1024 * 1024));
 
     int field_indices[1] = { fi };
@@ -2208,7 +2208,7 @@ int build_btree_streaming(const char *db_root, const char *object,
     if (est < 8)   est = 8;
     if (est > 256) est = 256;
 
-    log_msg(2, "BUILD-BTREE %s/%s/%s: streaming + external-merge, %d kf, pool=%d, budget=%zu MB",
+    LOG_WARN(LOG_SUB_BTREE, "BUILD-BTREE %s/%s/%s: streaming + external-merge, %d kf, pool=%d, budget=%zu MB",
             db_root, object, field, n_kf, pool_size, budget / (1024 * 1024));
     return run_streaming_build(STREAM_BTREE, db_root, object, field, sch, ts, sdb,
                                idx_n, n_kf, is_comp,
@@ -2566,7 +2566,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
                 n_batches++;
                 batch_start = batch_end;
             }
-            log_msg(2, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
+            LOG_WARN(LOG_SUB_INDEX, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
                     object, actual_count, n_batches, live_count,
                     budget / (1024 * 1024));
         }
@@ -2759,7 +2759,7 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
     unlink_index_by_line(db_root, object, matched_line, sch.splits);
     invalidate_idx_cache(object);
 
-    log_msg(3, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
+    LOG_INFO(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
     OUT("{\"status\":\"removed\",\"field\":\"%s\"}\n", field);
     return 0;
 }
@@ -2840,7 +2840,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
     }
 
     invalidate_idx_cache(object);
-    log_msg(3, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
+    LOG_INFO(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
     OUT("{\"status\":\"removed\",\"count\":%d,\"not_indexed\":%d}\n", removed, missing);
     return 0;
 }
@@ -2955,7 +2955,7 @@ int reindex_object(const char *eff_root, const char *object) {
     g_out = saved_out;
     if (devnull) fclose(devnull);
 
-    log_msg(3, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
     return nf;
 }
 
@@ -2985,7 +2985,7 @@ static void reindex_clean_legacy(const char *eff_root, const char *object) {
         snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
         btree_cache_invalidate(path);
         if (unlinkat(dfd, e->d_name, 0) == 0) {
-            log_msg(3, "REINDEX %s/%s: cleaned legacy single-file index %s",
+            LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: cleaned legacy single-file index %s",
                     eff_root, object, e->d_name);
         }
     }
