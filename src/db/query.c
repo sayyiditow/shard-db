@@ -1544,7 +1544,20 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
         len = st.st_size;
         if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
-        json = mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0);
+        /* MAP_PRIVATE on a file fd lets us write the trailing NUL into
+           the partial last page (zero-filled slack, copy-on-write). But
+           if `len` is *exactly* page-aligned, there is no partial last
+           page — byte [len] lives on a NEW page that the kernel does
+           NOT back. Writing there SIGBUSes. Skip the mmap path in that
+           case and fall through to alloc+read, which owns its memory.
+           Reproduced via ASan when a 5000-row bulk-insert chunk landed
+           on exactly 0x86000 bytes (548 KB) after schema-shrink. */
+        long pgsize_l = sysconf(_SC_PAGESIZE);
+        size_t pgsize = (pgsize_l > 0) ? (size_t)pgsize_l : 4096;
+        int try_mmap = (len % pgsize) != 0;
+        json = try_mmap
+            ? mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0)
+            : MAP_FAILED;
         if (json == MAP_FAILED) {
             /* Fallback: allocate and read */
             json = malloc(len + 1);
