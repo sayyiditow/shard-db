@@ -652,7 +652,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 save_tokens_conf_full(raw_db_root, ds, os);
                 pthread_mutex_unlock(&g_token_lock);
                 const char *pstr = (perm == PERM_R) ? "r" : (perm == PERM_RW) ? "rw" : "rwx";
-                log_msg(3, "AUTH add-token scope=%s/%s perm=%s from %s",
+                LOG_INFO(LOG_SUB_AUTH, "AUTH add-token scope=%s/%s perm=%s from %s",
                         ds ? ds : "global", os ? os : "", pstr, client_ip);
                 OUT("{\"status\":\"token_added\",\"scope\":\"%s%s%s\",\"perm\":\"%s\"}\n",
                     ds ? ds : "global",
@@ -738,7 +738,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 ip_set_add(ip);
                 save_allowed_ips_conf(raw_db_root);
                 pthread_mutex_unlock(&g_ip_lock);
-                log_msg(3, "AUTH add-ip %s from %s", ip, client_ip);
+                LOG_INFO(LOG_SUB_AUTH, "AUTH add-ip %s from %s", ip, client_ip);
                 OUT("{\"status\":\"ip_added\"}\n");
             } else {
                 OUT("{\"error\":\"Missing ip\"}\n");
@@ -2561,7 +2561,7 @@ done_collect:
     }
     free(idx_tasks);
 
-    log_msg(1, "WARMUP done: %d objects, %d kf files + %d index files in %lums",
+    LOG_INFO(LOG_SUB_WARMUP, "WARMUP done: %d objects, %d kf files + %d index files in %lums",
             objects, atomic_load(&kf_count), atomic_load(&idx_count),
             (unsigned long)(now_ms() - t0));
     free(a);
@@ -2577,7 +2577,7 @@ static void *auto_vacuum_thread(void *arg) {
     g_out = fopen("/dev/null", "w");
     if (!g_out) g_out = stderr;
 
-    log_msg(3, "AUTO-VACUUM thread started: interval=%ds pct=%d min_deleted=%d",
+    LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM thread started: interval=%ds pct=%d min_deleted=%d",
             g_auto_vacuum_interval_sec, g_vacuum_recommend_pct,
             g_vacuum_recommend_min_deleted);
 
@@ -2626,12 +2626,12 @@ static void *auto_vacuum_thread(void *arg) {
                        g_vacuum_recommend_min_deleted >= deleted check
                        and total > 0 gate above), so the divide is safe. */
                     int pct_observed = (deleted * 100) / total;
-                    log_msg(3,
+                    LOG_INFO(LOG_SUB_VACUUM,
                         "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
                         dirs_copy[di], de->d_name, count, deleted, pct_observed);
                     uint64_t obj_t0 = now_ms();
                     cmd_vacuum(eff, de->d_name, 0, 0);
-                    log_msg(3,
+                    LOG_INFO(LOG_SUB_VACUUM,
                         "AUTO-VACUUM done %s/%s in %lums",
                         dirs_copy[di], de->d_name,
                         (unsigned long)(now_ms() - obj_t0));
@@ -2640,7 +2640,7 @@ static void *auto_vacuum_thread(void *arg) {
             }
             closedir(dd);
         }
-        log_msg(3, "AUTO-VACUUM tick: scanned=%d vacuumed=%d in %lums",
+        LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM tick: scanned=%d vacuumed=%d in %lums",
                 scanned, vacuumed, (unsigned long)(now_ms() - tick_t0));
     }
 
@@ -2728,7 +2728,7 @@ static int validate_metadata(const char *db_root) {
        stopped" with the only diagnostic in error.log.) */
     for (int i = 0; i < schema_count; i++) {
         if (!is_valid_dir(schema_entries[i].dir)) {
-            log_msg(2,
+            LOG_WARN(LOG_SUB_SERVER,
                 "VALIDATE warning: schema.conf references dir [%s] (object [%s]) "
                 "not in dirs.conf — entry ignored",
                 schema_entries[i].dir, schema_entries[i].obj);
@@ -2777,7 +2777,7 @@ static int validate_metadata(const char *db_root) {
                 fprintf(stderr,
                     "validate: object [%s/%s] has %s but missing fields.conf\n",
                     de->d_name, oe->d_name, layout_marker);
-                log_msg(1,
+                LOG_ERROR(LOG_SUB_SERVER,
                     "VALIDATE %s/%s has %s but no fields.conf",
                     de->d_name, oe->d_name, layout_marker);
                 errors++;
@@ -2795,7 +2795,7 @@ static int validate_metadata(const char *db_root) {
                 fprintf(stderr,
                     "validate: object [%s/%s] has %s but missing schema.conf line\n",
                     de->d_name, oe->d_name, layout_marker);
-                log_msg(1,
+                LOG_ERROR(LOG_SUB_SERVER,
                     "VALIDATE %s/%s has %s but no schema.conf line",
                     de->d_name, oe->d_name, layout_marker);
                 errors++;
@@ -3013,7 +3013,7 @@ int cmd_server(const char *db_root, int daemonize) {
             if (per_slot > g_query_buffer_max_bytes)
                 g_query_buffer_max_bytes = per_slot;
         }
-        log_msg(1, "QUERY_BUFFER_MB auto-tuned to %zu MB (× %d slots = %zu MB peak)",
+        LOG_INFO(LOG_SUB_SERVER, "QUERY_BUFFER_MB auto-tuned to %zu MB (× %d slots = %zu MB peak)",
                 g_query_buffer_max_bytes / (1024 * 1024),
                 g_max_concurrent_queries,
                 (g_query_buffer_max_bytes * (size_t)g_max_concurrent_queries) / (1024 * 1024));
@@ -3073,7 +3073,7 @@ int cmd_server(const char *db_root, int daemonize) {
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",
             port, getpid(), nthreads, g_timeout, g_tls_enable ? "on" : "off");
     fflush(stdout);
-    log_msg(3, "SERVER START port=%d pid=%d workers=%d tls=%d",
+    LOG_INFO(LOG_SUB_SERVER, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
 
     /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
@@ -3154,7 +3154,7 @@ int cmd_server(const char *db_root, int daemonize) {
 
     /* Graceful shutdown */
     close(sfd);
-    log_msg(3, "SHUTDOWN: waiting for %d in-flight writes, %d active connections",
+    LOG_INFO(LOG_SUB_SERVER, "SHUTDOWN: waiting for %d in-flight writes, %d active connections",
             in_flight_writes, active_threads);
 
     /* Wake workers and wait for them */
@@ -3174,7 +3174,7 @@ int cmd_server(const char *db_root, int daemonize) {
     bt_cache_shutdown();
     slotcask_shutdown();
     tls_shutdown();
-    log_msg(3, "SERVER STOP pid=%d", getpid());
+    LOG_INFO(LOG_SUB_SERVER, "SERVER STOP pid=%d", getpid());
     log_shutdown();
     fprintf(stdout, "shard-db stopped (pid=%d)\n", getpid());
     fflush(stdout);
