@@ -2566,7 +2566,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
                 n_batches++;
                 batch_start = batch_end;
             }
-            LOG_WARN(LOG_SUB_INDEX, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
+            LOG_AUDIT(LOG_SUB_INDEX, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
                     object, actual_count, n_batches, live_count,
                     budget / (1024 * 1024));
         }
@@ -2759,7 +2759,7 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
     unlink_index_by_line(db_root, object, matched_line, sch.splits);
     invalidate_idx_cache(object);
 
-    LOG_INFO(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
+    LOG_AUDIT(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
     OUT("{\"status\":\"removed\",\"field\":\"%s\"}\n", field);
     return 0;
 }
@@ -2840,7 +2840,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
     }
 
     invalidate_idx_cache(object);
-    LOG_INFO(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
+    LOG_AUDIT(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
     OUT("{\"status\":\"removed\",\"count\":%d,\"not_indexed\":%d}\n", removed, missing);
     return 0;
 }

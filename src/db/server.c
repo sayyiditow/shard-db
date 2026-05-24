@@ -596,6 +596,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(auth);
         }
         if (!authorized) {
+            LOG_AUDIT(LOG_SUB_AUTH, "AUTH failed: ip=%s mode=%s (admin gate)", client_ip, mode ? mode : "");
             OUT("{\"error\":\"unauthorized\"}\n");
             free(mode); return;
         }
@@ -652,7 +653,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 save_tokens_conf_full(raw_db_root, ds, os);
                 pthread_mutex_unlock(&g_token_lock);
                 const char *pstr = (perm == PERM_R) ? "r" : (perm == PERM_RW) ? "rw" : "rwx";
-                LOG_INFO(LOG_SUB_AUTH, "AUTH add-token scope=%s/%s perm=%s from %s",
+                LOG_AUDIT(LOG_SUB_AUTH, "AUTH add-token scope=%s/%s perm=%s from %s",
                         ds ? ds : "global", os ? os : "", pstr, client_ip);
                 OUT("{\"status\":\"token_added\",\"scope\":\"%s%s%s\",\"perm\":\"%s\"}\n",
                     ds ? ds : "global",
@@ -726,8 +727,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     OUT("{\"error\":\"ambiguous fingerprint — multiple tokens match\"}\n");
                 else if (matches == 0)
                     OUT("{\"status\":\"token_not_found\"}\n");
-                else
+                else {
+                    if (removed)
+                        LOG_AUDIT(LOG_SUB_AUTH, "AUTH remove-token scope=%s/%s from %s",
+                                rm_dir[0] ? rm_dir : "global", rm_obj, client_ip);
                     OUT("{\"status\":\"%s\"}\n", removed ? "token_removed" : "token_not_found");
+                }
 
                 free(token); free(fp);
             }
@@ -738,7 +743,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 ip_set_add(ip);
                 save_allowed_ips_conf(raw_db_root);
                 pthread_mutex_unlock(&g_ip_lock);
-                LOG_INFO(LOG_SUB_AUTH, "AUTH add-ip %s from %s", ip, client_ip);
+                LOG_AUDIT(LOG_SUB_AUTH, "AUTH add-ip %s from %s", ip, client_ip);
                 OUT("{\"status\":\"ip_added\"}\n");
             } else {
                 OUT("{\"error\":\"Missing ip\"}\n");
@@ -751,6 +756,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 int removed = ip_set_remove(ip);
                 if (removed) save_allowed_ips_conf(raw_db_root);
                 pthread_mutex_unlock(&g_ip_lock);
+                if (removed)
+                    LOG_AUDIT(LOG_SUB_AUTH, "AUTH remove-ip %s from %s", ip, client_ip);
                 OUT("{\"status\":\"%s\"}\n", removed ? "ip_removed" : "ip_not_found");
             } else {
                 OUT("{\"error\":\"Missing ip\"}\n");
@@ -845,6 +852,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int ok = auth && is_authorized(auth, req_dir, req_obj, mode);
         free(auth); free(req_dir); free(req_obj);
         if (!ok) {
+            LOG_AUDIT(LOG_SUB_AUTH, "AUTH failed: ip=%s mode=%s", client_ip, mode ? mode : "");
             free(mode);
             OUT("{\"error\":\"auth failed\"}\n");
             return;

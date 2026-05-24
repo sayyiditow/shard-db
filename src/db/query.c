@@ -5762,7 +5762,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     int idx_rebuilt = 0;
     if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
 
-    LOG_INFO(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
             old_sch->streams, new_sch->streams,
             old_sch->slot_size, new_sch->slot_size, drop_tombstoned, idx_rebuilt);
@@ -6086,7 +6086,7 @@ int rebuild_object(const char *db_root, const char *object,
     int idx_rebuilt = 0;
     if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
 
-    LOG_INFO(LOG_SUB_CONFIG, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_splits, new_splits,
             old_sch.slot_size, new_sch.slot_size, drop_tombstoned, idx_rebuilt);
     OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
@@ -6634,7 +6634,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
             return 1;
         }
         invalidate_schema_caches(db_root, object);
-        LOG_INFO(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
+        LOG_AUDIT(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
                 db_root, object, n_edits);
         OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":false}\n", n_edits);
         for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
@@ -6716,7 +6716,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     selective_reindex_dirty(db_root, object, dirty_names, n_dirty,
                             &idx_rebuilt, &idx_skipped);
 
-    LOG_INFO(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
+    LOG_AUDIT(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
                "idx_rebuilt=%d, idx_skipped=%d",
             db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
             idx_rebuilt, idx_skipped);
@@ -15583,6 +15583,7 @@ int cmd_truncate(const char *db_root, const char *object) {
     mkdirp(path);
 
     set_count(db_root, object, 0);
+    LOG_AUDIT(LOG_SUB_CONFIG, "TRUNCATE %s", object);
     OUT("{\"status\":\"truncated\",\"object\":\"%s\"}\n", object);
     return 0;
 }
@@ -16596,6 +16597,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
+    LOG_AUDIT(LOG_SUB_CONFIG, "CREATE-OBJECT %s/%s: splits=%d max_key=%d fields=%d streams=%d",
+            dir, object, splits, max_key, nfields, streams);
     OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
         object, dir, splits, max_key, total_value_size, nfields, streams);
     return 0;
@@ -16674,7 +16677,7 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    LOG_INFO(LOG_SUB_CONFIG, "DROP-OBJECT %s/%s", dir, object);
+    LOG_AUDIT(LOG_SUB_CONFIG, "DROP-OBJECT %s/%s", dir, object);
     OUT("{\"status\":\"dropped\",\"dir\":\"%s\",\"object\":\"%s\"}\n", dir, object);
     return 0;
 }

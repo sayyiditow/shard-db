@@ -3130,7 +3130,10 @@ int cmd_add_fields(const char *db_root, const char *object,
     }
 
     /* rebuild_object appends lines to fields.conf and rewrites shards atomically. */
-    return rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
+    int rc = rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
+    if (rc == 0)
+        LOG_AUDIT(LOG_SUB_CONFIG, "ADD-FIELD %s/%s: %d field(s) added", db_root, object, nlines);
+    return rc;
 }
 
 /* ========== remove-field ==========
@@ -3308,7 +3311,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    LOG_INFO(LOG_SUB_CONFIG, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
             db_root, object, nnames, dropped);
     OUT("{\"status\":\"removed\",\"fields\":%d,\"indexes_dropped\":%d}\n", nnames, dropped);
     return 0;
@@ -3396,7 +3399,7 @@ int cmd_rename_field(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    LOG_INFO(LOG_SUB_CONFIG, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
+    LOG_AUDIT(LOG_SUB_CONFIG, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
     OUT("{\"status\":\"renamed\",\"old\":\"%s\",\"new\":\"%s\"}\n", old_name, new_name);
     return 0;
 }
