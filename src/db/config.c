@@ -114,33 +114,7 @@ uint64_t now_ms_coarse(void) {
 
 extern char g_log_dir[PATH_MAX];
 
-void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms) {
-    __atomic_add_fetch(&g_slow_query_count, 1, __ATOMIC_RELAXED);
-    pthread_mutex_lock(&g_slow_query_lock);
-    SlowQueryEntry *e = &g_slow_queries[g_slow_query_head];
-    e->ts_ms = now_ms();
-    e->duration_ms = duration_ms;
-    snprintf(e->mode,   sizeof(e->mode),   "%s", mode   ? mode   : "");
-    snprintf(e->dir,    sizeof(e->dir),    "%s", dir    ? dir    : "");
-    snprintf(e->object, sizeof(e->object), "%s", object ? object : "");
-    g_slow_query_head = (g_slow_query_head + 1) % SLOW_QUERY_RING;
-    pthread_mutex_unlock(&g_slow_query_lock);
-    /* Dated slow log file, same rotation as info/error */
-    time_t t = time(NULL);
-    struct tm tmbuf; struct tm *tm = localtime_r(&t, &tmbuf);
-    char date[16], path[PATH_MAX];
-    strftime(date, sizeof(date), "%Y-%m-%d", tm);
-    snprintf(path, sizeof(path), "%s/slow-%s.log", g_log_dir, date);
-    FILE *f = fopen(path, "a");
-    if (f) {
-        char iso[32];
-        strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S", tm);
-        fprintf(f, "%s %ums mode=%s dir=%s object=%s\n",
-                iso, duration_ms,
-                mode ? mode : "", dir ? dir : "", object ? object : "");
-        fclose(f);
-    }
-}
+/* log_slow_query — defined after LogEntry/ring declarations below. */
 __thread FILE *g_out = NULL;    /* per-thread output; init to stdout in main() */
 char g_db_root[PATH_MAX] = {0};
 
@@ -375,6 +349,52 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     if (next != g_log_tail) {
         g_log_ring[g_log_head] = entry;
         g_log_head = next;
+    }
+    pthread_cond_signal(&g_log_cond);
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+void log_slow_query(const char *mode, const char *dir,
+                    const char *object, uint32_t duration_ms) {
+    __atomic_add_fetch(&g_slow_query_count, 1, __ATOMIC_RELAXED);
+
+    /* In-memory ring for the /stats endpoint (existing behaviour). */
+    pthread_mutex_lock(&g_slow_query_lock);
+    SlowQueryEntry *e = &g_slow_queries[g_slow_query_head];
+    e->ts_ms = now_ms();
+    e->duration_ms = duration_ms;
+    snprintf(e->mode,   sizeof(e->mode),   "%s", mode   ? mode   : "");
+    snprintf(e->dir,    sizeof(e->dir),    "%s", dir    ? dir    : "");
+    snprintf(e->object, sizeof(e->object), "%s", object ? object : "");
+    g_slow_query_head = (g_slow_query_head + 1) % SLOW_QUERY_RING;
+    pthread_mutex_unlock(&g_slow_query_lock);
+
+    /* File log via shared ring buffer (replaces the previous direct
+       fopen+fprintf path).  is_slow=1 routes to slow-<date>.log via
+       the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
+       threshold is the filter. */
+    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    time_t now = time(NULL);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+
+    LogEntry entry;
+    entry.level    = LOG_LVL_INFO;
+    entry.is_audit = 0;
+    entry.is_slow  = 1;
+    snprintf(entry.msg, sizeof(entry.msg),
+             "%s INFO [slow] %ums mode=%s dir=%s object=%s\n",
+             ts, duration_ms,
+             mode   ? mode   : "",
+             dir    ? dir    : "",
+             object ? object : "");
+
+    pthread_mutex_lock(&g_log_lock);
+    int next2 = (g_log_head + 1) % LOG_RING_SIZE;
+    if (next2 != g_log_tail) {
+        g_log_ring[g_log_head] = entry;
+        g_log_head = next2;
     }
     pthread_cond_signal(&g_log_cond);
     pthread_mutex_unlock(&g_log_lock);
