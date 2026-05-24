@@ -151,11 +151,13 @@ int g_log_level = 3;
 int g_log_retain_days = 7;
 
 #define LOG_RING_SIZE 8192
-#define LOG_MSG_SIZE  512
+#define LOG_MSG_MAX   4096
 
 typedef struct {
-    char msg[LOG_MSG_SIZE];
-    int level;
+    int  level;      /* LOG_LVL_* */
+    int  is_audit;   /* 1 = route to audit file, bypass level filter */
+    int  is_slow;    /* 1 = route to slow file, bypass level filter */
+    char msg[LOG_MSG_MAX];
 } LogEntry;
 
 LogEntry g_log_ring[LOG_RING_SIZE];
@@ -265,25 +267,33 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
     return rc;
 }
 
-void log_msg(int level, const char *fmt, ...) {
+void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     if (level > g_log_level ||
         !atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
+    if (level < 1 || level > 4) level = LOG_LVL_INFO;
+    const char *sub = subsystem ? subsystem : "unknown";
+
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
 
     LogEntry entry;
-    entry.level = level;
-    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s [%s] ", ts, labels[level]);
+    entry.level    = level;
+    entry.is_audit = 0;
+    entry.is_slow  = 0;
+    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s %s [%s] ",
+                       ts, labels[level], sub);
     va_list ap;
     va_start(ap, fmt);
     pos += vsnprintf(entry.msg + pos, sizeof(entry.msg) - pos, fmt, ap);
     va_end(ap);
-    if (pos < (int)sizeof(entry.msg) - 1) { entry.msg[pos] = '\n'; entry.msg[pos+1] = '\0'; }
+    if (pos < (int)sizeof(entry.msg) - 1) {
+        entry.msg[pos]   = '\n';
+        entry.msg[pos+1] = '\0';
+    }
 
-    /* Non-blocking enqueue */
     pthread_mutex_lock(&g_log_lock);
     int next = (g_log_head + 1) % LOG_RING_SIZE;
     if (next != g_log_tail) {
@@ -293,6 +303,21 @@ void log_msg(int level, const char *fmt, ...) {
     pthread_cond_signal(&g_log_cond);
     pthread_mutex_unlock(&g_log_lock);
 }
+
+/* Legacy shim — routes through log_msg_sub so existing callers transparently
+   emit the new "LEVEL [core] msg" format. Suppress the self-deprecation
+   warning at this definition site; callers still see it. */
+_Pragma("GCC diagnostic push")
+_Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+void log_msg(int level, const char *fmt, ...) {
+    char buf[LOG_MSG_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_msg_sub(level, "core", "%s", buf);
+}
+_Pragma("GCC diagnostic pop")
 
 int load_db_root(char *out, size_t outlen) {
     FILE *f = fopen("db.env", "r");
