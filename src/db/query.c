@@ -11323,15 +11323,49 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
  * failure with a human-readable message written into `err`. Callers
  * emit the message and abort. */
 
+/* For composite-field references (`a+b+c`) every subfield must resolve.
+ * Composite names only exist in the context of composite indexes; there is
+ * no per-record dynamic-field semantics in shard-db, so an unknown subfield
+ * is just as broken as an unknown plain field. Returns the offending sub-
+ * name in `bad` (caller-owned buffer ≥256 B) when validation fails, so the
+ * error message can pinpoint it. */
+static int composite_subfields_known(const TypedSchema *ts, const char *name,
+                                     char *bad, size_t bad_sz) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", name);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, "+", &save); tok;
+         tok = strtok_r(NULL, "+", &save)) {
+        if (!tok[0]) continue;     /* empty token from leading/trailing '+' */
+        if (typed_field_index(ts, tok) < 0) {
+            snprintf(bad, bad_sz, "%s", tok);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int field_known(const TypedSchema *ts, const char *name) {
     if (!ts || !name || !name[0]) return 1;          /* nothing to check */
-    if (strchr(name, '+')) return 1;                  /* composite — handled per-record */
+    if (strchr(name, '+')) {
+        char dummy[256];
+        return composite_subfields_known(ts, name, dummy, sizeof(dummy));
+    }
     return typed_field_index(ts, name) >= 0;
 }
 
 static int validate_field(const TypedSchema *ts, const char *name,
                           const char *label, char *err, size_t err_sz) {
-    if (field_known(ts, name)) return 0;
+    if (!ts || !name || !name[0]) return 0;
+    if (strchr(name, '+')) {
+        char bad[256];
+        if (composite_subfields_known(ts, name, bad, sizeof(bad))) return 0;
+        snprintf(err, err_sz,
+                 "unknown sub-field '%s' in composite '%s' (%s)",
+                 bad, name, label);
+        return -1;
+    }
+    if (typed_field_index(ts, name) >= 0) return 0;
     snprintf(err, err_sz, "unknown field '%s' in %s", name, label);
     return -1;
 }

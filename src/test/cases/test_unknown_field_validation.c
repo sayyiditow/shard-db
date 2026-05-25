@@ -145,15 +145,26 @@ static int test_unknown_field_validation_run(void) {
                 "aggregate: order_by=missing → error");
     free(resp); resp = NULL;
 
-    /* ===== composite field bypass: still tolerated =====
-       'name+city' is a composite key — decode_field handles it per record.
-       The validator must NOT reject composites. */
+    /* ===== composite field: all subfields must exist =====
+       'name+city' has both subfields in the schema → accepted. */
     tc_request(tc,
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ufv\","
         "\"criteria\":[{\"field\":\"name+city\",\"op\":\"eq\",\"value\":\"alice|london\"}]}",
         &resp);
-    ASSERT_TRUE(resp && !has_unknown_field_error(resp),
-                "count: composite field 'name+city' accepted (not rejected as unknown)");
+    ASSERT_TRUE(resp && !has_unknown_field_error(resp)
+                && strstr(resp, "unknown sub-field") == NULL,
+                "count: composite 'name+city' (both subfields exist) → accepted");
+    free(resp); resp = NULL;
+
+    /* ===== composite with unknown subfield → error =====
+       Composite fields only exist in the context of indexes; an unknown
+       sub-name is the same bug class as a plain unknown field. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ufv\","
+        "\"criteria\":[{\"field\":\"name+missing\",\"op\":\"eq\",\"value\":\"alice|x\"}]}",
+        &resp);
+    ASSERT_TRUE(resp && strstr(resp, "unknown sub-field 'missing'") != NULL,
+                "count: composite 'name+missing' → error pinpointing 'missing'");
     free(resp); resp = NULL;
 
     tc_close(tc);
