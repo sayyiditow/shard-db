@@ -11658,17 +11658,20 @@ typedef struct {
     KeySet *ks;
     QueryDeadline *deadline;
     int dl_counter;
+    int overflowed;   /* set when keyset_insert reports cap exhausted */
 } IntersectCollectCtx;
 
 /* btree callback for the first leaf: every hit drops into the seed KeySet.
    Returns -1 on insert failure (capacity exhausted) so the btree walk halts
-   instead of paying O(cap) per insert into a full table. */
+   instead of paying O(cap) per insert into a full table.  Sets `overflowed`
+   so the caller can distinguish "capacity exhausted" (KeySet incomplete,
+   must discard) from "deadline hit" (return what we have, mark timed-out). */
 static int intersect_collect_cb(const char *val, size_t vlen,
                                 const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     IntersectCollectCtx *c = (IntersectCollectCtx *)ctx;
     if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
-    if (keyset_insert(c->ks, hash16) < 0) return -1;
+    if (keyset_insert(c->ks, hash16) < 0) { c->overflowed = 1; return -1; }
     return 0;
 }
 
@@ -12500,30 +12503,57 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
            NULL since there's no btree to fall back to, and the caller
            drops to full-scan — same effective behavior. */
     }
-    size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
+    /* Tiered KeySet allocation. Pre-2026-05-25 this function pre-allocated
+       a KeySet sized to (file-size hint floored at live count), which on a
+       25M-row table works out to ~1.2 GB pre-allocation — exceeds the
+       default QUERY_BUFFER_MB=256 budget guard → return NULL → every
+       caller falls back to per-record scan. Measured: an eq lookup on a
+       unique field that should return 0-1 rows took 23 seconds because
+       the budget guard refused to allocate.
+
+       Two-tier with overflow detection fixes that without per-operator
+       heuristics:
+
+         Tier 1: 64K slots (~1.5 MB) — fits the typical selective query
+                 (unique-field eq, narrow range, small in-set).
+         Tier 2: bounded by g_query_buffer_max_bytes — fits moderate-
+                 selectivity range/in/OR queries.
+         NULL  : even tier 2 overflowed → caller falls back to full
+                 scan. At that selectivity (millions of matches) the
+                 filter-first prefilter wouldn't have helped much anyway.
+
+       On tier-1 overflow we pay one extra btree walk to retry at tier 2.
+       Worth it: the alternative is the 23-second full ordered walk. */
+    const size_t bytes_per_entry = 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    const size_t budget_max_hint = g_query_buffer_max_bytes / bytes_per_entry;
+
+    size_t tier1 = 65536;
+    size_t tier2 = leaf_capacity_hint(db_root, object, leaf->field, splits);
     int live = get_live_count(db_root, object);
-    if (live > 0 && (size_t)live > hint) hint = (size_t)live;
-    /* Per-query budget guard: KeySet capacity is rounded up to ~2× hint
-       and each slot is `keys[16] + state[4]` = 20 B (with padding ≈ 24 B).
-       For a 25M-row table that's ~1.2 GB just for this one keyset —
-       blows past QUERY_BUFFER_MB (default 500) and triggers swap thrash
-       at the OS level. Return NULL when the projected footprint exceeds
-       the budget; callers already handle NULL by falling through to the
-       per-record scan path (slower but bounded memory, returns correct
-       results without OOM-ing the daemon). */
-    size_t ks_bytes_est = hint * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
-    /* coverity[tainted_data] CID 1693849: hint is bounded above by the
-       explicit g_query_buffer_max_bytes check immediately above. */
-    KeySet *ks = keyset_new(hint);
-    if (!ks) return NULL;
+    if (live > 0 && (size_t)live > tier2) tier2 = (size_t)live;
+    if (tier2 > budget_max_hint) tier2 = budget_max_hint;
+    if (tier2 < tier1) tier2 = tier1;   /* tiny table — both tiers same */
+
     TypedSchema *ts = load_typed_schema(db_root, object);
-    IntersectCollectCtx c = { ks, dl, 0 };
-    btree_dispatch(db_root, object, leaf->field, splits,
-                   leaf, resolve_idx_field(ts, leaf->field),
-                   intersect_collect_cb, &c);
-    if (dl->timed_out) { keyset_free(ks); return NULL; }
-    return ks;
+    const TypedField *tf = resolve_idx_field(ts, leaf->field);
+
+    size_t hints[2] = { tier1, tier2 };
+    int try_count = (tier1 == tier2) ? 1 : 2;
+    for (int t = 0; t < try_count; t++) {
+        /* coverity[tainted_data] CID 1693849: hint is bounded above by
+           the budget_max_hint clamp during tier2 derivation. */
+        KeySet *ks = keyset_new(hints[t]);
+        if (!ks) return NULL;
+        IntersectCollectCtx c = { ks, dl, 0, 0 };
+        btree_dispatch(db_root, object, leaf->field, splits,
+                       leaf, tf, intersect_collect_cb, &c);
+        if (dl->timed_out) { keyset_free(ks); return NULL; }
+        if (!c.overflowed) return ks;
+        keyset_free(ks);
+        /* Tier-1 overflowed; loop retries at tier 2.  Tier-2 overflow
+           exits the loop and returns NULL. */
+    }
+    return NULL;
 }
 
 /* Below this threshold for the most-selective leaf, fan out the candidates as
