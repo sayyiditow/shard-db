@@ -11862,32 +11862,17 @@ static int op_prefers_trigram(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_ICONTAINS;
 }
 
-/* Planner heuristic — for short contains/i_contains patterns on a
- * field that also has a btree, the btree-leaf walk wins over trigram
- * because the trigram path's verify step is O(candidates × per-record
- * fetch) while btree-leaf is O(total_leaves × per-leaf memmem). At
- * 25M scale on small-vocab data: "baker" (5 char, 833k hits)
- * costs ~160ms via btree-leaf vs ~740ms via trigram (verify-bound).
+/* Crossover length between btree-leaf scan and trigram intersection
+ * for contains/i_contains. The trigram verify step is O(candidates ×
+ * per-record fetch) while btree-leaf is O(total_leaves × per-leaf
+ * memmem). At 25M scale on small-vocab data: "baker" (5 char, 833k
+ * hits) costs ~160ms via btree-leaf vs ~740ms via trigram. Threshold 6
+ * is empirical: 5-char patterns regress to ~700ms+ via trigram, 6-char
+ * rare patterns win via trigram (6ms vs 200ms btree-leaf). Above 6 chars
+ * trigram intersection prunes fast and verify cost stays manageable.
  *
- * Threshold 6 is empirical: 5-char patterns regress to ~700ms+ via
- * trigram, 6-char rare patterns (e.g. "qwerty") win via trigram (6ms
- * vs 200ms btree-leaf). Above 6 chars trigram intersection prunes
- * fast and verify cost stays manageable for typical result sizes.
- *
- * Pre-condition: caller has already established op is trigram-able
- * and the field has a trigram index. */
+ * Consumed by pick_index_for_leaf — the single dispatch decision point. */
 #define TG_PREFER_BTREE_LEN 6
-static int planner_prefer_btree_leaf(const char *db_root, const char *object,
-                                     const SearchCriterion *leaf) {
-    if (!leaf) return 0;
-    size_t plen = strlen(leaf->value);
-    if (plen >= TG_PREFER_BTREE_LEN) return 0;
-    /* Order-independent — field_index_type returns first-declared type
-       only, so a field with both btree+trigram could return IT_TRIGRAM
-       depending on index.conf order. field_has_index_type checks for
-       any matching type, which is what we want here. */
-    return field_has_index_type(db_root, object, leaf->field, IT_BTREE);
-}
 
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
    over the cached arrays — cheap for the planner hot path. */
@@ -11923,7 +11908,7 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
  *  - For contains / i_contains:
  *      * pattern < TG_PREFER_BTREE_LEN chars AND btree present →
  *        IT_BTREE (btree-leaf memmem beats trigram-verify at short
- *        patterns; threshold is empirical, see planner_prefer_btree_leaf).
+ *        patterns; threshold is empirical, see TG_PREFER_BTREE_LEN).
  *      * Otherwise, trigram present AND pattern ≥ 3 chars → IT_TRIGRAM
  *        (trigrams need 3-grams).
  *      * Otherwise btree present → IT_BTREE (catches sub-3-char contains
@@ -13401,12 +13386,39 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
                where the positive match set is small; also the correct
                answer for NOT_EXISTS (the old default-branch path visited
-               every indexed entry and returned count(exists) instead). */
+               every indexed entry and returned count(exists) instead).
+               Dispatch on the picker's choice for the *inverted* form
+               — e.g. count(NOT_CONTAINS 'foobar') runs through trigram
+               if the picker would have picked trigram for CONTAINS
+               'foobar' (long-pattern win), then subtracts. */
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
             size_t pos_count = 0;
             int pos_ok = 1;
-            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+            int pos_picked = pick_index_for_leaf(db_root, object, &pos);
+            if (pos_picked == IT_TRIGRAM) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, &pos, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    /* parallel_indexed_count re-verifies each candidate
+                       against the full criterion tree, but here the
+                       positive form `pos` is what we want — substitute
+                       a single-leaf tree around `pos` instead of `tree`. */
+                    CriteriaNode pos_leaf = { .kind = CNODE_LEAF, .leaf = pos,
+                                              .children = NULL, .n_children = 0 };
+                    pos_count = parallel_indexed_count(db_root, object, &sch,
+                                                       entries, (int)n,
+                                                       &pos_leaf, &fs, &dl);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    pos_ok = !dl.timed_out;
+                } else {
+                    pos_ok = 0;
+                }
+            } else if (pos_picked == IT_BITMAP) {
                 /* Bitmap popcount fast path for the inverted positive.
                    Eq/IN → per-value popcount sum. Anything else (the
                    inverted form of NOT_LIKE / NOT_CONTAINS / NOT_REGEX
@@ -13422,6 +13434,9 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                               &pos, pc_tf);
                 }
             } else {
+                /* IT_BTREE or -1 — btree_dispatch handles bitmap-keyed
+                   fields via its internal routing if the picker fell
+                   back to btree for a non-trigram-prefer op. */
                 int pos_cp = op_needs_check_primary(pos.op);
                 IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
                 btree_dispatch(db_root, object, pc->field, sch.splits,
@@ -13436,14 +13451,18 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            /* Trigram fast path: contains/i_contains over a
-               trigram-indexed field. Build the candidate keyset via
-               trigram intersection, then verify each candidate with
-               the full criterion (kills false positives from
-               order-insensitive trigram match). */
-            if (op_prefers_trigram(op) &&
-                !planner_prefer_btree_leaf(db_root, object, pc) &&
-                field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+            /* Dispatch on the picker's chosen index — same rulebook the
+               planner used to claim this leaf:
+                 IT_TRIGRAM → build trigram keyset, verify candidates via
+                             parallel_indexed_count (kills false positives
+                             from order-insensitive trigram match).
+                 IT_BITMAP  → popcount-style fast path (per-value sum for
+                             eq/IN, dict-scan + per-matching-value sum
+                             otherwise). Avoids the per-record fan-out the
+                             default idx_count_cb path needs.
+                 IT_BTREE   → btree_dispatch + idx_count_cb. */
+            int picked = pick_index_for_leaf(db_root, object, pc);
+            if (picked == IT_TRIGRAM) {
                 KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                            sch.splits, pc, &dl);
                 if (tg_ks) {
@@ -13460,26 +13479,14 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     free_criteria_tree(tree);
                     return 0;
                 }
-                /* tg_ks NULL → sub-3-char pattern. Drop to the
-                   PRIMARY_NONE record-walk so correctness is preserved
-                   (a sub-3 pattern can match anything; no index can
-                   help). */
-                {
-                    CountCtx ctx = { tree, &fs, 0, &dl, 0 };
-                    scan_dispatch(db_root, object, &sch, data_dir,
-                                  count_scan_cb, &ctx);
-                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                    else OUT("%d\n", ctx.count);
-                    free_criteria_tree(tree);
-                    return 0;
-                }
+                /* tg_ks NULL is unexpected here — the picker enforces
+                   plen ≥ 3 before returning IT_TRIGRAM. Treat as a
+                   transient failure and emit 0 (defensive only). */
+                OUT("0\n");
+                free_criteria_tree(tree);
+                return 0;
             }
-            /* Bitmap routes all single-leaf counts through a popcount-
-               style fast path: per-value sum for eq/IN, dict-scan +
-               per-matching-value sum for everything else. Both avoid
-               the per-record fan-out + per-bit cb invocations that the
-               default idx_count_cb path needs. */
-            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+            if (picked == IT_BITMAP) {
                 size_t total;
                 if (op == OP_EQUAL || op == OP_IN) {
                     total = bm_popcount_for_crit(db_root, object,
@@ -14615,15 +14622,18 @@ int cmd_find(const char *db_root, const char *object,
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
-        /* Trigram dispatch: contains/i_contains over a trigram-indexed
-           field — build candidate keyset, convert to CollectedHash[],
-           feed to process_batch. Same emit pipeline as idx_find_parallel,
-           just sourced from the trigram intersection instead of a btree
-           walk. */
+        /* Dispatch on the picker's chosen index — same rulebook the
+           planner used to claim this leaf, so we can't disagree.
+           IT_TRIGRAM goes through keyset_emit_find sourced from the
+           trigram intersection; IT_BITMAP and IT_BTREE both ride
+           idx_find_parallel, which routes bitmap via btree_dispatch's
+           internal bitmap branch. The picker has already enforced
+           plen >= 3 for trigram, so build_keyset_from_trigram returning
+           NULL here is a transient failure rather than an unsupported
+           pattern. */
         int rc = 0;
-        if (op_prefers_trigram(op) &&
-            !planner_prefer_btree_leaf(db_root, object, pc) &&
-            field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+        int picked = pick_index_for_leaf(db_root, object, pc);
+        if (picked == IT_TRIGRAM) {
             KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                        sch.splits, pc, &dl);
             if (tg_ks) {
@@ -14634,17 +14644,9 @@ int cmd_find(const char *db_root, const char *object,
                                       rows_fmt, dict_fmt, csv_delim,
                                       joins, njoins, &dl);
                 keyset_free(tg_ks);
-                goto find_emit_close;
             }
-            /* tg_ks NULL (sub-3-char pattern) — fall through to
-               idx_find_parallel, which will also return zero results
-               since trigram-only fields have no .idx. Better to scan;
-               but the scan-fallback only fires from cmd_count today —
-               for find we accept "no results" on sub-3 patterns as the
-               documented behaviour (HN explorer is supposed to gate
-               this client-side). */
+            goto find_emit_close;
         }
-
         rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
