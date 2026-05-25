@@ -1266,7 +1266,7 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
                     BmPair *t = xrealloc_or_free(sw->bm_pairs[fi],
                                                   new_cap * sizeof(BmPair));
                     if (!t) {
-                        log_msg(1, "INDEX_OOM shard=%d field=%s (dropped bitmap pair)",
+                        LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (dropped bitmap pair)",
                                 sw->shard_id, sw->idx_fields[fi]);
                         sw->bm_pairs[fi] = NULL;
                         sw->bm_pair_counts[fi] = 0;
@@ -1314,7 +1314,7 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
                 size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
                 BtEntry *t = xrealloc_or_free(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
                 if (!t) {
-                    log_msg(1, "INDEX_OOM shard=%d field=%s (dropped index pair on realloc; rerun reindex)",
+                    LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (dropped index pair on realloc; rerun reindex)",
                             sw->shard_id, sw->idx_fields[fi]);
                     sw->idx_pairs[fi] = NULL;
                     sw->idx_pair_counts[fi] = 0;
@@ -1345,7 +1345,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
-        log_msg(1, "INSERT_DROP shard=%d (cannot open slotcask, dropping %zu records)",
+        LOG_ERROR(LOG_SUB_SLOTCASK, "INSERT_DROP shard=%d (cannot open slotcask, dropping %zu records)",
                 sw->shard_id, sw->count);
         sw->errors += (int)sw->count;
         return NULL;
@@ -1530,73 +1530,15 @@ static void *bulk_insert_shard_worker(void *arg) {
 /* Internal: bulk insert from a json string already in memory (no file I/O) */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str, int if_not_exists);
 
-int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
-                    int if_not_exists) {
+/* ---- bulk_ins_run: shared parser + write body --------------------------
+   Caller owns `data` (null-terminated, len bytes). This helper never
+   frees or munmaps it — all cleanup of the buffer belongs to the caller.
+   Returns 0 on success, 1 on parse/insert error (JSON error already
+   written via OUT() before returning). */
+static int bulk_ins_run(const char *db_root, const char *object,
+                        const char *data, size_t len, int if_not_exists) {
+    const char *json = data;
     uint64_t t0 = now_ms_coarse();
-    size_t len;
-    char *json;
-    int json_mmaped = 0;
-    if (input) {
-        /* mmap the file instead of malloc — OS pages in/out as we scan */
-        int ifd = open(input, O_RDONLY);
-        if (ifd < 0) { fprintf(stderr, "Error: Cannot open %s\n", input); return 1; }
-        struct stat st;
-        if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
-        len = st.st_size;
-        if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
-        /* MAP_PRIVATE on a file fd lets us write the trailing NUL into
-           the partial last page (zero-filled slack, copy-on-write). But
-           if `len` is *exactly* page-aligned, there is no partial last
-           page — byte [len] lives on a NEW page that the kernel does
-           NOT back. Writing there SIGBUSes. Skip the mmap path in that
-           case and fall through to alloc+read, which owns its memory.
-           Reproduced via ASan when a 5000-row bulk-insert chunk landed
-           on exactly 0x86000 bytes (548 KB) after schema-shrink. */
-        long pgsize_l = sysconf(_SC_PAGESIZE);
-        size_t pgsize = (pgsize_l > 0) ? (size_t)pgsize_l : 4096;
-        int try_mmap = (len % pgsize) != 0;
-        json = try_mmap
-            ? mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0)
-            : MAP_FAILED;
-        if (json == MAP_FAILED) {
-            /* Fallback: allocate and read */
-            json = malloc(len + 1);
-            if (!json) { close(ifd); fprintf(stderr, "Error: Cannot allocate\n"); return 1; }
-            lseek(ifd, 0, SEEK_SET);
-            size_t rd = 0;
-            while (rd < len) {
-                ssize_t n = read(ifd, json + rd, len - rd);
-                if (n <= 0) break;
-                rd += n;
-            }
-            json[len] = '\0';
-        } else {
-            json_mmaped = 1;
-            madvise(json, len, MADV_SEQUENTIAL);
-            /* Null-terminate — MAP_PRIVATE so write is COW on last page only */
-            json[len] = '\0';
-        }
-        close(ifd);
-    } else {
-        size_t cap = 65536, pos = 0;
-        json = malloc(cap);
-        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
-        int c;
-        while ((c = fgetc(stdin)) != EOF) {
-            if (pos >= cap - 1) {
-                cap *= 2;
-                char *t = xrealloc_or_free(json, cap);
-                if (!t) { json = NULL; break; }
-                json = t;
-            }
-            json[pos++] = c;
-        }
-        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
-        json[pos] = '\0'; len = pos;
-    }
-    /* json is non-NULL on all paths reaching here: the file branch (988-1015)
-       returns early on every alloc failure; the stdin branch (1016-1032)
-       returns at the initial-malloc and post-realloc NULL guards. */
 
     /* Load config ONCE */
     Schema sc = load_schema(db_root, object);
@@ -1612,7 +1554,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     if (ts && ts->total_size > sc.max_value) {
         fprintf(stderr, "Error: typed record size %d exceeds max_value %d\n",
                 ts->total_size, sc.max_value);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         return 1;
     }
 
@@ -1666,7 +1607,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
 
     if (!is_object_format && !is_array_format) {
         fprintf(stderr, "Error: Expected JSON object or array\n");
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
         return 1;
@@ -1887,7 +1827,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
             validation_failed_idx);
         return 1;
@@ -1942,7 +1881,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"query_timeout\"}\n");
         return 1;
     }
@@ -1959,7 +1897,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"oom: bulk_insert shard_counts\"}\n");
         return 1;
     }
@@ -2000,7 +1937,6 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        if (json_mmaped) munmap(json, len + 1); else free(json);
         OUT("{\"error\":\"oom: bulk_insert workers\"}\n");
         return 1;
     }
@@ -2085,7 +2021,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                 while (idx_pair_counts[fi] + add > new_cap) new_cap *= 2;
                 BtEntry *t = xrealloc_or_free(idx_pairs[fi], new_cap * sizeof(BtEntry));
                 if (!t) {
-                    log_msg(1, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
+                    LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
                             fi, idx_pair_counts[fi] + add);
                     idx_pairs[fi] = NULL;
                     idx_pair_counts[fi] = 0;
@@ -2119,8 +2055,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
     /* ucache keeps mmaps open — OS flushes dirty pages */
-    if (json_mmaped) munmap(json, len + 1);  /* len+1 matches mmap size */
-    else free(json);
+    /* (caller owns the json buffer — no free/munmap here) */
 
     /* Bulk write indexes — one worker per field; the worker streams the per-
        shard merges sequentially. Halves dispatch overhead vs the old
@@ -2153,7 +2088,7 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     if (count > 0) update_count(db_root, object, count);
 
     uint64_t t4 = now_ms_coarse();  /* end of Phase 4 (index build) */
-    log_msg(3, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
+    LOG_INFO(LOG_SUB_QUERY, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
             object, count,
             (unsigned long)(t1 - t0),
             (unsigned long)(t2 - t1),
@@ -2190,49 +2125,80 @@ int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
     return errors > 0 ? 1 : 0;
 }
 
-/* Bulk insert from a string already in memory — no temp file needed.
-   On Linux the fast path uses memfd_create + /proc/self/fd/N so the
-   downstream mmap reader is page-cache only with no real filesystem
-   round-trip. macOS has neither memfd_create nor /proc/self/fd/N, so
-   it takes the /tmp fallback unconditionally (same code path that
-   already handles memfd_create failure on Linux). */
+int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
+                    int if_not_exists) {
+    size_t len;
+    char *json;
+    int json_mmaped = 0;
+    if (input) {
+        /* mmap the file instead of malloc — OS pages in/out as we scan */
+        int ifd = open(input, O_RDONLY);
+        if (ifd < 0) { fprintf(stderr, "Error: Cannot open %s\n", input); return 1; }
+        struct stat st;
+        if (fstat(ifd, &st) < 0) { close(ifd); fprintf(stderr, "Error: Cannot stat %s\n", input); return 1; }
+        len = st.st_size;
+        if (len == 0) { close(ifd); fprintf(stderr, "Error: Empty input\n"); return 1; }
+        /* MAP_PRIVATE on a file fd lets us write the trailing NUL into
+           the partial last page (zero-filled slack, copy-on-write). But
+           if `len` is *exactly* page-aligned, there is no partial last
+           page — byte [len] lives on a NEW page that the kernel does
+           NOT back. Writing there SIGBUSes. Skip the mmap path in that
+           case and fall through to alloc+read, which owns its memory.
+           Reproduced via ASan when a 5000-row bulk-insert chunk landed
+           on exactly 0x86000 bytes (548 KB) after schema-shrink. */
+        long pgsize_l = sysconf(_SC_PAGESIZE);
+        size_t pgsize = (pgsize_l > 0) ? (size_t)pgsize_l : 4096;
+        int try_mmap = (len % pgsize) != 0;
+        json = try_mmap
+            ? mmap(NULL, len + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, ifd, 0)
+            : MAP_FAILED;
+        if (json == MAP_FAILED) {
+            /* Fallback: allocate and read */
+            json = malloc(len + 1);
+            if (!json) { close(ifd); fprintf(stderr, "Error: Cannot allocate\n"); return 1; }
+            lseek(ifd, 0, SEEK_SET);
+            size_t rd = 0;
+            while (rd < len) {
+                ssize_t n = read(ifd, json + rd, len - rd);
+                if (n <= 0) break;
+                rd += n;
+            }
+            json[len] = '\0';
+        } else {
+            json_mmaped = 1;
+            madvise(json, len, MADV_SEQUENTIAL);
+            /* Null-terminate — MAP_PRIVATE so write is COW on last page only */
+            json[len] = '\0';
+        }
+        close(ifd);
+    } else {
+        size_t cap = 65536, pos = 0;
+        json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
+        int c;
+        while ((c = fgetc(stdin)) != EOF) {
+            if (pos >= cap - 1) {
+                cap *= 2;
+                char *t = xrealloc_or_free(json, cap);
+                if (!t) { json = NULL; break; }
+                json = t;
+            }
+            json[pos++] = c;
+        }
+        if (!json) { fprintf(stderr, "Error: out of memory reading stdin\n"); return 1; }
+        json[pos] = '\0'; len = pos;
+    }
+
+    int rc = bulk_ins_run(db_root, object, json, len, if_not_exists);
+    if (json_mmaped) munmap(json, len + 1); else free(json);
+    return rc;
+}
+
+/* Bulk insert from a string already in memory — calls bulk_ins_run directly,
+   no memfd/mmap dance needed. */
 int cmd_bulk_insert_string(const char *db_root, const char *object, char *json_str,
                            int if_not_exists) {
-    size_t slen = strlen(json_str);
-#ifdef __linux__
-    int memfd = memfd_create("shard-db_bulk", 0);
-#else
-    int memfd = -1;  /* macOS / non-Linux: skip straight to /tmp fallback */
-#endif
-    if (memfd < 0) {
-        /* Fallback: temp file. Also the macOS path. */
-        char tmp[PATH_MAX];
-        snprintf(tmp, sizeof(tmp), "/tmp/shard-db_bulk_%d_%d.json", getpid(), (int)pthread_self());
-        FILE *tf = fopen(tmp, "w");
-        if (tf) { fwrite(json_str, 1, slen, tf); fclose(tf); }
-        int r = cmd_bulk_insert(db_root, object, tmp, if_not_exists);
-        unlink(tmp);
-        return r;
-    }
-    /* Coverity CID 1693846: check ftruncate + write returns. Silent
-       failure here would feed an empty file to cmd_bulk_insert and
-       silently process zero records. */
-    if (ftruncate(memfd, (off_t)slen) < 0) {
-        close(memfd);
-        OUT("{\"error\":\"memfd ftruncate failed: %s\"}\n", strerror(errno));
-        return 1;
-    }
-    ssize_t wrote = write(memfd, json_str, slen);
-    if (wrote != (ssize_t)slen) {
-        close(memfd);
-        OUT("{\"error\":\"memfd short write: %zd of %zu\"}\n", wrote, slen);
-        return 1;
-    }
-    char fdpath[64];
-    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", memfd);
-    int r = cmd_bulk_insert(db_root, object, fdpath, if_not_exists);
-    close(memfd);
-    return r;
+    return bulk_ins_run(db_root, object, json_str, strlen(json_str), if_not_exists);
 }
 
 /* ========== BULK INSERT (DELIMITED TEXT FILE) ========== */
@@ -2727,7 +2693,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 while (idx_pair_counts[fi] + add > new_cap) new_cap *= 2;
                 BtEntry *t = xrealloc_or_free(idx_pairs[fi], new_cap * sizeof(BtEntry));
                 if (!t) {
-                    log_msg(1, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
+                    LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM merge field_idx=%d (dropped %zu pairs; rerun reindex)",
                             fi, idx_pair_counts[fi] + add);
                     idx_pairs[fi] = NULL;
                     idx_pair_counts[fi] = 0;
@@ -2787,7 +2753,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     if (count > 0) update_count(db_root, object, count);
 
     uint64_t t4 = now_ms_coarse();  /* end of Phase 4 (index build) */
-    log_msg(3, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
+    LOG_INFO(LOG_SUB_QUERY, "BULK-INSERT %s: rows=%d phase1_parse=%lums phase2_write=%lums (grows=%d grow_total=%lums per_worker_max=%lums) phase3_activate=%lums phase4_index=%lums total=%lums",
             object, count,
             (unsigned long)(t1 - t0),
             (unsigned long)(t2 - t1),
@@ -3728,7 +3694,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     }
     free(workers);
 
-    log_msg(3, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
+    LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
 
     if (cas_crit) free_criteria(cas_crit, cas_ncrit);
@@ -4135,7 +4101,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     /* Caller owns `data`. */
     (void)data_mmaped; (void)st;
 
-    log_msg(3, "BULK-UPDATE-DELIM %s matched=%d updated=%d skipped=%d",
+    LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE-DELIM %s matched=%d updated=%d skipped=%d",
             object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
     return 0;
@@ -4735,7 +4701,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     if (json_mmaped) munmap((void *)json, len);
     else if (input_is_file) free(json);
 
-    log_msg(3, "BULK-UPDATE-JSON %s matched=%d updated=%d skipped=%d",
+    LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE-JSON %s matched=%d updated=%d skipped=%d",
             object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
     return 0;
@@ -4947,7 +4913,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     if (!sdb || matched == 0) {
-        log_msg(3, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
+        LOG_INFO(LOG_SUB_QUERY, "BULK-DELETE %s matched=%d deleted=0 skipped=%d (v2)",
                  object, matched, sdb ? 0 : matched);
         OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":%d}\n",
             matched, sdb ? 0 : matched);
@@ -5042,7 +5008,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         update_count(db_root, object, -deleted);
         update_deleted_count(db_root, object, deleted);
     }
-    log_msg(3, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
+    LOG_INFO(LOG_SUB_QUERY, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
              object, matched, deleted, skipped);
     OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
 
@@ -5137,7 +5103,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         update_deleted_count(db_root, object, deleted);
     }
 
-    log_msg(3, "BULK-DELETE %s matched=%d deleted=%d skipped=%d", object, matched, deleted, skipped);
+    LOG_INFO(LOG_SUB_QUERY, "BULK-DELETE %s matched=%d deleted=%d skipped=%d", object, matched, deleted, skipped);
     OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
 
     if (cas_crit) free_criteria(cas_crit, cas_ncrit);
@@ -5588,7 +5554,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     /* Atomic rename: data/ → data.legacy/. The new slotcask_open below
        will re-create data/ from scratch with the new schema. */
     if (rename(data_dir, legacy_dir) != 0) {
-        log_msg(1, "rebuild_v2: rename(%s → %s) failed: %s",
+        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed: %s",
                 data_dir, legacy_dir, strerror(errno));
         OUT("{\"error\":\"Failed to stage legacy data\"}\n");
         return 1;
@@ -5613,7 +5579,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     snprintf(legacy_data_under_root, sizeof(legacy_data_under_root),
              "%s/data", legacy_root);
     if (rename(legacy_dir, legacy_data_under_root) != 0) {
-        log_msg(1, "rebuild_v2: rename(%s → %s): %s",
+        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s): %s",
                 legacy_dir, legacy_data_under_root, strerror(errno));
         rmrf(legacy_root);
         OUT("{\"error\":\"Failed to stage legacy data root\"}\n");
@@ -5630,7 +5596,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     if (!legacy_open || !new_open) {
         if (legacy_open) slotcask_close(&legacy_db);
         if (new_open)    slotcask_close(&new_db);
-        log_msg(1, "rebuild_v2: open failed (legacy=%d new=%d)",
+        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: open failed (legacy=%d new=%d)",
                 legacy_open, new_open);
         OUT("{\"error\":\"Failed to open slotcask handles for rebuild\"}\n");
         return 1;
@@ -5697,7 +5663,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     slotcask_close(&new_db);
 
     if (walk_err) {
-        log_msg(1, "rebuild_v2: walk error after %d records", live_count);
+        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: walk error after %d records", live_count);
         OUT("{\"error\":\"Rebuild walk failed; %s/.rebuild_legacy_root preserved\"}\n", obj_dir);
         return 1;
     }
@@ -5733,9 +5699,9 @@ static int rebuild_object_v2(const char *db_root, const char *object,
         fclose(fin);
         fclose(fout);
         if (rename(fpath, fpath_old) != 0)
-            log_msg(1, "rebuild_v2: rename(%s → %s) failed", fpath, fpath_old);
+            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed", fpath, fpath_old);
         if (rename(fpath_new, fpath) != 0) {
-            log_msg(1, "rebuild_v2: rename(%s → %s) failed — restoring", fpath_new, fpath);
+            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed — restoring", fpath_new, fpath);
             (void)rename(fpath_old, fpath);
             OUT("{\"error\":\"Failed to swap fields.conf\"}\n");
             return 1;
@@ -5762,7 +5728,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     int idx_rebuilt = 0;
     if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
 
-    log_msg(3, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
             old_sch->streams, new_sch->streams,
             old_sch->slot_size, new_sch->slot_size, drop_tombstoned, idx_rebuilt);
@@ -5947,11 +5913,11 @@ int rebuild_object(const char *db_root, const char *object,
                     }
                     if (slot < 0) {
                         ucache_write_release(wh);
-                        log_msg(1, "REBUILD %s/%s: no free slot in new shard %d after grow", db_root, object, new_shard);
+                        LOG_ERROR(LOG_SUB_CONFIG, "REBUILD %s/%s: no free slot in new shard %d after grow", db_root, object, new_shard);
                         continue;
                     }
                 } else {
-                    log_msg(1, "REBUILD %s/%s: grow failed for new shard %d", db_root, object, new_shard);
+                    LOG_ERROR(LOG_SUB_CONFIG, "REBUILD %s/%s: grow failed for new shard %d", db_root, object, new_shard);
                     continue;
                 }
             }
@@ -6041,7 +6007,7 @@ int rebuild_object(const char *db_root, const char *object,
            manually restore data_old → data_dir; either way we're already
            returning an error so just log the secondary failure. */
         if (rename(data_old, data_dir) != 0)
-            log_msg(1, "vacuum: rollback rename(%s → %s) failed: %s",
+            LOG_ERROR(LOG_SUB_VACUUM, "vacuum: rollback rename(%s → %s) failed: %s",
                     data_old, data_dir, strerror(errno));
         if (fields_changed) unlink(fpath_new);
         OUT("{\"error\":\"Failed to rename data.new → data\"}\n");
@@ -6050,10 +6016,10 @@ int rebuild_object(const char *db_root, const char *object,
 
     if (fields_changed) {
         if (rename(fpath, fpath_old) != 0)
-            log_msg(1, "vacuum: rename(%s → %s) failed: %s",
+            LOG_ERROR(LOG_SUB_VACUUM, "vacuum: rename(%s → %s) failed: %s",
                     fpath, fpath_old, strerror(errno));
         if (rename(fpath_new, fpath) != 0) {
-            log_msg(1, "vacuum: rename(%s → %s) failed: %s — restoring old fields.conf",
+            LOG_ERROR(LOG_SUB_VACUUM, "vacuum: rename(%s → %s) failed: %s — restoring old fields.conf",
                     fpath_new, fpath, strerror(errno));
             /* Best-effort restore of the previous fields.conf from .old. */
             (void)rename(fpath_old, fpath);
@@ -6086,7 +6052,7 @@ int rebuild_object(const char *db_root, const char *object,
     int idx_rebuilt = 0;
     if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
 
-    log_msg(3, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_splits, new_splits,
             old_sch.slot_size, new_sch.slot_size, drop_tombstoned, idx_rebuilt);
     OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
@@ -6634,7 +6600,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
             return 1;
         }
         invalidate_schema_caches(db_root, object);
-        log_msg(3, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
+        LOG_AUDIT(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited (no-op encoding, fields.conf only)",
                 db_root, object, n_edits);
         OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":false}\n", n_edits);
         for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
@@ -6703,7 +6669,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
         /* Data is already in new shape but fields.conf still reflects old.
            This is the unrecoverable corner. Log loudly so the operator can
            fix manually. */
-        log_msg(1, "EDIT-FIELD %s/%s: data rebuilt but fields.conf rewrite "
+        LOG_ERROR(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: data rebuilt but fields.conf rewrite "
                    "failed — manual repair required", db_root, object);
         OUT("{\"error\":\"Data rebuilt but fields.conf rewrite failed; manual repair required\"}\n");
         return 1;
@@ -6716,7 +6682,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     selective_reindex_dirty(db_root, object, dirty_names, n_dirty,
                             &idx_rebuilt, &idx_skipped);
 
-    log_msg(3, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
+    LOG_AUDIT(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
                "idx_rebuilt=%d, idx_skipped=%d",
             db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
             idx_rebuilt, idx_skipped);
@@ -15583,6 +15549,7 @@ int cmd_truncate(const char *db_root, const char *object) {
     mkdirp(path);
 
     set_count(db_root, object, 0);
+    LOG_AUDIT(LOG_SUB_CONFIG, "TRUNCATE %s", object);
     OUT("{\"status\":\"truncated\",\"object\":\"%s\"}\n", object);
     return 0;
 }
@@ -16037,6 +16004,25 @@ static int parse_auto_key_spec(const char *spec, char *out_seq_name, size_t seq_
     return -1;
 }
 
+/* Worker for parallel bitmap-shard materialisation inside cmd_create_object.
+   Each task creates one (field, shard) bitmap file; tasks are independent so
+   no locking is needed beyond what bm_open already provides internally. */
+typedef struct {
+    char    path[PATH_MAX];
+    int     slots_per_shard;
+    int     is_bool;
+    uint32_t max_values;
+} CreateBmArg;
+
+static void *create_bm_worker(void *raw) {
+    CreateBmArg *a = (CreateBmArg *)raw;
+    BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 1, a->is_bool,
+                               a->max_values, 1 /* writer: materialise file */);
+    if (bm) bm_close(bm);
+    /* Best-effort — same policy as the old serial loop. */
+    return NULL;
+}
+
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
@@ -16467,7 +16453,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             (void)write(sfd, "0\n", 2);
             close(sfd);
         } else if (errno != EEXIST) {
-            log_msg(1, "auto_key seq init: open(%s) failed: %s",
+            LOG_ERROR(LOG_SUB_CONFIG, "auto_key seq init: open(%s) failed: %s",
                     seq_path, strerror(errno));
         }
     }
@@ -16564,38 +16550,66 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
        the declared cap (default or override). Empty at create-time;
        CRUD maintains bits on insert/update/delete, reindex backfills
        any records that pre-existed the field. Per declared bitmap field,
-       create `splits` per-data-shard files. */
-    for (int i = 0; i < npidx; i++) {
-        if (pidx[i].type != IT_BITMAP) continue;
-        /* Skip composite — already rejected upstream, defensive only. */
-        if (strchr(pidx[i].name, '+')) continue;
-        /* Find field's storage type to set the bool fast-path flag. */
-        int is_bool = 0;
-        int fnlen = (int)strlen(pidx[i].name);
-        for (int j = 0; j < nfields; j++) {
-            const char *fc = strchr(field_specs[j], ':');
-            if (!fc) continue;
-            int jlen = (int)(fc - field_specs[j]);
-            if (jlen != fnlen) continue;
-            if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
-            if (strncmp(fc + 1, "bool", 4) == 0 && (fc[5] == '\0' || fc[5] == ':')) {
-                is_bool = 1;
-            }
-            break;
-        }
+       create `splits` per-data-shard files.
+
+       Fan out via parallel_for: flatten (bitmap-field × shard) into one
+       task array, then let the thread pool do the ftruncate+mmap calls
+       concurrently.  At 256 splits × 1 bool field this is 256 independent
+       file-creates that previously ran serially (~2.4 s cold). */
+    {
         int slots_per_shard = (int)slotcask_default_slots_for_splits(splits);
-        for (int s = 0; s < splits; s++) {
-            char bm_path[PATH_MAX];
-            bm_build_path(bm_path, sizeof(bm_path), eff_root, object,
-                          pidx[i].name, s);
-            BitmapShard *bm = bm_open(bm_path, slots_per_shard, 1, is_bool,
-                                      pidx[i].max_values, 1 /* writer: materialise file */);
-            if (bm) bm_close(bm);
-            /* Best-effort: if a single shard fails to create, the next
-               insert will retry. Don't fail the whole create-object. */
+
+        /* First pass: count tasks so we can size the array exactly. */
+        int total_bm_tasks = 0;
+        for (int i = 0; i < npidx; i++) {
+            if (pidx[i].type != IT_BITMAP) continue;
+            if (strchr(pidx[i].name, '+')) continue;
+            total_bm_tasks += splits;
+        }
+
+        if (total_bm_tasks > 0) {
+            CreateBmArg *bm_args = malloc((size_t)total_bm_tasks * sizeof(CreateBmArg));
+            if (!bm_args) {
+                OUT("{\"error\":\"OOM building bitmap prealloc task list\"}\n");
+                return 1;
+            }
+            int idx = 0;
+            for (int i = 0; i < npidx; i++) {
+                if (pidx[i].type != IT_BITMAP) continue;
+                if (strchr(pidx[i].name, '+')) continue;
+
+                /* Find field's storage type to set the bool fast-path flag. */
+                int is_bool = 0;
+                int fnlen = (int)strlen(pidx[i].name);
+                for (int j = 0; j < nfields; j++) {
+                    const char *fc = strchr(field_specs[j], ':');
+                    if (!fc) continue;
+                    int jlen = (int)(fc - field_specs[j]);
+                    if (jlen != fnlen) continue;
+                    if (memcmp(field_specs[j], pidx[i].name, fnlen) != 0) continue;
+                    if (strncmp(fc + 1, "bool", 4) == 0 &&
+                        (fc[5] == '\0' || fc[5] == ':')) {
+                        is_bool = 1;
+                    }
+                    break;
+                }
+
+                for (int s = 0; s < splits; s++) {
+                    bm_build_path(bm_args[idx].path, sizeof(bm_args[idx].path),
+                                  eff_root, object, pidx[i].name, s);
+                    bm_args[idx].slots_per_shard = slots_per_shard;
+                    bm_args[idx].is_bool         = is_bool;
+                    bm_args[idx].max_values      = pidx[i].max_values;
+                    idx++;
+                }
+            }
+            parallel_for(create_bm_worker, bm_args, total_bm_tasks, sizeof(CreateBmArg));
+            free(bm_args);
         }
     }
 
+    LOG_AUDIT(LOG_SUB_CONFIG, "CREATE-OBJECT %s/%s: splits=%d max_key=%d fields=%d streams=%d",
+            dir, object, splits, max_key, nfields, streams);
     OUT("{\"status\":\"created\",\"object\":\"%s\",\"dir\":\"%s\",\"splits\":%d,\"max_key\":%d,\"value_size\":%d,\"fields\":%d,\"storage_version\":2,\"streams\":%d}\n",
         object, dir, splits, max_key, total_value_size, nfields, streams);
     return 0;
@@ -16665,7 +16679,7 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
             fclose(out);
             fclose(in);
             if (rename(tmp_path, schema_path) != 0) {
-                log_msg(1, "drop_object: rename(%s → %s): %s",
+                LOG_ERROR(LOG_SUB_CONFIG, "drop_object: rename(%s → %s): %s",
                         tmp_path, schema_path, strerror(errno));
                 unlink(tmp_path);
             }
@@ -16674,7 +16688,7 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    log_msg(3, "DROP-OBJECT %s/%s", dir, object);
+    LOG_AUDIT(LOG_SUB_CONFIG, "DROP-OBJECT %s/%s", dir, object);
     OUT("{\"status\":\"dropped\",\"dir\":\"%s\",\"object\":\"%s\"}\n", dir, object);
     return 0;
 }

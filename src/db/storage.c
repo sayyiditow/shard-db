@@ -602,7 +602,7 @@ static void grow_recovery_dir(const char *dir) {
             size_t nl = strlen(e->d_name);
             if (nl >= 4 && strcmp(e->d_name + nl - 4, ".new") == 0) {
                 if (unlinkat(dfd, e->d_name, 0) == 0)
-                    log_msg(2, "grow_recovery: unlinked stale %s/%s",
+                    LOG_WARN(LOG_SUB_SLOTCASK, "grow_recovery: unlinked stale %s/%s",
                             dir, e->d_name);
             }
         }
@@ -1001,7 +1001,7 @@ int cmd_get(const char *db_root, const char *object,
         OUT("{\"error\":\"Not found\"}\n");
         return 1;
     }
-    log_msg(4, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
+    LOG_DEBUG(LOG_SUB_SLOTCASK, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
     TypedSchema *ts = load_typed_schema(db_root, object);
     typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
                          g_out ? g_out : stdout);
@@ -1393,7 +1393,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     if (!result.was_update) update_count(db_root, object, 1);
     char wire_key[1100];
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
-    log_msg(3, "%s %s.%s (slotcask)",
+    LOG_INFO(LOG_SUB_SLOTCASK, "%s %s.%s (slotcask)",
             result.was_update ? "UPDATE" : "INSERT", object, wire_key);
 
     free(result.current_value);
@@ -1727,7 +1727,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
 
     char wire_key[1100];
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
-    log_msg(3, "UPDATE %s.%s (slotcask)", object, wire_key);
+    LOG_INFO(LOG_SUB_SLOTCASK, "UPDATE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
     OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
     return 0;
@@ -1939,7 +1939,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     }
 
     update_counts(db_root, object, -1, 1);
-    log_msg(3, "DELETE %s.%s (slotcask)", object, wire_key);
+    LOG_INFO(LOG_SUB_SLOTCASK, "DELETE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
     free_criteria(crit, ncrit);
     OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);

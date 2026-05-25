@@ -1242,10 +1242,10 @@ void objlock_wrlock(const char *db_root, const char *object);
 void objlock_wrunlock(const char *db_root, const char *object);
 void rebuild_recovery(const char *db_root);
 
-/* logging */
+/* logging — see src/db/log.h for the macros + subsystem registry. */
+#include "log.h"
 void log_init(const char *db_root);
 void log_shutdown(void);
-void log_msg(int level, const char *fmt, ...);
 
 /* pthread_create wrapper that pre-sets stack size to 8 MB. macOS default
    thread stack is 512 KB (Linux is 8 MB) — too small for our deepest

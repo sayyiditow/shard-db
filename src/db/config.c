@@ -114,33 +114,7 @@ uint64_t now_ms_coarse(void) {
 
 extern char g_log_dir[PATH_MAX];
 
-void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms) {
-    __atomic_add_fetch(&g_slow_query_count, 1, __ATOMIC_RELAXED);
-    pthread_mutex_lock(&g_slow_query_lock);
-    SlowQueryEntry *e = &g_slow_queries[g_slow_query_head];
-    e->ts_ms = now_ms();
-    e->duration_ms = duration_ms;
-    snprintf(e->mode,   sizeof(e->mode),   "%s", mode   ? mode   : "");
-    snprintf(e->dir,    sizeof(e->dir),    "%s", dir    ? dir    : "");
-    snprintf(e->object, sizeof(e->object), "%s", object ? object : "");
-    g_slow_query_head = (g_slow_query_head + 1) % SLOW_QUERY_RING;
-    pthread_mutex_unlock(&g_slow_query_lock);
-    /* Dated slow log file, same rotation as info/error */
-    time_t t = time(NULL);
-    struct tm tmbuf; struct tm *tm = localtime_r(&t, &tmbuf);
-    char date[16], path[PATH_MAX];
-    strftime(date, sizeof(date), "%Y-%m-%d", tm);
-    snprintf(path, sizeof(path), "%s/slow-%s.log", g_log_dir, date);
-    FILE *f = fopen(path, "a");
-    if (f) {
-        char iso[32];
-        strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S", tm);
-        fprintf(f, "%s %ums mode=%s dir=%s object=%s\n",
-                iso, duration_ms,
-                mode ? mode : "", dir ? dir : "", object ? object : "");
-        fclose(f);
-    }
-}
+/* log_slow_query — defined after LogEntry/ring declarations below. */
 __thread FILE *g_out = NULL;    /* per-thread output; init to stdout in main() */
 char g_db_root[PATH_MAX] = {0};
 
@@ -151,11 +125,13 @@ int g_log_level = 3;
 int g_log_retain_days = 7;
 
 #define LOG_RING_SIZE 8192
-#define LOG_MSG_SIZE  512
+#define LOG_MSG_MAX   4096
 
 typedef struct {
-    char msg[LOG_MSG_SIZE];
-    int level;
+    int  level;      /* LOG_LVL_* */
+    int  is_audit;   /* 1 = route to audit file, bypass level filter */
+    int  is_slow;    /* 1 = route to slow file, bypass level filter */
+    char msg[LOG_MSG_MAX];
 } LogEntry;
 
 LogEntry g_log_ring[LOG_RING_SIZE];
@@ -214,18 +190,46 @@ void *log_writer_thread(void *arg) {
             pthread_cond_wait(&g_log_cond, &g_log_lock);
 
         /* Batch flush */
-        FILE *info_f = NULL, *err_f = NULL;
+        FILE *info_f = NULL, *err_f = NULL, *audit_f = NULL, *slow_f = NULL;
         while (g_log_head != g_log_tail) {
             LogEntry *e = &g_log_ring[g_log_tail];
-            FILE **target = (e->level <= 1) ? &err_f : &info_f;
-            if (!*target) *target = open_log_for_level(e->level);
+            FILE **target;
+            if (e->is_audit) {
+                /* Route to <date>-audit.log, bypassing level filter */
+                if (!audit_f) {
+                    time_t now2 = time(NULL);
+                    struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
+                    char date2[16], path2[PATH_MAX];
+                    strftime(date2, sizeof(date2), "%Y-%m-%d", t2);
+                    snprintf(path2, sizeof(path2), "%s/%s-audit.log", g_log_dir, date2);
+                    audit_f = fopen(path2, "a");
+                }
+                target = &audit_f;
+            } else if (e->is_slow) {
+                /* Route to slow-<date>.log (Task 4 sets is_slow=1) */
+                if (!slow_f) {
+                    time_t now2 = time(NULL);
+                    struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
+                    char date2[16], path2[PATH_MAX];
+                    strftime(date2, sizeof(date2), "%Y-%m-%d", t2);
+                    snprintf(path2, sizeof(path2), "%s/slow-%s.log", g_log_dir, date2);
+                    slow_f = fopen(path2, "a");
+                }
+                target = &slow_f;
+            } else {
+                /* Normal level-based routing */
+                target = (e->level <= 1) ? &err_f : &info_f;
+                if (!*target) *target = open_log_for_level(e->level);
+            }
             if (*target) fputs(e->msg, *target);
             g_log_tail = (g_log_tail + 1) % LOG_RING_SIZE;
         }
         pthread_mutex_unlock(&g_log_lock);
 
-        if (info_f) { fflush(info_f); fclose(info_f); }
-        if (err_f) { fflush(err_f); fclose(err_f); }
+        if (info_f)  { fflush(info_f);  fclose(info_f);  }
+        if (err_f)   { fflush(err_f);   fclose(err_f);   }
+        if (audit_f) { fflush(audit_f); fclose(audit_f); }
+        if (slow_f)  { fflush(slow_f);  fclose(slow_f);  }
 
         /* Purge old logs every ~1000 flushes */
         if (++flush_counter % 1000 == 0) purge_old_logs();
@@ -265,30 +269,118 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
     return rc;
 }
 
-void log_msg(int level, const char *fmt, ...) {
+void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     if (level > g_log_level ||
         !atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
+    if (level < 1 || level > 4) level = LOG_LVL_INFO;
+    const char *sub = subsystem ? subsystem : "unknown";
+
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
 
     LogEntry entry;
-    entry.level = level;
-    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s [%s] ", ts, labels[level]);
+    entry.level    = level;
+    entry.is_audit = 0;
+    entry.is_slow  = 0;
+    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s %s [%s] ",
+                       ts, labels[level], sub);
     va_list ap;
     va_start(ap, fmt);
     pos += vsnprintf(entry.msg + pos, sizeof(entry.msg) - pos, fmt, ap);
     va_end(ap);
-    if (pos < (int)sizeof(entry.msg) - 1) { entry.msg[pos] = '\n'; entry.msg[pos+1] = '\0'; }
+    if (pos < (int)sizeof(entry.msg) - 1) {
+        entry.msg[pos]   = '\n';
+        entry.msg[pos+1] = '\0';
+    }
 
-    /* Non-blocking enqueue */
     pthread_mutex_lock(&g_log_lock);
     int next = (g_log_head + 1) % LOG_RING_SIZE;
     if (next != g_log_tail) {
         g_log_ring[g_log_head] = entry;
         g_log_head = next;
+    }
+    pthread_cond_signal(&g_log_cond);
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+
+void log_audit_sub(const char *subsystem, const char *fmt, ...) {
+    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    const char *sub = subsystem ? subsystem : "unknown";
+
+    time_t now = time(NULL);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+
+    LogEntry entry;
+    entry.level    = LOG_LVL_INFO;   /* for the displayed line shape */
+    entry.is_audit = 1;
+    entry.is_slow  = 0;
+    int pos = snprintf(entry.msg, sizeof(entry.msg), "%s INFO [%s] ", ts, sub);
+    va_list ap;
+    va_start(ap, fmt);
+    pos += vsnprintf(entry.msg + pos, sizeof(entry.msg) - pos, fmt, ap);
+    va_end(ap);
+    if (pos < (int)sizeof(entry.msg) - 1) {
+        entry.msg[pos]   = '\n';
+        entry.msg[pos+1] = '\0';
+    }
+
+    pthread_mutex_lock(&g_log_lock);
+    int next = (g_log_head + 1) % LOG_RING_SIZE;
+    if (next != g_log_tail) {
+        g_log_ring[g_log_head] = entry;
+        g_log_head = next;
+    }
+    pthread_cond_signal(&g_log_cond);
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+void log_slow_query(const char *mode, const char *dir,
+                    const char *object, uint32_t duration_ms) {
+    __atomic_add_fetch(&g_slow_query_count, 1, __ATOMIC_RELAXED);
+
+    /* In-memory ring for the /stats endpoint (existing behaviour). */
+    pthread_mutex_lock(&g_slow_query_lock);
+    SlowQueryEntry *e = &g_slow_queries[g_slow_query_head];
+    e->ts_ms = now_ms();
+    e->duration_ms = duration_ms;
+    snprintf(e->mode,   sizeof(e->mode),   "%s", mode   ? mode   : "");
+    snprintf(e->dir,    sizeof(e->dir),    "%s", dir    ? dir    : "");
+    snprintf(e->object, sizeof(e->object), "%s", object ? object : "");
+    g_slow_query_head = (g_slow_query_head + 1) % SLOW_QUERY_RING;
+    pthread_mutex_unlock(&g_slow_query_lock);
+
+    /* File log via shared ring buffer (replaces the previous direct
+       fopen+fprintf path).  is_slow=1 routes to slow-<date>.log via
+       the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
+       threshold is the filter. */
+    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    time_t now = time(NULL);
+    struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+
+    LogEntry entry;
+    entry.level    = LOG_LVL_INFO;
+    entry.is_audit = 0;
+    entry.is_slow  = 1;
+    snprintf(entry.msg, sizeof(entry.msg),
+             "%s INFO [slow] %ums mode=%s dir=%s object=%s\n",
+             ts, duration_ms,
+             mode   ? mode   : "",
+             dir    ? dir    : "",
+             object ? object : "");
+
+    pthread_mutex_lock(&g_log_lock);
+    int next2 = (g_log_head + 1) % LOG_RING_SIZE;
+    if (next2 != g_log_tail) {
+        g_log_ring[g_log_head] = entry;
+        g_log_head = next2;
     }
     pthread_cond_signal(&g_log_cond);
     pthread_mutex_unlock(&g_log_lock);
@@ -541,7 +633,7 @@ int dirs_add(const char *db_root, const char *dir) {
     char dir_path[PATH_MAX];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dir);
     if (mkdir(dir_path, 0755) != 0 && errno != EEXIST)
-        log_msg(1, "add_dir: mkdir(%s): %s", dir_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "add_dir: mkdir(%s): %s", dir_path, strerror(errno));
 
     pthread_mutex_unlock(&g_dirs_lock);
     return 0;
@@ -602,7 +694,7 @@ int dirs_remove(const char *db_root, const char *dir, int check_empty) {
         }
         fclose(in); fclose(out);
         if (rename(tmp, path) != 0) {
-            log_msg(1, "remove_dir: rename(%s → %s): %s", tmp, path, strerror(errno));
+            LOG_ERROR(LOG_SUB_CONFIG, "remove_dir: rename(%s → %s): %s", tmp, path, strerror(errno));
             unlink(tmp);
         }
     } else {
@@ -2882,7 +2974,7 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
         }
 
         if (renameat(dfd, e->d_name, dfd, newbase) != 0) {
-            log_msg(1, "rename-field: failed to rename %s/%s -> %s: %s",
+            LOG_ERROR(LOG_SUB_CONFIG, "rename-field: failed to rename %s/%s -> %s: %s",
                     idx_dir, e->d_name, newbase, strerror(errno));
         }
     }
@@ -2909,7 +3001,7 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
     fclose(f);
     fclose(nf);
     if (rename(newconf_path, conf_path) != 0) {  /* atomic swap */
-        log_msg(1, "rename_field: rename(%s → %s): %s", newconf_path, conf_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "rename_field: rename(%s → %s): %s", newconf_path, conf_path, strerror(errno));
         unlink(newconf_path);
     }
     return 0;
@@ -3024,7 +3116,10 @@ int cmd_add_fields(const char *db_root, const char *object,
     }
 
     /* rebuild_object appends lines to fields.conf and rewrites shards atomically. */
-    return rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
+    int rc = rebuild_object(db_root, object, 0, 0, lines, nlines, 0);
+    if (rc == 0)
+        LOG_AUDIT(LOG_SUB_CONFIG, "ADD-FIELD %s/%s: %d field(s) added", db_root, object, nlines);
+    return rc;
 }
 
 /* ========== remove-field ==========
@@ -3111,7 +3206,7 @@ static int drop_indexes_for_fields(const char *db_root, const char *object,
     fclose(f);
     fclose(nf);
     if (rename(tmp_path, conf_path) != 0) {
-        log_msg(1, "remove_field: rename(%s → %s): %s", tmp_path, conf_path, strerror(errno));
+        LOG_ERROR(LOG_SUB_CONFIG, "remove_field: rename(%s → %s): %s", tmp_path, conf_path, strerror(errno));
         unlink(tmp_path);
     }
     return dropped;
@@ -3202,7 +3297,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    log_msg(3, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
+    LOG_AUDIT(LOG_SUB_CONFIG, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
             db_root, object, nnames, dropped);
     OUT("{\"status\":\"removed\",\"fields\":%d,\"indexes_dropped\":%d}\n", nnames, dropped);
     return 0;
@@ -3290,7 +3385,7 @@ int cmd_rename_field(const char *db_root, const char *object,
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(object);
 
-    log_msg(3, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
+    LOG_AUDIT(LOG_SUB_CONFIG, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
     OUT("{\"status\":\"renamed\",\"old\":\"%s\",\"new\":\"%s\"}\n", old_name, new_name);
     return 0;
 }
