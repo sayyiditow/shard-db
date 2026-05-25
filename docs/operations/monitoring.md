@@ -43,10 +43,10 @@ Key metrics to scrape:
 Queries exceeding `SLOW_QUERY_MS` (default 500 ms, floor 100 ms):
 
 - Last 64 kept in memory (visible in `stats`).
-- Persisted to `$LOG_DIR/slow-YYYY-MM-DD.log` — one JSON object per line.
+- Persisted to `$LOG_DIR/YYYY-MM-DD-slow.log` — one JSON object per line.
 
 ```bash
-tail -f /opt/shard-db/logs/slow-$(date +%Y-%m-%d).log
+tail -f /opt/shard-db/logs/$(date +%Y-%m-%d)-slow.log
 ```
 
 Use a log-based alert (`jq` + your monitoring stack, or a log-shipper like Vector / Fluent Bit) to alert on duration or frequency spikes.
@@ -71,7 +71,7 @@ All logs live under `$LOG_DIR` (default `./logs/`).
 |---|---|---|
 | `info-YYYY-MM-DD.log` | Server start/stop, schema mutations, vacuum runs, connection accept/close at debug level. | Daily. Pruned after `LOG_RETAIN_DAYS` (default 7). |
 | `error-YYYY-MM-DD.log` | Auth failures, malformed requests, write errors, crashes. | Daily. Same retention. |
-| `slow-YYYY-MM-DD.log` | Queries exceeding `SLOW_QUERY_MS`. | Daily. Same retention. |
+| `YYYY-MM-DD-slow.log` | Queries exceeding `SLOW_QUERY_MS`. | Daily. Same retention. |
 
 Set `LOG_RETAIN_DAYS=0` to disable auto-prune and use logrotate instead (see [Deployment → Log rotation](deployment.md#log-rotation)).
 

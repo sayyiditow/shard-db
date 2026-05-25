@@ -206,13 +206,16 @@ void *log_writer_thread(void *arg) {
                 }
                 target = &audit_f;
             } else if (e->is_slow) {
-                /* Route to slow-<date>.log (Task 4 sets is_slow=1) */
+                /* Route to <date>-slow.log — matches the date-prefix
+                   convention used by the info / error / audit logs.
+                   (Pre-2026.05.9 used the inconsistent `slow-<date>.log`
+                   form; ls in $LOG_DIR was ordered weirdly.) */
                 if (!slow_f) {
                     time_t now2 = time(NULL);
                     struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
                     char date2[16], path2[PATH_MAX];
                     strftime(date2, sizeof(date2), "%Y-%m-%d", t2);
-                    snprintf(path2, sizeof(path2), "%s/slow-%s.log", g_log_dir, date2);
+                    snprintf(path2, sizeof(path2), "%s/%s-slow.log", g_log_dir, date2);
                     slow_f = fopen(path2, "a");
                 }
                 target = &slow_f;

@@ -324,7 +324,7 @@ Token-management endpoints inherit auth: anyone with a global `rwx` token (or fr
 Queries exceeding `SLOW_QUERY_MS` (default 500 ms, floor 100 ms) are logged to:
 
 - **In-memory ring** — last 64, visible via `stats`.
-- **On-disk** — `$LOG_DIR/slow-YYYY-MM-DD.log`, one line per slow query with timestamp, mode, object, duration, abridged criteria.
+- **On-disk** — `$LOG_DIR/YYYY-MM-DD-slow.log`, one line per slow query with timestamp, mode, object, duration, abridged criteria.
 
 Disable with `SLOW_QUERY_MS=0`. Raise the floor if your baseline queries routinely cross 100 ms — otherwise the log drowns in noise.
 
@@ -332,7 +332,7 @@ Disable with `SLOW_QUERY_MS=0`. Raise the floor if your baseline queries routine
 
 - `info-YYYY-MM-DD.log` — structured info events (server start/stop, schema mutations, vacuum runs).
 - `error-YYYY-MM-DD.log` — errors (auth failures, malformed requests, write errors, crashes).
-- `slow-YYYY-MM-DD.log` — slow query ring, persisted.
+- `YYYY-MM-DD-slow.log` — slow query ring, persisted.
 
 `LOG_RETAIN_DAYS` auto-prunes older files. `0` = keep forever.
 
