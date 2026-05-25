@@ -257,6 +257,13 @@ static int bench_queries_run(void) {
     const char *db_root_env = getenv("SHARD_BENCH_DB_ROOT");
     int bench_keep = getenv("SHARD_BENCH_KEEP") ? 1 : 0;
     int bench_skip_insert = getenv("SHARD_BENCH_SKIP_INSERT") ? 1 : 0;
+    /* SHARD_BENCH_DROP_INDEXES_FIRST=1 → exercise the load-then-index
+       pattern (create-object with no indexes, bulk-insert, then add-index
+       per field). At R = COUNT/200K ≥ ~20 this beats pre-existing-indexes
+       parallel because per-(field, shard) merge cost scales O(R²). For
+       25M / 1M chunks that's R=25 — solidly in load-then-index territory.
+       See docs/operations/bulk-loading.md for the crossover. */
+    int bench_drop_idx_first = getenv("SHARD_BENCH_DROP_INDEXES_FIRST") ? 1 : 0;
     if (bench_skip_insert && !db_root_env) {
         fprintf(stderr, "bench-queries: SHARD_BENCH_SKIP_INSERT requires SHARD_BENCH_DB_ROOT\n");
         return 1;
@@ -326,21 +333,48 @@ static int bench_queries_run(void) {
        that even at high N. (If chunked-bulk-insert into a populated
        indexed table hits performance issues, the engine needs to fix
        it — not the bench's job to paper over it.) */
+    /* Index names — must match the indexes embedded in the create-object
+       JSON below when bench_drop_idx_first == 0, AND drive the post-insert
+       add-index loop when bench_drop_idx_first == 1. Single source of
+       truth keeps the two modes from drifting. */
+    static const char *const IDX_FIELDS[] = {
+        "username", "email", "age", "user_id", "rank",
+        "score", "active", "level", "birthday",
+        "created_at", "balance", "hourly_rate"
+    };
+    const int IDX_NFIELDS = (int)(sizeof(IDX_FIELDS) / sizeof(IDX_FIELDS[0]));
+
     if (!bench_skip_insert) {
         char create_obj[2048];
-        snprintf(create_obj, sizeof(create_obj),
-            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
-            "\"splits\":%ld,\"max_key\":32,"
-            "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
-                        "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
-                        "\"rank:short\",\"score:double\",\"active:bool\","
-                        "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
-                        "\"balance:numeric:12,2\",\"hourly_rate:currency\","
-                        "\"category:enum(electronics,clothing,books,home,sports)\"],"
-            "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
-                         "\"score\",\"active\",\"level\",\"birthday\","
-                         "\"created_at\",\"balance\",\"hourly_rate\"]}",
-            SPLITS);
+        if (bench_drop_idx_first) {
+            snprintf(create_obj, sizeof(create_obj),
+                "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+                "\"splits\":%ld,\"max_key\":32,"
+                "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                            "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                            "\"rank:short\",\"score:double\",\"active:bool\","
+                            "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                            "\"balance:numeric:12,2\",\"hourly_rate:currency\","
+                            "\"category:enum(electronics,clothing,books,home,sports)\"],"
+                "\"indexes\":[]}",
+                SPLITS);
+            printf("  load-then-index mode (SHARD_BENCH_DROP_INDEXES_FIRST=1) — "
+                   "no indexes during insert; %d adds run after\n", IDX_NFIELDS);
+        } else {
+            snprintf(create_obj, sizeof(create_obj),
+                "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+                "\"splits\":%ld,\"max_key\":32,"
+                "\"fields\":[\"username:varchar:50\",\"email:varchar:100\","
+                            "\"bio:varchar:500\",\"age:int\",\"user_id:long\","
+                            "\"rank:short\",\"score:double\",\"active:bool\","
+                            "\"level:byte\",\"birthday:date\",\"created_at:datetime\","
+                            "\"balance:numeric:12,2\",\"hourly_rate:currency\","
+                            "\"category:enum(electronics,clothing,books,home,sports)\"],"
+                "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
+                             "\"score\",\"active\",\"level\",\"birthday\","
+                             "\"created_at\",\"balance\",\"hourly_rate\"]}",
+                SPLITS);
+        }
         tc_request(tc, create_obj, &resp);
         free(resp); resp = NULL;
     }
@@ -413,6 +447,36 @@ static int bench_queries_run(void) {
         printf("  total insert: %.2fs  throughput: %.2f M/sec\n\n",
                (double)(insert_t1 - insert_t0) / 1e9,
                (double)COUNT / 1e6 / ((double)(insert_t1 - insert_t0) / 1e9));
+
+        /* Load-then-index phase: only fires when SHARD_BENCH_DROP_INDEXES_FIRST
+           is set. One add-index call with the full field array → cmd_add_indexes
+           scans storage ONCE and accumulates entries for every index in the
+           same pass (per-field workers fed by a shared scan; see index.c
+           comment "Per-shard build worker shared by cmd_add_index and
+           cmd_add_indexes"). Versus 12 sequential single-field add-index
+           calls, which would each do their own scan over 25 M records —
+           wasteful. */
+        if (bench_drop_idx_first) {
+            char add_req[512];
+            int n = snprintf(add_req, sizeof(add_req),
+                "{\"mode\":\"add-index\",\"dir\":\"default\","
+                "\"object\":\"users\",\"fields\":[");
+            for (int i = 0; i < IDX_NFIELDS; i++) {
+                n += snprintf(add_req + n, sizeof(add_req) - n,
+                              "%s\"%s\"", i ? "," : "", IDX_FIELDS[i]);
+            }
+            snprintf(add_req + n, sizeof(add_req) - n, "]}");
+            printf("  add-index phase (load-then-index, %d fields in one scan)…",
+                   IDX_NFIELDS);
+            fflush(stdout);
+            uint64_t a0 = bench_now_ns();
+            tc_request(tc, add_req, &resp);
+            uint64_t a1 = bench_now_ns();
+            printf(" %.2fs\n", (double)(a1 - a0) / 1e9);
+            free(resp); resp = NULL;
+            printf("  load+index total: %.2fs\n\n",
+                   (double)(a1 - insert_t0) / 1e9);
+        }
     } else {
         printf("  skipping insert (SHARD_BENCH_SKIP_INSERT=1)\n\n");
     }

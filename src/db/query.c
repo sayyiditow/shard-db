@@ -1591,12 +1591,25 @@ static int bulk_ins_run(const char *db_root, const char *object,
             char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
             char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
             while (tok && idx_field_counts[fi] < 16) {
-                idx_field_indices[fi][idx_field_counts[fi]++] =
-                    ts ? typed_field_index(ts, tok) : -1;
+                int fidx = ts ? typed_field_index(ts, tok) : -1;
+                if (fidx < 0) {
+                    LOG_ERROR(LOG_SUB_CONFIG,
+                              "index.conf drift on object '%s': index '%s' "
+                              "references unknown sub-field '%s' (bulk-insert)",
+                              object, idx_fields[fi], tok);
+                }
+                idx_field_indices[fi][idx_field_counts[fi]++] = fidx;
                 tok = strtok_r(NULL, "+", &_tok_save);
             }
         } else {
-            idx_field_indices[fi][0] = ts ? typed_field_index(ts, idx_fields[fi]) : -1;
+            int fidx = ts ? typed_field_index(ts, idx_fields[fi]) : -1;
+            if (fidx < 0) {
+                LOG_ERROR(LOG_SUB_CONFIG,
+                          "index.conf drift on object '%s': field '%s' "
+                          "indexed but not in fields.conf (bulk-insert)",
+                          object, idx_fields[fi]);
+            }
+            idx_field_indices[fi][0] = fidx;
             idx_field_counts[fi] = 1;
         }
     }
@@ -2268,11 +2281,25 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
             char fb[256]; strncpy(fb, idx_fields[fi], 255); fb[255] = '\0';
             char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
             while (tok && idx_field_counts[fi] < 16) {
-                idx_field_indices[fi][idx_field_counts[fi]++] = typed_field_index(ts, tok);
+                int fidx = typed_field_index(ts, tok);
+                if (fidx < 0) {
+                    LOG_ERROR(LOG_SUB_CONFIG,
+                              "index.conf drift on object '%s': index '%s' "
+                              "references unknown sub-field '%s' (bulk-delete)",
+                              object, idx_fields[fi], tok);
+                }
+                idx_field_indices[fi][idx_field_counts[fi]++] = fidx;
                 tok = strtok_r(NULL, "+", &_tok_save);
             }
         } else {
-            idx_field_indices[fi][0] = typed_field_index(ts, idx_fields[fi]);
+            int fidx = typed_field_index(ts, idx_fields[fi]);
+            if (fidx < 0) {
+                LOG_ERROR(LOG_SUB_CONFIG,
+                          "index.conf drift on object '%s': field '%s' "
+                          "indexed but not in fields.conf (bulk-delete)",
+                          object, idx_fields[fi]);
+            }
+            idx_field_indices[fi][0] = fidx;
             idx_field_counts[fi] = 1;
         }
     }
