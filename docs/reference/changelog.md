@@ -4,27 +4,30 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased
+## 2026.05.8
 
-In-flight on `feat/logging-framework`. Logging surface reshape + bundled bug/perf fixes.
+Correctness + perf release. Headline: **4800× speedup** on selective-filter + order_by queries when the matching record's order-key lands late in the sort walk. **Logging framework reshape** (typed `LOG_*` macros, new `<date>-audit.log`, structured `subsystem` field — operators with log-parsing regexes need to update). **Unknown-field queries error loudly** instead of silently returning empty results. No `./migrate` required, wire-compatible with 2026.05.7.x.
 
-### Logging framework
+Full notes: [`docs/release-notes/2026.05.8.md`](../release-notes/2026.05.8.md). Highlights:
 
-- **Log line shape changed.** Was `2026-05-24 21:11:54 [INFO] body`; now `2026-05-24 21:11:54 INFO [subsystem] body`. Subsystem is one of: `server`, `slotcask`, `btree`, `bitmap`, `trigram`, `index`, `query`, `planner`, `vacuum`, `warmup`, `auth`, `tls`, `config`, `reindex`, `slow`. Operators with log-parsing regexes need to update.
-- **New per-level macros + subsystem registry** in `src/db/log.h`: `LOG_ERROR`, `LOG_WARN`, `LOG_INFO`, `LOG_DEBUG`, `LOG_AUDIT`. Compiler enforces level + subsystem at every site (typo-safe). Legacy `log_msg(int level, fmt, ...)` removed — every internal caller migrated.
-- **New audit log file.** `<date>-audit.log` captures security/admin events: token add/remove, IP allow-list mutations, schema mutations (add/edit/remove/rename field), create-object, drop-object, add-index, remove-index, auth failures, admin-gate denials. Bypasses `LOG_LEVEL` filter so compliance review doesn't depend on operator config. Inherits `LOG_RETAIN_DAYS` retention.
-- **Slow-query log reformatted.** Keeps filename `slow-YYYY-MM-DD.log` but line shape aligns with the framework: `2026-05-24 21:11:54 INFO [slow] 789ms mode=find dir=hn object=stories` (was ISO-T datetime). Routes through the shared async ring buffer instead of direct fopen.
-- **Audit-class events promoted from INFO/WARN to AUDIT.** Every admin command + auth failure now lands in the audit file in addition to (or instead of) the regular per-level file. Four NEW audit-log sites added that previously had no logging at all: `add-token`, `remove-token`, `add-ip`, `remove-ip`.
-
-### Performance + bug-class fixes (bundled)
-
-- **`cmd_create_object` per-shard bitmap preallocation parallelised** via `parallel_for`. 256-split × 3 bool-field create-object drops from ~2.4 s to ~645 ms (~4×). The kf and seg preallocations were already parallel inside `slotcask_open`; only the bitmap-shard loop was serial.
-- **Server-side `bulk-insert` no longer routes through `memfd_create` + mmap.** Extracted the parser body into `bulk_ins_run(data, len, ...)`. `cmd_bulk_insert_string` calls it directly with the in-memory JSON — drops ~5 syscalls per bulk-insert and eliminates the page-aligned-mmap SIGBUS bug class (fixed minimally in PR #72) by construction for the server path. CLI bulk-insert keeps the mmap-or-read path for genuine large-file loads.
+- **`find criteria + order_by`** with selective prefilter no longer walks the full order_by btree. New small-prefilter shortcut (K ≤ 1000 → fetch + in-memory sort) plus unified `pick_index_for_leaf` at plan time. Worst case `eq username order_by age desc limit 10`: **1737 ms → 0.36 ms**.
+- **Unknown-field validation** at the entry of `cmd_count`/`cmd_find`/`cmd_aggregate`. Composite-field sub-names validated too. Returns `{"error":"unknown field 'X' in criteria"}` in microseconds instead of `[]` after a 38-second scan.
+- **`cmd_drop_object`** 17-33 ms during warmup (was 3-20 s) — fixed `g_reg_lock`-held-across-`slotcask_open` contention.
+- **`cmd_bulk_insert` SIGBUS on page-aligned payloads** fixed; server path no longer routes through memfd+mmap.
+- **Warmup drives slotcask registry + kfcache via cache APIs** so first user query is genuinely warm.
+- **Bitmap cardinality probe** before materializing ordered-find prefilter — skips ~37 s of doomed materialization on broad bitmap criteria.
+- **`pick_index_for_leaf` unifies index dispatch** at plan time, no runtime cross-index cascade. Closes silent-empty bugs on sub-3-char trigram and bitmap-with-tiered-KeySet.
+- **Logging framework**: typed `LOG_INFO/WARN/ERROR/DEBUG/AUDIT`, new `<date>-audit.log`, structured subsystem field. Log line shape changed — see operator notes.
+- **`KF_RESPLIT`** demoted from raw stderr to `LOG_INFO(LOG_SUB_SLOTCASK,...)`.
+- **`docs/operations/bulk-loading.md`** new cookbook with the R-crossover rule (R = N/200K, load-then-index for R ≥ 20). New `SHARD_BENCH_DROP_INDEXES_FIRST=1` knob in `bench-queries` to A/B the seed pattern.
+- **Bulk-insert/delete index-drift safety net**: `LOG_ERROR("index.conf drift...")` if it ever fires. Audit confirmed unreachable today; future-proofed.
+- **`bench-cache-pollution`** reproducer added. 25M scale: noise band (working set fits in RAM). Re-trigger at full-HN scale.
 
 ### Operator migration notes
 
-- Log-parsing scripts that match `\[ERROR\]` etc. need to switch to `^[\d-]+ [\d:]+ ERROR \[`.
-- New `<date>-audit.log` file in `LOG_DIR`. Add to log shipping if you forward shard-db logs externally.
+- Log-parsing scripts that match `\[ERROR\]` etc. need to switch to `^[\d-]+ [\d:]+ ERROR \[`. New shape: `2026-05-25 14:33:21 ERROR [subsystem] body`.
+- New `<date>-audit.log` file in `LOG_DIR`. Add to log shipping if you forward shard-db logs externally. Bypasses `LOG_LEVEL`.
+- If seeding > 4 M records on a fresh object: drop indexes → bulk-insert → multi-field `add-index` (plural) is dramatically faster than inserting into pre-existing indexes. See [`docs/operations/bulk-loading.md`](../operations/bulk-loading.md). Don't loop singular `add-index` per field — that's N full scans.
 
 ## 2026.05.7.1
 
