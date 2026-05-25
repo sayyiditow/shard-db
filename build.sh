@@ -139,6 +139,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
     src/test/cases/test_unknown_field_validation.c \
+    src/test/cases/test_small_prefilter_orderby.c \
     src/test/cases/test_float_field_type.c \
     src/test/cases/test_all_field_types.c \
     src/test/cases/test_case_sensitivity.c \
@@ -242,6 +243,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_invoice.c \
     src/bench/bench_parallel.c \
     src/bench/bench_queries.c \
+    src/bench/bench_cache_pollution.c \
     src/bench/bench_joins.c \
     src/bench/bench_incremental.c \
     src/bench/bench_btree.c \

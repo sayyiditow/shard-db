@@ -14130,6 +14130,69 @@ static int cursor_find_cb(const char *val, size_t vlen,
     return 0;
 }
 
+/* Threshold for the small-prefilter ordered-find shortcut.
+ *
+ * When the prefilter KeySet built from indexed criteria has very few
+ * entries (typical case: selective single-match like
+ * `eq username='alice.smith0'`), walking the order_by btree from one
+ * end to the other looking for a hash16 in a 1-entry KeySet is O(N)
+ * in the table size. If the matching record's order-by value lands
+ * late in the desc walk, that's 25M btree entries visited for a
+ * limit-10 query.
+ *
+ * Below the threshold we instead fetch every prefilter record directly
+ * (K reads, no scan), decode the order_by field, sort in memory, and
+ * emit. Costs O(K log K + K record fetches) = sub-ms at K = 1000.
+ *
+ * Above the threshold the in-memory fetch+sort starts to exceed the
+ * btree-walk-with-limit-short-circuit cost. 1000 is a starting point
+ * — bench against your real data if you tune it. */
+#define SMALL_PREFILTER_THRESHOLD 1000
+
+typedef struct {
+    uint8_t hash[16];
+    uint8_t sort_key[1024];   /* typed_field_to_index_key output — memcmp-sortable */
+    size_t  sort_key_len;
+} SmallPrefilterRow;
+
+typedef struct {
+    SmallPrefilterRow *rows;
+    size_t             cap;
+    size_t             i;
+} SmallPrefilterCollect;
+
+static int small_prefilter_collect_cb(const uint8_t hash[16], void *ctx) {
+    SmallPrefilterCollect *c = (SmallPrefilterCollect *)ctx;
+    if (c->i >= c->cap) return 1;            /* defensive */
+    memcpy(c->rows[c->i].hash, hash, 16);
+    c->i++;
+    return 0;
+}
+
+/* Memcmp on the index-encoded sort_key bytes — they're produced by
+ * typed_field_to_index_key, which mirrors the btree's storage encoding
+ * (varchar = raw bytes, int/long/short/byte = top-bit-flipped BE so
+ * memcmp orders signed values correctly, date/datetime/numeric/currency
+ * = BE bytes). qsort is stable enough across libcs for our use; we
+ * don't depend on tie-break stability since hash16 break-down is the
+ * btree's responsibility, not ours.
+ *
+ * Length-aware: shorter strings compare as smaller at the prefix-match
+ * point, matching the btree's varchar order. */
+static int small_prefilter_cmp_asc(const void *a, const void *b) {
+    const SmallPrefilterRow *ra = a, *rb = b;
+    size_t mlen = ra->sort_key_len < rb->sort_key_len
+                  ? ra->sort_key_len : rb->sort_key_len;
+    int c = memcmp(ra->sort_key, rb->sort_key, mlen);
+    if (c != 0) return c;
+    if (ra->sort_key_len < rb->sort_key_len) return -1;
+    if (ra->sort_key_len > rb->sort_key_len) return 1;
+    return 0;
+}
+static int small_prefilter_cmp_desc(const void *a, const void *b) {
+    return -small_prefilter_cmp_asc(a, b);
+}
+
 /* Maximum candidate count before we fall back from filter-first to
    walk-ordered + per-record criteria_match. The threshold is set to
    100K because:
@@ -14593,6 +14656,115 @@ int cmd_find(const char *db_root, const char *object,
                 free_criteria_tree(tree);
                 free_excluded(&excluded);
                 return 0;
+            }
+
+            /* Small-prefilter shortcut. When the indexed criteria
+               narrowed down to ≤ SMALL_PREFILTER_THRESHOLD matches,
+               walking the order_by btree end-to-end to find them is
+               O(N); fetching the K records directly + in-memory sort
+               is O(K log K). At K=1 with the matching record's
+               order-by value at the tail of the desc walk, this
+               drops queries like
+                   eq username='alice.smith0' order_by age desc limit 10
+               from ~1700 ms (walks 25M btree entries) to single
+               digit ms. Filed as backlog-small-prefilter-orderby-
+               shortcut after bench-cache-pollution surfaced the
+               pathological case. */
+            int order_field_idx = -1;
+            if (driver_fs.ts) {
+                for (int i = 0; i < driver_fs.ts->nfields; i++) {
+                    if (strcmp(driver_fs.ts->fields[i].name, order_by) == 0) {
+                        order_field_idx = i;
+                        break;
+                    }
+                }
+            }
+            if (prefilter_ks &&
+                keyset_size(prefilter_ks) <= SMALL_PREFILTER_THRESHOLD &&
+                order_tf && driver_fs.ts && order_field_idx >= 0) {
+                size_t n_pre = keyset_size(prefilter_ks);
+                SmallPrefilterRow *rows = calloc(n_pre, sizeof(SmallPrefilterRow));
+                if (rows) {
+                    SmallPrefilterCollect ca = { rows, n_pre, 0 };
+                    keyset_iter(prefilter_ks, small_prefilter_collect_cb, &ca);
+
+                    /* Fetch each candidate, run the full criteria tree
+                       (kills any post-filter from non-indexed siblings),
+                       extract the order-key bytes via the same encoder
+                       the btree uses so memcmp orders them correctly. */
+                    int n_kept = 0;
+                    for (size_t i = 0; i < n_pre; i++) {
+                        RecordRef rr;
+                        if (read_record_ref(db_root, object, &sch,
+                                             rows[i].hash, &rr) != 0) continue;
+                        if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                                          tree, &driver_fs)) {
+                            release_record_ref(&rr);
+                            continue;
+                        }
+                        if (n_kept != (int)i)
+                            memcpy(rows[n_kept].hash, rows[i].hash, 16);
+                        typed_field_to_index_key(driver_fs.ts,
+                                                 (const uint8_t *)rr.val,
+                                                 order_field_idx,
+                                                 rows[n_kept].sort_key,
+                                                 &rows[n_kept].sort_key_len);
+                        n_kept++;
+                        release_record_ref(&rr);
+                    }
+
+                    qsort(rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
+                          desc ? small_prefilter_cmp_desc
+                               : small_prefilter_cmp_asc);
+
+                    /* Emit via cursor_find_cb so format handling (rows/
+                       dict/default) stays in one place. We've already
+                       filtered+sorted; tell the cb to skip its own
+                       prefilter (NULL) and cursor (has_cursor=0). The
+                       remaining-criteria re-check inside the cb is a
+                       cheap double-check on already-validated records;
+                       leave it on for safety. */
+                    CursorFindCtx cc;
+                    memset(&cc, 0, sizeof(cc));
+                    cc.db_root         = db_root;
+                    cc.object          = object;
+                    cc.sch             = &sch;
+                    cc.fs              = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+                    cc.remaining       = tree;
+                    cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
+                    cc.proj_count      = proj_count;
+                    cc.rows_fmt        = rows_fmt;
+                    cc.dict_fmt        = dict_fmt;
+                    cc.limit           = limit;
+                    cc.printed         = 0;
+                    cc.order_tf        = order_tf;
+                    cc.order_field_idx = order_field_idx;
+                    cc.has_cursor      = 0;
+                    cc.desc            = desc;
+                    cc.skip_remaining  = offset > 0 ? offset : 0;
+                    cc.offset_mode     = 1;
+                    cc.deadline        = &dl;
+                    cc.prefilter_ks    = NULL;   /* already filtered */
+                    cc.parent_out      = g_out;
+
+                    for (int i = 0; i < n_kept; i++) {
+                        if (cursor_find_cb("", 0, rows[i].hash, &cc) < 0) break;
+                    }
+
+                    free(rows);
+                    free(cc.last_value_str);
+                    free(cc.last_key_str);
+                    keyset_free(prefilter_ks);
+
+                    if (dict_fmt) OUT("}\n");
+                    else if (rows_fmt) OUT("]\n");
+                    else OUT("]\n");
+                    free_joins(joins, njoins);
+                    free_criteria_tree(tree);
+                    free_excluded(&excluded);
+                    return 0;
+                }
+                /* calloc failed — fall through to the btree-walk path. */
             }
 
             CursorFindCtx cc;
