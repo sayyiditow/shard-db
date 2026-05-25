@@ -94,10 +94,19 @@ static int test_length_ops_run(void) {
          "{\"field\":\"name\",\"op\":\"len_lt\",\"value\":\"5\"}]"),
         1, "starts a AND len_lt 5 → 1");
 
-    /* Non-existent field */
-    ASSERT_EQ_INT(do_count(tc,
-        "[{\"field\":\"missing_field\",\"op\":\"len_eq\",\"value\":\"5\"}]"),
-        0, "len_eq on unknown field → 0");
+    /* Non-existent field: post-2026-05-25 returns a loud error instead of
+       a silent 0 (which used to mean "0 matches" but was indistinguishable
+       from a genuine 0-result filter). */
+    {
+        char *resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"lent\","
+            "\"criteria\":[{\"field\":\"missing_field\",\"op\":\"len_eq\",\"value\":\"5\"}]}",
+            &resp);
+        ASSERT_TRUE(resp && strstr(resp, "unknown field") != NULL,
+                    "len_eq on unknown field → error");
+        free(resp);
+    }
 
     /* bulk-update with len criteria */
     tc_request(tc,
