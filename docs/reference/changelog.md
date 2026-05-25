@@ -4,6 +4,28 @@ For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased
+
+In-flight on `feat/logging-framework`. Logging surface reshape + bundled bug/perf fixes.
+
+### Logging framework
+
+- **Log line shape changed.** Was `2026-05-24 21:11:54 [INFO] body`; now `2026-05-24 21:11:54 INFO [subsystem] body`. Subsystem is one of: `server`, `slotcask`, `btree`, `bitmap`, `trigram`, `index`, `query`, `planner`, `vacuum`, `warmup`, `auth`, `tls`, `config`, `reindex`, `slow`. Operators with log-parsing regexes need to update.
+- **New per-level macros + subsystem registry** in `src/db/log.h`: `LOG_ERROR`, `LOG_WARN`, `LOG_INFO`, `LOG_DEBUG`, `LOG_AUDIT`. Compiler enforces level + subsystem at every site (typo-safe). Legacy `log_msg(int level, fmt, ...)` removed — every internal caller migrated.
+- **New audit log file.** `<date>-audit.log` captures security/admin events: token add/remove, IP allow-list mutations, schema mutations (add/edit/remove/rename field), create-object, drop-object, add-index, remove-index, auth failures, admin-gate denials. Bypasses `LOG_LEVEL` filter so compliance review doesn't depend on operator config. Inherits `LOG_RETAIN_DAYS` retention.
+- **Slow-query log reformatted.** Keeps filename `slow-YYYY-MM-DD.log` but line shape aligns with the framework: `2026-05-24 21:11:54 INFO [slow] 789ms mode=find dir=hn object=stories` (was ISO-T datetime). Routes through the shared async ring buffer instead of direct fopen.
+- **Audit-class events promoted from INFO/WARN to AUDIT.** Every admin command + auth failure now lands in the audit file in addition to (or instead of) the regular per-level file. Four NEW audit-log sites added that previously had no logging at all: `add-token`, `remove-token`, `add-ip`, `remove-ip`.
+
+### Performance + bug-class fixes (bundled)
+
+- **`cmd_create_object` per-shard bitmap preallocation parallelised** via `parallel_for`. 256-split × 3 bool-field create-object drops from ~2.4 s to ~645 ms (~4×). The kf and seg preallocations were already parallel inside `slotcask_open`; only the bitmap-shard loop was serial.
+- **Server-side `bulk-insert` no longer routes through `memfd_create` + mmap.** Extracted the parser body into `bulk_ins_run(data, len, ...)`. `cmd_bulk_insert_string` calls it directly with the in-memory JSON — drops ~5 syscalls per bulk-insert and eliminates the page-aligned-mmap SIGBUS bug class (fixed minimally in PR #72) by construction for the server path. CLI bulk-insert keeps the mmap-or-read path for genuine large-file loads.
+
+### Operator migration notes
+
+- Log-parsing scripts that match `\[ERROR\]` etc. need to switch to `^[\d-]+ [\d:]+ ERROR \[`.
+- New `<date>-audit.log` file in `LOG_DIR`. Add to log shipping if you forward shard-db logs externally.
+
 ## 2026.05.7.1
 
 Patch release on the 2026.05.7 line. Headline is a **critical correctness fix in `cmd_find`** that returned `[]` non-deterministically on indexed queries served by a busy daemon. Bundled with **edit-field polish**, **add-field computed-defaults backfill**, and **startup warmup**.
