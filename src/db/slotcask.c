@@ -1008,14 +1008,16 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
 
     /* Phase breakdown: setup / rebuild / msync / rename+fsync / remap.
        `live` is records actually re-inserted at new capacity (= header.total
-       on the new kf). Goes to stderr so the daemon's log captures it; the
-       bench fixture's daemon log is at $DB_ROOT/logs/.
+       on the new kf). Routed through LOG_INFO so it lands in the daemon's
+       info log instead of spamming stderr (the bench harness was getting
+       hundreds of lines during 25M inserts because raw fprintf bypasses
+       LOG_LEVEL filtering). Bench fixture's daemon log is at $DB_ROOT/logs/.
        Suppressed for same-cap rebuilds (vacuum's tombstone-compaction path)
        — those are routine maintenance, not a notable resize event. */
     if (new_cap != old_cap) {
-        fprintf(stderr,
+        LOG_INFO(LOG_SUB_SLOTCASK,
             "KF_RESPLIT path=%s old_cap=%zu new_cap=%zu live=%lu "
-            "total_us=%lu setup_us=%lu rebuild_us=%lu msync_us=%lu rename_us=%lu remap_us=%lu\n",
+            "total_us=%lu setup_us=%lu rebuild_us=%lu msync_us=%lu rename_us=%lu remap_us=%lu",
             e->path, old_cap, new_cap, (unsigned long)live_copied,
             (unsigned long)(t_end - t_start),
             (unsigned long)(t_after_setup   - t_start),
