@@ -9715,13 +9715,11 @@ static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
 /* Forward decls — both definitions live near build_keyset_from_bitmap. */
 static enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field);
-static enum IndexType field_index_type_for_op(const char *db_root,
-                                              const char *object,
-                                              const char *field,
-                                              enum SearchOp op);
 static int field_has_index_type(const char *db_root, const char *object,
                                 const char *field, enum IndexType want);
 static int op_prefers_trigram(enum SearchOp op);
+static int pick_index_for_leaf(const char *db_root, const char *object,
+                               const SearchCriterion *c);
 
 /* Per-shard worker arg for parallel bitmap dispatch — mirrors btree's
    ShardWalkArg in index.c. The shared atomic stop_flag lets a worker
@@ -11314,100 +11312,13 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
    Returns 1 and fills out_idx_path on success, 0 otherwise. */
 static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
                            const char *object, char *out_idx_path, size_t out_sz) {
-    if (!c || !c->field[0]) return 0;
-    /* OP_EXISTS rides the indexed btree path: idx_count_cb walks the
-       btree and counts entries (the index only contains non-empty
-       varchar values, so btree_size = count(exists)). Per-thread batch
-       counter (2528e17) removed the prior shared-atomic bottleneck —
-       count(exists varchar_idx) on 1M records is ~5ms (down from
-       ~22ms full scan).
-
-       OP_NOT_EXISTS is *deliberately* kept on PRIMARY_NONE: scan_shards
-       parallelizes a varchar elen check across 8 data shards × 16
-       workers at ~3ms — beats the indexed path's `live_count - count(
-       exists)` at ~5ms. Non-varchar EXISTS / NOT_EXISTS hits the
-       live_count shortcut earlier in cmd_count regardless. */
-    if (c->op == OP_NOT_EXISTS) return 0;
-    /* Field-vs-field ops can't use a btree on the LHS alone — the RHS is
-       per-record, so even a perfect btree walk still pays record fetches.
-       Force full-scan to keep the planner honest. */
-    if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
-        c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
-        c->op == OP_LTE_FIELD || c->op == OP_GTE_FIELD) return 0;
-    /* Regex on indexed varchar: the btree leaf carries the literal bytes,
-       so the callback can regexec directly without a record fetch. The
-       legacy match_criterion regex case caches the compiled pattern in a
-       thread-local, so regcomp fires once per thread, not per leaf entry.
-       Non-varchar indexed fields store memcmp-sortable encoded bytes (top-
-       bit-flipped ints, etc.) — running a regex on those would match
-       garbage, so keep them on the full-scan path. */
-    if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) {
-        TypedSchema *ts = load_typed_schema(db_root, object);
-        if (!ts) return 0;
-        int fi = typed_field_index(ts, c->field);
-        if (fi < 0 || ts->fields[fi].type != FT_VARCHAR) return 0;
-    }
-
-    /* Per-shard layout: index lives at <obj>/indexes/<field>/<NNN>.idx with
-       index_splits_for(splits) shards. btree_idx_exists checks for any
-       non-empty shard.
-       Old single-file <field>.idx layout is gone; load_splits trips into
-       the schema cache so this stays cheap on the planner hot path.
-
-       Bitmap-indexed fields don't have .idx files — they have .bm files
-       at <obj>/indexes/<field>/<NNN>.bm. The planner picks them up only
-       for ops bitmap supports (OP_EQUAL for MVP). Other ops on a
-       bitmap-only field fall back to PRIMARY_NONE (full scan). */
-    enum IndexType itype = field_index_type_for_op(db_root, object, c->field, c->op);
-    Schema sch = load_schema(db_root, object);
-    if (itype == IT_TRIGRAM) {
-        /* Trigram serves contains/i_contains only (op_prefers_trigram
-           returned true for us to get here). Tag the leaf with the
-           field directory the same way bitmap does — execution sites
-           dispatch on itype, not on path content. The pattern must be
-           ≥3 chars to generate any trigrams; sub-3 falls back to scan
-           but that's checked at build_keyset_from_trigram time
-           (returns NULL → caller falls through to full scan). */
-        if (out_idx_path) {
-            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
-                     db_root, object, c->field);
-        }
-        return 1;
-    }
-    if (itype == IT_BITMAP) {
-        /* Bitmap serves every op the field's type supports — matches
-           btree's behaviour: the planner always picks the index path
-           when an index exists, and the dispatcher decides between a
-           direct value-walk (eq/IN) and a dict-scan (everything else).
-           Two narrow exceptions:
-             - eq_field / neq_field / lt_field / gt_field / lte_field /
-               gte_field: the RHS is per-record, so no static value to
-               compare against. btree falls to full scan for these too;
-               bitmap can't beat that. Return 0 → PRIMARY_NONE.
-             - Anything else: claim it. btree_dispatch's bitmap branch
-               routes eq/IN through the popcount-style fast path and
-               every other op through the generic dict-scan worker
-               (iterates ≤256 dict entries per shard, walks matching
-               value bitmaps). */
-        switch (c->op) {
-            case OP_EQ_FIELD:  case OP_NEQ_FIELD:
-            case OP_LT_FIELD:  case OP_GT_FIELD:
-            case OP_LTE_FIELD: case OP_GTE_FIELD:
-                return 0;
-            default:
-                break;
-        }
-        if (out_idx_path) {
-            snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
-                     db_root, object, c->field);
-        }
-        return 1;
-    }
-    if (!btree_idx_exists(db_root, object, c->field, sch.splits)) return 0;
+    /* All "is this leaf indexable?" logic lives in pick_index_for_leaf
+       (the same picker the executor dispatches off, so planner and
+       builder stay in sync). out_idx_path is an opaque tag for callers
+       that want a non-empty string to mean "indexed"; per-shard wrappers
+       rebuild the real per-shard paths internally from (field, splits). */
+    if (pick_index_for_leaf(db_root, object, c) < 0) return 0;
     if (out_idx_path) {
-        /* out_idx_path is now an opaque tag for callers that want a
-           non-empty string to mean "indexed". The per-shard wrappers
-           rebuild the real per-shard paths internally from (field, splits). */
         snprintf(out_idx_path, out_sz, "%s/%s/indexes/%s",
                  db_root, object, c->field);
     }
@@ -11658,17 +11569,20 @@ typedef struct {
     KeySet *ks;
     QueryDeadline *deadline;
     int dl_counter;
+    int overflowed;   /* set when keyset_insert reports cap exhausted */
 } IntersectCollectCtx;
 
 /* btree callback for the first leaf: every hit drops into the seed KeySet.
    Returns -1 on insert failure (capacity exhausted) so the btree walk halts
-   instead of paying O(cap) per insert into a full table. */
+   instead of paying O(cap) per insert into a full table.  Sets `overflowed`
+   so the caller can distinguish "capacity exhausted" (KeySet incomplete,
+   must discard) from "deadline hit" (return what we have, mark timed-out). */
 static int intersect_collect_cb(const char *val, size_t vlen,
                                 const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     IntersectCollectCtx *c = (IntersectCollectCtx *)ctx;
     if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
-    if (keyset_insert(c->ks, hash16) < 0) return -1;
+    if (keyset_insert(c->ks, hash16) < 0) { c->overflowed = 1; return -1; }
     return 0;
 }
 
@@ -11948,32 +11862,17 @@ static int op_prefers_trigram(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_ICONTAINS;
 }
 
-/* Planner heuristic — for short contains/i_contains patterns on a
- * field that also has a btree, the btree-leaf walk wins over trigram
- * because the trigram path's verify step is O(candidates × per-record
- * fetch) while btree-leaf is O(total_leaves × per-leaf memmem). At
- * 25M scale on small-vocab data: "baker" (5 char, 833k hits)
- * costs ~160ms via btree-leaf vs ~740ms via trigram (verify-bound).
+/* Crossover length between btree-leaf scan and trigram intersection
+ * for contains/i_contains. The trigram verify step is O(candidates ×
+ * per-record fetch) while btree-leaf is O(total_leaves × per-leaf
+ * memmem). At 25M scale on small-vocab data: "baker" (5 char, 833k
+ * hits) costs ~160ms via btree-leaf vs ~740ms via trigram. Threshold 6
+ * is empirical: 5-char patterns regress to ~700ms+ via trigram, 6-char
+ * rare patterns win via trigram (6ms vs 200ms btree-leaf). Above 6 chars
+ * trigram intersection prunes fast and verify cost stays manageable.
  *
- * Threshold 6 is empirical: 5-char patterns regress to ~700ms+ via
- * trigram, 6-char rare patterns (e.g. "qwerty") win via trigram (6ms
- * vs 200ms btree-leaf). Above 6 chars trigram intersection prunes
- * fast and verify cost stays manageable for typical result sizes.
- *
- * Pre-condition: caller has already established op is trigram-able
- * and the field has a trigram index. */
+ * Consumed by pick_index_for_leaf — the single dispatch decision point. */
 #define TG_PREFER_BTREE_LEN 6
-static int planner_prefer_btree_leaf(const char *db_root, const char *object,
-                                     const SearchCriterion *leaf) {
-    if (!leaf) return 0;
-    size_t plen = strlen(leaf->value);
-    if (plen >= TG_PREFER_BTREE_LEN) return 0;
-    /* Order-independent — field_index_type returns first-declared type
-       only, so a field with both btree+trigram could return IT_TRIGRAM
-       depending on index.conf order. field_has_index_type checks for
-       any matching type, which is what we want here. */
-    return field_has_index_type(db_root, object, leaf->field, IT_BTREE);
-}
 
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
    over the cached arrays — cheap for the planner hot path. */
@@ -11990,35 +11889,67 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
     return IT_BTREE;
 }
 
-/* Pick the right index type for a given operator. Honours the routing
- * rules above (op_prefers_trigram). When the preferred type isn't
- * declared, falls back to the field's first declared type. */
-static enum IndexType field_index_type_for_op(const char *db_root,
-                                              const char *object,
-                                              const char *field,
-                                              enum SearchOp op) {
-    if (op_prefers_trigram(op) &&
-        field_has_index_type(db_root, object, field, IT_TRIGRAM)) {
-        return IT_TRIGRAM;
+/* Plan-time index picker — single source of truth for "which index
+ * should this leaf use, if any?".  Returns IT_BTREE / IT_BITMAP /
+ * IT_TRIGRAM, or -1 when no usable index exists for this (field, op)
+ * combination (caller falls back to full scan).
+ *
+ * Both `leaf_is_indexed` (planner) and `build_keyset_from_leaf`
+ * (executor) dispatch off this — keeping them in sync removes the
+ * pre-2026-05-25 runtime cascade where the builder would try trigram,
+ * then fall through to bitmap, then to btree.  When this returns a
+ * type, that's *the* index for the leaf; if the corresponding builder
+ * later returns NULL (transient alloc failure etc.), the caller drops
+ * to full scan instead of attempting a different index type.
+ *
+ * Rules:
+ *  - NOT_EXISTS, field-vs-field ops, regex on non-varchar → -1
+ *    (existing un-indexable cases).
+ *  - For contains / i_contains:
+ *      * pattern < TG_PREFER_BTREE_LEN chars AND btree present →
+ *        IT_BTREE (btree-leaf memmem beats trigram-verify at short
+ *        patterns; threshold is empirical, see TG_PREFER_BTREE_LEN).
+ *      * Otherwise, trigram present AND pattern ≥ 3 chars → IT_TRIGRAM
+ *        (trigrams need 3-grams).
+ *      * Otherwise btree present → IT_BTREE (catches sub-3-char contains
+ *        on a btree-only field — btree-leaf scan still beats full scan).
+ *      * Else → -1.
+ *  - All other ops: bitmap preferred when present, then btree, else -1. */
+static int pick_index_for_leaf(const char *db_root, const char *object,
+                               const SearchCriterion *c) {
+    if (!c || !c->field[0]) return -1;
+    if (c->op == OP_NOT_EXISTS) return -1;
+    if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
+        c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
+        c->op == OP_LTE_FIELD || c->op == OP_GTE_FIELD) return -1;
+    if (c->op == OP_REGEX || c->op == OP_NOT_REGEX) {
+        TypedSchema *ts = load_typed_schema(db_root, object);
+        if (!ts) return -1;
+        int fi = typed_field_index(ts, c->field);
+        if (fi < 0 || ts->fields[fi].type != FT_VARCHAR) return -1;
     }
-    /* For non-trigram ops, never return IT_TRIGRAM even if it's the
-       only declared type — trigram can't accelerate eq/range/etc., so
-       falling through to "no index" is honest. */
-    enum IndexType t = field_index_type(db_root, object, field);
-    if (t == IT_TRIGRAM && !op_prefers_trigram(op)) {
-        /* Field has trigram but op can't use it; check for a sibling
-           btree/bitmap declaration. */
-        if (field_has_index_type(db_root, object, field, IT_BITMAP)) return IT_BITMAP;
-        if (field_has_index_type(db_root, object, field, IT_BTREE))  return IT_BTREE;
-        /* Trigram-only field with a non-trigram op → caller should
-           treat the field as un-indexed for this op. Returning
-           IT_TRIGRAM here would mislead leaf_is_indexed into claiming
-           the leaf. Signal "not indexed for this op" by returning a
-           value the planner already maps to no-index — we use IT_BTREE
-           and let the existing btree_idx_exists check reject it. */
+    Schema sch = load_schema(db_root, object);
+    int has_btree   = field_has_index_type(db_root, object, c->field, IT_BTREE);
+    int has_bitmap  = field_has_index_type(db_root, object, c->field, IT_BITMAP);
+    int has_trigram = field_has_index_type(db_root, object, c->field, IT_TRIGRAM);
+
+    if (op_prefers_trigram(c->op)) {
+        size_t plen = strlen(c->value);
+        if (has_btree && plen < TG_PREFER_BTREE_LEN) {
+            return btree_idx_exists(db_root, object, c->field, sch.splits)
+                   ? IT_BTREE : -1;
+        }
+        if (has_trigram && plen >= 3) return IT_TRIGRAM;
+        if (has_btree) {
+            return btree_idx_exists(db_root, object, c->field, sch.splits)
+                   ? IT_BTREE : -1;
+        }
+        return -1;
+    }
+    if (has_bitmap) return IT_BITMAP;
+    if (has_btree && btree_idx_exists(db_root, object, c->field, sch.splits))
         return IT_BTREE;
-    }
-    return t;
+    return -1;
 }
 
 /* Sum bm_count for a single encoded value across every data shard.
@@ -12475,55 +12406,74 @@ static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
                                       QueryDeadline *dl) {
-    /* Dispatch by index type. Trigram-indexed contains/i_contains goes
-       through the trigram intersection walker. Bitmap-indexed eq goes
-       through the bitmap walker. Everything else stays on the existing
-       btree path. */
-    if (op_prefers_trigram(leaf->op) &&
-        !planner_prefer_btree_leaf(db_root, object, leaf) &&
-        field_has_index_type(db_root, object, leaf->field, IT_TRIGRAM)) {
-        KeySet *ks = build_keyset_from_trigram(db_root, object, splits, leaf, dl);
-        if (ks) return ks;
-        /* Sub-3-char pattern or alloc failure — fall through. If no
-           btree exists for this field the next call returns NULL too
-           and the caller drops to full scan (correct, just slower). */
+    /* Dispatch on the plan-time picker's choice — single index per leaf,
+       no runtime cascade between index types.  If the picker says
+       IT_TRIGRAM and the trigram builder returns NULL (e.g. transient
+       alloc failure), caller drops to full scan rather than retrying
+       via btree.  The picker has already considered all available
+       indexes for this (field, op, pattern-length) tuple. */
+    int picked = pick_index_for_leaf(db_root, object, leaf);
+    if (picked < 0) return NULL;
+    if (picked == IT_TRIGRAM) {
+        return build_keyset_from_trigram(db_root, object, splits, leaf, dl);
     }
-    enum IndexType itype = field_index_type(db_root, object, leaf->field);
-    if (itype == IT_BITMAP) {
+    if (picked == IT_BITMAP) {
         TypedSchema *ts = load_typed_schema(db_root, object);
         const TypedField *tf = resolve_idx_field(ts, leaf->field);
-        KeySet *ks = build_keyset_from_bitmap(db_root, object, splits,
-                                              leaf, tf, dl);
-        if (ks) return ks;
-        /* Fall through to btree path if bitmap couldn't help (op not eq,
-           timeout, etc.). For most bitmap leaves this just produces a
-           NULL since there's no btree to fall back to, and the caller
-           drops to full-scan — same effective behavior. */
+        return build_keyset_from_bitmap(db_root, object, splits,
+                                        leaf, tf, dl);
     }
-    size_t hint = leaf_capacity_hint(db_root, object, leaf->field, splits);
+    /* IT_BTREE — tiered KeySet allocation. Pre-2026-05-25 this function pre-allocated
+       a KeySet sized to (file-size hint floored at live count), which on a
+       25M-row table works out to ~1.2 GB pre-allocation — exceeds the
+       default QUERY_BUFFER_MB=256 budget guard → return NULL → every
+       caller falls back to per-record scan. Measured: an eq lookup on a
+       unique field that should return 0-1 rows took 23 seconds because
+       the budget guard refused to allocate.
+
+       Two-tier with overflow detection fixes that without per-operator
+       heuristics:
+
+         Tier 1: 64K slots (~1.5 MB) — fits the typical selective query
+                 (unique-field eq, narrow range, small in-set).
+         Tier 2: bounded by g_query_buffer_max_bytes — fits moderate-
+                 selectivity range/in/OR queries.
+         NULL  : even tier 2 overflowed → caller falls back to full
+                 scan. At that selectivity (millions of matches) the
+                 filter-first prefilter wouldn't have helped much anyway.
+
+       On tier-1 overflow we pay one extra btree walk to retry at tier 2.
+       Worth it: the alternative is the 23-second full ordered walk. */
+    const size_t bytes_per_entry = 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    const size_t budget_max_hint = g_query_buffer_max_bytes / bytes_per_entry;
+
+    size_t tier1 = 65536;
+    size_t tier2 = leaf_capacity_hint(db_root, object, leaf->field, splits);
     int live = get_live_count(db_root, object);
-    if (live > 0 && (size_t)live > hint) hint = (size_t)live;
-    /* Per-query budget guard: KeySet capacity is rounded up to ~2× hint
-       and each slot is `keys[16] + state[4]` = 20 B (with padding ≈ 24 B).
-       For a 25M-row table that's ~1.2 GB just for this one keyset —
-       blows past QUERY_BUFFER_MB (default 500) and triggers swap thrash
-       at the OS level. Return NULL when the projected footprint exceeds
-       the budget; callers already handle NULL by falling through to the
-       per-record scan path (slower but bounded memory, returns correct
-       results without OOM-ing the daemon). */
-    size_t ks_bytes_est = hint * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
-    /* coverity[tainted_data] CID 1693849: hint is bounded above by the
-       explicit g_query_buffer_max_bytes check immediately above. */
-    KeySet *ks = keyset_new(hint);
-    if (!ks) return NULL;
+    if (live > 0 && (size_t)live > tier2) tier2 = (size_t)live;
+    if (tier2 > budget_max_hint) tier2 = budget_max_hint;
+    if (tier2 < tier1) tier2 = tier1;   /* tiny table — both tiers same */
+
     TypedSchema *ts = load_typed_schema(db_root, object);
-    IntersectCollectCtx c = { ks, dl, 0 };
-    btree_dispatch(db_root, object, leaf->field, splits,
-                   leaf, resolve_idx_field(ts, leaf->field),
-                   intersect_collect_cb, &c);
-    if (dl->timed_out) { keyset_free(ks); return NULL; }
-    return ks;
+    const TypedField *tf = resolve_idx_field(ts, leaf->field);
+
+    size_t hints[2] = { tier1, tier2 };
+    int try_count = (tier1 == tier2) ? 1 : 2;
+    for (int t = 0; t < try_count; t++) {
+        /* coverity[tainted_data] CID 1693849: hint is bounded above by
+           the budget_max_hint clamp during tier2 derivation. */
+        KeySet *ks = keyset_new(hints[t]);
+        if (!ks) return NULL;
+        IntersectCollectCtx c = { ks, dl, 0, 0 };
+        btree_dispatch(db_root, object, leaf->field, splits,
+                       leaf, tf, intersect_collect_cb, &c);
+        if (dl->timed_out) { keyset_free(ks); return NULL; }
+        if (!c.overflowed) return ks;
+        keyset_free(ks);
+        /* Tier-1 overflowed; loop retries at tier 2.  Tier-2 overflow
+           exits the loop and returns NULL. */
+    }
+    return NULL;
 }
 
 /* Below this threshold for the most-selective leaf, fan out the candidates as
@@ -13436,12 +13386,39 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
                where the positive match set is small; also the correct
                answer for NOT_EXISTS (the old default-branch path visited
-               every indexed entry and returned count(exists) instead). */
+               every indexed entry and returned count(exists) instead).
+               Dispatch on the picker's choice for the *inverted* form
+               — e.g. count(NOT_CONTAINS 'foobar') runs through trigram
+               if the picker would have picked trigram for CONTAINS
+               'foobar' (long-pattern win), then subtracts. */
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
             size_t pos_count = 0;
             int pos_ok = 1;
-            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+            int pos_picked = pick_index_for_leaf(db_root, object, &pos);
+            if (pos_picked == IT_TRIGRAM) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, &pos, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    /* parallel_indexed_count re-verifies each candidate
+                       against the full criterion tree, but here the
+                       positive form `pos` is what we want — substitute
+                       a single-leaf tree around `pos` instead of `tree`. */
+                    CriteriaNode pos_leaf = { .kind = CNODE_LEAF, .leaf = pos,
+                                              .children = NULL, .n_children = 0 };
+                    pos_count = parallel_indexed_count(db_root, object, &sch,
+                                                       entries, (int)n,
+                                                       &pos_leaf, &fs, &dl);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    pos_ok = !dl.timed_out;
+                } else {
+                    pos_ok = 0;
+                }
+            } else if (pos_picked == IT_BITMAP) {
                 /* Bitmap popcount fast path for the inverted positive.
                    Eq/IN → per-value popcount sum. Anything else (the
                    inverted form of NOT_LIKE / NOT_CONTAINS / NOT_REGEX
@@ -13457,6 +13434,9 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                               &pos, pc_tf);
                 }
             } else {
+                /* IT_BTREE or -1 — btree_dispatch handles bitmap-keyed
+                   fields via its internal routing if the picker fell
+                   back to btree for a non-trigram-prefer op. */
                 int pos_cp = op_needs_check_primary(pos.op);
                 IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
                 btree_dispatch(db_root, object, pc->field, sch.splits,
@@ -13471,14 +13451,18 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            /* Trigram fast path: contains/i_contains over a
-               trigram-indexed field. Build the candidate keyset via
-               trigram intersection, then verify each candidate with
-               the full criterion (kills false positives from
-               order-insensitive trigram match). */
-            if (op_prefers_trigram(op) &&
-                !planner_prefer_btree_leaf(db_root, object, pc) &&
-                field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+            /* Dispatch on the picker's chosen index — same rulebook the
+               planner used to claim this leaf:
+                 IT_TRIGRAM → build trigram keyset, verify candidates via
+                             parallel_indexed_count (kills false positives
+                             from order-insensitive trigram match).
+                 IT_BITMAP  → popcount-style fast path (per-value sum for
+                             eq/IN, dict-scan + per-matching-value sum
+                             otherwise). Avoids the per-record fan-out the
+                             default idx_count_cb path needs.
+                 IT_BTREE   → btree_dispatch + idx_count_cb. */
+            int picked = pick_index_for_leaf(db_root, object, pc);
+            if (picked == IT_TRIGRAM) {
                 KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                            sch.splits, pc, &dl);
                 if (tg_ks) {
@@ -13495,26 +13479,14 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     free_criteria_tree(tree);
                     return 0;
                 }
-                /* tg_ks NULL → sub-3-char pattern. Drop to the
-                   PRIMARY_NONE record-walk so correctness is preserved
-                   (a sub-3 pattern can match anything; no index can
-                   help). */
-                {
-                    CountCtx ctx = { tree, &fs, 0, &dl, 0 };
-                    scan_dispatch(db_root, object, &sch, data_dir,
-                                  count_scan_cb, &ctx);
-                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                    else OUT("%d\n", ctx.count);
-                    free_criteria_tree(tree);
-                    return 0;
-                }
+                /* tg_ks NULL is unexpected here — the picker enforces
+                   plen ≥ 3 before returning IT_TRIGRAM. Treat as a
+                   transient failure and emit 0 (defensive only). */
+                OUT("0\n");
+                free_criteria_tree(tree);
+                return 0;
             }
-            /* Bitmap routes all single-leaf counts through a popcount-
-               style fast path: per-value sum for eq/IN, dict-scan +
-               per-matching-value sum for everything else. Both avoid
-               the per-record fan-out + per-bit cb invocations that the
-               default idx_count_cb path needs. */
-            if (field_index_type(db_root, object, pc->field) == IT_BITMAP) {
+            if (picked == IT_BITMAP) {
                 size_t total;
                 if (op == OP_EQUAL || op == OP_IN) {
                     total = bm_popcount_for_crit(db_root, object,
@@ -14650,15 +14622,18 @@ int cmd_find(const char *db_root, const char *object,
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
-        /* Trigram dispatch: contains/i_contains over a trigram-indexed
-           field — build candidate keyset, convert to CollectedHash[],
-           feed to process_batch. Same emit pipeline as idx_find_parallel,
-           just sourced from the trigram intersection instead of a btree
-           walk. */
+        /* Dispatch on the picker's chosen index — same rulebook the
+           planner used to claim this leaf, so we can't disagree.
+           IT_TRIGRAM goes through keyset_emit_find sourced from the
+           trigram intersection; IT_BITMAP and IT_BTREE both ride
+           idx_find_parallel, which routes bitmap via btree_dispatch's
+           internal bitmap branch. The picker has already enforced
+           plen >= 3 for trigram, so build_keyset_from_trigram returning
+           NULL here is a transient failure rather than an unsupported
+           pattern. */
         int rc = 0;
-        if (op_prefers_trigram(op) &&
-            !planner_prefer_btree_leaf(db_root, object, pc) &&
-            field_has_index_type(db_root, object, pc->field, IT_TRIGRAM)) {
+        int picked = pick_index_for_leaf(db_root, object, pc);
+        if (picked == IT_TRIGRAM) {
             KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                        sch.splits, pc, &dl);
             if (tg_ks) {
@@ -14669,17 +14644,9 @@ int cmd_find(const char *db_root, const char *object,
                                       rows_fmt, dict_fmt, csv_delim,
                                       joins, njoins, &dl);
                 keyset_free(tg_ks);
-                goto find_emit_close;
             }
-            /* tg_ks NULL (sub-3-char pattern) — fall through to
-               idx_find_parallel, which will also return zero results
-               since trigram-only fields have no .idx. Better to scan;
-               but the scan-fallback only fires from cmd_count today —
-               for find we accept "no results" on sub-3 patterns as the
-               documented behaviour (HN explorer is supposed to gate
-               this client-side). */
+            goto find_emit_close;
         }
-
         rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
