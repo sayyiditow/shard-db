@@ -4097,6 +4097,7 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
     char key[PATH_MAX];
     reg_key(key, effective_root, object);
 
+    /* Fast path: probe under the lock; hit returns immediately. */
     pthread_mutex_lock(&g_reg_lock);
     int slot = reg_probe(key);
     if (slot < 0) {
@@ -4110,26 +4111,52 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
         pthread_mutex_unlock(&g_reg_lock);
         return db;
     }
+    pthread_mutex_unlock(&g_reg_lock);
 
-    /* Cache miss — open under the mutex. Opens are rare (per-object, once
-       per process) so the global serialization is acceptable. */
+    /* Miss — open OUTSIDE the registry lock.  slotcask_open mmaps 8 stream
+       segments × 128 MiB and can take seconds on large objects (e.g.
+       hn/comments at splits=256).  Holding g_reg_lock across that would
+       block every other registry operation (other opens via warmup's
+       parallel_for, drop-object's slotcask_registry_invalidate, any
+       slotcask_registry_get caller in a query handler).  Pre-fix this
+       caused drop-object to wait 7-12s under warmup contention.
+
+       Race: two concurrent misses for the same key both reach this
+       point.  Re-probe inside the install lock below; the loser frees
+       its own SlotcaskDb and returns the winner's. */
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s", effective_root, object);
 
     SlotcaskDb *db = calloc(1, sizeof(SlotcaskDb));
-    if (!db) {
-        pthread_mutex_unlock(&g_reg_lock);
-        return NULL;
-    }
+    if (!db) return NULL;
     if (slotcask_open(db, data_dir, info->splits, info->streams,
                       info->slot_size) != 0) {
         free(db);
-        pthread_mutex_unlock(&g_reg_lock);
         fprintf(stderr, "slotcask_registry: open failed for %s/%s\n",
                 effective_root, object);
         return NULL;
     }
 
+    /* Install (or lose the race + free ours). */
+    pthread_mutex_lock(&g_reg_lock);
+    slot = reg_probe(key);
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_reg_lock);
+        slotcask_close(db);
+        free(db);
+        fprintf(stderr, "slotcask_registry: table full (%d buckets)\n",
+                SLOTCASK_REG_BUCKETS);
+        return NULL;
+    }
+    if (g_reg[slot].used) {
+        /* Another thread installed while we were opening.  Discard ours
+           and use theirs. */
+        SlotcaskDb *winner = g_reg[slot].db;
+        pthread_mutex_unlock(&g_reg_lock);
+        slotcask_close(db);
+        free(db);
+        return winner;
+    }
     snprintf(g_reg[slot].key, sizeof(g_reg[slot].key), "%s", key);
     g_reg[slot].db = db;
     g_reg[slot].used = 1;
