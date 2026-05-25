@@ -1,6 +1,6 @@
 # Changelog
 
-For the full history see [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db/blob/main/CHANGELOG.md) at the repo root. This page summarizes shipped releases and notes on what's in flight.
+This is the maintained per-release summary. The root [`CHANGELOG.md`](https://github.com/sayyiditow/shard-db/blob/main/CHANGELOG.md) is a pointer here; rich per-version notes (motivation, migration, code references) live in [`docs/release-notes/`](../release-notes/).
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
