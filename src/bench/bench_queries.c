@@ -457,15 +457,24 @@ static int bench_queries_run(void) {
            calls, which would each do their own scan over 25 M records —
            wasteful. */
         if (bench_drop_idx_first) {
+            /* JSON request: {"mode":"add-index","dir":"default","object":"users",
+                              "fields":["a","b",...]}
+               Use BENCH_SB_APPEND so a) per-call snprintf return doesn't
+               overflow `off`, and b) sizeof(buf) - off can't underflow if
+               an earlier append already saturated. CodeQL flagged the raw
+               n += snprintf(...) idiom; this macro is the documented safe
+               replacement (see bench_stats.h header comment). */
             char add_req[512];
-            int n = snprintf(add_req, sizeof(add_req),
+            size_t off = 0;
+            const size_t cap = sizeof(add_req);
+            BENCH_SB_APPEND(add_req, off, cap,
                 "{\"mode\":\"add-index\",\"dir\":\"default\","
                 "\"object\":\"users\",\"fields\":[");
             for (int i = 0; i < IDX_NFIELDS; i++) {
-                n += snprintf(add_req + n, sizeof(add_req) - n,
-                              "%s\"%s\"", i ? "," : "", IDX_FIELDS[i]);
+                BENCH_SB_APPEND(add_req, off, cap,
+                                "%s\"%s\"", i ? "," : "", IDX_FIELDS[i]);
             }
-            snprintf(add_req + n, sizeof(add_req) - n, "]}");
+            BENCH_SB_APPEND(add_req, off, cap, "]}");
             printf("  add-index phase (load-then-index, %d fields in one scan)…",
                    IDX_NFIELDS);
             fflush(stdout);
