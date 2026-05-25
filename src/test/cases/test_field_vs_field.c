@@ -118,12 +118,23 @@ static int test_field_vs_field_run(void) {
     ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"day_a\",\"op\":\"lt_field\",\"value\":\"day_b\"}]"),
                   1, "day_a lt_field day_b → 1 (k1)");
 
-    /* Type mismatch silently matches nothing. */
+    /* Type mismatch silently matches nothing (both fields exist; the
+       per-record decode returns no equality). */
     ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"name\",\"op\":\"eq_field\",\"value\":\"received_at\"}]"),
                   0, "name eq_field received_at → 0 (varchar vs int)");
-    /* Unknown RHS field. */
-    ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"name\",\"op\":\"eq_field\",\"value\":\"missing_field\"}]"),
-                  0, "name eq_field missing_field → 0");
+    /* Unknown RHS field: post-2026-05-25 returns a loud error instead of
+       a silent 0. The RHS of eq_field/neq_field/etc. names a real field
+       and must resolve in the schema. */
+    {
+        char *resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"fft\","
+            "\"criteria\":[{\"field\":\"name\",\"op\":\"eq_field\",\"value\":\"missing_field\"}]}",
+            &resp);
+        ASSERT_TRUE(resp && strstr(resp, "unknown field") != NULL,
+                    "name eq_field missing_field → error");
+        free(resp);
+    }
 
     /* Combined with regular ops via AND.
        received_at lt_field scheduled_at AND received_at gt 50 → k1 (100<200 and 100>50). */

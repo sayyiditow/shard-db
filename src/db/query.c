@@ -11306,6 +11306,72 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
     return NULL;
 }
 
+/* ========== Unknown-field validation ==========
+ *
+ * Single source of truth for "does this field name resolve in the typed
+ * schema?". Composite fields (`field1+field2`) bypass schema lookup
+ * because decode_field handles them per-record; everything else must
+ * exist as a declared typed field or we error out loudly. Pre-2026-05-25
+ * an unknown field name silently dispatched to a no-op match path,
+ * producing empty results in O(scan-all) time — see the bench-DB
+ * `category` query that ran for 38 s and returned `[]` against a
+ * persistent DB that didn't have that field. Validating up front means
+ * the user gets `{"error":"unknown field 'category'"}` in microseconds
+ * instead.
+ *
+ * `validate_*_fields` helpers all return 0 on success / -1 on first
+ * failure with a human-readable message written into `err`. Callers
+ * emit the message and abort. */
+
+static int field_known(const TypedSchema *ts, const char *name) {
+    if (!ts || !name || !name[0]) return 1;          /* nothing to check */
+    if (strchr(name, '+')) return 1;                  /* composite — handled per-record */
+    return typed_field_index(ts, name) >= 0;
+}
+
+static int validate_field(const TypedSchema *ts, const char *name,
+                          const char *label, char *err, size_t err_sz) {
+    if (field_known(ts, name)) return 0;
+    snprintf(err, err_sz, "unknown field '%s' in %s", name, label);
+    return -1;
+}
+
+static int validate_criteria_tree_fields(const CriteriaNode *n,
+                                         const TypedSchema *ts,
+                                         char *err, size_t err_sz) {
+    if (!n) return 0;
+    if (n->kind == CNODE_LEAF) {
+        const SearchCriterion *c = &n->leaf;
+        if (validate_field(ts, c->field, "criteria", err, err_sz) < 0) return -1;
+        switch (c->op) {
+            case OP_EQ_FIELD:  case OP_NEQ_FIELD:
+            case OP_LT_FIELD:  case OP_GT_FIELD:
+            case OP_LTE_FIELD: case OP_GTE_FIELD:
+                /* RHS of field-vs-field ops names a second field. */
+                if (validate_field(ts, c->value, "criteria (rhs)",
+                                   err, err_sz) < 0) return -1;
+                break;
+            default:
+                break;
+        }
+        return 0;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (validate_criteria_tree_fields(n->children[i], ts, err, err_sz) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int validate_field_list(const char *const *names, int n,
+                               const TypedSchema *ts, const char *label,
+                               char *err, size_t err_sz) {
+    for (int i = 0; i < n; i++) {
+        if (validate_field(ts, names[i], label, err, err_sz) < 0) return -1;
+    }
+    return 0;
+}
+
 /* ========== Criteria tree planner ========== */
 
 /* Is the leaf's field indexable AND does the operator make a useful btree range?
@@ -13278,6 +13344,15 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
     Schema sch = load_schema(db_root, object);
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
+
+    {
+        char verr[256];
+        if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
+            OUT("{\"error\":\"%s\"}\n", verr);
+            free_criteria_tree(tree);
+            return 1;
+        }
+    }
     compile_criteria_tree(tree, fs.ts);
 
     char data_dir[PATH_MAX];
@@ -14156,6 +14231,21 @@ int cmd_find(const char *db_root, const char *object,
         free_criteria_tree(tree);
         free_excluded(&excluded);
         return -1;
+    }
+
+    {
+        char verr[256];
+        if (validate_criteria_tree_fields(tree, driver_fs.ts, verr, sizeof(verr)) < 0 ||
+            (proj_count > 0 && validate_field_list(proj_fields, proj_count, driver_fs.ts,
+                                                   "projection", verr, sizeof(verr)) < 0) ||
+            (order_by && order_by[0] && validate_field(driver_fs.ts, order_by,
+                                                       "order_by", verr, sizeof(verr)) < 0)) {
+            OUT("{\"error\":\"%s\"}\n", verr);
+            free_joins(joins, njoins);
+            free_criteria_tree(tree);
+            free_excluded(&excluded);
+            return -1;
+        }
     }
 
     compile_criteria_tree(tree, driver_fs.ts);
@@ -19042,6 +19132,23 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    {
+        char verr[256];
+        if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
+            OUT("{\"error\":\"%s\"}\n", verr); free_criteria_tree(tree); free(specs); return -1;
+        }
+        for (int i = 0; i < nspecs; i++) {
+            /* count(*) / count() carry no field — skip. */
+            if (specs[i].fn == AGG_COUNT && specs[i].field[0] == '\0') continue;
+            if (validate_field(fs.ts, specs[i].field, "aggregate",
+                               verr, sizeof(verr)) < 0) {
+                OUT("{\"error\":\"%s\"}\n", verr); free_criteria_tree(tree); free(specs); return -1;
+            }
+        }
+        /* order_by validated below after group_by parse — it may reference
+           an aggregate alias or a group_by field, not just a typed field. */
+    }
+
     /* Fast path: count-only with no criteria and no group_by → metadata.
        Skipped when count has a varchar field — that needs a per-record
        elen>0 check (count(varchar) only counts non-empty content), which
@@ -19352,6 +19459,33 @@ int cmd_aggregate(const char *db_root, const char *object,
     /* Parse group_by */
     if (group_by_json && group_by_json[0])
         ctx.ngroups = parse_group_by(group_by_json, ctx.group_fields);
+
+    {
+        char verr[256];
+        for (int i = 0; i < ctx.ngroups; i++) {
+            if (validate_field(fs.ts, ctx.group_fields[i], "group_by",
+                               verr, sizeof(verr)) < 0) {
+                OUT("{\"error\":\"%s\"}\n", verr);
+                free_criteria_tree(tree); free(specs); return -1;
+            }
+        }
+        /* order_by in aggregate may name (a) a typed field, (b) an
+           aggregate alias, or (c) a group_by field. Accept any. */
+        if (order_by && order_by[0]) {
+            int ok = field_known(fs.ts, order_by);
+            for (int i = 0; !ok && i < nspecs; i++)
+                if (strcmp(specs[i].alias, order_by) == 0) ok = 1;
+            for (int i = 0; !ok && i < ctx.ngroups; i++)
+                if (strcmp(ctx.group_fields[i], order_by) == 0) ok = 1;
+            if (!ok) {
+                snprintf(verr, sizeof(verr),
+                         "unknown field '%s' in order_by (no matching field, alias, or group_by)",
+                         order_by);
+                OUT("{\"error\":\"%s\"}\n", verr);
+                free_criteria_tree(tree); free(specs); return -1;
+            }
+        }
+    }
 
     /* Pre-resolve TypedField pointers for group_by and agg specs — NULL means
        composite ("a+b") or unknown field, which falls back to decode_field. */

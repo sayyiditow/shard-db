@@ -138,6 +138,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_bulk_update_delimited.c \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
+    src/test/cases/test_unknown_field_validation.c \
     src/test/cases/test_float_field_type.c \
     src/test/cases/test_all_field_types.c \
     src/test/cases/test_case_sensitivity.c \
