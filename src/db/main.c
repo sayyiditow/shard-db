@@ -59,17 +59,29 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  export-schema [out_path]             Write JSON manifest of all schemas\n");
         fprintf(stderr, "  import-schema <in_path> [--if-not-exists]\n");
         fprintf(stderr, "                                       Replay manifest as create-object calls\n");
-        fprintf(stderr, "\nSchema mutations (via JSON query):\n");
-        fprintf(stderr, "  query '{\"mode\":\"rename-field\",\"dir\":\"...\",\"object\":\"...\",\"old\":\"...\",\"new\":\"...\"}'\n");
-        fprintf(stderr, "  query '{\"mode\":\"remove-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"f1\",\"f2\"]}'\n");
+        fprintf(stderr, "\nSchema mutations:\n");
+        fprintf(stderr, "  edit-field <dir> <object> <name:type[:param]>   Same-type single-field edit\n");
+        fprintf(stderr, "  remove-field <dir> <object> <field>             Soft-remove (tombstone)\n");
+        fprintf(stderr, "  rename-field <dir> <object> <old> <new>         Rename a field\n");
         fprintf(stderr, "  query '{\"mode\":\"add-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"name:type[:param]\"]}'\n");
-        fprintf(stderr, "  query '{\"mode\":\"edit-field\",\"dir\":\"...\",\"object\":\"...\",\"fields\":[\"name:type[:param]\"]}'\n");
-        fprintf(stderr, "  edit-field <dir> <object> <name:type[:param]>   (single-field shortcut)\n");
+        fprintf(stderr, "                                                   (add-field is JSON-only; batch + computed defaults)\n");
         fprintf(stderr, "  query '{\"mode\":\"vacuum\",\"dir\":\"...\",\"object\":\"...\",\"compact\":true,\"splits\":128}'\n");
-        fprintf(stderr, "\nObject management (via JSON query):\n");
+        fprintf(stderr, "\nDir / object management:\n");
+        fprintf(stderr, "  add-dir <dir>                        Register a tenant directory\n");
+        fprintf(stderr, "  remove-dir <dir> [--force]           Remove a tenant directory (--force = ignore non-empty)\n");
+        fprintf(stderr, "  list-objects <dir>                   List objects in a dir\n");
+        fprintf(stderr, "  describe <dir> <object>              Show object schema\n");
         fprintf(stderr, "  query '{\"mode\":\"create-object\",\"dir\":\"...\",\"object\":\"...\",\n");
-        fprintf(stderr, "          \"fields\":[...],\"indexes\":[...],\n");
-        fprintf(stderr, "          \"splits\":N,\"max_key\":N}'\n");
+        fprintf(stderr, "          \"fields\":[...],\"indexes\":[...],\"splits\":N,\"max_key\":N}'\n");
+        fprintf(stderr, "                                                   (JSON-only; create-object has too many params for a CLI shortcut)\n");
+        fprintf(stderr, "\nAuth admin:\n");
+        fprintf(stderr, "  add-token <token> [--dir <d>] [--object <o>] [--perm r|rw|rwx]\n");
+        fprintf(stderr, "                                       Add a token (global / tenant / object scope)\n");
+        fprintf(stderr, "  remove-token <token>                 Remove a token\n");
+        fprintf(stderr, "  list-tokens [--dir <d>] [--object <o>]   List tokens at the given scope\n");
+        fprintf(stderr, "  add-ip <ip>                          Add trusted IP\n");
+        fprintf(stderr, "  remove-ip <ip>                       Remove trusted IP\n");
+        fprintf(stderr, "  list-ips                             List trusted IPs\n");
         fprintf(stderr, "\nJSON query mode:\n");
         fprintf(stderr, "  query '{\"mode\":\"get\",\"object\":\"users\",\"key\":\"k1\"}'\n");
         fprintf(stderr, "  query '{\"mode\":\"get\",\"object\":\"users\",\"keys\":[\"k1\",\"k2\"]}'\n");
@@ -380,6 +392,179 @@ int main(int argc, char *argv[]) {
             "{\"mode\":\"list-files\",\"dir\":\"%s\",\"object\":\"%s\","
             "\"pattern\":\"%s\",\"match\":\"%s\",\"offset\":%s,\"limit\":%s}",
             argv[2], argv[3], pos[0], match, pos[1], pos[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+
+    /* ===== Admin shortcuts — operations that were previously only
+       reachable via `shard-db query '{"mode":"..."}'`.  Localhost is
+       trusted by default, so the CLI sends the JSON and echoes the
+       daemon's response.  Remote operators still need to craft JSON
+       with an `auth` field via `query`. */
+
+    if (strcmp(cmd, "add-dir") == 0) {
+        if (argc < 3) { fprintf(stderr, "Usage: shard-db add-dir <dir>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"add-dir\",\"dir\":\"%s\"}", argv[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "remove-dir") == 0) {
+        if (argc < 3) {
+            fprintf(stderr,
+                "Usage: shard-db remove-dir <dir> [--force]\n"
+                "       --force removes even if the dir still has objects\n");
+            return 1;
+        }
+        int force = 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--force") == 0) force = 1;
+        size_t cap = strlen(argv[2]) + 96;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"remove-dir\",\"dir\":\"%s\",\"check_empty\":%s}",
+            argv[2], force ? "false" : "true");
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "list-objects") == 0) {
+        if (argc < 3) { fprintf(stderr, "Usage: shard-db list-objects <dir>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", argv[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "describe-object") == 0 || strcmp(cmd, "describe") == 0) {
+        if (argc < 4) { fprintf(stderr, "Usage: shard-db describe <dir> <object>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + 96;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"describe-object\",\"dir\":\"%s\",\"object\":\"%s\"}",
+            argv[2], argv[3]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+
+    if (strcmp(cmd, "add-token") == 0) {
+        if (argc < 3) {
+            fprintf(stderr,
+                "Usage: shard-db add-token <token> [--dir <d>] [--object <o>] [--perm r|rw|rwx]\n"
+                "       --dir omitted = global token; --object requires --dir\n"
+                "       --perm default rwx\n");
+            return 1;
+        }
+        const char *token = argv[2];
+        const char *dir = NULL, *obj = NULL, *perm = NULL;
+        for (int i = 3; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--dir") == 0)         dir  = argv[++i];
+            else if (strcmp(argv[i], "--object") == 0) obj  = argv[++i];
+            else if (strcmp(argv[i], "--perm") == 0)   perm = argv[++i];
+        }
+        char dir_part[256] = "", obj_part[256] = "", perm_part[64] = "";
+        if (dir)  snprintf(dir_part,  sizeof(dir_part),  ",\"dir\":\"%s\"", dir);
+        if (obj)  snprintf(obj_part,  sizeof(obj_part),  ",\"object\":\"%s\"", obj);
+        if (perm) snprintf(perm_part, sizeof(perm_part), ",\"perm\":\"%s\"", perm);
+        size_t cap = strlen(token) + sizeof(dir_part) + sizeof(obj_part) + sizeof(perm_part) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"add-token\",\"token\":\"%s\"%s%s%s}",
+            token, dir_part, obj_part, perm_part);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "remove-token") == 0) {
+        if (argc < 3) { fprintf(stderr, "Usage: shard-db remove-token <token>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"remove-token\",\"token\":\"%s\"}", argv[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "list-tokens") == 0) {
+        const char *dir = NULL, *obj = NULL;
+        for (int i = 2; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--dir") == 0)         dir = argv[++i];
+            else if (strcmp(argv[i], "--object") == 0) obj = argv[++i];
+        }
+        char dir_part[256] = "", obj_part[256] = "";
+        if (dir) snprintf(dir_part, sizeof(dir_part), ",\"dir\":\"%s\"", dir);
+        if (obj) snprintf(obj_part, sizeof(obj_part), ",\"object\":\"%s\"", obj);
+        size_t cap = sizeof(dir_part) + sizeof(obj_part) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"list-tokens\"%s%s}", dir_part, obj_part);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+
+    if (strcmp(cmd, "add-ip") == 0) {
+        if (argc < 3) { fprintf(stderr, "Usage: shard-db add-ip <ip>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"add-ip\",\"ip\":\"%s\"}", argv[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "remove-ip") == 0) {
+        if (argc < 3) { fprintf(stderr, "Usage: shard-db remove-ip <ip>\n"); return 1; }
+        size_t cap = strlen(argv[2]) + 64;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap, "{\"mode\":\"remove-ip\",\"ip\":\"%s\"}", argv[2]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "list-ips") == 0) {
+        return cmd_query_json(port, "{\"mode\":\"list-ips\"}");
+    }
+
+    if (strcmp(cmd, "remove-field") == 0) {
+        if (argc < 5) {
+            fprintf(stderr,
+                "Usage: shard-db remove-field <dir> <object> <field>\n"
+                "       Soft-removes (tombstones) the field. Batch via JSON query.\n");
+            return 1;
+        }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(argv[4]) + 96;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"remove-field\",\"dir\":\"%s\",\"object\":\"%s\",\"fields\":[\"%s\"]}",
+            argv[2], argv[3], argv[4]);
+        int rc = cmd_query_json(port, json);
+        free(json);
+        return rc;
+    }
+    if (strcmp(cmd, "rename-field") == 0) {
+        if (argc < 6) {
+            fprintf(stderr, "Usage: shard-db rename-field <dir> <object> <old> <new>\n");
+            return 1;
+        }
+        size_t cap = strlen(argv[2]) + strlen(argv[3]) + strlen(argv[4]) + strlen(argv[5]) + 96;
+        char *json = malloc(cap);
+        if (!json) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        snprintf(json, cap,
+            "{\"mode\":\"rename-field\",\"dir\":\"%s\",\"object\":\"%s\",\"old\":\"%s\",\"new\":\"%s\"}",
+            argv[2], argv[3], argv[4], argv[5]);
         int rc = cmd_query_json(port, json);
         free(json);
         return rc;
