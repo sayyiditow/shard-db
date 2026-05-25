@@ -14038,9 +14038,37 @@ static KeySet *build_keyset_from_plan(QueryPlan *plan,
                                       QueryDeadline *dl) {
     if (!plan) return NULL;
     switch (plan->kind) {
-    case PRIMARY_LEAF:
+    case PRIMARY_LEAF: {
+        /* Cheap cardinality probe for bitmap-indexed leaves: the only
+           consumers of build_keyset_from_plan are the two ordered-find
+           prefilter sites, both of which discard any KeySet exceeding
+           ORDERED_FIND_KEYSET_MAX immediately after building. For a
+           ~5M-match bitmap criterion that's ~37 s of materialization
+           thrown away. bm_popcount_for_crit walks the per-shard bitmaps
+           popcounting only — no KeySet entries enumerated — so the
+           probe costs ~ms regardless of match count. When the popcount
+           exceeds the cap, skip the materialization and return NULL;
+           the caller's per-record criteria_match walk with limit
+           short-circuit (which is what ordered-find already does when
+           prefilter is NULL) wins on broad criteria. */
+        SearchCriterion *leaf = plan->primary_leaf;
+        if (leaf && pick_index_for_leaf(db_root, object, leaf) == IT_BITMAP) {
+            TypedSchema *ts = load_typed_schema(db_root, object);
+            const TypedField *tf = resolve_idx_field(ts, leaf->field);
+            size_t pop;
+            if (leaf->op == OP_EQUAL || leaf->op == OP_IN) {
+                pop = bm_popcount_for_crit(db_root, object, sch->splits,
+                                           leaf, tf);
+            } else {
+                pop = bm_popcount_generic_for_crit(db_root, object,
+                                                    leaf->field, sch->splits,
+                                                    leaf, tf);
+            }
+            if (pop > ORDERED_FIND_KEYSET_MAX) return NULL;
+        }
         return build_keyset_from_leaf(db_root, object, sch->splits,
                                       plan->primary_leaf, dl);
+    }
     case PRIMARY_INTERSECT: {
         int small_primary = 0;
         return intersect_indexed_leaves(db_root, object, sch->splits,
