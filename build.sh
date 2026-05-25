@@ -242,6 +242,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/bench/bench_invoice.c \
     src/bench/bench_parallel.c \
     src/bench/bench_queries.c \
+    src/bench/bench_cache_pollution.c \
     src/bench/bench_joins.c \
     src/bench/bench_incremental.c \
     src/bench/bench_btree.c \
