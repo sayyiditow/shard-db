@@ -16646,19 +16646,18 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* Invalidate caches BEFORE removing files so no concurrent reader picks
-       up a stale mmap after we unlink the backing files. */
     char eff_obj[PATH_MAX];
     snprintf(eff_obj, sizeof(eff_obj), "%s/%s", dir, object);
     char eff_root[PATH_MAX];
     snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
+
     fcache_invalidate(obj_dir);
     slotcask_registry_invalidate(eff_root, object);
     invalidate_idx_cache(object);
     invalidate_schema_caches(db_root, object);
     counts_invalidate(eff_root, object);
 
-    /* Nuke the on-disk object tree entirely. */
+    /* Nuke the on-disk object tree. */
     rmrf(obj_dir);
 
     /* Strip the "dir:object:..." line from schema.conf (atomic rewrite). */
