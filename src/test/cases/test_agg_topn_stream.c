@@ -291,3 +291,84 @@ static int test_topn_stream_count_no_criteria(void) {
 }
 
 TEST_REGISTER("test-topn-stream-count-no-criteria", test_topn_stream_count_no_criteria)
+
+static int test_topn_stream_with_criteria_bitmap(void) {
+    TestEnv env;
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_crit\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"name:varchar:16\",\"active:bool\",\"score:int\"],"
+        "\"indexes\":[\"name\",\"active:bitmap\",\"score\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* 50 authors × 20 records. Author N has 10 records active=true, 10 active=false. */
+    size_t body_cap = 1 << 20;
+    char *body = malloc(body_cap);
+    int p = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    int next = 0;
+    for (int a = 0; a < 50; a++) {
+        for (int j = 0; j < 20; j++) {
+            p += snprintf(body + p, body_cap - p,
+                          "%s\"k%d\":{\"name\":\"a_%02d\",\"active\":%s,\"score\":%d}",
+                          next == 0 ? "" : ",", next, a,
+                          j < 10 ? "true" : "false", j);
+            next++;
+        }
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_crit\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* Top 5 active=true authors by count. Each active author has 10 records. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_crit\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
+    ASSERT_TRUE(resp != NULL, "criteria-filtered aggregate response");
+
+    /* Every author should have count=10 under active=true. Top 5 are returned.
+     * The streaming top-N path returns aggregate results in array format with
+     * each row as {"name":"...", "n":10}. Check for the count value. */
+    ASSERT_TRUE(strstr(resp, "\"n\":10") != NULL,
+                "count = 10 per author in response");
+
+    /* Count result rows: array of objects, each having a "name" field.
+     * limit=5 → 5 result rows. Count "name" strings to verify. */
+    int name_count = 0;
+    const char *q = resp;
+    while ((q = strstr(q, "\"name\":")) != NULL) {
+        name_count++;
+        q++;
+    }
+    ASSERT_EQ_INT(name_count, 5, "limit=5 returns 5 rows");
+
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-with-criteria-bitmap", test_topn_stream_with_criteria_bitmap)
