@@ -114,7 +114,7 @@ gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c s
 # (src/db/util.c) for response parsing; otherwise self-contained (TCP/TLS
 # client + assertion macros + per-test daemon fixtures). Future test cases
 # under src/test/cases/ get listed here.
-gcc $MODE_CFLAGS -o shard-db-test \
+gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/shard-db-test.c \
     src/test/test_client.c \
     src/test/test_runner.c \
@@ -210,6 +210,7 @@ gcc $MODE_CFLAGS -o shard-db-test \
     src/test/cases/test_slotcask_api.c \
     src/test/cases/test_tls_unit.c \
     src/test/cases/test_util.c \
+    src/test/cases/test_agg_topn_stream.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \

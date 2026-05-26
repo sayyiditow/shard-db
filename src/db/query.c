@@ -11649,32 +11649,75 @@ static int find_intersect_leaves(CriteriaNode *root,
     if (out_partial) *out_partial = 0;
     if (!root || root->kind != CNODE_AND) return 0;
     if (root->n_children < 2) return 0;
-    int n = 0;
+
+    /* Two-pass collection. We need to know whether any non-bitmap
+     * eligible leaf exists before deciding whether to keep bitmaps in
+     * the intersect or push them into the post-filter:
+     *
+     * - n_nonbitmap >= 2: intersect non-bitmap leaves only. Bitmaps
+     *   re-evaluate per-record via criteria_match_tree (single byte
+     *   read on the decoded record — cheaper than walking a 5M-entry
+     *   bool/enum bitmap into a KeySet just to intersect against the
+     *   small set the non-bitmap leaves already produced).
+     *
+     * - n_nonbitmap == 1: only one non-bitmap leaf — too few to
+     *   intersect. Return 0 so the caller falls back to PRIMARY_LEAF
+     *   on that non-bitmap leaf (find_primary_leaf's selectivity
+     *   scoring promotes it over any bitmap sibling).
+     *
+     * - n_nonbitmap == 0, n_bitmap >= 2: pure-bitmap AND. Keep all
+     *   bitmaps in the intersect so PRIMARY_INTERSECT's popcount /
+     *   bitmap-keyset fast path runs (PRIMARY_LEAF on one bitmap +
+     *   per-record post-filter on the others collects every matching
+     *   hash for the chosen value — 5.6M for type=story — then runs
+     *   per-record verification, which is dramatically worse). This is
+     *   the path the landing page hits (type IN […] AND dead=false
+     *   AND deleted=false) and was the regression that motivated this
+     *   second-pass rework. */
+    SearchCriterion *cand_leaves[MAX_INTERSECT_LEAVES * 2];
+    char             cand_paths[MAX_INTERSECT_LEAVES * 2][PATH_MAX];
+    int              cand_is_bitmap[MAX_INTERSECT_LEAVES * 2];
+    int n_cand = 0, n_nonbitmap = 0, n_bitmap = 0;
     int dropped = 0;
+    const int CAND_CAP = (int)(sizeof(cand_leaves) / sizeof(cand_leaves[0]));
+
     for (int i = 0; i < root->n_children; i++) {
         CriteriaNode *c = root->children[i];
-        /* Non-leaf (OR sub-tree) / non-rangeable op (icontains/regex/…) /
-         * non-indexed leaf → skip, let criteria_match_tree handle it
-         * per-record. Previously any of these aborted the intersect,
-         * forcing a single PRIMARY_LEAF on whichever indexed leaf came
-         * first in source order — which was usually the wrong choice
-         * when a selective trigram sat next to a broad bitmap. */
         if (c->kind != CNODE_LEAF) { dropped = 1; continue; }
         if (!op_eligible_for_intersect(c->leaf.op)) { dropped = 1; continue; }
         char path[PATH_MAX];
         if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) { dropped = 1; continue; }
-        /* Bitmaps cost more to walk into a KeySet (millions of entries for
-         * a bool / low-card enum) than to bit-test per record after the
-         * primary already narrowed the set. Push them into the post-filter. */
+        if (n_cand >= CAND_CAP) { dropped = 1; continue; }
         int picked = pick_index_for_leaf(db_root, object, &c->leaf);
-        if (picked == IT_BITMAP) { dropped = 1; continue; }
-        if (n >= MAX_INTERSECT_LEAVES) { dropped = 1; continue; }
-        out_leaves[n] = &c->leaf;
-        memcpy(out_paths[n], path, PATH_MAX);
-        n++;
+        cand_leaves[n_cand] = &c->leaf;
+        memcpy(cand_paths[n_cand], path, PATH_MAX);
+        cand_is_bitmap[n_cand] = (picked == IT_BITMAP) ? 1 : 0;
+        if (picked == IT_BITMAP) n_bitmap++; else n_nonbitmap++;
+        n_cand++;
+    }
+
+    int n = 0;
+    int bitmaps_skipped = 0;
+    if (n_nonbitmap >= 2) {
+        for (int i = 0; i < n_cand && n < MAX_INTERSECT_LEAVES; i++) {
+            if (cand_is_bitmap[i]) { bitmaps_skipped = 1; continue; }
+            out_leaves[n] = cand_leaves[i];
+            memcpy(out_paths[n], cand_paths[i], PATH_MAX);
+            n++;
+        }
+        if (n < n_nonbitmap) dropped = 1;  /* spilled past MAX_INTERSECT_LEAVES */
+    } else if (n_nonbitmap == 0 && n_bitmap >= 2) {
+        for (int i = 0; i < n_cand && n < MAX_INTERSECT_LEAVES; i++) {
+            out_leaves[n] = cand_leaves[i];
+            memcpy(out_paths[n], cand_paths[i], PATH_MAX);
+            n++;
+        }
+        if (n < n_bitmap) dropped = 1;
+    } else {
+        return 0;
     }
     if (n < 2) return 0;
-    if (out_partial) *out_partial = dropped;
+    if (out_partial) *out_partial = dropped || bitmaps_skipped;
     /* Insertion sort by selectivity rank — n is tiny (≤ MAX_INTERSECT_LEAVES). */
     for (int i = 1; i < n; i++) {
         for (int j = i; j > 0; j--) {
@@ -17400,6 +17443,176 @@ static void agg_arena_transfer(AggArena *dst, AggArena *src) {
         tail->next = src->head;
     }
     src->head = NULL;
+}
+
+/* ========== Top-N streaming heap (Phase 1) ==========
+ *
+ * Fixed-capacity array-backed binary heap, inverted on the agg metric.
+ *
+ * order:desc (default top-N): MIN-heap on metric — root is the smallest
+ *   kept value; offer() replaces the root if the new metric is greater.
+ *   At the end, drain in DECREASING metric order (sort desc).
+ * order:asc (bottom-N): MAX-heap — root is the largest kept value;
+ *   replace root when smaller arrives. Drain in increasing metric order.
+ *
+ * Capacity is fixed at allocation; no resize. group_key is owned by
+ * each entry and freed on eviction or destroy.
+ */
+
+typedef struct {
+    double   metric;       /* sort key (count / sum / min / max) */
+    char    *group_key;    /* owned varchar bytes — must free on evict */
+    size_t   group_key_len;
+    int64_t  count;        /* per-spec running state — fields used depend on spec */
+    double   sum;
+    double   min;
+    double   max;
+} TopNHeapEntry;
+
+typedef struct {
+    TopNHeapEntry *entries;  /* 1-indexed binary heap, [0] unused */
+    int            cap;
+    int            size;
+    int            order_desc;  /* 1 = top-N (min-heap), 0 = bottom-N (max-heap) */
+} TopNHeap;
+
+#ifdef TEST_BUILD
+#define TOPN_VIS
+#else
+#define TOPN_VIS static
+#endif
+
+TOPN_VIS void *topn_heap_new(int cap, int order_desc) {
+    if (cap <= 0) return NULL;
+    TopNHeap *h = calloc(1, sizeof(TopNHeap));
+    if (!h) return NULL;
+    h->entries = calloc((size_t)cap + 1, sizeof(TopNHeapEntry));
+    if (!h->entries) { free(h); return NULL; }
+    h->cap = cap;
+    h->size = 0;
+    h->order_desc = order_desc;
+    return h;
+}
+
+TOPN_VIS void topn_heap_destroy(void *hp) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h) return;
+    for (int i = 1; i <= h->size; i++) free(h->entries[i].group_key);
+    free(h->entries);
+    free(h);
+}
+
+TOPN_VIS int topn_heap_size(void *hp) {
+    return hp ? ((TopNHeap *)hp)->size : 0;
+}
+
+/* For top-N (desc): heap is a MIN-heap on metric → root is smallest kept.
+ *   new beats root iff new.metric > root.metric.
+ * For bottom-N (asc): MAX-heap → root is largest kept.
+ *   new beats root iff new.metric < root.metric. */
+static int topn_metric_beats(const TopNHeap *h, double a, double b) {
+    return h->order_desc ? (a > b) : (a < b);
+}
+
+/* Standard sift-down — children at 2i, 2i+1. "Worse" = closer to root in
+ * inverted-heap terms. */
+static void topn_sift_down(TopNHeap *h, int i) {
+    for (;;) {
+        int l = 2 * i, r = 2 * i + 1, worst = i;
+        if (l <= h->size && topn_metric_beats(h, h->entries[worst].metric,
+                                              h->entries[l].metric)) worst = l;
+        if (r <= h->size && topn_metric_beats(h, h->entries[worst].metric,
+                                              h->entries[r].metric)) worst = r;
+        if (worst == i) return;
+        TopNHeapEntry tmp = h->entries[i];
+        h->entries[i] = h->entries[worst];
+        h->entries[worst] = tmp;
+        i = worst;
+    }
+}
+
+static void topn_sift_up(TopNHeap *h, int i) {
+    while (i > 1) {
+        int p = i / 2;
+        if (topn_metric_beats(h, h->entries[p].metric, h->entries[i].metric)) {
+            TopNHeapEntry tmp = h->entries[i];
+            h->entries[i] = h->entries[p];
+            h->entries[p] = tmp;
+            i = p;
+        } else return;
+    }
+}
+
+/* Returns 1 if the entry was accepted (added or replaced root), 0 if
+ * rejected. group_key is copied (heap owns the copy). */
+TOPN_VIS int topn_heap_offer(void *hp, double metric,
+                              const char *gk, size_t gklen,
+                              int64_t count, double sum, double min, double max) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h) return 0;
+    if (h->size < h->cap) {
+        h->size++;
+        h->entries[h->size].metric = metric;
+        h->entries[h->size].count = count;
+        h->entries[h->size].sum = sum;
+        h->entries[h->size].min = min;
+        h->entries[h->size].max = max;
+        h->entries[h->size].group_key = malloc(gklen + 1);
+        if (!h->entries[h->size].group_key) { h->size--; return 0; }
+        memcpy(h->entries[h->size].group_key, gk, gklen);
+        h->entries[h->size].group_key[gklen] = '\0';
+        h->entries[h->size].group_key_len = gklen;
+        topn_sift_up(h, h->size);
+        return 1;
+    }
+    /* Full — compare against root. */
+    if (!topn_metric_beats(h, metric, h->entries[1].metric)) return 0;
+    free(h->entries[1].group_key);
+    h->entries[1].metric = metric;
+    h->entries[1].count = count;
+    h->entries[1].sum = sum;
+    h->entries[1].min = min;
+    h->entries[1].max = max;
+    h->entries[1].group_key = malloc(gklen + 1);
+    if (!h->entries[1].group_key) { h->size--; return 0; }
+    memcpy(h->entries[1].group_key, gk, gklen);
+    h->entries[1].group_key[gklen] = '\0';
+    h->entries[1].group_key_len = gklen;
+    topn_sift_down(h, 1);
+    return 1;
+}
+
+/* Drain into caller-provided arrays (must be sized >= cap). Returns
+ * the number of entries written. Output is sorted by the user's
+ * order_by direction (desc → metrics decreasing, asc → metrics
+ * increasing). Heap is empty after drain. Caller takes ownership of
+ * each gkeys_out[i] and must free(). */
+TOPN_VIS int topn_heap_drain(void *hp, double *metrics_out,
+                              char **gkeys_out, size_t *gklens_out,
+                              int64_t *counts_out, double *sums_out,
+                              double *mins_out, double *maxs_out) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h || h->size == 0) return 0;
+    int n = h->size;
+    /* Repeatedly extract-root → produces sorted ascending order
+     * for top-N (min-heap) and descending for bottom-N (max-heap).
+     * Reverse on the way out so output direction matches user's
+     * order_by. */
+    int idx = n;
+    while (h->size > 0) {
+        idx--;
+        metrics_out[idx]  = h->entries[1].metric;
+        gkeys_out[idx]    = h->entries[1].group_key;  /* transfer */
+        gklens_out[idx]   = h->entries[1].group_key_len;
+        counts_out[idx]   = h->entries[1].count;
+        sums_out[idx]     = h->entries[1].sum;
+        mins_out[idx]     = h->entries[1].min;
+        maxs_out[idx]     = h->entries[1].max;
+        h->entries[1] = h->entries[h->size];
+        h->size--;
+        if (h->size > 0) topn_sift_down(h, 1);
+    }
+    return n;
 }
 
 typedef struct {
