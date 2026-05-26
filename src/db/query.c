@@ -11749,6 +11749,40 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
                                    p.intersect_leaves, p.intersect_paths,
                                    &partial);
     if (ni >= 2) {
+        /* A pure-bitmap intersect is the right call ONLY when no more-
+         * selective single leaf exists. When find_intersect_leaves dropped a
+         * leaf (partial) and every leaf it kept is a bitmap, the AND also
+         * holds an indexed leaf that couldn't join the intersect — a trigram
+         * contains / btree like / regex. Intersecting the bitmaps yields
+         * millions of candidate hashes that we'd then post-filter the
+         * selective leaf across (the hn/stories "title icontains X AND
+         * dead=false AND deleted=false" 20s regression). Leading with that
+         * selective leaf as PRIMARY_LEAF and re-checking the bitmaps per
+         * record (single byte compare on the decoded record) is dramatically
+         * cheaper. Pure-bitmap landing-page ANDs drop nothing (partial=0) and
+         * keep the popcount intersect — its bitmap-vs-bitmap fast path wins. */
+        if (partial) {
+            int all_bitmap = 1;
+            for (int i = 0; i < ni; i++) {
+                if (pick_index_for_leaf(db_root, object, p.intersect_leaves[i]) != IT_BITMAP) {
+                    all_bitmap = 0;
+                    break;
+                }
+            }
+            if (all_bitmap) {
+                char lp[PATH_MAX] = "";
+                SearchCriterion *lf = find_primary_leaf(tree, db_root, object,
+                                                        lp, sizeof(lp));
+                /* score < 80 == strictly more selective than a bitmap. */
+                if (lf && leaf_selectivity_score(lf, db_root, object) < 80) {
+                    QueryPlan pl = {0};
+                    pl.kind = PRIMARY_LEAF;
+                    pl.primary_leaf = lf;
+                    strncpy(pl.primary_idx_path, lp, sizeof(pl.primary_idx_path) - 1);
+                    return pl;
+                }
+            }
+        }
         p.kind = PRIMARY_INTERSECT;
         p.intersect_count = ni;
         p.partial_intersect = partial;
@@ -11775,6 +11809,35 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
     p.kind = PRIMARY_NONE;
     return p;
 }
+
+#ifdef TEST_BUILD
+/* Test-only hook: expose the planner's primary-source decision so tests can
+ * assert plan SELECTION. A wrong plan that still returns the right answer —
+ * e.g. a broad bitmap intersect chosen over a selective trigram leaf — is
+ * invisible to result-only functional tests, so this surfaces the kind +
+ * (for PRIMARY_LEAF) the chosen field as stable strings. */
+const char *planner_primary_kind_for_test(const char *db_root, const char *object,
+                                          const char *criteria_json,
+                                          char *out_field, size_t out_sz) {
+    if (out_field && out_sz) out_field[0] = '\0';
+    const char *err = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return "parse_error";
+    QueryPlan p = choose_primary_source(tree, db_root, object);
+    const char *kind = "?";
+    switch (p.kind) {
+        case PRIMARY_NONE:      kind = "none"; break;
+        case PRIMARY_LEAF:      kind = "leaf";
+            if (out_field && out_sz && p.primary_leaf)
+                snprintf(out_field, out_sz, "%s", p.primary_leaf->field);
+            break;
+        case PRIMARY_KEYSET:    kind = "keyset"; break;
+        case PRIMARY_INTERSECT: kind = "intersect"; break;
+    }
+    free_criteria_tree(tree);
+    return kind;
+}
+#endif
 
 /* ========== AND index-intersection (KeySet fast path) ==========
 
