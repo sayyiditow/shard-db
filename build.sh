@@ -211,6 +211,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_tls_unit.c \
     src/test/cases/test_util.c \
     src/test/cases/test_agg_topn_stream.c \
+    src/test/cases/test_planner_trigram_selectivity.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \
