@@ -11452,9 +11452,62 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     return 1;
 }
 
-/* Walk immediate children of an AND root looking for the first indexable leaf.
-   Single-LEAF roots are treated as an AND of one. Returns the leaf's
-   SearchCriterion* (pointer into the tree — do not free). */
+/* Estimate selectivity of an indexed leaf — lower = more selective ⇒
+ * better PRIMARY_LEAF candidate. INT_MAX = not indexed (caller skips).
+ *
+ * Pre-2026-05-26 find_primary_leaf returned the FIRST indexed leaf in
+ * AND-child order regardless of how broad it was. On the Netcup deploy
+ * `(type IN [...] AND dead=false AND deleted=false AND title icontains
+ * "X")` picked `type` (bitmap, 5.6M matches) as primary instead of
+ * `title` (trigram, hundreds of matches) — search timed out at 30s.
+ *
+ * Heuristic (no on-disk stats yet):
+ *   IT_TRIGRAM     →  10  contains/icontains with ≥3-char pattern,
+ *                          usually hundreds or fewer matches
+ *   IT_BTREE eq    →  20  point lookup
+ *   IT_BTREE in    →  30  small set
+ *   IT_BTREE between →40  bounded range
+ *   IT_BTREE range →  50  unbounded half-range; selectivity depends on bound
+ *   IT_BTREE starts→  60  prefix scan
+ *   IT_BTREE other →  70  contains/like/regex on btree (full leaf walk)
+ *   IT_BITMAP any  →  80  bool / low-card enum — typically 20-80% of records.
+ *                          Cheap as a per-record post-filter (bit lookup)
+ *                          but expensive as PRIMARY because it'd build a
+ *                          multi-million-entry KeySet.
+ *   other          →  90
+ *
+ * Strategy: PRIMARY_LEAF picks the leaf with the lowest score; remaining
+ * AND children stay in the tree and get re-evaluated per record via
+ * criteria_match_tree (cheap for indexed bitmap fields — single byte
+ * compare on the decoded record). */
+static int leaf_selectivity_score(const SearchCriterion *c,
+                                  const char *db_root, const char *object) {
+    if (!c) return INT_MAX;
+    int picked = pick_index_for_leaf(db_root, object, c);
+    if (picked < 0) return INT_MAX;
+
+    if (picked == IT_TRIGRAM) return 10;
+    if (picked == IT_BTREE) {
+        switch (c->op) {
+            case OP_EQUAL:       return 20;
+            case OP_IN:          return 30;
+            case OP_BETWEEN:     return 40;
+            case OP_LESS: case OP_GREATER:
+            case OP_LESS_EQ: case OP_GREATER_EQ:
+                                 return 50;
+            case OP_STARTS_WITH: return 60;
+            default:             return 70;
+        }
+    }
+    if (picked == IT_BITMAP) return 80;
+    return 90;
+}
+
+/* Walk immediate children of an AND root and pick the most-selective
+   indexable leaf as PRIMARY. Single-LEAF roots are treated as an AND of
+   one. Returns the leaf's SearchCriterion* (pointer into the tree — do
+   not free). Remaining AND children stay in the tree and get re-checked
+   per record by the executor's post-filter. */
 static SearchCriterion *find_primary_leaf(CriteriaNode *root,
                                           const char *db_root, const char *object,
                                           char *out_idx_path, size_t out_sz) {
@@ -11465,12 +11518,28 @@ static SearchCriterion *find_primary_leaf(CriteriaNode *root,
         return NULL;
     }
     if (root->kind == CNODE_AND) {
+        SearchCriterion *best = NULL;
+        int best_score = INT_MAX;
+        char best_path[PATH_MAX] = "";
         for (int i = 0; i < root->n_children; i++) {
             CriteriaNode *c = root->children[i];
-            if (c->kind == CNODE_LEAF &&
-                leaf_is_indexed(&c->leaf, db_root, object, out_idx_path, out_sz))
-                return &c->leaf;
+            if (c->kind != CNODE_LEAF) continue;
+            char path[PATH_MAX];
+            if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) continue;
+            int score = leaf_selectivity_score(&c->leaf, db_root, object);
+            if (score < best_score) {
+                best_score = score;
+                best = &c->leaf;
+                memcpy(best_path, path, sizeof(best_path));
+            }
         }
+        if (best && out_idx_path) {
+            size_t n = strlen(best_path);
+            if (n >= out_sz) n = out_sz - 1;
+            memcpy(out_idx_path, best_path, n);
+            out_idx_path[n] = '\0';
+        }
+        return best;
     }
     return NULL;
 }
@@ -11528,6 +11597,11 @@ typedef struct {
     SearchCriterion *intersect_leaves[MAX_INTERSECT_LEAVES];
     char intersect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
     int intersect_count;
+    /* find_intersect_leaves dropped at least one AND child (bitmap leaf,
+       non-rangeable op, OR sub-tree, non-indexed leaf, or excess past
+       MAX_INTERSECT_LEAVES). Executors MUST post-filter via the full
+       criteria tree — keyset_size alone is not the answer. */
+    int partial_intersect;
 } QueryPlan;
 
 /* True if the operator yields a precise btree candidate set without needing
@@ -11570,21 +11644,80 @@ static int op_selectivity_rank(enum SearchOp op) {
 static int find_intersect_leaves(CriteriaNode *root,
                                  const char *db_root, const char *object,
                                  SearchCriterion *out_leaves[MAX_INTERSECT_LEAVES],
-                                 char out_paths[MAX_INTERSECT_LEAVES][PATH_MAX]) {
+                                 char out_paths[MAX_INTERSECT_LEAVES][PATH_MAX],
+                                 int *out_partial) {
+    if (out_partial) *out_partial = 0;
     if (!root || root->kind != CNODE_AND) return 0;
-    if (root->n_children < 2 || root->n_children > MAX_INTERSECT_LEAVES) return 0;
-    int n = 0;
+    if (root->n_children < 2) return 0;
+
+    /* Two-pass collection. We need to know whether any non-bitmap
+     * eligible leaf exists before deciding whether to keep bitmaps in
+     * the intersect or push them into the post-filter:
+     *
+     * - n_nonbitmap >= 2: intersect non-bitmap leaves only. Bitmaps
+     *   re-evaluate per-record via criteria_match_tree (single byte
+     *   read on the decoded record — cheaper than walking a 5M-entry
+     *   bool/enum bitmap into a KeySet just to intersect against the
+     *   small set the non-bitmap leaves already produced).
+     *
+     * - n_nonbitmap == 1: only one non-bitmap leaf — too few to
+     *   intersect. Return 0 so the caller falls back to PRIMARY_LEAF
+     *   on that non-bitmap leaf (find_primary_leaf's selectivity
+     *   scoring promotes it over any bitmap sibling).
+     *
+     * - n_nonbitmap == 0, n_bitmap >= 2: pure-bitmap AND. Keep all
+     *   bitmaps in the intersect so PRIMARY_INTERSECT's popcount /
+     *   bitmap-keyset fast path runs (PRIMARY_LEAF on one bitmap +
+     *   per-record post-filter on the others collects every matching
+     *   hash for the chosen value — 5.6M for type=story — then runs
+     *   per-record verification, which is dramatically worse). This is
+     *   the path the landing page hits (type IN […] AND dead=false
+     *   AND deleted=false) and was the regression that motivated this
+     *   second-pass rework. */
+    SearchCriterion *cand_leaves[MAX_INTERSECT_LEAVES * 2];
+    char             cand_paths[MAX_INTERSECT_LEAVES * 2][PATH_MAX];
+    int              cand_is_bitmap[MAX_INTERSECT_LEAVES * 2];
+    int n_cand = 0, n_nonbitmap = 0, n_bitmap = 0;
+    int dropped = 0;
+    const int CAND_CAP = (int)(sizeof(cand_leaves) / sizeof(cand_leaves[0]));
+
     for (int i = 0; i < root->n_children; i++) {
         CriteriaNode *c = root->children[i];
-        if (c->kind != CNODE_LEAF) return 0;
-        if (!op_eligible_for_intersect(c->leaf.op)) return 0;
+        if (c->kind != CNODE_LEAF) { dropped = 1; continue; }
+        if (!op_eligible_for_intersect(c->leaf.op)) { dropped = 1; continue; }
         char path[PATH_MAX];
-        if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) return 0;
-        out_leaves[n] = &c->leaf;
-        memcpy(out_paths[n], path, PATH_MAX);
-        n++;
+        if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) { dropped = 1; continue; }
+        if (n_cand >= CAND_CAP) { dropped = 1; continue; }
+        int picked = pick_index_for_leaf(db_root, object, &c->leaf);
+        cand_leaves[n_cand] = &c->leaf;
+        memcpy(cand_paths[n_cand], path, PATH_MAX);
+        cand_is_bitmap[n_cand] = (picked == IT_BITMAP) ? 1 : 0;
+        if (picked == IT_BITMAP) n_bitmap++; else n_nonbitmap++;
+        n_cand++;
+    }
+
+    int n = 0;
+    int bitmaps_skipped = 0;
+    if (n_nonbitmap >= 2) {
+        for (int i = 0; i < n_cand && n < MAX_INTERSECT_LEAVES; i++) {
+            if (cand_is_bitmap[i]) { bitmaps_skipped = 1; continue; }
+            out_leaves[n] = cand_leaves[i];
+            memcpy(out_paths[n], cand_paths[i], PATH_MAX);
+            n++;
+        }
+        if (n < n_nonbitmap) dropped = 1;  /* spilled past MAX_INTERSECT_LEAVES */
+    } else if (n_nonbitmap == 0 && n_bitmap >= 2) {
+        for (int i = 0; i < n_cand && n < MAX_INTERSECT_LEAVES; i++) {
+            out_leaves[n] = cand_leaves[i];
+            memcpy(out_paths[n], cand_paths[i], PATH_MAX);
+            n++;
+        }
+        if (n < n_bitmap) dropped = 1;
+    } else {
+        return 0;
     }
     if (n < 2) return 0;
+    if (out_partial) *out_partial = dropped || bitmaps_skipped;
     /* Insertion sort by selectivity rank — n is tiny (≤ MAX_INTERSECT_LEAVES). */
     for (int i = 1; i < n; i++) {
         for (int j = i; j > 0; j--) {
@@ -11611,11 +11744,14 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
     /* Try intersection first — if 2+ indexable AND-leaves on rangeable ops
        exist, intersecting candidate hashes is faster than primary-leaf +
        per-record post-filter for selective queries. */
+    int partial = 0;
     int ni = find_intersect_leaves(tree, db_root, object,
-                                   p.intersect_leaves, p.intersect_paths);
+                                   p.intersect_leaves, p.intersect_paths,
+                                   &partial);
     if (ni >= 2) {
         p.kind = PRIMARY_INTERSECT;
         p.intersect_count = ni;
+        p.partial_intersect = partial;
         return p;
     }
 
@@ -12828,14 +12964,19 @@ static size_t keyset_count_from_intersect(const char *db_root, const char *objec
                                               &small_primary);
     if (!result) return 0;
 
-    if (!small_primary) {
+    /* Partial intersect: at least one AND child was dropped from the
+       intersect (bitmap leaf, non-rangeable op, OR sub-tree, …) and
+       lives in the criteria tree as a post-filter. Bare keyset_size
+       would over-count; route through parallel_indexed_count which
+       re-applies the full tree per record. */
+    if (!small_primary && !plan->partial_intersect) {
         size_t n = keyset_size(result);
         keyset_free(result);
         return n;
     }
 
-    /* Small first leaf: skip the second-leaf btree walk(s). Convert to a
-       CollectedHash[] and feed parallel_indexed_count with the full tree. */
+    /* Small first leaf or partial intersect: feed parallel_indexed_count
+       with the full tree so every dropped/post-filter leaf is verified. */
     CollectedHash *batch = NULL;
     size_t batch_count = 0;
     int rc = keyset_to_collected_hashes(result, sch->splits, &batch, &batch_count);
@@ -13226,10 +13367,13 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                           plan->intersect_count, dl,
                                           &small_primary);
     if (!ks) return 0;
-    /* Small primary: pass the full tree so emit re-checks every leaf via
-       criteria_match_tree. Big primary: intersection already exact, skip rematch. */
+    /* Small primary OR partial intersect: pass the full tree so emit
+       re-checks every leaf (including any bitmap/OR/non-rangeable child
+       the planner kept out of the intersect) via criteria_match_tree.
+       Big primary with full intersect: intersection already exact, skip rematch. */
+    int need_rematch = small_primary || plan->partial_intersect;
     int rc = keyset_emit_find(db_root, object, sch, ks,
-                              small_primary ? tree : NULL,
+                              need_rematch ? tree : NULL,
                               excluded, offset, limit,
                               proj_fields, proj_count, fs, rows_fmt, dict_fmt, csv_delim,
                               joins, njoins, dl);
@@ -13308,10 +13452,12 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                           &small_primary);
     if (!ks) return 0;
 
-    if (small_primary) {
+    if (small_primary || plan->partial_intersect) {
         /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
            AggCtx lives further down the file — caller passes &ctx.tree to
-           avoid a forward decl. */
+           avoid a forward decl. Partial intersect: at least one AND child
+           (bitmap, non-rangeable op, OR sub-tree, …) was dropped from the
+           intersect and survives only in the criteria tree as a post-filter. */
         *agg_ctx_tree_field = full_tree;
     }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -13642,6 +13788,39 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 else OUT("%zu\n", ic.count);
             }
         } else {
+            /* Multi-leaf tree, indexed primary. Dispatch on the picker's
+               choice — btree_dispatch only handles btree/bitmap, so a
+               trigram primary needs build_keyset_from_trigram before the
+               full-tree post-filter via parallel_indexed_count. Previously
+               find_primary_leaf returned source-order, so trigram rarely
+               sat as primary in multi-leaf trees; the selectivity-scoring
+               picker now favours it (trigram=10 vs bitmap=80) and surfaced
+               this gap. */
+            int picked = pick_index_for_leaf(db_root, object, pc);
+            if (picked == IT_TRIGRAM) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, pc, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    size_t count = parallel_indexed_count(db_root, object, &sch,
+                                                          entries, (int)n,
+                                                          tree, &fs, &dl);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%zu\n", count);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+                /* Trigram builder transient failure (alloc, …) — defensive 0
+                   matches the single-leaf branch's behaviour. */
+                OUT("0\n");
+                free_criteria_tree(tree);
+                return 0;
+            }
+
             CollectCtx cc;
             collect_ctx_init(&cc);
             cc.splits = sch.splits;
@@ -17266,6 +17445,547 @@ static void agg_arena_transfer(AggArena *dst, AggArena *src) {
     src->head = NULL;
 }
 
+/* ========== Top-N streaming heap (Phase 1) ==========
+ *
+ * Fixed-capacity array-backed binary heap, inverted on the agg metric.
+ *
+ * order:desc (default top-N): MIN-heap on metric — root is the smallest
+ *   kept value; offer() replaces the root if the new metric is greater.
+ *   At the end, drain in DECREASING metric order (sort desc).
+ * order:asc (bottom-N): MAX-heap — root is the largest kept value;
+ *   replace root when smaller arrives. Drain in increasing metric order.
+ *
+ * Capacity is fixed at allocation; no resize. group_key is owned by
+ * each entry and freed on eviction or destroy.
+ */
+
+typedef struct {
+    double   metric;       /* sort key (count / sum / min / max) */
+    char    *group_key;    /* owned varchar bytes — must free on evict */
+    size_t   group_key_len;
+    int64_t  count;        /* per-spec running state — fields used depend on spec */
+    double   sum;
+    double   min;
+    double   max;
+} TopNHeapEntry;
+
+typedef struct {
+    TopNHeapEntry *entries;  /* 1-indexed binary heap, [0] unused */
+    int            cap;
+    int            size;
+    int            order_desc;  /* 1 = top-N (min-heap), 0 = bottom-N (max-heap) */
+} TopNHeap;
+
+#ifdef TEST_BUILD
+#define TOPN_VIS
+#else
+#define TOPN_VIS static
+#endif
+
+TOPN_VIS void *topn_heap_new(int cap, int order_desc) {
+    if (cap <= 0) return NULL;
+    TopNHeap *h = calloc(1, sizeof(TopNHeap));
+    if (!h) return NULL;
+    h->entries = calloc((size_t)cap + 1, sizeof(TopNHeapEntry));
+    if (!h->entries) { free(h); return NULL; }
+    h->cap = cap;
+    h->size = 0;
+    h->order_desc = order_desc;
+    return h;
+}
+
+TOPN_VIS void topn_heap_destroy(void *hp) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h) return;
+    for (int i = 1; i <= h->size; i++) free(h->entries[i].group_key);
+    free(h->entries);
+    free(h);
+}
+
+TOPN_VIS int topn_heap_size(void *hp) {
+    return hp ? ((TopNHeap *)hp)->size : 0;
+}
+
+/* For top-N (desc): heap is a MIN-heap on metric → root is smallest kept.
+ *   new beats root iff new.metric > root.metric.
+ * For bottom-N (asc): MAX-heap → root is largest kept.
+ *   new beats root iff new.metric < root.metric. */
+static int topn_metric_beats(const TopNHeap *h, double a, double b) {
+    return h->order_desc ? (a > b) : (a < b);
+}
+
+/* Standard sift-down — children at 2i, 2i+1. "Worse" = closer to root in
+ * inverted-heap terms. */
+static void topn_sift_down(TopNHeap *h, int i) {
+    for (;;) {
+        int l = 2 * i, r = 2 * i + 1, worst = i;
+        if (l <= h->size && topn_metric_beats(h, h->entries[worst].metric,
+                                              h->entries[l].metric)) worst = l;
+        if (r <= h->size && topn_metric_beats(h, h->entries[worst].metric,
+                                              h->entries[r].metric)) worst = r;
+        if (worst == i) return;
+        TopNHeapEntry tmp = h->entries[i];
+        h->entries[i] = h->entries[worst];
+        h->entries[worst] = tmp;
+        i = worst;
+    }
+}
+
+static void topn_sift_up(TopNHeap *h, int i) {
+    while (i > 1) {
+        int p = i / 2;
+        if (topn_metric_beats(h, h->entries[p].metric, h->entries[i].metric)) {
+            TopNHeapEntry tmp = h->entries[i];
+            h->entries[i] = h->entries[p];
+            h->entries[p] = tmp;
+            i = p;
+        } else return;
+    }
+}
+
+/* Returns 1 if the entry was accepted (added or replaced root), 0 if
+ * rejected. group_key is copied (heap owns the copy). */
+TOPN_VIS int topn_heap_offer(void *hp, double metric,
+                              const char *gk, size_t gklen,
+                              int64_t count, double sum, double min, double max) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h) return 0;
+    if (h->size < h->cap) {
+        h->size++;
+        h->entries[h->size].metric = metric;
+        h->entries[h->size].count = count;
+        h->entries[h->size].sum = sum;
+        h->entries[h->size].min = min;
+        h->entries[h->size].max = max;
+        h->entries[h->size].group_key = malloc(gklen + 1);
+        if (!h->entries[h->size].group_key) { h->size--; return 0; }
+        memcpy(h->entries[h->size].group_key, gk, gklen);
+        h->entries[h->size].group_key[gklen] = '\0';
+        h->entries[h->size].group_key_len = gklen;
+        topn_sift_up(h, h->size);
+        return 1;
+    }
+    /* Full — compare against root. */
+    if (!topn_metric_beats(h, metric, h->entries[1].metric)) return 0;
+    free(h->entries[1].group_key);
+    h->entries[1].metric = metric;
+    h->entries[1].count = count;
+    h->entries[1].sum = sum;
+    h->entries[1].min = min;
+    h->entries[1].max = max;
+    h->entries[1].group_key = malloc(gklen + 1);
+    if (!h->entries[1].group_key) { h->size--; return 0; }
+    memcpy(h->entries[1].group_key, gk, gklen);
+    h->entries[1].group_key[gklen] = '\0';
+    h->entries[1].group_key_len = gklen;
+    topn_sift_down(h, 1);
+    return 1;
+}
+
+/* Drain into caller-provided arrays (must be sized >= cap). Returns
+ * the number of entries written. Output is sorted by the user's
+ * order_by direction (desc → metrics decreasing, asc → metrics
+ * increasing). Heap is empty after drain. Caller takes ownership of
+ * each gkeys_out[i] and must free(). */
+TOPN_VIS int topn_heap_drain(void *hp, double *metrics_out,
+                              char **gkeys_out, size_t *gklens_out,
+                              int64_t *counts_out, double *sums_out,
+                              double *mins_out, double *maxs_out) {
+    TopNHeap *h = (TopNHeap *)hp;
+    if (!h || h->size == 0) return 0;
+    int n = h->size;
+    /* Repeatedly extract-root → produces sorted ascending order
+     * for top-N (min-heap) and descending for bottom-N (max-heap).
+     * Reverse on the way out so output direction matches user's
+     * order_by. */
+    int idx = n;
+    while (h->size > 0) {
+        idx--;
+        metrics_out[idx]  = h->entries[1].metric;
+        gkeys_out[idx]    = h->entries[1].group_key;  /* transfer */
+        gklens_out[idx]   = h->entries[1].group_key_len;
+        counts_out[idx]   = h->entries[1].count;
+        sums_out[idx]     = h->entries[1].sum;
+        mins_out[idx]     = h->entries[1].min;
+        maxs_out[idx]     = h->entries[1].max;
+        h->entries[1] = h->entries[h->size];
+        h->size--;
+        if (h->size > 0) topn_sift_down(h, 1);
+    }
+    return n;
+}
+
+/* ========== Top-N streaming eligibility (Phase 1) ==========
+ *
+ * Pure shape + index-presence check. Phase 1 fires for:
+ *   - single-field group_by
+ *   - field has IT_BTREE index
+ *   - order_by references an aggregate alias (not the group_by field)
+ *   - limit in (0, 10000]
+ *   - no HAVING clause
+ *   - every spec is count() or sum/min/max on the group_by field itself
+ *
+ * Phase 2 (composite-covered agg on different field) and Phase 3
+ * (multi-field group_by via composite) relax conditions in this same
+ * function in later tasks.
+ */
+#ifdef TEST_BUILD
+#define TOPN_ELIG_VIS
+#else
+#define TOPN_ELIG_VIS static
+#endif
+
+TOPN_ELIG_VIS int eligible_for_topn_stream(
+    const char *db_root, const char *object,
+    const AggSpec *specs, int nspecs,
+    const char *group_by_csv,
+    const char *order_by_alias,
+    int limit,
+    const char *having)
+{
+    if (!specs || nspecs <= 0) return 0;
+    if (!group_by_csv || !*group_by_csv) return 0;
+    if (!order_by_alias || !*order_by_alias) return 0;
+    if (limit <= 0 || limit > 10000) return 0;
+    if (having && *having) return 0;
+
+    /* Single group_by field only (Phase 1). */
+    if (strchr(group_by_csv, ',')) return 0;
+    const char *gb_field = group_by_csv;
+
+    /* order_by must reference an aggregate alias, not the group_by field. */
+    if (strcmp(order_by_alias, gb_field) == 0) return 0;
+    int matching_spec = -1;
+    for (int i = 0; i < nspecs; i++) {
+        if (strcmp(specs[i].alias, order_by_alias) == 0) {
+            matching_spec = i;
+            break;
+        }
+    }
+    if (matching_spec < 0) return 0;
+
+    /* group_by field must have a btree index. */
+    if (!field_has_index_type(db_root, object, gb_field, IT_BTREE)) return 0;
+
+    /* Phase 1: every spec is count() OR agg on the group_by field itself. */
+    for (int i = 0; i < nspecs; i++) {
+        if (specs[i].fn == AGG_COUNT) continue;
+        if (specs[i].field[0] && strcmp(specs[i].field, gb_field) == 0) continue;
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Forward declarations for helpers defined later in this file that the
+ * streaming top-N executor needs. */
+static int  decode_index_key_to_double(const TypedField *f,
+                                        const uint8_t *key, size_t klen,
+                                        double *out);
+static void fmt_double(char *buf, size_t sz, double v);
+
+/* ========== Streaming top-N aggregate executor (Phase 1) ==========
+ *
+ * Pre: eligible_for_topn_stream returned 1.
+ *
+ * Walks the group_by field's btree in global value-sorted order via
+ * btree_idx_walk_ordered (streaming k-way merge of per-shard
+ * BtRangeIters). Run-length finalizes each group on value-change;
+ * keeps a K-element top-N heap on the order_by spec's metric.
+ * Memory O(K). No seg-file reads for pure count().
+ *
+ * Returns  0 on success (output written via OUT()),
+ *         -1 on timeout/alloc error,
+ *         -2 when caller should fall back (non-indexable criteria).
+ */
+
+typedef struct {
+    char        *current_key;
+    size_t       current_key_len;
+    int64_t      current_count;
+    double       current_sum;
+    double       current_min;
+    double       current_max;
+    int          current_min_set;
+    int          current_max_set;
+
+    const AggSpec    *specs;
+    int               nspecs;
+    int               order_spec_idx;
+    void             *heap;
+    KeySet           *prefilter;
+    QueryDeadline    *dl;
+    int               dl_counter;
+    const TypedField *gb_tf;   /* for future sum/min/max on the group field */
+} TopNWalkCtx;
+
+static double topn_metric_from_state(const TopNWalkCtx *c) {
+    const AggSpec *s = &c->specs[c->order_spec_idx];
+    switch (s->fn) {
+        case AGG_COUNT: return (double)c->current_count;
+        case AGG_SUM:   return c->current_sum;
+        case AGG_MIN:   return c->current_min_set ? c->current_min : 0.0;
+        case AGG_MAX:   return c->current_max_set ? c->current_max : 0.0;
+        case AGG_AVG:   return c->current_count > 0
+                              ? c->current_sum / (double)c->current_count : 0.0;
+        default:        return 0.0;
+    }
+}
+
+static void topn_finalize_run(TopNWalkCtx *c) {
+    if (!c->current_key) return;
+    double metric = topn_metric_from_state(c);
+    topn_heap_offer(c->heap, metric,
+                    c->current_key, c->current_key_len,
+                    c->current_count, c->current_sum,
+                    c->current_min_set ? c->current_min : 0.0,
+                    c->current_max_set ? c->current_max : 0.0);
+    free(c->current_key);
+    c->current_key     = NULL;
+    c->current_key_len = 0;
+    c->current_count   = 0;
+    c->current_sum     = 0.0;
+    c->current_min     = 0.0;
+    c->current_max     = 0.0;
+    c->current_min_set = 0;
+    c->current_max_set = 0;
+}
+
+static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
+                        const uint8_t *hash16, void *ctx_v) {
+    TopNWalkCtx *c = (TopNWalkCtx *)ctx_v;
+
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->prefilter && !keyset_contains(c->prefilter, hash16)) return 0;
+
+    int new_group = 0;
+    if (!c->current_key) {
+        new_group = 1;
+    } else if (c->current_key_len != enc_val_len ||
+               memcmp(c->current_key, enc_val, enc_val_len) != 0) {
+        topn_finalize_run(c);
+        new_group = 1;
+    }
+
+    if (new_group) {
+        c->current_key = malloc(enc_val_len + 1);
+        if (!c->current_key) return -1;
+        memcpy(c->current_key, enc_val, enc_val_len);
+        c->current_key[enc_val_len] = '\0';
+        c->current_key_len = enc_val_len;
+        c->current_count   = 0;
+        c->current_sum     = 0.0;
+        c->current_min     = 0.0;
+        c->current_max     = 0.0;
+        c->current_min_set = 0;
+        c->current_max_set = 0;
+    }
+    c->current_count++;
+
+    /* If the group_by field is numeric, decode the leaf bytes and
+     * update sum/min/max for specs that aggregate the group_by field
+     * itself. Varchar group_by → numeric specs would be a no-op
+     * anyway; skip decode to avoid false positives. */
+    if (c->gb_tf && c->gb_tf->type != FT_VARCHAR) {
+        double v;
+        if (decode_index_key_to_double(c->gb_tf,
+                                        (const uint8_t *)enc_val, enc_val_len,
+                                        &v)) {
+            c->current_sum += v;
+            if (!c->current_min_set || v < c->current_min) {
+                c->current_min = v;
+                c->current_min_set = 1;
+            }
+            if (!c->current_max_set || v > c->current_max) {
+                c->current_max = v;
+                c->current_max_set = 1;
+            }
+        }
+    }
+    return 0;
+}
+
+#ifdef TEST_BUILD
+#define TOPN_RUN_VIS
+#else
+#define TOPN_RUN_VIS static
+#endif
+
+TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
+                                      const Schema *sch, FieldSchema *fs,
+                                      const AggSpec *specs, int nspecs,
+                                      const char *group_by_field,
+                                      const char *order_by_alias,
+                                      int order_desc,
+                                      int limit,
+                                      CriteriaNode *tree,
+                                      QueryDeadline *dl)
+{
+    int order_spec_idx = -1;
+    for (int i = 0; i < nspecs; i++) {
+        if (strcmp(specs[i].alias, order_by_alias) == 0) {
+            order_spec_idx = i;
+            break;
+        }
+    }
+    if (order_spec_idx < 0) return -1;
+
+    void *heap = topn_heap_new(limit, order_desc);
+    if (!heap) return -1;
+
+    /* Build prefilter KeySet from criteria, or fall back if un-indexable. */
+    KeySet *prefilter = NULL;
+    if (tree) {
+        QueryPlan p = choose_primary_source(tree, db_root, object);
+        if (p.kind == PRIMARY_NONE) {
+            topn_heap_destroy(heap);
+            return -2;  /* criteria exist but no usable index — fall back */
+        }
+        if (p.kind == PRIMARY_INTERSECT) {
+            int sp = 0;
+            prefilter = intersect_indexed_leaves(db_root, object, sch->splits,
+                                                  p.intersect_leaves,
+                                                  p.intersect_count,
+                                                  dl, &sp);
+        } else if (p.kind == PRIMARY_LEAF) {
+            prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
+                                               p.primary_leaf, dl);
+        } else if (p.kind == PRIMARY_KEYSET) {
+            int budget = 0;
+            prefilter = build_or_keyset(db_root, object, sch->splits,
+                                        p.or_node, dl, &budget, 0);
+        } else {
+            topn_heap_destroy(heap);
+            return -2;
+        }
+        if (dl->timed_out) {
+            if (prefilter) keyset_free(prefilter);
+            topn_heap_destroy(heap);
+            return -1;
+        }
+    }
+
+    TopNWalkCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.specs          = specs;
+    ctx.nspecs         = nspecs;
+    ctx.order_spec_idx = order_spec_idx;
+    ctx.heap           = heap;
+    ctx.prefilter      = prefilter;
+    ctx.dl             = dl;
+    ctx.gb_tf          = resolve_idx_field(fs->ts, group_by_field);
+
+    btree_idx_walk_ordered(db_root, object, group_by_field, sch->splits,
+                            "", 0, 0,
+                            "\xff\xff\xff\xff", 4, 0,
+                            0 /* asc */,
+                            topn_walk_cb, &ctx);
+
+    topn_finalize_run(&ctx);
+    free(ctx.current_key);  /* in case callback returned early */
+    if (prefilter) keyset_free(prefilter);
+
+    if (dl->timed_out) {
+        topn_heap_destroy(heap);
+        return -1;
+    }
+
+    int n_out = topn_heap_size(heap);
+    double  *metrics = calloc((size_t)n_out + 1, sizeof(double));
+    char   **gkeys   = calloc((size_t)n_out + 1, sizeof(char *));
+    size_t  *gklens  = calloc((size_t)n_out + 1, sizeof(size_t));
+    int64_t *counts  = calloc((size_t)n_out + 1, sizeof(int64_t));
+    double  *sums    = calloc((size_t)n_out + 1, sizeof(double));
+    double  *mins    = calloc((size_t)n_out + 1, sizeof(double));
+    double  *maxs    = calloc((size_t)n_out + 1, sizeof(double));
+    if (!metrics || !gkeys || !gklens || !counts || !sums || !mins || !maxs) {
+        free(metrics); free(gkeys); free(gklens);
+        free(counts); free(sums); free(mins); free(maxs);
+        topn_heap_destroy(heap);
+        return -1;
+    }
+    int n = topn_heap_drain(heap, metrics, gkeys, gklens, counts, sums, mins, maxs);
+    topn_heap_destroy(heap);
+
+    /* Determine if the group_by field's btree stores raw bytes (varchar)
+     * or encoded numeric bytes. For varchar, gkeys[i] is the raw string.
+     * For numeric types, decode via decode_index_key_to_double + format. */
+    int gb_is_varchar = ctx.gb_tf && ctx.gb_tf->type == FT_VARCHAR;
+
+    OUT("[");
+    for (int i = 0; i < n; i++) {
+        if (i > 0) OUT(",");
+        OUT("{");
+
+        /* Emit the group_by field value. */
+        char val_buf[1032];
+        int  vl = 0;
+        if (gb_is_varchar) {
+            /* Index stores raw string content for varchar. */
+            vl = (int)gklens[i];
+            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
+            memcpy(val_buf, gkeys[i], (size_t)vl);
+            val_buf[vl] = '\0';
+            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+        } else if (ctx.gb_tf) {
+            /* Numeric index key — decode to double and format as quoted
+             * string to match the existing IGB/scan-path output shape
+             * where group_vals are always emitted as JSON strings. */
+            double dv = 0.0;
+            if (decode_index_key_to_double(ctx.gb_tf, (const uint8_t *)gkeys[i],
+                                            gklens[i], &dv)) {
+                char dbuf[64];
+                fmt_double(dbuf, sizeof(dbuf), dv);
+                OUT("\"%s\":\"%s\"", group_by_field, dbuf);
+            } else {
+                OUT("\"%s\":null", group_by_field);
+            }
+        } else {
+            /* Unknown type — emit raw bytes as string (safe for ASCII). */
+            vl = (int)gklens[i];
+            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
+            memcpy(val_buf, gkeys[i], (size_t)vl);
+            val_buf[vl] = '\0';
+            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+        }
+
+        /* Emit aggregate values. */
+        for (int s = 0; s < nspecs; s++) {
+            char vbuf[64];
+            switch (specs[s].fn) {
+                case AGG_COUNT:
+                    OUT(",\"%s\":%lld", specs[s].alias, (long long)counts[i]);
+                    break;
+                case AGG_SUM:
+                    fmt_double(vbuf, sizeof(vbuf), sums[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_MIN:
+                    fmt_double(vbuf, sizeof(vbuf), mins[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_MAX:
+                    fmt_double(vbuf, sizeof(vbuf), maxs[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_AVG: {
+                    double v = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0;
+                    fmt_double(vbuf, sizeof(vbuf), v);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                }
+            }
+        }
+        OUT("}");
+        free(gkeys[i]);
+    }
+    OUT("]\n");
+
+    free(metrics); free(gkeys); free(gklens);
+    free(counts); free(sums); free(mins); free(maxs);
+    return 0;
+}
+
 typedef struct {
     CriteriaNode *tree;
     FieldSchema *fs;
@@ -18869,19 +19589,39 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
-        CollectCtx cc;
-        collect_ctx_init(&cc);
-        cc.splits = sch->splits;
-        cc.primary_crit = pc;
-        cc.check_primary = check_primary;
-        cc.deadline = ctx->deadline;
-        btree_dispatch(db_root, object, pc->field, sch->splits,
-                       pc,
-                       resolve_idx_field(ctx->fs->ts, pc->field),
-                       collect_hash_cb, &cc);
-        if (cc.budget_exceeded) ctx->budget_exceeded = 1;
-        else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
-        collect_ctx_destroy(&cc);
+
+        /* Trigram primary: btree_dispatch has no trigram fan-out, so a
+         * trigram-only field (no btree sibling) would return 0
+         * candidates and silently empty the aggregate. Route through
+         * build_keyset_from_trigram instead, then hand the verified
+         * keys to parallel_indexed_agg with the full tree intact. */
+        int picked = pick_index_for_leaf(db_root, object, pc);
+        if (picked == IT_TRIGRAM) {
+            KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                       sch->splits, pc, ctx->deadline);
+            if (tg_ks) {
+                CollectedHash *entries = NULL;
+                size_t n = 0;
+                keyset_to_collected_hashes(tg_ks, sch->splits, &entries, &n);
+                parallel_indexed_agg(ctx, db_root, object, sch, entries, (int)n);
+                free(entries);
+                keyset_free(tg_ks);
+            }
+        } else {
+            CollectCtx cc;
+            collect_ctx_init(&cc);
+            cc.splits = sch->splits;
+            cc.primary_crit = pc;
+            cc.check_primary = check_primary;
+            cc.deadline = ctx->deadline;
+            btree_dispatch(db_root, object, pc->field, sch->splits,
+                           pc,
+                           resolve_idx_field(ctx->fs->ts, pc->field),
+                           collect_hash_cb, &cc);
+            if (cc.budget_exceeded) ctx->budget_exceeded = 1;
+            else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
+            collect_ctx_destroy(&cc);
+        }
     } else if (plan.kind == PRIMARY_INTERSECT) {
         CriteriaNode *saved = ctx->tree;
         ctx->tree = NULL;
@@ -19676,6 +20416,47 @@ int cmd_aggregate(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, fs.ts);
 
+    /* Streaming top-N dispatch: eligible_for_topn_stream + agg_run_topn_stream.
+     * Build a CSV form of group_by_json for the eligibility check. */
+    {
+        char gb_csv[2048] = {0};
+        if (group_by_json && group_by_json[0]) {
+            char tmp_fields[MAX_FIELDS][256];
+            int tmp_ng = parse_group_by(group_by_json, tmp_fields);
+            int pos = 0;
+            for (int i = 0; i < tmp_ng && pos < (int)sizeof(gb_csv) - 1; i++) {
+                if (i > 0 && pos < (int)sizeof(gb_csv) - 1)
+                    gb_csv[pos++] = ',';
+                int fl = (int)strlen(tmp_fields[i]);
+                if (pos + fl >= (int)sizeof(gb_csv) - 1) fl = (int)sizeof(gb_csv) - 1 - pos;
+                memcpy(gb_csv + pos, tmp_fields[i], (size_t)fl);
+                pos += fl;
+            }
+            gb_csv[pos] = '\0';
+        }
+        if (gb_csv[0] && order_by && order_by[0] &&
+            eligible_for_topn_stream(db_root, object, specs, nspecs,
+                                      gb_csv, order_by, limit, having_json)) {
+            QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+            int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
+                                          specs, nspecs, gb_csv,
+                                          order_by, order_desc,
+                                          limit, tree, &topn_dl);
+            if (rc == 0) {
+                free_criteria_tree(tree);
+                free(specs);
+                return 0;
+            }
+            if (rc == -1) {
+                free_criteria_tree(tree);
+                free(specs);
+                OUT("{\"error\":\"query_timeout\"}\n");
+                return -1;
+            }
+            /* rc == -2: fall through to existing scan-and-hashmap path. */
+        }
+    }
+
     /* Build context */
     AggCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -19958,9 +20739,14 @@ int cmd_aggregate(const char *db_root, const char *object,
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
             SearchCriterion *isect_leaves[MAX_INTERSECT_LEAVES];
             char isect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
+            int isect_partial = 0;
             int ni = find_intersect_leaves(tree, db_root, object,
-                                           isect_leaves, isect_paths);
-            if (ni >= 2) {
+                                           isect_leaves, isect_paths,
+                                           &isect_partial);
+            /* Partial intersect means at least one AND child stays in the
+               criteria tree as a post-filter. emit_min_max_via_keyset has
+               no rematch hook, so skipping it would over-report. Fall back. */
+            if (ni >= 2 && !isect_partial) {
                 int small_primary = 0;
                 KeySet *ks = intersect_indexed_leaves(db_root, object,
                                                       sch.splits,
