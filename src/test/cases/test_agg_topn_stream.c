@@ -216,3 +216,78 @@ static int test_topn_eligible_truth_table(void) {
 }
 
 TEST_REGISTER("test-topn-eligible-truth-table", test_topn_eligible_truth_table)
+
+static int test_topn_stream_count_no_criteria(void) {
+    TestEnv env;
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    /* 100 unique names × variable counts; author N has count = N+1. Total = 5050. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_e2e\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"name:varchar:16\",\"score:int\"],"
+        "\"indexes\":[\"name\",\"score\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* Build bulk body. */
+    size_t body_cap = 1 << 20;
+    char *body = malloc(body_cap);
+    int p = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    int next_id = 0;
+    for (int a = 0; a < 100; a++) {
+        int n = a + 1;
+        for (int j = 0; j < n; j++) {
+            p += snprintf(body + p, body_cap - p,
+                          "%s\"k%d\":{\"name\":\"author_%03d\",\"score\":%d}",
+                          next_id == 0 ? "" : ",", next_id, a, j);
+            next_id++;
+        }
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_e2e\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* Top 10 authors by count desc. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_e2e\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":10}", &resp);
+    ASSERT_TRUE(resp != NULL, "got aggregate response");
+
+    /* Top 10 should be author_099 (100), author_098 (99), ..., author_090 (91). */
+    const char *p99 = strstr(resp, "\"author_099\"");
+    const char *p98 = strstr(resp, "\"author_098\"");
+    const char *p90 = strstr(resp, "\"author_090\"");
+    ASSERT_TRUE(p99 != NULL, "author_099 present");
+    ASSERT_TRUE(p98 != NULL, "author_098 present");
+    ASSERT_TRUE(p90 != NULL, "author_090 present");
+    ASSERT_TRUE(p99 != NULL && p98 != NULL && p99 < p98, "099 before 098");
+    ASSERT_TRUE(p98 != NULL && p90 != NULL && p98 < p90, "098 before 090");
+
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-count-no-criteria", test_topn_stream_count_no_criteria)

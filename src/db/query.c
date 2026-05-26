@@ -17677,6 +17677,294 @@ TOPN_ELIG_VIS int eligible_for_topn_stream(
     return 1;
 }
 
+/* Forward declarations for helpers defined later in this file that the
+ * streaming top-N executor needs. */
+static int  decode_index_key_to_double(const TypedField *f,
+                                        const uint8_t *key, size_t klen,
+                                        double *out);
+static void fmt_double(char *buf, size_t sz, double v);
+
+/* ========== Streaming top-N aggregate executor (Phase 1) ==========
+ *
+ * Pre: eligible_for_topn_stream returned 1.
+ *
+ * Walks the group_by field's btree in global value-sorted order via
+ * btree_idx_walk_ordered (streaming k-way merge of per-shard
+ * BtRangeIters). Run-length finalizes each group on value-change;
+ * keeps a K-element top-N heap on the order_by spec's metric.
+ * Memory O(K). No seg-file reads for pure count().
+ *
+ * Returns  0 on success (output written via OUT()),
+ *         -1 on timeout/alloc error,
+ *         -2 when caller should fall back (non-indexable criteria).
+ */
+
+typedef struct {
+    char        *current_key;
+    size_t       current_key_len;
+    int64_t      current_count;
+    double       current_sum;
+    double       current_min;
+    double       current_max;
+    int          current_min_set;
+    int          current_max_set;
+
+    const AggSpec    *specs;
+    int               nspecs;
+    int               order_spec_idx;
+    void             *heap;
+    KeySet           *prefilter;
+    QueryDeadline    *dl;
+    int               dl_counter;
+    const TypedField *gb_tf;   /* for future sum/min/max on the group field */
+} TopNWalkCtx;
+
+static double topn_metric_from_state(const TopNWalkCtx *c) {
+    const AggSpec *s = &c->specs[c->order_spec_idx];
+    switch (s->fn) {
+        case AGG_COUNT: return (double)c->current_count;
+        case AGG_SUM:   return c->current_sum;
+        case AGG_MIN:   return c->current_min_set ? c->current_min : 0.0;
+        case AGG_MAX:   return c->current_max_set ? c->current_max : 0.0;
+        case AGG_AVG:   return c->current_count > 0
+                              ? c->current_sum / (double)c->current_count : 0.0;
+        default:        return 0.0;
+    }
+}
+
+static void topn_finalize_run(TopNWalkCtx *c) {
+    if (!c->current_key) return;
+    double metric = topn_metric_from_state(c);
+    topn_heap_offer(c->heap, metric,
+                    c->current_key, c->current_key_len,
+                    c->current_count, c->current_sum,
+                    c->current_min_set ? c->current_min : 0.0,
+                    c->current_max_set ? c->current_max : 0.0);
+    free(c->current_key);
+    c->current_key     = NULL;
+    c->current_key_len = 0;
+    c->current_count   = 0;
+    c->current_sum     = 0.0;
+    c->current_min     = 0.0;
+    c->current_max     = 0.0;
+    c->current_min_set = 0;
+    c->current_max_set = 0;
+}
+
+static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
+                        const uint8_t *hash16, void *ctx_v) {
+    TopNWalkCtx *c = (TopNWalkCtx *)ctx_v;
+
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->prefilter && !keyset_contains(c->prefilter, hash16)) return 0;
+
+    int new_group = 0;
+    if (!c->current_key) {
+        new_group = 1;
+    } else if (c->current_key_len != enc_val_len ||
+               memcmp(c->current_key, enc_val, enc_val_len) != 0) {
+        topn_finalize_run(c);
+        new_group = 1;
+    }
+
+    if (new_group) {
+        c->current_key = malloc(enc_val_len + 1);
+        if (!c->current_key) return -1;
+        memcpy(c->current_key, enc_val, enc_val_len);
+        c->current_key[enc_val_len] = '\0';
+        c->current_key_len = enc_val_len;
+        c->current_count   = 0;
+        c->current_sum     = 0.0;
+        c->current_min     = 0.0;
+        c->current_max     = 0.0;
+        c->current_min_set = 0;
+        c->current_max_set = 0;
+    }
+    c->current_count++;
+    return 0;
+}
+
+#ifdef TEST_BUILD
+#define TOPN_RUN_VIS
+#else
+#define TOPN_RUN_VIS static
+#endif
+
+TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
+                                      const Schema *sch, FieldSchema *fs,
+                                      const AggSpec *specs, int nspecs,
+                                      const char *group_by_field,
+                                      const char *order_by_alias,
+                                      int order_desc,
+                                      int limit,
+                                      CriteriaNode *tree,
+                                      QueryDeadline *dl)
+{
+    int order_spec_idx = -1;
+    for (int i = 0; i < nspecs; i++) {
+        if (strcmp(specs[i].alias, order_by_alias) == 0) {
+            order_spec_idx = i;
+            break;
+        }
+    }
+    if (order_spec_idx < 0) return -1;
+
+    void *heap = topn_heap_new(limit, order_desc);
+    if (!heap) return -1;
+
+    /* Build prefilter KeySet from criteria, or fall back if un-indexable. */
+    KeySet *prefilter = NULL;
+    if (tree) {
+        QueryPlan p = choose_primary_source(tree, db_root, object);
+        if (p.kind == PRIMARY_NONE) {
+            topn_heap_destroy(heap);
+            return -2;  /* criteria exist but no usable index — fall back */
+        }
+        if (p.kind == PRIMARY_INTERSECT) {
+            int sp = 0;
+            prefilter = intersect_indexed_leaves(db_root, object, sch->splits,
+                                                  p.intersect_leaves,
+                                                  p.intersect_count,
+                                                  dl, &sp);
+        } else if (p.kind == PRIMARY_LEAF) {
+            prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
+                                               p.primary_leaf, dl);
+        } else if (p.kind == PRIMARY_KEYSET) {
+            int budget = 0;
+            prefilter = build_or_keyset(db_root, object, sch->splits,
+                                        p.or_node, dl, &budget, 0);
+        } else {
+            topn_heap_destroy(heap);
+            return -2;
+        }
+        if (dl->timed_out) {
+            if (prefilter) keyset_free(prefilter);
+            topn_heap_destroy(heap);
+            return -1;
+        }
+    }
+
+    TopNWalkCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.specs          = specs;
+    ctx.nspecs         = nspecs;
+    ctx.order_spec_idx = order_spec_idx;
+    ctx.heap           = heap;
+    ctx.prefilter      = prefilter;
+    ctx.dl             = dl;
+    ctx.gb_tf          = resolve_idx_field(fs->ts, group_by_field);
+
+    btree_idx_walk_ordered(db_root, object, group_by_field, sch->splits,
+                            "", 0, 0,
+                            "\xff\xff\xff\xff", 4, 0,
+                            0 /* asc */,
+                            topn_walk_cb, &ctx);
+
+    topn_finalize_run(&ctx);
+    free(ctx.current_key);  /* in case callback returned early */
+    if (prefilter) keyset_free(prefilter);
+
+    if (dl->timed_out) {
+        topn_heap_destroy(heap);
+        return -1;
+    }
+
+    int n_out = topn_heap_size(heap);
+    double  *metrics = calloc((size_t)n_out + 1, sizeof(double));
+    char   **gkeys   = calloc((size_t)n_out + 1, sizeof(char *));
+    size_t  *gklens  = calloc((size_t)n_out + 1, sizeof(size_t));
+    int64_t *counts  = calloc((size_t)n_out + 1, sizeof(int64_t));
+    double  *sums    = calloc((size_t)n_out + 1, sizeof(double));
+    double  *mins    = calloc((size_t)n_out + 1, sizeof(double));
+    double  *maxs    = calloc((size_t)n_out + 1, sizeof(double));
+    if (!metrics || !gkeys || !gklens || !counts || !sums || !mins || !maxs) {
+        free(metrics); free(gkeys); free(gklens);
+        free(counts); free(sums); free(mins); free(maxs);
+        topn_heap_destroy(heap);
+        return -1;
+    }
+    int n = topn_heap_drain(heap, metrics, gkeys, gklens, counts, sums, mins, maxs);
+    topn_heap_destroy(heap);
+
+    /* Determine if the group_by field's btree stores raw bytes (varchar)
+     * or encoded numeric bytes. For varchar, gkeys[i] is the raw string.
+     * For numeric types, decode via decode_index_key_to_double + format. */
+    int gb_is_varchar = ctx.gb_tf && ctx.gb_tf->type == FT_VARCHAR;
+
+    OUT("[");
+    for (int i = 0; i < n; i++) {
+        if (i > 0) OUT(",");
+        OUT("{");
+
+        /* Emit the group_by field value. */
+        char val_buf[1032];
+        int  vl = 0;
+        if (gb_is_varchar) {
+            /* Index stores raw string content for varchar. */
+            vl = (int)gklens[i];
+            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
+            memcpy(val_buf, gkeys[i], (size_t)vl);
+            val_buf[vl] = '\0';
+            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+        } else if (ctx.gb_tf) {
+            /* Numeric index key — decode to double and format as quoted
+             * string to match the existing IGB/scan-path output shape
+             * where group_vals are always emitted as JSON strings. */
+            double dv = 0.0;
+            if (decode_index_key_to_double(ctx.gb_tf, (const uint8_t *)gkeys[i],
+                                            gklens[i], &dv)) {
+                char dbuf[64];
+                fmt_double(dbuf, sizeof(dbuf), dv);
+                OUT("\"%s\":\"%s\"", group_by_field, dbuf);
+            } else {
+                OUT("\"%s\":null", group_by_field);
+            }
+        } else {
+            /* Unknown type — emit raw bytes as string (safe for ASCII). */
+            vl = (int)gklens[i];
+            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
+            memcpy(val_buf, gkeys[i], (size_t)vl);
+            val_buf[vl] = '\0';
+            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+        }
+
+        /* Emit aggregate values. */
+        for (int s = 0; s < nspecs; s++) {
+            char vbuf[64];
+            switch (specs[s].fn) {
+                case AGG_COUNT:
+                    OUT(",\"%s\":%lld", specs[s].alias, (long long)counts[i]);
+                    break;
+                case AGG_SUM:
+                    fmt_double(vbuf, sizeof(vbuf), sums[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_MIN:
+                    fmt_double(vbuf, sizeof(vbuf), mins[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_MAX:
+                    fmt_double(vbuf, sizeof(vbuf), maxs[i]);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                case AGG_AVG: {
+                    double v = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0;
+                    fmt_double(vbuf, sizeof(vbuf), v);
+                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
+                    break;
+                }
+            }
+        }
+        OUT("}");
+        free(gkeys[i]);
+    }
+    OUT("]\n");
+
+    free(metrics); free(gkeys); free(gklens);
+    free(counts); free(sums); free(mins); free(maxs);
+    return 0;
+}
+
 typedef struct {
     CriteriaNode *tree;
     FieldSchema *fs;
@@ -20106,6 +20394,47 @@ int cmd_aggregate(const char *db_root, const char *object,
     }
 
     compile_criteria_tree(tree, fs.ts);
+
+    /* Streaming top-N dispatch: eligible_for_topn_stream + agg_run_topn_stream.
+     * Build a CSV form of group_by_json for the eligibility check. */
+    {
+        char gb_csv[2048] = {0};
+        if (group_by_json && group_by_json[0]) {
+            char tmp_fields[MAX_FIELDS][256];
+            int tmp_ng = parse_group_by(group_by_json, tmp_fields);
+            int pos = 0;
+            for (int i = 0; i < tmp_ng && pos < (int)sizeof(gb_csv) - 1; i++) {
+                if (i > 0 && pos < (int)sizeof(gb_csv) - 1)
+                    gb_csv[pos++] = ',';
+                int fl = (int)strlen(tmp_fields[i]);
+                if (pos + fl >= (int)sizeof(gb_csv) - 1) fl = (int)sizeof(gb_csv) - 1 - pos;
+                memcpy(gb_csv + pos, tmp_fields[i], (size_t)fl);
+                pos += fl;
+            }
+            gb_csv[pos] = '\0';
+        }
+        if (gb_csv[0] && order_by && order_by[0] &&
+            eligible_for_topn_stream(db_root, object, specs, nspecs,
+                                      gb_csv, order_by, limit, having_json)) {
+            QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+            int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
+                                          specs, nspecs, gb_csv,
+                                          order_by, order_desc,
+                                          limit, tree, &topn_dl);
+            if (rc == 0) {
+                free_criteria_tree(tree);
+                free(specs);
+                return 0;
+            }
+            if (rc == -1) {
+                free_criteria_tree(tree);
+                free(specs);
+                OUT("{\"error\":\"query_timeout\"}\n");
+                return -1;
+            }
+            /* rc == -2: fall through to existing scan-and-hashmap path. */
+        }
+    }
 
     /* Build context */
     AggCtx ctx;
