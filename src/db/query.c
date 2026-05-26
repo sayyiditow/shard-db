@@ -12152,37 +12152,6 @@ static enum IndexType field_index_type(const char *db_root, const char *object,
     return IT_BTREE;
 }
 
-/* Return the composite-index directory name (e.g. "a+b") that covers
- * `group_by_field` followed by `agg_field`, or NULL if none exists.
- * Required: composite leading column == group_by_field, so the
- * value-ordered walk groups by run length. Cold path — called once
- * during aggregate planning. Mirrors eligible_for_topn_stream's
- * field_has_index_type / load_schema / btree_idx_exists call shapes. */
-#ifdef TEST_BUILD
-#define COMP_PICK_VIS
-#else
-#define COMP_PICK_VIS static
-#endif
-
-COMP_PICK_VIS const char *pick_composite_for_agg(
-    const char *db_root, const char *object,
-    const char *group_by_field, const char *agg_field)
-    __attribute__((unused));
-
-COMP_PICK_VIS const char *pick_composite_for_agg(
-    const char *db_root, const char *object,
-    const char *group_by_field, const char *agg_field)
-{
-    if (!group_by_field || !*group_by_field || !agg_field || !*agg_field) return NULL;
-    static __thread char buf[256];
-    int n = snprintf(buf, sizeof(buf), "%s+%s", group_by_field, agg_field);
-    if (n < 0 || (size_t)n >= sizeof(buf)) return NULL;
-    if (!field_has_index_type(db_root, object, buf, IT_BTREE)) return NULL;
-    Schema sch = load_schema(db_root, object);
-    if (!btree_idx_exists(db_root, object, buf, sch.splits)) return NULL;
-    return buf;
-}
-
 /* Plan-time index picker — single source of truth for "which index
  * should this leaf use, if any?".  Returns IT_BTREE / IT_BITMAP /
  * IT_TRIGRAM, or -1 when no usable index exists for this (field, op)

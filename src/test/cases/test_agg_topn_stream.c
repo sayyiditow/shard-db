@@ -40,12 +40,6 @@ extern int eligible_for_topn_stream(
     int limit,
     const char *having);
 
-/* Composite-index picker (Phase 2). Exposed to tests via COMP_PICK_VIS
- * macro in query.c when TEST_BUILD is set. */
-extern const char *pick_composite_for_agg(
-    const char *db_root, const char *object,
-    const char *group_by_field, const char *agg_field);
-
 static int test_topn_heap_basic_desc(void) {
     void *h = topn_heap_new(3, 1 /* desc */);
     ASSERT_TRUE(h != NULL, "heap created");
@@ -464,69 +458,6 @@ static int test_topn_stream_sum_min_max(void) {
 }
 
 TEST_REGISTER("test-topn-stream-sum-min-max", test_topn_stream_sum_min_max)
-
-/* ========== Composite-index picker tests (Phase 2) ========== */
-
-static int test_topn_composite_picker(void) {
-    TestEnv env = {0};
-    if (test_env_start(&env) != 0) {
-        ASSERT_TRUE(0, "daemon spawn");
-        return 1;
-    }
-
-    TestClientCfg cfg = { .port = env.port };
-    TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { test_env_stop(&env); return 1; }
-
-    char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
-    free(resp); resp = NULL;
-
-    /* Object with btree indexes on a, b, and the composite a+b. */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"comp_pick\","
-                   "\"splits\":8,\"max_key\":12,\"fields\":["
-                   "\"a:varchar:16\",\"b:int\",\"c:int\"],"
-                   "\"indexes\":[\"a\",\"b\",\"a+b\"]}", &resp);
-    free(resp); resp = NULL;
-
-    /* Insert one record so the btree shard files exist on disk. */
-    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"comp_pick\","
-                   "\"key\":\"k1\",\"value\":{\"a\":\"x\",\"b\":1,\"c\":2}}", &resp);
-    free(resp); resp = NULL;
-
-    /* pick_composite_for_agg calls load_schema, which (mirroring the real
-       planner) takes the effective tenant root (DB_ROOT/<dir>) plus the
-       bare object name, and resolves the tenant dir by stripping the
-       process-global g_db_root prefix. In production the daemon sets
-       g_db_root at config load; here in the test process we set it to the
-       daemon's DB_ROOT so load_schema can parse schema.conf the same way
-       the daemon would. */
-    extern char g_db_root[];
-    snprintf(g_db_root, PATH_MAX, "%s", env.db_root);
-
-    char eff_root[512];
-    snprintf(eff_root, sizeof(eff_root), "%s/default", env.db_root);
-    const char *obj = "comp_pick";
-    const char *got;
-
-    got = pick_composite_for_agg(eff_root, obj, "a", "b");
-    ASSERT_TRUE(got != NULL && strcmp(got, "a+b") == 0,
-                "group_by=a agg-on=b → composite a+b");
-
-    got = pick_composite_for_agg(eff_root, obj, "a", "c");
-    ASSERT_TRUE(got == NULL, "group_by=a agg-on=c (no a+c) → NULL");
-
-    got = pick_composite_for_agg(eff_root, obj, "b", "a");
-    ASSERT_TRUE(got == NULL,
-                "group_by=b agg-on=a (b+a not declared) → NULL — leading column must be group_by");
-
-    tc_close(tc);
-    test_env_stop(&env);
-    return 0;
-}
-
-TEST_REGISTER("test-topn-composite-picker", test_topn_composite_picker)
 
 /* ========== Composite-covered streaming top-N (Phase 2) ========== */
 
