@@ -496,6 +496,7 @@ typedef struct {
     char mode[24];
     char dir[24];
     char object[48];
+    char query[512];          /* truncated request JSON — identifies WHICH query was slow */
 } SlowQueryEntry;
 extern SlowQueryEntry g_slow_queries[SLOW_QUERY_RING];
 extern int g_slow_query_head;
@@ -544,7 +545,8 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
    from oversubscription (page faults on mmap MAP_SHARED writes,
    fsync waits) without polluting the CPU pool that read paths share. */
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
-void log_slow_query(const char *mode, const char *dir, const char *object, uint32_t duration_ms);
+void log_slow_query(const char *mode, const char *dir, const char *object,
+                    const char *query, uint32_t duration_ms);
 int ucache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 
