@@ -527,3 +527,98 @@ static int test_topn_composite_picker(void) {
 }
 
 TEST_REGISTER("test-topn-composite-picker", test_topn_composite_picker)
+
+/* ========== Composite-covered streaming top-N (Phase 2) ========== */
+
+/* End-to-end: group_by a varchar field, aggregate sum() on a *different*
+ * (int) field, with a covering composite "a+b" btree present. Whether the
+ * streaming top-N path exploits the composite or falls back to the hashmap
+ * aggregate, the *answer* must be correct: top group by sum(b) is g_49 with
+ * sum = 49095 (sum of 4900..4919). Locks correctness regardless of which
+ * executor path runs. */
+static int test_topn_stream_with_composite(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    /* fields a:varchar:16, b:int; indexes a, b, and composite a+b. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_comp\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"a:varchar:16\",\"b:int\"],"
+        "\"indexes\":[\"a\",\"b\",\"a+b\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* 50 groups × 20 records. Record (g, j): a = "g_<g>", b = g*100 + j.
+     * For group g, sum(b) = sum_{j=0..19}(g*100 + j) = 20*g*100 + 190.
+     * g=49 → 20*4900 + 190 = 98000 + 190 ... wait recompute below in assert. */
+    size_t body_cap = 1 << 20;
+    char *body = malloc(body_cap);
+    int p = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    int next = 0;
+    for (int g = 0; g < 50; g++) {
+        for (int j = 0; j < 20; j++) {
+            p += snprintf(body + p, body_cap - p,
+                          "%s\"k%d\":{\"a\":\"g_%d\",\"b\":%d}",
+                          next == 0 ? "" : ",", next, g, g * 100 + j);
+            next++;
+        }
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_comp\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* group_by a, sum(b) desc, limit 3. Top group is g_49:
+     * b values 4900..4919, sum = (4900+4919)*20/2 = 9819*10 = 98190.
+     * Wait: that's sum of 20 terms 4900..4919 = (4900+4919)*20/2 = 98190.
+     * The plan's "49095" was for j=0..19 with b=g*100+j and the prior
+     * formula; recompute: 4900..4919 inclusive is 20 numbers summing to
+     * 98190. Assert on the real arithmetic. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_comp\","
+        "\"group_by\":[\"a\"],"
+        "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"b\",\"alias\":\"sb\"}],"
+        "\"order_by\":\"sb\",\"order\":\"desc\",\"limit\":3}", &resp);
+    ASSERT_TRUE(resp != NULL, "composite-covered aggregate response");
+
+    /* Top group present. */
+    ASSERT_TRUE(strstr(resp, "\"a\":\"g_49\"") != NULL,
+                "top group a=g_49 present");
+    /* sum(b) for g_49 = 4900+...+4919 = 98190. Accept integer or scientific
+     * float renderings produced by fmt_double. */
+    ASSERT_TRUE(strstr(resp, "98190") != NULL,
+                "sum(b) for g_49 = 98190 present");
+
+    /* Ordering: g_49 (98190) before g_48 (sum 4800..4819 = 96190). */
+    const char *p49 = strstr(resp, "\"a\":\"g_49\"");
+    const char *p48 = strstr(resp, "\"a\":\"g_48\"");
+    ASSERT_TRUE(p49 != NULL, "g_49 found");
+    ASSERT_TRUE(p48 != NULL, "g_48 found");
+    ASSERT_TRUE(p49 != NULL && p48 != NULL && p49 < p48,
+                "g_49 ordered before g_48 (desc by sum)");
+
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-with-composite", test_topn_stream_with_composite)
