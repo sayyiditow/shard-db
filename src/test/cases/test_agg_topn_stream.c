@@ -372,3 +372,87 @@ static int test_topn_stream_with_criteria_bitmap(void) {
 }
 
 TEST_REGISTER("test-topn-stream-with-criteria-bitmap", test_topn_stream_with_criteria_bitmap)
+
+static int test_topn_stream_sum_min_max(void) {
+    TestEnv env;
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    /* 100 unique int values, 10 copies each = 1000 records.
+     * For each value v, sum(v) = 10*v.  Top 3 by sum should be 99, 98, 97. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_smm\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"v:int\"],"
+        "\"indexes\":[\"v\"]}", &resp);
+    free(resp); resp = NULL;
+
+    size_t body_cap = 1 << 16;
+    char *body = malloc(body_cap);
+    int p = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    int next = 0;
+    for (int v = 0; v < 100; v++) {
+        for (int j = 0; j < 10; j++) {
+            p += snprintf(body + p, body_cap - p,
+                          "%s\"k%d\":{\"v\":%d}", next == 0 ? "" : ",", next, v);
+            next++;
+        }
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_smm\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* Top 3 values by sum(v) desc. Value 99 sum = 990, value 98 sum = 980, value 97 sum = 970. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_smm\","
+        "\"group_by\":[\"v\"],"
+        "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"v\",\"alias\":\"s\"}],"
+        "\"order_by\":\"s\",\"order\":\"desc\",\"limit\":3}", &resp);
+    ASSERT_TRUE(resp != NULL, "sum aggregate response");
+
+    /* Existing aggregate output emits numerics via fmt_double which produces
+     * things like "990" or "990.000000" or "9.9e+02" depending on path.
+     * Look for the value AND its sum in the response.
+     * Match liberally — both quoted and unquoted forms are valid output shapes. */
+    ASSERT_TRUE(strstr(resp, "\"v\":\"99\"") != NULL || strstr(resp, "\"v\":99") != NULL,
+                "top by sum: v=99 present");
+    ASSERT_TRUE(strstr(resp, "990") != NULL,
+                "sum(99)=990 appears in response");
+
+    /* Verify ordering: v=99 should appear before v=98, v=98 before v=97. */
+    const char *p99 = strstr(resp, "\"v\":\"99\"");
+    if (!p99) p99 = strstr(resp, "\"v\":99");
+    const char *p98 = strstr(resp, "\"v\":\"98\"");
+    if (!p98) p98 = strstr(resp, "\"v\":98");
+    const char *p97 = strstr(resp, "\"v\":\"97\"");
+    if (!p97) p97 = strstr(resp, "\"v\":97");
+    ASSERT_TRUE(p99 != NULL, "v=99 found");
+    ASSERT_TRUE(p98 != NULL, "v=98 found");
+    ASSERT_TRUE(p97 != NULL, "v=97 found");
+    ASSERT_TRUE(p99 != NULL && p98 != NULL && p99 < p98, "99 before 98");
+    ASSERT_TRUE(p98 != NULL && p97 != NULL && p98 < p97, "98 before 97");
+
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-sum-min-max", test_topn_stream_sum_min_max)

@@ -17781,6 +17781,27 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
         c->current_max_set = 0;
     }
     c->current_count++;
+
+    /* If the group_by field is numeric, decode the leaf bytes and
+     * update sum/min/max for specs that aggregate the group_by field
+     * itself. Varchar group_by → numeric specs would be a no-op
+     * anyway; skip decode to avoid false positives. */
+    if (c->gb_tf && c->gb_tf->type != FT_VARCHAR) {
+        double v;
+        if (decode_index_key_to_double(c->gb_tf,
+                                        (const uint8_t *)enc_val, enc_val_len,
+                                        &v)) {
+            c->current_sum += v;
+            if (!c->current_min_set || v < c->current_min) {
+                c->current_min = v;
+                c->current_min_set = 1;
+            }
+            if (!c->current_max_set || v > c->current_max) {
+                c->current_max = v;
+                c->current_max_set = 1;
+            }
+        }
+    }
     return 0;
 }
 
