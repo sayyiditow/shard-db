@@ -13745,6 +13745,39 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 else OUT("%zu\n", ic.count);
             }
         } else {
+            /* Multi-leaf tree, indexed primary. Dispatch on the picker's
+               choice — btree_dispatch only handles btree/bitmap, so a
+               trigram primary needs build_keyset_from_trigram before the
+               full-tree post-filter via parallel_indexed_count. Previously
+               find_primary_leaf returned source-order, so trigram rarely
+               sat as primary in multi-leaf trees; the selectivity-scoring
+               picker now favours it (trigram=10 vs bitmap=80) and surfaced
+               this gap. */
+            int picked = pick_index_for_leaf(db_root, object, pc);
+            if (picked == IT_TRIGRAM) {
+                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                           sch.splits, pc, &dl);
+                if (tg_ks) {
+                    CollectedHash *entries = NULL;
+                    size_t n = 0;
+                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
+                    size_t count = parallel_indexed_count(db_root, object, &sch,
+                                                          entries, (int)n,
+                                                          tree, &fs, &dl);
+                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else OUT("%zu\n", count);
+                    free(entries);
+                    keyset_free(tg_ks);
+                    free_criteria_tree(tree);
+                    return 0;
+                }
+                /* Trigram builder transient failure (alloc, …) — defensive 0
+                   matches the single-leaf branch's behaviour. */
+                OUT("0\n");
+                free_criteria_tree(tree);
+                return 0;
+            }
+
             CollectCtx cc;
             collect_ctx_init(&cc);
             cc.splits = sch.splits;
@@ -18972,19 +19005,39 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         SearchCriterion *pc = plan.primary_leaf;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
-        CollectCtx cc;
-        collect_ctx_init(&cc);
-        cc.splits = sch->splits;
-        cc.primary_crit = pc;
-        cc.check_primary = check_primary;
-        cc.deadline = ctx->deadline;
-        btree_dispatch(db_root, object, pc->field, sch->splits,
-                       pc,
-                       resolve_idx_field(ctx->fs->ts, pc->field),
-                       collect_hash_cb, &cc);
-        if (cc.budget_exceeded) ctx->budget_exceeded = 1;
-        else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
-        collect_ctx_destroy(&cc);
+
+        /* Trigram primary: btree_dispatch has no trigram fan-out, so a
+         * trigram-only field (no btree sibling) would return 0
+         * candidates and silently empty the aggregate. Route through
+         * build_keyset_from_trigram instead, then hand the verified
+         * keys to parallel_indexed_agg with the full tree intact. */
+        int picked = pick_index_for_leaf(db_root, object, pc);
+        if (picked == IT_TRIGRAM) {
+            KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                       sch->splits, pc, ctx->deadline);
+            if (tg_ks) {
+                CollectedHash *entries = NULL;
+                size_t n = 0;
+                keyset_to_collected_hashes(tg_ks, sch->splits, &entries, &n);
+                parallel_indexed_agg(ctx, db_root, object, sch, entries, (int)n);
+                free(entries);
+                keyset_free(tg_ks);
+            }
+        } else {
+            CollectCtx cc;
+            collect_ctx_init(&cc);
+            cc.splits = sch->splits;
+            cc.primary_crit = pc;
+            cc.check_primary = check_primary;
+            cc.deadline = ctx->deadline;
+            btree_dispatch(db_root, object, pc->field, sch->splits,
+                           pc,
+                           resolve_idx_field(ctx->fs->ts, pc->field),
+                           collect_hash_cb, &cc);
+            if (cc.budget_exceeded) ctx->budget_exceeded = 1;
+            else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
+            collect_ctx_destroy(&cc);
+        }
     } else if (plan.kind == PRIMARY_INTERSECT) {
         CriteriaNode *saved = ctx->tree;
         ctx->tree = NULL;
