@@ -17615,6 +17615,68 @@ TOPN_VIS int topn_heap_drain(void *hp, double *metrics_out,
     return n;
 }
 
+/* ========== Top-N streaming eligibility (Phase 1) ==========
+ *
+ * Pure shape + index-presence check. Phase 1 fires for:
+ *   - single-field group_by
+ *   - field has IT_BTREE index
+ *   - order_by references an aggregate alias (not the group_by field)
+ *   - limit in (0, 10000]
+ *   - no HAVING clause
+ *   - every spec is count() or sum/min/max on the group_by field itself
+ *
+ * Phase 2 (composite-covered agg on different field) and Phase 3
+ * (multi-field group_by via composite) relax conditions in this same
+ * function in later tasks.
+ */
+#ifdef TEST_BUILD
+#define TOPN_ELIG_VIS
+#else
+#define TOPN_ELIG_VIS static
+#endif
+
+TOPN_ELIG_VIS int eligible_for_topn_stream(
+    const char *db_root, const char *object,
+    const AggSpec *specs, int nspecs,
+    const char *group_by_csv,
+    const char *order_by_alias,
+    int limit,
+    const char *having)
+{
+    if (!specs || nspecs <= 0) return 0;
+    if (!group_by_csv || !*group_by_csv) return 0;
+    if (!order_by_alias || !*order_by_alias) return 0;
+    if (limit <= 0 || limit > 10000) return 0;
+    if (having && *having) return 0;
+
+    /* Single group_by field only (Phase 1). */
+    if (strchr(group_by_csv, ',')) return 0;
+    const char *gb_field = group_by_csv;
+
+    /* order_by must reference an aggregate alias, not the group_by field. */
+    if (strcmp(order_by_alias, gb_field) == 0) return 0;
+    int matching_spec = -1;
+    for (int i = 0; i < nspecs; i++) {
+        if (strcmp(specs[i].alias, order_by_alias) == 0) {
+            matching_spec = i;
+            break;
+        }
+    }
+    if (matching_spec < 0) return 0;
+
+    /* group_by field must have a btree index. */
+    if (!field_has_index_type(db_root, object, gb_field, IT_BTREE)) return 0;
+
+    /* Phase 1: every spec is count() OR agg on the group_by field itself. */
+    for (int i = 0; i < nspecs; i++) {
+        if (specs[i].fn == AGG_COUNT) continue;
+        if (specs[i].field[0] && strcmp(specs[i].field, gb_field) == 0) continue;
+        return 0;
+    }
+
+    return 1;
+}
+
 typedef struct {
     CriteriaNode *tree;
     FieldSchema *fs;

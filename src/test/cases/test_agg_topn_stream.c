@@ -2,6 +2,8 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include "../../db/types.h"
+#include "../test_client.h"
+#include "../fixtures.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +20,23 @@ extern int   topn_heap_drain(void *h, double *metrics_out,
                               char **gkeys_out, size_t *gklens_out,
                               int64_t *counts_out, double *sums_out,
                               double *mins_out, double *maxs_out);
+
+/* Forward decl of AggSpec — test's version must be compatible on
+ * the first three fields (fn, field, alias) which are the only ones
+ * eligible_for_topn_stream reads. */
+typedef struct {
+    int  fn;                /* enum AggFn from query.c */
+    char field[256];
+    char alias[256];
+} TestAggSpec;
+
+extern int eligible_for_topn_stream(
+    const char *db_root, const char *object,
+    const TestAggSpec *specs, int nspecs,
+    const char *group_by_csv,
+    const char *order_by_alias,
+    int limit,
+    const char *having);
 
 static int test_topn_heap_basic_desc(void) {
     void *h = topn_heap_new(3, 1 /* desc */);
@@ -91,3 +110,109 @@ static int test_topn_heap_under_cap(void) {
 TEST_REGISTER("test-topn-heap-basic-desc", test_topn_heap_basic_desc)
 TEST_REGISTER("test-topn-heap-basic-asc", test_topn_heap_basic_asc)
 TEST_REGISTER("test-topn-heap-under-cap", test_topn_heap_under_cap)
+
+/* ========== Eligibility detector tests ========== */
+
+static int test_topn_eligible_truth_table(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "daemon spawn");
+        return 1;
+    }
+
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    /* Register the "default" tenant dir at runtime. */
+    char *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp);
+    resp = NULL;
+
+    /* Create object with fields + immediately-declared indexes. This creates
+       index.conf with the index entries at object creation time, before any
+       inserts trigger btree file allocation. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_elig\","
+        "\"splits\":8,\"max_key\":12,"
+        "\"fields\":[\"name:varchar:32\",\"score:int\",\"score_unindexed:int\"],"
+        "\"indexes\":[\"name\",\"score\"]}", &resp);
+    free(resp);
+    resp = NULL;
+
+    /* Insert one record to trigger btree files. */
+    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"topn_elig\",\"key\":\"k1\",\"value\":{\"name\":\"a\",\"score\":1,\"score_unindexed\":0}}", &resp);
+    free(resp); resp = NULL;
+
+    /* AGG_COUNT enum value — from query.c enum AggFn { AGG_COUNT=0, ... } */
+    const int AGG_COUNT_VAL = 0;
+    const int AGG_SUM_VAL = 1;
+
+    /* Verify db_root + object exist */
+    ASSERT_NOT_NULL(env.db_root, "env.db_root is set");
+
+    /* The shape checks: eligibility gating on input shape alone */
+
+    /* The object path includes the dir: "default/topn_elig" */
+    const char *obj_path = "default/topn_elig";
+
+    /* Case A: minimal eligible shape - count() + single-field group_by + limit */
+    TestAggSpec spec_a;
+    spec_a.fn = AGG_COUNT_VAL;
+    spec_a.field[0] = '\0';
+    strcpy(spec_a.alias, "n");
+    int r = eligible_for_topn_stream(env.db_root, obj_path,
+                                      &spec_a, 1, "name", "n", 20, NULL);
+    ASSERT_EQ_INT(r, 1, "Case A: count + indexed group_by + order_by agg alias + limit → ELIGIBLE");
+
+    /* Case B: no limit → NOT ELIGIBLE */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "name", "n", 0, NULL);
+    ASSERT_EQ_INT(r, 0, "Case B: no limit (0) → NOT ELIGIBLE");
+
+    /* Case C: order_by on group_by field instead of agg alias → NOT ELIGIBLE */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "name", "name", 20, NULL);
+    ASSERT_EQ_INT(r, 0, "Case C: order_by on group_by field → NOT ELIGIBLE");
+
+    /* Case D: group_by on un-indexed field → NOT ELIGIBLE */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "score_unindexed", "n", 20, NULL);
+    ASSERT_EQ_INT(r, 0, "Case D: un-indexed group_by → NOT ELIGIBLE");
+
+    /* Case E: multi-field group_by → NOT ELIGIBLE in Phase 1 */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "name,score", "n", 20, NULL);
+    ASSERT_EQ_INT(r, 0, "Case E: multi-field group_by (Phase 1 limit) → NOT ELIGIBLE");
+
+    /* Case F: sum on group_by field itself + order_by on sum alias → ELIGIBLE */
+    TestAggSpec spec_f;
+    spec_f.fn = AGG_SUM_VAL;
+    strcpy(spec_f.field, "score");  /* sum on the group_by field itself */
+    strcpy(spec_f.alias, "total");
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_f, 1, "score", "total", 10000, NULL);
+    ASSERT_EQ_INT(r, 1, "Case F: sum on group_by field + limit=max → ELIGIBLE");
+
+    /* Case G: limit > 10000 → NOT ELIGIBLE */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "name", "n", 10001, NULL);
+    ASSERT_EQ_INT(r, 0, "Case G: limit > 10000 → NOT ELIGIBLE");
+
+    /* Case H: sum on different field → NOT ELIGIBLE in Phase 1 */
+    TestAggSpec spec_h;
+    spec_h.fn = AGG_SUM_VAL;
+    strcpy(spec_h.field, "score_unindexed");  /* NOT the group_by field */
+    strcpy(spec_h.alias, "total");
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_h, 1, "name", "total", 10000, NULL);
+    ASSERT_EQ_INT(r, 0, "Case H: agg on non-group_by field (Phase 1 limit) → NOT ELIGIBLE");
+
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-eligible-truth-table", test_topn_eligible_truth_table)
