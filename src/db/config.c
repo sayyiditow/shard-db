@@ -344,10 +344,13 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...) {
 }
 
 void log_slow_query(const char *mode, const char *dir,
-                    const char *object, uint32_t duration_ms) {
+                    const char *object, const char *query, uint32_t duration_ms) {
     __atomic_add_fetch(&g_slow_query_count, 1, __ATOMIC_RELAXED);
 
-    /* In-memory ring for the /stats endpoint (existing behaviour). */
+    /* In-memory ring for the /stats endpoint (existing behaviour). The
+       query is the full request JSON, truncated to the fixed field — enough
+       to capture criteria/order_by/limit for find/count/aggregate searches
+       (a huge bulk-insert payload truncates harmlessly). */
     pthread_mutex_lock(&g_slow_query_lock);
     SlowQueryEntry *e = &g_slow_queries[g_slow_query_head];
     e->ts_ms = now_ms();
@@ -355,6 +358,7 @@ void log_slow_query(const char *mode, const char *dir,
     snprintf(e->mode,   sizeof(e->mode),   "%s", mode   ? mode   : "");
     snprintf(e->dir,    sizeof(e->dir),    "%s", dir    ? dir    : "");
     snprintf(e->object, sizeof(e->object), "%s", object ? object : "");
+    snprintf(e->query,  sizeof(e->query),  "%s", query  ? query  : "");
     g_slow_query_head = (g_slow_query_head + 1) % SLOW_QUERY_RING;
     pthread_mutex_unlock(&g_slow_query_lock);
 
@@ -373,11 +377,12 @@ void log_slow_query(const char *mode, const char *dir,
     entry.is_audit = 0;
     entry.is_slow  = 1;
     snprintf(entry.msg, sizeof(entry.msg),
-             "%s INFO [slow] %ums mode=%s dir=%s object=%s\n",
+             "%s INFO [slow] %ums mode=%s dir=%s object=%s query=%.500s\n",
              ts, duration_ms,
              mode   ? mode   : "",
              dir    ? dir    : "",
-             object ? object : "");
+             object ? object : "",
+             query  ? query  : "");
 
     pthread_mutex_lock(&g_log_lock);
     int next2 = (g_log_head + 1) % LOG_RING_SIZE;

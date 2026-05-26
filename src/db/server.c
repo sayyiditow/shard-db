@@ -919,7 +919,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 int idx = (g_slow_query_head - 1 - i + SLOW_QUERY_RING) % SLOW_QUERY_RING;
                 SlowQueryEntry *e = &g_slow_queries[idx];
                 if (e->duration_ms == 0 && e->ts_ms == 0) break;
-                OUT("  %-20s %ums  %s/%s\n", e->mode, e->duration_ms, e->dir, e->object);
+                OUT("  %-20s %ums  %s/%s  %s\n", e->mode, e->duration_ms, e->dir, e->object, e->query);
                 printed++;
             }
             pthread_mutex_unlock(&g_slow_query_lock);
@@ -938,8 +938,17 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 int idx = (g_slow_query_head - 1 - i + SLOW_QUERY_RING) % SLOW_QUERY_RING;
                 SlowQueryEntry *e = &g_slow_queries[idx];
                 if (e->duration_ms == 0 && e->ts_ms == 0) break;
-                OUT("%s{\"ts_ms\":%lu,\"duration_ms\":%u,\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\"}",
-                    printed ? "," : "", e->ts_ms, e->duration_ms, e->mode, e->dir, e->object);
+                /* query is itself JSON — escape it as a string value. Sized
+                   for worst-case 6x expansion of the 512-byte field + quotes. */
+                char qesc[512 * 6 + 4];
+                qesc[0] = '"';
+                int qel = json_escape_into(qesc + 1, sizeof(qesc) - 3,
+                                           e->query, strlen(e->query));
+                if (qel < 0) qel = 0;
+                qesc[1 + qel] = '"';
+                qesc[2 + qel] = '\0';
+                OUT("%s{\"ts_ms\":%lu,\"duration_ms\":%u,\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\",\"query\":%s}",
+                    printed ? "," : "", e->ts_ms, e->duration_ms, e->mode, e->dir, e->object, qesc);
                 printed++;
             }
             pthread_mutex_unlock(&g_slow_query_lock);
@@ -2124,6 +2133,7 @@ timing:
             log_slow_query(mode ? mode : (is_json ? "" : "legacy"),
                            dir_s ? dir_s : "",
                            obj_s ? obj_s : "",
+                           trimmed,
                            (uint32_t)dt);
             free(mode); free(dir_s); free(obj_s);
         }

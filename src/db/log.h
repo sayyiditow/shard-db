@@ -60,7 +60,7 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...)
    know it goes through the ring buffer now). Bypasses LOG_LEVEL
    because the SLOW_QUERY_MS threshold is the filter. */
 void log_slow_query(const char *mode, const char *dir,
-                    const char *object, uint32_t duration_ms);
+                    const char *object, const char *query, uint32_t duration_ms);
 
 
 #endif /* SHARD_DB_LOG_H */
