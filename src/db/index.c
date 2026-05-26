@@ -2250,6 +2250,16 @@ int build_bitmap_pass(const char *db_root, const char *object,
     const TypedField *f = &ts->fields[fi];
     int bool_fastpath = (f->type == FT_BOOL);
 
+    /* Build banner — matches BUILD-BTREE / BUILD-TRIGRAM pattern so
+       operators can grep one prefix and see every index-build event.
+       Without this entry, bitmap rebuilds were silent — a partial
+       bulk-load (the 60s-client-timeout bug on the Netcup deploy)
+       left 3 of 8 shards empty for stories' bitmaps but produced no
+       log to spot it from. */
+    LOG_WARN(LOG_SUB_BITMAP,
+        "BUILD-BITMAP %s/%s/%s: %d shards, max_values=%u, bool_fastpath=%d",
+        db_root, object, field, sch->splits, max_values, bool_fastpath);
+
     /* Wipe + re-create every shard's .bm file with the correct cap.
        Invalidate the global bm_cache entry for each path BEFORE the
        unlink + recreate so a stale mmap on the old inode doesn't
