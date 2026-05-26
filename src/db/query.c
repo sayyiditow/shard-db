@@ -11452,9 +11452,62 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     return 1;
 }
 
-/* Walk immediate children of an AND root looking for the first indexable leaf.
-   Single-LEAF roots are treated as an AND of one. Returns the leaf's
-   SearchCriterion* (pointer into the tree — do not free). */
+/* Estimate selectivity of an indexed leaf — lower = more selective ⇒
+ * better PRIMARY_LEAF candidate. INT_MAX = not indexed (caller skips).
+ *
+ * Pre-2026-05-26 find_primary_leaf returned the FIRST indexed leaf in
+ * AND-child order regardless of how broad it was. On the Netcup deploy
+ * `(type IN [...] AND dead=false AND deleted=false AND title icontains
+ * "X")` picked `type` (bitmap, 5.6M matches) as primary instead of
+ * `title` (trigram, hundreds of matches) — search timed out at 30s.
+ *
+ * Heuristic (no on-disk stats yet):
+ *   IT_TRIGRAM     →  10  contains/icontains with ≥3-char pattern,
+ *                          usually hundreds or fewer matches
+ *   IT_BTREE eq    →  20  point lookup
+ *   IT_BTREE in    →  30  small set
+ *   IT_BTREE between →40  bounded range
+ *   IT_BTREE range →  50  unbounded half-range; selectivity depends on bound
+ *   IT_BTREE starts→  60  prefix scan
+ *   IT_BTREE other →  70  contains/like/regex on btree (full leaf walk)
+ *   IT_BITMAP any  →  80  bool / low-card enum — typically 20-80% of records.
+ *                          Cheap as a per-record post-filter (bit lookup)
+ *                          but expensive as PRIMARY because it'd build a
+ *                          multi-million-entry KeySet.
+ *   other          →  90
+ *
+ * Strategy: PRIMARY_LEAF picks the leaf with the lowest score; remaining
+ * AND children stay in the tree and get re-evaluated per record via
+ * criteria_match_tree (cheap for indexed bitmap fields — single byte
+ * compare on the decoded record). */
+static int leaf_selectivity_score(const SearchCriterion *c,
+                                  const char *db_root, const char *object) {
+    if (!c) return INT_MAX;
+    int picked = pick_index_for_leaf(db_root, object, c);
+    if (picked < 0) return INT_MAX;
+
+    if (picked == IT_TRIGRAM) return 10;
+    if (picked == IT_BTREE) {
+        switch (c->op) {
+            case OP_EQUAL:       return 20;
+            case OP_IN:          return 30;
+            case OP_BETWEEN:     return 40;
+            case OP_LESS: case OP_GREATER:
+            case OP_LESS_EQ: case OP_GREATER_EQ:
+                                 return 50;
+            case OP_STARTS_WITH: return 60;
+            default:             return 70;
+        }
+    }
+    if (picked == IT_BITMAP) return 80;
+    return 90;
+}
+
+/* Walk immediate children of an AND root and pick the most-selective
+   indexable leaf as PRIMARY. Single-LEAF roots are treated as an AND of
+   one. Returns the leaf's SearchCriterion* (pointer into the tree — do
+   not free). Remaining AND children stay in the tree and get re-checked
+   per record by the executor's post-filter. */
 static SearchCriterion *find_primary_leaf(CriteriaNode *root,
                                           const char *db_root, const char *object,
                                           char *out_idx_path, size_t out_sz) {
@@ -11465,12 +11518,28 @@ static SearchCriterion *find_primary_leaf(CriteriaNode *root,
         return NULL;
     }
     if (root->kind == CNODE_AND) {
+        SearchCriterion *best = NULL;
+        int best_score = INT_MAX;
+        char best_path[PATH_MAX] = "";
         for (int i = 0; i < root->n_children; i++) {
             CriteriaNode *c = root->children[i];
-            if (c->kind == CNODE_LEAF &&
-                leaf_is_indexed(&c->leaf, db_root, object, out_idx_path, out_sz))
-                return &c->leaf;
+            if (c->kind != CNODE_LEAF) continue;
+            char path[PATH_MAX];
+            if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) continue;
+            int score = leaf_selectivity_score(&c->leaf, db_root, object);
+            if (score < best_score) {
+                best_score = score;
+                best = &c->leaf;
+                memcpy(best_path, path, sizeof(best_path));
+            }
         }
+        if (best && out_idx_path) {
+            size_t n = strlen(best_path);
+            if (n >= out_sz) n = out_sz - 1;
+            memcpy(out_idx_path, best_path, n);
+            out_idx_path[n] = '\0';
+        }
+        return best;
     }
     return NULL;
 }
@@ -11528,6 +11597,11 @@ typedef struct {
     SearchCriterion *intersect_leaves[MAX_INTERSECT_LEAVES];
     char intersect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
     int intersect_count;
+    /* find_intersect_leaves dropped at least one AND child (bitmap leaf,
+       non-rangeable op, OR sub-tree, non-indexed leaf, or excess past
+       MAX_INTERSECT_LEAVES). Executors MUST post-filter via the full
+       criteria tree — keyset_size alone is not the answer. */
+    int partial_intersect;
 } QueryPlan;
 
 /* True if the operator yields a precise btree candidate set without needing
@@ -11570,21 +11644,37 @@ static int op_selectivity_rank(enum SearchOp op) {
 static int find_intersect_leaves(CriteriaNode *root,
                                  const char *db_root, const char *object,
                                  SearchCriterion *out_leaves[MAX_INTERSECT_LEAVES],
-                                 char out_paths[MAX_INTERSECT_LEAVES][PATH_MAX]) {
+                                 char out_paths[MAX_INTERSECT_LEAVES][PATH_MAX],
+                                 int *out_partial) {
+    if (out_partial) *out_partial = 0;
     if (!root || root->kind != CNODE_AND) return 0;
-    if (root->n_children < 2 || root->n_children > MAX_INTERSECT_LEAVES) return 0;
+    if (root->n_children < 2) return 0;
     int n = 0;
+    int dropped = 0;
     for (int i = 0; i < root->n_children; i++) {
         CriteriaNode *c = root->children[i];
-        if (c->kind != CNODE_LEAF) return 0;
-        if (!op_eligible_for_intersect(c->leaf.op)) return 0;
+        /* Non-leaf (OR sub-tree) / non-rangeable op (icontains/regex/…) /
+         * non-indexed leaf → skip, let criteria_match_tree handle it
+         * per-record. Previously any of these aborted the intersect,
+         * forcing a single PRIMARY_LEAF on whichever indexed leaf came
+         * first in source order — which was usually the wrong choice
+         * when a selective trigram sat next to a broad bitmap. */
+        if (c->kind != CNODE_LEAF) { dropped = 1; continue; }
+        if (!op_eligible_for_intersect(c->leaf.op)) { dropped = 1; continue; }
         char path[PATH_MAX];
-        if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) return 0;
+        if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) { dropped = 1; continue; }
+        /* Bitmaps cost more to walk into a KeySet (millions of entries for
+         * a bool / low-card enum) than to bit-test per record after the
+         * primary already narrowed the set. Push them into the post-filter. */
+        int picked = pick_index_for_leaf(db_root, object, &c->leaf);
+        if (picked == IT_BITMAP) { dropped = 1; continue; }
+        if (n >= MAX_INTERSECT_LEAVES) { dropped = 1; continue; }
         out_leaves[n] = &c->leaf;
         memcpy(out_paths[n], path, PATH_MAX);
         n++;
     }
     if (n < 2) return 0;
+    if (out_partial) *out_partial = dropped;
     /* Insertion sort by selectivity rank — n is tiny (≤ MAX_INTERSECT_LEAVES). */
     for (int i = 1; i < n; i++) {
         for (int j = i; j > 0; j--) {
@@ -11611,11 +11701,14 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
     /* Try intersection first — if 2+ indexable AND-leaves on rangeable ops
        exist, intersecting candidate hashes is faster than primary-leaf +
        per-record post-filter for selective queries. */
+    int partial = 0;
     int ni = find_intersect_leaves(tree, db_root, object,
-                                   p.intersect_leaves, p.intersect_paths);
+                                   p.intersect_leaves, p.intersect_paths,
+                                   &partial);
     if (ni >= 2) {
         p.kind = PRIMARY_INTERSECT;
         p.intersect_count = ni;
+        p.partial_intersect = partial;
         return p;
     }
 
@@ -12828,14 +12921,19 @@ static size_t keyset_count_from_intersect(const char *db_root, const char *objec
                                               &small_primary);
     if (!result) return 0;
 
-    if (!small_primary) {
+    /* Partial intersect: at least one AND child was dropped from the
+       intersect (bitmap leaf, non-rangeable op, OR sub-tree, …) and
+       lives in the criteria tree as a post-filter. Bare keyset_size
+       would over-count; route through parallel_indexed_count which
+       re-applies the full tree per record. */
+    if (!small_primary && !plan->partial_intersect) {
         size_t n = keyset_size(result);
         keyset_free(result);
         return n;
     }
 
-    /* Small first leaf: skip the second-leaf btree walk(s). Convert to a
-       CollectedHash[] and feed parallel_indexed_count with the full tree. */
+    /* Small first leaf or partial intersect: feed parallel_indexed_count
+       with the full tree so every dropped/post-filter leaf is verified. */
     CollectedHash *batch = NULL;
     size_t batch_count = 0;
     int rc = keyset_to_collected_hashes(result, sch->splits, &batch, &batch_count);
@@ -13226,10 +13324,13 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                           plan->intersect_count, dl,
                                           &small_primary);
     if (!ks) return 0;
-    /* Small primary: pass the full tree so emit re-checks every leaf via
-       criteria_match_tree. Big primary: intersection already exact, skip rematch. */
+    /* Small primary OR partial intersect: pass the full tree so emit
+       re-checks every leaf (including any bitmap/OR/non-rangeable child
+       the planner kept out of the intersect) via criteria_match_tree.
+       Big primary with full intersect: intersection already exact, skip rematch. */
+    int need_rematch = small_primary || plan->partial_intersect;
     int rc = keyset_emit_find(db_root, object, sch, ks,
-                              small_primary ? tree : NULL,
+                              need_rematch ? tree : NULL,
                               excluded, offset, limit,
                               proj_fields, proj_count, fs, rows_fmt, dict_fmt, csv_delim,
                               joins, njoins, dl);
@@ -13308,10 +13409,12 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                           &small_primary);
     if (!ks) return 0;
 
-    if (small_primary) {
+    if (small_primary || plan->partial_intersect) {
         /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
            AggCtx lives further down the file — caller passes &ctx.tree to
-           avoid a forward decl. */
+           avoid a forward decl. Partial intersect: at least one AND child
+           (bitmap, non-rangeable op, OR sub-tree, …) was dropped from the
+           intersect and survives only in the criteria tree as a post-filter. */
         *agg_ctx_tree_field = full_tree;
     }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -19958,9 +20061,14 @@ int cmd_aggregate(const char *db_root, const char *object,
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
             SearchCriterion *isect_leaves[MAX_INTERSECT_LEAVES];
             char isect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
+            int isect_partial = 0;
             int ni = find_intersect_leaves(tree, db_root, object,
-                                           isect_leaves, isect_paths);
-            if (ni >= 2) {
+                                           isect_leaves, isect_paths,
+                                           &isect_partial);
+            /* Partial intersect means at least one AND child stays in the
+               criteria tree as a post-filter. emit_min_max_via_keyset has
+               no rematch hook, so skipping it would over-report. Fall back. */
+            if (ni >= 2 && !isect_partial) {
                 int small_primary = 0;
                 KeySet *ks = intersect_indexed_leaves(db_root, object,
                                                       sch.splits,
