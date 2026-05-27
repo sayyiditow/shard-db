@@ -12288,8 +12288,69 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     int prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
     int prim_sel = leaf_is_selective(est[prim], N);
 
-    /* Multi-leaf AND (Task 1b.3) inserts its branch here, before the
-     * single-leaf fallthrough below. */
+    /* Multi-leaf AND (Task 1b.3): count indexed + selective leaves among all
+     * AND-leaves, then decide: pure-bitmap → intersect; count + 2 selective →
+     * intersect; find + selective primary → fall to single-seed; all broad →
+     * intersect-to-narrow. */
+    {
+        int n_indexed = 0, n_selective = 0, all_bitmap = 1;
+        for (int i = 0; i < nL; i++) {
+            int it = pick_index_for_leaf(db_root, object, leaves[i]);
+            if (it < 0) continue;
+            n_indexed++;
+            if (it != IT_BITMAP) all_bitmap = 0;
+            if (leaf_is_selective(est[i], N)) n_selective++;
+        }
+        if (n_indexed >= 2) {
+            /* B3: pure-bitmap AND → popcount intersect (mirror choose_primary_source).
+             * Fires regardless of fetching: bitmap intersect is always cheapest. */
+            if (all_bitmap) {
+                fp.kind = FP_INTERSECT; fp.source_is_bitmap = 1;
+                for (int i = 0; i < nL; i++) {
+                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                    if (it == IT_BITMAP && fp.n_source < MAX_INTERSECT_LEAVES)
+                        fp.source_leaves[fp.n_source++] = leaves[i];
+                    else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
+                        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                }
+                if (!fp.n_source) fp.kind = FP_FULL_SCAN; /* defensive */
+                return fp; /* 1b.5: goto order_overlay */
+            }
+            /* COUNT (fetching==0) with ≥2 selective indexed leaves:
+             * intersect index-only — no record reads needed for count. */
+            if (!fetching && n_selective >= 2) {
+                fp.kind = FP_INTERSECT;
+                for (int i = 0; i < nL; i++) {
+                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                    if (it >= 0 && leaf_is_selective(est[i], N)
+                            && fp.n_source < MAX_INTERSECT_LEAVES)
+                        fp.source_leaves[fp.n_source++] = leaves[i];
+                    else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
+                        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                }
+                return fp; /* 1b.5: goto order_overlay */
+            }
+            /* FIND (fetching==1) with a selective primary seed: fall through to
+             * the single-seed PRIMARY_LEAF block below — fetch the few, check
+             * the rest on the record for free (B4's "fetch the 100, check rest").
+             * Also the path for B2: selective btree + broad bitmap → leaf-on-btree. */
+            if (fetching && prim_sel) { /* fall through to single-seed */ }
+            else if (n_selective == 0) {
+                /* All indexed leaves are broad → intersect-to-narrow before fetch. */
+                fp.kind = FP_INTERSECT;
+                for (int i = 0; i < nL; i++) {
+                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                    if (it >= 0 && fp.n_source < MAX_INTERSECT_LEAVES)
+                        fp.source_leaves[fp.n_source++] = leaves[i];
+                    else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
+                        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                }
+                return fp; /* 1b.5: goto order_overlay */
+            }
+            /* else: one selective leaf present, fetching=1 OR count with only
+             * one selective leaf → fall through to single-seed PRIMARY_LEAF. */
+        }
+    }
 
     /* --- single effective seed --- */
     if (prim_it == IT_BITMAP && !prim_sel) {
