@@ -553,3 +553,96 @@ static int test_topn_stream_with_composite(void) {
 }
 
 TEST_REGISTER("test-topn-stream-with-composite", test_topn_stream_with_composite)
+
+/* ========== Bitmap criterion must post-filter, not materialise ==========
+ *
+ * Regression for the planner-parity bug: a streaming top-N with a bitmap
+ * criterion picked the bitmap as PRIMARY_LEAF and called build_keyset_from_leaf
+ * → build_keyset_from_bitmap, which materialises EVERY matching hash into a
+ * KeySet. When that KeySet's estimate exceeds QUERY_BUFFER_MB the builder
+ * returns NULL, and agg_run_topn_stream then walked with prefilter=NULL —
+ * silently counting UNFILTERED (criterion ignored → wrong, inflated counts).
+ *
+ * This test pins QUERY_BUFFER_MB=1 and makes the matching set (~40k hashes ≈
+ * 1.6MB est) blow past it, so the broken path returns the unfiltered count.
+ * The fix applies the bitmap as a per-record bm_test post-filter (bounded
+ * memory, never materialised) → the correct FILTERED count.
+ *
+ * Group "g0" has 40000 active=true + 5000 active=false rows. Under
+ * criteria active=true the count must be 40000, never 45000. */
+static int test_topn_stream_bitmap_postfilter_bounded(void) {
+    setenv("SHARD_TEST_QUERY_BUFFER_MB", "1", 1);
+    TestEnv env = {0};
+    int started = test_env_start(&env);
+    unsetenv("SHARD_TEST_QUERY_BUFFER_MB");
+    if (started != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"name:varchar:16\",\"active:bool\"],"
+        "\"indexes\":[\"name\",\"active:bitmap\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* 40000 active=true + 5000 active=false, all in group g0. */
+    const int N_TRUE = 40000, N_FALSE = 5000;
+    size_t body_cap = 1 << 22; /* 4 MB */
+    char *body = malloc(body_cap);
+    int p = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    int next = 0;
+    for (int i = 0; i < N_TRUE; i++) {
+        p += snprintf(body + p, body_cap - p,
+                      "%s\"k%d\":{\"name\":\"g0\",\"active\":true}",
+                      next == 0 ? "" : ",", next);
+        next++;
+    }
+    for (int i = 0; i < N_FALSE; i++) {
+        p += snprintf(body + p, body_cap - p,
+                      ",\"k%d\":{\"name\":\"g0\",\"active\":false}", next);
+        next++;
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+    ASSERT_TRUE(p < (int)body_cap, "bulk body fit in buffer");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* group_by name, count, criteria active=true, top 5. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
+    ASSERT_TRUE(resp != NULL, "bitmap-criteria aggregate response");
+
+    ASSERT_TRUE(strstr(resp, "\"n\":40000") != NULL,
+                "g0 count is the FILTERED active=true count (40000)");
+    ASSERT_TRUE(strstr(resp, "\"n\":45000") == NULL,
+                "must NOT return the unfiltered count (45000) — criterion dropped under budget");
+
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-bitmap-postfilter-bounded", test_topn_stream_bitmap_postfilter_bounded)

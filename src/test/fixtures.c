@@ -145,6 +145,14 @@ int test_env_start(TestEnv *env) {
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n",
         env->db_root, env->port, base);
+    /* Optional per-test override: a test that needs to exercise the
+       per-query memory cap (e.g. forcing a bitmap KeySet past budget)
+       sets SHARD_TEST_QUERY_BUFFER_MB before test_env_start, then unsets
+       it. Absent → daemon default. Kept out of TestEnv so the many
+       uninitialised `TestEnv env;` callers are unaffected. */
+    const char *qbuf_mb = getenv("SHARD_TEST_QUERY_BUFFER_MB");
+    if (qbuf_mb && *qbuf_mb)
+        fprintf(f, "export QUERY_BUFFER_MB=%s\n", qbuf_mb);
     fclose(f);
     char logs_dir[400];
     snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);

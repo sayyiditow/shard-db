@@ -12494,6 +12494,140 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     return ks;
 }
 
+/* ---- Bitmap COMPLEMENT keyset (records whose value is NOT a target) ----
+ *
+ * Used by the streaming top-N when a bitmap eq/IN criterion matches the
+ * MAJORITY of rows (e.g. type='story' = 99.4%). Building the match-set then
+ * costs a multi-million-entry KeySet; the complement is tiny, so we build it
+ * instead and the caller inverts the membership test.
+ *
+ * Walks every dict value EXCEPT the target(s) via bm_iter_values — no
+ * BM_DICT_MATCH_CAP ceiling, so it's complete even for high-cardinality
+ * bitmaps. Correct for always-set bitmap fields (bool/enum): a NULL-valued
+ * record would be wrongly included, but bitmap fields always carry a value. */
+typedef struct {
+    const BitmapShard  *bm;
+    const uint8_t     (*tvals)[1024];
+    const size_t       *tvlens;
+    int                 nt;
+    BmCollectCtx       *collect;
+} BmComplementCtx;
+
+static int bm_complement_value_cb(const uint8_t *value, size_t vlen, void *ctx) {
+    BmComplementCtx *cc = (BmComplementCtx *)ctx;
+    if (cc->collect->dl && cc->collect->dl->timed_out) return 1;
+    for (int t = 0; t < cc->nt; t++) {
+        if (vlen == cc->tvlens[t] && memcmp(value, cc->tvals[t], vlen) == 0)
+            return 0;  /* target value — excluded from the complement */
+    }
+    bm_walk(cc->bm, value, vlen, bm_collect_to_keyset_cb, cc->collect);
+    return 0;
+}
+
+static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *object,
+                                              int splits, const SearchCriterion *leaf,
+                                              QueryDeadline *dl,
+                                              const uint8_t (*tvals)[1024],
+                                              const size_t *tvlens, int nt,
+                                              size_t comp_hint) {
+    size_t ks_bytes_est = (comp_hint ? comp_hint : 1024)
+                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
+
+    Schema sc = load_schema(db_root, object);
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return NULL;
+
+    KeySet *ks = keyset_new(comp_hint > 0 ? comp_hint : 1024);
+    if (!ks) return NULL;
+
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+
+        char kfp[PATH_MAX];
+        slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            bm_close(bm);
+            continue;
+        }
+
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
+        BmComplementCtx cc = { bm, tvals, tvlens, nt, &c };
+        bm_iter_values(bm, bm_complement_value_cb, &cc);
+
+        kfcache_release(&kh);
+        bm_close(bm);
+    }
+    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    return ks;
+}
+
+/* For a bitmap-indexed eq/IN leaf, build whichever of {match-set, complement}
+ * is smaller, so the streaming top-N prefilter never materialises the
+ * majority side. *inverted=1 ⇒ the complement was built and the caller counts
+ * a row when its hash is NOT in the set. Returns NULL on budget/error so the
+ * caller falls back rather than counting unfiltered. */
+static KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
+                                           int splits, const SearchCriterion *leaf,
+                                           const TypedField *tf, QueryDeadline *dl,
+                                           int *inverted) {
+    *inverted = 0;
+    if (!tf || (leaf->op != OP_EQUAL && leaf->op != OP_IN))
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+
+    int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
+    if (n_vals <= 0)
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+
+    uint8_t (*tvals)[1024] = calloc((size_t)n_vals, sizeof(*tvals));
+    size_t  *tvlens = calloc((size_t)n_vals, sizeof(*tvlens));
+    if (!tvals || !tvlens) { free(tvals); free(tvlens); return NULL; }
+    int nt = 0;
+    for (int i = 0; i < n_vals; i++) {
+        const char *v = (leaf->op == OP_EQUAL) ? leaf->value : leaf->in_values[i];
+        encode_criterion_value(tf, v, strlen(v), tvals[nt], &tvlens[nt]);
+        if (tvlens[nt] > 0) nt++;
+    }
+    if (nt == 0) {
+        free(tvals); free(tvlens);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+    }
+
+    /* Sum bm_count across shards — cheap stride popcount per (shard, value). */
+    size_t matches = 0;
+    for (int s = 0; s < splits; s++) {
+        if (dl && dl->timed_out) { free(tvals); free(tvlens); return NULL; }
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) continue;
+        for (int i = 0; i < nt; i++) matches += bm_count(bm, tvals[i], tvlens[i]);
+        bm_close(bm);
+    }
+    int total = get_live_count(db_root, object);
+    size_t comp = ((size_t)total > matches) ? (size_t)total - matches : 0;
+
+    KeySet *ks;
+    if (matches <= comp) {
+        ks = build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+    } else {
+        ks = build_keyset_bitmap_complement(db_root, object, splits, leaf, dl,
+                                            (const uint8_t (*)[1024])tvals,
+                                            tvlens, nt, comp);
+        if (ks) *inverted = 1;
+    }
+    free(tvals); free(tvlens);
+    return ks;
+}
+
 /* Collect hashes from a single trigram's posting list (range scan
    on the .tg btree shards for key=trigram). Hashes land in a fresh
    KeySet allocated by the caller. */
@@ -17777,6 +17911,7 @@ typedef struct {
     int               order_spec_idx;
     void             *heap;
     KeySet           *prefilter;
+    int               prefilter_inverted; /* 1 ⇒ count when hash NOT in prefilter (complement set) */
     QueryDeadline    *dl;
     int               dl_counter;
     const TypedField *gb_tf;   /* for future sum/min/max on the group field */
@@ -17819,7 +17954,12 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
     TopNWalkCtx *c = (TopNWalkCtx *)ctx_v;
 
     if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
-    if (c->prefilter && !keyset_contains(c->prefilter, hash16)) return 0;
+    if (c->prefilter) {
+        int in = keyset_contains(c->prefilter, hash16);
+        /* Normal prefilter: skip rows NOT in the match-set. Inverted
+           (complement) prefilter: skip rows that ARE in the complement. */
+        if (c->prefilter_inverted ? in : !in) return 0;
+    }
 
     int new_group = 0;
     if (!c->current_key) {
@@ -17898,6 +18038,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
 
     /* Build prefilter KeySet from criteria, or fall back if un-indexable. */
     KeySet *prefilter = NULL;
+    int prefilter_inverted = 0;
     if (tree) {
         QueryPlan p = choose_primary_source(tree, db_root, object);
         if (p.kind == PRIMARY_NONE) {
@@ -17911,8 +18052,20 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
                                                   p.intersect_count,
                                                   dl, &sp);
         } else if (p.kind == PRIMARY_LEAF) {
-            prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
-                                               p.primary_leaf, dl);
+            /* A bitmap eq/IN primary would materialise EVERY matching hash —
+               crippling when the value is the majority (e.g. type='story').
+               Build the smaller of {match-set, complement} instead; the walk
+               inverts membership when we built the complement. */
+            if ((p.primary_leaf->op == OP_EQUAL || p.primary_leaf->op == OP_IN) &&
+                field_has_index_type(db_root, object, p.primary_leaf->field, IT_BITMAP)) {
+                prefilter = build_smaller_bitmap_keyset(
+                    db_root, object, sch->splits, p.primary_leaf,
+                    resolve_idx_field(fs->ts, p.primary_leaf->field),
+                    dl, &prefilter_inverted);
+            } else {
+                prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
+                                                   p.primary_leaf, dl);
+            }
         } else if (p.kind == PRIMARY_KEYSET) {
             int budget = 0;
             prefilter = build_or_keyset(db_root, object, sch->splits,
@@ -17926,6 +18079,14 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             topn_heap_destroy(heap);
             return -1;
         }
+        /* Criteria existed but no prefilter could be built (budget overflow
+           or builder error). Do NOT walk unfiltered — that silently drops
+           the criterion and over-counts. Fall back to the scan+hashmap path
+           which evaluates criteria per record. */
+        if (!prefilter) {
+            topn_heap_destroy(heap);
+            return -2;
+        }
     }
 
     TopNWalkCtx ctx;
@@ -17935,6 +18096,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     ctx.order_spec_idx = order_spec_idx;
     ctx.heap           = heap;
     ctx.prefilter      = prefilter;
+    ctx.prefilter_inverted = prefilter_inverted;
     ctx.dl             = dl;
     ctx.gb_tf          = resolve_idx_field(fs->ts, group_by_field);
 
