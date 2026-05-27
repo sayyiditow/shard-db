@@ -56,3 +56,62 @@ static int test_cost_selectivity_primitive(void) {
     return 0;
 }
 TEST_REGISTER("test-cost-selectivity-primitive", test_cost_selectivity_primitive)
+
+extern const char *plan_filter_kind_for_test(const char *db_root, const char *object,
+        const char *criteria_json, const char *order_by, int fetching,
+        char *out_field, size_t fsz, char *out_order, size_t osz);
+
+/* A1: 1 selective btree eq → leaf, seeded on `tag`. */
+static int test_planA1_selective_leaf(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "a1", "\"tag:varchar:8\"", "\"tag\"");
+    if (!tc) return 1;
+    cm_insert_tags(tc, "a1");
+    char f[64]={0}, o[16]={0};
+    const char *k = plan_filter_kind_for_test(env.db_root, "default/a1",
+        "{\"tag\":\"rare\"}", NULL, 1, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(k, "leaf", "A1 selective eq → PRIMARY_LEAF");
+    ASSERT_EQ_STR(f, "tag", "A1 seeds on tag");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a1-selective-leaf", test_planA1_selective_leaf)
+
+/* A2: 1 broad bitmap (active=true, 70/100) → bitmap smaller-side, never leaf. */
+static int test_planA2_broad_bitmap(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "a2", "\"active:bool\"", "\"active:bitmap\"");
+    if (!tc) return 1;
+    char body[16384]; int p=0,k=0; char *resp=NULL;
+    p+=snprintf(body+p,sizeof(body)-p,"{");
+    for(int i=0;i<70;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
+    for(int i=0;i<30;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"active\":false}",k);k++;}
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[17408];
+    snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a2\",\"records\":%s}",body);
+    tc_request(tc, req, &resp); free(resp);
+    char f[64]={0}, o[16]={0};
+    const char *kind = plan_filter_kind_for_test(env.db_root, "default/a2",
+        "{\"active\":true}", NULL, 1, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(kind, "bitmap", "A2 broad bitmap → BITMAP_SMALLER (not leaf)");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a2-broad-bitmap", test_planA2_broad_bitmap)
+
+/* A5: 1 non-indexed leaf → full scan. */
+static int test_planA5_nonindexed_scan(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "a5", "\"tag:varchar:8\",\"note:varchar:16\"", "\"tag\"");
+    if (!tc) return 1;
+    cm_insert_tags(tc, "a5"); /* note absent → empty; only tag indexed */
+    char f[64]={0}, o[16]={0};
+    /* Use array-form criteria so parse_criteria_tree gets a proper contains leaf */
+    const char *k = plan_filter_kind_for_test(env.db_root, "default/a5",
+        "[{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(k, "scan", "A5 non-indexed → FULL_SCAN");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a5-nonindexed-scan", test_planA5_nonindexed_scan)

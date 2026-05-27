@@ -12249,6 +12249,108 @@ static int most_selective_indexed(const char *db_root, const char *object,
     return best;
 }
 
+/* Flatten a tree into its AND-leaves (the implicit-AND children, or a lone
+ * leaf). OR sub-trees and nested AND are handled by the caller; here we only
+ * collect direct LEAF children for the per-leaf cost pass. Returns count. */
+static int collect_and_leaves(CriteriaNode *tree, SearchCriterion **out, int max) {
+    int n = 0;
+    if (!tree) return 0;
+    if (tree->kind == CNODE_LEAF) { if (max>0){ out[0]=&tree->leaf; return 1;} return 0; }
+    if (tree->kind == CNODE_AND) {
+        for (int i=0;i<tree->n_children && n<max;i++)
+            if (tree->children[i]->kind == CNODE_LEAF) out[n++]=&tree->children[i]->leaf;
+    }
+    return n;
+}
+
+__attribute__((unused))
+static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
+                              const char *object, const FieldSchema *fs,
+                              int splits, size_t N, const char *order_by,
+                              int fetching) {
+    FilterPlan fp; memset(&fp, 0, sizeof(fp));
+    fp.fetching = fetching;
+    fp.order = FP_ORDER_NONE;
+    if (!tree) { fp.kind = FP_FULL_SCAN; return fp; }
+
+    /* OR / hybrid handled in Task 1b.4; for now treat a pure-OR root via the
+     * existing detector and otherwise fall to the AND-leaf cost pass. */
+    /* (1b.4 inserts the OR branch here.) */
+
+    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
+    int nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
+    if (nL == 0) { fp.kind = FP_FULL_SCAN; return fp; }
+
+    CardEst est[MAX_INTERSECT_LEAVES];
+    int prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
+    if (prim < 0) { fp.kind = FP_FULL_SCAN; return fp; }   /* nothing indexed → A5/B7 */
+
+    int prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
+    int prim_sel = leaf_is_selective(est[prim], N);
+
+    /* Multi-leaf AND (Task 1b.3) inserts its branch here, before the
+     * single-leaf fallthrough below. */
+
+    /* --- single effective seed --- */
+    if (prim_it == IT_BITMAP && !prim_sel) {
+        fp.kind = FP_BITMAP_SMALLER; fp.source_is_bitmap = 1;
+    } else if (prim_sel || prim_it != IT_BITMAP) {
+        /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
+         * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
+        if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated) {
+            /* broad non-bitmap: K > budget → fetch loses to scan (B5) */
+            fp.kind = FP_FULL_SCAN; return fp;
+        }
+        fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);
+    } else {
+        fp.kind = FP_FULL_SCAN; return fp;
+    }
+    fp.source_leaves[0] = leaves[prim];
+    fp.n_source = 1;
+    /* every other leaf is a post-filter */
+    for (int i=0;i<nL;i++) if (i!=prim && fp.n_postfilter<MAX_INTERSECT_LEAVES)
+        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+    /* total_cheap + order overlay folded in 1b.5 */
+    return fp;
+}
+
+#ifdef TEST_BUILD
+static const char *fp_kind_str(FilterPlanKind k){
+    switch(k){case FP_FULL_SCAN:return "scan";case FP_PRIMARY_LEAF:return "leaf";
+    case FP_BITMAP_SMALLER:return "bitmap";case FP_INTERSECT:return "intersect";
+    case FP_UNION:return "union";} return "?"; }
+static const char *fp_order_str(FilterOrderKind o){
+    switch(o){case FP_ORDER_NONE:return "none";case FP_ORDER_COMPOSITE:return "composite";
+    case FP_ORDER_SORT:return "sort";case FP_ORDER_INDEX_WALK:return "walk";} return "?"; }
+
+const char *plan_filter_kind_for_test(const char *db_root, const char *object,
+        const char *criteria_json, const char *order_by, int fetching,
+        char *out_field, size_t fsz, char *out_order, size_t osz) {
+    if (out_field && fsz) out_field[0]='\0';
+    if (out_order && osz) out_order[0]='\0';
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object,'/');
+    if (slash){size_t d=(size_t)(slash-object);
+        snprintf(eff_root,sizeof(eff_root),"%s/%.*s",db_root,(int)d,object);
+        snprintf(bare,sizeof(bare),"%s",slash+1);
+    } else { snprintf(eff_root,sizeof(eff_root),"%s",db_root);
+        snprintf(bare,sizeof(bare),"%s",object); }
+    const char *err=NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return "parse_error";
+    Schema sc = load_schema(eff_root, bare);
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    size_t N = (size_t)get_live_count(eff_root, bare);
+    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N, order_by, fetching);
+    if (out_field && fsz && fp.n_source>0 && fp.source_leaves[0])
+        snprintf(out_field, fsz, "%s", fp.source_leaves[0]->field);
+    if (out_order && osz) snprintf(out_order, osz, "%s", fp_order_str(fp.order));
+    free_criteria_tree(tree);
+    return fp_kind_str(fp.kind);
+}
+#endif
+
 #ifdef TEST_BUILD
 /* Expose leaf_is_selective for a single eq leaf. Returns 1/0; writes K to
  * *out_k. Mirrors card_est_by_field's dir/obj split + g_db_root setup. */
