@@ -1,0 +1,131 @@
+#define _GNU_SOURCE
+#include "test_runner.h"
+#include "test_assert.h"
+#include "../../db/types.h"
+#include "../test_client.h"
+#include "../fixtures.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+typedef struct { size_t k; int saturated; int estimable; } CardEst;
+extern CardEst card_est_by_field(const char *db_root, const char *object,
+                                 const char *field, const char *value, size_t cap);
+extern CardEst card_est_by_field_contains(const char *db_root, const char *object,
+                                          const char *field, const char *value, size_t cap);
+
+static int test_card_est_bitmap_exact(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ce\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"active:bool\"],"
+        "\"indexes\":[\"active:bitmap\"]}", &resp); free(resp); resp=NULL;
+    char body[16384]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
+    for (int i=0;i<70;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
+    for (int i=0;i<30;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"active\":false}",k);k++;}
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[17408]; snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ce\",\"records\":%s}",body);
+    tc_request(tc, req, &resp); free(resp); resp=NULL;
+
+    CardEst e = card_est_by_field(env.db_root, "default/ce", "active", "true", 10);
+    ASSERT_EQ_INT((int)e.k, 70, "active=true exact count = 70");
+    ASSERT_EQ_INT(e.saturated, 0, "bitmap exact, not saturated even with cap<k");
+    ASSERT_EQ_INT(e.estimable, 1, "bitmap is estimable");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-card-est-bitmap-exact", test_card_est_bitmap_exact)
+
+static int test_card_est_btree_capped(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ceb\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"tag:varchar:8\"],"
+        "\"indexes\":[\"tag\"]}", &resp); free(resp); resp=NULL;
+    char body[65536]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
+    for (int i=0;i<5;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
+    for (int i=0;i<200;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\"}",k);k++;}
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[66560]; snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ceb\",\"records\":%s}",body);
+    tc_request(tc, req, &resp); free(resp); resp=NULL;
+
+    CardEst r = card_est_by_field(env.db_root, "default/ceb", "tag", "rare", 10);
+    ASSERT_EQ_INT((int)r.k, 5, "tag=rare exact = 5");
+    ASSERT_EQ_INT(r.saturated, 0, "rare not saturated under cap 10");
+    ASSERT_EQ_INT(r.estimable, 1, "btree eq is estimable");
+    CardEst c = card_est_by_field(env.db_root, "default/ceb", "tag", "common", 10);
+    ASSERT_EQ_INT(c.saturated, 1, "tag=common saturated over cap 10");
+    ASSERT_TRUE(c.k > 10, "common k reported >= cap");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-card-est-btree-capped", test_card_est_btree_capped)
+
+static int test_card_est_trigram(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"cet\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"title:varchar:64\"],"
+        "\"indexes\":[\"title:trigram\"]}", &resp); free(resp); resp=NULL;
+
+    /* Insert 4 records containing rare substring "zqxj"
+     * and 150 records containing common substring "the". */
+    char body[65536]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
+    for (int i=0;i<4;i++){
+        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"title\":\"a zqxj title %d\"}",
+                    k==0?"":",",k,i);
+        k++;
+    }
+    for (int i=0;i<150;i++){
+        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"title\":\"the common one %d\"}",k,i);
+        k++;
+    }
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[66560];
+    snprintf(req,sizeof(req),
+             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cet\","
+             "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp=NULL;
+
+    /* Rare substring "zqxj": grams are "zqx" and "qxj".
+     * Both have posting size 4 (only the 4 inserted records).
+     * Estimate should be small (<=10) and not saturated under cap 50. */
+    CardEst r = card_est_by_field_contains(env.db_root, "default/cet",
+                                           "title", "zqxj", 50);
+    ASSERT_EQ_INT(r.estimable, 1, "trigram contains is estimable");
+    ASSERT_TRUE(r.k >= 4 && r.k <= 10,
+                "rare 'zqxj' estimate small (>=4 matches, <=10 candidates)");
+    ASSERT_EQ_INT(r.saturated, 0, "rare 'zqxj' not saturated under cap 50");
+
+    /* Common substring "the": every one of the 150 "the common one N" records
+     * contains "the", plus the rare ones don't.  150 > cap=50, so saturated. */
+    CardEst c = card_est_by_field_contains(env.db_root, "default/cet",
+                                           "title", "the", 50);
+    ASSERT_EQ_INT(c.estimable, 1, "trigram contains 'the' is estimable");
+    ASSERT_EQ_INT(c.saturated, 1, "common 'the' saturated over cap 50");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-card-est-trigram", test_card_est_trigram)
