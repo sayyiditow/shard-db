@@ -11841,9 +11841,13 @@ static int agg_criteria_fully_covered(const char *db_root, const char *object,
 /* ========== Cardinality estimator (planner primitive) ==========
  *
  * card_est_leaf: cheap estimate of how many records match `leaf` on a
- * single indexed field.  Today only IT_BITMAP is handled (exact count
- * via bm_count, ~1 ms/128-shard object even cold).  IT_BTREE and
- * IT_TRIGRAM are added in later tasks; they return estimable=0 for now.
+ * single indexed field.
+ *   IT_BITMAP  -> exact, free (bm_count, ~1 ms/128-shard even cold)
+ *   IT_BTREE   -> capped walk (exact when <= cap, saturated when broad)
+ *   IT_TRIGRAM -> rarest gram's capped posting (upper-bounds candidates)
+ * Ops needing per-record verification (contains-on-btree, like, ends,
+ * regex, len_*, exists, etc.) return estimable=0 — the cost model treats
+ * those leaves as unestimable.
  *
  * PRODUCTION code — the cost model wires it in at runtime in Phase 1b.
  * __attribute__((unused)) keeps -Wunused-function quiet until then (same
@@ -11999,7 +12003,58 @@ static CardEst card_est_leaf(const char *db_root, const char *object,
         e.saturated = (cctx.n > cap) ? 1 : 0;
         return e;
     }
-    /* trigram / non-eq bitmap ops: not yet estimated */
+    if (it == IT_TRIGRAM &&
+        (leaf->op == OP_CONTAINS || leaf->op == OP_ICONTAINS)) {
+        /* Estimate = rarest gram's posting size, capped at `cap`.
+           The candidate set for a trigram contains/icontains is the
+           intersection of all grams' posting lists, so it is bounded
+           above by the smallest (rarest) gram's posting count.
+           We lowercase the pattern here to match the index (same as
+           build_keyset_from_trigram does). */
+        size_t plen = strlen(leaf->value);
+        if (plen < 3) { e.estimable = 0; return e; }
+        if (plen > 1023) plen = 1023;
+
+        uint8_t pattern_lc[1024];
+        for (size_t i = 0; i < plen; i++) {
+            uint8_t c = (uint8_t)leaf->value[i];
+            pattern_lc[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+        }
+
+        uint8_t trigrams[TG_MAX_DISTINCT][3];
+        size_t ng = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
+        if (ng == 0) { e.estimable = 0; return e; }
+
+        int idx_n = index_splits_for(splits);
+        size_t min_count = (size_t)-1;   /* will be clamped below */
+
+        for (size_t gi = 0; gi < ng; gi++) {
+            /* Count this gram's posting across all .tg shards, stopping
+               once we exceed cap (no need to count further — the gram
+               already saturates, so it cannot be the rarest useful one
+               unless all grams saturate). */
+            CardCountCtx cctx = { 0, cap };
+            for (int s = 0; s < idx_n; s++) {
+                char tp[PATH_MAX];
+                tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
+                btree_range(tp,
+                            (const char *)trigrams[gi], 3,
+                            (const char *)trigrams[gi], 3,
+                            card_count_cb, &cctx);
+                if (cctx.n > cap) break;   /* already saturated */
+            }
+            size_t gram_count = cctx.n;
+            if (gram_count < min_count) min_count = gram_count;
+            /* If rarest so far is 0, result must be empty. */
+            if (min_count == 0) break;
+        }
+
+        if (min_count == (size_t)-1) min_count = 0;
+        e.k         = min_count;
+        e.saturated = (min_count > cap) ? 1 : 0;
+        return e;
+    }
+    /* non-eq bitmap ops / trigram non-contains: not estimated */
     e.estimable = 0;
     return e;
 }
@@ -12060,6 +12115,33 @@ CardEst card_est_by_field(const char *db_root, const char *object,
     SearchCriterion leaf; memset(&leaf, 0, sizeof(leaf));
     snprintf(leaf.field, sizeof(leaf.field), "%s", field);
     leaf.op = OP_EQUAL;
+    snprintf(leaf.value, sizeof(leaf.value), "%s", value);
+    const TypedField *tf = resolve_idx_field(fs.ts, field);
+    return card_est_leaf(eff_root, bare, sc.splits, &leaf, tf, cap);
+}
+
+/* Sibling hook for trigram/contains estimation.  Same path setup as
+ * card_est_by_field but sets leaf.op = OP_CONTAINS so the IT_TRIGRAM
+ * branch in card_est_leaf is exercised. */
+CardEst card_est_by_field_contains(const char *db_root, const char *object,
+                                   const char *field, const char *value, size_t cap) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX];
+    char bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dirlen = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s", db_root, (int)dirlen, object);
+        snprintf(bare, sizeof(bare), "%s", slash + 1);
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        snprintf(bare, sizeof(bare), "%s", object);
+    }
+    Schema sc = load_schema(eff_root, bare);
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    SearchCriterion leaf; memset(&leaf, 0, sizeof(leaf));
+    snprintf(leaf.field, sizeof(leaf.field), "%s", field);
+    leaf.op = OP_CONTAINS;
     snprintf(leaf.value, sizeof(leaf.value), "%s", value);
     const TypedField *tf = resolve_idx_field(fs.ts, field);
     return card_est_leaf(eff_root, bare, sc.splits, &leaf, tf, cap);
