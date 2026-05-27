@@ -40,3 +40,35 @@ static int test_card_est_bitmap_exact(void) {
     return 0;
 }
 TEST_REGISTER("test-card-est-bitmap-exact", test_card_est_bitmap_exact)
+
+static int test_card_est_btree_capped(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ceb\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"tag:varchar:8\"],"
+        "\"indexes\":[\"tag\"]}", &resp); free(resp); resp=NULL;
+    char body[65536]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
+    for (int i=0;i<5;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
+    for (int i=0;i<200;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\"}",k);k++;}
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[66560]; snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ceb\",\"records\":%s}",body);
+    tc_request(tc, req, &resp); free(resp); resp=NULL;
+
+    CardEst r = card_est_by_field(env.db_root, "default/ceb", "tag", "rare", 10);
+    ASSERT_EQ_INT((int)r.k, 5, "tag=rare exact = 5");
+    ASSERT_EQ_INT(r.saturated, 0, "rare not saturated under cap 10");
+    ASSERT_EQ_INT(r.estimable, 1, "btree eq is estimable");
+    CardEst c = card_est_by_field(env.db_root, "default/ceb", "tag", "common", 10);
+    ASSERT_EQ_INT(c.saturated, 1, "tag=common saturated over cap 10");
+    ASSERT_TRUE(c.k > 10, "common k reported >= cap");
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-card-est-btree-capped", test_card_est_btree_capped)

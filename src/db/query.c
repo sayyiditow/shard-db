@@ -11853,12 +11853,21 @@ static int agg_criteria_fully_covered(const char *db_root, const char *object,
  * path ignores it (bitmap counts are exact, not bounded). */
 typedef struct { size_t k; int saturated; int estimable; } CardEst;
 
+/* Counting callback for btree cardinality estimation.  Returns -1 once n
+   exceeds cap so btree_idx_walk_ordered stops early — O(min(K, cap)). */
+typedef struct { size_t n; size_t cap; } CardCountCtx;
+static int card_count_cb(const char *v, size_t vl, const uint8_t h[16], void *ctx) {
+    (void)v; (void)vl; (void)h;
+    CardCountCtx *c = (CardCountCtx *)ctx;
+    c->n++;
+    return (c->n > c->cap) ? -1 : 0;
+}
+
 __attribute__((unused))
 static CardEst card_est_leaf(const char *db_root, const char *object,
                              int splits, const SearchCriterion *leaf,
                              const TypedField *tf, size_t cap) {
     CardEst e = { 0, 0, 0 };
-    (void)cap;   /* used by future btree/trigram paths; silence warning now */
     int it = pick_index_for_leaf(db_root, object, leaf);
     if (it < 0) return e;              /* not indexed -> not estimable */
     e.estimable = 1;
@@ -11877,7 +11886,120 @@ static CardEst card_est_leaf(const char *db_root, const char *object,
         e.saturated = 0;               /* exact count — never saturated */
         return e;
     }
-    /* btree / trigram / non-eq bitmap ops: not yet estimated */
+    if (it == IT_BTREE) {
+        /* Capped count via btree_idx_walk_ordered (single-threaded k-way merge).
+           Returning -1 from the callback stops the walk, giving O(min(K,cap))
+           cost.  Bounds mirror btree_dispatch exactly for each rangeable op.
+           Ops that require per-record check_primary (contains, like-non-prefix,
+           ends, regex, etc.) cannot be bounded cheaply — leave estimable=0. */
+        uint8_t buf1[1032], buf2[1032];
+        size_t  len1 = 0,   len2 = 0;
+
+        CardCountCtx cctx = { 0, cap };
+
+        switch (leaf->op) {
+            case OP_EQUAL:
+                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if (len1 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       (const char *)buf1, len1, 0,
+                                       (const char *)buf1, len1, 0,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_GREATER_EQ:
+                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if (len1 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       (const char *)buf1, len1, 0,
+                                       "\xff\xff\xff\xff", 4, 0,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_GREATER:
+                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if (len1 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       (const char *)buf1, len1, 1,
+                                       "\xff\xff\xff\xff", 4, 0,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_LESS_EQ:
+                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if (len1 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       "", 0, 0,
+                                       (const char *)buf1, len1, 0,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_LESS:
+                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if (len1 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       "", 0, 0,
+                                       (const char *)buf1, len1, 1,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_BETWEEN:
+                encode_criterion_value(tf, leaf->value,  strlen(leaf->value),  buf1, &len1);
+                encode_criterion_value(tf, leaf->value2, strlen(leaf->value2), buf2, &len2);
+                if (len1 == 0 || len2 == 0) { e.estimable = 0; return e; }
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       (const char *)buf1, len1, leaf->min_exclusive,
+                                       (const char *)buf2, len2, leaf->max_exclusive,
+                                       0, card_count_cb, &cctx);
+                break;
+
+            case OP_IN: {
+                /* Sum across all IN values; stop the whole estimate once cap
+                   is exceeded (cctx.n is shared across all per-value walks). */
+                for (int iv = 0; iv < leaf->in_count; iv++) {
+                    if (cctx.n > cap) break;
+                    encode_criterion_value(tf, leaf->in_values[iv],
+                                           strlen(leaf->in_values[iv]), buf1, &len1);
+                    if (len1 == 0) continue;
+                    btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                           (const char *)buf1, len1, 0,
+                                           (const char *)buf1, len1, 0,
+                                           0, card_count_cb, &cctx);
+                }
+                break;
+            }
+
+            case OP_STARTS_WITH: {
+                int raw_prefix = (!tf || tf->type == FT_VARCHAR);
+                size_t plen;
+                if (raw_prefix) {
+                    plen = strlen(leaf->value);
+                    memcpy(buf1, leaf->value, plen);
+                } else {
+                    encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &plen);
+                }
+                memcpy(buf2, buf1, plen);
+                memset(buf2 + plen, 0xff, 4);
+                btree_idx_walk_ordered(db_root, object, leaf->field, splits,
+                                       (const char *)buf1, plen, 0,
+                                       (const char *)buf2, plen + 4, 0,
+                                       0, card_count_cb, &cctx);
+                break;
+            }
+
+            default:
+                /* contains, ends, like (non-prefix), i-variants, regex, exists,
+                   len_* — require per-record check_primary; not cheaply bounded.
+                   Leave estimable=0 so the cost model treats them as unknown. */
+                e.estimable = 0;
+                return e;
+        }
+
+        e.k         = cctx.n;
+        e.saturated = (cctx.n > cap) ? 1 : 0;
+        return e;
+    }
+    /* trigram / non-eq bitmap ops: not yet estimated */
     e.estimable = 0;
     return e;
 }
