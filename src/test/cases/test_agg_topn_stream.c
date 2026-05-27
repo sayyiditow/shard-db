@@ -646,3 +646,193 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
 }
 
 TEST_REGISTER("test-topn-stream-bitmap-postfilter-bounded", test_topn_stream_bitmap_postfilter_bounded)
+
+/* ========== Multi-criteria streaming top-N must apply EVERY leaf ==========
+ *
+ * Correctness regression: agg_run_topn_stream built its prefilter from the
+ * single primary leaf chosen by choose_primary_source and ignored the rest.
+ * For `active=true AND tag='x'` the planner excludes the bitmap (active) from
+ * the intersect and drives on tag='x' alone — so `active` was silently dropped
+ * and the count came back for tag='x' regardless of active (wrong, inflated).
+ *
+ * Group g0 (100 rows): 25 active=true+tag=x, 15 active=true+tag=y,
+ * 10 active=false+tag=x, 50 active=false+tag=y.
+ *   correct  [active=true AND tag=x] = 25
+ *   drop active (tag=x only)         = 35  ← old bug
+ *   drop tag    (active=true only)   = 40  ← old bug
+ * The aggregate MUST return 25. */
+static int test_topn_stream_multi_criteria_all_leaves(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) {
+        ASSERT_TRUE(0, "test_env_start failed");
+        return 1;
+    }
+
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"name:varchar:16\",\"active:bool\",\"tag:varchar:8\"],"
+        "\"indexes\":[\"name\",\"active:bitmap\",\"tag\"]}", &resp);
+    free(resp); resp = NULL;
+
+    size_t body_cap = 1 << 18;
+    char *body = malloc(body_cap);
+    int p = 0, next = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    /* (count, active, tag) groups */
+    struct { int n; const char *act; const char *tag; } seg[] = {
+        { 25, "true",  "x" }, { 15, "true",  "y" },
+        { 10, "false", "x" }, { 50, "false", "y" },
+    };
+    for (size_t g = 0; g < sizeof(seg)/sizeof(seg[0]); g++) {
+        for (int j = 0; j < seg[g].n; j++) {
+            p += snprintf(body + p, body_cap - p,
+                "%s\"k%d\":{\"name\":\"g0\",\"active\":%s,\"tag\":\"%s\"}",
+                next == 0 ? "" : ",", next, seg[g].act, seg[g].tag);
+            next++;
+        }
+    }
+    p += snprintf(body + p, body_cap - p, "}");
+
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    /* Diagnostic: plain count with the same criteria must be 25 too. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
+                      "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}]}", &resp);
+    ASSERT_TRUE(resp != NULL && strstr(resp, "25") != NULL,
+                "plain count [active=true AND tag=x] = 25");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
+                      "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
+    ASSERT_TRUE(resp != NULL, "multi-criteria aggregate response");
+
+    ASSERT_TRUE(strstr(resp, "\"n\":25") != NULL,
+                "count applies BOTH leaves: active=true AND tag=x = 25");
+    ASSERT_TRUE(strstr(resp, "\"n\":35") == NULL,
+                "must not drop the bitmap leaf (tag=x only = 35)");
+    ASSERT_TRUE(strstr(resp, "\"n\":40") == NULL,
+                "must not drop the tag leaf (active=true only = 40)");
+    free(resp); resp = NULL;
+
+    /* Diagnostic: same query but limit>10000 disqualifies the streaming path,
+       forcing the scan+hashmap aggregate path. Isolates whether THAT path is
+       also dropping the bitmap (vs the streaming path specifically). */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
+                      "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":20000}", &resp);
+    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":25") != NULL,
+                "scan-path aggregate (limit>10000) also applies both leaves = 25");
+    free(resp); resp = NULL;
+
+    /* No-group aggregate count with the same multi-criteria must also be 25
+       (the no-group keyset fast path reads |KeySet| directly and dropped the
+       sibling leaf the same way). */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_multi\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
+                      "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}]}", &resp);
+    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":25") != NULL,
+                "no-group aggregate count also applies both leaves = 25");
+    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":35") == NULL,
+                "no-group aggregate must not drop the bitmap leaf (= 35)");
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-multi-criteria-all-leaves", test_topn_stream_multi_criteria_all_leaves)
+
+/* Two btree leaves AND'd → PRIMARY_INTERSECT (non-partial) → the aggregate
+ * fast-paths intersect them (bounded, most-selective-first). Confirms
+ * btree+btree multi-field intersection works correctly in the aggregate
+ * (g0 has 30 t1=x&t2=y, 20 t1=x&t2=z, 10 t1=w&t2=y → [t1=x AND t2=y]=30,
+ * not t1=x-only 50 or t2=y-only 40). */
+static int test_topn_stream_btree_btree_intersect(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "test_env_start failed"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_bb\","
+        "\"splits\":8,\"max_key\":12,\"fields\":["
+        "\"name:varchar:16\",\"t1:varchar:8\",\"t2:varchar:8\"],"
+        "\"indexes\":[\"name\",\"t1\",\"t2\"]}", &resp);
+    free(resp); resp = NULL;
+
+    size_t body_cap = 1 << 18;
+    char *body = malloc(body_cap);
+    int p = 0, next = 0;
+    p += snprintf(body + p, body_cap - p, "{");
+    struct { int n; const char *t1; const char *t2; } seg[] = {
+        { 30, "x", "y" }, { 20, "x", "z" }, { 10, "w", "y" },
+    };
+    for (size_t g = 0; g < sizeof(seg)/sizeof(seg[0]); g++)
+        for (int j = 0; j < seg[g].n; j++) {
+            p += snprintf(body + p, body_cap - p,
+                "%s\"k%d\":{\"name\":\"g0\",\"t1\":\"%s\",\"t2\":\"%s\"}",
+                next == 0 ? "" : ",", next, seg[g].t1, seg[g].t2);
+            next++;
+        }
+    p += snprintf(body + p, body_cap - p, "}");
+    size_t req_cap = body_cap + 1024;
+    char *req = malloc(req_cap);
+    snprintf(req, req_cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_bb\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp);
+    free(req); free(body); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"topn_bb\","
+        "\"group_by\":[\"name\"],"
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"criteria\":[{\"field\":\"t1\",\"op\":\"eq\",\"value\":\"x\"},"
+                      "{\"field\":\"t2\",\"op\":\"eq\",\"value\":\"y\"}],"
+        "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
+    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":30") != NULL,
+                "btree+btree intersect: [t1=x AND t2=y] = 30");
+    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":50") == NULL &&
+                strstr(resp, "\"n\":40") == NULL,
+                "neither single-leaf result (50 / 40)");
+    free(resp); resp = NULL;
+    tc_close(tc);
+    test_env_stop(&env);
+    return 0;
+}
+
+TEST_REGISTER("test-topn-stream-btree-btree-intersect", test_topn_stream_btree_btree_intersect)

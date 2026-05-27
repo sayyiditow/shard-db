@@ -11810,6 +11810,34 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
     return p;
 }
 
+/* Does the planner's prefilter for `tree` represent the ENTIRE criteria tree?
+ *
+ * The aggregate group_by fast-paths (IGB walk, streaming top-N, no-group
+ * keyset) filter their index walk by ONE prefilter KeySet built from the
+ * planner's PRIMARY and have no per-record recheck. That's only correct when
+ * the prefilter == the whole filter. A partial intersect (find_intersect_leaves
+ * dropped a bitmap / non-rangeable / non-indexed leaf) or a PRIMARY_LEAF chosen
+ * out of a multi-leaf AND leaves siblings unapplied → those fast-paths would
+ * silently drop them (wrong counts). When this returns 0 the caller must fall
+ * through to agg_run_plan, which fetches the selective candidates and rechecks
+ * the full tree via agg_scan_cb (the "scan the small set, verify the rest"
+ * path). Returns 1 for no-criteria (nothing to drop). */
+static int agg_criteria_fully_covered(const char *db_root, const char *object,
+                                      CriteriaNode *tree) {
+    if (!tree) return 1;
+    QueryPlan p = choose_primary_source(tree, db_root, object);
+    int single_leaf =
+        (tree->kind == CNODE_LEAF) ||
+        (tree->kind == CNODE_AND && tree->n_children == 1 &&
+         tree->children[0]->kind == CNODE_LEAF);
+    switch (p.kind) {
+        case PRIMARY_INTERSECT: return !p.partial_intersect;
+        case PRIMARY_KEYSET:    return 1;
+        case PRIMARY_LEAF:      return single_leaf;
+        default:                return 0;  /* PRIMARY_NONE — no index covers it */
+    }
+}
+
 #ifdef TEST_BUILD
 /* Test-only hook: expose the planner's primary-source decision so tests can
  * assert plan SELECTION. A wrong plan that still returns the right answer —
@@ -18045,12 +18073,40 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             topn_heap_destroy(heap);
             return -2;  /* criteria exist but no usable index — fall back */
         }
+        /* The streaming walk has NO per-record post-filter step (no record is
+           fetched), so it may only trust a prefilter that represents the
+           ENTIRE criteria tree. A partial intersect (find_intersect_leaves
+           dropped a bitmap / non-rangeable / non-indexed leaf) or a
+           PRIMARY_LEAF chosen out of a multi-leaf AND would silently drop the
+           remaining leaves → wrong counts. In those cases fall back to the
+           scan+hashmap path, which evaluates the full tree per record. */
+        int single_leaf =
+            (tree->kind == CNODE_LEAF) ||
+            (tree->kind == CNODE_AND && tree->n_children == 1 &&
+             tree->children[0]->kind == CNODE_LEAF);
+        int plan_covers_tree =
+            (p.kind == PRIMARY_INTERSECT) ? !p.partial_intersect :
+            (p.kind == PRIMARY_KEYSET)    ? 1 :
+            (p.kind == PRIMARY_LEAF)      ? single_leaf : 0;
+        if (!plan_covers_tree) {
+            topn_heap_destroy(heap);
+            return -2;  /* prefilter wouldn't cover all criteria — scan applies the full tree */
+        }
         if (p.kind == PRIMARY_INTERSECT) {
             int sp = 0;
             prefilter = intersect_indexed_leaves(db_root, object, sch->splits,
                                                   p.intersect_leaves,
                                                   p.intersect_count,
                                                   dl, &sp);
+            /* small_primary: intersect_indexed_leaves returned ONLY the
+               smallest leaf's keyset (the rest expect a per-record
+               post-filter, which the walk can't do). The prefilter is
+               partial → fall back to agg_run_plan, which fetches + rechecks. */
+            if (sp) {
+                if (prefilter) keyset_free(prefilter);
+                topn_heap_destroy(heap);
+                return -2;
+            }
         } else if (p.kind == PRIMARY_LEAF) {
             /* A bitmap eq/IN primary would materialise EVERY matching hash —
                crippling when the value is the majority (e.g. type='story').
@@ -21188,7 +21244,8 @@ int cmd_aggregate(const char *db_root, const char *object,
            PRIMARY_LEAF / PRIMARY_INTERSECT / PRIMARY_KEYSET)
        Single-spec MIN/MAX is *not* eligible here — the walk-fetch-check
        and same-field shortcuts above are faster for those. */
-    if (tree && no_group && no_having && nspecs >= 1 && fs.ts) {
+    if (tree && no_group && no_having && nspecs >= 1 && fs.ts &&
+        agg_criteria_fully_covered(db_root, object, tree)) {
         int aw_eligible = 1;
         int aw_min_max_only = 1;
         for (int i = 0; i < nspecs && aw_eligible; i++) {
@@ -21681,7 +21738,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
        Records whose group_by field encodes to zero/empty (the index
        skip-zero rule) are excluded — same semantics as the existing
        no-criteria sum/avg/min/max btree fast path. */
-    int igb_eligible = (ctx.ngroups >= 1 && ctx.ngroups <= MAX_FIELDS && fs.ts);
+    int igb_eligible = (ctx.ngroups >= 1 && ctx.ngroups <= MAX_FIELDS && fs.ts &&
+                        agg_criteria_fully_covered(db_root, object, tree));
     if (igb_eligible) {
         for (int g = 0; g < ctx.ngroups; g++) {
             if (!ctx.group_tfs[g] ||
