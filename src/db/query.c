@@ -12148,6 +12148,134 @@ CardEst card_est_by_field_contains(const char *db_root, const char *object,
 }
 #endif
 
+/* ========== Phase 1b: cost model + unified filter planner ==========
+ *
+ * plan_filter() is the single decision function the rewrite (Phase 1c) wires
+ * count/find/aggregate onto. It consumes card_est_leaf (1a) and the cost knob
+ * below to pick a plan per the decision table
+ * (docs/superpowers/specs/2026-05-28-planner-filter-decision-table.md).
+ *
+ * PURE ADDITION in 1b: no runtime caller yet (1c migrates executors), so
+ * __attribute__((unused)) keeps -Wunused-function quiet — same idiom as
+ * card_est_leaf. Decisions are validated via the TEST_BUILD hook + the
+ * test_planner_cost_model.c matrix BEFORE any executor changes. */
+
+/* Cost model: fetch-and-check costs K random reads; full scan costs N
+ * sequential reads. random_read ≈ ratio × seq_read (page-fault/seek vs
+ * prefetch; PG's random_page_cost/seq_page_cost). Fetch beats scan when
+ * K × ratio < N, i.e. K < N/ratio. g_random_seq_ratio is the tunable
+ * RANDOM_SEQ_COST_RATIO knob (default 8). */
+static size_t selectivity_budget(size_t N) {
+    int r = g_random_seq_ratio;
+    if (r < 1) r = 1;
+    return N / (size_t)r;            /* rows below which fetch-and-check wins */
+}
+
+/* A leaf is "selective" when its estimated match count clears the cost bar:
+ * estimable, not saturated (the capped walk didn't bail), and K ≤ budget.
+ * Bitmaps are exact (never saturated) so a rare bitmap value CAN be selective
+ * via the K ≤ budget test; a broad one (type=story) cannot. Call card_est_leaf
+ * with cap = budget so a btree/trigram walk stops at budget+1 → saturated ⟺
+ * K > budget, unifying the test across index types. */
+__attribute__((unused))
+static int leaf_is_selective(CardEst e, size_t N) {
+    if (!e.estimable || e.saturated) return 0;
+    return e.k <= selectivity_budget(N);
+}
+
+/* Estimate every indexed leaf once and pick the most-selective as the seed.
+ * Ranking: estimable leaves ordered by ascending K; among equal/unestimable,
+ * fall back to op_selectivity_rank; bitmaps deprioritized (rank pushes them
+ * last) so a bitmap is the seed only when nothing else is indexed — per the
+ * spec's "bitmap last; never the seed" rule. Returns the index into `leaves`
+ * of the chosen primary, or -1 if none indexed. Fills est[] in parallel. */
+typedef enum {
+    FP_FULL_SCAN,        /* nothing indexed; cache-isolated scan + match_tree   (A5,B7,C2) */
+    FP_PRIMARY_LEAF,     /* one selective indexed leaf seeds; rest post-filtered (A1,A3,A4,B2,B4,C3,B5-fetch) */
+    FP_BITMAP_SMALLER,   /* lone/all-broad bitmap; smaller-of {match,complement} (A2,B3)   */
+    FP_INTERSECT,        /* 2+ indexed leaves intersected index-only             (B1/B6 count, B3) */
+    FP_UNION             /* pure OR, every child indexed; union keysets          (C1)   */
+} FilterPlanKind;
+
+typedef enum {
+    FP_ORDER_NONE,       /* no order_by */
+    FP_ORDER_COMPOSITE,  /* (filter+order) composite → sorted prefix scan       (D1) */
+    FP_ORDER_SORT,       /* bounded candidate set → sort in memory              (D2) */
+    FP_ORDER_INDEX_WALK  /* candidates too broad → walk order_by index to limit (D3) */
+} FilterOrderKind;
+
+typedef struct {
+    FilterPlanKind   kind;
+    FilterOrderKind  order;                              /* overlay; NONE when no order_by */
+    SearchCriterion *source_leaves[MAX_INTERSECT_LEAVES];/* seed: LEAF→[0]; INTERSECT→[0..n_source) */
+    int              n_source;
+    int              source_is_bitmap;                   /* primary seed is a bitmap (BITMAP_SMALLER, or bitmap primary) */
+    CriteriaNode    *or_node;                            /* FP_UNION */
+    SearchCriterion *postfilter_leaves[MAX_INTERSECT_LEAVES]; /* leaves not covered by source */
+    int              n_postfilter;
+    int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
+    int              fetching;                           /* dimension this plan was computed for */
+} FilterPlan;
+
+/* Pick the most-selective indexed leaf among `leaves` to seed the plan, and
+ * fill est[i] for each. Returns the chosen index, or -1 if none is indexed.
+ * Selection: smallest estimated K wins; bitmaps are pushed last (a broad
+ * bitmap must never seed). Unestimable-but-indexed leaves (e.g. like/regex)
+ * rank after every estimable one. N = live rows (for the budget/cap). */
+__attribute__((unused))
+static int most_selective_indexed(const char *db_root, const char *object,
+                                  int splits, SearchCriterion **leaves, int n,
+                                  const FieldSchema *fs, size_t N,
+                                  CardEst *est /* [n] */) {
+    int best = -1;
+    size_t budget = selectivity_budget(N);
+    for (int i = 0; i < n; i++) {
+        int it = pick_index_for_leaf(db_root, object, leaves[i]);
+        if (it < 0) { est[i] = (CardEst){0,0,0}; continue; }     /* not indexed */
+        const TypedField *tf = resolve_idx_field(fs->ts, leaves[i]->field);
+        est[i] = card_est_leaf(db_root, object, splits, leaves[i], tf, budget);
+        if (best < 0) { best = i; continue; }
+        /* Compare i vs best. Bitmaps deprioritized: a non-bitmap estimable
+         * leaf always beats a bitmap; between two same-class leaves, smaller
+         * K wins; unestimable ranks last. */
+        int it_best = pick_index_for_leaf(db_root, object, leaves[best]);
+        int i_bm = (it == IT_BITMAP), b_bm = (it_best == IT_BITMAP);
+        if (i_bm != b_bm) { if (b_bm) best = i; continue; }       /* prefer non-bitmap */
+        int i_e = est[i].estimable && !est[i].saturated;
+        int b_e = est[best].estimable && !est[best].saturated;
+        if (i_e != b_e) { if (i_e) best = i; continue; }          /* prefer estimable */
+        if (i_e && b_e && est[i].k < est[best].k) best = i;       /* smaller K wins */
+    }
+    return best;
+}
+
+#ifdef TEST_BUILD
+/* Expose leaf_is_selective for a single eq leaf. Returns 1/0; writes K to
+ * *out_k. Mirrors card_est_by_field's dir/obj split + g_db_root setup. */
+int leaf_selective_for_test(const char *db_root, const char *object,
+                            const char *field, const char *value, size_t *out_k) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) { size_t d=(size_t)(slash-object);
+        snprintf(eff_root,sizeof(eff_root),"%s/%.*s",db_root,(int)d,object);
+        snprintf(bare,sizeof(bare),"%s",slash+1);
+    } else { snprintf(eff_root,sizeof(eff_root),"%s",db_root);
+        snprintf(bare,sizeof(bare),"%s",object); }
+    Schema sc = load_schema(eff_root, bare);
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    SearchCriterion leaf; memset(&leaf,0,sizeof(leaf));
+    snprintf(leaf.field,sizeof(leaf.field),"%s",field);
+    leaf.op = OP_EQUAL;
+    snprintf(leaf.value,sizeof(leaf.value),"%s",value);
+    const TypedField *tf = resolve_idx_field(fs.ts, field);
+    size_t N = (size_t)get_live_count(eff_root, bare);
+    CardEst e = card_est_leaf(eff_root, bare, sc.splits, &leaf, tf, selectivity_budget(N));
+    if (out_k) *out_k = e.k;
+    return leaf_is_selective(e, N);
+}
+#endif
+
 /* ========== AND index-intersection (KeySet fast path) ==========
 
    For pure AND trees where every child is an indexed leaf on a btree-rangeable

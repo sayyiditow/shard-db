@@ -483,6 +483,7 @@ extern uint64_t g_bt_cache_misses;
 extern uint64_t g_server_start_ms;
 extern uint64_t g_slow_query_count;
 extern int g_slow_query_ms;
+extern int g_random_seq_ratio;
 extern int g_vacuum_recommend_pct;
 extern int g_vacuum_recommend_min_deleted;
 extern int g_auto_vacuum_enable;
