@@ -319,3 +319,114 @@ static int test_planB7_all_nonindexed(void) {
     return 0;
 }
 TEST_REGISTER("test-plan-b7-all-nonindexed", test_planB7_all_nonindexed)
+
+/* A4: indexed trigram-contains whose estimate is saturated (rarest gram
+ * count > budget) must stay PRIMARY_LEAF — NOT demote to FULL_SCAN.
+ *
+ * Setup: object `a4tg` with title:trigram; 50 rows containing "abc" (each
+ * row value is "abcdef"), 155 rows without (value "xyz"). N=205, budget=25.
+ * Pattern "abc" → one trigram "abc", count=50 > 25 → saturated.
+ * pick_index_for_leaf returns IT_TRIGRAM (pattern ≥3 chars, trigram index
+ * exists). card_est_leaf returns {estimable=1, saturated=1}.
+ * Before fix: demotion branch fires → "scan". After fix: skipped → "leaf". */
+static int test_planA4_saturated_trigram_stays_leaf(void) {
+    TestEnv env={0};
+    /* trigram index on title field */
+    TestClient *tc = cm_setup(&env, "a4tg",
+        "\"title:varchar:32\"",
+        "\"title:trigram\"");
+    if (!tc) return 1;
+
+    /* Build bulk-insert: 50 rows with "abcdef" (contains trigram abc,bcd,cde,def)
+     * and 155 rows with "xyZpqr" (no overlap). N=205, budget=205/8=25.
+     * Rarest gram among abc/bcd/cde/def = 50 > 25 → saturated. */
+    char body[65536]; int p=0, k=0; char *resp=NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i=0; i<50; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"title\":\"abcdef\"}", k==0?"":",", k); k++;
+    }
+    for (int i=0; i<155; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"k%d\":{\"title\":\"xyZpqr\"}", k); k++;
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a4tg\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp);
+
+    char f[64]={0}, o[16]={0};
+    /* Pattern "abc" → IT_TRIGRAM, saturated. Must be "leaf", never "scan". */
+    const char *k_str = plan_filter_kind_for_test(env.db_root, "default/a4tg",
+        "[{\"field\":\"title\",\"op\":\"contains\",\"value\":\"abc\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(k_str, "leaf",
+        "A4: saturated trigram-contains stays PRIMARY_LEAF (never FULL_SCAN)");
+
+    /* Also check fetching=0 (count path) — same result. */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
+    const char *k_count = plan_filter_kind_for_test(env.db_root, "default/a4tg",
+        "[{\"field\":\"title\",\"op\":\"contains\",\"value\":\"abc\"}]",
+        NULL, 0, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(k_count, "leaf",
+        "A4 count: saturated trigram-contains stays leaf");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a4-saturated-trigram-stays-leaf",
+              test_planA4_saturated_trigram_stays_leaf)
+
+/* BCS: count (fetching=0), n_indexed=2, exactly ONE selective leaf.
+ * tag=rare is selective (5 ≤ budget 25), tag2=common is broad (200 > 25).
+ * Expected plan: PRIMARY_LEAF seeded on `tag` (the selective one).
+ *
+ * This locks the fall-through path in the multi-leaf block:
+ *   !fetching && n_selective==1 → neither "intersect" branch fires;
+ *   falls to single-seed block → prim_sel=true → FP_PRIMARY_LEAF. */
+static int test_planBCS_count_one_selective_leaf(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "bcs",
+        "\"tag:varchar:8\",\"tag2:varchar:8\"",
+        "\"tag\",\"tag2\"");
+    if (!tc) return 1;
+
+    /* 5 rows tag=rare + tag2=common, 200 rows tag=common + tag2=common.
+     * tag=rare: 5 ≤ 25 → selective. tag2=common: 205 > 25 → broad.
+     * n_selective=1 (only tag=rare clears the bar). */
+    char body[65536]; int p=0, k=0; char *resp=NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i=0; i<5; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"common\"}",
+            k==0?"":",", k); k++;
+    }
+    for (int i=0; i<200; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}", k); k++;
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bcs\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp);
+
+    char f[64]={0}, o[16]={0};
+    /* fetching=0, n_indexed=2, n_selective=1 → must fall through to leaf. */
+    const char *kc = plan_filter_kind_for_test(env.db_root, "default/bcs",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+         "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"common\"}]",
+        NULL, 0, f, sizeof(f), o, sizeof(o));
+    ASSERT_EQ_STR(kc, "leaf",
+        "BCS count: n_indexed=2, exactly 1 selective → PRIMARY_LEAF (not intersect)");
+    ASSERT_EQ_STR(f, "tag",
+        "BCS count: seed is the selective field `tag`");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-bcs-count-one-selective-leaf",
+              test_planBCS_count_one_selective_leaf)

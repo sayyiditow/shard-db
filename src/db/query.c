@@ -12358,8 +12358,12 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     } else if (prim_sel || prim_it != IT_BITMAP) {
         /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
          * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
-        if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated) {
-            /* broad non-bitmap: K > budget → fetch loses to scan (B5) */
+        if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated
+                && op_eligible_for_intersect(leaves[prim]->op)) {
+            /* broad non-bitmap PRECISE-lookup leaf: K > budget → fetch loses
+             * to a data scan (B5). Leaf-scan ops (contains/like/ends/regex/
+             * len_* and their i-variants) are NOT demoted here — their index
+             * leaf-scan always beats a data-file scan (A4). */
             fp.kind = FP_FULL_SCAN; return fp;
         }
         fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);
