@@ -213,6 +213,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_topn_stream.c \
     src/test/cases/test_find_orderby_selective.c \
     src/test/cases/test_planner_trigram_selectivity.c \
+    src/test/cases/test_cardinality_estimate.c \
     src/test/cases/test_slow_query_log.c \
     src/db/util.c \
     src/db/slotcask.c \

@@ -11838,7 +11838,52 @@ static int agg_criteria_fully_covered(const char *db_root, const char *object,
     }
 }
 
+/* ========== Cardinality estimator (planner primitive) ==========
+ *
+ * card_est_leaf: cheap estimate of how many records match `leaf` on a
+ * single indexed field.  Today only IT_BITMAP is handled (exact count
+ * via bm_count, ~1 ms/128-shard object even cold).  IT_BTREE and
+ * IT_TRIGRAM are added in later tasks; they return estimable=0 for now.
+ *
+ * PRODUCTION code — the cost model wires it in at runtime in Phase 1b.
+ * __attribute__((unused)) keeps -Wunused-function quiet until then (same
+ * idiom as search_collect_cb / idx_build_worker above).
+ *
+ * cap is carried in the signature for those future callers; the bitmap
+ * path ignores it (bitmap counts are exact, not bounded). */
+typedef struct { size_t k; int saturated; int estimable; } CardEst;
+
+__attribute__((unused))
+static CardEst card_est_leaf(const char *db_root, const char *object,
+                             int splits, const SearchCriterion *leaf,
+                             const TypedField *tf, size_t cap) {
+    CardEst e = { 0, 0, 0 };
+    (void)cap;   /* used by future btree/trigram paths; silence warning now */
+    int it = pick_index_for_leaf(db_root, object, leaf);
+    if (it < 0) return e;              /* not indexed -> not estimable */
+    e.estimable = 1;
+    if (it == IT_BITMAP && (leaf->op == OP_EQUAL || leaf->op == OP_IN)) {
+        uint8_t val[1024]; size_t vlen = 0;
+        encode_criterion_value(tf, leaf->value, strlen(leaf->value), val, &vlen);
+        if (vlen == 0) { e.estimable = 0; return e; }
+        for (int s = 0; s < splits; s++) {
+            char bp[1024];
+            bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+            if (!bm) continue;
+            e.k += bm_count(bm, val, vlen);
+            bm_close(bm);
+        }
+        e.saturated = 0;               /* exact count — never saturated */
+        return e;
+    }
+    /* btree / trigram / non-eq bitmap ops: not yet estimated */
+    e.estimable = 0;
+    return e;
+}
+
 #ifdef TEST_BUILD
+
 /* Test-only hook: expose the planner's primary-source decision so tests can
  * assert plan SELECTION. A wrong plan that still returns the right answer —
  * e.g. a broad bitmap intersect chosen over a selective trigram leaf — is
@@ -11864,6 +11909,38 @@ const char *planner_primary_kind_for_test(const char *db_root, const char *objec
     }
     free_criteria_tree(tree);
     return kind;
+}
+
+/* Test-only hook for the cardinality estimator.  Accepts a combined
+ * "dir/object" string so tests can pass (env.db_root, "default/ce")
+ * without needing to pre-build the effective root themselves.
+ * Sets g_db_root (same pattern as planner_primary_kind_for_test's callers)
+ * so that load_schema can locate schema.conf in the test process. */
+CardEst card_est_by_field(const char *db_root, const char *object,
+                          const char *field, const char *value, size_t cap) {
+    /* Point g_db_root at the raw root so load_schema finds schema.conf. */
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+
+    /* Split "dir/obj" into eff_root = db_root + "/" + dir, bare = obj. */
+    char eff_root[PATH_MAX];
+    char bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dirlen = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s", db_root, (int)dirlen, object);
+        snprintf(bare, sizeof(bare), "%s", slash + 1);
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        snprintf(bare, sizeof(bare), "%s", object);
+    }
+    Schema sc = load_schema(eff_root, bare);
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    SearchCriterion leaf; memset(&leaf, 0, sizeof(leaf));
+    snprintf(leaf.field, sizeof(leaf.field), "%s", field);
+    leaf.op = OP_EQUAL;
+    snprintf(leaf.value, sizeof(leaf.value), "%s", value);
+    const TypedField *tf = resolve_idx_field(fs.ts, field);
+    return card_est_leaf(eff_root, bare, sc.splits, &leaf, tf, cap);
 }
 #endif
 
