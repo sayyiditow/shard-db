@@ -1,15 +1,22 @@
 /* src/test/cases/test_find_with_total.c
- * Phase 1d step 1/3 — server wiring + JSON shape.
+ * Phase 1d steps 1/3 and 2/3 — server wiring + JSON shape + real totals.
  *
- * Verifies that:
+ * Phase 1d.1 tests:
  *   - find without "total" → bare array [...] (unchanged)
- *   - find with "total":true → {"rows":[...], "total":null}
+ *   - find with "total":true → {"rows":[...], "total":null}  (envelope shape)
  *   - find with both "total":true and "cursor":{} → error
  *   - aggregate without "total" → bare array / bare object (unchanged)
  *   - aggregate with "total":true → {"rows":[...], "total":null}
  *   - fetch with "total":true → {"rows":[...], "total":null}
  *
- * The "total" value is null for Phase 1d.1; real totals come in 1d.2/1d.3.
+ * Phase 1d.2 tests (real totals):
+ *   A1: FP_PRIMARY_LEAF + ORDER_NONE → total = idx_count_for_leaf(seed)
+ *   A2: FP_BITMAP_SMALLER           → total = bm_popcount (bitmap count)
+ *   B1: FP_INTERSECT                → total = |KeySet| after intersection
+ *   C1: FP_UNION                    → total = |KeySet| after OR-union
+ *   A5: FP_FULL_SCAN (no index)     → total = null
+ *   D1: FP_ORDER_COMPOSITE          → total = null (spec)
+ *   D3: FP_ORDER_INDEX_WALK         → total = null (spec)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -123,7 +130,8 @@ static int test_find_with_total_shape(void) {
 }
 TEST_REGISTER("test-find-with-total-shape", test_find_with_total_shape)
 
-/* find with "total":true and no criteria match → {"rows":[], "total":null} */
+/* find with "total":true and no criteria match → {"rows":[], "total":0}
+   (indexed field: planner picks PRIMARY_LEAF, idx_count returns 0 = exact count) */
 static int test_find_with_total_empty(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "fwt3",
@@ -139,7 +147,8 @@ static int test_find_with_total_empty(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "find+total empty response not null");
     ASSERT_CONTAINS(resp, "\"rows\"", "find+total empty → rows key");
-    ASSERT_CONTAINS(resp, "\"total\":null", "find+total empty → total:null");
+    /* tag is indexed → PRIMARY_LEAF → idx_count_for_leaf(missing) = 0, not null */
+    ASSERT_CONTAINS(resp, "\"total\":0", "find+total empty → total:0 (indexed, zero matches)");
     free(resp);
 
     tc_close(tc); test_env_stop(&env);
@@ -334,3 +343,467 @@ static int test_fetch_without_total(void) {
     return 0;
 }
 TEST_REGISTER("test-fetch-without-total", test_fetch_without_total)
+
+/* ================================================================
+ * Phase 1d.2 tests: real total values per plan kind
+ * ================================================================ */
+
+/* Extract integer from "total":N in a JSON response.
+   Returns the integer value, or -999 if "total":null, or -1 on error. */
+static int extract_total(const char *resp) {
+    if (!resp) return -1;
+    const char *p = strstr(resp, "\"total\":");
+    if (!p) return -1;
+    p += 8; /* skip "total": */
+    while (*p == ' ') p++;
+    if (strncmp(p, "null", 4) == 0) return -999;
+    return atoi(p);
+}
+
+/* Count rows in the rows array — count occurrences of "key": to proxy row count. */
+static int count_rows_in_resp(const char *resp) {
+    if (!resp) return 0;
+    const char *rows_start = strstr(resp, "\"rows\":");
+    if (!rows_start) {
+        /* bare array */
+        rows_start = resp;
+    } else {
+        rows_start += 7;
+    }
+    /* Count "key": occurrences in the rows section */
+    int n = 0;
+    const char *p = rows_start;
+    while ((p = strstr(p, "\"key\":")) != NULL) { n++; p += 6; }
+    return n;
+}
+
+/* ---- A1: FP_PRIMARY_LEAF + ORDER_NONE → real total ------- */
+/* Insert 800 records: 5 with tag="rare", 795 with tag="common".
+   selectivity_budget(800) = 800/8 = 100 > 5 → leaf selective → PRIMARY_LEAF.
+   find {tag:"rare"} limit=3 total=true → rows.length=3, total=5. */
+static int test_real_total_a1_primary_leaf(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "rt_a1",
+        "\"tag:varchar:8\",\"score:int\"", "\"tag\"");
+    if (!tc) return 1;
+
+    /* Bulk-insert in two passes to keep each request buffer small. */
+    char body[32768]; int p = 0; char *resp = NULL;
+
+    /* Pass 1: 5 "rare" records */
+    p = 0;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 5; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"rare%d\":{\"tag\":\"rare\",\"score\":%d}", i?",":"", i, i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    {
+        char req[33000];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp); free(resp); resp = NULL;
+    }
+
+    /* Pass 2: 795 "common" records (split into 8 chunks of ~100) */
+    for (int chunk = 0; chunk < 8; chunk++) {
+        int start = chunk * 99, end = start + 99;
+        if (chunk == 7) end = start + (795 - 7*99); /* last chunk */
+        p = 0;
+        p += snprintf(body+p, sizeof(body)-p, "{");
+        for (int i = start; i < end; i++)
+            p += snprintf(body+p, sizeof(body)-p,
+                "%s\"cmn%d\":{\"tag\":\"common\",\"score\":%d}", i==start?"":",", i, i*10);
+        p += snprintf(body+p, sizeof(body)-p, "}");
+        char req[33000];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp); free(resp); resp = NULL;
+    }
+
+    /* find with limit=3, total=true */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_a1\","
+        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"}],"
+        "\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "A1 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "A1 → rows key present");
+    /* total must be the integer 5 (all matching records) */
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 5, "A1 → total = 5 (all rare records)");
+    /* rows array must have exactly 3 items (limit respected) */
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 3, "A1 → rows length = 3 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-a1-primary-leaf", test_real_total_a1_primary_leaf)
+
+/* ---- A1b: ORDER_SORT still gets real total ---------------- */
+/* Insert 800 records: 5 "rare" + 795 "common".  Same scale as A1 so the
+   planner picks PRIMARY_LEAF.  ORDER_SORT (order_by score, no composite) must
+   still compute total = 5 via a second index walk. */
+static int test_real_total_a1_order_sort(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "rt_a1s",
+        "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
+    if (!tc) return 1;
+
+    char body[32768]; int p = 0; char *resp = NULL;
+
+    /* Pass 1: 5 "rare" records */
+    p = 0;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 5; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"rare%d\":{\"tag\":\"rare\",\"score\":%d}", i?",":"", i, i*10);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    {
+        char req[33000];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1s\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp); free(resp); resp = NULL;
+    }
+
+    /* Pass 2: 795 "common" records */
+    for (int chunk = 0; chunk < 8; chunk++) {
+        int start = chunk * 99, end = start + 99;
+        if (chunk == 7) end = start + (795 - 7*99);
+        p = 0;
+        p += snprintf(body+p, sizeof(body)-p, "{");
+        for (int i = start; i < end; i++)
+            p += snprintf(body+p, sizeof(body)-p,
+                "%s\"cmn%d\":{\"tag\":\"common\",\"score\":%d}", i==start?"":",", i, 100+i);
+        p += snprintf(body+p, sizeof(body)-p, "}");
+        char req[33000];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1s\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp); free(resp); resp = NULL;
+    }
+
+    /* order_by=score: no composite by+score, so ORDER_SORT path (buffer + qsort) */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_a1s\","
+        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"}],"
+        "\"order_by\":\"score\",\"limit\":2,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "A1 ORDER_SORT response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "A1s → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 5, "A1 ORDER_SORT → total = 5 (sort doesn't affect count)");
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 2, "A1 ORDER_SORT → rows length = 2 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-a1-order-sort", test_real_total_a1_order_sort)
+
+/* ---- A2: FP_BITMAP_SMALLER → total = bm_popcount --------- */
+/* Insert 100 records: 70 active=true, 30 active=false.
+   find {active:true} limit=3 total=true → rows=3, total=70. */
+static int test_real_total_a2_bitmap(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "rt_a2",
+        "\"active:bool\",\"score:int\"", "\"active:bitmap\"");
+    if (!tc) return 1;
+
+    char body[8192]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 70; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"t%d\":{\"active\":true,\"score\":%d}", i?",":"", i, i);
+    for (int i = 0; i < 30; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"f%d\":{\"active\":false,\"score\":%d}", i, i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[8300];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a2\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_a2\","
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "A2 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "A2 → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 70, "A2 → total = 70 (bitmap popcount)");
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 3, "A2 → rows length = 3 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-a2-bitmap", test_real_total_a2_bitmap)
+
+/* ---- B1: FP_INTERSECT + small-primary → total = null (upper-bound case) -----
+   The intersect engine uses a "small-primary" heuristic: when the smallest leaf's
+   KeySet is below INTERSECT_MIN_PRIMARY (10 000 entries), it skips the second-leaf
+   walk and hands the first leaf's set to the caller as an upper bound.  At that
+   point the engine can't know the exact intersection size, so total must be null.
+
+   Setup: 100 records, 60 with tag="x", 40 with tag="y".
+   AND criteria: {tag:"x"} AND {score>=50} → planner picks FP_INTERSECT but
+   tag="x" leaf has 60 entries < 10 000 → small_primary fires → total=null.
+   Rows still respect the limit (5 records emitted, all post-verified). */
+static int test_real_total_b1_intersect(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "rt_b1",
+        "\"tag:varchar:4\",\"score:int\"", "\"tag\",\"score\"");
+    if (!tc) return 1;
+
+    char body[16384]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    int first = 1;
+    /* 20 records: tag="x", score=50..69 (match both leaves) */
+    for (int i = 0; i < 20; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"xh%d\":{\"tag\":\"x\",\"score\":%d}", first?"":",", i, 50+i);
+        first = 0;
+    }
+    /* 40 records: tag="x", score=0..39 (match tag but not score) */
+    for (int i = 0; i < 40; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"xl%d\":{\"tag\":\"x\",\"score\":%d}", i, i);
+    /* 40 records: tag="y" (match neither leaf for the intersect) */
+    for (int i = 0; i < 40; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"y%d\":{\"tag\":\"y\",\"score\":%d}", i, i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[16500];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_b1\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_b1\","
+        "\"criteria\":["
+          "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"},"
+          "{\"field\":\"score\",\"op\":\"gte\",\"value\":\"50\"}"
+        "],\"limit\":5,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "B1 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "B1 → rows key present");
+    /* small_primary fires (60 < INTERSECT_MIN_PRIMARY=10000): engine can't
+       know exact intersection size → total must be null */
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, -999, "B1 → total = null (small-primary: exact count unavailable)");
+    /* Rows must still be correct (post-filter verifies both criteria) */
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 5, "B1 → rows length = 5 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-b1-intersect", test_real_total_b1_intersect)
+
+/* ---- C1: FP_UNION → total = |KeySet| after OR-union ------- */
+/* Insert 50 records: 10 with tag="alpha", 10 with tag="beta",
+   30 with tag="other". OR {tag:"alpha"} OR {tag:"beta"} → 20 matches.
+   find limit=3 total=true → rows=3, total=20. */
+static int test_real_total_c1_union(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "rt_c1",
+        "\"tag:varchar:8\",\"score:int\"", "\"tag\"");
+    if (!tc) return 1;
+
+    char body[8192]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 10; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"a%d\":{\"tag\":\"alpha\",\"score\":%d}", i?",":"", i, i);
+    for (int i = 0; i < 10; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"b%d\":{\"tag\":\"beta\",\"score\":%d}", i, i);
+    for (int i = 0; i < 30; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"o%d\":{\"tag\":\"other\",\"score\":%d}", i, i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[8300];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_c1\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_c1\","
+        "\"criteria\":[{\"or\":["
+          "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"alpha\"},"
+          "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"beta\"}"
+        "]}],\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "C1 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "C1 → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 20, "C1 → total = 20 (union keyset size)");
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 3, "C1 → rows length = 3 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-c1-union", test_real_total_c1_union)
+
+/* ---- A5: FP_FULL_SCAN (non-indexed field) → total = null -- */
+/* Insert 10 records, no index on "note".
+   find {note:"hi"} total=true → total must be null. */
+static int test_real_total_a5_full_scan(void) {
+    TestEnv env = {0};
+    /* score:int indexed, note:varchar:8 NOT indexed */
+    TestClient *tc = setup_obj(&env, "rt_a5",
+        "\"note:varchar:8\",\"score:int\"", "\"score\"");
+    if (!tc) return 1;
+
+    char body[2048]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 10; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"note\":\"hi\",\"score\":%d}", i?",":"", i, i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[2200];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a5\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_a5\","
+        "\"criteria\":[{\"field\":\"note\",\"op\":\"eq\",\"value\":\"hi\"}],"
+        "\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "A5 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "A5 → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, -999, "A5 → total = null (full scan, no cheap count)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-a5-full-scan", test_real_total_a5_full_scan)
+
+/* ---- D1: FP_ORDER_COMPOSITE → total = null (spec) --------- */
+/* Setup mirrors test_d1_composite_executor: by:varchar + composite by+time.
+   find {by:"alice"} order_by time limit=3 total=true → total must be null. */
+static int test_real_total_d1_composite(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    char *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_d1\","
+        "\"splits\":8,\"max_key\":12,"
+        "\"fields\":[\"by:varchar:16\",\"time:long\"],"
+        "\"indexes\":[\"by\",\"by+time\"]}",
+        &resp); free(resp); resp = NULL;
+
+    /* Insert 20 alice rows and 10 bob rows */
+    char body[8192]; int p = 0;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 20; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"a%d\":{\"by\":\"alice\",\"time\":%d}", i?",":"", i, i*100);
+    for (int i = 0; i < 10; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"b%d\":{\"by\":\"bob\",\"time\":%d}", i, i*100);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[8300];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_d1\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_d1\","
+        "\"criteria\":[{\"field\":\"by\",\"op\":\"eq\",\"value\":\"alice\"}],"
+        "\"order_by\":\"time\",\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "D1 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "D1 → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, -999, "D1 → total = null (composite walk, per spec)");
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 3, "D1 → rows length = 3 (limit respected)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-d1-composite", test_real_total_d1_composite)
+
+/* ---- D3: FP_ORDER_INDEX_WALK → total = null (spec) -------- */
+/* Setup mirrors test_d3_order_walk_executor: score and time both indexed,
+   no composite. Broad filter (score>50) + indexed order_by → D3.
+   find {score>50} order_by time limit=3 total=true → total must be null. */
+static int test_real_total_d3_order_walk(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    char *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_d3\","
+        "\"splits\":8,\"max_key\":12,"
+        "\"fields\":[\"score:int\",\"time:long\"],"
+        "\"indexes\":[\"score\",\"time\"]}",
+        &resp); free(resp); resp = NULL;
+
+    /* 50 score=100 rows (matches score>50) + 30 score=10 rows (doesn't match) */
+    char body[8192]; int p = 0;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 50; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"s%d\":{\"score\":100,\"time\":%d}", i?",":"", i, i);
+    for (int i = 0; i < 30; i++)
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"n%d\":{\"score\":10,\"time\":%d}", i, 1000+i);
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[8300];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_d3\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"rt_d3\","
+        "\"criteria\":[{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}],"
+        "\"order_by\":\"time\",\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "D3 response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "D3 → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, -999, "D3 → total = null (index walk, per spec)");
+    int nrows = count_rows_in_resp(resp);
+    ASSERT_EQ_INT(nrows, 3, "D3 → rows length = 3 (limit respected)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-real-total-d3-order-walk", test_real_total_d3_order_walk)

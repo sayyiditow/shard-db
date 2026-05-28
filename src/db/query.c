@@ -14361,7 +14361,8 @@ static int keyset_find_from_or(const char *db_root, const char *object,
                                const char **proj_fields, int proj_count,
                                FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                                JoinSpec *joins, int njoins,
-                               QueryDeadline *dl, int *out_budget_exceeded) {
+                               QueryDeadline *dl, int *out_budget_exceeded,
+                               size_t *out_total) {
     /* Pure-OR (root IS the or_node, OR root is a single-child AND wrapping
        the or_node — common shape parsed from `[{"or":[...]}]`). In both,
        every KeySet member already matches the full tree, so we can skip
@@ -14374,12 +14375,16 @@ static int keyset_find_from_or(const char *db_root, const char *object,
          tree->children[0] == or_node);
     int need_rematch = !rematch_unnecessary;
 
-    int target = (!need_rematch && limit > 0) ? offset + limit : 0;
+    /* When out_total is requested, build the full union (no short-circuit)
+       so |KeySet| reflects every match, not just the first offset+limit. */
+    int target = (out_total == NULL && !need_rematch && limit > 0) ? offset + limit : 0;
 
     KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
                                  out_budget_exceeded, target);
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
+
+    if (out_total) *out_total = keyset_size(ks);
 
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               need_rematch ? tree : NULL,
@@ -14400,7 +14405,8 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       ExcludedKeys *excluded, int offset, int limit,
                                       const char **proj_fields, int proj_count,
                                       FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
-                                      JoinSpec *joins, int njoins, QueryDeadline *dl) {
+                                      JoinSpec *joins, int njoins, QueryDeadline *dl,
+                                      size_t *out_total) {
     int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
                                           (SearchCriterion **)fp->source_leaves,
@@ -14412,6 +14418,16 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
        the planner kept out of the intersect) via criteria_match_tree.
        Big primary with full intersect: intersection already exact, skip rematch. */
     int need_rematch = small_primary || (fp->n_postfilter > 0);
+
+    /* For FP_INTERSECT total: |KeySet| is the exact match count only when the
+       full intersection was performed (big primary, no post-filter). When
+       small_primary=1 the KeySet is merely the first leaf's entries (upper bound,
+       not the intersection), and n_postfilter>0 means additional criteria were
+       not materialized into the keyset. In both imprecise cases, leave total=null
+       (out_total untouched) so the caller emits null rather than a wrong number. */
+    if (out_total && !small_primary && fp->n_postfilter == 0)
+        *out_total = keyset_size(ks);
+
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               need_rematch ? tree : NULL,
                               excluded, offset, limit,
@@ -14951,6 +14967,60 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 
     free_criteria_tree(tree);
     return 0;
+}
+
+/* Count the matching entries for a single indexed leaf criterion without
+   fetching any records. Mirrors cmd_count's FP_PRIMARY_LEAF single-leaf
+   path but takes only the leaf + schema already resolved by the caller
+   (cmd_find has both by the time it needs a total count).
+
+   Returns the count, or 0 on timeout / build failure.  Caller must check
+   dl->timed_out after the call if it needs to distinguish "0 matches" from
+   "timed out".
+
+   Supports all three index dispatch paths that pick_index_for_leaf returns:
+     IT_TRIGRAM  → trigram KeySet + parallel_indexed_count
+     IT_BITMAP   → bm_popcount_for_crit / bm_popcount_generic_for_crit
+     IT_BTREE    → btree_dispatch + idx_count_cb  */
+static size_t idx_count_for_leaf(const char *db_root, const char *object,
+                                 const Schema *sch, const FieldSchema *fs,
+                                 SearchCriterion *leaf, QueryDeadline *dl) {
+    int picked = pick_index_for_leaf(db_root, object, leaf);
+    const TypedField *tf = resolve_idx_field(fs->ts, leaf->field);
+
+    if (picked == IT_TRIGRAM) {
+        KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
+                                                   sch->splits, leaf, dl);
+        if (!tg_ks) return 0;
+        CollectedHash *entries = NULL;
+        size_t n = 0;
+        keyset_to_collected_hashes(tg_ks, sch->splits, &entries, &n);
+        /* Build a single-leaf criteria node around `leaf` so
+           parallel_indexed_count verifies only that leaf (no tree). */
+        CriteriaNode leaf_node = { .kind = CNODE_LEAF, .leaf = *leaf,
+                                   .children = NULL, .n_children = 0 };
+        size_t cnt = parallel_indexed_count(db_root, object, sch,
+                                            entries, (int)n,
+                                            &leaf_node, (FieldSchema *)fs, dl);
+        free(entries);
+        keyset_free(tg_ks);
+        return cnt;
+    }
+
+    if (picked == IT_BITMAP) {
+        if (leaf->op == OP_EQUAL || leaf->op == OP_IN)
+            return bm_popcount_for_crit(db_root, object, sch->splits, leaf, tf);
+        return bm_popcount_generic_for_crit(db_root, object,
+                                             leaf->field, sch->splits, leaf, tf);
+    }
+
+    /* IT_BTREE (default) */
+    int check_primary = op_needs_check_primary(leaf->op);
+    IdxCountCtx ic = { leaf, check_primary, 0, dl, 0 };
+    btree_dispatch(db_root, object, leaf->field, sch->splits,
+                   leaf, tf, idx_count_cb, &ic);
+    idx_count_cb_flush_thread();
+    return ic.count;
 }
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
@@ -15855,6 +15925,12 @@ int cmd_find(const char *db_root, const char *object,
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
+    /* Phase 1d.2: per-kind total tracking.
+       find_total_null=1 → emit "total":null.  find_total_null=0 → emit the value.
+       Populated below for the kinds that can cheaply compute a total. */
+    size_t find_total = 0;
+    int    find_total_null = 1;
+
     if (has_joins) {
         /* Joined queries are tabular by default (rows_fmt-style). format=csv
            emits an equivalent CSV table with `<as>.<field>` column names. */
@@ -16126,12 +16202,19 @@ int cmd_find(const char *db_root, const char *object,
                     free(cc.last_key_str);
                     keyset_free(prefilter_ks);
 
-                    if (dict_fmt)
-                        OUT(want_total ? "},\"total\":null}\n" : "}\n");
-                    else if (rows_fmt)
-                        OUT(want_total ? "],\"total\":null}\n" : "]\n");
-                    else
-                        OUT(want_total ? "],\"total\":null}\n" : "]\n");
+                    /* Phase 1d.2: small-prefilter sorted all candidates
+                       before emitting, so n_kept is the exact total.
+                       Use it instead of null when want_total is set. */
+                    if (dict_fmt) {
+                        if (want_total) OUT("},\"total\":%d}\n", n_kept);
+                        else            OUT("}\n");
+                    } else if (rows_fmt) {
+                        if (want_total) OUT("],\"total\":%d}\n", n_kept);
+                        else            OUT("]\n");
+                    } else {
+                        if (want_total) OUT("],\"total\":%d}\n", n_kept);
+                        else            OUT("]\n");
+                    }
                     free_joins(joins, njoins);
                     free_criteria_tree(tree);
                     free_excluded(&excluded);
@@ -16339,13 +16422,28 @@ int cmd_find(const char *db_root, const char *object,
                            proj_fields, proj_count,
                            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                            rows_fmt, dict_fmt, csv_delim, &dl);
+        /* Streaming fast path: compute total after the emit walk.
+           FP_PRIMARY_LEAF / FP_BITMAP_SMALLER → idx_count_for_leaf on seed leaf
+           gives the exact match count.
+           FP_INTERSECT → the streaming path only walked the primary leaf and
+           post-filtered via criteria_match_tree; it never materialized the full
+           intersection KeySet, so the primary-leaf count is only an upper bound
+           (not the true intersection size). Emit null for FP_INTERSECT to stay
+           consistent with keyset_find_from_intersect's small-primary behavior. */
+        if (want_total && fp.kind != FP_INTERSECT) {
+            find_total = idx_count_for_leaf(db_root, object, &sch, &driver_fs,
+                                            primary, &dl);
+            if (!dl.timed_out) find_total_null = 0;
+        }
     } else if (fp.kind == FP_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
         keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                                   rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+                                   rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl,
+                                   want_total ? &find_total : NULL);
+        if (want_total && !dl.timed_out) find_total_null = 0;
     } else if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         SearchCriterion *pc = fp.n_source > 0 ? fp.source_leaves[0] : NULL;
@@ -16385,6 +16483,40 @@ int cmd_find(const char *db_root, const char *object,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                          rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+        /* Phase 1d.2: for PRIMARY_LEAF/BITMAP_SMALLER, compute total after emit.
+           ORDER_NONE / ORDER_SORT → idx_count_for_leaf on the seed leaf.
+           ORDER_INDEX_WALK / ORDER_COMPOSITE → spec says null (handled above as
+           early-return paths; unreachable here unless has_joins/rows_fmt/csv_delim
+           forced fall-through, in which case null is correct). */
+        if (want_total && !dl.timed_out &&
+            (fp.order == FP_ORDER_NONE || fp.order == FP_ORDER_SORT)) {
+            if (fp.kind == FP_BITMAP_SMALLER) {
+                /* Bitmap smaller path: use bitmap popcount (same as cmd_count) */
+                int picked_bm = pick_index_for_leaf(db_root, object, pc);
+                if (picked_bm == IT_BITMAP) {
+                    const TypedField *bm_tf = resolve_idx_field(driver_fs.ts, pc->field);
+                    if (pc->op == OP_EQUAL || pc->op == OP_IN)
+                        find_total = bm_popcount_for_crit(db_root, object,
+                                                          sch.splits, pc, bm_tf);
+                    else
+                        find_total = bm_popcount_generic_for_crit(db_root, object,
+                                                                   pc->field, sch.splits,
+                                                                   pc, bm_tf);
+                    if (!dl.timed_out) find_total_null = 0;
+                } else {
+                    /* Fell through without bitmap (unusual but defensive): count via leaf */
+                    find_total = idx_count_for_leaf(db_root, object, &sch,
+                                                    &driver_fs, pc, &dl);
+                    if (!dl.timed_out) find_total_null = 0;
+                }
+            } else {
+                /* FP_PRIMARY_LEAF: idx_count_for_leaf on the seed */
+                find_total = idx_count_for_leaf(db_root, object, &sch,
+                                                &driver_fs, pc, &dl);
+                if (!dl.timed_out) find_total_null = 0;
+            }
+        }
+
         find_emit_close:
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
@@ -16401,7 +16533,9 @@ int cmd_find(const char *db_root, const char *object,
         keyset_find_from_or(db_root, object, &sch, tree, fp.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                            rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded);
+                            rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded,
+                            want_total ? &find_total : NULL);
+        if (!budget_exceeded && want_total && !dl.timed_out) find_total_null = 0;
         if (budget_exceeded) {
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
             if (csv_delim) { /* no envelope to close */ }
@@ -16443,14 +16577,22 @@ int cmd_find(const char *db_root, const char *object,
 
     if (csv_delim)
         { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
-    else if (has_joins)
-        OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
+    else if (want_total) {
+        /* Phase 1d.2: emit real total when available, null otherwise. */
+        const char *arr_close = (has_joins || rows_fmt) ? "]}" :
+                                 dict_fmt                ? "}"  : "]";
+        if (find_total_null)
+            OUT("%s,\"total\":null}\n", arr_close);
+        else
+            OUT("%s,\"total\":%zu}\n", arr_close, find_total);
+    } else if (has_joins)
+        OUT("]}\n");
     else if (rows_fmt)
-        OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
+        OUT("]}\n");
     else if (dict_fmt)
-        OUT(want_total ? "},\"total\":null}\n" : "}\n");
+        OUT("}\n");
     else
-        OUT(want_total ? "],\"total\":null}\n" : "]\n");
+        OUT("]\n");
     free_excluded(&excluded);
 
     free_criteria_tree(tree);
