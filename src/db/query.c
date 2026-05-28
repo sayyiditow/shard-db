@@ -8652,27 +8652,34 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_FLOAT: {
         float v; memcpy(&v, p, 4);
-        double vd = (double)v;
-        double q1 = cc->d1;
-        double q2 = cc->d2;
+        /* Comparisons use float32 precision throughout: cast query literals to
+         * float before comparing so that a stored value of 3.14f (encoded as
+         * 3.140000104... in double) is not incorrectly excluded by `lte 3.14`
+         * (where the double literal 3.14 < 3.140000104...).  The btree
+         * encoding path stores the literal as float32, so record and query
+         * round identically there; the scan path must do the same. */
+        float qf1 = (float)cc->d1;
+        float qf2 = (float)cc->d2;
         switch (cc->op) {
-        case OP_EQUAL: return fabs(vd - q1) < 1e-6;
-        case OP_NOT_EQUAL: return fabs(vd - q1) >= 1e-6;
-        case OP_LESS: return vd < q1;
-        case OP_GREATER: return vd > q1;
-        case OP_LESS_EQ: return vd <= q1;
-        case OP_GREATER_EQ: return vd >= q1;
+        case OP_EQUAL:      return v == qf1;
+        case OP_NOT_EQUAL:  return v != qf1;
+        case OP_LESS:       return v <  qf1;
+        case OP_GREATER:    return v >  qf1;
+        case OP_LESS_EQ:    return v <= qf1;
+        case OP_GREATER_EQ: return v >= qf1;
         case OP_BETWEEN: {
-            int lo = (cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
-            int hi = (cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
+            int lo = (cc->raw && cc->raw->min_exclusive) ? (v > qf1) : (v >= qf1);
+            int hi = (cc->raw && cc->raw->max_exclusive) ? (v < qf2) : (v <= qf2);
             return lo && hi;
         }
         case OP_IN: {
-            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 1;
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == (float)cc->in_f64[i]) return 1;
             return 0;
         }
         case OP_NOT_IN: {
-            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 0;
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == (float)cc->in_f64[i]) return 0;
             return 1;
         }
         default: return 0;
@@ -10729,6 +10736,379 @@ static int idx_find_streaming(const char *db_root, const char *object,
     return sc.printed;
 }
 
+/* ============================================================
+   D1 executor: composite-prefix sorted scan.
+
+   Given a composite (a+b) btree, its leaf values are
+   encoded(a) ++ encoded(b) ++ hash16.  Walking the range
+   [encoded(a_val), encoded(a_val) ++ 0xff×4) in btree order
+   yields every record whose `a` field == a_val, with the
+   resulting entries already sorted by the encoded `b` value
+   within that prefix.  This gives an O(limit) ordered answer
+   for `find {a="alice"} order_by b limit N` — no in-memory
+   sort, no full-shard scan.
+
+   Constraints checked by caller:
+     • fp.order == FP_ORDER_COMPOSITE && fp.kind == FP_PRIMARY_LEAF
+     • no joins (need tabular materialise)
+     • no rows_fmt / csv (column-headers need full materialise)
+   Falls through (caller just skips this fn) for any edge case
+   the planner didn't cover.
+*/
+
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    CriteriaNode  *tree;          /* full tree for post-filter */
+    ExcludedKeys  *excluded;
+    const char   **proj_fields;
+    int            proj_count;
+    int            dict_fmt;
+    int            skip_remaining;
+    int            limit;
+    int            printed;
+    QueryDeadline *dl;
+    int            dl_counter;
+    FILE          *parent_out;    /* caller's socket stream */
+} CompositePrefixCtx;
+
+static int composite_prefix_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;   /* composite leaf value not needed; hash16 is the key */
+    CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
+    g_out = c->parent_out;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->printed >= c->limit) return -1;
+
+    /* Fetch the record by hash16. */
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    const uint8_t *key_start = rr.key;
+    const uint8_t *raw       = rr.val;
+    uint32_t       value_len = (uint32_t)rr.vlen;
+
+    /* Excluded-keys check: the key is a string in ExcludedKeys.
+       is_excluded() takes a char* key so build it from the fetched record. */
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        if (is_excluded(c->excluded, keybuf)) {
+            release_record_ref(&rr);
+            return 0;
+        }
+    }
+
+    /* Post-filter: apply the full criteria tree (seed leaf trivially passes
+       since we're inside its prefix; any extra AND leaves still need checking). */
+    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Offset skip-after-match */
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
+       excluded by the caller guard so we don't need those branches here. */
+    char key_buf[1024];
+    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
+    memcpy(key_buf, key_start, klen);
+    key_buf[klen] = '\0';
+
+    if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    c->printed++;
+    release_record_ref(&rr);
+    return (c->printed >= c->limit) ? -1 : 0;
+}
+
+/* D1 executor entry point.  seed is the equality leaf on the prefix field
+   (e.g. by="alice"); order_by is the sort field (e.g. "time").
+   Returns number of rows emitted (≥0) or -1 on deadline. */
+static int find_via_composite_prefix(const char *db_root, const char *object,
+                                     const Schema *sch, FieldSchema *fs,
+                                     SearchCriterion *seed,
+                                     const char *order_by,
+                                     int order_desc,
+                                     CriteriaNode *tree,
+                                     ExcludedKeys *excluded,
+                                     int offset, int limit,
+                                     const char **proj_fields, int proj_count,
+                                     int dict_fmt,
+                                     QueryDeadline *dl)
+{
+    /* 1. Encode the seed value — this becomes the prefix for the walk. */
+    uint8_t buf_lo[1024];
+    size_t  len_lo = 0;
+    const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
+    encode_criterion_value(seed_tf, seed->value, strlen(seed->value), buf_lo, &len_lo);
+
+    /* 2. Upper bound: seed prefix + 4 × 0xff  (the STARTS_WITH idiom). */
+    uint8_t buf_hi[1024 + 4];
+    memcpy(buf_hi, buf_lo, len_lo);
+    memset(buf_hi + len_lo, 0xff, 4);
+    size_t  len_hi = len_lo + 4;
+
+    /* 3. Build the composite index name "<seed_field>+<order_by>". */
+    char composite_field[256];
+    snprintf(composite_field, sizeof(composite_field), "%s+%s",
+             seed->field, order_by);
+
+    /* 4. Set up the callback context. */
+    CompositePrefixCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_root        = db_root;
+    ctx.object         = object;
+    ctx.sch            = sch;
+    ctx.fs             = fs;
+    ctx.tree           = tree;
+    ctx.excluded       = excluded;
+    ctx.proj_fields    = proj_fields;
+    ctx.proj_count     = proj_count;
+    ctx.dict_fmt       = dict_fmt;
+    ctx.skip_remaining = (offset > 0) ? offset : 0;
+    ctx.limit          = (limit > 0)  ? limit  : INT_MAX;
+    ctx.printed        = 0;
+    ctx.dl             = dl;
+    ctx.dl_counter     = 0;
+    ctx.parent_out     = g_out;
+
+    /* 5. Walk the composite btree.  The k-way merge across index shards
+          delivers entries already sorted by (encoded_a || encoded_b) in
+          the requested direction — asc or desc. */
+    btree_idx_walk_ordered(db_root, object, composite_field, sch->splits,
+                           (const char *)buf_lo, len_lo, 0,
+                           (const char *)buf_hi, len_hi, 0,
+                           order_desc, composite_prefix_cb, &ctx);
+
+    return ctx.printed;
+}
+
+/* ============================================================
+   D3 executor: order-index walk + per-record post-filter.
+
+   Walk the order_by btree across its full range in the
+   requested direction (asc or desc).  For each candidate,
+   fetch the record and run the full criteria tree.  Emit
+   matches until limit is reached, applying offset along the
+   way.  Cost is O(limit + records-walked-before-limit-fills),
+   which is dramatically cheaper than scan-and-sort-millions
+   when the broad predicate matches most records (e.g. the
+   feed/profile shape: score>50 order_by time limit 20).
+
+   Key difference from D1: the walk index is the order_by
+   field alone (not a composite), and the criteria tree is
+   checked in full for every fetched record — no leaf is
+   guaranteed-matching by the walk range.
+
+   Constraints checked by caller:
+     • fp.order == FP_ORDER_INDEX_WALK
+     • no joins, no rows_fmt, no csv_delim
+*/
+
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    CriteriaNode  *tree;          /* full tree — checked per record */
+    ExcludedKeys  *excluded;
+    const char   **proj_fields;
+    int            proj_count;
+    int            dict_fmt;
+    int            skip_remaining;
+    int            limit;
+    int            printed;
+    QueryDeadline *dl;
+    int            dl_counter;
+    FILE          *parent_out;
+} OrderIndexWalkCtx;
+
+static int order_index_walk_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *ctx_ptr) {
+    (void)val; (void)vlen;   /* walk value not needed; hash16 is the record key */
+    OrderIndexWalkCtx *c = (OrderIndexWalkCtx *)ctx_ptr;
+    g_out = c->parent_out;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->printed >= c->limit) return -1;
+
+    /* Fetch the record by hash16. */
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    const uint8_t *key_start = rr.key;
+    const uint8_t *raw       = rr.val;
+    uint32_t       value_len = (uint32_t)rr.vlen;
+
+    /* Excluded-keys check. */
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        if (is_excluded(c->excluded, keybuf)) {
+            release_record_ref(&rr);
+            return 0;
+        }
+    }
+
+    /* Post-filter: apply the FULL criteria tree — unlike D1 nothing is
+       guaranteed to match by the walk range alone. */
+    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Offset skip-after-match. */
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
+       excluded by the caller guard so we don't need those branches here. */
+    char key_buf[1024];
+    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
+    memcpy(key_buf, key_start, klen);
+    key_buf[klen] = '\0';
+
+    if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    c->printed++;
+    release_record_ref(&rr);
+    return (c->printed >= c->limit) ? -1 : 0;
+}
+
+/* D3 executor entry point.  order_by is the indexed sort field (e.g. "time").
+   Walk the full btree range in the requested direction; post-filter each
+   fetched record against the full criteria tree.
+   Returns number of rows emitted (≥0) or -1 on deadline. */
+static int find_via_order_index_walk(const char *db_root, const char *object,
+                                     const Schema *sch, FieldSchema *fs,
+                                     const char *order_by, int order_desc,
+                                     CriteriaNode *tree,
+                                     ExcludedKeys *excluded,
+                                     int offset, int limit,
+                                     const char **proj_fields, int proj_count,
+                                     int dict_fmt,
+                                     QueryDeadline *dl)
+{
+    /* Full range: lower = "" (len 0), upper = "\xff\xff\xff\xff" (len 4).
+       btree_idx_walk_ordered's desc flag handles walk direction. */
+    const char *lo = "";
+    size_t      lo_len = 0;
+    const char *hi = "\xff\xff\xff\xff";
+    size_t      hi_len = 4;
+
+    /* Set up the callback context. */
+    OrderIndexWalkCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_root        = db_root;
+    ctx.object         = object;
+    ctx.sch            = sch;
+    ctx.fs             = fs;
+    ctx.tree           = tree;
+    ctx.excluded       = excluded;
+    ctx.proj_fields    = proj_fields;
+    ctx.proj_count     = proj_count;
+    ctx.dict_fmt       = dict_fmt;
+    ctx.skip_remaining = (offset > 0) ? offset : 0;
+    ctx.limit          = (limit > 0)  ? limit  : INT_MAX;
+    ctx.printed        = 0;
+    ctx.dl             = dl;
+    ctx.dl_counter     = 0;
+    ctx.parent_out     = g_out;
+
+    /* Walk the order_by btree across its full range.  The k-way merge
+       delivers entries in (encoded_value, hash16) order — asc or desc
+       per order_desc.  The callback post-filters each record against the
+       full criteria tree and stops when limit is reached. */
+    btree_idx_walk_ordered(db_root, object, order_by, sch->splits,
+                           lo, lo_len, 0,
+                           hi, hi_len, 0,
+                           order_desc, order_index_walk_cb, &ctx);
+
+    return ctx.printed;
+}
+
 enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "eq") == 0 || strcmp(s, "equal") == 0) return OP_EQUAL;
     if (strcmp(s, "neq") == 0 || strcmp(s, "not_equal") == 0) return OP_NOT_EQUAL;
@@ -11452,98 +11832,6 @@ static int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
     return 1;
 }
 
-/* Estimate selectivity of an indexed leaf — lower = more selective ⇒
- * better PRIMARY_LEAF candidate. INT_MAX = not indexed (caller skips).
- *
- * Pre-2026-05-26 find_primary_leaf returned the FIRST indexed leaf in
- * AND-child order regardless of how broad it was. On the Netcup deploy
- * `(type IN [...] AND dead=false AND deleted=false AND title icontains
- * "X")` picked `type` (bitmap, 5.6M matches) as primary instead of
- * `title` (trigram, hundreds of matches) — search timed out at 30s.
- *
- * Heuristic (no on-disk stats yet):
- *   IT_TRIGRAM     →  10  contains/icontains with ≥3-char pattern,
- *                          usually hundreds or fewer matches
- *   IT_BTREE eq    →  20  point lookup
- *   IT_BTREE in    →  30  small set
- *   IT_BTREE between →40  bounded range
- *   IT_BTREE range →  50  unbounded half-range; selectivity depends on bound
- *   IT_BTREE starts→  60  prefix scan
- *   IT_BTREE other →  70  contains/like/regex on btree (full leaf walk)
- *   IT_BITMAP any  →  80  bool / low-card enum — typically 20-80% of records.
- *                          Cheap as a per-record post-filter (bit lookup)
- *                          but expensive as PRIMARY because it'd build a
- *                          multi-million-entry KeySet.
- *   other          →  90
- *
- * Strategy: PRIMARY_LEAF picks the leaf with the lowest score; remaining
- * AND children stay in the tree and get re-evaluated per record via
- * criteria_match_tree (cheap for indexed bitmap fields — single byte
- * compare on the decoded record). */
-static int leaf_selectivity_score(const SearchCriterion *c,
-                                  const char *db_root, const char *object) {
-    if (!c) return INT_MAX;
-    int picked = pick_index_for_leaf(db_root, object, c);
-    if (picked < 0) return INT_MAX;
-
-    if (picked == IT_TRIGRAM) return 10;
-    if (picked == IT_BTREE) {
-        switch (c->op) {
-            case OP_EQUAL:       return 20;
-            case OP_IN:          return 30;
-            case OP_BETWEEN:     return 40;
-            case OP_LESS: case OP_GREATER:
-            case OP_LESS_EQ: case OP_GREATER_EQ:
-                                 return 50;
-            case OP_STARTS_WITH: return 60;
-            default:             return 70;
-        }
-    }
-    if (picked == IT_BITMAP) return 80;
-    return 90;
-}
-
-/* Walk immediate children of an AND root and pick the most-selective
-   indexable leaf as PRIMARY. Single-LEAF roots are treated as an AND of
-   one. Returns the leaf's SearchCriterion* (pointer into the tree — do
-   not free). Remaining AND children stay in the tree and get re-checked
-   per record by the executor's post-filter. */
-static SearchCriterion *find_primary_leaf(CriteriaNode *root,
-                                          const char *db_root, const char *object,
-                                          char *out_idx_path, size_t out_sz) {
-    if (!root) return NULL;
-    if (root->kind == CNODE_LEAF) {
-        if (leaf_is_indexed(&root->leaf, db_root, object, out_idx_path, out_sz))
-            return &root->leaf;
-        return NULL;
-    }
-    if (root->kind == CNODE_AND) {
-        SearchCriterion *best = NULL;
-        int best_score = INT_MAX;
-        char best_path[PATH_MAX] = "";
-        for (int i = 0; i < root->n_children; i++) {
-            CriteriaNode *c = root->children[i];
-            if (c->kind != CNODE_LEAF) continue;
-            char path[PATH_MAX];
-            if (!leaf_is_indexed(&c->leaf, db_root, object, path, sizeof(path))) continue;
-            int score = leaf_selectivity_score(&c->leaf, db_root, object);
-            if (score < best_score) {
-                best_score = score;
-                best = &c->leaf;
-                memcpy(best_path, path, sizeof(best_path));
-            }
-        }
-        if (best && out_idx_path) {
-            size_t n = strlen(best_path);
-            if (n >= out_sz) n = out_sz - 1;
-            memcpy(out_idx_path, best_path, n);
-            out_idx_path[n] = '\0';
-        }
-        return best;
-    }
-    return NULL;
-}
-
 /* True if every child of `or_node` is a LEAF with an index. Nested AND/OR inside
    OR disqualifies (keeps the planner simple — those fall to full scan). */
 static int or_all_children_indexed(const CriteriaNode *or_node,
@@ -11576,33 +11864,7 @@ static CriteriaNode *find_fully_indexed_or(CriteriaNode *root,
     return NULL;
 }
 
-typedef enum {
-    PRIMARY_NONE,         /* full scan */
-    PRIMARY_LEAF,         /* single indexed leaf drives btree_range */
-    PRIMARY_KEYSET,       /* OR sub-tree drives index-union into a KeySet */
-    PRIMARY_INTERSECT     /* AND of 2+ indexed leaves intersected via KeySet */
-} PrimaryKind;
-
 #define MAX_INTERSECT_LEAVES 8
-
-typedef struct {
-    PrimaryKind kind;
-    SearchCriterion *primary_leaf;   /* PRIMARY_LEAF */
-    char primary_idx_path[PATH_MAX];
-    CriteriaNode *or_node;           /* PRIMARY_KEYSET */
-
-    /* PRIMARY_INTERSECT: ordered (most-selective-first) by op_selectivity_rank.
-       Excess indexed leaves beyond MAX_INTERSECT_LEAVES stay as post-filters
-       in criteria_match_tree. */
-    SearchCriterion *intersect_leaves[MAX_INTERSECT_LEAVES];
-    char intersect_paths[MAX_INTERSECT_LEAVES][PATH_MAX];
-    int intersect_count;
-    /* find_intersect_leaves dropped at least one AND child (bitmap leaf,
-       non-rangeable op, OR sub-tree, non-indexed leaf, or excess past
-       MAX_INTERSECT_LEAVES). Executors MUST post-filter via the full
-       criteria tree — keyset_size alone is not the answer. */
-    int partial_intersect;
-} QueryPlan;
 
 /* True if the operator yields a precise btree candidate set without needing
    per-record verification. Excludes substring/suffix ops (LIKE/CONTAINS/...
@@ -11736,108 +11998,6 @@ static int find_intersect_leaves(CriteriaNode *root,
     return n;
 }
 
-static QueryPlan choose_primary_source(CriteriaNode *tree,
-                                       const char *db_root, const char *object) {
-    QueryPlan p = {0};
-    if (!tree) { p.kind = PRIMARY_NONE; return p; }
-
-    /* Try intersection first — if 2+ indexable AND-leaves on rangeable ops
-       exist, intersecting candidate hashes is faster than primary-leaf +
-       per-record post-filter for selective queries. */
-    int partial = 0;
-    int ni = find_intersect_leaves(tree, db_root, object,
-                                   p.intersect_leaves, p.intersect_paths,
-                                   &partial);
-    if (ni >= 2) {
-        /* A pure-bitmap intersect is the right call ONLY when no more-
-         * selective single leaf exists. When find_intersect_leaves dropped a
-         * leaf (partial) and every leaf it kept is a bitmap, the AND also
-         * holds an indexed leaf that couldn't join the intersect — a trigram
-         * contains / btree like / regex. Intersecting the bitmaps yields
-         * millions of candidate hashes that we'd then post-filter the
-         * selective leaf across (the hn/stories "title icontains X AND
-         * dead=false AND deleted=false" 20s regression). Leading with that
-         * selective leaf as PRIMARY_LEAF and re-checking the bitmaps per
-         * record (single byte compare on the decoded record) is dramatically
-         * cheaper. Pure-bitmap landing-page ANDs drop nothing (partial=0) and
-         * keep the popcount intersect — its bitmap-vs-bitmap fast path wins. */
-        if (partial) {
-            int all_bitmap = 1;
-            for (int i = 0; i < ni; i++) {
-                if (pick_index_for_leaf(db_root, object, p.intersect_leaves[i]) != IT_BITMAP) {
-                    all_bitmap = 0;
-                    break;
-                }
-            }
-            if (all_bitmap) {
-                char lp[PATH_MAX] = "";
-                SearchCriterion *lf = find_primary_leaf(tree, db_root, object,
-                                                        lp, sizeof(lp));
-                /* score < 80 == strictly more selective than a bitmap. */
-                if (lf && leaf_selectivity_score(lf, db_root, object) < 80) {
-                    QueryPlan pl = {0};
-                    pl.kind = PRIMARY_LEAF;
-                    pl.primary_leaf = lf;
-                    strncpy(pl.primary_idx_path, lp, sizeof(pl.primary_idx_path) - 1);
-                    return pl;
-                }
-            }
-        }
-        p.kind = PRIMARY_INTERSECT;
-        p.intersect_count = ni;
-        p.partial_intersect = partial;
-        return p;
-    }
-
-    char idx_path[PATH_MAX] = "";
-    SearchCriterion *leaf = find_primary_leaf(tree, db_root, object,
-                                              idx_path, sizeof(idx_path));
-    if (leaf) {
-        p.kind = PRIMARY_LEAF;
-        p.primary_leaf = leaf;
-        strncpy(p.primary_idx_path, idx_path, sizeof(p.primary_idx_path) - 1);
-        return p;
-    }
-
-    CriteriaNode *or_node = find_fully_indexed_or(tree, db_root, object);
-    if (or_node) {
-        p.kind = PRIMARY_KEYSET;
-        p.or_node = or_node;
-        return p;
-    }
-
-    p.kind = PRIMARY_NONE;
-    return p;
-}
-
-/* Does the planner's prefilter for `tree` represent the ENTIRE criteria tree?
- *
- * The aggregate group_by fast-paths (IGB walk, streaming top-N, no-group
- * keyset) filter their index walk by ONE prefilter KeySet built from the
- * planner's PRIMARY and have no per-record recheck. That's only correct when
- * the prefilter == the whole filter. A partial intersect (find_intersect_leaves
- * dropped a bitmap / non-rangeable / non-indexed leaf) or a PRIMARY_LEAF chosen
- * out of a multi-leaf AND leaves siblings unapplied → those fast-paths would
- * silently drop them (wrong counts). When this returns 0 the caller must fall
- * through to agg_run_plan, which fetches the selective candidates and rechecks
- * the full tree via agg_scan_cb (the "scan the small set, verify the rest"
- * path). Returns 1 for no-criteria (nothing to drop). */
-static int agg_criteria_fully_covered(const char *db_root, const char *object,
-                                      CriteriaNode *tree) {
-    if (!tree) return 1;
-    QueryPlan p = choose_primary_source(tree, db_root, object);
-    int single_leaf =
-        (tree->kind == CNODE_LEAF) ||
-        (tree->kind == CNODE_AND && tree->n_children == 1 &&
-         tree->children[0]->kind == CNODE_LEAF);
-    switch (p.kind) {
-        case PRIMARY_INTERSECT: return !p.partial_intersect;
-        case PRIMARY_KEYSET:    return 1;
-        case PRIMARY_LEAF:      return single_leaf;
-        default:                return 0;  /* PRIMARY_NONE — no index covers it */
-    }
-}
-
 /* ========== Cardinality estimator (planner primitive) ==========
  *
  * card_est_leaf: cheap estimate of how many records match `leaf` on a
@@ -11867,7 +12027,6 @@ static int card_count_cb(const char *v, size_t vl, const uint8_t h[16], void *ct
     return (c->n > c->cap) ? -1 : 0;
 }
 
-__attribute__((unused))
 static CardEst card_est_leaf(const char *db_root, const char *object,
                              int splits, const SearchCriterion *leaf,
                              const TypedField *tf, size_t cap) {
@@ -12061,33 +12220,6 @@ static CardEst card_est_leaf(const char *db_root, const char *object,
 
 #ifdef TEST_BUILD
 
-/* Test-only hook: expose the planner's primary-source decision so tests can
- * assert plan SELECTION. A wrong plan that still returns the right answer —
- * e.g. a broad bitmap intersect chosen over a selective trigram leaf — is
- * invisible to result-only functional tests, so this surfaces the kind +
- * (for PRIMARY_LEAF) the chosen field as stable strings. */
-const char *planner_primary_kind_for_test(const char *db_root, const char *object,
-                                          const char *criteria_json,
-                                          char *out_field, size_t out_sz) {
-    if (out_field && out_sz) out_field[0] = '\0';
-    const char *err = NULL;
-    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
-    if (!tree) return "parse_error";
-    QueryPlan p = choose_primary_source(tree, db_root, object);
-    const char *kind = "?";
-    switch (p.kind) {
-        case PRIMARY_NONE:      kind = "none"; break;
-        case PRIMARY_LEAF:      kind = "leaf";
-            if (out_field && out_sz && p.primary_leaf)
-                snprintf(out_field, out_sz, "%s", p.primary_leaf->field);
-            break;
-        case PRIMARY_KEYSET:    kind = "keyset"; break;
-        case PRIMARY_INTERSECT: kind = "intersect"; break;
-    }
-    free_criteria_tree(tree);
-    return kind;
-}
-
 /* Test-only hook for the cardinality estimator.  Accepts a combined
  * "dir/object" string so tests can pass (env.db_root, "default/ce")
  * without needing to pre-build the effective root themselves.
@@ -12177,7 +12309,6 @@ static size_t selectivity_budget(size_t N) {
  * via the K ≤ budget test; a broad one (type=story) cannot. Call card_est_leaf
  * with cap = budget so a btree/trigram walk stops at budget+1 → saturated ⟺
  * K > budget, unifying the test across index types. */
-__attribute__((unused))
 static int leaf_is_selective(CardEst e, size_t N) {
     if (!e.estimable || e.saturated) return 0;
     return e.k <= selectivity_budget(N);
@@ -12222,7 +12353,6 @@ typedef struct {
  * Selection: smallest estimated K wins; bitmaps are pushed last (a broad
  * bitmap must never seed). Unestimable-but-indexed leaves (e.g. like/regex)
  * rank after every estimable one. N = live rows (for the budget/cap). */
-__attribute__((unused))
 static int most_selective_indexed(const char *db_root, const char *object,
                                   int splits, SearchCriterion **leaves, int n,
                                   const FieldSchema *fs, size_t N,
@@ -12253,7 +12383,6 @@ static int most_selective_indexed(const char *db_root, const char *object,
  * D1: a (filter_field + order_field) composite gives a sorted prefix scan.
  * Composite indexes are always btree (only btree supports multi-field prefix);
  * the on-disk dir name is the literal "a+b" (see CLAUDE.md "Composite indexes"). */
-__attribute__((unused))
 static int composite_index_exists(const char *db_root, const char *object,
                                   const char *a, const char *b) {
     char name[256];
@@ -12266,7 +12395,6 @@ static int composite_index_exists(const char *db_root, const char *object,
  * (broad single leaf → FULL_SCAN) must be suppressed so the seed stays
  * PRIMARY_LEAF and the order overlay below can set FP_ORDER_INDEX_WALK.
  * Composite indexes are handled separately by composite_index_exists. */
-__attribute__((unused))
 static int order_field_drivable(const char *db_root, const char *object,
                                 const char *order_by) {
     if (!order_by || !order_by[0]) return 0;
@@ -12287,7 +12415,6 @@ static int collect_and_leaves(CriteriaNode *tree, SearchCriterion **out, int max
     return n;
 }
 
-__attribute__((unused))
 static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                               const char *object, const FieldSchema *fs,
                               int splits, size_t N, const char *order_by,
@@ -12486,6 +12613,34 @@ order_overlay:
         }
     }
     return fp;
+}
+
+/* Does the planner's prefilter for `tree` represent the ENTIRE criteria tree?
+ *
+ * The aggregate group_by fast-paths (IGB walk, streaming top-N, no-group
+ * keyset) filter their index walk by ONE prefilter KeySet built from the
+ * planner's PRIMARY and have no per-record recheck. That's only correct when
+ * the prefilter == the whole filter. A partial intersect (find_intersect_leaves
+ * dropped a bitmap / non-rangeable / non-indexed leaf) or a PRIMARY_LEAF chosen
+ * out of a multi-leaf AND leaves siblings unapplied → those fast-paths would
+ * silently drop them (wrong counts). When this returns 0 the caller must fall
+ * through to agg_run_plan, which fetches the selective candidates and rechecks
+ * the full tree via agg_scan_cb (the "scan the small set, verify the rest"
+ * path). Returns 1 for no-criteria (nothing to drop). */
+static int agg_criteria_fully_covered(const char *db_root, const char *object,
+                                      CriteriaNode *tree) {
+    if (!tree) return 1;
+    /* Phase 1c.5: equivalent to (PRIMARY_INTERSECT && !partial) ||
+     * PRIMARY_KEYSET || (PRIMARY_LEAF && single_leaf).
+     * n_postfilter == 0 means every leaf is in the source set; nothing
+     * is left to verify per-record, so the index walk alone covers the
+     * full criteria tree. */
+    FieldSchema fs; init_field_schema(&fs, db_root, object);
+    Schema sc = load_schema(db_root, object);
+    size_t N = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sc.splits, N,
+                                NULL /*order_by*/, 0 /*fetching*/);
+    return (fp.kind != FP_FULL_SCAN && fp.n_postfilter == 0);
 }
 
 #ifdef TEST_BUILD
@@ -13863,44 +14018,6 @@ static int keyset_to_collected_hashes(KeySet *ks, int splits,
     return 0;
 }
 
-/* count(intersection) — caller checks dl->timed_out for error reporting.
-   Small-primary path: hand the first leaf's hashes off to parallel_indexed_count
-   with the full tree as post-filter (cheaper than walking subsequent btrees). */
-static size_t keyset_count_from_intersect(const char *db_root, const char *object,
-                                          const Schema *sch, QueryPlan *plan,
-                                          CriteriaNode *tree, FieldSchema *fs,
-                                          QueryDeadline *dl) {
-    int small_primary = 0;
-    KeySet *result = intersect_indexed_leaves(db_root, object, sch->splits,
-                                              plan->intersect_leaves,
-                                              plan->intersect_count, dl,
-                                              &small_primary);
-    if (!result) return 0;
-
-    /* Partial intersect: at least one AND child was dropped from the
-       intersect (bitmap leaf, non-rangeable op, OR sub-tree, …) and
-       lives in the criteria tree as a post-filter. Bare keyset_size
-       would over-count; route through parallel_indexed_count which
-       re-applies the full tree per record. */
-    if (!small_primary && !plan->partial_intersect) {
-        size_t n = keyset_size(result);
-        keyset_free(result);
-        return n;
-    }
-
-    /* Small first leaf or partial intersect: feed parallel_indexed_count
-       with the full tree so every dropped/post-filter leaf is verified. */
-    CollectedHash *batch = NULL;
-    size_t batch_count = 0;
-    int rc = keyset_to_collected_hashes(result, sch->splits, &batch, &batch_count);
-    keyset_free(result);
-    if (rc != 0 || batch_count == 0) { free(batch); return 0; }
-    size_t n = parallel_indexed_count(db_root, object, sch, batch,
-                                      (int)batch_count, tree, fs, dl);
-    free(batch);
-    return n;
-}
-
 /* ========== OR index-union (KeySet fast path) ========== */
 
 typedef struct {
@@ -14268,7 +14385,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
    skip the second-leaf btree walks and pass the full tree as post-filter via
    keyset_emit_find. */
 static int keyset_find_from_intersect(const char *db_root, const char *object,
-                                      const Schema *sch, QueryPlan *plan,
+                                      const Schema *sch, const FilterPlan *fp,
                                       CriteriaNode *tree,
                                       ExcludedKeys *excluded, int offset, int limit,
                                       const char **proj_fields, int proj_count,
@@ -14276,15 +14393,15 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       JoinSpec *joins, int njoins, QueryDeadline *dl) {
     int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
-                                          plan->intersect_leaves,
-                                          plan->intersect_count, dl,
+                                          (SearchCriterion **)fp->source_leaves,
+                                          fp->n_source, dl,
                                           &small_primary);
     if (!ks) return 0;
     /* Small primary OR partial intersect: pass the full tree so emit
        re-checks every leaf (including any bitmap/OR/non-rangeable child
        the planner kept out of the intersect) via criteria_match_tree.
        Big primary with full intersect: intersection already exact, skip rematch. */
-    int need_rematch = small_primary || plan->partial_intersect;
+    int need_rematch = small_primary || (fp->n_postfilter > 0);
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               need_rematch ? tree : NULL,
                               excluded, offset, limit,
@@ -14355,17 +14472,17 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
    and may want to know it was the fallback). */
 static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                      const Schema *sch, void *agg_ctx,
-                                     QueryPlan *plan, CriteriaNode *full_tree,
+                                     const FilterPlan *fp, CriteriaNode *full_tree,
                                      CriteriaNode **agg_ctx_tree_field,
                                      QueryDeadline *dl) {
     int small_primary = 0;
     KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
-                                          plan->intersect_leaves,
-                                          plan->intersect_count, dl,
+                                          (SearchCriterion **)fp->source_leaves,
+                                          fp->n_source, dl,
                                           &small_primary);
     if (!ks) return 0;
 
-    if (small_primary || plan->partial_intersect) {
+    if (small_primary || fp->n_postfilter > 0) {
         /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
            AggCtx lives further down the file — caller passes &ctx.tree to
            avoid a forward decl. Partial intersect: at least one AND child
@@ -14562,18 +14679,33 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         }
     }
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c step 1/6: cmd_count now consumes FilterPlan; choose_primary_source
+       no longer called from this path.  fetching=0 so the planner can enable
+       index-only intersect for count (no record reads needed). */
+    size_t N_live = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
+                                N_live, NULL /*order_by*/, 0 /*fetching=count*/);
+    /* FP_ORDER_* overlays are irrelevant for count (no order_by supplied). */
 
-    if (plan.kind == PRIMARY_LEAF) {
-        SearchCriterion *pc = plan.primary_leaf;
+    if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
+        /* FP_PRIMARY_LEAF: one selective indexed leaf seeds; remaining leaves
+           (fp.n_postfilter > 0) are post-filtered per record via full tree.
+           FP_BITMAP_SMALLER: lone/broad bitmap — routed here because
+           fp.source_leaves[0] is set and pick_index_for_leaf returns IT_BITMAP,
+           which the dispatch block below handles via bm_popcount_*. */
+        SearchCriterion *pc = fp.source_leaves[0];
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
-        /* Single-leaf tree → inline btree count, no record fetch. */
+        /* Single-leaf tree → inline btree count, no record fetch.
+           With FP_PRIMARY_LEAF and n_postfilter==0 the whole tree is covered
+           by the seed; with n_postfilter>0 we must fall to the multi-leaf
+           post-filter path even if the tree looks like a single leaf. */
         int is_single_leaf =
-            (tree->kind == CNODE_LEAF) ||
-            (tree->kind == CNODE_AND && tree->n_children == 1 &&
-             tree->children[0]->kind == CNODE_LEAF);
+            (fp.n_postfilter == 0) &&
+            ((tree->kind == CNODE_LEAF) ||
+             (tree->kind == CNODE_AND && tree->n_children == 1 &&
+              tree->children[0]->kind == CNODE_LEAF));
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
@@ -14755,22 +14887,52 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
         }
-    } else if (plan.kind == PRIMARY_INTERSECT) {
-        /* AND of indexed leaves on rangeable ops — intersect candidate hash
-           sets via KeySet, no record fetch needed for count. */
-        size_t count = keyset_count_from_intersect(db_root, object, &sch, &plan,
-                                                   tree, &fs, &dl);
-        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("%zu\n", count);
-    } else if (plan.kind == PRIMARY_KEYSET) {
-        /* Shape C / hybrid: build KeySet from OR index-union. */
+    } else if (fp.kind == FP_INTERSECT) {
+        /* FP_INTERSECT + n_postfilter==0: all AND leaves covered by source set
+           → intersect index-only, keyset_size is the exact count (no record reads).
+           FP_INTERSECT + n_postfilter>0: at least one leaf was dropped from the
+           intersect (non-rangeable op, bitmap, excess past MAX_INTERSECT_LEAVES);
+           those live in the criteria tree as post-filters → feed through
+           parallel_indexed_count which re-applies the full tree per record. */
+        int small_primary = 0;
+        KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
+                                                  fp.source_leaves, fp.n_source,
+                                                  &dl, &small_primary);
+        if (!result) {
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("0\n");
+        } else if (!small_primary && fp.n_postfilter == 0) {
+            /* index-only intersect: keyset_size is exact */
+            size_t n = keyset_size(result);
+            keyset_free(result);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%zu\n", n);
+        } else {
+            /* small first leaf or post-filter leaves: re-verify full tree */
+            CollectedHash *batch = NULL;
+            size_t batch_count = 0;
+            int rc = keyset_to_collected_hashes(result, sch.splits, &batch, &batch_count);
+            keyset_free(result);
+            if (rc != 0 || batch_count == 0) { free(batch); OUT("0\n"); }
+            else {
+                size_t n = parallel_indexed_count(db_root, object, &sch, batch,
+                                                  (int)batch_count, tree, &fs, &dl);
+                free(batch);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", n);
+            }
+        }
+    } else if (fp.kind == FP_UNION) {
+        /* FP_UNION: pure OR, every child indexed → union keysets, return size.
+           Pass fp.or_node (the OR sub-tree found by the planner). */
         int budget_exceeded = 0;
-        size_t count = keyset_count_from_or(db_root, object, &sch, tree, plan.or_node,
+        size_t count = keyset_count_from_or(db_root, object, &sch, tree, fp.or_node,
                                             &fs, &dl, &budget_exceeded);
         if (budget_exceeded) OUT(QUERY_BUFFER_ERR);
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("%zu\n", count);
     } else {
+        /* FP_FULL_SCAN: nothing indexed, or planner demoted to scan. */
         CountCtx ctx = { tree, &fs, 0, &dl, 0 };
         scan_dispatch(db_root, object, &sch, data_dir, count_scan_cb, &ctx);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -15322,14 +15484,15 @@ static int small_prefilter_cmp_desc(const void *a, const void *b) {
    table in cmd_find's primary-source switch but isolated so the
    ordered paths can size-check the candidate set and choose
    filter-first vs walk-ordered. */
-static KeySet *build_keyset_from_plan(QueryPlan *plan,
+static KeySet *build_keyset_from_plan(const FilterPlan *fp,
                                       const char *db_root,
                                       const char *object,
                                       const Schema *sch,
                                       QueryDeadline *dl) {
-    if (!plan) return NULL;
-    switch (plan->kind) {
-    case PRIMARY_LEAF: {
+    if (!fp) return NULL;
+    switch (fp->kind) {
+    case FP_PRIMARY_LEAF:
+    case FP_BITMAP_SMALLER: {
         /* Cheap cardinality probe for bitmap-indexed leaves: the only
            consumers of build_keyset_from_plan are the two ordered-find
            prefilter sites, both of which discard any KeySet exceeding
@@ -15342,7 +15505,7 @@ static KeySet *build_keyset_from_plan(QueryPlan *plan,
            the caller's per-record criteria_match walk with limit
            short-circuit (which is what ordered-find already does when
            prefilter is NULL) wins on broad criteria. */
-        SearchCriterion *leaf = plan->primary_leaf;
+        SearchCriterion *leaf = fp->n_source > 0 ? fp->source_leaves[0] : NULL;
         if (leaf && pick_index_for_leaf(db_root, object, leaf) == IT_BITMAP) {
             TypedSchema *ts = load_typed_schema(db_root, object);
             const TypedField *tf = resolve_idx_field(ts, leaf->field);
@@ -15358,22 +15521,22 @@ static KeySet *build_keyset_from_plan(QueryPlan *plan,
             if (pop > ORDERED_FIND_KEYSET_MAX) return NULL;
         }
         return build_keyset_from_leaf(db_root, object, sch->splits,
-                                      plan->primary_leaf, dl);
+                                      leaf, dl);
     }
-    case PRIMARY_INTERSECT: {
+    case FP_INTERSECT: {
         int small_primary = 0;
         return intersect_indexed_leaves(db_root, object, sch->splits,
-                                        plan->intersect_leaves,
-                                        plan->intersect_count,
+                                        (SearchCriterion **)fp->source_leaves,
+                                        fp->n_source,
                                         dl, &small_primary);
     }
-    case PRIMARY_KEYSET: {
+    case FP_UNION: {
         int budget_exceeded = 0;
         return build_or_keyset(db_root, object, sch->splits,
-                               plan->or_node, dl,
+                               fp->or_node, dl,
                                &budget_exceeded, 0);
     }
-    case PRIMARY_NONE:
+    case FP_FULL_SCAN:
     default:
         return NULL;
     }
@@ -15546,8 +15709,14 @@ int cmd_find(const char *db_root, const char *object,
            without paying the fetch + criteria_match per record. The
            threshold falls back to the legacy per-record path when
            the candidate set is too broad to materialise. */
-        QueryPlan cursor_plan = choose_primary_source(tree, db_root, object);
-        KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_plan,
+        /* Phase 1c.2 (cleaned up in 1c.6): plan_filter drives cursor's
+         * prefilter candidate-source decision directly.
+         * order_by is always present in the cursor path (asserted above). */
+        size_t cursor_N_live = (size_t)get_live_count(db_root, object);
+        FilterPlan cursor_fp = plan_filter(tree, db_root, object, &driver_fs,
+                                            sch.splits, cursor_N_live,
+                                            order_by, 1 /*fetching*/);
+        KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_fp,
                                                             db_root, object,
                                                             &sch, &cdl);
         if (cursor_prefilter_ks &&
@@ -15641,7 +15810,16 @@ int cmd_find(const char *db_root, const char *object,
         return 0;
     }
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c.2/1c.6: plan_filter is the single planner. FP_ORDER_COMPOSITE
+     * and FP_ORDER_INDEX_WALK are handled by D1/D3 executors; remaining
+     * ordered paths sort in-memory via the ordered-collect path.
+     * order_by passed only when present and joins absent (joins use
+     * rows_fmt with explicit ordering). */
+    size_t find_N_live = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &driver_fs,
+                                sch.splits, find_N_live,
+                                (order_by && order_by[0] && !has_joins) ? order_by : NULL,
+                                1 /*fetching=find*/);
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
@@ -15672,6 +15850,65 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     int has_order = (order_by && order_by[0] && !has_joins);
+
+    /* ===== D1: composite-prefix sorted scan (Phase 1c step 3/6) =====
+       When plan_filter selected FP_ORDER_COMPOSITE the planner already
+       confirmed that a "<seed>+<order_by>" composite btree exists and
+       the seed criterion is selective.  Walk the composite btree range
+       [encoded(seed), encoded(seed)+0xff×4) in the requested direction
+       — entries arrive sorted by order_by within the prefix, so no
+       in-memory sort is needed.  O(limit) cost.
+
+       Guards: no joins (need tabular materialise for column ordering),
+       no rows_fmt (table envelope needs full collect), no csv_delim
+       (header row needs full schema scan).  Those edge cases fall
+       through to the existing ordered-collect + in-memory sort path. */
+    if (fp.order == FP_ORDER_COMPOSITE && fp.kind == FP_PRIMARY_LEAF &&
+        !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        find_via_composite_prefix(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            fp.source_leaves[0], order_by, desc,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        /* Close the envelope opened above and return. */
+        if (dict_fmt) OUT("}\n");
+        else          OUT("]\n");
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    } else if (fp.order == FP_ORDER_INDEX_WALK &&
+               !has_joins && !rows_fmt && !csv_delim) {
+        /* ===== D3: order-index walk + per-record post-filter (Phase 1c step 4/6) =====
+           Walk the order_by btree full range in the requested direction;
+           post-filter the full criteria tree per fetched record; stop at
+           limit.  O(limit + records-walked-before-limit-fills) — dramatically
+           cheaper than scan-and-sort-millions for the feed/profile shape
+           (broad filter + indexed order_by, no composite).
+
+           Guards: same as D1 — no joins (tabular materialise), no rows_fmt
+           (table envelope needs full collect), no csv_delim (header row needs
+           full schema scan).  Those cases fall through to the existing
+           ordered-collect + in-memory sort path. */
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        find_via_order_index_walk(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            order_by, desc,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        /* Close the envelope opened above and return. */
+        if (dict_fmt) OUT("}\n");
+        else          OUT("]\n");
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    }
 
     /* ===== ORDERED FIND — indexed-walk fast path =====
        When order_by is indexed and there are no excluded keys, walk the
@@ -15723,7 +15960,7 @@ int cmd_find(const char *db_root, const char *object,
                limit). When size is zero, short-circuit the walk
                entirely. Built inside the !csv_delim branch so the
                CSV fallback path doesn't waste a build. */
-            KeySet *prefilter_ks = build_keyset_from_plan(&plan, db_root,
+            KeySet *prefilter_ks = build_keyset_from_plan(&fp, db_root,
                                                          object, &sch, &dl);
             if (prefilter_ks &&
                 keyset_size(prefilter_ks) > ORDERED_FIND_KEYSET_MAX) {
@@ -16023,18 +16260,20 @@ int cmd_find(const char *db_root, const char *object,
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
-               (plan.kind == PRIMARY_INTERSECT ||
-                (plan.kind == PRIMARY_LEAF && tree && tree->kind != CNODE_LEAF)) &&
+               (fp.kind == FP_INTERSECT ||
+                ((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
+                 tree && tree->kind != CNODE_LEAF)) &&
                /* Trigram-leaf is not streaming-friendly — idx_find_streaming
                   walks the leaf's btree (.idx) which doesn't exist for
-                  trigram-only fields. Fall through to PRIMARY_LEAF where
+                  trigram-only fields. Fall through to FP_PRIMARY_LEAF where
                   the trigram-aware dispatch lives. */
-               !(plan.kind == PRIMARY_LEAF &&
-                 op_prefers_trigram(plan.primary_leaf->op) &&
-                 field_has_index_type(db_root, object, plan.primary_leaf->field, IT_TRIGRAM))) {
+               !((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
+                 fp.n_source > 0 && fp.source_leaves[0] &&
+                 op_prefers_trigram(fp.source_leaves[0]->op) &&
+                 field_has_index_type(db_root, object, fp.source_leaves[0]->field, IT_TRIGRAM))) {
         /* ===== Streaming fast path for limit-bound, post-filtered finds.
            For small (offset + limit) where the tree has post-filter siblings
-           (PRIMARY_INTERSECT always; PRIMARY_LEAF when tree.kind != LEAF),
+           (FP_INTERSECT always; FP_PRIMARY_LEAF when tree.kind != LEAF),
            walk the most-selective leaf's btree and emit-as-we-go via
            criteria_match_tree. The collect-then-emit path's cap=offset+limit
            under-collects when a sibling rejects most candidates; streaming
@@ -16043,25 +16282,27 @@ int cmd_find(const char *db_root, const char *object,
            Eligibility: no joins (join semantics need full materialise),
            no rows_fmt envelope (also needs full collect for column ordering),
            no order_by (would need sort across shards). */
-        SearchCriterion *primary = (plan.kind == PRIMARY_INTERSECT)
-            ? plan.intersect_leaves[0]   /* already most-selective-first */
-            : plan.primary_leaf;
+        SearchCriterion *primary = (fp.kind == FP_INTERSECT)
+            ? fp.source_leaves[0]   /* already most-selective-first */
+            : (fp.n_source > 0 ? fp.source_leaves[0] : NULL);
+        if (!primary) goto find_full_scan;
         int check_primary = op_needs_check_primary(primary->op);
         idx_find_streaming(db_root, object, &sch, primary, check_primary,
                            tree, &excluded, offset, limit,
                            proj_fields, proj_count,
                            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                            rows_fmt, dict_fmt, csv_delim, &dl);
-    } else if (plan.kind == PRIMARY_INTERSECT) {
+    } else if (fp.kind == FP_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
-        keyset_find_from_intersect(db_root, object, &sch, &plan, tree,
+        keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                                    rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
-    } else if (plan.kind == PRIMARY_LEAF) {
+    } else if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
-        SearchCriterion *pc = plan.primary_leaf;
+        SearchCriterion *pc = fp.n_source > 0 ? fp.source_leaves[0] : NULL;
+        if (!pc) goto find_full_scan;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
@@ -16090,7 +16331,9 @@ int cmd_find(const char *db_root, const char *object,
             }
             goto find_emit_close;
         }
-        rc = idx_find_parallel(db_root, object, &sch, plan.primary_idx_path, tree,
+        /* idx_find_parallel: primary_idx_path arg is marked (void) inside the
+           function (vestigial from the legacy QueryPlan era); pass "" safely. */
+        rc = idx_find_parallel(db_root, object, &sch, "", tree,
                          pc, check_primary, &excluded, offset, limit,
                          proj_fields, proj_count,
                          (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
@@ -16105,10 +16348,10 @@ int cmd_find(const char *db_root, const char *object,
             OUT(QUERY_BUFFER_ERR);
             return -1;
         }
-    } else if (plan.kind == PRIMARY_KEYSET) {
+    } else if (fp.kind == FP_UNION) {
         /* ===== OR INDEX-UNION FIND ===== */
         int budget_exceeded = 0;
-        keyset_find_from_or(db_root, object, &sch, tree, plan.or_node,
+        keyset_find_from_or(db_root, object, &sch, tree, fp.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                             rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded);
@@ -16125,6 +16368,7 @@ int cmd_find(const char *db_root, const char *object,
             return -1;
         }
     } else {
+    find_full_scan: ;  /* empty stmt: pre-C23 disallows label→declaration directly */
         /* ===== FULL SCAN FALLBACK ===== */
         AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
                              proj_fields, proj_count, excluded, &driver_fs,
@@ -18756,35 +19000,32 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     KeySet *prefilter = NULL;
     int prefilter_inverted = 0;
     if (tree) {
-        QueryPlan p = choose_primary_source(tree, db_root, object);
-        if (p.kind == PRIMARY_NONE) {
+        /* Phase 1c.5/1c.6: plan_filter replaces choose_primary_source.
+         * order_by=NULL: the streaming top-N walk sorts by the aggregate
+         * spec alias, not by an input-row field — D1/D3 overlays irrelevant.
+         * fetching=0: the walk reads index leaves only, no record fetch. */
+        size_t topn_N = (size_t)get_live_count(db_root, object);
+        FilterPlan topn_fp = plan_filter(tree, db_root, object, fs,
+                                          sch->splits, topn_N,
+                                          NULL /*order_by*/, 0 /*fetching*/);
+        if (topn_fp.kind == FP_FULL_SCAN) {
             topn_heap_destroy(heap);
             return -2;  /* criteria exist but no usable index — fall back */
         }
         /* The streaming walk has NO per-record post-filter step (no record is
            fetched), so it may only trust a prefilter that represents the
-           ENTIRE criteria tree. A partial intersect (find_intersect_leaves
-           dropped a bitmap / non-rangeable / non-indexed leaf) or a
-           PRIMARY_LEAF chosen out of a multi-leaf AND would silently drop the
-           remaining leaves → wrong counts. In those cases fall back to the
-           scan+hashmap path, which evaluates the full tree per record. */
-        int single_leaf =
-            (tree->kind == CNODE_LEAF) ||
-            (tree->kind == CNODE_AND && tree->n_children == 1 &&
-             tree->children[0]->kind == CNODE_LEAF);
-        int plan_covers_tree =
-            (p.kind == PRIMARY_INTERSECT) ? !p.partial_intersect :
-            (p.kind == PRIMARY_KEYSET)    ? 1 :
-            (p.kind == PRIMARY_LEAF)      ? single_leaf : 0;
-        if (!plan_covers_tree) {
+           ENTIRE criteria tree. n_postfilter == 0 means every leaf is in
+           the source set and nothing is left to verify. Fall back to the
+           scan+hashmap path when any postfilter leaf remains. */
+        if (topn_fp.n_postfilter > 0) {
             topn_heap_destroy(heap);
             return -2;  /* prefilter wouldn't cover all criteria — scan applies the full tree */
         }
-        if (p.kind == PRIMARY_INTERSECT) {
+        if (topn_fp.kind == FP_INTERSECT) {
             int sp = 0;
             prefilter = intersect_indexed_leaves(db_root, object, sch->splits,
-                                                  p.intersect_leaves,
-                                                  p.intersect_count,
+                                                  topn_fp.source_leaves,
+                                                  topn_fp.n_source,
                                                   dl, &sp);
             /* small_primary: intersect_indexed_leaves returned ONLY the
                smallest leaf's keyset (the rest expect a per-record
@@ -18795,25 +19036,26 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
                 topn_heap_destroy(heap);
                 return -2;
             }
-        } else if (p.kind == PRIMARY_LEAF) {
+        } else if (topn_fp.kind == FP_PRIMARY_LEAF || topn_fp.kind == FP_BITMAP_SMALLER) {
+            SearchCriterion *prim = topn_fp.n_source > 0 ? topn_fp.source_leaves[0] : NULL;
             /* A bitmap eq/IN primary would materialise EVERY matching hash —
                crippling when the value is the majority (e.g. type='story').
                Build the smaller of {match-set, complement} instead; the walk
                inverts membership when we built the complement. */
-            if ((p.primary_leaf->op == OP_EQUAL || p.primary_leaf->op == OP_IN) &&
-                field_has_index_type(db_root, object, p.primary_leaf->field, IT_BITMAP)) {
+            if (prim && (prim->op == OP_EQUAL || prim->op == OP_IN) &&
+                field_has_index_type(db_root, object, prim->field, IT_BITMAP)) {
                 prefilter = build_smaller_bitmap_keyset(
-                    db_root, object, sch->splits, p.primary_leaf,
-                    resolve_idx_field(fs->ts, p.primary_leaf->field),
+                    db_root, object, sch->splits, prim,
+                    resolve_idx_field(fs->ts, prim->field),
                     dl, &prefilter_inverted);
             } else {
                 prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
-                                                   p.primary_leaf, dl);
+                                                   prim, dl);
             }
-        } else if (p.kind == PRIMARY_KEYSET) {
+        } else if (topn_fp.kind == FP_UNION) {
             int budget = 0;
             prefilter = build_or_keyset(db_root, object, sch->splits,
-                                        p.or_node, dl, &budget, 0);
+                                        topn_fp.or_node, dl, &budget, 0);
         } else {
             topn_heap_destroy(heap);
             return -2;
@@ -20552,10 +20794,22 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c.5/1c.6: plan_filter replaces choose_primary_source.
+     * order_by=NULL: aggregate's input-row ordering is irrelevant to
+     * candidate-source selection (GROUP BY result ordering is post-agg).
+     * fetching=0: intersect stays index-only for count-like paths; the
+     * executor fetches records itself when specs require it. */
+    size_t agg_run_N = (size_t)get_live_count(db_root, object);
+    FilterPlan agg_run_fp = plan_filter(tree, db_root, object, ctx->fs,
+                                         sch->splits, agg_run_N,
+                                         NULL /*order_by*/, 0 /*fetching*/);
 
-    if (plan.kind == PRIMARY_LEAF) {
-        SearchCriterion *pc = plan.primary_leaf;
+    SearchCriterion *agg_prim = (agg_run_fp.kind == FP_PRIMARY_LEAF ||
+                                  agg_run_fp.kind == FP_BITMAP_SMALLER)
+                                    ? (agg_run_fp.n_source > 0 ? agg_run_fp.source_leaves[0] : NULL)
+                                    : NULL;
+    if (agg_prim) {
+        SearchCriterion *pc = agg_prim;
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
@@ -20591,15 +20845,15 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
             collect_ctx_destroy(&cc);
         }
-    } else if (plan.kind == PRIMARY_INTERSECT) {
+    } else if (agg_run_fp.kind == FP_INTERSECT) {
         CriteriaNode *saved = ctx->tree;
         ctx->tree = NULL;
-        keyset_agg_from_intersect(db_root, object, sch, ctx, &plan,
+        keyset_agg_from_intersect(db_root, object, sch, ctx, &agg_run_fp,
                                   saved, &ctx->tree, ctx->deadline);
         ctx->tree = saved;
-    } else if (plan.kind == PRIMARY_KEYSET) {
+    } else if (agg_run_fp.kind == FP_UNION) {
         int budget_exceeded = 0;
-        keyset_agg_from_or(db_root, object, sch, ctx, plan.or_node,
+        keyset_agg_from_or(db_root, object, sch, ctx, agg_run_fp.or_node,
                            ctx->deadline, &budget_exceeded);
         if (budget_exceeded) ctx->budget_exceeded = 1;
     } else {
@@ -21969,10 +22223,17 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (nspecs == 1 && aw_min_max_only) aw_eligible = 0;
 
         if (aw_eligible) {
-            QueryPlan crit_plan = choose_primary_source(tree, db_root, object);
+            /* Phase 1c.5/1c.6: plan_filter replaces choose_primary_source.
+             * order_by=NULL / fetching=0: index-walk aggregate; no
+             * input-row order needed. */
+            size_t aw_N = (size_t)get_live_count(db_root, object);
+            FilterPlan aw_fp = plan_filter(tree, db_root, object, &fs,
+                                            sch.splits, aw_N,
+                                            NULL /*order_by*/, 0 /*fetching*/);
             KeySet *crit_ks = NULL;
             int aw_indef = 0;
-            if (crit_plan.kind == PRIMARY_LEAF) {
+            if (aw_fp.kind == FP_PRIMARY_LEAF || aw_fp.kind == FP_BITMAP_SMALLER) {
+                SearchCriterion *aw_prim = aw_fp.n_source > 0 ? aw_fp.source_leaves[0] : NULL;
                 /* build_keyset_from_leaf walks the btree but its callback
                    doesn't apply check_primary or length-op filtering — fine
                    for rangeable ops (eq/lt/gt/range/between/in/starts), but
@@ -21980,28 +22241,32 @@ int cmd_aggregate(const char *db_root, const char *object,
                    where the leaf walk visits all entries and the filter is
                    per-entry. Falling through to agg_run_plan / record-scan
                    keeps the result correct; the cost is higher but bounded. */
-                enum SearchOp lop = crit_plan.primary_leaf->op;
-                if (op_needs_check_primary(lop) || op_is_length(lop)) {
+                if (!aw_prim) {
                     aw_indef = 1;
                 } else {
-                    crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
-                                                      crit_plan.primary_leaf, &dl);
+                    enum SearchOp lop = aw_prim->op;
+                    if (op_needs_check_primary(lop) || op_is_length(lop)) {
+                        aw_indef = 1;
+                    } else {
+                        crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
+                                                          aw_prim, &dl);
+                    }
                 }
-            } else if (crit_plan.kind == PRIMARY_INTERSECT) {
+            } else if (aw_fp.kind == FP_INTERSECT) {
                 int small_primary = 0;
                 crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                    crit_plan.intersect_leaves,
-                                                    crit_plan.intersect_count,
+                                                    aw_fp.source_leaves,
+                                                    aw_fp.n_source,
                                                     &dl, &small_primary);
                 if (small_primary) {
                     if (crit_ks) keyset_free(crit_ks);
                     crit_ks = NULL;
                     aw_indef = 1;
                 }
-            } else if (crit_plan.kind == PRIMARY_KEYSET) {
+            } else if (aw_fp.kind == FP_UNION) {
                 int budget_exceeded = 0;
                 crit_ks = build_or_keyset(db_root, object, sch.splits,
-                                           crit_plan.or_node, &dl,
+                                           aw_fp.or_node, &dl,
                                            &budget_exceeded, 0);
                 if (budget_exceeded) {
                     if (crit_ks) keyset_free(crit_ks);
@@ -22009,7 +22274,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     aw_indef = 1;
                 }
             } else {
-                aw_indef = 1; /* PRIMARY_NONE */
+                aw_indef = 1; /* FP_FULL_SCAN */
             }
 
             if (!aw_indef && crit_ks && !dl.timed_out) {
@@ -22476,13 +22741,20 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
        in place as a no-op for diff continuity, but `igb_needs_hbm` no
        longer disqualifies. */
 
-    /* Plan the criteria (if any). PRIMARY_NONE means we can't build a
+    /* Plan the criteria (if any). FP_FULL_SCAN means we can't build a
        candidate KeySet from the index alone — fall through to the
        per-record scan path so non-indexed leaves are evaluated correctly. */
-    QueryPlan crit_plan = { .kind = PRIMARY_NONE };
+    /* Phase 1c.5/1c.6: plan_filter replaces choose_primary_source.
+     * order_by=NULL / fetching=0: IGB input-row ordering is irrelevant;
+     * GROUP BY result ordering is handled post-aggregation. */
+    FilterPlan igb_crit_fp; memset(&igb_crit_fp, 0, sizeof(igb_crit_fp));
+    igb_crit_fp.kind = FP_FULL_SCAN;
     if (igb_eligible && tree) {
-        crit_plan = choose_primary_source(tree, db_root, object);
-        if (crit_plan.kind == PRIMARY_NONE) igb_eligible = 0;
+        size_t igb_N = (size_t)get_live_count(db_root, object);
+        igb_crit_fp = plan_filter(tree, db_root, object, &fs,
+                                   sch.splits, igb_N,
+                                   NULL /*order_by*/, 0 /*fetching*/);
+        if (igb_crit_fp.kind == FP_FULL_SCAN) igb_eligible = 0;
     }
 
     if (igb_eligible) {
@@ -22509,30 +22781,35 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
         }
 
         /* If we have criteria, build a candidate KeySet from the indexed
-           plan and filter Pass 1 / Pass 2 by it. PRIMARY_LEAF →
-           build_keyset_from_leaf, PRIMARY_INTERSECT → intersect_indexed_leaves
+           plan and filter Pass 1 / Pass 2 by it. FP_PRIMARY_LEAF →
+           build_keyset_from_leaf, FP_INTERSECT → intersect_indexed_leaves
            (with small-primary fallthrough since that path needs record-rematch
-           which we don't do here), PRIMARY_KEYSET → build_or_keyset. On any
+           which we don't do here), FP_UNION → build_or_keyset. On any
            failure, fall through to the scan path. */
         KeySet *crit_ks = NULL;
         if (tree) {
-            if (crit_plan.kind == PRIMARY_LEAF) {
+            if (igb_crit_fp.kind == FP_PRIMARY_LEAF || igb_crit_fp.kind == FP_BITMAP_SMALLER) {
+                SearchCriterion *igb_prim = igb_crit_fp.n_source > 0 ? igb_crit_fp.source_leaves[0] : NULL;
                 /* Same caveat as the no-group_by path above:
                    build_keyset_from_leaf doesn't filter via check_primary,
                    so non-rangeable ops would over-include. Fall through to
                    agg_run_plan for those — correctness over speed. */
-                enum SearchOp lop = crit_plan.primary_leaf->op;
+                if (!igb_prim) {
+                    if (hbk_ready) hbk_free(&hbk);
+                    goto igb_skip;
+                }
+                enum SearchOp lop = igb_prim->op;
                 if (op_needs_check_primary(lop) || op_is_length(lop)) {
                     if (hbk_ready) hbk_free(&hbk);
                     goto igb_skip;
                 }
                 crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
-                                                  crit_plan.primary_leaf, &dl);
-            } else if (crit_plan.kind == PRIMARY_INTERSECT) {
+                                                  igb_prim, &dl);
+            } else if (igb_crit_fp.kind == FP_INTERSECT) {
                 int small_primary = 0;
                 crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                    crit_plan.intersect_leaves,
-                                                    crit_plan.intersect_count,
+                                                    igb_crit_fp.source_leaves,
+                                                    igb_crit_fp.n_source,
                                                     &dl, &small_primary);
                 if (small_primary) {
                     /* Small-primary intersect needs criteria_match_tree per
@@ -22542,10 +22819,10 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     if (hbk_ready) hbk_free(&hbk);
                     goto igb_skip;
                 }
-            } else if (crit_plan.kind == PRIMARY_KEYSET) {
+            } else if (igb_crit_fp.kind == FP_UNION) {
                 int budget_exceeded = 0;
                 crit_ks = build_or_keyset(db_root, object, sch.splits,
-                                           crit_plan.or_node, &dl,
+                                           igb_crit_fp.or_node, &dl,
                                            &budget_exceeded, 0);
                 if (budget_exceeded) {
                     if (crit_ks) keyset_free(crit_ks);
