@@ -12190,34 +12190,6 @@ static QueryPlan choose_primary_source(CriteriaNode *tree,
     return p;
 }
 
-/* Does the planner's prefilter for `tree` represent the ENTIRE criteria tree?
- *
- * The aggregate group_by fast-paths (IGB walk, streaming top-N, no-group
- * keyset) filter their index walk by ONE prefilter KeySet built from the
- * planner's PRIMARY and have no per-record recheck. That's only correct when
- * the prefilter == the whole filter. A partial intersect (find_intersect_leaves
- * dropped a bitmap / non-rangeable / non-indexed leaf) or a PRIMARY_LEAF chosen
- * out of a multi-leaf AND leaves siblings unapplied → those fast-paths would
- * silently drop them (wrong counts). When this returns 0 the caller must fall
- * through to agg_run_plan, which fetches the selective candidates and rechecks
- * the full tree via agg_scan_cb (the "scan the small set, verify the rest"
- * path). Returns 1 for no-criteria (nothing to drop). */
-static int agg_criteria_fully_covered(const char *db_root, const char *object,
-                                      CriteriaNode *tree) {
-    if (!tree) return 1;
-    QueryPlan p = choose_primary_source(tree, db_root, object);
-    int single_leaf =
-        (tree->kind == CNODE_LEAF) ||
-        (tree->kind == CNODE_AND && tree->n_children == 1 &&
-         tree->children[0]->kind == CNODE_LEAF);
-    switch (p.kind) {
-        case PRIMARY_INTERSECT: return !p.partial_intersect;
-        case PRIMARY_KEYSET:    return 1;
-        case PRIMARY_LEAF:      return single_leaf;
-        default:                return 0;  /* PRIMARY_NONE — no index covers it */
-    }
-}
-
 /* ========== Cardinality estimator (planner primitive) ==========
  *
  * card_est_leaf: cheap estimate of how many records match `leaf` on a
@@ -12903,6 +12875,34 @@ static QueryPlan qp_from_fp(const FilterPlan *fp) {
             break;
     }
     return p;
+}
+
+/* Does the planner's prefilter for `tree` represent the ENTIRE criteria tree?
+ *
+ * The aggregate group_by fast-paths (IGB walk, streaming top-N, no-group
+ * keyset) filter their index walk by ONE prefilter KeySet built from the
+ * planner's PRIMARY and have no per-record recheck. That's only correct when
+ * the prefilter == the whole filter. A partial intersect (find_intersect_leaves
+ * dropped a bitmap / non-rangeable / non-indexed leaf) or a PRIMARY_LEAF chosen
+ * out of a multi-leaf AND leaves siblings unapplied → those fast-paths would
+ * silently drop them (wrong counts). When this returns 0 the caller must fall
+ * through to agg_run_plan, which fetches the selective candidates and rechecks
+ * the full tree via agg_scan_cb (the "scan the small set, verify the rest"
+ * path). Returns 1 for no-criteria (nothing to drop). */
+static int agg_criteria_fully_covered(const char *db_root, const char *object,
+                                      CriteriaNode *tree) {
+    if (!tree) return 1;
+    /* Phase 1c.5: equivalent to (PRIMARY_INTERSECT && !partial) ||
+     * PRIMARY_KEYSET || (PRIMARY_LEAF && single_leaf).
+     * n_postfilter == 0 means every leaf is in the source set; nothing
+     * is left to verify per-record, so the index walk alone covers the
+     * full criteria tree. */
+    FieldSchema fs; init_field_schema(&fs, db_root, object);
+    Schema sc = load_schema(db_root, object);
+    size_t N = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sc.splits, N,
+                                NULL /*order_by*/, 0 /*fetching*/);
+    return (fp.kind != FP_FULL_SCAN && fp.n_postfilter == 0);
 }
 
 #ifdef TEST_BUILD
@@ -19296,26 +19296,29 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     KeySet *prefilter = NULL;
     int prefilter_inverted = 0;
     if (tree) {
-        QueryPlan p = choose_primary_source(tree, db_root, object);
+        /* Phase 1c.5: plan_filter + qp_from_fp adapter replaces
+         * choose_primary_source.  order_by=NULL: the streaming top-N
+         * walk sorts by the aggregate spec alias, not by an input-row
+         * field — plan_filter's D1/D3 overlays are irrelevant here.
+         * fetching=0: the walk reads index leaves only, no record fetch. */
+        size_t topn_N = (size_t)get_live_count(db_root, object);
+        FilterPlan topn_fp = plan_filter(tree, db_root, object, fs,
+                                          sch->splits, topn_N,
+                                          NULL /*order_by*/, 0 /*fetching*/);
+        QueryPlan p = qp_from_fp(&topn_fp);
         if (p.kind == PRIMARY_NONE) {
             topn_heap_destroy(heap);
             return -2;  /* criteria exist but no usable index — fall back */
         }
         /* The streaming walk has NO per-record post-filter step (no record is
            fetched), so it may only trust a prefilter that represents the
-           ENTIRE criteria tree. A partial intersect (find_intersect_leaves
-           dropped a bitmap / non-rangeable / non-indexed leaf) or a
-           PRIMARY_LEAF chosen out of a multi-leaf AND would silently drop the
-           remaining leaves → wrong counts. In those cases fall back to the
-           scan+hashmap path, which evaluates the full tree per record. */
-        int single_leaf =
-            (tree->kind == CNODE_LEAF) ||
-            (tree->kind == CNODE_AND && tree->n_children == 1 &&
-             tree->children[0]->kind == CNODE_LEAF);
-        int plan_covers_tree =
-            (p.kind == PRIMARY_INTERSECT) ? !p.partial_intersect :
-            (p.kind == PRIMARY_KEYSET)    ? 1 :
-            (p.kind == PRIMARY_LEAF)      ? single_leaf : 0;
+           ENTIRE criteria tree. n_postfilter == 0 means every leaf is in
+           the source set and nothing is left to verify — equivalent to the
+           old (PRIMARY_INTERSECT && !partial) || PRIMARY_KEYSET ||
+           (PRIMARY_LEAF && single_leaf) check.  Fall back to the
+           scan+hashmap path when any postfilter leaf remains. */
+        int plan_covers_tree = (topn_fp.kind != FP_FULL_SCAN &&
+                                topn_fp.n_postfilter == 0);
         if (!plan_covers_tree) {
             topn_heap_destroy(heap);
             return -2;  /* prefilter wouldn't cover all criteria — scan applies the full tree */
@@ -21092,7 +21095,16 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c.5: plan_filter + qp_from_fp replaces choose_primary_source.
+     * order_by=NULL: aggregate's input-row ordering is irrelevant to
+     * candidate-source selection (GROUP BY result ordering is post-agg).
+     * fetching=0: intersect stays index-only for count-like paths; the
+     * executor fetches records itself when specs require it. */
+    size_t agg_run_N = (size_t)get_live_count(db_root, object);
+    FilterPlan agg_run_fp = plan_filter(tree, db_root, object, ctx->fs,
+                                         sch->splits, agg_run_N,
+                                         NULL /*order_by*/, 0 /*fetching*/);
+    QueryPlan plan = qp_from_fp(&agg_run_fp);
 
     if (plan.kind == PRIMARY_LEAF) {
         SearchCriterion *pc = plan.primary_leaf;
@@ -22509,7 +22521,14 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (nspecs == 1 && aw_min_max_only) aw_eligible = 0;
 
         if (aw_eligible) {
-            QueryPlan crit_plan = choose_primary_source(tree, db_root, object);
+            /* Phase 1c.5: plan_filter + qp_from_fp replaces
+             * choose_primary_source.  order_by=NULL / fetching=0:
+             * index-walk aggregate; no input-row order needed. */
+            size_t aw_N = (size_t)get_live_count(db_root, object);
+            FilterPlan aw_fp = plan_filter(tree, db_root, object, &fs,
+                                            sch.splits, aw_N,
+                                            NULL /*order_by*/, 0 /*fetching*/);
+            QueryPlan crit_plan = qp_from_fp(&aw_fp);
             KeySet *crit_ks = NULL;
             int aw_indef = 0;
             if (crit_plan.kind == PRIMARY_LEAF) {
@@ -23019,9 +23038,16 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
     /* Plan the criteria (if any). PRIMARY_NONE means we can't build a
        candidate KeySet from the index alone — fall through to the
        per-record scan path so non-indexed leaves are evaluated correctly. */
+    /* Phase 1c.5: plan_filter + qp_from_fp replaces choose_primary_source.
+     * order_by=NULL / fetching=0: IGB input-row ordering is irrelevant;
+     * GROUP BY result ordering is handled post-aggregation. */
     QueryPlan crit_plan = { .kind = PRIMARY_NONE };
     if (igb_eligible && tree) {
-        crit_plan = choose_primary_source(tree, db_root, object);
+        size_t igb_N = (size_t)get_live_count(db_root, object);
+        FilterPlan igb_fp = plan_filter(tree, db_root, object, &fs,
+                                         sch.splits, igb_N,
+                                         NULL /*order_by*/, 0 /*fetching*/);
+        crit_plan = qp_from_fp(&igb_fp);
         if (crit_plan.kind == PRIMARY_NONE) igb_eligible = 0;
     }
 
