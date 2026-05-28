@@ -12173,13 +12173,17 @@ static CardEst card_est_leaf(const char *db_root, const char *object,
         return e;
     }
     if (it == IT_TRIGRAM &&
-        (leaf->op == OP_CONTAINS || leaf->op == OP_ICONTAINS)) {
+        (leaf->op == OP_CONTAINS || leaf->op == OP_ICONTAINS ||
+         leaf->op == OP_STARTS_WITH)) {
         /* Estimate = rarest gram's posting size, capped at `cap`.
-           The candidate set for a trigram contains/icontains is the
-           intersection of all grams' posting lists, so it is bounded
-           above by the smallest (rarest) gram's posting count.
-           We lowercase the pattern here to match the index (same as
-           build_keyset_from_trigram does). */
+           For contains/icontains: intersection of all grams in the pattern,
+           bounded above by the rarest gram's posting count.
+           For starts_with: same primitive — extract the leading 3-gram(s)
+           from the prefix; the rarest 3-gram gives a tight upper bound on
+           the candidate set (records whose field starts with the prefix are
+           a subset of records containing each of those grams).
+           We lowercase the pattern/prefix to match the index (trigrams are
+           stored lowercase — see tg_build_grams / build_keyset_from_trigram). */
         size_t plen = strlen(leaf->value);
         if (plen < 3) { e.estimable = 0; return e; }
         if (plen > 1023) plen = 1023;
@@ -12571,16 +12575,20 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     } else if (prim_sel || prim_it != IT_BITMAP) {
         /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
          * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
-        if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated
+        if (!prim_sel && prim_it != IT_BITMAP && prim_it != IT_TRIGRAM
+                && est[prim].estimable && est[prim].saturated
                 && op_eligible_for_intersect(leaves[prim]->op)
                 && !order_field_drivable(db_root, object, order_by)) {
-            /* broad non-bitmap PRECISE-lookup leaf: K > budget → fetch loses
-             * to a data scan (B5). Leaf-scan ops (contains/like/ends/regex/
-             * len_* and their i-variants) are NOT demoted here — their index
-             * leaf-scan always beats a data-file scan (A4). Also NOT demoted
-             * when an indexed order_by is available (D3: ORDER_INDEX_WALK is
-             * cheaper than scan-and-sort — the order overlay below sets it for
-             * the saturated seed). */
+            /* broad non-bitmap non-trigram PRECISE-lookup leaf: K > budget →
+             * fetch loses to a data scan (B5). Leaf-scan ops (contains/like/
+             * ends/regex/len_* and their i-variants) are NOT demoted here —
+             * their index leaf-scan always beats a data-file scan (A4).
+             * Trigram-backed starts_with is similarly never demoted: it narrows
+             * candidates via the leading 3-gram posting list, which is always
+             * faster than a full seg-file scan regardless of candidate count.
+             * Also NOT demoted when an indexed order_by is available (D3:
+             * ORDER_INDEX_WALK is cheaper than scan-and-sort — the order
+             * overlay below sets it for the saturated seed). */
             fp.kind = FP_FULL_SCAN; return fp;
         }
         fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);
@@ -13069,6 +13077,12 @@ static int op_prefers_trigram(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_ICONTAINS;
 }
 
+/* Returns 1 when the op can be served by a trigram index for starts_with
+ * (prefix length ≥ 3 required, checked by caller). */
+static int op_allows_trigram_starts(enum SearchOp op) {
+    return op == OP_STARTS_WITH;
+}
+
 /* Crossover length between btree-leaf scan and trigram intersection
  * for contains/i_contains. The trigram verify step is O(candidates ×
  * per-record fetch) while btree-leaf is O(total_leaves × per-leaf
@@ -13151,6 +13165,17 @@ static int pick_index_for_leaf(const char *db_root, const char *object,
             return btree_idx_exists(db_root, object, c->field, sch.splits)
                    ? IT_BTREE : -1;
         }
+        return -1;
+    }
+    /* starts_with: btree is the precise path; trigram is the fallback when
+     * no btree exists AND the prefix is long enough to extract a 3-gram.
+     * Shorter prefixes (<3 chars) cannot form any trigram, so they fall
+     * through to full scan (-1). */
+    if (op_allows_trigram_starts(c->op)) {
+        size_t plen = strlen(c->value);
+        if (has_btree && btree_idx_exists(db_root, object, c->field, sch.splits))
+            return IT_BTREE;
+        if (has_trigram && plen >= 3) return IT_TRIGRAM;
         return -1;
     }
     if (has_bitmap) return IT_BITMAP;

@@ -886,3 +886,74 @@ static int test_planD3_single_leaf_indexed_order(void) {
     return 0;
 }
 TEST_REGISTER("test-plan-d3-single-leaf-indexed-order", test_planD3_single_leaf_indexed_order)
+
+/* A3: starts_with on a trigram-only field (no btree) with prefix >= 3 chars.
+ * Before fix: pick_index_for_leaf returns -1 for OP_STARTS_WITH when only a
+ * trigram index exists → plan_filter falls through to FP_FULL_SCAN → "scan".
+ * After fix: pick_index_for_leaf returns IT_TRIGRAM for prefix >= 3 chars →
+ * plan_filter sees the leaf as indexed → FP_PRIMARY_LEAF → "leaf".
+ *
+ * Object cm_a3: title:varchar:64 indexed with trigram only (no btree).
+ * 20 rows with title="Show HN: ...", 80 rows with unrelated titles.
+ * Criteria: [{title starts_with "Show HN"}] (7 chars >= 3 → trigram eligible).
+ * Expected: kind="leaf", seed_field="title". */
+static int test_planA3_trigram_starts_with(void) {
+    TestEnv env = {0};
+    /* trigram-only index on title: no btree */
+    TestClient *tc = cm_setup(&env, "cm_a3",
+        "\"title:varchar:64\"",
+        "\"title:trigram\"");
+    if (!tc) return 1;
+
+    /* Insert 20 rows title="Show HN: <i>" and 80 unrelated rows. */
+    char body[65536]; int p = 0, k = 0; char *resp = NULL;
+    p += snprintf(body + p, sizeof(body) - p, "{");
+    for (int i = 0; i < 20; i++) {
+        p += snprintf(body + p, sizeof(body) - p,
+            "%s\"k%d\":{\"title\":\"Show HN: item %d\"}",
+            k == 0 ? "" : ",", k, i);
+        k++;
+    }
+    for (int i = 0; i < 80; i++) {
+        p += snprintf(body + p, sizeof(body) - p,
+            ",\"k%d\":{\"title\":\"Ask HN: something %d\"}", k, i);
+        k++;
+    }
+    p += snprintf(body + p, sizeof(body) - p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    char f[64] = {0}, o[16] = {0};
+    /* Prefix "Show HN" is 7 chars >= 3 → trigram eligible.
+     * Planner must return "leaf" (not "scan") and seed on "title". */
+    const char *kind = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind, "leaf",
+        "A3: starts_with on trigram-only field (prefix>=3) → PRIMARY_LEAF, not FULL_SCAN");
+    ASSERT_EQ_STR(f, "title",
+        "A3: seed field is 'title'");
+
+    /* Also verify fetching=0 (count path) — same result. */
+    memset(f, 0, sizeof(f)); memset(o, 0, sizeof(o));
+    const char *kind_count = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}]",
+        NULL, 0, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind_count, "leaf",
+        "A3 count: starts_with on trigram-only field stays leaf on count path too");
+
+    /* Short prefix (<3 chars) must still fall to scan — no trigram extractable. */
+    memset(f, 0, sizeof(f)); memset(o, 0, sizeof(o));
+    const char *kind_short = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Sh\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind_short, "scan",
+        "A3 short: prefix <3 chars → no usable trigram → FULL_SCAN");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a3-trigram-starts-with", test_planA3_trigram_starts_with)
