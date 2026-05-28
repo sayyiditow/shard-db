@@ -10736,6 +10736,197 @@ static int idx_find_streaming(const char *db_root, const char *object,
     return sc.printed;
 }
 
+/* ============================================================
+   D1 executor: composite-prefix sorted scan.
+
+   Given a composite (a+b) btree, its leaf values are
+   encoded(a) ++ encoded(b) ++ hash16.  Walking the range
+   [encoded(a_val), encoded(a_val) ++ 0xff×4) in btree order
+   yields every record whose `a` field == a_val, with the
+   resulting entries already sorted by the encoded `b` value
+   within that prefix.  This gives an O(limit) ordered answer
+   for `find {a="alice"} order_by b limit N` — no in-memory
+   sort, no full-shard scan.
+
+   Constraints checked by caller:
+     • fp.order == FP_ORDER_COMPOSITE && fp.kind == FP_PRIMARY_LEAF
+     • no joins (need tabular materialise)
+     • no rows_fmt / csv (column-headers need full materialise)
+   Falls through (caller just skips this fn) for any edge case
+   the planner didn't cover.
+*/
+
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    CriteriaNode  *tree;          /* full tree for post-filter */
+    ExcludedKeys  *excluded;
+    const char   **proj_fields;
+    int            proj_count;
+    int            dict_fmt;
+    int            skip_remaining;
+    int            limit;
+    int            printed;
+    QueryDeadline *dl;
+    int            dl_counter;
+    FILE          *parent_out;    /* caller's socket stream */
+} CompositePrefixCtx;
+
+static int composite_prefix_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;   /* composite leaf value not needed; hash16 is the key */
+    CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
+    g_out = c->parent_out;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->printed >= c->limit) return -1;
+
+    /* Fetch the record by hash16. */
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    const uint8_t *key_start = rr.key;
+    const uint8_t *raw       = rr.val;
+    uint32_t       value_len = (uint32_t)rr.vlen;
+
+    /* Excluded-keys check: the key is a string in ExcludedKeys.
+       is_excluded() takes a char* key so build it from the fetched record. */
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        if (is_excluded(c->excluded, keybuf)) {
+            release_record_ref(&rr);
+            return 0;
+        }
+    }
+
+    /* Post-filter: apply the full criteria tree (seed leaf trivially passes
+       since we're inside its prefix; any extra AND leaves still need checking). */
+    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Offset skip-after-match */
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
+       excluded by the caller guard so we don't need those branches here. */
+    char key_buf[1024];
+    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
+    memcpy(key_buf, key_start, klen);
+    key_buf[klen] = '\0';
+
+    if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    c->printed++;
+    release_record_ref(&rr);
+    return (c->printed >= c->limit) ? -1 : 0;
+}
+
+/* D1 executor entry point.  seed is the equality leaf on the prefix field
+   (e.g. by="alice"); order_by is the sort field (e.g. "time").
+   Returns number of rows emitted (≥0) or -1 on deadline. */
+static int find_via_composite_prefix(const char *db_root, const char *object,
+                                     const Schema *sch, FieldSchema *fs,
+                                     SearchCriterion *seed,
+                                     const char *order_by,
+                                     int order_desc,
+                                     CriteriaNode *tree,
+                                     ExcludedKeys *excluded,
+                                     int offset, int limit,
+                                     const char **proj_fields, int proj_count,
+                                     int dict_fmt,
+                                     QueryDeadline *dl)
+{
+    /* 1. Encode the seed value — this becomes the prefix for the walk. */
+    uint8_t buf_lo[1024];
+    size_t  len_lo = 0;
+    const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
+    encode_criterion_value(seed_tf, seed->value, strlen(seed->value), buf_lo, &len_lo);
+
+    /* 2. Upper bound: seed prefix + 4 × 0xff  (the STARTS_WITH idiom). */
+    uint8_t buf_hi[1024 + 4];
+    memcpy(buf_hi, buf_lo, len_lo);
+    memset(buf_hi + len_lo, 0xff, 4);
+    size_t  len_hi = len_lo + 4;
+
+    /* 3. Build the composite index name "<seed_field>+<order_by>". */
+    char composite_field[256];
+    snprintf(composite_field, sizeof(composite_field), "%s+%s",
+             seed->field, order_by);
+
+    /* 4. Set up the callback context. */
+    CompositePrefixCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_root        = db_root;
+    ctx.object         = object;
+    ctx.sch            = sch;
+    ctx.fs             = fs;
+    ctx.tree           = tree;
+    ctx.excluded       = excluded;
+    ctx.proj_fields    = proj_fields;
+    ctx.proj_count     = proj_count;
+    ctx.dict_fmt       = dict_fmt;
+    ctx.skip_remaining = (offset > 0) ? offset : 0;
+    ctx.limit          = (limit > 0)  ? limit  : INT_MAX;
+    ctx.printed        = 0;
+    ctx.dl             = dl;
+    ctx.dl_counter     = 0;
+    ctx.parent_out     = g_out;
+
+    /* 5. Walk the composite btree.  The k-way merge across index shards
+          delivers entries already sorted by (encoded_a || encoded_b) in
+          the requested direction — asc or desc. */
+    btree_idx_walk_ordered(db_root, object, composite_field, sch->splits,
+                           (const char *)buf_lo, len_lo, 0,
+                           (const char *)buf_hi, len_hi, 0,
+                           order_desc, composite_prefix_cb, &ctx);
+
+    return ctx.printed;
+}
+
 enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "eq") == 0 || strcmp(s, "equal") == 0) return OP_EQUAL;
     if (strcmp(s, "neq") == 0 || strcmp(s, "not_equal") == 0) return OP_NOT_EQUAL;
@@ -15780,6 +15971,37 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     int has_order = (order_by && order_by[0] && !has_joins);
+
+    /* ===== D1: composite-prefix sorted scan (Phase 1c step 3/6) =====
+       When plan_filter selected FP_ORDER_COMPOSITE the planner already
+       confirmed that a "<seed>+<order_by>" composite btree exists and
+       the seed criterion is selective.  Walk the composite btree range
+       [encoded(seed), encoded(seed)+0xff×4) in the requested direction
+       — entries arrive sorted by order_by within the prefix, so no
+       in-memory sort is needed.  O(limit) cost.
+
+       Guards: no joins (need tabular materialise for column ordering),
+       no rows_fmt (table envelope needs full collect), no csv_delim
+       (header row needs full schema scan).  Those edge cases fall
+       through to the existing ordered-collect + in-memory sort path. */
+    if (fp.order == FP_ORDER_COMPOSITE && fp.kind == FP_PRIMARY_LEAF &&
+        !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        find_via_composite_prefix(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            fp.source_leaves[0], order_by, desc,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        /* Close the envelope opened above and return. */
+        if (dict_fmt) OUT("}\n");
+        else          OUT("]\n");
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    }
 
     /* ===== ORDERED FIND — indexed-walk fast path =====
        When order_by is indexed and there are no excluded keys, walk the
