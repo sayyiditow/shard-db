@@ -219,6 +219,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_d3_order_walk_executor.c \
     src/test/cases/test_ft_float_consistency.c \
     src/test/cases/test_slow_query_log.c \
+    src/test/cases/test_find_with_total.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \

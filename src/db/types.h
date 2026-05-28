@@ -1101,8 +1101,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 int cmd_exists(const char *db_root, const char *object,
                const char *key, size_t klen);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);
-int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format, const char *delimiter);
-int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *delimiter, const char *join_json, const char *order_by, const char *order_dir, const char *cursor_json);
+int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format, const char *delimiter, int want_total);
+int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *delimiter, const char *join_json, const char *order_by, const char *order_dir, const char *cursor_json, int want_total);
 /* if_not_exists=1 makes bulk-insert idempotent — keys that already exist
    are skipped instead of overwritten, and the response carries a "skipped"
    counter alongside "inserted". */
@@ -1168,7 +1168,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
                   const char *order_by, int order_desc, int limit,
-                  const char *format, const char *delimiter);
+                  const char *format, const char *delimiter, int want_total);
 int cmd_put_file(const char *db_root, const char *object, const char *src);
 int cmd_get_file_path(const char *db_root, const char *object, const char *filename);
 int cmd_put_file_b64(const char *db_root, const char *object,
