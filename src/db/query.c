@@ -8652,27 +8652,34 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_FLOAT: {
         float v; memcpy(&v, p, 4);
-        double vd = (double)v;
-        double q1 = cc->d1;
-        double q2 = cc->d2;
+        /* Comparisons use float32 precision throughout: cast query literals to
+         * float before comparing so that a stored value of 3.14f (encoded as
+         * 3.140000104... in double) is not incorrectly excluded by `lte 3.14`
+         * (where the double literal 3.14 < 3.140000104...).  The btree
+         * encoding path stores the literal as float32, so record and query
+         * round identically there; the scan path must do the same. */
+        float qf1 = (float)cc->d1;
+        float qf2 = (float)cc->d2;
         switch (cc->op) {
-        case OP_EQUAL: return fabs(vd - q1) < 1e-6;
-        case OP_NOT_EQUAL: return fabs(vd - q1) >= 1e-6;
-        case OP_LESS: return vd < q1;
-        case OP_GREATER: return vd > q1;
-        case OP_LESS_EQ: return vd <= q1;
-        case OP_GREATER_EQ: return vd >= q1;
+        case OP_EQUAL:      return v == qf1;
+        case OP_NOT_EQUAL:  return v != qf1;
+        case OP_LESS:       return v <  qf1;
+        case OP_GREATER:    return v >  qf1;
+        case OP_LESS_EQ:    return v <= qf1;
+        case OP_GREATER_EQ: return v >= qf1;
         case OP_BETWEEN: {
-            int lo = (cc->raw && cc->raw->min_exclusive) ? (vd > q1) : (vd >= q1);
-            int hi = (cc->raw && cc->raw->max_exclusive) ? (vd < q2) : (vd <= q2);
+            int lo = (cc->raw && cc->raw->min_exclusive) ? (v > qf1) : (v >= qf1);
+            int hi = (cc->raw && cc->raw->max_exclusive) ? (v < qf2) : (v <= qf2);
             return lo && hi;
         }
         case OP_IN: {
-            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 1;
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == (float)cc->in_f64[i]) return 1;
             return 0;
         }
         case OP_NOT_IN: {
-            for (int i = 0; i < cc->in_count; i++) if (fabs(vd - cc->in_f64[i]) < 1e-6) return 0;
+            for (int i = 0; i < cc->in_count; i++)
+                if (v == (float)cc->in_f64[i]) return 0;
             return 1;
         }
         default: return 0;
@@ -14562,18 +14569,33 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         }
     }
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c step 1/6: cmd_count now consumes FilterPlan; choose_primary_source
+       no longer called from this path.  fetching=0 so the planner can enable
+       index-only intersect for count (no record reads needed). */
+    size_t N_live = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
+                                N_live, NULL /*order_by*/, 0 /*fetching=count*/);
+    /* FP_ORDER_* overlays are irrelevant for count (no order_by supplied). */
 
-    if (plan.kind == PRIMARY_LEAF) {
-        SearchCriterion *pc = plan.primary_leaf;
+    if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
+        /* FP_PRIMARY_LEAF: one selective indexed leaf seeds; remaining leaves
+           (fp.n_postfilter > 0) are post-filtered per record via full tree.
+           FP_BITMAP_SMALLER: lone/broad bitmap — routed here because
+           fp.source_leaves[0] is set and pick_index_for_leaf returns IT_BITMAP,
+           which the dispatch block below handles via bm_popcount_*. */
+        SearchCriterion *pc = fp.source_leaves[0];
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
-        /* Single-leaf tree → inline btree count, no record fetch. */
+        /* Single-leaf tree → inline btree count, no record fetch.
+           With FP_PRIMARY_LEAF and n_postfilter==0 the whole tree is covered
+           by the seed; with n_postfilter>0 we must fall to the multi-leaf
+           post-filter path even if the tree looks like a single leaf. */
         int is_single_leaf =
-            (tree->kind == CNODE_LEAF) ||
-            (tree->kind == CNODE_AND && tree->n_children == 1 &&
-             tree->children[0]->kind == CNODE_LEAF);
+            (fp.n_postfilter == 0) &&
+            ((tree->kind == CNODE_LEAF) ||
+             (tree->kind == CNODE_AND && tree->n_children == 1 &&
+              tree->children[0]->kind == CNODE_LEAF));
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
@@ -14755,22 +14777,52 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
         }
-    } else if (plan.kind == PRIMARY_INTERSECT) {
-        /* AND of indexed leaves on rangeable ops — intersect candidate hash
-           sets via KeySet, no record fetch needed for count. */
-        size_t count = keyset_count_from_intersect(db_root, object, &sch, &plan,
-                                                   tree, &fs, &dl);
-        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("%zu\n", count);
-    } else if (plan.kind == PRIMARY_KEYSET) {
-        /* Shape C / hybrid: build KeySet from OR index-union. */
+    } else if (fp.kind == FP_INTERSECT) {
+        /* FP_INTERSECT + n_postfilter==0: all AND leaves covered by source set
+           → intersect index-only, keyset_size is the exact count (no record reads).
+           FP_INTERSECT + n_postfilter>0: at least one leaf was dropped from the
+           intersect (non-rangeable op, bitmap, excess past MAX_INTERSECT_LEAVES);
+           those live in the criteria tree as post-filters → feed through
+           parallel_indexed_count which re-applies the full tree per record. */
+        int small_primary = 0;
+        KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
+                                                  fp.source_leaves, fp.n_source,
+                                                  &dl, &small_primary);
+        if (!result) {
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("0\n");
+        } else if (!small_primary && fp.n_postfilter == 0) {
+            /* index-only intersect: keyset_size is exact */
+            size_t n = keyset_size(result);
+            keyset_free(result);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%zu\n", n);
+        } else {
+            /* small first leaf or post-filter leaves: re-verify full tree */
+            CollectedHash *batch = NULL;
+            size_t batch_count = 0;
+            int rc = keyset_to_collected_hashes(result, sch.splits, &batch, &batch_count);
+            keyset_free(result);
+            if (rc != 0 || batch_count == 0) { free(batch); OUT("0\n"); }
+            else {
+                size_t n = parallel_indexed_count(db_root, object, &sch, batch,
+                                                  (int)batch_count, tree, &fs, &dl);
+                free(batch);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", n);
+            }
+        }
+    } else if (fp.kind == FP_UNION) {
+        /* FP_UNION: pure OR, every child indexed → union keysets, return size.
+           Pass fp.or_node (the OR sub-tree found by the planner). */
         int budget_exceeded = 0;
-        size_t count = keyset_count_from_or(db_root, object, &sch, tree, plan.or_node,
+        size_t count = keyset_count_from_or(db_root, object, &sch, tree, fp.or_node,
                                             &fs, &dl, &budget_exceeded);
         if (budget_exceeded) OUT(QUERY_BUFFER_ERR);
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("%zu\n", count);
     } else {
+        /* FP_FULL_SCAN: nothing indexed, or planner demoted to scan. */
         CountCtx ctx = { tree, &fs, 0, &dl, 0 };
         scan_dispatch(db_root, object, &sch, data_dir, count_scan_cb, &ctx);
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
