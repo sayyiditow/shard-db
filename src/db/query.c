@@ -7268,7 +7268,8 @@ static int v2_fetch_cb(const uint8_t hash16[16],
 static int cmd_fetch_v2(const char *db_root, const char *object,
                          int offset, int limit, const char *proj_str,
                          const char *cursor, const char *format,
-                         const char *delimiter, const Schema *sch) {
+                         const char *delimiter, const Schema *sch,
+                         int want_total) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
@@ -7299,14 +7300,18 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
 
-    if (csv_delim)
+    if (csv_delim) {
+        if (want_total) {
+            OUT("{\"error\":\"\\\"total\\\" with format=csv is not supported\"}\n");
+            return -1;
+        }
         csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count, fs_ptr, csv_delim);
-    else if (rows_fmt)
+    } else if (rows_fmt)
         emit_rows_columns(proj_fields, proj_count, fs_ptr);
     else if (dict_fmt)
-        OUT("{\"results\":{");
+        OUT(want_total ? "{\"rows\":{" : "{\"results\":{");
     else
-        OUT("{\"results\":[");
+        OUT(want_total ? "{\"rows\":[" : "{\"results\":[");
 
     V2FetchCtx fctx = {0};
     fctx.csv_delim = csv_delim;
@@ -7326,6 +7331,10 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
 
     if (csv_delim || rows_fmt) {
         /* No JSON wrapper. CSV / rows formats stream as-is. */
+    } else if (want_total) {
+        /* total mode: emit {"rows":[...],"total":null} — cursor is omitted */
+        const char *close = dict_fmt ? "}" : "]";
+        OUT("%s,\"total\":null}\n", close);
     } else {
         const char *close = dict_fmt ? "}" : "]";
         if (fctx.printed >= limit) {
@@ -7344,14 +7353,15 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
 int cmd_fetch(const char *db_root, const char *object,
                      int offset, int limit, const char *proj_str,
                      const char *cursor, const char *format,
-                     const char *delimiter) {
+                     const char *delimiter, int want_total) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
+    (void)rows_fmt; (void)dict_fmt; (void)csv_delim;
     if (limit <= 0) limit = g_global_limit;
     Schema sch = load_schema(db_root, object);
     return cmd_fetch_v2(db_root, object, offset, limit, proj_str, cursor,
-                         format, delimiter, &sch);
+                         format, delimiter, &sch, want_total);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
     FieldSchema fs_fetch;
@@ -15548,7 +15558,7 @@ int cmd_find(const char *db_root, const char *object,
                     const char *format, const char *delimiter,
                     const char *join_json,
                     const char *order_by, const char *order_dir,
-                    const char *cursor_json) {
+                    const char *cursor_json, int want_total) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
@@ -15628,6 +15638,27 @@ int cmd_find(const char *db_root, const char *object,
     }
 
     compile_criteria_tree(tree, driver_fs.ts);
+
+    /* Mutual exclusion: total and cursor conflict — cursor implies streaming
+       pagination with a continuation token; total implies a fixed-page count.
+       Reject early so neither path has to handle the combination. */
+    if (want_total && cursor_json && cursor_json[0] &&
+        strcmp(cursor_json, "null") != 0) {
+        OUT("{\"error\":\"\\\"total\\\" and \\\"cursor\\\" are mutually exclusive\"}\n");
+        free_joins(joins, njoins);
+        free_criteria_tree(tree);
+        free_excluded(&excluded);
+        return -1;
+    }
+
+    /* total+csv is not supported (CSV has no envelope to wrap). */
+    if (want_total && csv_delim) {
+        OUT("{\"error\":\"\\\"total\\\" with format=csv is not supported\"}\n");
+        free_joins(joins, njoins);
+        free_criteria_tree(tree);
+        free_excluded(&excluded);
+        return -1;
+    }
 
     /* ===== CURSOR PATH (keyset pagination) =====
        If the request carries "cursor": {...}, drive the walk off the
@@ -15833,6 +15864,9 @@ int cmd_find(const char *db_root, const char *object,
                                    proj_count > 0 ? proj_fields : NULL, proj_count,
                                    csv_delim);
         } else {
+            /* rows_fmt/joins always use {"rows":[...]} envelope — want_total
+               just appends ,"total":null before the closing }. No open change
+               needed here; the close is handled below. */
             emit_joined_columns(object, fs_ptr, joins, njoins,
                                 proj_count > 0 ? proj_fields : NULL, proj_count);
         }
@@ -15844,9 +15878,9 @@ int cmd_find(const char *db_root, const char *object,
         emit_rows_columns(proj_fields, proj_count,
                           (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL);
     } else if (dict_fmt) {
-        OUT("{");
+        OUT(want_total ? "{\"rows\":{" : "{");
     } else {
-        OUT("[");
+        OUT(want_total ? "{\"rows\":[" : "[");
     }
 
     int has_order = (order_by && order_by[0] && !has_joins);
@@ -15874,8 +15908,10 @@ int cmd_find(const char *db_root, const char *object,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         /* Close the envelope opened above and return. */
-        if (dict_fmt) OUT("}\n");
-        else          OUT("]\n");
+        if (dict_fmt)
+            OUT(want_total ? "},\"total\":null}\n" : "}\n");
+        else
+            OUT(want_total ? "],\"total\":null}\n" : "]\n");
         free_excluded(&excluded);
         free_criteria_tree(tree);
         free_joins(joins, njoins);
@@ -15902,8 +15938,10 @@ int cmd_find(const char *db_root, const char *object,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         /* Close the envelope opened above and return. */
-        if (dict_fmt) OUT("}\n");
-        else          OUT("]\n");
+        if (dict_fmt)
+            OUT(want_total ? "},\"total\":null}\n" : "}\n");
+        else
+            OUT(want_total ? "],\"total\":null}\n" : "]\n");
         free_excluded(&excluded);
         free_criteria_tree(tree);
         free_joins(joins, njoins);
@@ -15977,9 +16015,12 @@ int cmd_find(const char *db_root, const char *object,
                Turns 14s "scan all, find nothing" into ~constant time
                on selective filters with zero hits. */
             if (prefilter_ks && keyset_size(prefilter_ks) == 0) {
-                if (dict_fmt) OUT("}\n");
-                else if (rows_fmt) OUT("]\n");
-                else OUT("]\n");
+                if (dict_fmt)
+                    OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                else if (rows_fmt)
+                    OUT(want_total ? "],\"total\":null}\n" : "]\n");
+                else
+                    OUT(want_total ? "],\"total\":null}\n" : "]\n");
                 keyset_free(prefilter_ks);
                 free_joins(joins, njoins);
                 free_criteria_tree(tree);
@@ -16085,9 +16126,12 @@ int cmd_find(const char *db_root, const char *object,
                     free(cc.last_key_str);
                     keyset_free(prefilter_ks);
 
-                    if (dict_fmt) OUT("}\n");
-                    else if (rows_fmt) OUT("]\n");
-                    else OUT("]\n");
+                    if (dict_fmt)
+                        OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                    else if (rows_fmt)
+                        OUT(want_total ? "],\"total\":null}\n" : "]\n");
+                    else
+                        OUT(want_total ? "],\"total\":null}\n" : "]\n");
                     free_joins(joins, njoins);
                     free_criteria_tree(tree);
                     free_excluded(&excluded);
@@ -16122,9 +16166,12 @@ int cmd_find(const char *db_root, const char *object,
                                    "", 0, 0,
                                    "\xff\xff\xff\xff", 4, 0,
                                    desc, cursor_find_cb, &cc);
-            if (dict_fmt) OUT("}\n");
-            else if (rows_fmt) OUT("]\n");   /* rows_fmt closing handled below normally */
-            else OUT("]\n");
+            if (dict_fmt)
+                OUT(want_total ? "},\"total\":null}\n" : "}\n");
+            else if (rows_fmt)
+                OUT(want_total ? "],\"total\":null}\n" : "]\n");
+            else
+                OUT(want_total ? "],\"total\":null}\n" : "]\n");
 
             if (prefilter_ks) keyset_free(prefilter_ks);
             free(cc.last_value_str);
@@ -16341,9 +16388,9 @@ int cmd_find(const char *db_root, const char *object,
         find_emit_close:
         if (rc == -2) {
             if (csv_delim) { /* nothing to close */ }
-            else if (has_joins || rows_fmt) OUT("]}\n");
-            else if (dict_fmt) OUT("}\n");
-            else OUT("]\n");
+            else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
+            else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
+            else OUT(want_total ? "],\"total\":null}\n" : "]\n");
             free_excluded(&excluded); free_criteria_tree(tree); free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
             return -1;
@@ -16358,9 +16405,9 @@ int cmd_find(const char *db_root, const char *object,
         if (budget_exceeded) {
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
             if (csv_delim) { /* no envelope to close */ }
-            else if (has_joins || rows_fmt) OUT("]}\n");
-            else if (dict_fmt) OUT("}\n");
-            else OUT("]\n");
+            else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
+            else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
+            else OUT(want_total ? "],\"total\":null}\n" : "]\n");
             free_excluded(&excluded);
             free_criteria_tree(tree);
             free_joins(joins, njoins);
@@ -16397,13 +16444,13 @@ int cmd_find(const char *db_root, const char *object,
     if (csv_delim)
         { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
     else if (has_joins)
-        OUT("]}\n");
+        OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
     else if (rows_fmt)
-        OUT("]}\n");
+        OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
     else if (dict_fmt)
-        OUT("}\n");
+        OUT(want_total ? "},\"total\":null}\n" : "}\n");
     else
-        OUT("]\n");
+        OUT(want_total ? "],\"total\":null}\n" : "]\n");
     free_excluded(&excluded);
 
     free_criteria_tree(tree);
@@ -18982,7 +19029,8 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
                                       int order_desc,
                                       int limit,
                                       CriteriaNode *tree,
-                                      QueryDeadline *dl)
+                                      QueryDeadline *dl,
+                                      int want_total)
 {
     int order_spec_idx = -1;
     for (int i = 0; i < nspecs; i++) {
@@ -19123,7 +19171,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
      * For numeric types, decode via decode_index_key_to_double + format. */
     int gb_is_varchar = ctx.gb_tf && ctx.gb_tf->type == FT_VARCHAR;
 
-    OUT("[");
+    OUT(want_total ? "{\"rows\":[" : "[");
     for (int i = 0; i < n; i++) {
         if (i > 0) OUT(",");
         OUT("{");
@@ -19190,7 +19238,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         OUT("}");
         free(gkeys[i]);
     }
-    OUT("]\n");
+    OUT(want_total ? "],\"total\":null}\n" : "]\n");
 
     free(metrics); free(gkeys); free(gklens);
     free(counts); free(sums); free(mins); free(maxs);
@@ -20660,7 +20708,7 @@ static int agg_minmax_same_field_btree(
         const char *db_root, const char *object, const char *field,
         const char *alias, const TypedField *agg_tf, int splits,
         int is_max, const SearchCriterion *crit,
-        const char *format, const char *delimiter) {
+        const char *format, const char *delimiter, int want_total) {
     int rangeable = (crit->op == OP_EQUAL ||
                      crit->op == OP_GREATER ||
                      crit->op == OP_GREATER_EQ ||
@@ -20738,6 +20786,8 @@ static int agg_minmax_same_field_btree(
         OUT("\n");
         csv_emit_cell(vbuf, csv_delim_local);
         OUT("\n");
+    } else if (want_total) {
+        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", alias, vbuf);
     } else {
         OUT("{\"%s\":%s}\n", alias, vbuf);
     }
@@ -21247,7 +21297,8 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
                                     const TypedField *agg_tf,
                                     KeySet *ks,
                                     const char *format,
-                                    const char *delimiter) {
+                                    const char *delimiter,
+                                    int want_total) {
     int n_idx = index_splits_for(sch->splits);
     int desc  = (spec->fn == AGG_MAX) ? 1 : 0;
     double best = 0.0;
@@ -21286,6 +21337,8 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
         OUT("\n");
         csv_emit_cell(vbuf, csv_delim_local);
         OUT("\n");
+    } else if (want_total) {
+        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", spec->alias, vbuf);
     } else {
         OUT("{\"%s\":%s}\n", spec->alias, vbuf);
     }
@@ -21295,7 +21348,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
                   const char *order_by, int order_desc, int limit,
-                  const char *format, const char *delimiter) {
+                  const char *format, const char *delimiter, int want_total) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     if (!aggregates_json || aggregates_json[0] == '\0') {
         OUT("{\"error\":\"Missing aggregates\"}\n");
@@ -21361,7 +21414,10 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
         if (!needs_varchar_filter) {
             int n = get_live_count(db_root, object);
-            OUT("{\"%s\":%d}\n", specs[0].alias, n);
+            if (want_total)
+                OUT("{\"rows\":{\"%s\":%d},\"total\":null}\n", specs[0].alias, n);
+            else
+                OUT("{\"%s\":%d}\n", specs[0].alias, n);
             free(specs);
             return 0;
         }
@@ -21484,6 +21540,8 @@ int cmd_aggregate(const char *db_root, const char *object,
                 OUT("\n");
                 csv_emit_cell(vbuf, csv_delim_local);
                 OUT("\n");
+            } else if (want_total) {
+                OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", specs[0].alias, vbuf);
             } else {
                 OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
             }
@@ -21609,7 +21667,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                 }
                 OUT("\n");
             } else {
-                OUT("{");
+                OUT(want_total ? "{\"rows\":{" : "{");
                 for (int i = 0; i < nspecs; i++) {
                     if (i > 0) OUT(",");
                     char vbuf[64];
@@ -21630,7 +21688,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                         OUT("\"%s\":%s", specs[i].alias, vbuf); break;
                     }
                 }
-                OUT("}\n");
+                OUT(want_total ? "},\"total\":null}\n" : "}\n");
             }
             free(specs);
             return 0;
@@ -21664,7 +21722,8 @@ int cmd_aggregate(const char *db_root, const char *object,
             int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
                                           specs, nspecs, gb_csv,
                                           order_by, order_desc,
-                                          limit, tree, &topn_dl);
+                                          limit, tree, &topn_dl,
+                                          want_total);
             if (rc == 0) {
                 free_criteria_tree(tree);
                 free(specs);
@@ -21787,7 +21846,7 @@ int cmd_aggregate(const char *db_root, const char *object,
             if (agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
-                    specs[0].fn == AGG_MAX, crit, format, delimiter)) {
+                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
                 free_criteria_tree(tree);
                 free(specs);
                 return 0;
@@ -21858,6 +21917,8 @@ int cmd_aggregate(const char *db_root, const char *object,
                         OUT("\n");
                         csv_emit_cell(vbuf, csv_delim_local);
                         OUT("\n");
+                    } else if (want_total) {
+                        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", specs[0].alias, vbuf);
                     } else {
                         OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
                     }
@@ -21904,7 +21965,7 @@ int cmd_aggregate(const char *db_root, const char *object,
             if (agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
-                    specs[0].fn == AGG_MAX, crit, format, delimiter)) {
+                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
                 free_criteria_tree(tree);
                 free(specs);
                 return 0;
@@ -21931,7 +21992,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     !dl.timed_out && keyset_size(ks) > 0) {
                     emit_min_max_via_keyset(db_root, object, &sch,
                                             &specs[0], agg_tf, ks,
-                                            format, delimiter);
+                                            format, delimiter, want_total);
                     free_criteria_tree(tree);
                     free(specs);
                     return 0;
@@ -21979,7 +22040,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     keyset_size(ks) > 0) {
                     emit_min_max_via_keyset(db_root, object, &sch,
                                             &specs[0], agg_tf, ks,
-                                            format, delimiter);
+                                            format, delimiter, want_total);
                     free_criteria_tree(tree);
                     free(specs);
                     return 0;
@@ -22065,12 +22126,12 @@ int cmd_aggregate(const char *db_root, const char *object,
                 }
                 OUT("\n");
             } else {
-                OUT("{");
+                OUT(want_total ? "{\"rows\":{" : "{");
                 for (int i = 0; i < nspecs; i++) {
                     if (i > 0) OUT(",");
                     OUT("\"%s\":%zu", specs[i].alias, neg);
                 }
-                OUT("}\n");
+                OUT(want_total ? "},\"total\":null}\n" : "}\n");
             }
             free_criteria_tree(tree); agg_free(&ctx); return 0;
         }
@@ -22140,7 +22201,7 @@ int cmd_aggregate(const char *db_root, const char *object,
             }
             OUT("\n");
         } else {
-            OUT("{");
+            OUT(want_total ? "{\"rows\":{" : "{");
             for (int i = 0; i < nspecs; i++) {
                 if (i > 0) OUT(",");
                 int64_t cnt = (acc_full ? acc_full[i].count : 0) - (acc_eq ? acc_eq[i].count : 0);
@@ -22157,7 +22218,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     default: break;
                 }
             }
-            OUT("}\n");
+            OUT(want_total ? "},\"total\":null}\n" : "}\n");
         }
 
         free(bs_eq); free(bs_full);
@@ -22400,7 +22461,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     }
                     OUT("\n");
                 } else {
-                    OUT("{");
+                    OUT(want_total ? "{\"rows\":{" : "{");
                     for (int i = 0; i < nspecs; i++) {
                         if (i > 0) OUT(",");
                         if (specs[i].fn == AGG_COUNT) {
@@ -22419,7 +22480,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                             OUT("\"%s\":%s", specs[i].alias, vbuf);
                         }
                     }
-                    OUT("}\n");
+                    OUT(want_total ? "},\"total\":null}\n" : "}\n");
                 }
 
                 keyset_free(crit_ks);
@@ -23452,7 +23513,7 @@ igb_skip:
     if (ctx.ngroups == 0 && nbuckets == 1) {
         /* No group_by: single object */
         AggBucket *b = buckets[0];
-        OUT("{");
+        OUT(want_total ? "{\"rows\":{" : "{");
         for (int i = 0; i < nspecs; i++) {
             AggAccum *a = &b->accums[i];
             if (i > 0) OUT(",");
@@ -23479,10 +23540,10 @@ igb_skip:
                     break;
             }
         }
-        OUT("}\n");
+        OUT(want_total ? "},\"total\":null}\n" : "}\n");
     } else {
         /* Group_by: array of objects */
-        OUT("[");
+        OUT(want_total ? "{\"rows\":[" : "[");
         for (int bi = 0; bi < nbuckets; bi++) {
             AggBucket *b = buckets[bi];
             if (bi > 0) OUT(",");
@@ -23524,7 +23585,7 @@ igb_skip:
             }
             OUT("}");
         }
-        OUT("]\n");
+        OUT(want_total ? "],\"total\":null}\n" : "]\n");
     }
 
     free(buckets);

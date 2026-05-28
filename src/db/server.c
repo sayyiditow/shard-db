@@ -1464,14 +1464,17 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *ob = json_obj_strdup(&req, "order_by");
         char *od = json_obj_strdup(&req, "order");
         char *cur = json_obj_strdup_raw(&req, "cursor");
+        char *tot_s = json_obj_strdup(&req, "total");
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
+        int want_total = (tot_s && strcmp(tot_s, "true") == 0) ? 1 : 0;
         if (criteria || join)
             cmd_find(db_root, object, criteria ? criteria : "[]",
-                     off, lim, fields, excl, fmt, delim, join, ob, od, cur);
+                     off, lim, fields, excl, fmt, delim, join, ob, od, cur,
+                     want_total);
         else OUT("{\"error\":\"Missing criteria\"}\n");
         free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
-        free(delim); free(join); free(ob); free(od); free(cur);
+        free(delim); free(join); free(ob); free(od); free(cur); free(tot_s);
     } else if (strcmp(mode, "keys") == 0) {
         char *off_s = json_obj_strdup(&req, "offset");
         char *lim_s = json_obj_strdup(&req, "limit");
@@ -1486,8 +1489,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *cur = json_obj_strdup(&req, "cursor");
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
-        cmd_fetch(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fields, cur, fmt, delim);
-        free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim);
+        char *tot_s = json_obj_strdup(&req, "total");
+        int want_total = (tot_s && strcmp(tot_s, "true") == 0) ? 1 : 0;
+        cmd_fetch(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fields, cur, fmt, delim, want_total);
+        free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim); free(tot_s);
     } else if (strcmp(mode, "add-index") == 0) {
         char *field = json_obj_strdup(&req, "field");
         char *fields_arr = json_obj_strdup_raw(&req, "fields");
@@ -1800,11 +1805,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *lim_s = json_obj_strdup(&req, "limit");
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
+        char *tot_s = json_obj_strdup(&req, "total");
         int desc = (od && strcmp(od, "desc") == 0);
         int lim = lim_s ? atoi(lim_s) : 0;
-        cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim);
+        int want_total = (tot_s && strcmp(tot_s, "true") == 0) ? 1 : 0;
+        cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim, want_total);
         free(crit); free(grp); free(aggs); free(hav);
-        free(ob); free(od); free(lim_s); free(fmt); free(delim);
+        free(ob); free(od); free(lim_s); free(fmt); free(delim); free(tot_s);
     } else if (strcmp(mode, "sequence") == 0) {
         char *name = json_obj_strdup(&req, "name");
         char *action = json_obj_strdup(&req, "action");
@@ -2067,12 +2074,12 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "fetch") == 0) {
         /* fetch\tobj\toff\tlim\tfields */
         cmd_fetch(eff_root, object, arg1[0] ? atoi(arg1) : 0,
-                  arg2[0] ? atoi(arg2) : 0, arg3[0] ? arg3 : NULL, NULL, NULL, NULL);
+                  arg2[0] ? atoi(arg2) : 0, arg3[0] ? arg3 : NULL, NULL, NULL, NULL, 0);
     } else if (strcasecmp(cmd, "find") == 0) {
         /* find\tobj\tcriteria\toff\tlim\tfields (excludedKeys/join/order_by via JSON mode only) */
         cmd_find(eff_root, object, arg1,
                  arg2[0] ? atoi(arg2) : 0, arg3[0] ? atoi(arg3) : 0,
-                 arg4[0] ? arg4 : NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                 arg4[0] ? arg4 : NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
     } else if (strcasecmp(cmd, "backup") == 0) {
         cmd_backup(eff_root, object);
     } else if (strcasecmp(cmd, "restore") == 0) {
