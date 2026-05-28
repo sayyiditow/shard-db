@@ -10927,6 +10927,188 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
     return ctx.printed;
 }
 
+/* ============================================================
+   D3 executor: order-index walk + per-record post-filter.
+
+   Walk the order_by btree across its full range in the
+   requested direction (asc or desc).  For each candidate,
+   fetch the record and run the full criteria tree.  Emit
+   matches until limit is reached, applying offset along the
+   way.  Cost is O(limit + records-walked-before-limit-fills),
+   which is dramatically cheaper than scan-and-sort-millions
+   when the broad predicate matches most records (e.g. the
+   feed/profile shape: score>50 order_by time limit 20).
+
+   Key difference from D1: the walk index is the order_by
+   field alone (not a composite), and the criteria tree is
+   checked in full for every fetched record — no leaf is
+   guaranteed-matching by the walk range.
+
+   Constraints checked by caller:
+     • fp.order == FP_ORDER_INDEX_WALK
+     • no joins, no rows_fmt, no csv_delim
+*/
+
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    CriteriaNode  *tree;          /* full tree — checked per record */
+    ExcludedKeys  *excluded;
+    const char   **proj_fields;
+    int            proj_count;
+    int            dict_fmt;
+    int            skip_remaining;
+    int            limit;
+    int            printed;
+    QueryDeadline *dl;
+    int            dl_counter;
+    FILE          *parent_out;
+} OrderIndexWalkCtx;
+
+static int order_index_walk_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *ctx_ptr) {
+    (void)val; (void)vlen;   /* walk value not needed; hash16 is the record key */
+    OrderIndexWalkCtx *c = (OrderIndexWalkCtx *)ctx_ptr;
+    g_out = c->parent_out;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    if (c->printed >= c->limit) return -1;
+
+    /* Fetch the record by hash16. */
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    const uint8_t *key_start = rr.key;
+    const uint8_t *raw       = rr.val;
+    uint32_t       value_len = (uint32_t)rr.vlen;
+
+    /* Excluded-keys check. */
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        if (is_excluded(c->excluded, keybuf)) {
+            release_record_ref(&rr);
+            return 0;
+        }
+    }
+
+    /* Post-filter: apply the FULL criteria tree — unlike D1 nothing is
+       guaranteed to match by the walk range alone. */
+    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Offset skip-after-match. */
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
+        release_record_ref(&rr);
+        return 0;
+    }
+
+    /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
+       excluded by the caller guard so we don't need those branches here. */
+    char key_buf[1024];
+    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
+    memcpy(key_buf, key_start, klen);
+    key_buf[klen] = '\0';
+
+    if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    c->printed++;
+    release_record_ref(&rr);
+    return (c->printed >= c->limit) ? -1 : 0;
+}
+
+/* D3 executor entry point.  order_by is the indexed sort field (e.g. "time").
+   Walk the full btree range in the requested direction; post-filter each
+   fetched record against the full criteria tree.
+   Returns number of rows emitted (≥0) or -1 on deadline. */
+static int find_via_order_index_walk(const char *db_root, const char *object,
+                                     const Schema *sch, FieldSchema *fs,
+                                     const char *order_by, int order_desc,
+                                     CriteriaNode *tree,
+                                     ExcludedKeys *excluded,
+                                     int offset, int limit,
+                                     const char **proj_fields, int proj_count,
+                                     int dict_fmt,
+                                     QueryDeadline *dl)
+{
+    /* Full range: lower = "" (len 0), upper = "\xff\xff\xff\xff" (len 4).
+       btree_idx_walk_ordered's desc flag handles walk direction. */
+    const char *lo = "";
+    size_t      lo_len = 0;
+    const char *hi = "\xff\xff\xff\xff";
+    size_t      hi_len = 4;
+
+    /* Set up the callback context. */
+    OrderIndexWalkCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_root        = db_root;
+    ctx.object         = object;
+    ctx.sch            = sch;
+    ctx.fs             = fs;
+    ctx.tree           = tree;
+    ctx.excluded       = excluded;
+    ctx.proj_fields    = proj_fields;
+    ctx.proj_count     = proj_count;
+    ctx.dict_fmt       = dict_fmt;
+    ctx.skip_remaining = (offset > 0) ? offset : 0;
+    ctx.limit          = (limit > 0)  ? limit  : INT_MAX;
+    ctx.printed        = 0;
+    ctx.dl             = dl;
+    ctx.dl_counter     = 0;
+    ctx.parent_out     = g_out;
+
+    /* Walk the order_by btree across its full range.  The k-way merge
+       delivers entries in (encoded_value, hash16) order — asc or desc
+       per order_desc.  The callback post-filters each record against the
+       full criteria tree and stops when limit is reached. */
+    btree_idx_walk_ordered(db_root, object, order_by, sch->splits,
+                           lo, lo_len, 0,
+                           hi, hi_len, 0,
+                           order_desc, order_index_walk_cb, &ctx);
+
+    return ctx.printed;
+}
+
 enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "eq") == 0 || strcmp(s, "equal") == 0) return OP_EQUAL;
     if (strcmp(s, "neq") == 0 || strcmp(s, "not_equal") == 0) return OP_NOT_EQUAL;
@@ -15992,6 +16174,34 @@ int cmd_find(const char *db_root, const char *object,
             db_root, object, &sch,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             fp.source_leaves[0], order_by, desc,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        /* Close the envelope opened above and return. */
+        if (dict_fmt) OUT("}\n");
+        else          OUT("]\n");
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    } else if (fp.order == FP_ORDER_INDEX_WALK &&
+               !has_joins && !rows_fmt && !csv_delim) {
+        /* ===== D3: order-index walk + per-record post-filter (Phase 1c step 4/6) =====
+           Walk the order_by btree full range in the requested direction;
+           post-filter the full criteria tree per fetched record; stop at
+           limit.  O(limit + records-walked-before-limit-fills) — dramatically
+           cheaper than scan-and-sort-millions for the feed/profile shape
+           (broad filter + indexed order_by, no composite).
+
+           Guards: same as D1 — no joins (tabular materialise), no rows_fmt
+           (table envelope needs full collect), no csv_delim (header row needs
+           full schema scan).  Those cases fall through to the existing
+           ordered-collect + in-memory sort path. */
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        find_via_order_index_walk(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            order_by, desc,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         /* Close the envelope opened above and return. */
