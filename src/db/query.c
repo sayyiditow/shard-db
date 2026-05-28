@@ -12495,6 +12495,43 @@ order_overlay:
     return fp;
 }
 
+/* Phase 1c adapter: compose a legacy QueryPlan from a FilterPlan so executors
+ * (keyset_find_from_intersect, build_keyset_from_plan, and the cmd_find/cmd_fetch
+ * dispatch cascade) can consume plan_filter's output without per-call-site
+ * surgery. Only the fields the executors actually read are populated:
+ * `primary_idx_path` and `intersect_paths` are vestigial (idx_find_parallel
+ * marks the path arg `(void)` at query.c:10508; keyset_find_from_intersect
+ * uses only intersect_leaves/intersect_count/partial_intersect). Deleted in
+ * 1c.6 alongside QueryPlan and choose_primary_source. */
+__attribute__((unused))
+static QueryPlan qp_from_fp(const FilterPlan *fp) {
+    QueryPlan p = {0};
+    switch (fp->kind) {
+        case FP_FULL_SCAN:
+            p.kind = PRIMARY_NONE;
+            break;
+        case FP_PRIMARY_LEAF:
+        case FP_BITMAP_SMALLER:
+            /* Legacy executors handle a lone bitmap via the PRIMARY_LEAF path
+             * (btree_dispatch's IT_BITMAP branch); BITMAP_SMALLER routes there. */
+            p.kind = PRIMARY_LEAF;
+            p.primary_leaf = fp->n_source > 0 ? fp->source_leaves[0] : NULL;
+            break;
+        case FP_INTERSECT:
+            p.kind = PRIMARY_INTERSECT;
+            p.intersect_count = fp->n_source;
+            p.partial_intersect = (fp->n_postfilter > 0);
+            for (int i = 0; i < fp->n_source && i < MAX_INTERSECT_LEAVES; i++)
+                p.intersect_leaves[i] = fp->source_leaves[i];
+            break;
+        case FP_UNION:
+            p.kind = PRIMARY_KEYSET;
+            p.or_node = fp->or_node;
+            break;
+    }
+    return p;
+}
+
 #ifdef TEST_BUILD
 static const char *fp_kind_str(FilterPlanKind k){
     switch(k){case FP_FULL_SCAN:return "scan";case FP_PRIMARY_LEAF:return "leaf";
@@ -15598,7 +15635,14 @@ int cmd_find(const char *db_root, const char *object,
            without paying the fetch + criteria_match per record. The
            threshold falls back to the legacy per-record path when
            the candidate set is too broad to materialise. */
-        QueryPlan cursor_plan = choose_primary_source(tree, db_root, object);
+        /* Phase 1c.2: plan_filter + qp_from_fp adapter; cursor's prefilter
+         * uses the same candidate-source decision plan_filter already makes.
+         * order_by is always present in the cursor path (asserted above). */
+        size_t cursor_N_live = (size_t)get_live_count(db_root, object);
+        FilterPlan cursor_fp = plan_filter(tree, db_root, object, &driver_fs,
+                                            sch.splits, cursor_N_live,
+                                            order_by, 1 /*fetching*/);
+        QueryPlan cursor_plan = qp_from_fp(&cursor_fp);
         KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_plan,
                                                             db_root, object,
                                                             &sch, &cdl);
@@ -15693,7 +15737,19 @@ int cmd_find(const char *db_root, const char *object,
         return 0;
     }
 
-    QueryPlan plan = choose_primary_source(tree, db_root, object);
+    /* Phase 1c.2: plan_filter is the planner; qp_from_fp adapts it to the
+     * existing QueryPlan-shaped executor cascade (no executor-call-site
+     * changes needed). FP_ORDER_COMPOSITE / FP_ORDER_INDEX_WALK collapse to
+     * PRIMARY_LEAF/INTERSECT and the existing ordered-collect path handles
+     * order_by via in-memory sort — 1c.3 (D1) and 1c.4 (D3) add the
+     * dedicated executors. order_by passed only when present and joins
+     * absent (joins use rows_fmt with explicit ordering). */
+    size_t find_N_live = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &driver_fs,
+                                sch.splits, find_N_live,
+                                (order_by && order_by[0] && !has_joins) ? order_by : NULL,
+                                1 /*fetching=find*/);
+    QueryPlan plan = qp_from_fp(&fp);
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
