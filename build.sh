@@ -214,6 +214,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_find_orderby_selective.c \
     src/test/cases/test_planner_trigram_selectivity.c \
     src/test/cases/test_cardinality_estimate.c \
+    src/test/cases/test_planner_cost_model.c \
     src/test/cases/test_slow_query_log.c \
     src/db/util.c \
     src/db/slotcask.c \
@@ -308,6 +309,9 @@ export LOG_DIR="../logs"
 export LOG_LEVEL=3
 export LOG_RETAIN_DAYS=7
 export SLOW_QUERY_MS=500
+# Cost-model: random-read penalty vs sequential (fetch-and-check beats full
+# scan when matches < live_rows / RANDOM_SEQ_COST_RATIO). Higher = prefer scan.
+export RANDOM_SEQ_COST_RATIO=8
 
 # Threading + concurrency
 export THREADS=0

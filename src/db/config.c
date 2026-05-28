@@ -55,6 +55,7 @@ uint64_t g_bt_cache_misses = 0;
 uint64_t g_server_start_ms = 0;
 uint64_t g_slow_query_count = 0;
 int g_slow_query_ms = 500;  /* configurable via SLOW_QUERY_MS */
+int g_random_seq_ratio = 8;  /* configurable via RANDOM_SEQ_COST_RATIO */
 
 /* vacuum-check thresholds — drive the "vacuum":true recommendation in
    `vacuum-check` AND the auto-vacuum thread's selection logic (one source
@@ -483,6 +484,11 @@ int load_db_root(char *out, size_t outlen) {
                 if (n > 600000) n = 600000;
                 g_slow_query_ms = n;
             }
+        } else if (strncmp(p, "RANDOM_SEQ_COST_RATIO=", 22) == 0) {
+            int n = atoi(p + 22);
+            if (n < 1)   n = 1;
+            if (n > 100) n = 100;
+            g_random_seq_ratio = n;
         } else if (strncmp(p, "VACUUM_RECOMMEND_TOMBSTONE_PCT=", 31) == 0) {
             int n = atoi(p + 31);
             if (n >= 1 && n <= 100) g_vacuum_recommend_pct = n;
