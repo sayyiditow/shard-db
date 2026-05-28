@@ -215,6 +215,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_planner_trigram_selectivity.c \
     src/test/cases/test_cardinality_estimate.c \
     src/test/cases/test_planner_cost_model.c \
+    src/test/cases/test_ft_float_consistency.c \
     src/test/cases/test_slow_query_log.c \
     src/db/util.c \
     src/db/slotcask.c \
