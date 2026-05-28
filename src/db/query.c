@@ -12261,6 +12261,18 @@ static int composite_index_exists(const char *db_root, const char *object,
     return field_has_index_type(db_root, object, name, IT_BTREE);
 }
 
+/* True if `order_by` has a btree index that can drive an ORDER_INDEX_WALK
+ * (D3 from the decision table).  When this is the case the B5 demotion
+ * (broad single leaf → FULL_SCAN) must be suppressed so the seed stays
+ * PRIMARY_LEAF and the order overlay below can set FP_ORDER_INDEX_WALK.
+ * Composite indexes are handled separately by composite_index_exists. */
+__attribute__((unused))
+static int order_field_drivable(const char *db_root, const char *object,
+                                const char *order_by) {
+    if (!order_by || !order_by[0]) return 0;
+    return field_has_index_type(db_root, object, order_by, IT_BTREE);
+}
+
 /* Flatten a tree into its AND-leaves (the implicit-AND children, or a lone
  * leaf). OR sub-trees and nested AND are handled by the caller; here we only
  * collect direct LEAF children for the per-leaf cost pass. Returns count. */
@@ -12423,11 +12435,15 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
          * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
         if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated
-                && op_eligible_for_intersect(leaves[prim]->op)) {
+                && op_eligible_for_intersect(leaves[prim]->op)
+                && !order_field_drivable(db_root, object, order_by)) {
             /* broad non-bitmap PRECISE-lookup leaf: K > budget → fetch loses
              * to a data scan (B5). Leaf-scan ops (contains/like/ends/regex/
              * len_* and their i-variants) are NOT demoted here — their index
-             * leaf-scan always beats a data-file scan (A4). */
+             * leaf-scan always beats a data-file scan (A4). Also NOT demoted
+             * when an indexed order_by is available (D3: ORDER_INDEX_WALK is
+             * cheaper than scan-and-sort — the order overlay below sets it for
+             * the saturated seed). */
             fp.kind = FP_FULL_SCAN; return fp;
         }
         fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);

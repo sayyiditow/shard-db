@@ -801,3 +801,88 @@ static int test_plan_total_cheap(void) {
     return 0;
 }
 TEST_REGISTER("test-plan-total-cheap", test_plan_total_cheap)
+
+/* D3 single-leaf: broad btree leaf + indexed order_by → demotion suppressed.
+ *
+ * Two scenarios:
+ *  (a) order_by field IS btree-indexed → demotion must be suppressed so the
+ *      seed stays PRIMARY_LEAF and the order overlay fires (saturated seed →
+ *      FP_ORDER_INDEX_WALK / "walk").  Currently broken: B5 guard demotes to
+ *      FULL_SCAN before the overlay runs.
+ *  (b) order_by field is NOT indexed → demotion fires → FULL_SCAN (regression
+ *      lock: this is correct behaviour that must stay true after the fix).
+ *
+ * Object layout:
+ *   score:int  (btree-indexed) — criteria leaf: score > 50 (broad, gt eligible
+ *                                 for intersect → B5 guard fires without fix)
+ *   time:long  (btree-indexed) — order_by field for scenario (a)
+ *   note:varchar:32 (NOT indexed) — order_by field for scenario (b)
+ *
+ * Data: 250 rows all with score=100 (> 50) → N=250, budget=250/8=31.
+ *   K for "score>50" = 250 > 31 → saturated → demotion guard fires.
+ */
+static int test_planD3_single_leaf_indexed_order(void) {
+    TestEnv env={0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    char *resp = NULL;
+    /* add-dir */
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+
+    /* create object: score + time indexed, note NOT indexed */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"d3sl\","
+        "\"splits\":8,\"max_key\":12,"
+        "\"fields\":[\"score:int\",\"time:long\",\"note:varchar:32\"],"
+        "\"indexes\":[\"score\",\"time\"]}",
+        &resp); free(resp); resp = NULL;
+
+    /* insert 250 rows: score=100, time=i, note="x" */
+    char body[65536]; int bp = 0, ki = 0;
+    bp += snprintf(body+bp, sizeof(body)-bp, "{");
+    for (int i = 0; i < 250; i++) {
+        bp += snprintf(body+bp, sizeof(body)-bp,
+            "%s\"r%d\":{\"score\":\"100\",\"time\":\"%d\",\"note\":\"x\"}",
+            ki == 0 ? "" : ",", ki, i);
+        ki++;
+    }
+    bp += snprintf(body+bp, sizeof(body)-bp, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3sl\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    char f[64]={0}, o[32]={0};
+    int cheap = -1;
+
+    /* (a) order_by="time" (indexed btree) — demotion must be suppressed.
+     *   Expected: kind="leaf" (PRIMARY_LEAF, NOT demoted to scan),
+     *             out_order="walk" (saturated seed → ORDER_INDEX_WALK). */
+    const char *k_a = plan_filter_kind_for_test(env.db_root, "default/d3sl",
+        "[{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}]",
+        "time", 1,
+        f, sizeof(f), o, sizeof(o), &cheap);
+    ASSERT_EQ_STR(k_a, "leaf",
+        "D3 single-leaf: indexed order_by suppresses B5 demotion → PRIMARY_LEAF");
+    ASSERT_EQ_STR(o, "walk",
+        "D3 single-leaf: saturated seed + indexed order_by → ORDER_INDEX_WALK");
+
+    /* (b) order_by="note" (NOT indexed) — demotion must still fire → FULL_SCAN.
+     *   Regression lock: no indexed order_by means B5 should demote as before. */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o)); cheap = -1;
+    const char *k_b = plan_filter_kind_for_test(env.db_root, "default/d3sl",
+        "[{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}]",
+        "note", 1,
+        f, sizeof(f), o, sizeof(o), &cheap);
+    ASSERT_EQ_STR(k_b, "scan",
+        "D3 single-leaf dual: unindexed order_by → B5 demotion still fires → FULL_SCAN");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-d3-single-leaf-indexed-order", test_planD3_single_leaf_indexed_order)
