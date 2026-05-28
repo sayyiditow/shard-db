@@ -12768,9 +12768,21 @@ order_overlay:
     if (order_by && order_by[0] && fp.kind != FP_FULL_SCAN && fp.n_source > 0) {
         /* D1: a (seed_field + order_by) composite index exists → the index
          * already delivers rows in (filter_field, order_by) order → sorted
-         * prefix scan; no in-memory sort and no extra index walk needed. */
+         * prefix scan; no in-memory sort and no extra index walk needed.
+         *
+         * Gated on the seed op being EQ or STARTS_WITH: find_via_composite_prefix
+         * bounds the walk as [encoded(value), encoded(value)+0xff*4] — that's
+         * the prefix-range pattern. For GTE/LT/BETWEEN/IN seeds, those bounds
+         * are wrong (cuts off the actual range we need to scan) and the
+         * executor returns ~0 rows. Those ops fall through to ORDER_SORT /
+         * ORDER_INDEX_WALK below, which correctly post-filter the criterion
+         * per fetched record. (Symptom that surfaced: showcase trending
+         * `time>=since order_by score` returned [] because the composite
+         * prefix range didn't actually cover the seek range.) */
         if (composite_index_exists(db_root, object,
-                                   fp.source_leaves[0]->field, order_by)) {
+                                   fp.source_leaves[0]->field, order_by)
+            && (fp.source_leaves[0]->op == OP_EQUAL ||
+                fp.source_leaves[0]->op == OP_STARTS_WITH)) {
             fp.order = FP_ORDER_COMPOSITE;
         } else {
             /* D2 vs D3: if the seed leaf's candidate set is bounded (estimable
