@@ -6,7 +6,7 @@
  *   - find with "total":true → {"rows":[...], "total":null}  (envelope shape)
  *   - find with both "total":true and "cursor":{} → error
  *   - aggregate without "total" → bare array / bare object (unchanged)
- *   - aggregate with "total":true → {"rows":[...], "total":null}
+ *   - aggregate with "total":true → {"rows":[...], "total":N} (real value since 1d.3)
  *   - fetch with "total":true → {"rows":[...], "total":null}
  *
  * Phase 1d.2 tests (real totals):
@@ -30,6 +30,10 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ helpers */
+
+/* Forward declarations for helpers defined in the 1d.2 section below. */
+static int extract_total(const char *resp);
+static int count_agg_rows(const char *resp);
 
 static TestClient *setup_obj(TestEnv *env, const char *obj,
                              const char *fields, const char *indexes) {
@@ -240,7 +244,8 @@ static int test_aggregate_without_total(void) {
 }
 TEST_REGISTER("test-aggregate-without-total", test_aggregate_without_total)
 
-/* aggregate with "total":true and group_by → {"rows":[...], "total":null} */
+/* aggregate with "total":true and group_by → {"rows":[...], "total":N} */
+/* insert_rows inserts 5 rows with tag="t0".."t4" (all distinct) → 5 groups. */
 static int test_aggregate_with_total_group(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "awt2",
@@ -256,7 +261,9 @@ static int test_aggregate_with_total_group(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "agg+total+group response not null");
     ASSERT_CONTAINS(resp, "\"rows\"", "agg+total group → rows key");
-    ASSERT_CONTAINS(resp, "\"total\":null", "agg+total group → total:null");
+    /* Now returns real total = 5 distinct groups (Phase 1d.3). */
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 5, "agg+total group → total = 5 distinct groups");
     /* rows value should be an array */
     const char *rows_pos = strstr(resp, "\"rows\":");
     ASSERT_NOT_NULL(rows_pos, "rows key found in agg response");
@@ -270,7 +277,8 @@ static int test_aggregate_with_total_group(void) {
 }
 TEST_REGISTER("test-aggregate-with-total-group", test_aggregate_with_total_group)
 
-/* aggregate with "total":true and no group_by → {"rows":{...}, "total":null} */
+/* aggregate with "total":true and no group_by → {"rows":{...}, "total":1} */
+/* No group_by always produces exactly one scalar row → total = 1. */
 static int test_aggregate_with_total_nogroup(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "awt3",
@@ -286,7 +294,9 @@ static int test_aggregate_with_total_nogroup(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "agg+total no-group response not null");
     ASSERT_CONTAINS(resp, "\"rows\"", "agg+total no-group → rows key");
-    ASSERT_CONTAINS(resp, "\"total\":null", "agg+total no-group → total:null");
+    /* Now returns real total = 1 (single scalar row, Phase 1d.3). */
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 1, "agg+total no-group → total = 1 (scalar row)");
     free(resp);
 
     tc_close(tc); test_env_stop(&env);
@@ -807,3 +817,207 @@ static int test_real_total_d3_order_walk(void) {
     return 0;
 }
 TEST_REGISTER("test-real-total-d3-order-walk", test_real_total_d3_order_walk)
+
+/* ================================================================
+ * Phase 1d.3 tests — cmd_aggregate computes total group count
+ * ================================================================ */
+
+/* Count objects in a JSON array or object by counting "{" at depth 1. */
+static int count_agg_rows(const char *resp) {
+    if (!resp) return 0;
+    /* Locate the rows value: either {"rows":[...]} or bare [...] / {single} */
+    const char *start = strstr(resp, "\"rows\":");
+    if (start) {
+        start += 7; /* skip "rows": */
+        while (*start == ' ' || *start == '\t') start++;
+    } else {
+        start = resp;
+    }
+    if (*start == '{') return 1;   /* single-row no-group object */
+    if (*start != '[') return 0;
+    start++;
+    int depth = 0, n = 0;
+    for (const char *p = start; *p; p++) {
+        if (*p == '{') { if (depth == 0) n++; depth++; }
+        else if (*p == '}') { depth--; }
+        else if (*p == ']' && depth == 0) break;
+    }
+    return n;
+}
+
+/* ---- aggregate group_by + total: 50 records, 5 distinct tags, limit=3 --- */
+/* Inserts 50 records with tag cycling "g0".."g4" (10 each).
+   aggregate count() group_by=tag limit=3 total=true
+   → rows.length=3, total=5 (5 distinct groups, page limits to 3). */
+static int test_agg_total_groupby(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "at_gb",
+        "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
+    if (!tc) return 1;
+
+    char body[4096]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 50; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"r%d\":{\"tag\":\"g%d\",\"score\":%d}",
+            i ? "," : "", i, i % 5, i * 2);
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[4200];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+        "\"object\":\"at_gb\",\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"at_gb\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"cnt\"}],"
+        "\"group_by\":[\"tag\"],\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "agg groupby → response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "agg groupby → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 5, "agg groupby → total = 5 (5 distinct groups)");
+    int nrows = count_agg_rows(resp);
+    ASSERT_EQ_INT(nrows, 3, "agg groupby → rows length = 3 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-agg-total-groupby", test_agg_total_groupby)
+
+/* ---- aggregate no-group + total: 100 records, count() → total=1 --------- */
+/* aggregate count() total=true on 100 records → rows.length=1, total=1
+   (single scalar row — always 1 by definition). */
+static int test_agg_total_nogroup(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "at_ng",
+        "\"score:int\"", "\"score\"");
+    if (!tc) return 1;
+
+    char body[8192]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 100; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"r%d\":{\"score\":%d}", i ? "," : "", i, i);
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[8300];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+        "\"object\":\"at_ng\",\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"at_ng\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"cnt\"}],"
+        "\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "agg no-group → response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "agg no-group → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 1, "agg no-group → total = 1 (single scalar row)");
+    int nrows = count_agg_rows(resp);
+    ASSERT_EQ_INT(nrows, 1, "agg no-group → rows length = 1");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-agg-total-nogroup", test_agg_total_nogroup)
+
+/* ---- aggregate streaming top-N + total: total=null (documented fallback) - */
+/* eligible_for_topn_stream requires: single group_by, order_by an agg alias,
+   limit > 0.  Insert 200 records with 20 distinct tags (10 each), then
+   aggregate count() group_by=tag order_by=cnt desc limit=3 total=true.
+   The streaming path doesn't materialise a full group table → total=null. */
+static int test_agg_total_streaming_topn(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "at_sn",
+        "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
+    if (!tc) return 1;
+
+    char body[16384]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i = 0; i < 200; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"r%d\":{\"tag\":\"t%02d\",\"score\":%d}",
+            i ? "," : "", i, i % 20, i);
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[16600];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+        "\"object\":\"at_sn\",\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    /* This request shape is exactly what eligible_for_topn_stream requires. */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"at_sn\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"cnt\"}],"
+        "\"group_by\":[\"tag\"],\"order_by\":\"cnt\",\"order_desc\":true,"
+        "\"limit\":3,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "agg streaming topN → response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "agg streaming topN → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, -999, "agg streaming topN → total = null (documented fallback)");
+    int nrows = count_agg_rows(resp);
+    ASSERT_EQ_INT(nrows, 3, "agg streaming topN → rows length = 3 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-agg-total-streaming-topn", test_agg_total_streaming_topn)
+
+/* ---- aggregate group_by + criteria + total: filtered group count ---------- */
+/* Insert 50 records: 5 authors × 10 records each, half with active=1.
+   aggregate count() group_by=author criteria=[active=1] limit=2 total=true
+   → total = 5 (all 5 authors appear in active records), rows = 2 (limit). */
+static int test_agg_total_groupby_filtered(void) {
+    TestEnv env = {0};
+    TestClient *tc = setup_obj(&env, "at_gf",
+        "\"author:varchar:8\",\"active:bool\"",
+        "\"author\",\"active\"");
+    if (!tc) return 1;
+
+    char body[4096]; int p = 0; char *resp = NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    /* 5 authors, each with 5 active + 5 inactive records (10 total) */
+    int k = 0;
+    for (int a = 0; a < 5; a++) {
+        for (int j = 0; j < 10; j++) {
+            p += snprintf(body+p, sizeof(body)-p,
+                "%s\"r%d\":{\"author\":\"au%d\",\"active\":%s}",
+                k ? "," : "", k, a, j < 5 ? "true" : "false");
+            k++;
+        }
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[4200];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+        "\"object\":\"at_gf\",\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"at_gf\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"cnt\"}],"
+        "\"group_by\":[\"author\"],"
+        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],"
+        "\"limit\":2,\"total\":true}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "agg filtered groupby → response not null");
+    ASSERT_CONTAINS(resp, "\"rows\"", "agg filtered groupby → rows key present");
+    int total = extract_total(resp);
+    ASSERT_EQ_INT(total, 5, "agg filtered groupby → total = 5 (5 authors with active records)");
+    int nrows = count_agg_rows(resp);
+    ASSERT_EQ_INT(nrows, 2, "agg filtered groupby → rows length = 2 (limit)");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-agg-total-groupby-filtered", test_agg_total_groupby_filtered)

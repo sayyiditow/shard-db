@@ -20929,7 +20929,7 @@ static int agg_minmax_same_field_btree(
         csv_emit_cell(vbuf, csv_delim_local);
         OUT("\n");
     } else if (want_total) {
-        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", alias, vbuf);
+        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", alias, vbuf);
     } else {
         OUT("{\"%s\":%s}\n", alias, vbuf);
     }
@@ -21480,7 +21480,7 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
         csv_emit_cell(vbuf, csv_delim_local);
         OUT("\n");
     } else if (want_total) {
-        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", spec->alias, vbuf);
+        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", spec->alias, vbuf);
     } else {
         OUT("{\"%s\":%s}\n", spec->alias, vbuf);
     }
@@ -21557,7 +21557,7 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (!needs_varchar_filter) {
             int n = get_live_count(db_root, object);
             if (want_total)
-                OUT("{\"rows\":{\"%s\":%d},\"total\":null}\n", specs[0].alias, n);
+                OUT("{\"rows\":{\"%s\":%d},\"total\":1}\n", specs[0].alias, n);
             else
                 OUT("{\"%s\":%d}\n", specs[0].alias, n);
             free(specs);
@@ -21683,7 +21683,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                 csv_emit_cell(vbuf, csv_delim_local);
                 OUT("\n");
             } else if (want_total) {
-                OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", specs[0].alias, vbuf);
+                OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", specs[0].alias, vbuf);
             } else {
                 OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
             }
@@ -21830,7 +21830,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                         OUT("\"%s\":%s", specs[i].alias, vbuf); break;
                     }
                 }
-                OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                OUT(want_total ? "},\"total\":1}\n" : "}\n");
             }
             free(specs);
             return 0;
@@ -22060,7 +22060,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                         csv_emit_cell(vbuf, csv_delim_local);
                         OUT("\n");
                     } else if (want_total) {
-                        OUT("{\"rows\":{\"%s\":%s},\"total\":null}\n", specs[0].alias, vbuf);
+                        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", specs[0].alias, vbuf);
                     } else {
                         OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
                     }
@@ -22273,7 +22273,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     if (i > 0) OUT(",");
                     OUT("\"%s\":%zu", specs[i].alias, neg);
                 }
-                OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                OUT(want_total ? "},\"total\":1}\n" : "}\n");
             }
             free_criteria_tree(tree); agg_free(&ctx); return 0;
         }
@@ -22360,7 +22360,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     default: break;
                 }
             }
-            OUT(want_total ? "},\"total\":null}\n" : "}\n");
+            OUT(want_total ? "},\"total\":1}\n" : "}\n");
         }
 
         free(bs_eq); free(bs_full);
@@ -22622,7 +22622,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                             OUT("\"%s\":%s", specs[i].alias, vbuf);
                         }
                     }
-                    OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                    OUT(want_total ? "},\"total\":1}\n" : "}\n");
                 }
 
                 keyset_free(crit_ks);
@@ -22660,7 +22660,10 @@ int cmd_aggregate(const char *db_root, const char *object,
        cheaper than millions of per-record lookups. Abort and fall
        through to IGB cleanly — nothing has been written to ctx.ht yet. */
 #define VS_RUN_HASH_CAP 16384
-    int vs_eligible = (tree == NULL && no_having &&
+    /* VS path stops at `limit` entries — ctx.ht never has the full group
+       count.  When the caller needs total, fall through to IGB (which builds
+       the full hash table) so agg_total_groups is exact. */
+    int vs_eligible = (!want_total && tree == NULL && no_having &&
                        (!order_by || !order_by[0]) &&
                        limit > 0 && limit <= 100000 &&
                        ctx.ngroups == 1 && ctx.group_tfs[0] &&
@@ -23605,8 +23608,9 @@ igb_skip:
         qsort(buckets, nbuckets, sizeof(AggBucket *), agg_sort_cmp);
     }
 
-    /* Apply limit */
+    /* Apply limit — capture pre-limit group count for total. */
     if (limit <= 0) limit = g_global_limit;
+    int agg_total_groups = nbuckets;   /* distinct groups BEFORE limit truncation */
     if (nbuckets > limit) nbuckets = limit;
 
     /* Output — CSV path short-circuits before JSON emit. */
@@ -23682,7 +23686,7 @@ igb_skip:
                     break;
             }
         }
-        OUT(want_total ? "},\"total\":null}\n" : "}\n");
+        OUT(want_total ? "},\"total\":1}\n" : "}\n");
     } else {
         /* Group_by: array of objects */
         OUT(want_total ? "{\"rows\":[" : "[");
@@ -23727,7 +23731,8 @@ igb_skip:
             }
             OUT("}");
         }
-        OUT(want_total ? "],\"total\":null}\n" : "]\n");
+        if (want_total) OUT("],\"total\":%d}\n", agg_total_groups);
+        else OUT("]\n");
     }
 
     free(buckets);
