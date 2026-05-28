@@ -96,7 +96,7 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -220,6 +220,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_ft_float_consistency.c \
     src/test/cases/test_slow_query_log.c \
     src/test/cases/test_find_with_total.c \
+    src/test/cases/test_o_direct_scan.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \
@@ -232,6 +233,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/db/bitmap.c \
     src/db/trigram.c \
     src/db/objlock.c \
+    src/db/io_direct.c \
     src/db/query.c \
     src/db/server.c \
     src/db/config.c \
@@ -274,6 +276,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/tls.c \
     src/db/slotcask.c \
     src/db/simd.c \
+    src/db/io_direct.c \
     src/db/query.c \
     src/db/config.c \
     -Isrc/db -Isrc/test -Isrc/bench \

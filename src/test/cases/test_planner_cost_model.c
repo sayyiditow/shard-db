@@ -886,3 +886,198 @@ static int test_planD3_single_leaf_indexed_order(void) {
     return 0;
 }
 TEST_REGISTER("test-plan-d3-single-leaf-indexed-order", test_planD3_single_leaf_indexed_order)
+
+/* A3: starts_with on a trigram-only field (no btree) with prefix >= 3 chars.
+ * Before fix: pick_index_for_leaf returns -1 for OP_STARTS_WITH when only a
+ * trigram index exists → plan_filter falls through to FP_FULL_SCAN → "scan".
+ * After fix: pick_index_for_leaf returns IT_TRIGRAM for prefix >= 3 chars →
+ * plan_filter sees the leaf as indexed → FP_PRIMARY_LEAF → "leaf".
+ *
+ * Object cm_a3: title:varchar:64 indexed with trigram only (no btree).
+ * 20 rows with title="Show HN: ...", 80 rows with unrelated titles.
+ * Criteria: [{title starts_with "Show HN"}] (7 chars >= 3 → trigram eligible).
+ * Expected: kind="leaf", seed_field="title". */
+static int test_planA3_trigram_starts_with(void) {
+    TestEnv env = {0};
+    /* trigram-only index on title: no btree */
+    TestClient *tc = cm_setup(&env, "cm_a3",
+        "\"title:varchar:64\"",
+        "\"title:trigram\"");
+    if (!tc) return 1;
+
+    /* Insert 20 rows title="Show HN: <i>" and 80 unrelated rows. */
+    char body[65536]; int p = 0, k = 0; char *resp = NULL;
+    p += snprintf(body + p, sizeof(body) - p, "{");
+    for (int i = 0; i < 20; i++) {
+        p += snprintf(body + p, sizeof(body) - p,
+            "%s\"k%d\":{\"title\":\"Show HN: item %d\"}",
+            k == 0 ? "" : ",", k, i);
+        k++;
+    }
+    for (int i = 0; i < 80; i++) {
+        p += snprintf(body + p, sizeof(body) - p,
+            ",\"k%d\":{\"title\":\"Ask HN: something %d\"}", k, i);
+        k++;
+    }
+    p += snprintf(body + p, sizeof(body) - p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp); resp = NULL;
+
+    char f[64] = {0}, o[16] = {0};
+    /* Prefix "Show HN" is 7 chars >= 3 → trigram eligible.
+     * Planner must return "leaf" (not "scan") and seed on "title". */
+    const char *kind = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind, "leaf",
+        "A3: starts_with on trigram-only field (prefix>=3) → PRIMARY_LEAF, not FULL_SCAN");
+    ASSERT_EQ_STR(f, "title",
+        "A3: seed field is 'title'");
+
+    /* Also verify fetching=0 (count path) — same result. */
+    memset(f, 0, sizeof(f)); memset(o, 0, sizeof(o));
+    const char *kind_count = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}]",
+        NULL, 0, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind_count, "leaf",
+        "A3 count: starts_with on trigram-only field stays leaf on count path too");
+
+    /* Short prefix (<3 chars) must still fall to scan — no trigram extractable. */
+    memset(f, 0, sizeof(f)); memset(o, 0, sizeof(o));
+    const char *kind_short = plan_filter_kind_for_test(env.db_root, "default/cm_a3",
+        "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Sh\"}]",
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+    ASSERT_EQ_STR(kind_short, "scan",
+        "A3 short: prefix <3 chars → no usable trigram → FULL_SCAN");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-a3-trigram-starts-with", test_planA3_trigram_starts_with)
+
+/* ============================================================
+ * A3 executor: find_via_trigram_starts_with (Phase 1e step 2/5)
+ *
+ * Object cm_a3exec: title:varchar:64 indexed with trigram only (no btree).
+ * 30 rows with title="Show HN: foo bar <i>", 100 with other prefixes.
+ * Tests:
+ *   1. Plan kind = "leaf" for starts_with (1e.1 confirmed).
+ *   2. find {title starts "Show HN"} limit=10 → 10 rows all with "Show HN" prefix.
+ *   3. Negative: title starts "Show HN: missing xxx" → empty array.
+ *   4. Edge: prefix < 3 chars → full scan, still correct (plan kind = "scan").
+ * ============================================================ */
+static int test_a3_trigram_starts_with_executor(void) {
+    TestEnv env = {0};
+    /* trigram-only index on title — no btree */
+    TestClient *tc = cm_setup(&env, "cm_a3exec",
+        "\"title:varchar:64\"",
+        "\"title:trigram\"");
+    if (!tc) return 1;
+
+    /* Insert 30 "Show HN: foo bar <i>" rows (keys s0..s29) */
+    {
+        char body[65536]; int p = 0, k = 0; char *resp = NULL;
+        p += snprintf(body + p, sizeof(body) - p, "{");
+        for (int i = 0; i < 30; i++) {
+            p += snprintf(body + p, sizeof(body) - p,
+                "%s\"s%d\":{\"title\":\"Show HN: foo bar %d\"}",
+                k == 0 ? "" : ",", i, i);
+            k++;
+        }
+        /* 50 "Ask HN: ..." rows */
+        for (int i = 0; i < 50; i++) {
+            p += snprintf(body + p, sizeof(body) - p,
+                ",\"a%d\":{\"title\":\"Ask HN: question %d\"}", i, i);
+        }
+        /* 50 "How to ..." rows */
+        for (int i = 0; i < 50; i++) {
+            p += snprintf(body + p, sizeof(body) - p,
+                ",\"h%d\":{\"title\":\"How to do thing %d\"}", i, i);
+        }
+        p += snprintf(body + p, sizeof(body) - p, "}");
+        char req[66560];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3exec\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp); free(resp);
+    }
+
+    /* 1. Plan kind check: starts_with "Show HN" (7 chars >= 3) → leaf. */
+    {
+        char f[64] = {0}, o[16] = {0};
+        const char *kind = plan_filter_kind_for_test(env.db_root, "default/cm_a3exec",
+            "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}]",
+            NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+        ASSERT_EQ_STR(kind, "leaf", "A3 exec: starts_with on trigram-only → leaf plan");
+        ASSERT_EQ_STR(f, "title", "A3 exec: seed field is title");
+    }
+
+    /* 2. find with limit=10 → 10 rows, all starting with "Show HN" */
+    {
+        char *resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"cm_a3exec\","
+            "\"criteria\":[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Show HN\"}],"
+            "\"limit\":10}",
+            &resp);
+        ASSERT_NOT_NULL(resp, "A3 exec: find response not null");
+        /* Should be a JSON array starting with '[' */
+        ASSERT_TRUE(resp && resp[0] == '[', "A3 exec: response is array");
+        /* Count occurrences of "Show HN" in the response — should be 10 */
+        int count = 0;
+        const char *p = resp;
+        while ((p = strstr(p, "Show HN")) != NULL) { count++; p++; }
+        ASSERT_EQ_INT(count, 10, "A3 exec: 10 rows returned all with Show HN prefix");
+        /* Should NOT contain "Ask HN" or "How to" */
+        ASSERT_TRUE(strstr(resp, "Ask HN") == NULL, "A3 exec: no Ask HN rows in result");
+        ASSERT_TRUE(strstr(resp, "How to") == NULL, "A3 exec: no How to rows in result");
+        free(resp);
+    }
+
+    /* 3. Negative case: prefix that matches nothing */
+    {
+        char *resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"cm_a3exec\","
+            "\"criteria\":[{\"field\":\"title\",\"op\":\"starts_with\","
+            "\"value\":\"Show HN: missing xxx\"}],"
+            "\"limit\":10}",
+            &resp);
+        ASSERT_NOT_NULL(resp, "A3 exec: negative case response not null");
+        ASSERT_TRUE(resp && (strcmp(resp, "[]\n") == 0 || strcmp(resp, "[]") == 0),
+            "A3 exec: no matches for non-existent prefix");
+        free(resp);
+    }
+
+    /* 4. Edge: prefix < 3 chars → plan falls to full scan, find still works */
+    {
+        /* Plan kind: "Sh" (2 chars) → scan */
+        char f[64] = {0}, o[16] = {0};
+        const char *kind_short = plan_filter_kind_for_test(env.db_root, "default/cm_a3exec",
+            "[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Sh\"}]",
+            NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
+        ASSERT_EQ_STR(kind_short, "scan",
+            "A3 exec edge: prefix <3 chars → FULL_SCAN");
+        /* find still works (via full scan) */
+        char *resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"cm_a3exec\","
+            "\"criteria\":[{\"field\":\"title\",\"op\":\"starts_with\",\"value\":\"Sh\"}],"
+            "\"limit\":50}",
+            &resp);
+        ASSERT_NOT_NULL(resp, "A3 exec edge: short prefix find response not null");
+        /* All "Show HN" rows match "Sh" prefix */
+        int count = 0;
+        const char *p = resp;
+        while ((p = strstr(p, "Show HN")) != NULL) { count++; p++; }
+        ASSERT_EQ_INT(count, 30, "A3 exec edge: all 30 Show HN rows match Sh prefix via full scan");
+        free(resp);
+    }
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-a3-trigram-starts-with-executor", test_a3_trigram_starts_with_executor)

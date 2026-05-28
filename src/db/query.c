@@ -3,8 +3,10 @@
 #include "simd.h"
 #include "bitmap.h"
 #include "trigram.h"
+#include "io_direct.h"
 #include <fnmatch.h>
 #include <math.h>
+#include <dirent.h>
 
 /* ========== Probing helpers ========== */
 
@@ -179,20 +181,6 @@ static void *v2_shard_worker(void *raw) {
     return NULL;
 }
 
-/* Streaming variant of v2_shard_worker — uses slotcask_walk_one_shard_streaming
-   so cb response is per-record, not deferred to Pass 2. Right path for
-   limit-bound scans (cmd_keys, FIND limit-N, etc). */
-static void *v2_shard_worker_streaming(void *raw) {
-    V2ShardArg *w = (V2ShardArg *)raw;
-    g_out = w->parent_out ? w->parent_out : stdout;
-    if (w->stop_flag &&
-        __atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
-    int rc = slotcask_walk_one_shard_streaming(w->db, w->kf_shard_id,
-                                                w->scb, w->sctx, w->stop_flag);
-    if (rc != 0 && w->stop_flag)
-        __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
-    return NULL;
-}
 
 void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     g_scan_stop = 0;
@@ -219,31 +207,132 @@ void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     free(args);
 }
 
-/* Streaming variant of scan_shards_v2 — uses the streaming per-shard
-   walker so cb stop response is per-record. Use for limit-bound queries
-   (cmd_keys, FIND-with-limit, etc.) where the buffered walker's Pass 1
-   would collect refs the caller would never read after the limit fires. */
+/* Forward declaration — defined below after the O_DIRECT helper block. */
+void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx);
+
+/* Streaming variant of scan_shards_v2 — routes through the O_DIRECT
+   seg-file path for cache pollution avoidance.  Early-stop semantics
+   are preserved: seg_scan_o_direct returns non-zero when the cb adapter
+   returns non-zero, and the shared stop_flag propagates across parallel
+   file workers so limit-bound scans bail quickly.
+   The old slotcask_walk_one_shard_streaming per-kf-shard fan-out is
+   replaced by the seg-file fan-out in scan_shards_v2_o_direct. */
 void scan_shards_v2_streaming(SlotcaskDb *db, scan_callback cb, void *ctx) {
-    g_scan_stop = 0;
+    scan_shards_v2_o_direct(db, cb, ctx);
+}
+
+/* ========== O_DIRECT full-scan path (FP_FULL_SCAN / Phase 1e.4) ==========
+ *
+ * scan_shards_v2_o_direct: cache-bypassing replacement for the mmap-based
+ * scan_shards_v2 / slotcask_walk_one_shard inner loop.  Enumerates every
+ * .dat segment file under <data_dir>/data/streams/<s>/ for each stream
+ * s in [0, num_streams) and calls seg_scan_o_direct on each file.  The
+ * caller's scan_callback is invoked via a thin adapter that reconstructs
+ * the (SlotHeader *, block) shape the callback expects.
+ *
+ * Parallelism: one parallel_for entry per segment file across all streams.
+ * This matches the throughput of scan_shards_v2's per-kf-shard fan-out
+ * (typically the same or better because .dat files are the actual data).
+ *
+ * Fallback: if O_DIRECT open fails silently (EINVAL / unsupported FS),
+ * seg_scan_o_direct reverts to buffered + POSIX_FADV_DONTNEED internally —
+ * the caller is unaffected.
+ */
+
+/* Adapter: od_record_cb → v2_scan_wrap_cb (SlotcaskScanCb) → scan_callback.
+ * rec layout: [0..16) hash16  [16..18) klen LE  [18] flag  [19] rsv  [20..24) vlen LE
+ *             [24..24+klen) key  [24+klen..) value
+ * od_record_cb is called only for flag==1 records, so we skip the flag check. */
+typedef struct {
+    V2ScanWrap *wrap;      /* wraps the real scan_callback */
+    int        *stop_flag;
+} OdSegAdapterCtx;
+
+static int od_seg_record_cb(const uint8_t *rec, size_t vlen,
+                             const uint8_t hash16[16], void *raw_ctx)
+{
+    OdSegAdapterCtx *actx = (OdSegAdapterCtx *)raw_ctx;
+    if (actx->stop_flag &&
+        __atomic_load_n(actx->stop_flag, __ATOMIC_RELAXED)) return 1;
+
+    uint16_t klen_le;
+    memcpy(&klen_le, rec + 16, 2);
+    uint16_t klen = klen_le;   /* already native-endian LE on x86/ARM LE */
+    const uint8_t *key = rec + 24;
+    const uint8_t *val = rec + 24 + klen;
+    /* Delegate to the existing v2_scan_wrap_cb which synthesises a
+       SlotHeader and fires the real scan_callback. */
+    int rc = v2_scan_wrap_cb(hash16, key, klen, val, (size_t)vlen,
+                             actx->wrap);
+    if (rc != 0 && actx->stop_flag)
+        __atomic_store_n(actx->stop_flag, 1, __ATOMIC_RELEASE);
+    return rc;
+}
+
+/* One entry in the per-file parallel_for array. */
+typedef struct {
+    char           seg_path[PATH_MAX];
+    int            slot_size;
+    V2ScanWrap    *wrap;
+    int           *stop_flag;
+    FILE          *parent_out;
+} OdSegFileArg;
+
+static void *od_seg_file_worker(void *raw) {
+    OdSegFileArg *arg = (OdSegFileArg *)raw;
+    g_out = arg->parent_out ? arg->parent_out : stdout;
+    if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
+    OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    return NULL;
+}
+
+/* Enumerate all .dat files under every stream directory and fan out. */
+void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
+    if (!db || db->num_streams <= 0) return;
+
+    /* Collect all .dat paths into a dynamic array. */
+    OdSegFileArg *args = NULL;
+    size_t nargs = 0, cap = 0;
+
     V2ScanWrap wrap = { cb, ctx };
-    int n = db->num_shards;
-    if (n <= 0) return;
     int stop_flag = 0;
-    V2ShardArg *args = malloc((size_t)n * sizeof(V2ShardArg));
-    if (!args) {
-        slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
-        return;
-    }
     FILE *parent_out = g_out;
-    for (int s = 0; s < n; s++) {
-        args[s] = (V2ShardArg){
-            .db = db, .kf_shard_id = s,
-            .scb = v2_scan_wrap_cb, .sctx = &wrap,
-            .stop_flag = &stop_flag,
-            .parent_out = parent_out,
-        };
+
+    for (int s = 0; s < db->num_streams; s++) {
+        char stream_dir[PATH_MAX];
+        snprintf(stream_dir, sizeof(stream_dir),
+                 "%s/data/streams/%03d", db->data_dir, s);
+        DIR *dh = opendir(stream_dir);
+        if (!dh) continue;
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
+                continue;
+            /* Grow array if needed. */
+            if (nargs >= cap) {
+                size_t newcap = cap ? cap * 2 : 64;
+                OdSegFileArg *t = realloc(args, newcap * sizeof(OdSegFileArg));
+                if (!t) { closedir(dh); goto run; }
+                args = t;
+                cap = newcap;
+            }
+            snprintf(args[nargs].seg_path, PATH_MAX,
+                     "%s/%s", stream_dir, de->d_name);
+            args[nargs].slot_size  = db->slot_size;
+            args[nargs].wrap       = &wrap;
+            args[nargs].stop_flag  = &stop_flag;
+            args[nargs].parent_out = parent_out;
+            nargs++;
+        }
+        closedir(dh);
     }
-    parallel_for(v2_shard_worker_streaming, args, n, sizeof(V2ShardArg));
+
+run:
+    if (nargs == 0) { free(args); return; }
+    g_scan_stop = 0;
+    parallel_for(od_seg_file_worker, args, (int)nargs, sizeof(OdSegFileArg));
     free(args);
 }
 
@@ -259,7 +348,7 @@ int scan_dispatch(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
-    scan_shards_v2(sdb, cb, ctx);
+    scan_shards_v2_o_direct(sdb, cb, ctx);
     return 0;
     scan_shards(data_dir, sc->slot_size, cb, ctx);
     return 0;
@@ -9809,6 +9898,68 @@ typedef struct BmGenericShardArg {
 } BmGenericShardArg;
 static void *bm_generic_shard_worker(void *arg);
 
+/* ---- O_DIRECT btree leaf-scan adapter (btree_dispatch default branch) ----
+ *
+ * For ops that require a full index leaf scan (contains, ends, like-substring,
+ * regex, len_eq/lt/gt, not_in, not_like, not_contains, exists — the
+ * "default:" case in btree_dispatch), replace the mmap-based
+ * btree_idx_range("","","\xff"...) with a cache-bypassing
+ * btree_leaf_scan_o_direct per shard.
+ *
+ * Callback shape:
+ *   od_leaf_cb:   (const uint8_t *value, size_t vlen, hash16, ctx)
+ *   bt_result_cb: (const char    *value, size_t vlen, hash16, ctx)
+ * These are identical in layout (uint8_t* vs char* is ABI-identical);
+ * the adapter is a thin cast. */
+typedef struct {
+    char          idx_path[PATH_MAX];
+    bt_result_cb  cb;
+    void         *ctx;
+} BtreeOdShardArg;
+
+static int btree_od_leaf_cb(const uint8_t *value, size_t vlen,
+                             const uint8_t hash16[16], void *raw_ctx)
+{
+    BtreeOdShardArg *arg = (BtreeOdShardArg *)raw_ctx;
+    /* bt_result_cb and od_leaf_cb have identical runtime layout. */
+    return arg->cb((const char *)value, vlen, hash16, arg->ctx);
+}
+
+static void *btree_od_shard_worker(void *raw)
+{
+    BtreeOdShardArg *arg = (BtreeOdShardArg *)raw;
+    btree_leaf_scan_o_direct(arg->idx_path, btree_od_leaf_cb, arg);
+    /* Flush any thread-local count accumulator just as shard_walk_worker
+       does (index.c:129). No-op for callbacks that don't use TLS. */
+    idx_count_cb_flush_thread();
+    return NULL;
+}
+
+/* Fan out btree_leaf_scan_o_direct across index_splits_for(splits) shards,
+ * mirroring the parallel_for pattern of shard_walk_dispatch in index.c. */
+static void btree_idx_full_leaf_scan_o_direct(
+        const char *db_root, const char *object,
+        const char *field, int splits,
+        bt_result_cb cb, void *ctx)
+{
+    int idx_n = index_splits_for(splits);
+    BtreeOdShardArg *args = malloc((size_t)idx_n * sizeof(BtreeOdShardArg));
+    if (!args) {
+        /* OOM fallback: original mmap path. */
+        btree_idx_range(db_root, object, field, splits,
+                        "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+        return;
+    }
+    for (int s = 0; s < idx_n; s++) {
+        build_idx_path(args[s].idx_path, sizeof(args[s].idx_path),
+                       db_root, object, field, s);
+        args[s].cb  = cb;
+        args[s].ctx = ctx;
+    }
+    parallel_for(btree_od_shard_worker, args, idx_n, sizeof(BtreeOdShardArg));
+    free(args);
+}
+
 static void btree_dispatch(const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
@@ -9989,10 +10140,12 @@ static void btree_dispatch(const char *db_root, const char *object,
                                 (const char *)buf2, needle_len + 4, cb, ctx);
                 break;
             }
-            /* Substring / suffix / non-varchar → full leaf scan; per-entry
-               filter via check_primary in the callback handles correctness. */
-            btree_idx_range(db_root, object, field, splits,
-                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            /* Substring / suffix / non-varchar → full leaf scan via O_DIRECT;
+               per-entry filter via check_primary in the callback handles
+               correctness.  Cache-bypassing: hot index pages for targeted
+               reads (eq/range/prefix) are not evicted. */
+            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
+                                              cb, ctx);
             break;
         }
         case OP_NOT_EQUAL:
@@ -10019,9 +10172,11 @@ static void btree_dispatch(const char *db_root, const char *object,
                                "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         default:
-            /* Full index scan: contains, like, ends_with, not_like, not_contains, not_in, exists */
-            btree_idx_range(db_root, object, field, splits,
-                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            /* Full index scan: contains, like, ends_with, not_like,
+               not_contains, not_in, exists — use O_DIRECT leaf walk to
+               avoid polluting the btree page cache used by fast paths. */
+            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
+                                              cb, ctx);
             break;
     }
 }
@@ -12173,13 +12328,17 @@ static CardEst card_est_leaf(const char *db_root, const char *object,
         return e;
     }
     if (it == IT_TRIGRAM &&
-        (leaf->op == OP_CONTAINS || leaf->op == OP_ICONTAINS)) {
+        (leaf->op == OP_CONTAINS || leaf->op == OP_ICONTAINS ||
+         leaf->op == OP_STARTS_WITH)) {
         /* Estimate = rarest gram's posting size, capped at `cap`.
-           The candidate set for a trigram contains/icontains is the
-           intersection of all grams' posting lists, so it is bounded
-           above by the smallest (rarest) gram's posting count.
-           We lowercase the pattern here to match the index (same as
-           build_keyset_from_trigram does). */
+           For contains/icontains: intersection of all grams in the pattern,
+           bounded above by the rarest gram's posting count.
+           For starts_with: same primitive — extract the leading 3-gram(s)
+           from the prefix; the rarest 3-gram gives a tight upper bound on
+           the candidate set (records whose field starts with the prefix are
+           a subset of records containing each of those grams).
+           We lowercase the pattern/prefix to match the index (trigrams are
+           stored lowercase — see tg_build_grams / build_keyset_from_trigram). */
         size_t plen = strlen(leaf->value);
         if (plen < 3) { e.estimable = 0; return e; }
         if (plen > 1023) plen = 1023;
@@ -12571,16 +12730,20 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     } else if (prim_sel || prim_it != IT_BITMAP) {
         /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
          * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
-        if (!prim_sel && prim_it != IT_BITMAP && est[prim].estimable && est[prim].saturated
+        if (!prim_sel && prim_it != IT_BITMAP && prim_it != IT_TRIGRAM
+                && est[prim].estimable && est[prim].saturated
                 && op_eligible_for_intersect(leaves[prim]->op)
                 && !order_field_drivable(db_root, object, order_by)) {
-            /* broad non-bitmap PRECISE-lookup leaf: K > budget → fetch loses
-             * to a data scan (B5). Leaf-scan ops (contains/like/ends/regex/
-             * len_* and their i-variants) are NOT demoted here — their index
-             * leaf-scan always beats a data-file scan (A4). Also NOT demoted
-             * when an indexed order_by is available (D3: ORDER_INDEX_WALK is
-             * cheaper than scan-and-sort — the order overlay below sets it for
-             * the saturated seed). */
+            /* broad non-bitmap non-trigram PRECISE-lookup leaf: K > budget →
+             * fetch loses to a data scan (B5). Leaf-scan ops (contains/like/
+             * ends/regex/len_* and their i-variants) are NOT demoted here —
+             * their index leaf-scan always beats a data-file scan (A4).
+             * Trigram-backed starts_with is similarly never demoted: it narrows
+             * candidates via the leading 3-gram posting list, which is always
+             * faster than a full seg-file scan regardless of candidate count.
+             * Also NOT demoted when an indexed order_by is available (D3:
+             * ORDER_INDEX_WALK is cheaper than scan-and-sort — the order
+             * overlay below sets it for the saturated seed). */
             fp.kind = FP_FULL_SCAN; return fp;
         }
         fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);
@@ -13069,6 +13232,12 @@ static int op_prefers_trigram(enum SearchOp op) {
     return op == OP_CONTAINS || op == OP_ICONTAINS;
 }
 
+/* Returns 1 when the op can be served by a trigram index for starts_with
+ * (prefix length ≥ 3 required, checked by caller). */
+static int op_allows_trigram_starts(enum SearchOp op) {
+    return op == OP_STARTS_WITH;
+}
+
 /* Crossover length between btree-leaf scan and trigram intersection
  * for contains/i_contains. The trigram verify step is O(candidates ×
  * per-record fetch) while btree-leaf is O(total_leaves × per-leaf
@@ -13151,6 +13320,17 @@ static int pick_index_for_leaf(const char *db_root, const char *object,
             return btree_idx_exists(db_root, object, c->field, sch.splits)
                    ? IT_BTREE : -1;
         }
+        return -1;
+    }
+    /* starts_with: btree is the precise path; trigram is the fallback when
+     * no btree exists AND the prefix is long enough to extract a 3-gram.
+     * Shorter prefixes (<3 chars) cannot form any trigram, so they fall
+     * through to full scan (-1). */
+    if (op_allows_trigram_starts(c->op)) {
+        size_t plen = strlen(c->value);
+        if (has_btree && btree_idx_exists(db_root, object, c->field, sch.splits))
+            return IT_BTREE;
+        if (has_trigram && plen >= 3) return IT_TRIGRAM;
         return -1;
     }
     if (has_bitmap) return IT_BITMAP;
@@ -13741,6 +13921,57 @@ static KeySet *build_keyset_from_trigram(const char *db_root, const char *object
     }
     free(order);
     return acc;
+}
+
+/* ============================================================
+   A3 executor: trigram-prefix starts_with on a trigram-only field.
+
+   Uses only the leading 3-gram (cheaper than build_keyset_from_trigram
+   which intersects all grams). False positives filtered by
+   criteria_match_tree's OP_STARTS_WITH check. */
+static int find_via_trigram_starts_with(const char *db_root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        SearchCriterion *seed,
+                                        CriteriaNode *tree,
+                                        ExcludedKeys *excluded,
+                                        int offset, int limit,
+                                        const char **proj_fields, int proj_count,
+                                        int dict_fmt,
+                                        QueryDeadline *dl)
+{
+    size_t plen = strlen(seed->value);
+    if (plen < 3) return 0;
+
+    uint8_t gram[3];
+    for (int i = 0; i < 3; i++) {
+        uint8_t c = (uint8_t)seed->value[i];
+        gram[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+    }
+
+    size_t posting_count = tg_posting_count(db_root, object, seed->field,
+                                            sch->splits, gram, dl);
+    if (dl->timed_out) return 0;
+    if (posting_count == 0) return 0;
+
+    KeySet *ks = keyset_new(posting_count);
+    if (!ks) return 0;
+
+    int idx_n = index_splits_for(sch->splits);
+    TgCollectCtx cc = { ks, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, seed->field, s);
+        btree_range(tp, (const char *)gram, 3, (const char *)gram, 3,
+                    tg_collect_to_keyset_cb, &cc);
+        if (cc.timed_out) { keyset_free(ks); return 0; }
+    }
+    int rc = keyset_emit_find(db_root, object, sch, ks,
+                              tree, excluded, offset, limit,
+                              proj_fields, proj_count,
+                              fs, 0 /*rows_fmt*/, dict_fmt, 0 /*csv_delim*/,
+                              NULL /*joins*/, 0 /*njoins*/, dl);
+    keyset_free(ks);
+    return rc;
 }
 
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
@@ -16399,7 +16630,8 @@ int cmd_find(const char *db_root, const char *object,
                   the trigram-aware dispatch lives. */
                !((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
                  fp.n_source > 0 && fp.source_leaves[0] &&
-                 op_prefers_trigram(fp.source_leaves[0]->op) &&
+                 (op_prefers_trigram(fp.source_leaves[0]->op) ||
+                  op_allows_trigram_starts(fp.source_leaves[0]->op)) &&
                  field_has_index_type(db_root, object, fp.source_leaves[0]->field, IT_TRIGRAM))) {
         /* ===== Streaming fast path for limit-bound, post-filtered finds.
            For small (offset + limit) where the tree has post-filter siblings
@@ -16453,16 +16685,40 @@ int cmd_find(const char *db_root, const char *object,
 
         /* Dispatch on the picker's chosen index — same rulebook the
            planner used to claim this leaf, so we can't disagree.
-           IT_TRIGRAM goes through keyset_emit_find sourced from the
-           trigram intersection; IT_BITMAP and IT_BTREE both ride
-           idx_find_parallel, which routes bitmap via btree_dispatch's
-           internal bitmap branch. The picker has already enforced
-           plen >= 3 for trigram, so build_keyset_from_trigram returning
-           NULL here is a transient failure rather than an unsupported
+           IT_TRIGRAM + OP_STARTS_WITH → A3 executor (leading-gram walk +
+           per-record prefix verify): cheaper than build_keyset_from_trigram
+           (no multi-gram intersection, no keyset allocation) when the query
+           has no joins/rows_fmt/csv_delim.
+           IT_TRIGRAM + other ops → keyset_emit_find sourced from the
+           trigram intersection (OP_CONTAINS/ICONTAINS).
+           IT_BITMAP and IT_BTREE both ride idx_find_parallel, which routes
+           bitmap via btree_dispatch's internal bitmap branch. The picker has
+           already enforced plen >= 3 for trigram, so build_keyset_from_trigram
+           returning NULL here is a transient failure rather than an unsupported
            pattern. */
         int rc = 0;
         int picked = pick_index_for_leaf(db_root, object, pc);
         if (picked == IT_TRIGRAM) {
+            /* A3: starts_with on trigram-only field — leading-gram walk +
+               per-record full-prefix verify.  Guards: no joins (tabular
+               materialise), no rows_fmt (table envelope), no csv_delim
+               (header row).  Those cases fall through to the keyset path. */
+            if (pc->op == OP_STARTS_WITH && !has_joins && !rows_fmt && !csv_delim) {
+                find_via_trigram_starts_with(
+                    db_root, object, &sch,
+                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                    pc, tree, &excluded, offset, limit,
+                    proj_fields, proj_count, dict_fmt, &dl);
+                /* Close the envelope opened above and return. */
+                if (dict_fmt)
+                    OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                else
+                    OUT(want_total ? "],\"total\":null}\n" : "]\n");
+                free_excluded(&excluded);
+                free_criteria_tree(tree);
+                free_joins(joins, njoins);
+                return 0;
+            }
             KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                        sch.splits, pc, &dl);
             if (tg_ks) {
