@@ -59,7 +59,8 @@ TEST_REGISTER("test-cost-selectivity-primitive", test_cost_selectivity_primitive
 
 extern const char *plan_filter_kind_for_test(const char *db_root, const char *object,
         const char *criteria_json, const char *order_by, int fetching,
-        char *out_field, size_t fsz, char *out_order, size_t osz);
+        char *out_field, size_t fsz, char *out_order, size_t osz,
+        int *out_total_cheap);
 
 /* A1: 1 selective btree eq → leaf, seeded on `tag`. */
 static int test_planA1_selective_leaf(void) {
@@ -69,7 +70,7 @@ static int test_planA1_selective_leaf(void) {
     cm_insert_tags(tc, "a1");
     char f[64]={0}, o[16]={0};
     const char *k = plan_filter_kind_for_test(env.db_root, "default/a1",
-        "{\"tag\":\"rare\"}", NULL, 1, f, sizeof(f), o, sizeof(o));
+        "{\"tag\":\"rare\"}", NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k, "leaf", "A1 selective eq → PRIMARY_LEAF");
     ASSERT_EQ_STR(f, "tag", "A1 seeds on tag");
     tc_close(tc); test_env_stop(&env);
@@ -92,7 +93,7 @@ static int test_planA2_broad_bitmap(void) {
     tc_request(tc, req, &resp); free(resp);
     char f[64]={0}, o[16]={0};
     const char *kind = plan_filter_kind_for_test(env.db_root, "default/a2",
-        "{\"active\":true}", NULL, 1, f, sizeof(f), o, sizeof(o));
+        "{\"active\":true}", NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(kind, "bitmap", "A2 broad bitmap → BITMAP_SMALLER (not leaf)");
     tc_close(tc); test_env_stop(&env);
     return 0;
@@ -109,7 +110,7 @@ static int test_planA5_nonindexed_scan(void) {
     /* Use array-form criteria so parse_criteria_tree gets a proper contains leaf */
     const char *k = plan_filter_kind_for_test(env.db_root, "default/a5",
         "[{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
-        NULL, 1, f, sizeof(f), o, sizeof(o));
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k, "scan", "A5 non-indexed → FULL_SCAN");
     tc_close(tc); test_env_stop(&env);
     return 0;
@@ -151,7 +152,7 @@ static int test_planB1_two_selective_btree(void) {
     const char *kc = plan_filter_kind_for_test(env.db_root,"default/b1",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "intersect", "B1 count: two selective → intersect");
 
     /* find path (fetching=1): most-selective seeds PRIMARY_LEAF, other post-filters */
@@ -159,7 +160,7 @@ static int test_planB1_two_selective_btree(void) {
     const char *kf = plan_filter_kind_for_test(env.db_root,"default/b1",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kf, "leaf", "B1 find: two selective → leaf (fetch+check)");
 
     tc_close(tc); test_env_stop(&env);
@@ -197,7 +198,7 @@ static int test_planB2_selective_btree_broad_bitmap(void) {
     const char *kf = plan_filter_kind_for_test(env.db_root,"default/b2",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kf, "leaf", "B2 find: selective btree seeds, bitmap post-filters");
     ASSERT_EQ_STR(f, "tag", "B2 find: seed is tag (btree), not active (bitmap)");
 
@@ -206,7 +207,7 @@ static int test_planB2_selective_btree_broad_bitmap(void) {
     const char *kc = plan_filter_kind_for_test(env.db_root,"default/b2",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "leaf", "B2 count: selective btree still seeds (not intersect: bitmap broad)");
     ASSERT_EQ_STR(f, "tag", "B2 count: seed is tag");
 
@@ -243,14 +244,14 @@ static int test_planB3_two_broad_bitmaps(void) {
     const char *kf = plan_filter_kind_for_test(env.db_root,"default/b3",
         "[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},"
          "{\"field\":\"flagged\",\"op\":\"eq\",\"value\":\"true\"}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kf, "intersect", "B3 find: pure-bitmap AND → intersect");
 
     memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
     const char *kc = plan_filter_kind_for_test(env.db_root,"default/b3",
         "[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"},"
          "{\"field\":\"flagged\",\"op\":\"eq\",\"value\":\"true\"}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "intersect", "B3 count: pure-bitmap AND → intersect");
 
     tc_close(tc); test_env_stop(&env);
@@ -273,7 +274,7 @@ static int test_planB4_selective_btree_nonindexed(void) {
     const char *kf = plan_filter_kind_for_test(env.db_root,"default/b4",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kf, "leaf", "B4 find: selective btree seeds, non-indexed post-filters");
     ASSERT_EQ_STR(f, "tag", "B4 find: seed is tag");
 
@@ -282,7 +283,7 @@ static int test_planB4_selective_btree_nonindexed(void) {
     const char *kc = plan_filter_kind_for_test(env.db_root,"default/b4",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "leaf", "B4 count: selective btree + non-indexed → leaf");
     ASSERT_EQ_STR(f, "tag", "B4 count: seed is tag");
 
@@ -312,7 +313,7 @@ static int test_planB7_all_nonindexed(void) {
     const char *k = plan_filter_kind_for_test(env.db_root,"default/b7",
         "[{\"field\":\"bio\",\"op\":\"contains\",\"value\":\"x\"},"
          "{\"field\":\"about\",\"op\":\"contains\",\"value\":\"y\"}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k, "scan", "B7: both non-indexed → full scan");
 
     tc_close(tc); test_env_stop(&env);
@@ -361,7 +362,7 @@ static int test_planA4_saturated_trigram_stays_leaf(void) {
     /* Pattern "abc" → IT_TRIGRAM, saturated. Must be "leaf", never "scan". */
     const char *k_str = plan_filter_kind_for_test(env.db_root, "default/a4tg",
         "[{\"field\":\"title\",\"op\":\"contains\",\"value\":\"abc\"}]",
-        NULL, 1, f, sizeof(f), o, sizeof(o));
+        NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k_str, "leaf",
         "A4: saturated trigram-contains stays PRIMARY_LEAF (never FULL_SCAN)");
 
@@ -369,7 +370,7 @@ static int test_planA4_saturated_trigram_stays_leaf(void) {
     memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
     const char *k_count = plan_filter_kind_for_test(env.db_root, "default/a4tg",
         "[{\"field\":\"title\",\"op\":\"contains\",\"value\":\"abc\"}]",
-        NULL, 0, f, sizeof(f), o, sizeof(o));
+        NULL, 0, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "leaf",
         "A4 count: saturated trigram-contains stays leaf");
 
@@ -419,7 +420,7 @@ static int test_planBCS_count_one_selective_leaf(void) {
     const char *kc = plan_filter_kind_for_test(env.db_root, "default/bcs",
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"common\"}]",
-        NULL, 0, f, sizeof(f), o, sizeof(o));
+        NULL, 0, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "leaf",
         "BCS count: n_indexed=2, exactly 1 selective → PRIMARY_LEAF (not intersect)");
     ASSERT_EQ_STR(f, "tag",
@@ -472,7 +473,7 @@ static int test_planC1_pure_or_all_indexed(void) {
     const char *k_str = plan_filter_kind_for_test(env.db_root,"default/c1",
         "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
                   "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_str, "union", "C1: pure OR all-indexed → FP_UNION");
 
     /* Also test fetching=0 (count) */
@@ -480,7 +481,7 @@ static int test_planC1_pure_or_all_indexed(void) {
     const char *k_count = plan_filter_kind_for_test(env.db_root,"default/c1",
         "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
                   "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "union", "C1 count: pure OR all-indexed → FP_UNION");
 
     tc_close(tc); test_env_stop(&env);
@@ -503,7 +504,7 @@ static int test_planC2_or_with_nonindexed_child(void) {
     const char *k_str = plan_filter_kind_for_test(env.db_root,"default/c2",
         "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
                   "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_str, "scan", "C2: OR with non-indexed child → FULL_SCAN");
 
     /* Also count path */
@@ -511,7 +512,7 @@ static int test_planC2_or_with_nonindexed_child(void) {
     const char *k_count = plan_filter_kind_for_test(env.db_root,"default/c2",
         "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
                   "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "scan", "C2 count: OR with non-indexed child → FULL_SCAN");
 
     tc_close(tc); test_env_stop(&env);
@@ -553,7 +554,7 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"or\":[{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"a\"},"
                   "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"b\"}]}]",
-        NULL, 1, f,sizeof(f), o,sizeof(o));
+        NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_str, "leaf", "C3: AND+OR sub-tree → PRIMARY_LEAF");
     ASSERT_EQ_STR(f, "tag", "C3: seed is the AND leaf `tag`, not the OR child");
 
@@ -563,7 +564,7 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
         "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
          "{\"or\":[{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"a\"},"
                   "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"b\"}]}]",
-        NULL, 0, f,sizeof(f), o,sizeof(o));
+        NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "leaf", "C3 count: AND+OR sub-tree → PRIMARY_LEAF");
     ASSERT_EQ_STR(f, "tag", "C3 count: seed is tag");
 
@@ -571,3 +572,232 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
     return 0;
 }
 TEST_REGISTER("test-plan-c3-and-leaf-plus-or-subtree", test_planC3_and_leaf_plus_or_subtree)
+
+/* -----------------------------------------------------------------------
+ * D-row tests: order_by overlay (Task 1b.5)
+ *
+ * D1: composite (filter+order) index exists → FP_ORDER_COMPOSITE.
+ * D2: no composite, seed K bounded → FP_ORDER_SORT.
+ * D3: no composite, seed K broad (saturated) → FP_ORDER_INDEX_WALK.
+ * total_cheap: materialized KeySet plans → 1; FULL_SCAN → 0.
+ * ----------------------------------------------------------------------- */
+
+/* D1: by=varchar:16 + time=long; indexes: "by" (btree) + "by+time" (composite btree).
+ * criteria {"by":"alice"} (selective), order_by "time" → composite exists → COMPOSITE. */
+static int test_planD1_composite_order(void) {
+    TestEnv env={0};
+    /* Two fields; composite index "by+time" stays btree. */
+    TestClient *tc = cm_setup(&env, "d1",
+        "\"by:varchar:16\",\"time:long\"",
+        "\"by\",\"by+time\"");
+    if (!tc) return 1;
+
+    /* Insert 5 rows by="alice", 200 rows by="bob" (N=205, budget=25).
+     * by="alice" is selective (5 ≤ 25). */
+    char body[65536]; int p=0,k=0; char *resp=NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i=0; i<5; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"by\":\"alice\",\"time\":%d}",
+            k==0?"":",", k, k*100); k++;
+    }
+    for (int i=0; i<200; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"k%d\":{\"by\":\"bob\",\"time\":%d}", k, k*100); k++;
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d1\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp);
+
+    char f[64]={0}, o[32]={0};
+    int tc_val = -1;
+    const char *k_str = plan_filter_kind_for_test(env.db_root, "default/d1",
+        "{\"by\":\"alice\"}", "time", 1,
+        f, sizeof(f), o, sizeof(o), &tc_val);
+    ASSERT_EQ_STR(k_str, "leaf", "D1: selective by= → PRIMARY_LEAF");
+    ASSERT_EQ_STR(o, "composite", "D1: by+time composite → FP_ORDER_COMPOSITE");
+    ASSERT_EQ_INT(tc_val, 1, "D1: total_cheap=1 (KeySet materialized)");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-d1-composite-order", test_planD1_composite_order)
+
+/* D2: by=varchar:16 + time=long; ONLY "by" indexed (NO composite).
+ * criteria {"by":"alice"} (selective, K=5 ≤ budget), order_by "time" → SORT. */
+static int test_planD2_sort_order(void) {
+    TestEnv env={0};
+    /* Only "by" indexed; no composite; time is not indexed. */
+    TestClient *tc = cm_setup(&env, "d2",
+        "\"by:varchar:16\",\"time:long\"",
+        "\"by\"");
+    if (!tc) return 1;
+
+    /* 5 rows by="alice" (selective), 200 rows by="bob". */
+    char body[65536]; int p=0,k=0; char *resp=NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i=0; i<5; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"by\":\"alice\",\"time\":%d}",
+            k==0?"":",", k, k*100); k++;
+    }
+    for (int i=0; i<200; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"k%d\":{\"by\":\"bob\",\"time\":%d}", k, k*100); k++;
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d2\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp);
+
+    char f[64]={0}, o[32]={0};
+    int tc_val = -1;
+    const char *k_str = plan_filter_kind_for_test(env.db_root, "default/d2",
+        "{\"by\":\"alice\"}", "time", 1,
+        f, sizeof(f), o, sizeof(o), &tc_val);
+    ASSERT_EQ_STR(k_str, "leaf", "D2: selective by= → PRIMARY_LEAF");
+    ASSERT_EQ_STR(o, "sort", "D2: bounded K=5, no composite → FP_ORDER_SORT");
+    ASSERT_EQ_INT(tc_val, 1, "D2: total_cheap=1 (KeySet materialized)");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-d2-sort-order", test_planD2_sort_order)
+
+/* D3: by=varchar:16 + time=long; ONLY "by" indexed; value "bob" is BROAD
+ * (200 rows > budget 25), order_by "time" → seed saturated → INDEX_WALK.
+ * No composite exists. */
+static int test_planD3_walk_order(void) {
+    TestEnv env={0};
+    /* Only "by" indexed; no composite. */
+    TestClient *tc = cm_setup(&env, "d3",
+        "\"by:varchar:16\",\"time:long\"",
+        "\"by\"");
+    if (!tc) return 1;
+
+    /* 200 rows by="bob" (broad: 200 > budget 25), 5 rows by="alice".
+     * Query on by="bob" → broad → seed saturated → FP_ORDER_INDEX_WALK. */
+    char body[65536]; int p=0,k=0; char *resp=NULL;
+    p += snprintf(body+p, sizeof(body)-p, "{");
+    for (int i=0; i<200; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            "%s\"k%d\":{\"by\":\"bob\",\"time\":%d}",
+            k==0?"":",", k, k*100); k++;
+    }
+    for (int i=0; i<5; i++) {
+        p += snprintf(body+p, sizeof(body)-p,
+            ",\"k%d\":{\"by\":\"alice\",\"time\":%d}", k, k*100); k++;
+    }
+    p += snprintf(body+p, sizeof(body)-p, "}");
+    char req[66560];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3\","
+        "\"records\":%s}", body);
+    tc_request(tc, req, &resp); free(resp);
+
+    char f[64]={0}, o[32]={0};
+    int tc_val = -1;
+    /* by="bob" is broad: N=205, budget=25, K=200 > 25 → saturated.
+     * pick_index_for_leaf=IT_BTREE (not bitmap). The demotion gate
+     * (op_eligible_for_intersect) fires for eq, demoting to FULL_SCAN unless
+     * the seed is a PRIMARY_LEAF at all. Wait — the single-seed block checks
+     * !prim_sel && prim_it!=IT_BITMAP && est.saturated → FULL_SCAN.
+     * But "bob" IS broad (saturated) and the single-seed block would scan.
+     * For order overlay D3 we need the path where the plan IS a leaf but
+     * the seed is broad. Use the multi-leaf path to force PRIMARY_LEAF:
+     * criteria AND of [by="bob", time >= 0] where time is not indexed —
+     * only by is indexed → n_indexed=1, prim=by, prim_sel=0, prim_it=IT_BTREE.
+     * BUT the demotion guard fires → FULL_SCAN. No order overlay for FULL_SCAN.
+     *
+     * The spec says D3 fires "when candidates > budget" and the plan is
+     * non-scan. To reach D3 cleanly: use a BROAD bitmap (never demoted to
+     * FULL_SCAN) with order_by. A broad bitmap → FP_BITMAP_SMALLER. Its seed
+     * K is the smaller-side complement count (estimable, may be saturated when
+     * both sides are broad). For a pure D3-like "walk" path via btree, we need
+     * n_selective=0 and all_bitmap=0, falling to intersect (which can then
+     * have a broad seed for the overlay). OR: use the multi-leaf broad intersect
+     * path (n_selective=0, n_indexed≥2) → FP_INTERSECT → order overlay runs
+     * on source_leaves[0] which is broad → saturated → WALK.
+     *
+     * Build: two non-selective btree leaves, n_selective=0 → INTERSECT,
+     * then overlay on source_leaves[0] (broad) → WALK. */
+
+    /* Re-insert into a fresh object d3b with two indexed fields, both broad. */
+    char *resp2=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"d3b\","
+        "\"splits\":8,\"max_key\":12,"
+        "\"fields\":[\"by:varchar:16\",\"cat:varchar:8\"],"
+        "\"indexes\":[\"by\",\"cat\"]}",
+        &resp2); free(resp2); resp2=NULL;
+
+    /* 200 rows by="bob"/cat="x" → both broad (200 > budget 25). N=200. */
+    char body2[65536]; int p2=0,k2=0;
+    p2 += snprintf(body2+p2, sizeof(body2)-p2, "{");
+    for (int i=0; i<200; i++) {
+        p2 += snprintf(body2+p2, sizeof(body2)-p2,
+            "%s\"r%d\":{\"by\":\"bob\",\"cat\":\"x\"}",
+            k2==0?"":",", k2); k2++;
+    }
+    p2 += snprintf(body2+p2, sizeof(body2)-p2, "}");
+    char req2[66560];
+    snprintf(req2, sizeof(req2),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3b\","
+        "\"records\":%s}", body2);
+    char *resp3=NULL;
+    tc_request(tc, req2, &resp3); free(resp3);
+
+    /* fetching=0 (count), both broad indexed → FP_INTERSECT (n_selective=0 path).
+     * source_leaves[0] = "by"="bob" → broad → saturated → FP_ORDER_INDEX_WALK. */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o)); tc_val=-1;
+    const char *k_d3b = plan_filter_kind_for_test(env.db_root, "default/d3b",
+        "[{\"field\":\"by\",\"op\":\"eq\",\"value\":\"bob\"},"
+         "{\"field\":\"cat\",\"op\":\"eq\",\"value\":\"x\"}]",
+        "by", 0,
+        f, sizeof(f), o, sizeof(o), &tc_val);
+    ASSERT_EQ_STR(k_d3b, "intersect", "D3: all-broad indexed → INTERSECT");
+    ASSERT_EQ_STR(o, "walk", "D3: broad seed + order_by → FP_ORDER_INDEX_WALK");
+    ASSERT_EQ_INT(tc_val, 1, "D3: total_cheap=1 (INTERSECT materializes KeySet)");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-d3-walk-order", test_planD3_walk_order)
+
+/* total_cheap: A1 (selective leaf, no order_by) → 1; A5 (scan) → 0. */
+static int test_plan_total_cheap(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "tc_obj",
+        "\"tag:varchar:8\",\"note:varchar:16\"",
+        "\"tag\"");
+    if (!tc) return 1;
+    cm_insert_tags(tc, "tc_obj");
+
+    char f[64]={0}, o[32]={0};
+    int cheap = -1;
+
+    /* A1: selective btree leaf, no order_by → PRIMARY_LEAF → total_cheap=1 */
+    const char *k1 = plan_filter_kind_for_test(env.db_root, "default/tc_obj",
+        "{\"tag\":\"rare\"}", NULL, 1,
+        f, sizeof(f), o, sizeof(o), &cheap);
+    ASSERT_EQ_STR(k1, "leaf", "total_cheap A1: kind=leaf");
+    ASSERT_EQ_INT(cheap, 1, "total_cheap A1: total_cheap=1 (KeySet materialized)");
+
+    /* A5: non-indexed → FULL_SCAN → total_cheap=0 */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o)); cheap=-1;
+    const char *k5 = plan_filter_kind_for_test(env.db_root, "default/tc_obj",
+        "[{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
+        NULL, 1,
+        f, sizeof(f), o, sizeof(o), &cheap);
+    ASSERT_EQ_STR(k5, "scan", "total_cheap A5: kind=scan");
+    ASSERT_EQ_INT(cheap, 0, "total_cheap A5: total_cheap=0 (no KeySet)");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-total-cheap", test_plan_total_cheap)

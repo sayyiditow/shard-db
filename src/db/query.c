@@ -12249,6 +12249,18 @@ static int most_selective_indexed(const char *db_root, const char *object,
     return best;
 }
 
+/* True if a composite index named "<a>+<b>" exists on the object. Used for
+ * D1: a (filter_field + order_field) composite gives a sorted prefix scan.
+ * Composite indexes are always btree (only btree supports multi-field prefix);
+ * the on-disk dir name is the literal "a+b" (see CLAUDE.md "Composite indexes"). */
+__attribute__((unused))
+static int composite_index_exists(const char *db_root, const char *object,
+                                  const char *a, const char *b) {
+    char name[256];
+    snprintf(name, sizeof(name), "%s+%s", a, b);
+    return field_has_index_type(db_root, object, name, IT_BTREE);
+}
+
 /* Flatten a tree into its AND-leaves (the implicit-AND children, or a lone
  * leaf). OR sub-trees and nested AND are handled by the caller; here we only
  * collect direct LEAF children for the per-leaf cost pass. Returns count. */
@@ -12289,8 +12301,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         CriteriaNode *orn = find_fully_indexed_or(tree, db_root, object);
         if (orn) {
             fp.kind = FP_UNION; fp.or_node = orn;
-            /* 1b.5: goto order_overlay */
-            return fp;
+            goto order_overlay;
         }
         fp.kind = FP_FULL_SCAN; return fp;
     }
@@ -12314,8 +12325,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         CriteriaNode *orn = find_fully_indexed_or(tree, db_root, object);
         if (orn) {
             fp.kind = FP_UNION; fp.or_node = orn;
-            /* 1b.5: goto order_overlay */
-            return fp;
+            goto order_overlay;
         }
         fp.kind = FP_FULL_SCAN; return fp;
     }
@@ -12368,7 +12378,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                         fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
                 }
                 if (!fp.n_source) fp.kind = FP_FULL_SCAN; /* defensive */
-                return fp; /* 1b.5: goto order_overlay */
+                goto order_overlay;
             }
             /* COUNT (fetching==0) with ≥2 selective indexed leaves:
              * intersect index-only — no record reads needed for count. */
@@ -12382,7 +12392,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                     else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
                         fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
                 }
-                return fp; /* 1b.5: goto order_overlay */
+                goto order_overlay;
             }
             /* FIND (fetching==1) with a selective primary seed: fall through to
              * the single-seed PRIMARY_LEAF block below — fetch the few, check
@@ -12399,7 +12409,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                     else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
                         fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
                 }
-                return fp; /* 1b.5: goto order_overlay */
+                goto order_overlay;
             }
             /* else: one selective leaf present, fetching=1 OR count with only
              * one selective leaf → fall through to single-seed PRIMARY_LEAF. */
@@ -12429,7 +12439,36 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     /* every other leaf is a post-filter */
     for (int i=0;i<nL;i++) if (i!=prim && fp.n_postfilter<MAX_INTERSECT_LEAVES)
         fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
-    /* total_cheap + order overlay folded in 1b.5 */
+
+order_overlay:
+    /* total is free whenever the plan materializes a candidate KeySet — the
+     * count of candidates is known before any record fetch (1d). */
+    fp.total_cheap = (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_INTERSECT ||
+                      fp.kind == FP_UNION        || fp.kind == FP_BITMAP_SMALLER);
+
+    /* order_by overlay (D1–D3): only when we have a source leaf to composite-
+     * check against, and the plan is not a full scan (scans handle order in 1c
+     * via a separate streaming merge — no overlay needed here). */
+    if (order_by && order_by[0] && fp.kind != FP_FULL_SCAN && fp.n_source > 0) {
+        /* D1: a (seed_field + order_by) composite index exists → the index
+         * already delivers rows in (filter_field, order_by) order → sorted
+         * prefix scan; no in-memory sort and no extra index walk needed. */
+        if (composite_index_exists(db_root, object,
+                                   fp.source_leaves[0]->field, order_by)) {
+            fp.order = FP_ORDER_COMPOSITE;
+        } else {
+            /* D2 vs D3: if the seed leaf's candidate set is bounded (estimable
+             * and not saturated), fetch + sort in memory (D2).  When it's broad
+             * (saturated / unestimable), walk the order_by index directly (D3). */
+            const TypedField *seed_tf =
+                resolve_idx_field(fs->ts, fp.source_leaves[0]->field);
+            CardEst se = card_est_leaf(db_root, object, splits,
+                                       fp.source_leaves[0], seed_tf,
+                                       selectivity_budget(N));
+            fp.order = (se.estimable && !se.saturated)
+                       ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
+        }
+    }
     return fp;
 }
 
@@ -12444,9 +12483,11 @@ static const char *fp_order_str(FilterOrderKind o){
 
 const char *plan_filter_kind_for_test(const char *db_root, const char *object,
         const char *criteria_json, const char *order_by, int fetching,
-        char *out_field, size_t fsz, char *out_order, size_t osz) {
+        char *out_field, size_t fsz, char *out_order, size_t osz,
+        int *out_total_cheap) {
     if (out_field && fsz) out_field[0]='\0';
     if (out_order && osz) out_order[0]='\0';
+    if (out_total_cheap) *out_total_cheap = -1;
     snprintf(g_db_root, PATH_MAX, "%s", db_root);
     char eff_root[PATH_MAX], bare[256];
     const char *slash = strchr(object,'/');
@@ -12465,6 +12506,7 @@ const char *plan_filter_kind_for_test(const char *db_root, const char *object,
     if (out_field && fsz && fp.n_source>0 && fp.source_leaves[0])
         snprintf(out_field, fsz, "%s", fp.source_leaves[0]->field);
     if (out_order && osz) snprintf(out_order, osz, "%s", fp_order_str(fp.order));
+    if (out_total_cheap) *out_total_cheap = fp.total_cheap;
     free_criteria_tree(tree);
     return fp_kind_str(fp.kind);
 }
