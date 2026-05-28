@@ -430,3 +430,144 @@ static int test_planBCS_count_one_selective_leaf(void) {
 }
 TEST_REGISTER("test-plan-bcs-count-one-selective-leaf",
               test_planBCS_count_one_selective_leaf)
+
+/* -----------------------------------------------------------------------
+ * C-row tests: OR / hybrid (Task 1b.4)
+ *
+ * OR JSON shape confirmed from test_or_logic.c:
+ *   pure OR root:    [{"or":[{leaf},{leaf}]}]
+ *   AND + OR child:  [{leaf}, {"or":[{leaf},{leaf}]}]
+ * Both produce a CNODE_AND root; the inner {"or":[...]} is a CNODE_OR child.
+ * find_fully_indexed_or() handles the CNODE_AND-with-OR-child case.
+ * ----------------------------------------------------------------------- */
+
+/* C1: pure OR, every child a selective indexed eq (tag="rare" OR tag2="rare").
+ * Both tag and tag2 are btree-indexed → find_fully_indexed_or returns the OR
+ * node → FP_UNION. */
+static int test_planC1_pure_or_all_indexed(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "c1",
+        "\"tag:varchar:8\",\"tag2:varchar:8\"",
+        "\"tag\",\"tag2\"");
+    if (!tc) return 1;
+    /* 5 rows tag=rare+tag2=rare, 200 tag=common+tag2=common.
+     * Both selective fields indexed → pure OR with all indexed children. */
+    char body[65536]; int p=0,k=0; char *resp=NULL;
+    p+=snprintf(body+p,sizeof(body)-p,"{");
+    for(int i=0;i<5;i++){
+        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"rare\"}",
+            k==0?"":",",k); k++;
+    }
+    for(int i=0;i<200;i++){
+        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}",k); k++;
+    }
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[66560];
+    snprintf(req,sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c1\",\"records\":%s}",body);
+    tc_request(tc,req,&resp); free(resp);
+
+    char f[64]={0}, o[16]={0};
+    /* Pure OR array form: [{"or":[{tag=rare},{tag2=rare}]}] */
+    const char *k_str = plan_filter_kind_for_test(env.db_root,"default/c1",
+        "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+                  "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]}]",
+        NULL, 1, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_str, "union", "C1: pure OR all-indexed → FP_UNION");
+
+    /* Also test fetching=0 (count) */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
+    const char *k_count = plan_filter_kind_for_test(env.db_root,"default/c1",
+        "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+                  "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"rare\"}]}]",
+        NULL, 0, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_count, "union", "C1 count: pure OR all-indexed → FP_UNION");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-c1-pure-or-all-indexed", test_planC1_pure_or_all_indexed)
+
+/* C2: OR with a non-indexed child (tag="rare" OR note contains "x").
+ * note is not indexed → find_fully_indexed_or returns NULL → FP_FULL_SCAN. */
+static int test_planC2_or_with_nonindexed_child(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "c2",
+        "\"tag:varchar:8\",\"note:varchar:16\"",
+        "\"tag\"");   /* note is NOT indexed */
+    if (!tc) return 1;
+    cm_insert_tags(tc, "c2");   /* 5 rare + 200 common; note field absent */
+
+    char f[64]={0}, o[16]={0};
+    /* OR where one child (note contains "x") has no index */
+    const char *k_str = plan_filter_kind_for_test(env.db_root,"default/c2",
+        "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+                  "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]}]",
+        NULL, 1, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_str, "scan", "C2: OR with non-indexed child → FULL_SCAN");
+
+    /* Also count path */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
+    const char *k_count = plan_filter_kind_for_test(env.db_root,"default/c2",
+        "[{\"or\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+                  "{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]}]",
+        NULL, 0, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_count, "scan", "C2 count: OR with non-indexed child → FULL_SCAN");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-c2-or-with-nonindexed-child", test_planC2_or_with_nonindexed_child)
+
+/* C3: AND of indexed leaf + OR sub-tree (tag="rare" AND (tag2="a" OR tag2="b")).
+ * collect_and_leaves picks up the LEAF child (tag); the OR child is skipped.
+ * most_selective_indexed seeds on tag → FP_PRIMARY_LEAF, field="tag".
+ * The OR sub-tree becomes a per-record post-filter (has_subtree=1 internally). */
+static int test_planC3_and_leaf_plus_or_subtree(void) {
+    TestEnv env={0};
+    TestClient *tc = cm_setup(&env, "c3",
+        "\"tag:varchar:8\",\"tag2:varchar:8\"",
+        "\"tag\",\"tag2\"");
+    if (!tc) return 1;
+    /* 5 rows tag=rare+tag2=a, 200 rows tag=common+tag2=b */
+    char body[65536]; int p=0,k=0; char *resp=NULL;
+    p+=snprintf(body+p,sizeof(body)-p,"{");
+    for(int i=0;i<5;i++){
+        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"a\"}",
+            k==0?"":",",k); k++;
+    }
+    for(int i=0;i<200;i++){
+        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"tag2\":\"b\"}",k); k++;
+    }
+    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char req[66560];
+    snprintf(req,sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c3\",\"records\":%s}",body);
+    tc_request(tc,req,&resp); free(resp);
+
+    char f[64]={0}, o[16]={0};
+    /* AND + OR sub-tree: [{tag=rare}, {"or":[{tag2=a},{tag2=b}]}]
+     * collect_and_leaves sees 1 LEAF (tag=rare), skips the OR child.
+     * Seeds on tag → FP_PRIMARY_LEAF. */
+    const char *k_str = plan_filter_kind_for_test(env.db_root,"default/c3",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+         "{\"or\":[{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"a\"},"
+                  "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"b\"}]}]",
+        NULL, 1, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_str, "leaf", "C3: AND+OR sub-tree → PRIMARY_LEAF");
+    ASSERT_EQ_STR(f, "tag", "C3: seed is the AND leaf `tag`, not the OR child");
+
+    /* fetching=0 (count): same — one selective indexed AND-leaf seeds */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o));
+    const char *k_count = plan_filter_kind_for_test(env.db_root,"default/c3",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"rare\"},"
+         "{\"or\":[{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"a\"},"
+                  "{\"field\":\"tag2\",\"op\":\"eq\",\"value\":\"b\"}]}]",
+        NULL, 0, f,sizeof(f), o,sizeof(o));
+    ASSERT_EQ_STR(k_count, "leaf", "C3 count: AND+OR sub-tree → PRIMARY_LEAF");
+    ASSERT_EQ_STR(f, "tag", "C3 count: seed is tag");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-plan-c3-and-leaf-plus-or-subtree", test_planC3_and_leaf_plus_or_subtree)

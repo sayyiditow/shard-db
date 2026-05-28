@@ -12273,13 +12273,67 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     fp.order = FP_ORDER_NONE;
     if (!tree) { fp.kind = FP_FULL_SCAN; return fp; }
 
-    /* OR / hybrid handled in Task 1b.4; for now treat a pure-OR root via the
-     * existing detector and otherwise fall to the AND-leaf cost pass. */
-    /* (1b.4 inserts the OR branch here.) */
+    /* (1b.4) OR / hybrid handling.
+     *
+     * C1/C2: Pure OR root (CNODE_OR) or AND whose only children are OR nodes
+     * (collect_and_leaves returns nL=0). Use find_fully_indexed_or which handles
+     * both CNODE_OR root and CNODE_AND-with-OR-child.
+     *   C1: every OR child indexed → UNION; 1b.5: goto order_overlay.
+     *   C2: any non-indexed child → FULL_SCAN.
+     *
+     * C3: AND of indexed leaf + OR sub-tree: collect_and_leaves returns the
+     * LEAF children only (skips the OR child). The OR sub-tree is automatically
+     * excluded from `source`; has_subtree marks its presence so 1c's executor
+     * rechecks the WHOLE tree via criteria_match_tree (completeness guarantee). */
+    if (tree->kind == CNODE_OR) {
+        CriteriaNode *orn = find_fully_indexed_or(tree, db_root, object);
+        if (orn) {
+            fp.kind = FP_UNION; fp.or_node = orn;
+            /* 1b.5: goto order_overlay */
+            return fp;
+        }
+        fp.kind = FP_FULL_SCAN; return fp;
+    }
 
     SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
     int nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
-    if (nL == 0) { fp.kind = FP_FULL_SCAN; return fp; }
+    if (nL == 0) {
+        /* No LEAF children — could be CNODE_AND whose only children are OR
+         * nodes (the array form [{"or":[...]}] produces this). Try the OR
+         * fast path; if not fully indexed, fall to scan.
+         *
+         * KNOWN LIMITATION (matches the legacy choose_primary_source — not a
+         * regression): find_fully_indexed_or returns only the FIRST fully-
+         * indexed OR child. For an AND of multiple ORs (e.g.
+         * [{"or":[a,b]},{"or":[c,d]}]) the union seeds on that first OR; the
+         * remaining OR(s) are NOT index-narrowed here. Results stay CORRECT —
+         * 1c's executor rechecks the WHOLE tree via criteria_match_tree per
+         * fetched record — only the plan is suboptimal. AND-of-multiple-ORs is
+         * outside the current decision table (rows C1-C3); revisit as its own
+         * row + an OR-intersect seed if a real query needs it. */
+        CriteriaNode *orn = find_fully_indexed_or(tree, db_root, object);
+        if (orn) {
+            fp.kind = FP_UNION; fp.or_node = orn;
+            /* 1b.5: goto order_overlay */
+            return fp;
+        }
+        fp.kind = FP_FULL_SCAN; return fp;
+    }
+
+    /* C3: an AND that also contains OR/nested-AND sub-trees alongside LEAF
+     * children. collect_and_leaves already skipped those non-LEAF children, so
+     * they are NOT in `source`. Mark has_subtree so 1c's executor knows to
+     * recheck the full tree — never SKIP the per-record post-filter when an OR
+     * sub-tree is present (the seed leaf still uses its index; the OR is
+     * verified on each fetched record). */
+    int has_subtree = 0;
+    if (tree->kind == CNODE_AND)
+        for (int i = 0; i < tree->n_children; i++)
+            if (tree->children[i]->kind != CNODE_LEAF) has_subtree = 1;
+    /* has_subtree forces full-tree recheck in 1c; add a FilterPlan field then.
+     * The single-seed block below already post-filters all non-source leaves,
+     * and 1c will recheck the whole tree on each fetched record. */
+    (void)has_subtree;
 
     CardEst est[MAX_INTERSECT_LEAVES];
     int prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
