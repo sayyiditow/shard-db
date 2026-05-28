@@ -13768,6 +13768,57 @@ static KeySet *build_keyset_from_trigram(const char *db_root, const char *object
     return acc;
 }
 
+/* ============================================================
+   A3 executor: trigram-prefix starts_with on a trigram-only field.
+
+   Uses only the leading 3-gram (cheaper than build_keyset_from_trigram
+   which intersects all grams). False positives filtered by
+   criteria_match_tree's OP_STARTS_WITH check. */
+static int find_via_trigram_starts_with(const char *db_root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        SearchCriterion *seed,
+                                        CriteriaNode *tree,
+                                        ExcludedKeys *excluded,
+                                        int offset, int limit,
+                                        const char **proj_fields, int proj_count,
+                                        int dict_fmt,
+                                        QueryDeadline *dl)
+{
+    size_t plen = strlen(seed->value);
+    if (plen < 3) return 0;
+
+    uint8_t gram[3];
+    for (int i = 0; i < 3; i++) {
+        uint8_t c = (uint8_t)seed->value[i];
+        gram[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+    }
+
+    size_t posting_count = tg_posting_count(db_root, object, seed->field,
+                                            sch->splits, gram, dl);
+    if (dl->timed_out) return 0;
+    if (posting_count == 0) return 0;
+
+    KeySet *ks = keyset_new(posting_count);
+    if (!ks) return 0;
+
+    int idx_n = index_splits_for(sch->splits);
+    TgCollectCtx cc = { ks, dl, 0 };
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, seed->field, s);
+        btree_range(tp, (const char *)gram, 3, (const char *)gram, 3,
+                    tg_collect_to_keyset_cb, &cc);
+        if (cc.timed_out) { keyset_free(ks); return 0; }
+    }
+    int rc = keyset_emit_find(db_root, object, sch, ks,
+                              tree, excluded, offset, limit,
+                              proj_fields, proj_count,
+                              fs, 0 /*rows_fmt*/, dict_fmt, 0 /*csv_delim*/,
+                              NULL /*joins*/, 0 /*njoins*/, dl);
+    keyset_free(ks);
+    return rc;
+}
+
 static KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                       int splits,
                                       SearchCriterion *leaf,
@@ -16424,7 +16475,8 @@ int cmd_find(const char *db_root, const char *object,
                   the trigram-aware dispatch lives. */
                !((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
                  fp.n_source > 0 && fp.source_leaves[0] &&
-                 op_prefers_trigram(fp.source_leaves[0]->op) &&
+                 (op_prefers_trigram(fp.source_leaves[0]->op) ||
+                  op_allows_trigram_starts(fp.source_leaves[0]->op)) &&
                  field_has_index_type(db_root, object, fp.source_leaves[0]->field, IT_TRIGRAM))) {
         /* ===== Streaming fast path for limit-bound, post-filtered finds.
            For small (offset + limit) where the tree has post-filter siblings
@@ -16478,16 +16530,40 @@ int cmd_find(const char *db_root, const char *object,
 
         /* Dispatch on the picker's chosen index — same rulebook the
            planner used to claim this leaf, so we can't disagree.
-           IT_TRIGRAM goes through keyset_emit_find sourced from the
-           trigram intersection; IT_BITMAP and IT_BTREE both ride
-           idx_find_parallel, which routes bitmap via btree_dispatch's
-           internal bitmap branch. The picker has already enforced
-           plen >= 3 for trigram, so build_keyset_from_trigram returning
-           NULL here is a transient failure rather than an unsupported
+           IT_TRIGRAM + OP_STARTS_WITH → A3 executor (leading-gram walk +
+           per-record prefix verify): cheaper than build_keyset_from_trigram
+           (no multi-gram intersection, no keyset allocation) when the query
+           has no joins/rows_fmt/csv_delim.
+           IT_TRIGRAM + other ops → keyset_emit_find sourced from the
+           trigram intersection (OP_CONTAINS/ICONTAINS).
+           IT_BITMAP and IT_BTREE both ride idx_find_parallel, which routes
+           bitmap via btree_dispatch's internal bitmap branch. The picker has
+           already enforced plen >= 3 for trigram, so build_keyset_from_trigram
+           returning NULL here is a transient failure rather than an unsupported
            pattern. */
         int rc = 0;
         int picked = pick_index_for_leaf(db_root, object, pc);
         if (picked == IT_TRIGRAM) {
+            /* A3: starts_with on trigram-only field — leading-gram walk +
+               per-record full-prefix verify.  Guards: no joins (tabular
+               materialise), no rows_fmt (table envelope), no csv_delim
+               (header row).  Those cases fall through to the keyset path. */
+            if (pc->op == OP_STARTS_WITH && !has_joins && !rows_fmt && !csv_delim) {
+                find_via_trigram_starts_with(
+                    db_root, object, &sch,
+                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                    pc, tree, &excluded, offset, limit,
+                    proj_fields, proj_count, dict_fmt, &dl);
+                /* Close the envelope opened above and return. */
+                if (dict_fmt)
+                    OUT(want_total ? "},\"total\":null}\n" : "}\n");
+                else
+                    OUT(want_total ? "],\"total\":null}\n" : "]\n");
+                free_excluded(&excluded);
+                free_criteria_tree(tree);
+                free_joins(joins, njoins);
+                return 0;
+            }
             KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
                                                        sch.splits, pc, &dl);
             if (tg_ks) {
