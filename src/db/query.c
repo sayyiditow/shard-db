@@ -15865,6 +15865,91 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
     }
 }
 
+/* Phase 1d follow-up: compute the true match count for a FilterPlan when the
+ * dispatch path didn't produce one for free.  Called by cmd_find's
+ * want_total branches that early-return (FP_ORDER_INDEX_WALK,
+ * FP_ORDER_COMPOSITE) and by the tail close fallback.  Same work the
+ * client would do firing a separate count query; this consolidates it
+ * into the find round-trip.
+ *
+ * Sets *out_null = 0 + returns the count when computed; *out_null = 1
+ * + returns 0 when we can't cheaply compute (e.g. FP_FULL_SCAN, or
+ * postfilter-bearing plans where the count would need a full recheck). */
+static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
+                               const char *db_root, const char *object,
+                               const Schema *sch, FieldSchema *fs,
+                               QueryDeadline *dl, int *out_null) {
+    (void)tree;
+    *out_null = 1;
+    if (!fp || dl->timed_out) return 0;
+    switch (fp->kind) {
+    case FP_INTERSECT: {
+        int small_primary = 0;
+        /* Cast away const on the source_leaves array: the function's signature
+         * is SearchCriterion** (mutates nothing in practice; the const is a
+         * caller-side guarantee that's just not threaded into the helper). */
+        SearchCriterion **leaves = (SearchCriterion **)(uintptr_t)fp->source_leaves;
+        KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
+                                              leaves, fp->n_source,
+                                              dl, &small_primary);
+        if (!ks || dl->timed_out) { if (ks) keyset_free(ks); return 0; }
+        size_t n = 0;
+        if (!small_primary && fp->n_postfilter == 0) {
+            /* Clean intersection: KeySet size IS the match count. */
+            n = keyset_size(ks);
+            *out_null = 0;
+        } else {
+            /* small_primary OR n_postfilter > 0 → KeySet is candidates,
+             * not the answer. Walk it, fetch + criteria_match_tree per
+             * record, count matches. Same cost as the explorer's
+             * separate count query; we just consolidate it here. */
+            CollectedHash *entries = NULL;
+            size_t nh = 0;
+            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
+            if (entries && tree) {
+                n = parallel_indexed_count(db_root, object, sch,
+                                           entries, (int)nh,
+                                           tree, fs, dl);
+                if (!dl->timed_out) *out_null = 0;
+            } else if (entries && !tree) {
+                /* No tree to verify against → every candidate is a match. */
+                n = nh;
+                *out_null = 0;
+            }
+            free(entries);
+        }
+        keyset_free(ks);
+        return n;
+    }
+    case FP_PRIMARY_LEAF:
+    case FP_BITMAP_SMALLER: {
+        if (fp->n_source == 0 || fp->n_postfilter != 0) return 0;
+        size_t n = idx_count_for_leaf(db_root, object, sch, fs,
+                                      fp->source_leaves[0], dl);
+        if (!dl->timed_out) *out_null = 0;
+        return n;
+    }
+    case FP_UNION: {
+        int budget_exc = 0;
+        KeySet *ks = build_or_keyset(db_root, object, sch->splits,
+                                     fp->or_node, dl, &budget_exc, 0);
+        size_t n = 0;
+        if (ks && !dl->timed_out && !budget_exc) {
+            n = keyset_size(ks);
+            *out_null = 0;
+        }
+        if (ks) keyset_free(ks);
+        return n;
+    }
+    case FP_FULL_SCAN:
+    default:
+        /* Full-scan count would mean another full scan over the
+         * same data — skip and emit null; caller can fire a separate
+         * count if they really need it for this shape. */
+        return 0;
+    }
+}
+
 int cmd_find(const char *db_root, const char *object,
                     const char *criteria_json, int offset, int limit,
                     const char *proj_str, const char *excluded_csv,
@@ -16226,11 +16311,22 @@ int cmd_find(const char *db_root, const char *object,
             fp.source_leaves[0], order_by, desc,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
-        /* Close the envelope opened above and return. */
-        if (dict_fmt)
-            OUT(want_total ? "},\"total\":null}\n" : "}\n");
-        else
-            OUT(want_total ? "],\"total\":null}\n" : "]\n");
+        /* Close the envelope opened above and return.  When want_total,
+         * compute the real match count via fp_compute_total (extra walk —
+         * same work the client would do firing a separate count; this
+         * consolidates it into the find round-trip). */
+        size_t d1_total = 0; int d1_null = 1;
+        if (want_total) d1_total = fp_compute_total(&fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d1_null);
+        if (dict_fmt) {
+            if (!want_total) OUT("}\n");
+            else if (d1_null) OUT("},\"total\":null}\n");
+            else OUT("},\"total\":%zu}\n", d1_total);
+        } else {
+            if (!want_total) OUT("]\n");
+            else if (d1_null) OUT("],\"total\":null}\n");
+            else OUT("],\"total\":%zu}\n", d1_total);
+        }
         free_excluded(&excluded);
         free_criteria_tree(tree);
         free_joins(joins, njoins);
@@ -16256,11 +16352,20 @@ int cmd_find(const char *db_root, const char *object,
             order_by, desc,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
-        /* Close the envelope opened above and return. */
-        if (dict_fmt)
-            OUT(want_total ? "},\"total\":null}\n" : "}\n");
-        else
-            OUT(want_total ? "],\"total\":null}\n" : "]\n");
+        /* Close the envelope opened above and return.  When want_total,
+         * compute the real match count via fp_compute_total. */
+        size_t d3_total = 0; int d3_null = 1;
+        if (want_total) d3_total = fp_compute_total(&fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d3_null);
+        if (dict_fmt) {
+            if (!want_total) OUT("}\n");
+            else if (d3_null) OUT("},\"total\":null}\n");
+            else OUT("},\"total\":%zu}\n", d3_total);
+        } else {
+            if (!want_total) OUT("]\n");
+            else if (d3_null) OUT("],\"total\":null}\n");
+            else OUT("],\"total\":%zu}\n", d3_total);
+        }
         free_excluded(&excluded);
         free_criteria_tree(tree);
         free_joins(joins, njoins);
@@ -16846,7 +16951,20 @@ int cmd_find(const char *db_root, const char *object,
     if (csv_delim)
         { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
     else if (want_total) {
-        /* Phase 1d.2: emit real total when available, null otherwise. */
+        /* Phase 1d follow-up: if the dispatch path didn't compute total
+         * cheaply (FP_FULL_SCAN, postfilter-bearing plans), call the
+         * shared fp_compute_total helper. Falls back to null when the
+         * plan can't cheaply produce a count (e.g. FP_FULL_SCAN — caller
+         * can fire a separate count query for those rare shapes). */
+        if (find_total_null && !dl.timed_out) {
+            int helper_null = 1;
+            size_t n = fp_compute_total(&fp, tree, db_root, object,
+                                         &sch, &driver_fs, &dl, &helper_null);
+            if (!helper_null) {
+                find_total = n;
+                find_total_null = 0;
+            }
+        }
         const char *arr_close = (has_joins || rows_fmt) ? "]}" :
                                  dict_fmt                ? "}"  : "]";
         if (find_total_null)

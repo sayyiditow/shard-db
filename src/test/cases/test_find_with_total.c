@@ -558,16 +558,20 @@ static int test_real_total_a2_bitmap(void) {
 }
 TEST_REGISTER("test-real-total-a2-bitmap", test_real_total_a2_bitmap)
 
-/* ---- B1: FP_INTERSECT + small-primary → total = null (upper-bound case) -----
-   The intersect engine uses a "small-primary" heuristic: when the smallest leaf's
-   KeySet is below INTERSECT_MIN_PRIMARY (10 000 entries), it skips the second-leaf
-   walk and hands the first leaf's set to the caller as an upper bound.  At that
-   point the engine can't know the exact intersection size, so total must be null.
+/* ---- B1: FP_INTERSECT + small-primary → real total (post Phase 1d follow-up) ---
+   After the Phase 1d follow-up that lets the daemon compute total for ALL
+   want_total requests via fp_compute_total: when small_primary fires (the
+   first leaf's KeySet is < INTERSECT_MIN_PRIMARY=10000 entries — the engine
+   handed back the smallest leaf as a candidate set, not the actual
+   intersection), the helper walks that candidate KeySet, fetches each record,
+   verifies against the full criteria tree via parallel_indexed_count, and
+   returns the true match count. Same work the explorer would do firing a
+   separate count query; consolidated into this round-trip.
 
    Setup: 100 records, 60 with tag="x", 40 with tag="y".
-   AND criteria: {tag:"x"} AND {score>=50} → planner picks FP_INTERSECT but
-   tag="x" leaf has 60 entries < 10 000 → small_primary fires → total=null.
-   Rows still respect the limit (5 records emitted, all post-verified). */
+   AND criteria: {tag:"x"} AND {score>=50}. 20 records have BOTH (tag=x and
+   score in [50,69]). small_primary fires (60 tag="x" entries < 10000), the
+   helper recheck-counts the 60 candidates against score>=50 → 20 matches. */
 static int test_real_total_b1_intersect(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "rt_b1",
@@ -610,7 +614,7 @@ static int test_real_total_b1_intersect(void) {
     /* small_primary fires (60 < INTERSECT_MIN_PRIMARY=10000): engine can't
        know exact intersection size → total must be null */
     int total = extract_total(resp);
-    ASSERT_EQ_INT(total, -999, "B1 → total = null (small-primary: exact count unavailable)");
+    ASSERT_EQ_INT(total, 20, "B1 → total = 20 (small-primary recheck: 20 of 60 tag=x match score>=50)");
     /* Rows must still be correct (post-filter verifies both criteria) */
     int nrows = count_rows_in_resp(resp);
     ASSERT_EQ_INT(nrows, 5, "B1 → rows length = 5 (limit)");
@@ -762,10 +766,13 @@ static int test_real_total_d1_composite(void) {
 }
 TEST_REGISTER("test-real-total-d1-composite", test_real_total_d1_composite)
 
-/* ---- D3: FP_ORDER_INDEX_WALK → total = null (spec) -------- */
+/* ---- D3: FP_ORDER_INDEX_WALK → real total (post Phase 1d follow-up) -------- */
 /* Setup mirrors test_d3_order_walk_executor: score and time both indexed,
    no composite. Broad filter (score>50) + indexed order_by → D3.
-   find {score>50} order_by time limit=3 total=true → total must be null. */
+   After the Phase 1d follow-up that lets the daemon compute total for
+   ALL want_total requests (via fp_compute_total), D3 returns the real
+   match count instead of null. find {score>50} order_by time limit=3
+   total=true → total = 50 (the 50 score=100 rows that match score>50). */
 static int test_real_total_d3_order_walk(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
@@ -808,7 +815,7 @@ static int test_real_total_d3_order_walk(void) {
     ASSERT_NOT_NULL(resp, "D3 response not null");
     ASSERT_CONTAINS(resp, "\"rows\"", "D3 → rows key present");
     int total = extract_total(resp);
-    ASSERT_EQ_INT(total, -999, "D3 → total = null (index walk, per spec)");
+    ASSERT_EQ_INT(total, 50, "D3 → total = 50 (50 score=100 rows match score>50)");
     int nrows = count_rows_in_resp(resp);
     ASSERT_EQ_INT(nrows, 3, "D3 → rows length = 3 (limit respected)");
     free(resp);
