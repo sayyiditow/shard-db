@@ -3,8 +3,10 @@
 #include "simd.h"
 #include "bitmap.h"
 #include "trigram.h"
+#include "io_direct.h"
 #include <fnmatch.h>
 #include <math.h>
+#include <dirent.h>
 
 /* ========== Probing helpers ========== */
 
@@ -179,20 +181,6 @@ static void *v2_shard_worker(void *raw) {
     return NULL;
 }
 
-/* Streaming variant of v2_shard_worker — uses slotcask_walk_one_shard_streaming
-   so cb response is per-record, not deferred to Pass 2. Right path for
-   limit-bound scans (cmd_keys, FIND limit-N, etc). */
-static void *v2_shard_worker_streaming(void *raw) {
-    V2ShardArg *w = (V2ShardArg *)raw;
-    g_out = w->parent_out ? w->parent_out : stdout;
-    if (w->stop_flag &&
-        __atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
-    int rc = slotcask_walk_one_shard_streaming(w->db, w->kf_shard_id,
-                                                w->scb, w->sctx, w->stop_flag);
-    if (rc != 0 && w->stop_flag)
-        __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
-    return NULL;
-}
 
 void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     g_scan_stop = 0;
@@ -219,31 +207,132 @@ void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
     free(args);
 }
 
-/* Streaming variant of scan_shards_v2 — uses the streaming per-shard
-   walker so cb stop response is per-record. Use for limit-bound queries
-   (cmd_keys, FIND-with-limit, etc.) where the buffered walker's Pass 1
-   would collect refs the caller would never read after the limit fires. */
+/* Forward declaration — defined below after the O_DIRECT helper block. */
+void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx);
+
+/* Streaming variant of scan_shards_v2 — routes through the O_DIRECT
+   seg-file path for cache pollution avoidance.  Early-stop semantics
+   are preserved: seg_scan_o_direct returns non-zero when the cb adapter
+   returns non-zero, and the shared stop_flag propagates across parallel
+   file workers so limit-bound scans bail quickly.
+   The old slotcask_walk_one_shard_streaming per-kf-shard fan-out is
+   replaced by the seg-file fan-out in scan_shards_v2_o_direct. */
 void scan_shards_v2_streaming(SlotcaskDb *db, scan_callback cb, void *ctx) {
-    g_scan_stop = 0;
+    scan_shards_v2_o_direct(db, cb, ctx);
+}
+
+/* ========== O_DIRECT full-scan path (FP_FULL_SCAN / Phase 1e.4) ==========
+ *
+ * scan_shards_v2_o_direct: cache-bypassing replacement for the mmap-based
+ * scan_shards_v2 / slotcask_walk_one_shard inner loop.  Enumerates every
+ * .dat segment file under <data_dir>/data/streams/<s>/ for each stream
+ * s in [0, num_streams) and calls seg_scan_o_direct on each file.  The
+ * caller's scan_callback is invoked via a thin adapter that reconstructs
+ * the (SlotHeader *, block) shape the callback expects.
+ *
+ * Parallelism: one parallel_for entry per segment file across all streams.
+ * This matches the throughput of scan_shards_v2's per-kf-shard fan-out
+ * (typically the same or better because .dat files are the actual data).
+ *
+ * Fallback: if O_DIRECT open fails silently (EINVAL / unsupported FS),
+ * seg_scan_o_direct reverts to buffered + POSIX_FADV_DONTNEED internally —
+ * the caller is unaffected.
+ */
+
+/* Adapter: od_record_cb → v2_scan_wrap_cb (SlotcaskScanCb) → scan_callback.
+ * rec layout: [0..16) hash16  [16..18) klen LE  [18] flag  [19] rsv  [20..24) vlen LE
+ *             [24..24+klen) key  [24+klen..) value
+ * od_record_cb is called only for flag==1 records, so we skip the flag check. */
+typedef struct {
+    V2ScanWrap *wrap;      /* wraps the real scan_callback */
+    int        *stop_flag;
+} OdSegAdapterCtx;
+
+static int od_seg_record_cb(const uint8_t *rec, size_t vlen,
+                             const uint8_t hash16[16], void *raw_ctx)
+{
+    OdSegAdapterCtx *actx = (OdSegAdapterCtx *)raw_ctx;
+    if (actx->stop_flag &&
+        __atomic_load_n(actx->stop_flag, __ATOMIC_RELAXED)) return 1;
+
+    uint16_t klen_le;
+    memcpy(&klen_le, rec + 16, 2);
+    uint16_t klen = klen_le;   /* already native-endian LE on x86/ARM LE */
+    const uint8_t *key = rec + 24;
+    const uint8_t *val = rec + 24 + klen;
+    /* Delegate to the existing v2_scan_wrap_cb which synthesises a
+       SlotHeader and fires the real scan_callback. */
+    int rc = v2_scan_wrap_cb(hash16, key, klen, val, (size_t)vlen,
+                             actx->wrap);
+    if (rc != 0 && actx->stop_flag)
+        __atomic_store_n(actx->stop_flag, 1, __ATOMIC_RELEASE);
+    return rc;
+}
+
+/* One entry in the per-file parallel_for array. */
+typedef struct {
+    char           seg_path[PATH_MAX];
+    int            slot_size;
+    V2ScanWrap    *wrap;
+    int           *stop_flag;
+    FILE          *parent_out;
+} OdSegFileArg;
+
+static void *od_seg_file_worker(void *raw) {
+    OdSegFileArg *arg = (OdSegFileArg *)raw;
+    g_out = arg->parent_out ? arg->parent_out : stdout;
+    if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
+    OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    return NULL;
+}
+
+/* Enumerate all .dat files under every stream directory and fan out. */
+void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
+    if (!db || db->num_streams <= 0) return;
+
+    /* Collect all .dat paths into a dynamic array. */
+    OdSegFileArg *args = NULL;
+    size_t nargs = 0, cap = 0;
+
     V2ScanWrap wrap = { cb, ctx };
-    int n = db->num_shards;
-    if (n <= 0) return;
     int stop_flag = 0;
-    V2ShardArg *args = malloc((size_t)n * sizeof(V2ShardArg));
-    if (!args) {
-        slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
-        return;
-    }
     FILE *parent_out = g_out;
-    for (int s = 0; s < n; s++) {
-        args[s] = (V2ShardArg){
-            .db = db, .kf_shard_id = s,
-            .scb = v2_scan_wrap_cb, .sctx = &wrap,
-            .stop_flag = &stop_flag,
-            .parent_out = parent_out,
-        };
+
+    for (int s = 0; s < db->num_streams; s++) {
+        char stream_dir[PATH_MAX];
+        snprintf(stream_dir, sizeof(stream_dir),
+                 "%s/data/streams/%03d", db->data_dir, s);
+        DIR *dh = opendir(stream_dir);
+        if (!dh) continue;
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
+                continue;
+            /* Grow array if needed. */
+            if (nargs >= cap) {
+                size_t newcap = cap ? cap * 2 : 64;
+                OdSegFileArg *t = realloc(args, newcap * sizeof(OdSegFileArg));
+                if (!t) { closedir(dh); goto run; }
+                args = t;
+                cap = newcap;
+            }
+            snprintf(args[nargs].seg_path, PATH_MAX,
+                     "%s/%s", stream_dir, de->d_name);
+            args[nargs].slot_size  = db->slot_size;
+            args[nargs].wrap       = &wrap;
+            args[nargs].stop_flag  = &stop_flag;
+            args[nargs].parent_out = parent_out;
+            nargs++;
+        }
+        closedir(dh);
     }
-    parallel_for(v2_shard_worker_streaming, args, n, sizeof(V2ShardArg));
+
+run:
+    if (nargs == 0) { free(args); return; }
+    g_scan_stop = 0;
+    parallel_for(od_seg_file_worker, args, (int)nargs, sizeof(OdSegFileArg));
     free(args);
 }
 
@@ -259,7 +348,7 @@ int scan_dispatch(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
-    scan_shards_v2(sdb, cb, ctx);
+    scan_shards_v2_o_direct(sdb, cb, ctx);
     return 0;
     scan_shards(data_dir, sc->slot_size, cb, ctx);
     return 0;
@@ -9809,6 +9898,68 @@ typedef struct BmGenericShardArg {
 } BmGenericShardArg;
 static void *bm_generic_shard_worker(void *arg);
 
+/* ---- O_DIRECT btree leaf-scan adapter (btree_dispatch default branch) ----
+ *
+ * For ops that require a full index leaf scan (contains, ends, like-substring,
+ * regex, len_eq/lt/gt, not_in, not_like, not_contains, exists — the
+ * "default:" case in btree_dispatch), replace the mmap-based
+ * btree_idx_range("","","\xff"...) with a cache-bypassing
+ * btree_leaf_scan_o_direct per shard.
+ *
+ * Callback shape:
+ *   od_leaf_cb:   (const uint8_t *value, size_t vlen, hash16, ctx)
+ *   bt_result_cb: (const char    *value, size_t vlen, hash16, ctx)
+ * These are identical in layout (uint8_t* vs char* is ABI-identical);
+ * the adapter is a thin cast. */
+typedef struct {
+    char          idx_path[PATH_MAX];
+    bt_result_cb  cb;
+    void         *ctx;
+} BtreeOdShardArg;
+
+static int btree_od_leaf_cb(const uint8_t *value, size_t vlen,
+                             const uint8_t hash16[16], void *raw_ctx)
+{
+    BtreeOdShardArg *arg = (BtreeOdShardArg *)raw_ctx;
+    /* bt_result_cb and od_leaf_cb have identical runtime layout. */
+    return arg->cb((const char *)value, vlen, hash16, arg->ctx);
+}
+
+static void *btree_od_shard_worker(void *raw)
+{
+    BtreeOdShardArg *arg = (BtreeOdShardArg *)raw;
+    btree_leaf_scan_o_direct(arg->idx_path, btree_od_leaf_cb, arg);
+    /* Flush any thread-local count accumulator just as shard_walk_worker
+       does (index.c:129). No-op for callbacks that don't use TLS. */
+    idx_count_cb_flush_thread();
+    return NULL;
+}
+
+/* Fan out btree_leaf_scan_o_direct across index_splits_for(splits) shards,
+ * mirroring the parallel_for pattern of shard_walk_dispatch in index.c. */
+static void btree_idx_full_leaf_scan_o_direct(
+        const char *db_root, const char *object,
+        const char *field, int splits,
+        bt_result_cb cb, void *ctx)
+{
+    int idx_n = index_splits_for(splits);
+    BtreeOdShardArg *args = malloc((size_t)idx_n * sizeof(BtreeOdShardArg));
+    if (!args) {
+        /* OOM fallback: original mmap path. */
+        btree_idx_range(db_root, object, field, splits,
+                        "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+        return;
+    }
+    for (int s = 0; s < idx_n; s++) {
+        build_idx_path(args[s].idx_path, sizeof(args[s].idx_path),
+                       db_root, object, field, s);
+        args[s].cb  = cb;
+        args[s].ctx = ctx;
+    }
+    parallel_for(btree_od_shard_worker, args, idx_n, sizeof(BtreeOdShardArg));
+    free(args);
+}
+
 static void btree_dispatch(const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
@@ -9989,10 +10140,12 @@ static void btree_dispatch(const char *db_root, const char *object,
                                 (const char *)buf2, needle_len + 4, cb, ctx);
                 break;
             }
-            /* Substring / suffix / non-varchar → full leaf scan; per-entry
-               filter via check_primary in the callback handles correctness. */
-            btree_idx_range(db_root, object, field, splits,
-                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            /* Substring / suffix / non-varchar → full leaf scan via O_DIRECT;
+               per-entry filter via check_primary in the callback handles
+               correctness.  Cache-bypassing: hot index pages for targeted
+               reads (eq/range/prefix) are not evicted. */
+            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
+                                              cb, ctx);
             break;
         }
         case OP_NOT_EQUAL:
@@ -10019,9 +10172,11 @@ static void btree_dispatch(const char *db_root, const char *object,
                                "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         default:
-            /* Full index scan: contains, like, ends_with, not_like, not_contains, not_in, exists */
-            btree_idx_range(db_root, object, field, splits,
-                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
+            /* Full index scan: contains, like, ends_with, not_like,
+               not_contains, not_in, exists — use O_DIRECT leaf walk to
+               avoid polluting the btree page cache used by fast paths. */
+            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
+                                              cb, ctx);
             break;
     }
 }
