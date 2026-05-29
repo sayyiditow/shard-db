@@ -246,19 +246,19 @@ static int test_topn_stream_count_no_criteria(void) {
     /* Build bulk body. */
     size_t body_cap = 1 << 20;
     char *body = malloc(body_cap);
-    int p = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0;
+    SB_APPEND(body, p, body_cap, "{");
     int next_id = 0;
     for (int a = 0; a < 100; a++) {
         int n = a + 1;
         for (int j = 0; j < n; j++) {
-            p += snprintf(body + p, body_cap - p,
-                          "%s\"k%d\":{\"name\":\"author_%03d\",\"score\":%d}",
-                          next_id == 0 ? "" : ",", next_id, a, j);
+            SB_APPEND(body, p, body_cap,
+                      "%s\"k%d\":{\"name\":\"author_%03d\",\"score\":%d}",
+                      next_id == 0 ? "" : ",", next_id, a, j);
             next_id++;
         }
     }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -320,19 +320,19 @@ static int test_topn_stream_with_criteria_bitmap(void) {
     /* 50 authors × 20 records. Author N has 10 records active=true, 10 active=false. */
     size_t body_cap = 1 << 20;
     char *body = malloc(body_cap);
-    int p = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0;
+    SB_APPEND(body, p, body_cap, "{");
     int next = 0;
     for (int a = 0; a < 50; a++) {
         for (int j = 0; j < 20; j++) {
-            p += snprintf(body + p, body_cap - p,
-                          "%s\"k%d\":{\"name\":\"a_%02d\",\"active\":%s,\"score\":%d}",
-                          next == 0 ? "" : ",", next, a,
-                          j < 10 ? "true" : "false", j);
+            SB_APPEND(body, p, body_cap,
+                      "%s\"k%d\":{\"name\":\"a_%02d\",\"active\":%s,\"score\":%d}",
+                      next == 0 ? "" : ",", next, a,
+                      j < 10 ? "true" : "false", j);
             next++;
         }
     }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -401,17 +401,17 @@ static int test_topn_stream_sum_min_max(void) {
 
     size_t body_cap = 1 << 16;
     char *body = malloc(body_cap);
-    int p = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0;
+    SB_APPEND(body, p, body_cap, "{");
     int next = 0;
     for (int v = 0; v < 100; v++) {
         for (int j = 0; j < 10; j++) {
-            p += snprintf(body + p, body_cap - p,
-                          "%s\"k%d\":{\"v\":%d}", next == 0 ? "" : ",", next, v);
+            SB_APPEND(body, p, body_cap,
+                      "%s\"k%d\":{\"v\":%d}", next == 0 ? "" : ",", next, v);
             next++;
         }
     }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -496,18 +496,18 @@ static int test_topn_stream_with_composite(void) {
      * g=49 → 20*4900 + 190 = 98000 + 190 ... wait recompute below in assert. */
     size_t body_cap = 1 << 20;
     char *body = malloc(body_cap);
-    int p = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0;
+    SB_APPEND(body, p, body_cap, "{");
     int next = 0;
     for (int g = 0; g < 50; g++) {
         for (int j = 0; j < 20; j++) {
-            p += snprintf(body + p, body_cap - p,
-                          "%s\"k%d\":{\"a\":\"g_%d\",\"b\":%d}",
-                          next == 0 ? "" : ",", next, g, g * 100 + j);
+            SB_APPEND(body, p, body_cap,
+                      "%s\"k%d\":{\"a\":\"g_%d\",\"b\":%d}",
+                      next == 0 ? "" : ",", next, g, g * 100 + j);
             next++;
         }
     }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -600,22 +600,22 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
     const int N_TRUE = 40000, N_FALSE = 5000;
     size_t body_cap = 1 << 22; /* 4 MB */
     char *body = malloc(body_cap);
-    int p = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0;
+    SB_APPEND(body, p, body_cap, "{");
     int next = 0;
     for (int i = 0; i < N_TRUE; i++) {
-        p += snprintf(body + p, body_cap - p,
-                      "%s\"k%d\":{\"name\":\"g0\",\"active\":true}",
-                      next == 0 ? "" : ",", next);
+        SB_APPEND(body, p, body_cap,
+                  "%s\"k%d\":{\"name\":\"g0\",\"active\":true}",
+                  next == 0 ? "" : ",", next);
         next++;
     }
     for (int i = 0; i < N_FALSE; i++) {
-        p += snprintf(body + p, body_cap - p,
-                      ",\"k%d\":{\"name\":\"g0\",\"active\":false}", next);
+        SB_APPEND(body, p, body_cap,
+                  ",\"k%d\":{\"name\":\"g0\",\"active\":false}", next);
         next++;
     }
-    p += snprintf(body + p, body_cap - p, "}");
-    ASSERT_TRUE(p < (int)body_cap, "bulk body fit in buffer");
+    SB_APPEND(body, p, body_cap, "}");
+    ASSERT_TRUE(p < body_cap, "bulk body fit in buffer");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -686,8 +686,8 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
 
     size_t body_cap = 1 << 18;
     char *body = malloc(body_cap);
-    int p = 0, next = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0; int next = 0;
+    SB_APPEND(body, p, body_cap, "{");
     /* (count, active, tag) groups */
     struct { int n; const char *act; const char *tag; } seg[] = {
         { 25, "true",  "x" }, { 15, "true",  "y" },
@@ -695,13 +695,13 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
     };
     for (size_t g = 0; g < sizeof(seg)/sizeof(seg[0]); g++) {
         for (int j = 0; j < seg[g].n; j++) {
-            p += snprintf(body + p, body_cap - p,
+            SB_APPEND(body, p, body_cap,
                 "%s\"k%d\":{\"name\":\"g0\",\"active\":%s,\"tag\":\"%s\"}",
                 next == 0 ? "" : ",", next, seg[g].act, seg[g].tag);
             next++;
         }
     }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
 
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
@@ -796,19 +796,19 @@ static int test_topn_stream_btree_btree_intersect(void) {
 
     size_t body_cap = 1 << 18;
     char *body = malloc(body_cap);
-    int p = 0, next = 0;
-    p += snprintf(body + p, body_cap - p, "{");
+    size_t p = 0; int next = 0;
+    SB_APPEND(body, p, body_cap, "{");
     struct { int n; const char *t1; const char *t2; } seg[] = {
         { 30, "x", "y" }, { 20, "x", "z" }, { 10, "w", "y" },
     };
     for (size_t g = 0; g < sizeof(seg)/sizeof(seg[0]); g++)
         for (int j = 0; j < seg[g].n; j++) {
-            p += snprintf(body + p, body_cap - p,
+            SB_APPEND(body, p, body_cap,
                 "%s\"k%d\":{\"name\":\"g0\",\"t1\":\"%s\",\"t2\":\"%s\"}",
                 next == 0 ? "" : ",", next, seg[g].t1, seg[g].t2);
             next++;
         }
-    p += snprintf(body + p, body_cap - p, "}");
+    SB_APPEND(body, p, body_cap, "}");
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
     snprintf(req, req_cap,

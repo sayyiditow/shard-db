@@ -27,10 +27,11 @@ static int test_card_est_bitmap_exact(void) {
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ce\","
         "\"splits\":8,\"max_key\":12,\"fields\":[\"active:bool\"],"
         "\"indexes\":[\"active:bitmap\"]}", &resp); free(resp); resp=NULL;
-    char body[16384]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
-    for (int i=0;i<70;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
-    for (int i=0;i<30;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"active\":false}",k);k++;}
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char body[16384]; size_t p=0; int k=0;
+    SB_APPEND(body,p,sizeof(body),"{");
+    for (int i=0;i<70;i++){SB_APPEND(body,p,sizeof(body),"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
+    for (int i=0;i<30;i++){SB_APPEND(body,p,sizeof(body),",\"k%d\":{\"active\":false}",k);k++;}
+    SB_APPEND(body,p,sizeof(body),"}");
     char req[17408]; snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ce\",\"records\":%s}",body);
     tc_request(tc, req, &resp); free(resp); resp=NULL;
 
@@ -56,10 +57,11 @@ static int test_card_est_btree_capped(void) {
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ceb\","
         "\"splits\":8,\"max_key\":12,\"fields\":[\"tag:varchar:8\"],"
         "\"indexes\":[\"tag\"]}", &resp); free(resp); resp=NULL;
-    char body[65536]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
-    for (int i=0;i<5;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
-    for (int i=0;i<200;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\"}",k);k++;}
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char body[65536]; size_t p=0; int k=0;
+    SB_APPEND(body,p,sizeof(body),"{");
+    for (int i=0;i<5;i++){SB_APPEND(body,p,sizeof(body),"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
+    for (int i=0;i<200;i++){SB_APPEND(body,p,sizeof(body),",\"k%d\":{\"tag\":\"common\"}",k);k++;}
+    SB_APPEND(body,p,sizeof(body),"}");
     char req[66560]; snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ceb\",\"records\":%s}",body);
     tc_request(tc, req, &resp); free(resp); resp=NULL;
 
@@ -91,17 +93,18 @@ static int test_card_est_trigram(void) {
 
     /* Insert 4 records containing rare substring "zqxj"
      * and 150 records containing common substring "the". */
-    char body[65536]; int p=0,k=0; p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0;
+    SB_APPEND(body,p,sizeof(body),"{");
     for (int i=0;i<4;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"title\":\"a zqxj title %d\"}",
-                    k==0?"":",",k,i);
+        SB_APPEND(body,p,sizeof(body),"%s\"k%d\":{\"title\":\"a zqxj title %d\"}",
+                  k==0?"":",",k,i);
         k++;
     }
     for (int i=0;i<150;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"title\":\"the common one %d\"}",k,i);
+        SB_APPEND(body,p,sizeof(body),",\"k%d\":{\"title\":\"the common one %d\"}",k,i);
         k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body,p,sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
              "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cet\","

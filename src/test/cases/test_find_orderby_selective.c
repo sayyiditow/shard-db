@@ -3,6 +3,7 @@
 #include "test_assert.h"
 #include "../test_client.h"
 #include "../fixtures.h"
+#include "types.h"   /* SB_APPEND — safe StringBuilder vs CodeQL snprintf-overflow flag */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -27,16 +28,16 @@ static int test_find_by_orderby_time_correct(void) {
         "\"splits\":8,\"max_key\":12,\"fields\":[\"by:varchar:16\",\"time:long\"],"
         "\"indexes\":[\"by\",\"time\",\"by+time\"]}", &resp); free(resp); resp=NULL;
 
-    char body[8192]; int p = 0, k = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0; int k = 0;
+    SB_APPEND(body, p, sizeof(body), "{");
     const char *names[] = {"a","b","c"};
     for (int g = 0; g < 3; g++)
         for (int j = 0; j < 10; j++) {
-            p += snprintf(body+p, sizeof(body)-p, "%s\"k%d\":{\"by\":\"%s\",\"time\":%d}",
-                          k==0?"":",", k, names[g], (g+1)*100 + j);
+            SB_APPEND(body, p, sizeof(body), "%s\"k%d\":{\"by\":\"%s\",\"time\":%d}",
+                      k==0?"":",", k, names[g], (g+1)*100 + j);
             k++;
         }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[9216];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"prof\",\"records\":%s}", body);
@@ -78,13 +79,13 @@ static int test_count_find_parity(void) {
         "\"splits\":8,\"max_key\":12,\"fields\":[\"tag:varchar:8\",\"active:bool\"],"
         "\"indexes\":[\"tag\",\"active:bitmap\"]}", &resp); free(resp); resp=NULL;
 
-    char body[16384]; int p=0,k=0;
-    p += snprintf(body+p,sizeof(body)-p,"{");
+    char body[16384]; size_t p=0; int k=0;
+    SB_APPEND(body, p, sizeof(body), "{");
     struct { int n; const char*t; const char*a; } seg[]={{30,"x","true"},{20,"x","false"},{10,"y","true"}};
     for (size_t g=0; g<sizeof(seg)/sizeof(seg[0]); g++)
-        for (int j=0;j<seg[g].n;j++){ p+=snprintf(body+p,sizeof(body)-p,
+        for (int j=0;j<seg[g].n;j++){ SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"tag\":\"%s\",\"active\":%s}",k==0?"":",",k,seg[g].t,seg[g].a); k++; }
-    p += snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[17408];
     snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"par\",\"records\":%s}",body);
     tc_request(tc, req, &resp); free(resp); resp=NULL;

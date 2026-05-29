@@ -31,11 +31,11 @@ static TestClient *cm_setup(TestEnv *env, const char *obj, const char *fields,
     return tc;
 }
 static void cm_insert_tags(TestClient *tc, const char *obj) {
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
-    for (int i=0;i<5;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
-    for (int i=0;i<200;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\"}",k);k++;}
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
+    for (int i=0;i<5;i++){SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
+    for (int i=0;i<200;i++){SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"tag\":\"common\"}",k);k++;}
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\",\"records\":%s}",obj,body);
     tc_request(tc, req, &resp); free(resp);
@@ -83,11 +83,11 @@ static int test_planA2_broad_bitmap(void) {
     TestEnv env={0};
     TestClient *tc = cm_setup(&env, "a2", "\"active:bool\"", "\"active:bitmap\"");
     if (!tc) return 1;
-    char body[16384]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
-    for(int i=0;i<70;i++){p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
-    for(int i=0;i<30;i++){p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"active\":false}",k);k++;}
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    char body[16384]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
+    for(int i=0;i<70;i++){SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"active\":true}",k==0?"":",",k);k++;}
+    for(int i=0;i<30;i++){SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"active\":false}",k);k++;}
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[17408];
     snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a2\",\"records\":%s}",body);
     tc_request(tc, req, &resp); free(resp);
@@ -132,16 +132,16 @@ static int test_planB1_two_selective_btree(void) {
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
     /* Insert 5 rows matching both, 200 matching only tag=common/tag2=common */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
     for(int i=0;i<5;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"rare\"}",
+        SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"rare\"}",
             k==0?"":",",k); k++;
     }
     for(int i=0;i<200;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}",k); k++;
+        SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}",k); k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b1\",\"records\":%s}",body);
@@ -177,17 +177,17 @@ static int test_planB2_selective_btree_broad_bitmap(void) {
         "\"tag:varchar:8\",\"active:bool\"",
         "\"tag\",\"active:bitmap\"");
     if (!tc) return 1;
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
     /* 5 rare+active=true, 200 common+active=true (broad bitmap: 205/205 ≫ budget) */
     for(int i=0;i<5;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"active\":true}",
+        SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\",\"active\":true}",
             k==0?"":",",k); k++;
     }
     for(int i=0;i<200;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"active\":true}",k); k++;
+        SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"tag\":\"common\",\"active\":true}",k); k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b2\",\"records\":%s}",body);
@@ -224,17 +224,17 @@ static int test_planB3_two_broad_bitmaps(void) {
         "\"active:bool\",\"flagged:bool\"",
         "\"active:bitmap\",\"flagged:bitmap\"");
     if (!tc) return 1;
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
     /* 150 rows: active=true (150/205 broad), flagged=true (150/205 broad) */
     for(int i=0;i<150;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"active\":true,\"flagged\":true}",
+        SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"active\":true,\"flagged\":true}",
             k==0?"":",",k); k++;
     }
     for(int i=0;i<55;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"active\":false,\"flagged\":false}",k); k++;
+        SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"active\":false,\"flagged\":false}",k); k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b3\",\"records\":%s}",body);
@@ -341,17 +341,17 @@ static int test_planA4_saturated_trigram_stays_leaf(void) {
     /* Build bulk-insert: 50 rows with "abcdef" (contains trigram abc,bcd,cde,def)
      * and 155 rows with "xyZpqr" (no overlap). N=205, budget=205/8=25.
      * Rarest gram among abc/bcd/cde/def = 50 > 25 → saturated. */
-    char body[65536]; int p=0, k=0; char *resp=NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i=0; i<50; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"title\":\"abcdef\"}", k==0?"":",", k); k++;
     }
     for (int i=0; i<155; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"title\":\"xyZpqr\"}", k); k++;
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a4tg\","
@@ -397,18 +397,18 @@ static int test_planBCS_count_one_selective_leaf(void) {
     /* 5 rows tag=rare + tag2=common, 200 rows tag=common + tag2=common.
      * tag=rare: 5 ≤ 25 → selective. tag2=common: 205 > 25 → broad.
      * n_selective=1 (only tag=rare clears the bar). */
-    char body[65536]; int p=0, k=0; char *resp=NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i=0; i<5; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"common\"}",
             k==0?"":",", k); k++;
     }
     for (int i=0; i<200; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}", k); k++;
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bcs\","
@@ -453,16 +453,16 @@ static int test_planC1_pure_or_all_indexed(void) {
     if (!tc) return 1;
     /* 5 rows tag=rare+tag2=rare, 200 tag=common+tag2=common.
      * Both selective fields indexed → pure OR with all indexed children. */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
     for(int i=0;i<5;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"rare\"}",
+        SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"rare\"}",
             k==0?"":",",k); k++;
     }
     for(int i=0;i<200;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}",k); k++;
+        SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"tag\":\"common\",\"tag2\":\"common\"}",k); k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c1\",\"records\":%s}",body);
@@ -531,16 +531,16 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
     /* 5 rows tag=rare+tag2=a, 200 rows tag=common+tag2=b */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p+=snprintf(body+p,sizeof(body)-p,"{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body),"{");
     for(int i=0;i<5;i++){
-        p+=snprintf(body+p,sizeof(body)-p,"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"a\"}",
+        SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\",\"tag2\":\"a\"}",
             k==0?"":",",k); k++;
     }
     for(int i=0;i<200;i++){
-        p+=snprintf(body+p,sizeof(body)-p,",\"k%d\":{\"tag\":\"common\",\"tag2\":\"b\"}",k); k++;
+        SB_APPEND(body, p, sizeof(body),",\"k%d\":{\"tag\":\"common\",\"tag2\":\"b\"}",k); k++;
     }
-    p+=snprintf(body+p,sizeof(body)-p,"}");
+    SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c3\",\"records\":%s}",body);
@@ -594,18 +594,18 @@ static int test_planD1_composite_order(void) {
 
     /* Insert 5 rows by="alice", 200 rows by="bob" (N=205, budget=25).
      * by="alice" is selective (5 ≤ 25). */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i=0; i<5; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"by\":\"alice\",\"time\":%d}",
             k==0?"":",", k, k*100); k++;
     }
     for (int i=0; i<200; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"by\":\"bob\",\"time\":%d}", k, k*100); k++;
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d1\","
@@ -637,18 +637,18 @@ static int test_planD2_sort_order(void) {
     if (!tc) return 1;
 
     /* 5 rows by="alice" (selective), 200 rows by="bob". */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i=0; i<5; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"by\":\"alice\",\"time\":%d}",
             k==0?"":",", k, k*100); k++;
     }
     for (int i=0; i<200; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"by\":\"bob\",\"time\":%d}", k, k*100); k++;
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d2\","
@@ -682,18 +682,18 @@ static int test_planD3_walk_order(void) {
 
     /* 200 rows by="bob" (broad: 200 > budget 25), 5 rows by="alice".
      * Query on by="bob" → broad → seed saturated → FP_ORDER_INDEX_WALK. */
-    char body[65536]; int p=0,k=0; char *resp=NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p=0; int k=0; char *resp=NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i=0; i<200; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"by\":\"bob\",\"time\":%d}",
             k==0?"":",", k, k*100); k++;
     }
     for (int i=0; i<5; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"by\":\"alice\",\"time\":%d}", k, k*100); k++;
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3\","
@@ -737,14 +737,14 @@ static int test_planD3_walk_order(void) {
         &resp2); free(resp2); resp2=NULL;
 
     /* 200 rows by="bob"/cat="x" → both broad (200 > budget 25). N=200. */
-    char body2[65536]; int p2=0,k2=0;
-    p2 += snprintf(body2+p2, sizeof(body2)-p2, "{");
+    char body2[65536]; size_t p2=0; int k2=0;
+    SB_APPEND(body2, p2, sizeof(body2), "{");
     for (int i=0; i<200; i++) {
-        p2 += snprintf(body2+p2, sizeof(body2)-p2,
+        SB_APPEND(body2, p2, sizeof(body2),
             "%s\"r%d\":{\"by\":\"bob\",\"cat\":\"x\"}",
             k2==0?"":",", k2); k2++;
     }
-    p2 += snprintf(body2+p2, sizeof(body2)-p2, "}");
+    SB_APPEND(body2, p2, sizeof(body2), "}");
     char req2[66560];
     snprintf(req2, sizeof(req2),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3b\","
@@ -842,15 +842,15 @@ static int test_planD3_single_leaf_indexed_order(void) {
         &resp); free(resp); resp = NULL;
 
     /* insert 250 rows: score=100, time=i, note="x" */
-    char body[65536]; int bp = 0, ki = 0;
-    bp += snprintf(body+bp, sizeof(body)-bp, "{");
+    char body[65536]; size_t bp = 0; int ki = 0;
+    SB_APPEND(body, bp, sizeof(body), "{");
     for (int i = 0; i < 250; i++) {
-        bp += snprintf(body+bp, sizeof(body)-bp,
+        SB_APPEND(body, bp, sizeof(body),
             "%s\"r%d\":{\"score\":\"100\",\"time\":\"%d\",\"note\":\"x\"}",
             ki == 0 ? "" : ",", ki, i);
         ki++;
     }
-    bp += snprintf(body+bp, sizeof(body)-bp, "}");
+    SB_APPEND(body, bp, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3sl\","
@@ -906,20 +906,20 @@ static int test_planA3_trigram_starts_with(void) {
     if (!tc) return 1;
 
     /* Insert 20 rows title="Show HN: <i>" and 80 unrelated rows. */
-    char body[65536]; int p = 0, k = 0; char *resp = NULL;
-    p += snprintf(body + p, sizeof(body) - p, "{");
+    char body[65536]; size_t p = 0; int k = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 20; i++) {
-        p += snprintf(body + p, sizeof(body) - p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"title\":\"Show HN: item %d\"}",
             k == 0 ? "" : ",", k, i);
         k++;
     }
     for (int i = 0; i < 80; i++) {
-        p += snprintf(body + p, sizeof(body) - p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"k%d\":{\"title\":\"Ask HN: something %d\"}", k, i);
         k++;
     }
-    p += snprintf(body + p, sizeof(body) - p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3\","
@@ -979,25 +979,25 @@ static int test_a3_trigram_starts_with_executor(void) {
 
     /* Insert 30 "Show HN: foo bar <i>" rows (keys s0..s29) */
     {
-        char body[65536]; int p = 0, k = 0; char *resp = NULL;
-        p += snprintf(body + p, sizeof(body) - p, "{");
+        char body[65536]; size_t p = 0; int k = 0; char *resp = NULL;
+        SB_APPEND(body, p, sizeof(body), "{");
         for (int i = 0; i < 30; i++) {
-            p += snprintf(body + p, sizeof(body) - p,
+            SB_APPEND(body, p, sizeof(body),
                 "%s\"s%d\":{\"title\":\"Show HN: foo bar %d\"}",
                 k == 0 ? "" : ",", i, i);
             k++;
         }
         /* 50 "Ask HN: ..." rows */
         for (int i = 0; i < 50; i++) {
-            p += snprintf(body + p, sizeof(body) - p,
+            SB_APPEND(body, p, sizeof(body),
                 ",\"a%d\":{\"title\":\"Ask HN: question %d\"}", i, i);
         }
         /* 50 "How to ..." rows */
         for (int i = 0; i < 50; i++) {
-            p += snprintf(body + p, sizeof(body) - p,
+            SB_APPEND(body, p, sizeof(body),
                 ",\"h%d\":{\"title\":\"How to do thing %d\"}", i, i);
         }
-        p += snprintf(body + p, sizeof(body) - p, "}");
+        SB_APPEND(body, p, sizeof(body), "}");
         char req[66560];
         snprintf(req, sizeof(req),
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3exec\","
