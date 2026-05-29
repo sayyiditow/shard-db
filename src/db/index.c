@@ -220,6 +220,31 @@ static void sc_pull(ShardCursor *c) {
     }
 }
 
+/* Heap helpers for the k-way merge below.
+   Heap holds shard-cursor *indices* into cursors[]; we only swap small ints,
+   the underlying ShardCursor structs stay put.  Comparison delegates to
+   sc_cmp_asc and is negated for desc walks. */
+static inline int merge_cmp(int a, int b, const ShardCursor *cursors, int desc) {
+    int r = sc_cmp_asc(&cursors[a], &cursors[b]);
+    return desc ? -r : r;
+}
+
+static inline void merge_swap(int *heap, int i, int j) {
+    int t = heap[i]; heap[i] = heap[j]; heap[j] = t;
+}
+
+static void merge_sift_down(int *heap, int n, int i,
+                            const ShardCursor *cursors, int desc) {
+    for (;;) {
+        int l = 2 * i + 1, r = 2 * i + 2, best = i;
+        if (l < n && merge_cmp(heap[l], heap[best], cursors, desc) < 0) best = l;
+        if (r < n && merge_cmp(heap[r], heap[best], cursors, desc) < 0) best = r;
+        if (best == i) return;
+        merge_swap(heap, i, best);
+        i = best;
+    }
+}
+
 void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *field, int splits,
                             const char *min_val, size_t min_len, int min_exclusive,
@@ -227,11 +252,13 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
                             int desc, bt_result_cb cb, void *ctx) {
     int n = index_splits_for(splits);
     ShardCursor *cursors = calloc((size_t)n, sizeof(ShardCursor));
-    if (!cursors) return;
+    int *heap = calloc((size_t)n, sizeof(int));
+    if (!cursors || !heap) { free(cursors); free(heap); return; }
 
     /* Open one streaming iterator per shard and prime its head entry. Shards
-       whose iterator fails to open (missing file, etc.) drop out — they
-       contribute nothing and don't block the merge. */
+       whose iterator fails to open (missing file, etc.) or are immediately
+       drained drop out — they contribute nothing and don't enter the heap. */
+    int nh = 0;
     for (int s = 0; s < n; s++) {
         char idx_path[PATH_MAX];
         build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
@@ -241,31 +268,38 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
                                                 max_val, max_len, max_exclusive,
                                                 desc);
         if (cursors[s].iter) sc_pull(&cursors[s]);
+        if (cursors[s].has_entry) heap[nh++] = s;
     }
 
-    /* Linear-scan-pick-best is fine at this scale — splits/4 ≤ 1024 and the
-       per-iteration callback cost (record fetch + criteria_match_tree)
-       dwarfs the O(N) selection. Heap would shave µs at high splits but
-       complicates code without changing the dominant cost. */
-    while (1) {
-        int best = -1;
-        for (int s = 0; s < n; s++) {
-            if (!cursors[s].has_entry) continue;
-            if (best < 0) { best = s; continue; }
-            int cmp = sc_cmp_asc(&cursors[s], &cursors[best]);
-            if (desc ? cmp > 0 : cmp < 0) best = s;
-        }
-        if (best < 0) break;  /* every iterator drained */
+    /* Build heap in O(nh) via Floyd's bottom-up sift-down. */
+    for (int i = nh / 2 - 1; i >= 0; i--)
+        merge_sift_down(heap, nh, i, cursors, desc);
 
-        ShardCursor *bc = &cursors[best];
+    /* k-way merge: pop the head of heap[0], advance its iterator, sift the
+       refilled (or, if drained, the swapped-in last) cursor back into place.
+       Per-emit cost is O(log nh) — replaces the previous O(nh) linear scan.
+       At high splits this is the difference between profile-page composite
+       walks completing in ms vs hitting the 30s daemon TIMEOUT (see
+       backlog-btree-walk-heap-merge for the failure shape). */
+    while (nh > 0) {
+        ShardCursor *bc = &cursors[heap[0]];
         if (cb(bc->value, bc->vlen, bc->hash, ctx) < 0) break;
         sc_pull(bc);
+        if (bc->has_entry) {
+            merge_sift_down(heap, nh, 0, cursors, desc);
+        } else {
+            /* Drained: drop heap[0] by overwriting with the last entry and
+               shrinking the heap, then sift the new root into place. */
+            heap[0] = heap[--nh];
+            merge_sift_down(heap, nh, 0, cursors, desc);
+        }
     }
 
     for (int s = 0; s < n; s++) {
         if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
     }
     free(cursors);
+    free(heap);
 }
 
 void btree_idx_unlink_all(const char *db_root, const char *object,
