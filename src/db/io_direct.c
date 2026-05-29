@@ -531,26 +531,83 @@ static inline uint16_t bts_slot_off(const uint8_t *page, uint32_t s)
     return off;
 }
 
-/* Resolve page_id to a pointer within the collected chunks. */
-static const uint8_t *bts_page(uint8_t **chunks, size_t n_chunks,
-                                size_t total_bytes,
-                                uint32_t pid, int page_sz)
+/* Decode every leaf in a contiguous byte range and call cb per live entry.
+ * `range` points to the first byte of the range, `range_len` is its length.
+ * `start_off` is the byte offset of `range[0]` in the file (used only by the
+ * page-0 header check on the first chunk).
+ *
+ * Pages are processed independently — prefix compression is leaf-local
+ * (anchors at every BT_LEAF_RESTART_K slots restart the prefix), so any
+ * leaf in any order decodes correctly without needing prior leaves.
+ * Non-leaf pages (internal nodes, empty) are skipped via page_type
+ * inspection.  Callback signals early-stop with non-zero return; bubble
+ * that up via *stop_out.
+ *
+ * Returns 0 on success, non-zero on validation/decode error. */
+static int btree_decode_leaves_in_range(const uint8_t *range, size_t range_len,
+                                        off_t start_off, int page_sz,
+                                        od_leaf_cb cb, void *ctx, int *stop_out)
 {
-    off_t byte_off = (off_t)pid * (off_t)page_sz;
-    if (byte_off < 0) return NULL;
-    if ((size_t)byte_off + (size_t)page_sz > total_bytes) return NULL;
-    size_t ci  = (size_t)byte_off / ODIRECT_BUF_SIZE;
-    size_t off = (size_t)byte_off % ODIRECT_BUF_SIZE;
-    if (ci >= n_chunks) return NULL;
-    /* Verify the entire page is within this chunk (true when
-       page_sz < ODIRECT_BUF_SIZE, which is always the case). */
-    if (off + (size_t)page_sz > ODIRECT_BUF_SIZE) {
-        /* Page straddles chunk boundary — shouldn't happen at bt_page_size
-           ≤ 64 KB << 4 MB, but be defensive: only possible if a page_sz
-           change lands exactly at a 4 MB boundary.  Skip silently. */
-        return NULL;
+    size_t off = 0;
+    /* Skip the file header on chunk 0 — page 0 holds BtFileHeader, not a
+     * BtPageHeader.  Everywhere else, every aligned page_sz-sized window
+     * starts with a BtPageHeader. */
+    if (start_off == 0 && range_len >= sizeof(BtFileHeader)) {
+        const BtFileHeader *fh = (const BtFileHeader *)range;
+        uint32_t magic; memcpy(&magic, &fh->magic, 4);
+        if (magic != BT_MAGIC) return -EINVAL;
+        uint64_t ec; memcpy(&ec, &fh->entry_count, 8);
+        if (ec == 0) { *stop_out = 1; return 0; }   /* empty btree → done */
+        off = (size_t)page_sz;                       /* skip page 0 (header) */
     }
-    return chunks[ci] + off;
+
+    char   key_buf[BT_MAX_VAL_LEN];
+    size_t key_len = 0;
+
+    while (off + (size_t)page_sz <= range_len) {
+        const uint8_t *pg = range + off;
+        const BtPageHeader *ph = (const BtPageHeader *)pg;
+        uint32_t ptype; memcpy(&ptype, &ph->page_type, 4);
+
+        /* Skip internal nodes (ptype==0) and any non-page bytes.
+         * Only leaves (ptype==1) carry user entries. */
+        if (ptype == 1) {
+            uint32_t cnt; memcpy(&cnt, &ph->count, 4);
+
+            for (uint32_t s = 0; s < cnt; s++) {
+                uint16_t eoff = bts_slot_off(pg, s);
+                if ((size_t)eoff + 3 > (size_t)page_sz) break;  /* corrupt */
+                const uint8_t *e = pg + eoff;
+                uint8_t  plen = bts_prefix_len(e);
+                size_t   slen = bts_suffix_len(e);
+
+                if ((s & (uint32_t)(BT_LEAF_RESTART_K - 1)) == 0) {
+                    key_len = slen;
+                    if (key_len > BT_MAX_VAL_LEN) key_len = BT_MAX_VAL_LEN;
+                    memcpy(key_buf, bts_suffix(e), key_len);
+                } else {
+                    size_t klen = (size_t)(plen & 0x7f) + slen;
+                    if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
+                    size_t take = (klen > (size_t)(plen & 0x7f))
+                                      ? (klen - (size_t)(plen & 0x7f)) : 0;
+                    memcpy(key_buf + (plen & 0x7f), bts_suffix(e), take);
+                    key_len = klen;
+                }
+
+                if (bts_is_tomb(e)) continue;
+
+                const uint8_t *hash16 = bts_hash(e);
+                if (cb((const uint8_t *)key_buf, key_len, hash16, ctx) != 0) {
+                    *stop_out = 1;
+                    return 0;
+                }
+            }
+        }
+        /* page_type==0 (internal) and unrecognised types are silently skipped. */
+
+        off += (size_t)page_sz;
+    }
+    return 0;
 }
 
 int btree_leaf_scan_o_direct(const char *btree_path,
@@ -569,161 +626,126 @@ int btree_leaf_scan_o_direct(const char *btree_path,
     int fd = od_open(btree_path);
     if (fd < 0) return -errno;
 
-    /* ---- Collect all chunks via double-buffered I/O ---- */
-
+    /* Stream-decode strategy.
+     *
+     * For unordered leaf scans (the only caller — btree_dispatch's
+     * default branch for contains/like-substring/ends/regex/len_X/
+     * exists), we don't need to follow the leaf chain in sort order.
+     * Every leaf page in the file is independently decodable (prefix
+     * compression is leaf-local), so we can walk the file linearly,
+     * processing each leaf as it arrives in the double-buffered
+     * prefetch.
+     *
+     * The previous "gather every chunk into chunks[] then decode"
+     * pattern allocated file_size bytes of RAM upfront (300 MB for
+     * a 300 MB index) and serialised I/O with decode, defeating the
+     * whole point of the double-buffer.  Streaming uses O(2 buffers)
+     * = 8 MB total and pipelines I/O with decode (worker preads
+     * chunk N+1 while main decodes chunk N).
+     *
+     * Carry handling: pages are smaller than ODIRECT_BUF_SIZE (page_sz
+     * = 4 KB typical, buffer = 4 MB), so at most one page straddles
+     * each chunk boundary.  We stash the tail bytes and prepend to
+     * next chunk before parsing.  Same pattern as seg_scan_o_direct.
+     */
     DbCtx dc;
     int rc = dbctx_init(&dc, fd, file_size);
     if (rc != 0) { close(fd); return rc; }
 
-    /* Chunk pointer array. */
-    size_t   nchunks_cap = 64;
-    uint8_t **chunks     = malloc(nchunks_cap * sizeof(uint8_t *));
-    size_t   nchunks     = 0;
-    size_t   total_bytes = 0;
-
-    if (!chunks) {
+    uint8_t *carry = malloc((size_t)page_sz);
+    if (!carry) {
         free(dc.buf[0]); free(dc.buf[1]);
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
-        close(fd); return -ENOMEM;
+        close(fd);
+        return -ENOMEM;
     }
+    int carry_len = 0;
 
     pthread_t worker_tid;
     if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
         int e = errno;
-        free(chunks);
+        free(carry);
         free(dc.buf[0]); free(dc.buf[1]);
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
-        close(fd); return -e;
+        close(fd);
+        return -e;
     }
 
     dbctx_kickoff(&dc);
 
-    /* Gather all chunks. We cannot parse in-place because btree pages
-       are addressed by page_id (not sequential order); we need random
-       access across the whole file.  So collect, then decode. */
-    int gather_err = 0;
+    int ret = 0;
+    int stop = 0;
+    off_t chunk_off = 0;       /* byte offset of dc.buf[dc.active] in file */
+
     for (;;) {
         ssize_t chunk_len = dc.active_len;
         if (chunk_len <= 0) {
-            if (chunk_len < 0) gather_err = (int)(-chunk_len);
+            if (chunk_len < 0) ret = (int)chunk_len;
             break;
         }
 
-        /* Take ownership of this buffer: allocate a fresh one to replace
-           it in the DbCtx so the worker can reuse the slots safely.
-           Actually simpler: just memcpy out of the active buf, then swap.
-           The buffer belongs to DbCtx; we must copy it. */
-        if (nchunks >= nchunks_cap) {
-            nchunks_cap *= 2;
-            uint8_t **t = realloc(chunks, nchunks_cap * sizeof(uint8_t *));
-            if (!t) { gather_err = ENOMEM; break; }
-            chunks = t;
-        }
-        uint8_t *copy = od_alloc_buf();
-        if (!copy) { gather_err = ENOMEM; break; }
-        memcpy(copy, dc.buf[dc.active], (size_t)chunk_len);
-        chunks[nchunks++] = copy;
-        total_bytes += (size_t)chunk_len;
+        uint8_t *chunk = dc.buf[dc.active];
+        size_t   pos   = 0;
 
-        ssize_t next = dbctx_swap(&dc);
-        if (next < 0) { gather_err = (int)(-next); break; }
-        if (next == 0) { dc.active_len = 0; break; }  /* EOF */
-    }
-
-    dbctx_destroy(&dc, worker_tid);
-    close(fd);
-
-    if (gather_err) {
-        for (size_t i = 0; i < nchunks; i++) free(chunks[i]);
-        free(chunks);
-        return -gather_err;
-    }
-    if (nchunks == 0) { free(chunks); return 0; }
-
-    /* ---- Decode leaf pages ---- */
-
-    int ret = 0;
-
-    /* Validate file header (page 0). */
-    const uint8_t *hdr_page = bts_page(chunks, nchunks, total_bytes, 0, page_sz);
-    if (!hdr_page) goto done_free;
-
-    {
-        const BtFileHeader *fh = (const BtFileHeader *)hdr_page;
-        uint32_t magic; memcpy(&magic, &fh->magic, 4);
-        if (magic != BT_MAGIC) goto done_free;
-
-        uint64_t ec; memcpy(&ec, &fh->entry_count, 8);
-        if (ec == 0) goto done_free;
-    }
-
-    {
-        const BtFileHeader *fh = (const BtFileHeader *)hdr_page;
-
-        /* Walk internal nodes to find the first leaf. */
-        uint32_t page_id; memcpy(&page_id, &fh->root_page, 4);
-        for (;;) {
-            const uint8_t *pg = bts_page(chunks, nchunks, total_bytes,
-                                         page_id, page_sz);
-            if (!pg) goto done_free;
-            const BtPageHeader *ph = (const BtPageHeader *)pg;
-            uint32_t ptype; memcpy(&ptype, &ph->page_type, 4);
-            if (ptype == 1) break;   /* leaf */
-            uint32_t nlp; memcpy(&nlp, &ph->next_leaf, 4);
-            if (nlp == 0) goto done_free;
-            page_id = nlp;
-        }
-
-        /* Walk the leaf chain. */
-        char   key_buf[BT_MAX_VAL_LEN];
-        size_t key_len = 0;
-
-        while (page_id != 0) {
-            const uint8_t *pg = bts_page(chunks, nchunks, total_bytes,
-                                         page_id, page_sz);
-            if (!pg) break;
-            const BtPageHeader *ph = (const BtPageHeader *)pg;
-            uint32_t cnt; memcpy(&cnt, &ph->count, 4);
-
-            for (uint32_t s = 0; s < cnt; s++) {
-                uint16_t eoff = bts_slot_off(pg, s);
-                const uint8_t *e = pg + eoff;
-                uint8_t  plen = bts_prefix_len(e);
-                size_t   slen = bts_suffix_len(e);
-
-                if ((s & (uint32_t)(BT_LEAF_RESTART_K - 1)) == 0) {
-                    /* Anchor: full key. */
-                    key_len = slen;
-                    if (key_len > BT_MAX_VAL_LEN) key_len = BT_MAX_VAL_LEN;
-                    memcpy(key_buf, bts_suffix(e), key_len);
-                } else {
-                    /* Prefix-compressed. */
-                    size_t klen = (size_t)(plen & 0x7f) + slen;
-                    if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
-                    size_t take = (klen > (size_t)(plen & 0x7f))
-                                      ? (klen - (size_t)(plen & 0x7f)) : 0;
-                    memcpy(key_buf + (plen & 0x7f), bts_suffix(e), take);
-                    key_len = klen;
-                }
-
-                if (bts_is_tomb(e)) continue;
-
-                const uint8_t *hash16 = bts_hash(e);
-                int cbrc = cb((const uint8_t *)key_buf, key_len, hash16, ctx);
-                if (cbrc != 0) { ret = 1; goto done_free; }
+        /* Reassemble a page that straddled the previous chunk boundary. */
+        if (carry_len > 0) {
+            int need = page_sz - carry_len;
+            if ((ssize_t)need > chunk_len) {
+                /* Whole chunk still not enough (impossible at page_sz <
+                 * ODIRECT_BUF_SIZE, but defensive). */
+                memcpy(carry + carry_len, chunk, (size_t)chunk_len);
+                carry_len += (int)chunk_len;
+                goto next_chunk;
             }
+            memcpy(carry + carry_len, chunk, (size_t)need);
+            pos = (size_t)need;
+            carry_len = 0;
 
-            uint32_t nlp; memcpy(&nlp, &ph->next_leaf, 4);
-            page_id = nlp;
+            /* Decode the now-complete page (carry buf). */
+            int err = btree_decode_leaves_in_range(carry, (size_t)page_sz,
+                                                   /*start_off=*/chunk_off - page_sz + need,
+                                                   page_sz, cb, ctx, &stop);
+            if (err) { ret = err; goto done; }
+            if (stop) goto done;
+        }
+
+        /* Stride through full pages in this chunk.  The decoder skips
+         * page 0 internally when start_off==0. */
+        size_t whole_len = chunk_len - (chunk_len % (ssize_t)page_sz);
+        if (whole_len > pos) {
+            int err = btree_decode_leaves_in_range(chunk + pos, whole_len - pos,
+                                                   chunk_off + (off_t)pos,
+                                                   page_sz, cb, ctx, &stop);
+            if (err) { ret = err; goto done; }
+            if (stop) goto done;
+            pos = whole_len;
+        }
+
+        /* Save any partial page at the chunk tail. */
+        if (pos < (size_t)chunk_len) {
+            carry_len = (int)((size_t)chunk_len - pos);
+            memcpy(carry, chunk + pos, (size_t)carry_len);
+        }
+
+next_chunk:
+        {
+            chunk_off += (off_t)chunk_len;
+            ssize_t next = dbctx_swap(&dc);
+            if (next < 0) { ret = (int)next; goto done; }
+            if (next == 0) {
+                dc.active_len = 0;
+                break;
+            }
         }
     }
 
-done_free:
-    for (size_t i = 0; i < nchunks; i++) free(chunks[i]);
-    free(chunks);
+done:
+    dbctx_destroy(&dc, worker_tid);
+    free(carry);
+    close(fd);
     return ret;
 }
