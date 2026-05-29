@@ -1919,20 +1919,74 @@ static int iter_next_fwd(BtRangeIter *it) {
 
 static int iter_load_desc_snap(BtRangeIter *it);
 
-/* Initialise DESC walk by seeking to the rightmost leaf via the file
-   header's last_leaf_page (BT_MAGIC v3+). The actual leftward walk
-   happens in iter_load_desc_snap which follows ph->prev_leaf — no
-   per-leaf array, no forward-walk-then-reverse, O(1) start. */
+/* Initialise DESC walk by seeking to the leaf containing entries ≤
+   max_val.  Mirrors iter_seek_fwd's tree descent, but targets the
+   upper bound: at each internal node, find the rightmost child whose
+   subtree could contain keys ≤ max_val.  The leftward chain walk
+   then continues from there via iter_load_desc_snap (prev_leaf).
+
+   Without this seek, the previous version started at last_leaf_page
+   (the file's rightmost leaf) and walked leftward leaf-by-leaf
+   checking each leaf's first-key against max_val.  For a 38M-row
+   composite with bounds like ["Cogito", "Cogito\xff×4"] that meant
+   walking from "Zoltan…" all the way back to "Cogito…" through
+   every leaf in between — hundreds of thousands of cold page faults
+   regardless of selectivity.  Tree descent reaches the target leaf
+   in O(log N) page reads instead.
+
+   Open-bound case (max_len == 4 && max_val == "\xff\xff\xff\xff",
+   the convention used for "no upper limit"): falls back to
+   last_leaf_page since the descent would land there anyway. */
 static int iter_init_desc_leaves(BtRangeIter *it) {
     BtFileHeader *fh = (BtFileHeader *)it->bt.map;
+    uint32_t page_id;
+
+    /* Convention: max_val = "\xff\xff\xff\xff" (4 bytes) means
+       "unbounded above" — caller wants a full-range desc walk. Skip
+       the descent and go straight to the rightmost leaf. */
+    int unbounded = (it->max_len == 4 &&
+                     it->max_val[0] == (char)0xff && it->max_val[1] == (char)0xff &&
+                     it->max_val[2] == (char)0xff && it->max_val[3] == (char)0xff);
+    if (unbounded) {
+        page_id = fh->last_leaf_page;
+    } else {
+        /* Descend root → leaf finding the subtree that could contain
+           entries ≤ max_val.  page_bsearch returns the first entry ≥
+           target; we want the subtree of the largest key ≤ max_val,
+           which is the child just BEFORE that first ≥-target entry
+           (unless an exact match exists, in which case it's that
+           entry's own child). */
+        page_id = fh->root_page;
+        while (1) {
+            uint8_t *page = bt_page(&it->bt, page_id);
+            BtPageHeader *ph = (BtPageHeader *)page;
+            if (ph->page_type == 1) break;
+            int pos = page_bsearch(page, it->max_val, it->max_len);
+            if (pos < (int)ph->count) {
+                /* If entry[pos] == max_val, descend its own child (which
+                   contains keys with that separator and above-within-range). */
+                uint8_t *e = page_entry(page, pos);
+                if (val_cmp(int_entry_value(e), int_entry_vlen(e),
+                            it->max_val, it->max_len) == 0) {
+                    page_id = entry_child(e);
+                    continue;
+                }
+            }
+            /* No exact match: descend the child immediately before pos. */
+            if (pos == 0) page_id = ph->next_leaf;
+            else          page_id = entry_child(page_entry(page, pos - 1));
+            if (page_id == 0) break;
+        }
+    }
+
     /* desc_leaves repurposed as a single-slot cursor holding the
        page id of the leaf to load next. desc_leaf_count == 1 means
        the cursor is armed; desc_li == 0 keeps the existing
        "armed" sentinel logic in iter_next_desc satisfied. */
     it->desc_leaves = malloc(sizeof(uint32_t));
     if (!it->desc_leaves) return -1;
-    it->desc_leaves[0] = fh->last_leaf_page;
-    it->desc_leaf_count = (fh->last_leaf_page != 0) ? 1 : 0;
+    it->desc_leaves[0] = page_id;
+    it->desc_leaf_count = (page_id != 0) ? 1 : 0;
     it->desc_li = (int)it->desc_leaf_count - 1;
     it->desc_snap_i = -1;
     if (it->desc_li >= 0) iter_load_desc_snap(it);
