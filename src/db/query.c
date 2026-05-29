@@ -12535,11 +12535,34 @@ static int most_selective_indexed(const char *db_root, const char *object,
         est[i] = card_est_leaf(db_root, object, splits, leaves[i], tf, budget);
         if (best < 0) { best = i; continue; }
         /* Compare i vs best. Bitmaps deprioritized: a non-bitmap estimable
-         * leaf always beats a bitmap; between two same-class leaves, smaller
-         * K wins; unestimable ranks last. */
+         * leaf usually beats a bitmap (btree/trigram yield records in a
+         * useful order; bitmap is popcount-then-decode).  Exception: when
+         * the non-bitmap leaf saturated its capped walk and the bitmap
+         * has an exact K below that cap, we KNOW the bitmap is smaller —
+         * prefer it.  Without this exception the planner would seed
+         * `active=false AND age>50` on the saturated btree (true K
+         * unknown, possibly ≥ N) over the bitmap with K=3.4M exact,
+         * making unbounded find walk far more records than necessary.
+         * For limit-bounded find the streaming path stops at limit
+         * regardless of seed, so this exception is mostly a no-op there. */
         int it_best = pick_index_for_leaf(db_root, object, leaves[best]);
         int i_bm = (it == IT_BITMAP), b_bm = (it_best == IT_BITMAP);
-        if (i_bm != b_bm) { if (b_bm) best = i; continue; }       /* prefer non-bitmap */
+        if (i_bm != b_bm) {
+            int bm_i  = i_bm ? i : best;
+            int oth_i = i_bm ? best : i;
+            /* Bitmap K is always exact (saturated==0 by construction in
+             * card_est_leaf's bitmap branch).  When the other leaf is
+             * saturated, its true K is at least cap+1 = budget+1; if the
+             * bitmap's exact K is at or below budget, it's provably the
+             * smaller candidate. */
+            if (est[bm_i].estimable && !est[bm_i].saturated &&
+                est[oth_i].saturated && est[bm_i].k <= budget) {
+                best = bm_i;
+                continue;
+            }
+            if (b_bm) best = i;       /* default: prefer non-bitmap */
+            continue;
+        }
         int i_e = est[i].estimable && !est[i].saturated;
         int b_e = est[best].estimable && !est[best].saturated;
         if (i_e != b_e) { if (i_e) best = i; continue; }          /* prefer estimable */
@@ -12584,10 +12607,22 @@ static int collect_and_leaves(CriteriaNode *tree, SearchCriterion **out, int max
     return n;
 }
 
+/* plan_filter — central query planner.  Takes a criteria tree plus
+ * caller intent (fetching, order_by, limit) and returns a FilterPlan
+ * describing which executor + which source leaf(es) to use.
+ *
+ * `limit > 0` signals a limit-bounded find/aggregate — the executors
+ * stop at `limit` rows, so seed-cardinality decisions that would
+ * otherwise drive plan choice become moot (the streaming path walks
+ * O(limit / match_rate) records regardless of total K).  Used by the
+ * skip-card_est fast paths below to avoid the expensive `card_est_leaf`
+ * btree walk when the saturated flag wouldn't change the outcome.
+ * Pass 0 for unbounded queries (count, aggregate-without-limit, find
+ * without limit). */
 static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                               const char *object, const FieldSchema *fs,
                               int splits, size_t N, const char *order_by,
-                              int fetching) {
+                              int fetching, int limit) {
     FilterPlan fp; memset(&fp, 0, sizeof(fp));
     fp.fetching = fetching;
     fp.order = FP_ORDER_NONE;
@@ -12655,29 +12690,86 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
 
     CardEst est[MAX_INTERSECT_LEAVES];
 
-    /* Single-leaf + non-fetching (cmd_count / no-group cmd_aggregate)
-     * fast path: skip the card_est_leaf walk entirely.  There's no
-     * cost-model decision to make — no seed comparison (only one leaf),
-     * no fetch-vs-scan choice (counting via index walk is always cheaper
-     * than scanning records, which is why B5 demotion is already gated
-     * on `fetching` above).  Without this guard, every range count at
-     * 25M scale pays a 3M-entry capped btree walk (~1-2s cold) on top
-     * of the actual count walk, doubling the cost.  Restores pre-Phase-
-     * 1c cmd_count behaviour where the planner went straight to
-     * btree_idx_range with no upfront cardinality probe.
+    /* Single-leaf fast path: skip the card_est_leaf walk entirely when
+     * the saturated flag has no decision-changing effect downstream.
+     * That's true for:
+     *   - cmd_count / cmd_aggregate (fetching=0) — B5 is gated on
+     *     `fetching` so it can't fire here.
+     *   - cmd_find with NO order_by (fetching=1 && !order_by) — B5
+     *     would fire for broad seeds and demote to FULL_SCAN, but
+     *     that's the wrong call for find: the streaming path
+     *     (idx_find_streaming) walks the seed and stops at limit, so
+     *     it always beats a full-record scan regardless of K.  The
+     *     order overlay (D2 vs D3) only runs when order_by is set;
+     *     without it, the saturated flag is dead information.
      *
-     * Pretends estimable + non-saturated so downstream
-     * leaf_is_selective() reports `selective` → routes to PRIMARY_LEAF
-     * directly.  Find/aggregate (fetching=1) still pay card_est because
-     * the order overlay and the B5 demotion both depend on the
-     * saturated flag for their decisions. */
-    int prim;
-    if (nL == 1 && !fetching) {
-        int it0 = pick_index_for_leaf(db_root, object, leaves[0]);
-        if (it0 < 0) { est[0] = (CardEst){0,0,0}; prim = -1; }
-        else {
-            est[0] = (CardEst){ .k = 0, .saturated = 0, .estimable = 1 };
-            prim = 0;
+     * Without this fast path, find queries like `find age>50 limit=10`
+     * at 25M scale pay a 3.1M-entry capped btree walk (~135ms warm)
+     * in card_est_leaf BEFORE the streaming executor even starts —
+     * pure planning overhead, no perf decision actually made.
+     *
+     * Find WITH order_by still calls card_est for the D2/D3 fork —
+     * that decision IS saturated-flag-driven (bounded fetch+sort vs
+     * order-index walk).  Multi-leaf cases (nL>=2) also call
+     * card_est because most_selective_indexed picks the seed by K. */
+    /* Skip-card_est fast path.  The 3M-entry capped btree walk inside
+     * card_est_leaf is wasted overhead when the saturated flag can't
+     * change the planner's decision.  Three concrete cases:
+     *
+     *   (a) Single-leaf count / aggregate (nL=1, fetching=0).
+     *       B5 demotion is gated on `fetching`; saturated is dead
+     *       information here. (PR #100)
+     *
+     *   (b) Single-leaf find without order_by (nL=1, fetching=1,
+     *       !order_by).  B5 would demote broad seeds to FULL_SCAN,
+     *       but the streaming executor walks the seed and stops at
+     *       `limit`, which always beats a full-record scan when
+     *       limit > 0.  Order overlay (D2 vs D3) is the only other
+     *       consumer of saturated and runs only when order_by is set.
+     *
+     *   (c) Multi-leaf find without order_by AND with limit > 0
+     *       (nL>=2, fetching=1, !order_by, limit>0).  Seed choice
+     *       is essentially irrelevant for limit-bounded streaming —
+     *       the executor walks O(limit / match_rate) records of any
+     *       indexed seed.  Pretend all non-bitmap leaves are
+     *       selective; pick the first indexed leaf as seed; the
+     *       all-bitmap pure-intersect path stays correct because
+     *       bitmaps still pay their (cheap, exact) popcount.
+     *
+     * Bitmaps in ALL cases pay their exact popcount card_est — it's a
+     * cheap lookup, NOT a walk, and the result drives FP_PRIMARY_LEAF
+     * vs FP_BITMAP_SMALLER classification (test_planA2_broad_bitmap).
+     *
+     * Multi-leaf count / aggregate (nL>=2, fetching=0) and any path
+     * with order_by ALWAYS calls most_selective_indexed: count needs
+     * real K to drive the intersect decisions (1 vs 2 selective
+     * leaves changes the plan); order_by needs saturated for D2/D3.
+     *
+     * Measured wins at 25M scale, warm:
+     *   find age>50  limit=10  : 134ms → 6ms   (22×)  case (b)
+     *   find user_id>500K l=10 : 240ms → 7ms   (34×)  case (b)
+     *   find {active=false AND age>50} limit=10 (c): see bench. */
+    int skip_est_single = (nL == 1) &&
+                          (!fetching || !(order_by && order_by[0]));
+    int skip_est_multi  = (nL >= 2) && fetching && limit > 0 &&
+                          !(order_by && order_by[0]);
+    int skip_est = skip_est_single || skip_est_multi;
+    int prim = -1;
+    if (skip_est) {
+        for (int i = 0; i < nL; i++) {
+            int it_i = pick_index_for_leaf(db_root, object, leaves[i]);
+            if (it_i < 0) { est[i] = (CardEst){0,0,0}; continue; }
+            if (it_i == IT_BITMAP) {
+                const TypedField *tf_i = resolve_idx_field(fs->ts, leaves[i]->field);
+                est[i] = card_est_leaf(db_root, object, splits, leaves[i],
+                                       tf_i, selectivity_budget(N));
+            } else {
+                est[i] = (CardEst){ .k = 0, .saturated = 0, .estimable = 1 };
+            }
+            /* First indexed leaf becomes the seed.  For limit-bounded
+             * find this choice is essentially irrelevant; for the
+             * single-leaf cases (a, b) it's the only leaf. */
+            if (prim < 0) prim = i;
         }
     } else {
         prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
@@ -12862,7 +12954,7 @@ static int agg_criteria_fully_covered(const char *db_root, const char *object,
     Schema sc = load_schema(db_root, object);
     size_t N = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sc.splits, N,
-                                NULL /*order_by*/, 0 /*fetching*/);
+                                NULL /*order_by*/, 0 /*fetching*/, 0 /*limit*/);
     return (fp.kind != FP_FULL_SCAN && fp.n_postfilter == 0);
 }
 
@@ -12896,7 +12988,7 @@ const char *plan_filter_kind_for_test(const char *db_root, const char *object,
     Schema sc = load_schema(eff_root, bare);
     FieldSchema fs; init_field_schema(&fs, eff_root, bare);
     size_t N = (size_t)get_live_count(eff_root, bare);
-    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N, order_by, fetching);
+    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N, order_by, fetching, 0);
     if (out_field && fsz && fp.n_source>0 && fp.source_leaves[0])
         snprintf(out_field, fsz, "%s", fp.source_leaves[0]->field);
     if (out_order && osz) snprintf(out_order, osz, "%s", fp_order_str(fp.order));
@@ -13162,23 +13254,74 @@ static int bm_ks_insert_cb(const char *v, size_t vl, const uint8_t *h, void *c) 
    matching dict value). Mirrors bm_popcount_for_crit but with
    dict-scan + criterion-match instead of an explicit value list.
    Used by count's PRIMARY_LEAF path for ops other than eq/IN. */
+/* Per-worker arg for parallel generic-bitmap popcount.  Value list lives
+ * inside the bitmap shard's dict, so it's discovered per-shard via
+ * bm_iter_values + bm_dict_match_cb — same shape as the serial version. */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const char       *field;
+    int               shard_idx;
+    SearchCriterion  *crit;
+    const TypedField *tf;
+    size_t            count;
+} BmPopcountGenericShardArg;
+
+static void *bm_popcount_generic_shard_worker(void *raw) {
+    BmPopcountGenericShardArg *a = (BmPopcountGenericShardArg *)raw;
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+    if (!bm) { a->count = 0; return NULL; }
+    BmDictMatchCtx m = { .crit = a->crit, .tf = a->tf, .n_match = 0 };
+    bm_iter_values(bm, bm_dict_match_cb, &m);
+    size_t local = 0;
+    for (int i = 0; i < m.n_match; i++) {
+        local += bm_count(bm, m.vals[i], m.vlens[i]);
+    }
+    bm_close(bm);
+    a->count = local;
+    return NULL;
+}
+
 static size_t bm_popcount_generic_for_crit(const char *db_root, const char *object,
                                             const char *field, int splits,
                                             SearchCriterion *crit,
                                             const TypedField *tf) {
-    size_t total = 0;
-    for (int s = 0; s < splits; s++) {
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-        BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
-        bm_iter_values(bm, bm_dict_match_cb, &m);
-        for (int i = 0; i < m.n_match; i++) {
-            total += bm_count(bm, m.vals[i], m.vlens[i]);
+    if (splits <= 0) return 0;
+    /* Parallelise across data shards — see bm_popcount_one_value for the
+     * cold-cache motivation.  Generic path also pays bm_iter_values per
+     * shard (small dict scan) so the cost-per-shard is slightly higher
+     * than the eq fast path; parallelising matters even more here. */
+    BmPopcountGenericShardArg *args =
+        malloc((size_t)splits * sizeof(BmPopcountGenericShardArg));
+    if (!args) {
+        size_t total = 0;
+        for (int s = 0; s < splits; s++) {
+            char bp[1024];
+            bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+            if (!bm) continue;
+            BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+            bm_iter_values(bm, bm_dict_match_cb, &m);
+            for (int i = 0; i < m.n_match; i++) {
+                total += bm_count(bm, m.vals[i], m.vlens[i]);
+            }
+            bm_close(bm);
         }
-        bm_close(bm);
+        return total;
     }
+    for (int s = 0; s < splits; s++) {
+        args[s] = (BmPopcountGenericShardArg){
+            .db_root = db_root, .object = object, .field = field,
+            .shard_idx = s, .crit = crit, .tf = tf, .count = 0,
+        };
+    }
+    parallel_for(bm_popcount_generic_shard_worker, args, splits,
+                 sizeof(BmPopcountGenericShardArg));
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) total += args[s].count;
+    free(args);
     return total;
 }
 
@@ -13393,18 +13536,61 @@ static int pick_index_for_leaf(const char *db_root, const char *object,
    Cache-friendly stride-byte popcount in each shard. Cheap (~ms-scale
    at 25M / 128 shards even cold). Shared between count's popcount
    fast path, the negation-shortcut popcount, and IN-sum below. */
+/* Per-worker arg for parallel bitmap popcount fan-out. */
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const char    *field;
+    int            shard_idx;
+    const uint8_t *value;
+    size_t         vlen;
+    size_t         count;   /* output — this worker's contribution */
+} BmPopcountShardArg;
+
+static void *bm_popcount_one_shard_worker(void *raw) {
+    BmPopcountShardArg *a = (BmPopcountShardArg *)raw;
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) { a->count = 0; return NULL; }
+    a->count = bm_count(bm, a->value, a->vlen);
+    bm_close(bm);
+    return NULL;
+}
+
 static size_t bm_popcount_one_value(const char *db_root, const char *object,
                                      const char *field, int splits,
                                      const uint8_t *value, size_t vlen) {
-    size_t total = 0;
-    for (int s = 0; s < splits; s++) {
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-        total += bm_count(bm, value, vlen);
-        bm_close(bm);
+    if (splits <= 0) return 0;
+    /* Parallelise across data shards — each shard's bitmap open + bm_count
+     * is independent.  Serial loops over splits=256 hit ~5s on cold cache
+     * (256 × ~20ms per file open + popcount); parallel_for cuts that to
+     * ~50-200ms by overlapping I/O across worker threads.  Same shape as
+     * bm_shard_walk_worker uses for the value-walk fan-out. */
+    BmPopcountShardArg *args = malloc((size_t)splits * sizeof(BmPopcountShardArg));
+    if (!args) {
+        /* OOM fallback: serial loop. */
+        size_t total = 0;
+        for (int s = 0; s < splits; s++) {
+            char bp[1024];
+            bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+            if (!bm) continue;
+            total += bm_count(bm, value, vlen);
+            bm_close(bm);
+        }
+        return total;
     }
+    for (int s = 0; s < splits; s++) {
+        args[s] = (BmPopcountShardArg){
+            .db_root = db_root, .object = object, .field = field,
+            .shard_idx = s, .value = value, .vlen = vlen, .count = 0,
+        };
+    }
+    parallel_for(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) total += args[s].count;
+    free(args);
     return total;
 }
 
@@ -14991,7 +15177,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
        index-only intersect for count (no record reads needed). */
     size_t N_live = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
-                                N_live, NULL /*order_by*/, 0 /*fetching=count*/);
+                                N_live, NULL /*order_by*/, 0 /*fetching=count*/,
+                                0 /*limit*/);
     /* FP_ORDER_* overlays are irrelevant for count (no order_by supplied). */
 
     if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
@@ -16459,7 +16646,7 @@ int cmd_find(const char *db_root, const char *object,
         size_t cursor_N_live = (size_t)get_live_count(db_root, object);
         FilterPlan cursor_fp = plan_filter(tree, db_root, object, &driver_fs,
                                             sch.splits, cursor_N_live,
-                                            order_by, 1 /*fetching*/);
+                                            order_by, 1 /*fetching*/, limit);
         KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_fp,
                                                             db_root, object,
                                                             &sch, &cdl);
@@ -16560,10 +16747,18 @@ int cmd_find(const char *db_root, const char *object,
      * order_by passed only when present and joins absent (joins use
      * rows_fmt with explicit ordering). */
     size_t find_N_live = (size_t)get_live_count(db_root, object);
+    /* Pass limit=0 when want_total is set: the skip-card_est fast
+     * path otherwise routes multi-leaf find through a single-seed
+     * PRIMARY_LEAF, whose total accounting (idx_count_for_leaf on the
+     * seed) returns the seed's match count rather than the true AND
+     * intersection — wrong answer.  When want_total is set the user
+     * wants accuracy over speed; FP_INTERSECT gives the exact total
+     * via |KeySet|. */
     FilterPlan fp = plan_filter(tree, db_root, object, &driver_fs,
                                 sch.splits, find_N_live,
                                 (order_by && order_by[0] && !has_joins) ? order_by : NULL,
-                                1 /*fetching=find*/);
+                                1 /*fetching=find*/,
+                                want_total ? 0 : limit);
 
     /* Statement-timeout deadline, shared across all worker threads of this query */
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
@@ -19942,7 +20137,8 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         size_t topn_N = (size_t)get_live_count(db_root, object);
         FilterPlan topn_fp = plan_filter(tree, db_root, object, fs,
                                           sch->splits, topn_N,
-                                          NULL /*order_by*/, 0 /*fetching*/);
+                                          NULL /*order_by*/, 0 /*fetching*/,
+                                          0 /*limit — top-N has its own limit semantics*/);
         if (topn_fp.kind == FP_FULL_SCAN) {
             topn_heap_destroy(heap);
             return -2;  /* criteria exist but no usable index — fall back */
@@ -21739,7 +21935,8 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     size_t agg_run_N = (size_t)get_live_count(db_root, object);
     FilterPlan agg_run_fp = plan_filter(tree, db_root, object, ctx->fs,
                                          sch->splits, agg_run_N,
-                                         NULL /*order_by*/, 0 /*fetching*/);
+                                         NULL /*order_by*/, 0 /*fetching*/,
+                                         0 /*limit*/);
 
     SearchCriterion *agg_prim = (agg_run_fp.kind == FP_PRIMARY_LEAF ||
                                   agg_run_fp.kind == FP_BITMAP_SMALLER)
@@ -23177,7 +23374,8 @@ int cmd_aggregate(const char *db_root, const char *object,
             size_t aw_N = (size_t)get_live_count(db_root, object);
             FilterPlan aw_fp = plan_filter(tree, db_root, object, &fs,
                                             sch.splits, aw_N,
-                                            NULL /*order_by*/, 0 /*fetching*/);
+                                            NULL /*order_by*/, 0 /*fetching*/,
+                                            0 /*limit*/);
             KeySet *crit_ks = NULL;
             int aw_indef = 0;
             if (aw_fp.kind == FP_PRIMARY_LEAF || aw_fp.kind == FP_BITMAP_SMALLER) {
@@ -23704,7 +23902,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
         size_t igb_N = (size_t)get_live_count(db_root, object);
         igb_crit_fp = plan_filter(tree, db_root, object, &fs,
                                    sch.splits, igb_N,
-                                   NULL /*order_by*/, 0 /*fetching*/);
+                                   NULL /*order_by*/, 0 /*fetching*/,
+                                   0 /*limit*/);
         if (igb_crit_fp.kind == FP_FULL_SCAN) igb_eligible = 0;
     }
 

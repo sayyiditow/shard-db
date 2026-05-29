@@ -117,9 +117,12 @@ static int test_find_with_total_shape(void) {
         "\"total\":true}",
         &resp);
     ASSERT_NOT_NULL(resp, "find+total response not null");
-    /* Shape must be {"rows":[...], "total":null} */
+    /* Shape must be {"rows":[...], "total":<value>}. After fp_compute_total
+     * the value is the real match count (1 for tag=t0); pre-1d.2 it was
+     * a null placeholder.  Either is shape-correct; just require the
+     * "total" key be present. */
     ASSERT_CONTAINS(resp, "\"rows\"", "find+total → rows key present");
-    ASSERT_CONTAINS(resp, "\"total\":null", "find+total → total:null placeholder");
+    ASSERT_CONTAINS(resp, "\"total\":", "find+total → total key present");
     /* The rows value must be an array starting with [ */
     const char *rows_pos = strstr(resp, "\"rows\":");
     ASSERT_NOT_NULL(rows_pos, "rows key found");
