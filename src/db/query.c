@@ -12654,7 +12654,34 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     (void)has_subtree;
 
     CardEst est[MAX_INTERSECT_LEAVES];
-    int prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
+
+    /* Single-leaf + non-fetching (cmd_count / no-group cmd_aggregate)
+     * fast path: skip the card_est_leaf walk entirely.  There's no
+     * cost-model decision to make — no seed comparison (only one leaf),
+     * no fetch-vs-scan choice (counting via index walk is always cheaper
+     * than scanning records, which is why B5 demotion is already gated
+     * on `fetching` above).  Without this guard, every range count at
+     * 25M scale pays a 3M-entry capped btree walk (~1-2s cold) on top
+     * of the actual count walk, doubling the cost.  Restores pre-Phase-
+     * 1c cmd_count behaviour where the planner went straight to
+     * btree_idx_range with no upfront cardinality probe.
+     *
+     * Pretends estimable + non-saturated so downstream
+     * leaf_is_selective() reports `selective` → routes to PRIMARY_LEAF
+     * directly.  Find/aggregate (fetching=1) still pay card_est because
+     * the order overlay and the B5 demotion both depend on the
+     * saturated flag for their decisions. */
+    int prim;
+    if (nL == 1 && !fetching) {
+        int it0 = pick_index_for_leaf(db_root, object, leaves[0]);
+        if (it0 < 0) { est[0] = (CardEst){0,0,0}; prim = -1; }
+        else {
+            est[0] = (CardEst){ .k = 0, .saturated = 0, .estimable = 1 };
+            prim = 0;
+        }
+    } else {
+        prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
+    }
     if (prim < 0) { fp.kind = FP_FULL_SCAN; return fp; }   /* nothing indexed → A5/B7 */
 
     int prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
@@ -12730,7 +12757,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     } else if (prim_sel || prim_it != IT_BITMAP) {
         /* selective btree/trigram/rare-bitmap → seed it; OR a broad non-bitmap
          * indexed leaf whose fetch still beats scan stays a leaf, else scan. */
-        if (!prim_sel && prim_it != IT_BITMAP && prim_it != IT_TRIGRAM
+        if (fetching && !prim_sel && prim_it != IT_BITMAP && prim_it != IT_TRIGRAM
                 && est[prim].estimable && est[prim].saturated
                 && op_eligible_for_intersect(leaves[prim]->op)
                 && !order_field_drivable(db_root, object, order_by)) {
@@ -12743,7 +12770,18 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
              * faster than a full seg-file scan regardless of candidate count.
              * Also NOT demoted when an indexed order_by is available (D3:
              * ORDER_INDEX_WALK is cheaper than scan-and-sort — the order
-             * overlay below sets it for the saturated seed). */
+             * overlay below sets it for the saturated seed).
+             *
+             * Gated on `fetching` (set only by cmd_find).  For COUNT and
+             * AGGREGATE the demotion is wrong: counting via an index walk
+             * is always cheaper than a full-segment scan since the index
+             * leaves are smaller and sorted (no per-record fetch, no
+             * data-file I/O).  The pre-1c cmd_count went directly to
+             * btree_idx_range with no plan-filter detour; restoring that
+             * shape recovers the 2026.05.8-era count perf — at 25M scale,
+             * `count gt age>50` (~11M matches) returns in ~1s via the
+             * btree walk vs ~13s when this demotion sent it to scan
+             * all 25M records. */
             fp.kind = FP_FULL_SCAN; return fp;
         }
         fp.kind = FP_PRIMARY_LEAF; fp.source_is_bitmap = (prim_it == IT_BITMAP);

@@ -21,6 +21,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -76,20 +77,20 @@ static TestClient *d3_setup(TestEnv *env) {
     free(r);
 
     /* Build bulk-insert: 50 score=100 rows + 30 score=10 rows. */
-    char body[65536]; int p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[65536]; size_t p = 0;
+    SB_APPEND(body, p, sizeof(body), "{");
     /* score=100 rows: s0..s49, time=0..49 */
     for (int i = 0; i < 50; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"s%d\":{\"score\":100,\"time\":%d}",
             i == 0 ? "" : ",", i, i);
     }
     /* score=10 rows: n0..n29, time=1000..1029 */
     for (int i = 0; i < 30; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"n%d\":{\"score\":10,\"time\":%d}", i, 1000+i);
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
 
     char req[65600];
     snprintf(req, sizeof(req),

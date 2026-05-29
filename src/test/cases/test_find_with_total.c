@@ -25,6 +25,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"   /* SB_APPEND — safe StringBuilder vs CodeQL snprintf-overflow flag */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,15 +57,15 @@ static TestClient *setup_obj(TestEnv *env, const char *obj,
 
 /* Insert n rows with tag="t<i>" and score=i into the given object. */
 static void insert_rows(TestClient *tc, const char *obj, int n) {
-    char body[65536]; int p = 0, k = 0; char *resp = NULL;
-    p += snprintf(body + p, sizeof(body) - p, "{");
+    char body[65536]; size_t p = 0; int k = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < n; i++) {
-        p += snprintf(body + p, sizeof(body) - p,
-                      "%s\"r%d\":{\"tag\":\"t%d\",\"score\":%d}",
-                      k == 0 ? "" : ",", k, i, i * 10);
+        SB_APPEND(body, p, sizeof(body),
+                  "%s\"r%d\":{\"tag\":\"t%d\",\"score\":%d}",
+                  k == 0 ? "" : ",", k, i, i * 10);
         k++;
     }
-    p += snprintf(body + p, sizeof(body) - p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[66560];
     snprintf(req, sizeof(req),
              "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
@@ -398,15 +399,15 @@ static int test_real_total_a1_primary_leaf(void) {
     if (!tc) return 1;
 
     /* Bulk-insert in two passes to keep each request buffer small. */
-    char body[32768]; int p = 0; char *resp = NULL;
+    char body[32768]; size_t p = 0; char *resp = NULL;
 
     /* Pass 1: 5 "rare" records */
     p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 5; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"rare%d\":{\"tag\":\"rare\",\"score\":%d}", i?",":"", i, i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     {
         char req[33000];
         snprintf(req, sizeof(req),
@@ -420,11 +421,11 @@ static int test_real_total_a1_primary_leaf(void) {
         int start = chunk * 99, end = start + 99;
         if (chunk == 7) end = start + (795 - 7*99); /* last chunk */
         p = 0;
-        p += snprintf(body+p, sizeof(body)-p, "{");
+        SB_APPEND(body, p, sizeof(body), "{");
         for (int i = start; i < end; i++)
-            p += snprintf(body+p, sizeof(body)-p,
+            SB_APPEND(body, p, sizeof(body),
                 "%s\"cmn%d\":{\"tag\":\"common\",\"score\":%d}", i==start?"":",", i, i*10);
-        p += snprintf(body+p, sizeof(body)-p, "}");
+        SB_APPEND(body, p, sizeof(body), "}");
         char req[33000];
         snprintf(req, sizeof(req),
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1\","
@@ -463,15 +464,15 @@ static int test_real_total_a1_order_sort(void) {
         "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
     if (!tc) return 1;
 
-    char body[32768]; int p = 0; char *resp = NULL;
+    char body[32768]; size_t p = 0; char *resp = NULL;
 
     /* Pass 1: 5 "rare" records */
     p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 5; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"rare%d\":{\"tag\":\"rare\",\"score\":%d}", i?",":"", i, i*10);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     {
         char req[33000];
         snprintf(req, sizeof(req),
@@ -485,11 +486,11 @@ static int test_real_total_a1_order_sort(void) {
         int start = chunk * 99, end = start + 99;
         if (chunk == 7) end = start + (795 - 7*99);
         p = 0;
-        p += snprintf(body+p, sizeof(body)-p, "{");
+        SB_APPEND(body, p, sizeof(body), "{");
         for (int i = start; i < end; i++)
-            p += snprintf(body+p, sizeof(body)-p,
+            SB_APPEND(body, p, sizeof(body),
                 "%s\"cmn%d\":{\"tag\":\"common\",\"score\":%d}", i==start?"":",", i, 100+i);
-        p += snprintf(body+p, sizeof(body)-p, "}");
+        SB_APPEND(body, p, sizeof(body), "}");
         char req[33000];
         snprintf(req, sizeof(req),
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a1s\","
@@ -525,15 +526,15 @@ static int test_real_total_a2_bitmap(void) {
         "\"active:bool\",\"score:int\"", "\"active:bitmap\"");
     if (!tc) return 1;
 
-    char body[8192]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 70; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"t%d\":{\"active\":true,\"score\":%d}", i?",":"", i, i);
     for (int i = 0; i < 30; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"f%d\":{\"active\":false,\"score\":%d}", i, i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[8300];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a2\","
@@ -578,24 +579,24 @@ static int test_real_total_b1_intersect(void) {
         "\"tag:varchar:4\",\"score:int\"", "\"tag\",\"score\"");
     if (!tc) return 1;
 
-    char body[16384]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[16384]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     int first = 1;
     /* 20 records: tag="x", score=50..69 (match both leaves) */
     for (int i = 0; i < 20; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"xh%d\":{\"tag\":\"x\",\"score\":%d}", first?"":",", i, 50+i);
         first = 0;
     }
     /* 40 records: tag="x", score=0..39 (match tag but not score) */
     for (int i = 0; i < 40; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"xl%d\":{\"tag\":\"x\",\"score\":%d}", i, i);
     /* 40 records: tag="y" (match neither leaf for the intersect) */
     for (int i = 0; i < 40; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"y%d\":{\"tag\":\"y\",\"score\":%d}", i, i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[16500];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_b1\","
@@ -635,18 +636,18 @@ static int test_real_total_c1_union(void) {
         "\"tag:varchar:8\",\"score:int\"", "\"tag\"");
     if (!tc) return 1;
 
-    char body[8192]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 10; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"a%d\":{\"tag\":\"alpha\",\"score\":%d}", i?",":"", i, i);
     for (int i = 0; i < 10; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"b%d\":{\"tag\":\"beta\",\"score\":%d}", i, i);
     for (int i = 0; i < 30; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"o%d\":{\"tag\":\"other\",\"score\":%d}", i, i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[8300];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_c1\","
@@ -683,12 +684,12 @@ static int test_real_total_a5_full_scan(void) {
         "\"note:varchar:8\",\"score:int\"", "\"score\"");
     if (!tc) return 1;
 
-    char body[2048]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[2048]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 10; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"k%d\":{\"note\":\"hi\",\"score\":%d}", i?",":"", i, i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[2200];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_a5\","
@@ -733,15 +734,15 @@ static int test_real_total_d1_composite(void) {
         &resp); free(resp); resp = NULL;
 
     /* Insert 20 alice rows and 10 bob rows */
-    char body[8192]; int p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 20; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"a%d\":{\"by\":\"alice\",\"time\":%d}", i?",":"", i, i*100);
     for (int i = 0; i < 10; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"b%d\":{\"by\":\"bob\",\"time\":%d}", i, i*100);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[8300];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_d1\","
@@ -792,15 +793,15 @@ static int test_real_total_d3_order_walk(void) {
         &resp); free(resp); resp = NULL;
 
     /* 50 score=100 rows (matches score>50) + 30 score=10 rows (doesn't match) */
-    char body[8192]; int p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 50; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"s%d\":{\"score\":100,\"time\":%d}", i?",":"", i, i);
     for (int i = 0; i < 30; i++)
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"n%d\":{\"score\":10,\"time\":%d}", i, 1000+i);
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[8300];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"rt_d3\","
@@ -862,14 +863,14 @@ static int test_agg_total_groupby(void) {
         "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
     if (!tc) return 1;
 
-    char body[4096]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[4096]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 50; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"r%d\":{\"tag\":\"g%d\",\"score\":%d}",
             i ? "," : "", i, i % 5, i * 2);
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[4200];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
@@ -903,13 +904,13 @@ static int test_agg_total_nogroup(void) {
         "\"score:int\"", "\"score\"");
     if (!tc) return 1;
 
-    char body[8192]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[8192]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 100; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"r%d\":{\"score\":%d}", i ? "," : "", i, i);
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[8300];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
@@ -945,14 +946,14 @@ static int test_agg_total_streaming_topn(void) {
         "\"tag:varchar:8\",\"score:int\"", "\"tag\",\"score\"");
     if (!tc) return 1;
 
-    char body[16384]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[16384]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 200; i++) {
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"r%d\":{\"tag\":\"t%02d\",\"score\":%d}",
             i ? "," : "", i, i % 20, i);
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[16600];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
@@ -990,19 +991,19 @@ static int test_agg_total_groupby_filtered(void) {
         "\"author\",\"active\"");
     if (!tc) return 1;
 
-    char body[4096]; int p = 0; char *resp = NULL;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[4096]; size_t p = 0; char *resp = NULL;
+    SB_APPEND(body, p, sizeof(body), "{");
     /* 5 authors, each with 5 active + 5 inactive records (10 total) */
     int k = 0;
     for (int a = 0; a < 5; a++) {
         for (int j = 0; j < 10; j++) {
-            p += snprintf(body+p, sizeof(body)-p,
+            SB_APPEND(body, p, sizeof(body),
                 "%s\"r%d\":{\"author\":\"au%d\",\"active\":%s}",
                 k ? "," : "", k, a, j < 5 ? "true" : "false");
             k++;
         }
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
     char req[4200];
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\","

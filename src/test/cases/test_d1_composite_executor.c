@@ -12,6 +12,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "types.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -60,21 +61,21 @@ static TestClient *d1_setup(TestEnv *env) {
     free(r);
 
     /* Build a bulk-insert JSON for alice (50 rows, time 1000..50000). */
-    char body[131072]; int p = 0;
-    p += snprintf(body+p, sizeof(body)-p, "{");
+    char body[131072]; size_t p = 0;
+    SB_APPEND(body, p, sizeof(body), "{");
     for (int i = 0; i < 50; i++) {
         long t = (long)(i+1) * 1000;   /* 1000, 2000, ..., 50000 */
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             "%s\"a%d\":{\"by\":\"alice\",\"time\":%ld}",
             i == 0 ? "" : ",", i, t);
     }
     /* Append 50 bob rows with shuffled times so they don't accidentally sort the same. */
     for (int i = 0; i < 50; i++) {
         long t = (long)(100 - i) * 1000;   /* 100000, 99000, ..., 51000 */
-        p += snprintf(body+p, sizeof(body)-p,
+        SB_APPEND(body, p, sizeof(body),
             ",\"b%d\":{\"by\":\"bob\",\"time\":%ld}", i, t);
     }
-    p += snprintf(body+p, sizeof(body)-p, "}");
+    SB_APPEND(body, p, sizeof(body), "}");
 
     char req[131200];
     snprintf(req, sizeof(req),

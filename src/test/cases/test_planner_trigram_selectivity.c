@@ -67,28 +67,28 @@ static int test_planner_trigram_over_bitmaps(void) {
      * This ensures plan_filter's selectivity scoring correctly prefers the
      * trigram primary over a pure-bitmap intersect. */
     {
-        char bulk[65536]; int pos = 0;
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        char bulk[65536]; size_t pos = 0;
+        SB_APPEND(bulk, pos, sizeof(bulk),
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"posts\",\"records\":[");
         /* 2 hawking records */
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        SB_APPEND(bulk, pos, sizeof(bulk),
             "{\"key\":\"1\",\"value\":{\"title\":\"stephen hawking dies\",\"dead\":false,\"deleted\":false}},");
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        SB_APPEND(bulk, pos, sizeof(bulk),
             "{\"key\":\"2\",\"value\":{\"title\":\"hawking radiation explained\",\"dead\":false,\"deleted\":false}}");
         /* 98 unrelated records to make bitmap fields broad */
         for (int i = 3; i <= 100; i++) {
-            pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+            SB_APPEND(bulk, pos, sizeof(bulk),
                 ",{\"key\":\"%d\",\"value\":{\"title\":\"generic news story number %d\","
                 "\"dead\":false,\"deleted\":false}}", i, i);
         }
         /* 3 dead records to ensure dead bitmap exists and has some entries */
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        SB_APPEND(bulk, pos, sizeof(bulk),
             ",{\"key\":\"101\",\"value\":{\"title\":\"old post a\",\"dead\":true,\"deleted\":false}}");
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        SB_APPEND(bulk, pos, sizeof(bulk),
             ",{\"key\":\"102\",\"value\":{\"title\":\"old post b\",\"dead\":true,\"deleted\":true}}");
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos,
+        SB_APPEND(bulk, pos, sizeof(bulk),
             ",{\"key\":\"103\",\"value\":{\"title\":\"old post c\",\"dead\":true,\"deleted\":true}}");
-        pos += snprintf(bulk+pos, sizeof(bulk)-pos, "]}");
+        SB_APPEND(bulk, pos, sizeof(bulk), "]}");
         tc_request(tc, bulk, &resp); free(resp); resp = NULL;
     }
     tc_close(tc);
