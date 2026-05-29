@@ -13162,23 +13162,74 @@ static int bm_ks_insert_cb(const char *v, size_t vl, const uint8_t *h, void *c) 
    matching dict value). Mirrors bm_popcount_for_crit but with
    dict-scan + criterion-match instead of an explicit value list.
    Used by count's PRIMARY_LEAF path for ops other than eq/IN. */
+/* Per-worker arg for parallel generic-bitmap popcount.  Value list lives
+ * inside the bitmap shard's dict, so it's discovered per-shard via
+ * bm_iter_values + bm_dict_match_cb — same shape as the serial version. */
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    const char       *field;
+    int               shard_idx;
+    SearchCriterion  *crit;
+    const TypedField *tf;
+    size_t            count;
+} BmPopcountGenericShardArg;
+
+static void *bm_popcount_generic_shard_worker(void *raw) {
+    BmPopcountGenericShardArg *a = (BmPopcountGenericShardArg *)raw;
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+    if (!bm) { a->count = 0; return NULL; }
+    BmDictMatchCtx m = { .crit = a->crit, .tf = a->tf, .n_match = 0 };
+    bm_iter_values(bm, bm_dict_match_cb, &m);
+    size_t local = 0;
+    for (int i = 0; i < m.n_match; i++) {
+        local += bm_count(bm, m.vals[i], m.vlens[i]);
+    }
+    bm_close(bm);
+    a->count = local;
+    return NULL;
+}
+
 static size_t bm_popcount_generic_for_crit(const char *db_root, const char *object,
                                             const char *field, int splits,
                                             SearchCriterion *crit,
                                             const TypedField *tf) {
-    size_t total = 0;
-    for (int s = 0; s < splits; s++) {
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-        BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
-        bm_iter_values(bm, bm_dict_match_cb, &m);
-        for (int i = 0; i < m.n_match; i++) {
-            total += bm_count(bm, m.vals[i], m.vlens[i]);
+    if (splits <= 0) return 0;
+    /* Parallelise across data shards — see bm_popcount_one_value for the
+     * cold-cache motivation.  Generic path also pays bm_iter_values per
+     * shard (small dict scan) so the cost-per-shard is slightly higher
+     * than the eq fast path; parallelising matters even more here. */
+    BmPopcountGenericShardArg *args =
+        malloc((size_t)splits * sizeof(BmPopcountGenericShardArg));
+    if (!args) {
+        size_t total = 0;
+        for (int s = 0; s < splits; s++) {
+            char bp[1024];
+            bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+            if (!bm) continue;
+            BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+            bm_iter_values(bm, bm_dict_match_cb, &m);
+            for (int i = 0; i < m.n_match; i++) {
+                total += bm_count(bm, m.vals[i], m.vlens[i]);
+            }
+            bm_close(bm);
         }
-        bm_close(bm);
+        return total;
     }
+    for (int s = 0; s < splits; s++) {
+        args[s] = (BmPopcountGenericShardArg){
+            .db_root = db_root, .object = object, .field = field,
+            .shard_idx = s, .crit = crit, .tf = tf, .count = 0,
+        };
+    }
+    parallel_for(bm_popcount_generic_shard_worker, args, splits,
+                 sizeof(BmPopcountGenericShardArg));
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) total += args[s].count;
+    free(args);
     return total;
 }
 
@@ -13393,18 +13444,61 @@ static int pick_index_for_leaf(const char *db_root, const char *object,
    Cache-friendly stride-byte popcount in each shard. Cheap (~ms-scale
    at 25M / 128 shards even cold). Shared between count's popcount
    fast path, the negation-shortcut popcount, and IN-sum below. */
+/* Per-worker arg for parallel bitmap popcount fan-out. */
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const char    *field;
+    int            shard_idx;
+    const uint8_t *value;
+    size_t         vlen;
+    size_t         count;   /* output — this worker's contribution */
+} BmPopcountShardArg;
+
+static void *bm_popcount_one_shard_worker(void *raw) {
+    BmPopcountShardArg *a = (BmPopcountShardArg *)raw;
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) { a->count = 0; return NULL; }
+    a->count = bm_count(bm, a->value, a->vlen);
+    bm_close(bm);
+    return NULL;
+}
+
 static size_t bm_popcount_one_value(const char *db_root, const char *object,
                                      const char *field, int splits,
                                      const uint8_t *value, size_t vlen) {
-    size_t total = 0;
-    for (int s = 0; s < splits; s++) {
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-        total += bm_count(bm, value, vlen);
-        bm_close(bm);
+    if (splits <= 0) return 0;
+    /* Parallelise across data shards — each shard's bitmap open + bm_count
+     * is independent.  Serial loops over splits=256 hit ~5s on cold cache
+     * (256 × ~20ms per file open + popcount); parallel_for cuts that to
+     * ~50-200ms by overlapping I/O across worker threads.  Same shape as
+     * bm_shard_walk_worker uses for the value-walk fan-out. */
+    BmPopcountShardArg *args = malloc((size_t)splits * sizeof(BmPopcountShardArg));
+    if (!args) {
+        /* OOM fallback: serial loop. */
+        size_t total = 0;
+        for (int s = 0; s < splits; s++) {
+            char bp[1024];
+            bm_build_path(bp, sizeof(bp), db_root, object, field, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+            if (!bm) continue;
+            total += bm_count(bm, value, vlen);
+            bm_close(bm);
+        }
+        return total;
     }
+    for (int s = 0; s < splits; s++) {
+        args[s] = (BmPopcountShardArg){
+            .db_root = db_root, .object = object, .field = field,
+            .shard_idx = s, .value = value, .vlen = vlen, .count = 0,
+        };
+    }
+    parallel_for(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
+    size_t total = 0;
+    for (int s = 0; s < splits; s++) total += args[s].count;
+    free(args);
     return total;
 }
 
