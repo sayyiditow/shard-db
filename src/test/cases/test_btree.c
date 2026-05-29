@@ -80,6 +80,76 @@ static int test_btree_run(void) {
     btree_range(path, "key_00100", 9, "key_00105", 9, bt_count_cb, NULL);
     ASSERT_EQ_INT(g_bt_count, 6, "bulk range 100..105");
 
+    /* DESC range-iter seek correctness — covers the 2026.05.x fix that
+       replaced last_leaf_page → walk-left-leaf-by-leaf with proper
+       root→leaf descent to max_val.  Previously, a DESC walk with a
+       low max_val on a tall tree would touch every leaf rightward of
+       the target before reaching the in-range leaves.  Here we verify
+       only the result count: the seek-perf assertion lives in the
+       bench, but if the descent navigates incorrectly we'd see wrong
+       counts or missing rows. */
+    {
+        /* DESC iterator over [key_00100, key_00105].  Expect 6 rows in
+           descending order: 105, 104, 103, 102, 101, 100. */
+        BtRangeIter *it = btree_range_iter_open(path,
+                                                "key_00100", 9, 0,
+                                                "key_00105", 9, 0,
+                                                1 /* desc */);
+        ASSERT_NOT_NULL(it, "desc iter opened");
+        if (it) {
+            const char *prev_v = NULL;
+            size_t prev_vl = 0;
+            int n = 0, ordered = 1;
+            const char *v; size_t vl; const uint8_t *h;
+            while (btree_range_iter_next(it, &v, &vl, &h)) {
+                if (prev_v) {
+                    size_t m = prev_vl < vl ? prev_vl : vl;
+                    if (memcmp(v, prev_v, m) > 0) ordered = 0;
+                }
+                prev_v = v; prev_vl = vl;
+                n++;
+            }
+            ASSERT_EQ_INT(n, 6, "desc range 100..105 count");
+            ASSERT_TRUE(ordered, "desc range emits in descending order");
+            btree_range_iter_close(it);
+        }
+
+        /* DESC seek to a low max_val on the 500-entry tree.  Without
+           the fix, the seek starts at the rightmost leaf
+           (key_00499...) and walks leftward through ~10 leaves to
+           reach the in-range zone.  With the fix, descent lands
+           directly at the target leaf — same result count, far fewer
+           leaf reads (proven by bench). */
+        it = btree_range_iter_open(path,
+                                   "key_00000", 9, 0,
+                                   "key_00010", 9, 0,
+                                   1 /* desc */);
+        ASSERT_NOT_NULL(it, "desc seek-to-low iter opened");
+        if (it) {
+            int n = 0;
+            const char *v; size_t vl; const uint8_t *h;
+            while (btree_range_iter_next(it, &v, &vl, &h)) n++;
+            ASSERT_EQ_INT(n, 11, "desc seek-to-low yields keys 00..10");
+            btree_range_iter_close(it);
+        }
+
+        /* Empty-result DESC walk: bounds entirely below all stored
+           keys.  Bug-shape repro: this is what the Cogito-with-zero-
+           comments query looks like at the iterator level. */
+        it = btree_range_iter_open(path,
+                                   "aaa", 3, 0,
+                                   "aaz", 3, 0,
+                                   1 /* desc */);
+        ASSERT_NOT_NULL(it, "desc empty-range iter opened");
+        if (it) {
+            int n = 0;
+            const char *v; size_t vl; const uint8_t *h;
+            while (btree_range_iter_next(it, &v, &vl, &h)) n++;
+            ASSERT_EQ_INT(n, 0, "desc empty-range yields nothing");
+            btree_range_iter_close(it);
+        }
+    }
+
     for (int i = 0; i < nbulk; i++) free((char *)entries[i].value);
     free(entries);
     unlink(path);

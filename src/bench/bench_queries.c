@@ -340,7 +340,14 @@ static int bench_queries_run(void) {
     static const char *const IDX_FIELDS[] = {
         "username", "email", "age", "user_id", "rank",
         "score", "active", "level", "birthday",
-        "created_at", "balance", "hourly_rate"
+        "created_at", "balance", "hourly_rate",
+        /* Composite index — exercises the D1 composite-prefix executor
+           and the DESC tree-descent in btree_range_iter_open (i.e. the
+           HN-explorer profile-page shape: `eq <filter> order_by <other>
+           desc limit N`).  Previously a DESC walk with a low max_val on
+           a tall composite walked every leaf rightward of the in-range
+           zone before reaching it — see DESC-seek fix in btree.c. */
+        "username+age"
     };
     const int IDX_NFIELDS = (int)(sizeof(IDX_FIELDS) / sizeof(IDX_FIELDS[0]));
 
@@ -372,7 +379,8 @@ static int bench_queries_run(void) {
                             "\"category:enum(electronics,clothing,books,home,sports)\"],"
                 "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
                              "\"score\",\"active\",\"level\",\"birthday\","
-                             "\"created_at\",\"balance\",\"hourly_rate\"]}",
+                             "\"created_at\",\"balance\",\"hourly_rate\","
+                             "\"username+age\"]}",
                 SPLITS);
         }
         tc_request(tc, create_obj, &resp);
@@ -780,6 +788,37 @@ static int bench_queries_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"eq\",\"value\":\"books\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"category\"]}");
     BR("eq active=true             order_by age desc limit 10 (broad — falls back)",
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"active\"]}");
+    bench_table_section_end();
+
+    /* ---------- FIND — composite-prefix + order_by DESC (D1 + DESC-seek) ----------
+       Exercises the D1 composite-prefix executor on `username+age`,
+       which calls btree_idx_walk_ordered with desc=1.  The DESC walk's
+       seek path must navigate root→leaf to the target max_val — without
+       that descent (the pre-fix code), DESC started at last_leaf_page
+       (rightmost) and walked leftward leaf-by-leaf until first_key ≤
+       max_val.  For a tall composite with bounds like ["user_5000000",
+       "user_5000000\xff×4"], that meant walking from the alphabetically-
+       last user all the way back to user_5000000 — hundreds of thousands
+       of cold page faults regardless of selectivity.
+
+       Each query below is a Cogito-shape regression case:
+         - 5000000   → exists, ~1 match
+         - __none__  → 0 matches (most painful case pre-fix: full leaf
+                       scan with zero rows to show for it)
+         - 0000001   → exists at lo end (worst case for old DESC: full
+                       walk from rightmost to leftmost)
+
+       If any of these regress past ~50ms warm, the DESC seek has lost
+       its tree-descent fast path. */
+    bench_table_section_begin("FIND — composite-prefix + order_by DESC (D1 + DESC-seek)");
+    BR("composite eq username='user_5000000' order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_5000000\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"age\"]}");
+    BR("composite eq username='__no_such_user__' order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"__no_such_user__\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"age\"]}");
+    BR("composite eq username='user_0000001' order_by age desc limit 10",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_0000001\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"username\",\"age\"]}");
+    BR("composite starts username='user_50' order_by age desc limit 25",
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"user_50\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":25,\"fields\":[\"username\",\"age\"]}");
     bench_table_section_end();
 
     /* ---------- AGGREGATE — single-fn standalone (per numeric type) ---------- */

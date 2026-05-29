@@ -15770,6 +15770,283 @@ static int small_prefilter_cmp_desc(const void *a, const void *b) {
     return -small_prefilter_cmp_asc(a, b);
 }
 
+/* Forward declaration — defined further down alongside the other
+   filter-plan adapters; the D2 executor below uses it. */
+static KeySet *build_keyset_from_plan(const FilterPlan *fp,
+                                      const char *db_root,
+                                      const char *object,
+                                      const Schema *sch,
+                                      QueryDeadline *dl);
+
+/* ============================================================
+   D2 executor: fetch-and-sort with streaming top-N.
+
+   Walks every hash16 in the seed-leaf KeySet (built from the planner's
+   FilterPlan), runs the full criteria tree per record to drop non-
+   matches from non-indexed sibling criteria, extracts the order_by
+   field via typed_field_to_index_key, and keeps only the top
+   (offset+limit) candidates in a heap.
+
+   Memory is O(offset+limit), not O(K) — heap of `M = offset+limit`
+   rows replaces the previous "materialize all K, qsort, slice"
+   pattern.  At HN-explorer profile-page shape (K ≈ user comments,
+   limit 25), the heap is ≈25 rows total regardless of K.  When
+   `limit` is 0 (unlimited), the executor falls back to full
+   materialization (bounded by allocator failure).
+
+   Per-record cost: 1 record fetch + criteria_match_tree + 1
+   typed_field_to_index_key + O(log M) heap push.  No order_by btree
+   walk at all — D2 fires when the seed leaf is selective enough
+   that K random fetches beats walking the order_by btree (D3) until
+   `limit` candidates pass the filter.  The planner's selectivity_
+   budget(N) check picks D2 vs D3.
+
+   Picked by the planner when:
+     • fp.order == FP_ORDER_SORT
+     • fp.kind ∈ {FP_PRIMARY_LEAF, FP_BITMAP_SMALLER, FP_INTERSECT, FP_UNION}
+       (any plan kind that build_keyset_from_plan can materialize)
+   Constraints checked by caller: no joins, no rows_fmt, no csv_delim.
+
+   Returns the total number of matched records (for want_total). */
+
+typedef struct {
+    /* fetch/filter inputs */
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    FieldSchema   *fs;
+    int            order_field_idx;
+    CriteriaNode  *tree;
+    ExcludedKeys  *excluded;
+
+    /* heap state — bounded top-N */
+    SmallPrefilterRow *heap;
+    int                heap_n;
+    int                heap_cap;     /* M = offset+limit; 0 = unbounded */
+    int                desc;
+
+    /* unbounded materialization (limit==0 path) */
+    SmallPrefilterRow *fullbuf;
+    int                full_n;
+    int                full_cap;
+    int                full_oom;
+
+    /* accounting */
+    size_t         n_matched;        /* total records passing the filter */
+    QueryDeadline *dl;
+    int            dl_counter;
+} FetchSortCtx;
+
+/* Heap ordering: root holds the "drop candidate" — the worst entry in
+   the top-M set so far.  ASC walk wants the M smallest → root = max;
+   DESC wants the M largest → root = min.  `d2_topn_outranks(a,b)` answers
+   "is a more root-worthy than b" with that orientation. */
+static inline int d2_topn_outranks(const SmallPrefilterRow *a,
+                                const SmallPrefilterRow *b, int desc) {
+    int c = small_prefilter_cmp_asc(a, b);
+    return desc ? (c < 0) : (c > 0);
+}
+
+static void d2_topn_sift_down(SmallPrefilterRow *heap, int n, int i, int desc) {
+    for (;;) {
+        int l = 2*i + 1, r = 2*i + 2, best = i;
+        if (l < n && d2_topn_outranks(&heap[l], &heap[best], desc)) best = l;
+        if (r < n && d2_topn_outranks(&heap[r], &heap[best], desc)) best = r;
+        if (best == i) return;
+        SmallPrefilterRow t = heap[i]; heap[i] = heap[best]; heap[best] = t;
+        i = best;
+    }
+}
+
+static void d2_topn_sift_up(SmallPrefilterRow *heap, int i, int desc) {
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (d2_topn_outranks(&heap[i], &heap[parent], desc)) {
+            SmallPrefilterRow t = heap[i]; heap[i] = heap[parent]; heap[parent] = t;
+            i = parent;
+        } else break;
+    }
+}
+
+static void d2_topn_push(SmallPrefilterRow *heap, int *n, int cap,
+                      const SmallPrefilterRow *cand, int desc) {
+    if (*n < cap) {
+        heap[*n] = *cand;
+        d2_topn_sift_up(heap, *n, desc);
+        (*n)++;
+        return;
+    }
+    /* Heap full: root is the WORST in our kept set (max for ASC, min
+       for DESC).  Replace root when the candidate is BETTER than it —
+       i.e. when root is more root-worthy than candidate (cand "ranks
+       below" root in the heap's drop-priority order).  This is the
+       OPPOSITE direction from sift-up/sift-down, which maintain the
+       invariant that root is the most-drop-worthy entry. */
+    if (d2_topn_outranks(&heap[0], cand, desc)) {
+        heap[0] = *cand;
+        d2_topn_sift_down(heap, *n, 0, desc);
+    }
+}
+
+/* keyset_iter callback: one fetch + filter + heap-push per candidate. */
+static int fetch_sort_collect_cb(const uint8_t hash[16], void *ctx_ptr) {
+    FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;  /* stop iter */
+
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash, &rr) != 0) return 0;
+
+    if (c->tree && !criteria_match_tree((const uint8_t *)rr.val, c->tree, c->fs)) {
+        release_record_ref(&rr);
+        return 0;
+    }
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, rr.key, klen); keybuf[klen] = '\0';
+        if (is_excluded(c->excluded, keybuf)) {
+            release_record_ref(&rr);
+            return 0;
+        }
+    }
+
+    c->n_matched++;
+
+    SmallPrefilterRow cur;
+    memcpy(cur.hash, hash, 16);
+    typed_field_to_index_key(c->fs->ts, (const uint8_t *)rr.val,
+                             c->order_field_idx,
+                             cur.sort_key, &cur.sort_key_len);
+    release_record_ref(&rr);
+
+    if (c->heap_cap > 0) {
+        d2_topn_push(c->heap, &c->heap_n, c->heap_cap, &cur, c->desc);
+    } else {
+        /* Unbounded (limit==0): grow a flat buffer.  Allocation failure
+           is sticky — once OOM we stop appending but keep counting via
+           n_matched (correct total even if output truncates). */
+        if (c->full_oom) return 0;
+        if (c->full_n == c->full_cap) {
+            int new_cap = c->full_cap ? c->full_cap * 2 : 64;
+            SmallPrefilterRow *bigger = realloc(c->fullbuf,
+                                                (size_t)new_cap * sizeof(SmallPrefilterRow));
+            if (!bigger) { c->full_oom = 1; return 0; }
+            c->fullbuf = bigger; c->full_cap = new_cap;
+        }
+        c->fullbuf[c->full_n++] = cur;
+    }
+    return 0;
+}
+
+/* D2 executor entry point.  Caller has already opened the JSON envelope
+   and verified !has_joins/!rows_fmt/!csv_delim.
+
+   `fp` is the FilterPlan from plan_filter; build_keyset_from_plan
+   derives the candidate KeySet from its source leaves.  `order_by` is
+   the typed field name to sort by (need NOT have its own index — D2
+   sorts via the typed value extracted from each fetched record).
+
+   Returns total matched record count for want_total accounting. */
+static size_t find_via_fetch_sort(const char *db_root, const char *object,
+                                  const Schema *sch, FieldSchema *fs,
+                                  const FilterPlan *fp,
+                                  const char *order_by, int desc,
+                                  CriteriaNode *tree,
+                                  ExcludedKeys *excluded,
+                                  int offset, int limit,
+                                  const char **proj_fields, int proj_count,
+                                  int dict_fmt,
+                                  QueryDeadline *dl)
+{
+    /* Resolve order_by → typed-field index for typed_field_to_index_key. */
+    int order_field_idx = -1;
+    if (fs && fs->ts) {
+        for (int i = 0; i < fs->ts->nfields; i++) {
+            if (strcmp(fs->ts->fields[i].name, order_by) == 0) {
+                order_field_idx = i;
+                break;
+            }
+        }
+    }
+    if (order_field_idx < 0) return 0;
+
+    /* Build the candidate KeySet from the planner's source.  NULL or
+       empty → nothing to emit. */
+    KeySet *prefilter_ks = build_keyset_from_plan(fp, db_root, object, sch, dl);
+    if (!prefilter_ks) return 0;
+    if (keyset_size(prefilter_ks) == 0) { keyset_free(prefilter_ks); return 0; }
+
+    /* Set up the top-N heap (or fall back to unbounded materialization
+       when limit==0). offset is included in the heap capacity so the
+       skip is honored after sort. */
+    int M = (limit > 0) ? (offset + limit) : 0;
+    SmallPrefilterRow *heap = NULL;
+    if (M > 0) {
+        heap = calloc((size_t)M, sizeof(SmallPrefilterRow));
+        if (!heap) { keyset_free(prefilter_ks); return 0; }
+    }
+
+    FetchSortCtx fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.db_root         = db_root;
+    fc.object          = object;
+    fc.sch             = sch;
+    fc.fs              = fs;
+    fc.order_field_idx = order_field_idx;
+    fc.tree            = tree;
+    fc.excluded        = excluded;
+    fc.heap            = heap;
+    fc.heap_cap        = M;
+    fc.desc            = desc;
+    fc.dl              = dl;
+
+    /* Stream the KeySet: one fetch+filter+heap-push per candidate. */
+    keyset_iter(prefilter_ks, fetch_sort_collect_cb, &fc);
+    keyset_free(prefilter_ks);
+
+    /* Sort the kept rows.  For the bounded path the heap holds at most
+       M ≪ K rows; for the unbounded path it's everything that matched. */
+    SmallPrefilterRow *out;
+    int out_n;
+    if (M > 0) { out = heap;       out_n = fc.heap_n; }
+    else       { out = fc.fullbuf; out_n = fc.full_n; }
+    qsort(out, (size_t)out_n, sizeof(SmallPrefilterRow),
+          desc ? small_prefilter_cmp_desc : small_prefilter_cmp_asc);
+
+    /* Emit via cursor_find_cb so format handling (default/dict/proj)
+       stays in one place.  We've already filtered+sorted; tell the cb
+       to skip its own prefilter (NULL) and cursor (has_cursor=0). */
+    CursorFindCtx cc;
+    memset(&cc, 0, sizeof(cc));
+    cc.db_root         = db_root;
+    cc.object          = object;
+    cc.sch             = sch;
+    cc.fs              = (fs && (fs->ts || fs->nfields > 0)) ? fs : NULL;
+    cc.remaining       = tree;
+    cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
+    cc.proj_count      = proj_count;
+    cc.dict_fmt        = dict_fmt;
+    cc.limit           = (limit > 0) ? limit : INT_MAX;
+    cc.printed         = 0;
+    cc.has_cursor      = 0;
+    cc.desc            = desc;
+    cc.skip_remaining  = offset > 0 ? offset : 0;
+    cc.offset_mode     = 1;
+    cc.deadline        = dl;
+    cc.prefilter_ks    = NULL;
+    cc.parent_out      = g_out;
+
+    for (int i = 0; i < out_n; i++) {
+        if (cursor_find_cb("", 0, out[i].hash, &cc) < 0) break;
+    }
+
+    free(heap);
+    free(fc.fullbuf);
+    free(cc.last_value_str);
+    free(cc.last_key_str);
+    return fc.n_matched;
+}
+
 /* Maximum candidate count before we fall back from filter-first to
    walk-ordered + per-record criteria_match. The threshold is set to
    100K because:
@@ -16365,6 +16642,50 @@ int cmd_find(const char *db_root, const char *object,
             if (!want_total) OUT("]\n");
             else if (d3_null) OUT("],\"total\":null}\n");
             else OUT("],\"total\":%zu}\n", d3_total);
+        }
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    } else if (fp.order == FP_ORDER_SORT &&
+               !has_joins && !rows_fmt && !csv_delim &&
+               fp.n_source > 0) {
+        /* ===== D2: fetch-and-sort with streaming top-N =====
+           When plan_filter selected FP_ORDER_SORT the seed leaf's
+           candidate set is bounded (estimable + not saturated).  Stream
+           the candidate KeySet, fetch each record, post-filter via the
+           full criteria tree, extract the order_by field via the typed
+           index-key encoder, and keep only the top (offset+limit) in a
+           heap.  Final qsort + emit via cursor_find_cb.
+
+           No order_by btree is required — D2 sorts via the typed value
+           extracted from each fetched record, so it works for any
+           order_by field in the schema.  This replaces the
+           SmallPrefilterRow shortcut that used to live inside
+           idx_find_parallel as a nested branch.
+
+           Memory is O(offset+limit), not O(K) — heap of (offset+limit)
+           rows.  Per-record cost: 1 fetch + criteria_match + 1
+           index-key extract + O(log(offset+limit)) heap push.
+
+           Guards: same as D1/D3 — no joins (tabular materialise), no
+           rows_fmt (table envelope), no csv_delim (header row). Those
+           cases fall through to idx_find_parallel's legacy ordered-
+           collect + sort path. */
+        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                  strcmp(order_dir, "DESC") == 0));
+        size_t d2_matched = find_via_fetch_sort(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            &fp, order_by, desc,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        if (dict_fmt) {
+            if (!want_total) OUT("}\n");
+            else OUT("},\"total\":%zu}\n", d2_matched);
+        } else {
+            if (!want_total) OUT("]\n");
+            else OUT("],\"total\":%zu}\n", d2_matched);
         }
         free_excluded(&excluded);
         free_criteria_tree(tree);
