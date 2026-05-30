@@ -65,6 +65,24 @@
 #include <errno.h>
 #include <stdint.h>
 
+/* Compiler-portable prefetch.  Non-faulting on x86/ARM64; noop elsewhere. */
+static inline void od_prefetch(const void *addr)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(addr, 0, 0);
+#else
+    (void)addr;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define od_likely(x)   __builtin_expect(!!(x), 1)
+#define od_unlikely(x) __builtin_expect(!!(x), 0)
+#else
+#define od_likely(x)   (x)
+#define od_unlikely(x) (x)
+#endif
+
 /* posix_fadvise is Linux-specific; macOS lacks it. */
 #ifndef POSIX_FADV_SEQUENTIAL
 #  define POSIX_FADV_SEQUENTIAL 2
@@ -897,6 +915,8 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
         /* ── VARCHAR EQ/NEQ ── */
         case MATCH_VARCHAR_EQ:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] != 1) continue;
                 uint16_t klen; memcpy(&klen, rec + 16, 2);
                 const uint8_t *p = rec + field_base + klen;
@@ -921,6 +941,8 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
         /* ── VARCHAR CONTAINS/NOT_CONTAINS ── */
         case MATCH_VARCHAR_CONTAINS:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] != 1) continue;
                 uint16_t klen; memcpy(&klen, rec + 16, 2);
                 const uint8_t *p = rec + field_base + klen;
@@ -972,20 +994,24 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
         /* ── VARCHAR EXISTS/NOT_EXISTS ── */
         case MATCH_VARCHAR_EXISTS:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] != 1) continue;
                 uint16_t klen; memcpy(&klen, rec + 16, 2);
                 int elen = od_varchar_content_max(rec + field_base + klen);
-                if (elen > varchar_cmax) elen = varchar_cmax;
-                if (elen > 0) local_count++;
+                if (od_likely(elen > 0 && varchar_cmax > 0))
+                    local_count++;
             }
             break;
         case MATCH_VARCHAR_NOT_EXISTS:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] != 1) continue;
                 uint16_t klen; memcpy(&klen, rec + 16, 2);
                 int elen = od_varchar_content_max(rec + field_base + klen);
-                if (elen > varchar_cmax) elen = varchar_cmax;
-                if (elen == 0) local_count++;
+                if (od_unlikely(elen == 0 || varchar_cmax == 0))
+                    local_count++;
             }
             break;
 
@@ -1061,6 +1087,8 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
         /* ── INT64 ── */
         case MATCH_INT64_EQ:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] != 1) continue;
                 uint16_t klen; memcpy(&klen, rec + 16, 2);
                 if (od_load_i64_be(rec + 24 + klen + field_offset) == i1) local_count++;
@@ -1491,6 +1519,8 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
         /* ── COUNT_ALL / COUNT_NONE (for EXISTS/NOT_EXISTS on non-varchar) ── */
         case MATCH_COUNT_ALL:
             for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
                 if (rec[18] == 1) local_count++;
             }
             break;
