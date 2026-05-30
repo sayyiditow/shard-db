@@ -53,9 +53,9 @@ MARCH_CFLAGS=""
 [ -n "$BUILD_MARCH" ] && MARCH_CFLAGS="-march=$BUILD_MARCH"
 case "$BUILD_MODE" in
     release)
-        MODE_CFLAGS="-O2 -flto=auto $MARCH_CFLAGS $WARN_CFLAGS"
+        MODE_CFLAGS="-O2 -g -fno-omit-frame-pointer -flto=auto $MARCH_CFLAGS $WARN_CFLAGS"
         MODE_LDFLAGS="-flto=auto"
-        DO_STRIP=1
+        DO_STRIP=${DO_STRIP:-1}
         ;;
     asan)
         MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-PIE -no-pie $WARN_CFLAGS"
@@ -349,6 +349,12 @@ export FCACHE_MAX=4096
 # field still runs alone. Crank up on big-RAM hosts to fit more fields per
 # pass (faster) or down on small VPS to cap peak.
 export INDEX_BUILD_BUDGET_MB=1024
+
+# Full-scan O_DIRECT chunk size (MB). Each parallel worker reads shard data
+# in chunks of this size using O_DIRECT (cache-bypassing pread). Larger chunks
+# reduce syscall overhead on fast NVMe; smaller chunks reduce peak RAM.
+# Default 4 MB if unset. Peak O_DIRECT RAM ~ 2 × DB_ODIRECT_BUF_MB × workers.
+export DB_ODIRECT_BUF_MB=4
 
 # Auth + access
 export TOKEN_CAP=1024

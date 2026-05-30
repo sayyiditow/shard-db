@@ -6,12 +6,12 @@
  * These helpers are used by 1e.4 (FP_FULL_SCAN re-wiring); this header only
  * declares them.  No existing query path is changed here.
  *
- * Design locked 2026-05-28:
+ * Design:
  *   - Linux:   O_DIRECT flag on open; aligned pread; silent fallback to
  *              buffered + POSIX_FADV_SEQUENTIAL|DONTNEED on EINVAL.
  *   - macOS:   F_NOCACHE via fcntl after open; no alignment requirements
  *              from the OS but we keep aligned buffers for consistency.
- *   - Chunk:   4 MB (sweet spot for NVMe sequential throughput).
+ *   - Chunk:   32 MB (reduced syscall rate on modern NVMe).
  *   - Double-buffering: one worker thread pre-fetches the next chunk while
  *     the main thread parses the current chunk.
  */
@@ -20,8 +20,14 @@
 #include <sys/types.h>
 #include <stdint.h>
 
-#define ODIRECT_BUF_SIZE  (4 * 1024 * 1024)   /* 4 MB aligned chunk       */
-#define ODIRECT_ALIGN     4096                 /* O_DIRECT alignment unit  */
+#include "types.h"  /* FieldSchema, CompiledCriterion, CriteriaNode, QueryDeadline */
+
+#define ODIRECT_BUF_SIZE_DEFAULT  (4 * 1024 * 1024)   /* 4 MB fallback          */
+#define ODIRECT_ALIGN            4096                 /* O_DIRECT alignment unit */
+
+/* Configurable chunk size. Override via env var DB_ODIRECT_BUF_MB=N (integer MB).
+ * Initialized before first allocation; safe to read without locking after that. */
+extern size_t odirect_buf_size;
 
 /* ---------------------------------------------------------------------------
  * Low-level helpers
@@ -40,7 +46,12 @@ int od_open(const char *path);
  * -errno on error.  Works on a buffered fallback fd too. */
 ssize_t od_pread(int fd, void *buf, size_t len, off_t off);
 
-/* Allocate one ODIRECT_BUF_SIZE-aligned scan buffer.  Caller frees with
+/* Read DB_ODIRECT_BUF_MB from env and set odirect_buf_size.
+ * Does nothing if the env var is unset/empty/zero/parse-error.
+ * Call only once (from startup), or let the lazy init in od_alloc_buf handle it. */
+void odirect_init_buf_size(void);
+
+/* Allocate one odirect_buf_size-aligned scan buffer.  Caller frees with
  * free().  Returns NULL on allocation failure. */
 void *od_alloc_buf(void);
 
@@ -56,6 +67,13 @@ void *od_alloc_buf(void);
  * Return 0 to continue, non-zero to stop the scan. */
 typedef int (*od_record_cb)(const uint8_t *rec, size_t vlen,
                             const uint8_t hash16[16], void *ctx);
+
+/* Callback for value-only seg-file records.
+ *   value    — pointer to record value bytes (contiguous, after the key)
+ *   vlen     — value byte count
+ *   ctx      — caller context
+ * Return 0 to continue, non-zero to stop the scan. */
+typedef int (*od_value_cb)(const uint8_t *value, size_t vlen, void *ctx);
 
 /* Callback for btree leaf entries.
  *   value    — decoded (prefix-decompressed) btree value bytes
@@ -82,6 +100,34 @@ typedef int (*od_leaf_cb)(const uint8_t *value, size_t vlen,
  */
 int seg_scan_o_direct(const char *seg_path, int slot_size,
                       od_record_cb cb, void *ctx);
+
+/* Same as seg_scan_o_direct, but the callback receives value bytes directly
+ * (the key-and-hash extraction adapter is moved into the inner loop, saving
+ * one function-call frame per record).  Use this when the caller only needs
+ * to inspect the value (e.g. field matching). */
+int seg_scan_o_direct_values(const char *seg_path, int slot_size,
+                              od_value_cb cb, void *ctx);
+
+/* Zero-callback variant: scans seg_path with O_DIRECT double-buffer,
+ * extracts the value from each live slot, and calls match_typed() or
+ * criteria_match_tree() directly — no function-pointer indirection.
+ *
+ * Parameters:
+ *   seg_path   — path to the .dat file
+ *   slot_size  — fixed per-record byte width
+ *   fs         — FieldSchema for typed-field decode
+ *   single_cc  — single compiled criterion (fast path, can be NULL)
+ *   tree       — criteria tree (fallback when single_cc is NULL)
+ *   dl         — QueryDeadline for timeout (can be NULL)
+ *   out_count  — set to number of matched records on return
+ *
+ * Returns 0 on success, -errno on I/O error. */
+int seg_scan_o_direct_match(const char *seg_path, int slot_size,
+                             FieldSchema *fs,
+                             const CompiledCriterion *single_cc,
+                             const CriteriaNode *tree,
+                             QueryDeadline *dl,
+                             int64_t *out_count);
 
 /* ---------------------------------------------------------------------------
  * Double-buffered btree leaf-page walker

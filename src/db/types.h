@@ -321,9 +321,57 @@ typedef struct {
     int max_exclusive;
 } SearchCriterion;
 
-/* Forward decl — opaque outside query.c. Created by compile_criteria() and
-   consumed by match_typed() in the scan hot path. */
-typedef struct CompiledCriterion CompiledCriterion;
+/* Like-kind for OP_LIKE / OP_ILIKE — determined at compile-criteria time
+   from the pattern shape (no wildcards → LK_EXACT, trailing % → LK_PREFIX,
+   leading+trailing % → LK_CONTAINS).  Replaces a runtime string search. */
+typedef enum LikeKind { LK_EXACT, LK_PREFIX, LK_CONTAINS } LikeKind;
+
+/* Compiled criterion — created by compile_criteria() and consumed by
+   match_typed() in the scan hot path.  Fully visible so io_direct.c's
+   batch matchers can pre-digest field type + op without opaque accessors. */
+typedef struct CompiledCriterion {
+    const TypedField *tf;       /* resolved; NULL iff composite or unknown */
+    const TypedField *rhs_tf;   /* RHS for field-vs-field ops; NULL otherwise */
+    enum SearchOp op;
+    enum FieldType ftype;       /* cached when tf != NULL */
+    int composite;              /* 1 if field name contains '+' */
+    const SearchCriterion *raw; /* kept for fallback path + OP_IN varchar */
+
+    /* Pre-parsed scalar rvalues (interpretation depends on ftype) */
+    int64_t  i1, i2;
+    double   d1, d2;
+    uint8_t  uuid_bytes[16];
+    uint8_t  uuid_bytes2[16];
+    uint8_t  time_val[3];
+    uint8_t  time_val2[3];
+    uint16_t t1, t2;
+    uint8_t  b1;
+
+    /* Varchar + LIKE rvalues */
+    char    *s1;
+    size_t   s1_len;
+    char    *s2;
+    size_t   s2_len;
+    char    *needle_lc;
+    size_t   needle_len;
+    enum LikeKind like_kind;
+
+    /* IN / NOT_IN lists */
+    int64_t  *in_i64;
+    double   *in_f64;
+    uint8_t (*in_uuid)[16];
+    uint8_t (*in_time)[3];
+    int       in_count;
+
+    /* OP_REGEX / OP_NOT_REGEX */
+    regex_t  *re;
+    int       re_compiled;
+
+    /* Literal-substring pre-filter for regex ops */
+    char    **re_anchors;
+    size_t   *re_anchor_lens;
+    int       re_anchor_count;
+} CompiledCriterion;
 
 /* Tree form of criteria — supports AND/OR composition.
    Built by parse_criteria_tree(); flat arrays parse as a single AND root.
