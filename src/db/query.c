@@ -69,11 +69,15 @@ typedef struct {
     FILE *parent_out;  /* inherit g_out from parent thread */
 } ScanWorkerArg;
 
+/* Forward decl — flushes TLS pending count, no-op for non-count callbacks. */
+static void count_scan_cb_flush_thread(void);
+
 void *scan_worker(void *arg) {
     ScanWorkerArg *w = (ScanWorkerArg *)arg;
     if (g_scan_stop) return NULL;
     g_out = w->parent_out ? w->parent_out : stdout;
     scan_one_shard(w->path, w->slot_size, w->cb, w->ctx);
+    count_scan_cb_flush_thread();  /* flush TLS pending count before thread exits */
     return NULL;
 }
 
@@ -142,6 +146,15 @@ typedef struct {
     void         *ctx;
 } V2ScanWrap;
 
+typedef struct {
+    SlotcaskDb  *db;
+    int          kf_shard_id;
+    SlotcaskScanCb scb;
+    void        *sctx;
+    int         *stop_flag;
+    FILE        *parent_out;
+} V2ShardArg;
+
 static int v2_scan_wrap_cb(const uint8_t hash[16],
                             const void *key, size_t klen,
                             const void *value, size_t vlen,
@@ -158,57 +171,22 @@ static int v2_scan_wrap_cb(const uint8_t hash[16],
 
 /* Per-shard worker: sets thread-local g_out (otherwise OUT() in the
    callback writes to stdout instead of the connection's stream), then
-   calls the storage primitive for one kf shard. The shared stop_flag
-   lets one shard's "abort" return halt the rest. */
-typedef struct {
-    SlotcaskDb  *db;
-    int          kf_shard_id;
-    SlotcaskScanCb scb;
-    void        *sctx;
-    int         *stop_flag;
-    FILE        *parent_out;
-} V2ShardArg;
+    calls the storage primitive for one kf shard. The shared stop_flag
+    lets one shard's "abort" return halt the rest. */
 
-static void *v2_shard_worker(void *raw) {
-    V2ShardArg *w = (V2ShardArg *)raw;
-    g_out = w->parent_out ? w->parent_out : stdout;
-    if (w->stop_flag &&
-        __atomic_load_n(w->stop_flag, __ATOMIC_ACQUIRE)) return NULL;
-    int rc = slotcask_walk_one_shard(w->db, w->kf_shard_id,
-                                      w->scb, w->sctx, w->stop_flag);
-    if (rc != 0 && w->stop_flag)
-        __atomic_store_n(w->stop_flag, 1, __ATOMIC_RELEASE);
-    return NULL;
-}
+/* Forward decl — definition lives alongside count_scan_cb in cmd_count.
+   Drains the per-thread TLS count accumulator into the bound CountCtx;
+   no-op for scan workers whose callback doesn't use TLS counting. */
+static void count_scan_cb_flush_thread(void);
 
-
-void scan_shards_v2(SlotcaskDb *db, scan_callback cb, void *ctx) {
-    g_scan_stop = 0;
-    V2ScanWrap wrap = { cb, ctx };
-    int n = db->num_shards;
-    if (n <= 0) return;
-    int stop_flag = 0;
-    V2ShardArg *args = malloc((size_t)n * sizeof(V2ShardArg));
-    if (!args) {
-        /* OOM fallback — sequential walk via the storage primitive. */
-        slotcask_walk_live(db, v2_scan_wrap_cb, &wrap);
-        return;
-    }
-    FILE *parent_out = g_out;
-    for (int s = 0; s < n; s++) {
-        args[s] = (V2ShardArg){
-            .db = db, .kf_shard_id = s,
-            .scb = v2_scan_wrap_cb, .sctx = &wrap,
-            .stop_flag = &stop_flag,
-            .parent_out = parent_out,
-        };
-    }
-    parallel_for(v2_shard_worker, args, n, sizeof(V2ShardArg));
-    free(args);
-}
-
-/* Forward declaration — defined below after the O_DIRECT helper block. */
+/* Forward declarations — defined below after the O_DIRECT helper block. */
 void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx);
+void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+                                    FieldSchema *fs,
+                                    const CompiledCriterion *single_cc,
+                                    const CriteriaNode *tree,
+                                    QueryDeadline *dl,
+                                    int64_t *out_count);
 
 /* Streaming variant of scan_shards_v2 — routes through the O_DIRECT
    seg-file path for cache pollution avoidance.  Early-stop semantics
@@ -284,6 +262,10 @@ static void *od_seg_file_worker(void *raw) {
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
     seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    /* Drain per-thread count accumulator (count_scan_cb) so the
+       orchestrator sees this worker's contribution after parallel_for
+       joins.  No-op for callbacks that don't use the TLS counter. */
+    count_scan_cb_flush_thread();
     return NULL;
 }
 
@@ -336,6 +318,86 @@ run:
     free(args);
 }
 
+/* ── inline-match scan dispatcher (zero-callback, direct match_typed) ── */
+
+/* One entry in the per-file parallel_for array for the match path. */
+typedef struct {
+    char                seg_path[PATH_MAX];
+    int                 slot_size;
+    FieldSchema        *fs;
+    const CompiledCriterion *single_cc;
+    const CriteriaNode  *tree;
+    QueryDeadline      *dl;
+    int64_t            *out_count;
+} OdMatchFileArg;
+
+static void *od_match_file_worker(void *raw) {
+    OdMatchFileArg *arg = (OdMatchFileArg *)raw;
+    int64_t local_count = 0;
+    int rc = seg_scan_o_direct_match(arg->seg_path, arg->slot_size,
+                                      arg->fs, arg->single_cc, arg->tree,
+                                      arg->dl, &local_count);
+    /* Merge matches regardless of error — partial count is better than losing all.
+       Error propagation would need a separate shared error flag (future work). */
+    if (local_count > 0)
+        __atomic_add_fetch((_Atomic int64_t *)arg->out_count,
+                           local_count, __ATOMIC_RELAXED);
+    (void)rc;  /* TODO: propagate errors via shared flag */
+    return NULL;
+}
+
+/* Enumerate all .dat files under every stream directory and fan out,
+   counting matches via the inline match path (no callback indirection). */
+void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+                                    FieldSchema *fs,
+                                    const CompiledCriterion *single_cc,
+                                    const CriteriaNode *tree,
+                                    QueryDeadline *dl,
+                                    int64_t *out_count)
+{
+    if (!db || db->num_streams <= 0) return;
+    *out_count = 0;
+
+    OdMatchFileArg *args = NULL;
+    size_t nargs = 0, cap = 0;
+
+    for (int s = 0; s < db->num_streams; s++) {
+        char stream_dir[PATH_MAX];
+        snprintf(stream_dir, sizeof(stream_dir),
+                 "%s/data/streams/%03d", db->data_dir, s);
+        DIR *dh = opendir(stream_dir);
+        if (!dh) continue;
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
+                continue;
+            if (nargs >= cap) {
+                size_t newcap = cap ? cap * 2 : 64;
+                OdMatchFileArg *t = realloc(args, newcap * sizeof(OdMatchFileArg));
+                if (!t) { closedir(dh); goto run_match; }
+                args = t;
+                cap = newcap;
+            }
+            snprintf(args[nargs].seg_path, PATH_MAX,
+                     "%s/%s", stream_dir, de->d_name);
+            args[nargs].slot_size  = db->slot_size;
+            args[nargs].fs         = fs;
+            args[nargs].single_cc  = single_cc;
+            args[nargs].tree       = tree;
+            args[nargs].dl         = dl;
+            args[nargs].out_count  = out_count;
+            nargs++;
+        }
+        closedir(dh);
+    }
+
+run_match:
+    if (nargs == 0) { free(args); return; }
+    parallel_for(od_match_file_worker, args, (int)nargs, sizeof(OdMatchFileArg));
+    free(args);
+}
+
 /* Dispatch helper: callers that have a Schema in scope use this to pick
    the right scan path. Returns 0 on success, -1 if v2 dispatch failed
    (caller can fall back to the legacy path or report no rows). */
@@ -349,8 +411,6 @@ int scan_dispatch(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
     scan_shards_v2_o_direct(sdb, cb, ctx);
-    return 0;
-    scan_shards(data_dir, sc->slot_size, cb, ctx);
     return 0;
 }
 
@@ -627,67 +687,9 @@ typedef struct {
     int local_is_composite;
 } JoinSpec;
 
-enum LikeKind { LK_EXACT, LK_PREFIX, LK_CONTAINS };
-
-struct CompiledCriterion {
-    const TypedField *tf;       /* resolved; NULL iff composite or unknown */
-    const TypedField *rhs_tf;   /* RHS for field-vs-field ops; NULL otherwise */
-    enum SearchOp op;
-    enum FieldType ftype;       /* cached when tf != NULL */
-    int composite;              /* 1 if field name contains '+' */
-    const SearchCriterion *raw; /* kept for fallback path + OP_IN varchar */
-
-    /* Pre-parsed scalar rvalues (interpretation depends on ftype) */
-    int64_t  i1, i2;            /* LONG/INT/SHORT/NUMERIC: native value.
-                                   DATE: 4-byte BE int32 date value.
-                                   DATETIME: i1=date int32, i2=unused */
-    double   d1, d2;            /* DOUBLE */
-    uint8_t  uuid_bytes[16];    /* UUID: for eq/neq */
-    uint8_t  uuid_bytes2[16];   /* UUID: for between */
-    uint8_t  time_val[3];       /* TIME: for eq/neq (seconds since midnight, BE) */
-    uint8_t  time_val2[3];      /* TIME: for between */
-    uint16_t t1, t2;            /* DATETIME packed time seconds */
-    uint8_t  b1;                /* BOOL/BYTE */
-
-    /* Varchar + LIKE rvalues (case-insensitive needles pre-lowered) */
-    char    *s1;                /* c->value: raw copy (for eq/between) */
-    size_t   s1_len;
-    char    *s2;                /* c->value2 */
-    size_t   s2_len;
-    char    *needle_lc;         /* lowercased s1 for LIKE/CONTAINS/STARTS/ENDS */
-    size_t   needle_len;
-    enum LikeKind like_kind;
-
-    /* IN/NOT_IN lists (pre-parsed for numeric types) */
-    int64_t  *in_i64;
-    double   *in_f64;
-    uint8_t (*in_uuid)[16];   /* UUID: array of 16-byte binary values */
-    uint8_t (*in_time)[3];    /* TIME: array of 3-byte values */
-    int       in_count;
-
-    /* OP_REGEX / OP_NOT_REGEX: pre-compiled POSIX extended regex.
-       Heap-allocated so free_compiled_criteria can regfree+free safely
-       even when the criterion is reused across many records. */
-    regex_t  *re;
-    int       re_compiled;        /* 1 iff regcomp succeeded; 0 → no match */
-
-    /* Literal-substring pre-filter for regex ops. When the pattern
-       reduces to a set of literal alternatives (e.g. `(engineer|developer)`,
-       `^z`, `@(gmail|yahoo)`), at least ONE of those literals must
-       appear in the haystack for the regex to match. Per-record check
-       via memmem (~30ns per anchor) is far cheaper than regexec
-       (~100ns-5µs depending on pattern complexity), so reject early
-       when no anchor is present.
-
-       Soundness: we only set anchors when EVERY top-level alternative
-       can be reduced to a pure literal. If any branch contains
-       metachars, anchor_count stays 0 and the pre-filter is bypassed
-       (regexec runs as before). False positives (anchor present but
-       regex doesn't match) are fine — regexec resolves them. */
-    char    **re_anchors;          /* re_anchors[i] is null-terminated literal */
-    size_t   *re_anchor_lens;      /* lengths in bytes (for memmem) */
-    int       re_anchor_count;     /* 0 = no pre-filter, run regex always */
-};
+/* CompiledCriterion is now defined in types.h — visible to io_direct.c's
+   batch matchers.  Keep only the LikeKind forward decl for code that still
+   references the name directly. */
 
 /* Fetch a record by its hex hash and print as JSON. Returns 1 if found. */
 int fetch_record_by_hash(const char *db_root, const char *object,
@@ -8337,9 +8339,15 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->in_count = c->in_count;
         switch (cc->ftype) {
         case FT_LONG: case FT_TIMESTAMP: case FT_INT: case FT_SHORT:
+        case FT_BOOL: case FT_BYTE:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
-            for (int i = 0; i < c->in_count; i++)
-                cc->in_i64[i] = (int64_t)strtoll(c->in_values[i], NULL, 10);
+            for (int i = 0; i < c->in_count; i++) {
+                if (cc->ftype == FT_BOOL && (c->in_values[i][0] == 't' ||
+                    c->in_values[i][0] == 'T' || c->in_values[i][0] == '1'))
+                    cc->in_i64[i] = 1;
+                else
+                    cc->in_i64[i] = (int64_t)strtoll(c->in_values[i], NULL, 10);
+            }
             break;
         case FT_NUMERIC:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
@@ -8379,7 +8387,7 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                                                           strlen(c->in_values[i]));
             break;
         default:
-            /* VARCHAR, DATETIME, BOOL, BYTE: use raw strings via c->in_values */
+            /* VARCHAR, DATETIME: use raw strings via c->in_values */
             break;
         }
     }
@@ -15037,17 +15045,78 @@ typedef struct {
     int count;
     QueryDeadline *deadline;
     int dl_counter;
+    /* Hot-path single-leaf pre-resolved criterion — set once before the
+     * scan starts when tree is a CNODE_LEAF with a compiled typed
+     * criterion.  Skips criteria_match_tree's dispatch (CNODE_AND/OR
+     * recursion + indirect function-pointer chain that LTO can't
+     * devirtualize through the seg-scan callback pointer cascade).
+     * NULL => fall back to the general criteria_match_tree path. */
+    const CompiledCriterion *single_leaf_cc;
 } CountCtx;
+
+/* Per-thread accumulator for count_scan_cb. Mirrors the idx_count_cb
+   pattern: each worker increments a TLS counter on every match, and
+   flushes the batched delta to the shared CountCtx with one atomic-add
+   per shard (instead of per-match).  Without this, a full-scan count
+   like `count exists bio` at 25M hits 25M shared atomic increments
+   across 16 worker threads — the cache line ping-pongs and serialises
+   the per-record critical path, taking ~4.8s warm (perf shows >50%
+   in count_scan_cb itself).  With per-thread batching the atomic-add
+   count drops to ≤ (num_workers × num_shard_files) = a few hundred
+   per query. */
+static __thread struct {
+    CountCtx *bound_cc;
+    int pending;
+} count_local = { NULL, 0 };
 
 static int count_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     CountCtx *cc = (CountCtx *)ctx;
+    /* Defensive rebind: if a worker is reused across queries without an
+       intervening flush, drain the pending count to the previously-bound
+       ctx before binding to the new one.  od_seg_file_worker calls
+       count_scan_cb_flush_thread() at the tail of every file, so this
+       branch should never fire in practice. */
+    if (count_local.bound_cc != cc) {
+        if (count_local.bound_cc) {
+            __atomic_add_fetch(&count_local.bound_cc->count,
+                               count_local.pending, __ATOMIC_RELAXED);
+        }
+        count_local.bound_cc = cc;
+        count_local.pending = 0;
+    }
     if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return 1;
     const uint8_t *raw = block + hdr->key_len;
-    if (!criteria_match_tree(raw, cc->tree, cc->fs)) return 0;
-    /* Concurrent shard workers all accumulate here — atomic increment so no
-       mutex is needed on the scan hot path. */
-    __atomic_fetch_add(&cc->count, 1, __ATOMIC_RELAXED);
+    /* Fast path: single CNODE_LEAF tree with a compiled criterion bypasses
+       criteria_match_tree() altogether — straight match_typed() call. */
+    int matched;
+    if (cc->single_leaf_cc) {
+        matched = match_typed(raw, cc->single_leaf_cc, cc->fs);
+    } else {
+        matched = criteria_match_tree(raw, cc->tree, cc->fs);
+    }
+    if (!matched) return 0;
+    count_local.pending++;
+    /* Cap residency so a freak query doesn't sit on a huge unflushed
+       local before the per-file flush — mirrors idx_count_cb. */
+    if (count_local.pending >= 4096) {
+        __atomic_add_fetch(&cc->count, count_local.pending, __ATOMIC_RELAXED);
+        count_local.pending = 0;
+    }
     return 0;
+}
+
+/* Drain this thread's pending count to the bound ctx and detach.
+   Called by the per-file scan worker (od_seg_file_worker) after each
+   seg_scan_o_direct returns so the orchestrator's read of cc->count
+   after parallel_for sees every worker's contribution.  Safe to call
+   when nothing is bound (no-op). */
+static void count_scan_cb_flush_thread(void) {
+    if (count_local.bound_cc) {
+        __atomic_add_fetch(&count_local.bound_cc->count,
+                           count_local.pending, __ATOMIC_RELAXED);
+        count_local.bound_cc = NULL;
+        count_local.pending = 0;
+    }
 }
 
 int cmd_count(const char *db_root, const char *object, const char *criteria_json) {
@@ -15426,11 +15495,40 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("%zu\n", count);
     } else {
-        /* FP_FULL_SCAN: nothing indexed, or planner demoted to scan. */
-        CountCtx ctx = { tree, &fs, 0, &dl, 0 };
-        scan_dispatch(db_root, object, &sch, data_dir, count_scan_cb, &ctx);
-        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("%d\n", ctx.count);
+        /* FP_FULL_SCAN: nothing indexed, or planner demoted to scan.
+         * Use the inline-match O_DIRECT path which calls match_typed()
+         * directly in the scan loop — no callback indirection, no
+         * SlotHeader construction, no adapter bounce.
+         * Hoist a single-leaf compiled criterion for the fast path
+         * (match_typed directly) vs. criteria_match_tree fallback. */
+        const CompiledCriterion *fast_cc = NULL;
+        if (tree) {
+            const CriteriaNode *leaf = NULL;
+            if (tree->kind == CNODE_LEAF) leaf = tree;
+            else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                     tree->children[0]->kind == CNODE_LEAF) leaf = tree->children[0];
+            if (leaf && leaf->compiled) fast_cc = leaf->compiled;
+        }
+        /* When we have a single compiled criterion, pass NULL tree and
+           let the inline loop use match_typed directly. */
+        SlotcaskSchemaInfo info = {
+            .splits = sch.splits, .slot_size = sch.slot_size,
+            .streams = sch.streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (sdb) {
+            int64_t match_count = 0;
+            scan_shards_v2_o_direct_match(sdb, &fs, fast_cc,
+                                            fast_cc ? NULL : tree,
+                                            &dl, &match_count);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%lld\n", (long long)match_count);
+        } else {
+            CountCtx ctx = { tree, &fs, 0, &dl, 0, fast_cc };
+            scan_shards(data_dir, sch.slot_size, count_scan_cb, &ctx);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%d\n", ctx.count);
+        }
     }
 
     free_criteria_tree(tree);
@@ -21556,9 +21654,7 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     src->total_buckets = 0;
 }
 
-/* Per-kf-shard aggregate worker for v2 full scan. Each worker gets its
-   own cloned AggCtx (own hash table + arena), so agg_scan_cb runs
-   lock-free. Replaces scan_shards_v2's shared-ctx parallel fan-out. */
+/* Per-kf-shard aggregate types and worker (mmap-based, proven path). */
 typedef struct {
     V2ScanWrap   wrap;
     V2ShardArg   arg;
@@ -21582,11 +21678,7 @@ static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
     int n = sdb->num_shards;
     if (n <= 0) return;
     AggV2ScanWork *workers = calloc((size_t)n, sizeof(AggV2ScanWork));
-    if (!workers) {
-        /* Fallback: sequential scan on shared ctx (same as old path). */
-        scan_shards_v2(sdb, agg_scan_cb, main_ctx);
-        return;
-    }
+    if (!workers) return;
     int stop_flag = 0;
     FILE *parent_out = g_out;
     for (int s = 0; s < n; s++) {
@@ -21605,9 +21697,6 @@ static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
     for (int s = 0; s < n; s++) {
         if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[s].local);
-        /* merge strdup's bucket strings into main's arena; src's arena
-           can now be released. Without this every parallel agg over a
-           v2 PRIMARY_NONE shard leaks the per-worker bucket arena. */
         agg_ctx_free_local(&workers[s].local);
     }
     free(workers);

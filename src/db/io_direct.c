@@ -52,6 +52,7 @@
 #include "btree.h"    /* BtFileHeader, BtPageHeader, BT_MAGIC*, bt_page_size,
                          BT_PAGE_DATA_START, BT_LEAF_RESTART_K,
                          BT_MAX_VAL_LEN, BT_HASH_SIZE               */
+#include "simd.h"    /* simd_memmem */
 
 #include <stdlib.h>
 #include <string.h>
@@ -64,11 +65,48 @@
 #include <errno.h>
 #include <stdint.h>
 
+/* Compiler-portable prefetch.  Non-faulting on x86/ARM64; noop elsewhere. */
+static inline void od_prefetch(const void *addr)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(addr, 0, 0);
+#else
+    (void)addr;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define od_likely(x)   __builtin_expect(!!(x), 1)
+#define od_unlikely(x) __builtin_expect(!!(x), 0)
+#else
+#define od_likely(x)   (x)
+#define od_unlikely(x) (x)
+#endif
+
 /* posix_fadvise is Linux-specific; macOS lacks it. */
 #ifndef POSIX_FADV_SEQUENTIAL
 #  define POSIX_FADV_SEQUENTIAL 2
 #  define POSIX_FADV_DONTNEED   4
 #endif
+/* Configurable buffer size — reads DB_ODIRECT_BUF_MB env var.
+   Defaults to 4 MB. Lazily initialised, safe for concurrent reads. */
+size_t odirect_buf_size = 0;
+
+void odirect_init_buf_size(void)
+{
+    if (odirect_buf_size > 0) return;
+    const char *env = getenv("DB_ODIRECT_BUF_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        long mb = strtol(env, &end, 10);
+        if (end != env && mb > 0 && mb <= 1048576) {
+            odirect_buf_size = (size_t)mb * 1024 * 1024;
+            return;
+        }
+    }
+    odirect_buf_size = ODIRECT_BUF_SIZE_DEFAULT;
+}
+
 
 /* ============================================================
  * Low-level helpers
@@ -115,8 +153,9 @@ ssize_t od_pread(int fd, void *buf, size_t len, off_t off)
 
 void *od_alloc_buf(void)
 {
+    if (odirect_buf_size == 0) odirect_init_buf_size();
     void *p = NULL;
-    if (posix_memalign(&p, ODIRECT_ALIGN, ODIRECT_BUF_SIZE) != 0)
+    if (posix_memalign(&p, ODIRECT_ALIGN, odirect_buf_size) != 0)
         return NULL;
     return p;
 }
@@ -182,11 +221,11 @@ static void *prefetch_worker(void *arg)
         int    inactive = c->inactive;
         off_t  off      = c->next_off;
         off_t  remain   = c->file_size - off;
-        size_t want     = (remain >= (off_t)ODIRECT_BUF_SIZE)
-                              ? ODIRECT_BUF_SIZE : (size_t)remain;
+        size_t want     = (remain >= (off_t)odirect_buf_size)
+                              ? odirect_buf_size : (size_t)remain;
         /* O_DIRECT needs alignment; round up (pread stops at real EOF). */
         size_t want_a   = (want + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
-        if (want_a > ODIRECT_BUF_SIZE) want_a = ODIRECT_BUF_SIZE;
+        if (want_a > odirect_buf_size) want_a = odirect_buf_size;
         pthread_mutex_unlock(&c->lock);
 
         ssize_t got = pread(c->fd, c->buf[inactive], want_a, off);
@@ -244,9 +283,9 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size)
 
     /* Fill buf[0] synchronously. */
     off_t  fsz  = file_size;
-    size_t want = (fsz >= (off_t)ODIRECT_BUF_SIZE) ? ODIRECT_BUF_SIZE : (size_t)fsz;
+    size_t want = (fsz >= (off_t)odirect_buf_size) ? odirect_buf_size : (size_t)fsz;
     size_t wanta = (want + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
-    if (wanta > ODIRECT_BUF_SIZE) wanta = ODIRECT_BUF_SIZE;
+    if (wanta > odirect_buf_size) wanta = odirect_buf_size;
 
     ssize_t got = pread(fd, c->buf[0], wanta, 0);
     if (got < 0) {
@@ -334,6 +373,33 @@ static void dbctx_destroy(DbCtx *c, pthread_t worker_tid)
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->prefetch_needed);
     pthread_cond_destroy(&c->prefetch_done);
+}
+
+/* ── Field-value load helpers (BE decoders) ── */
+static inline int od_varchar_content_max(const uint8_t *p) {
+    int len = ((int)p[0] << 8) | (int)p[1];
+    return len < 0 ? 0 : len;
+}
+static inline int64_t od_load_i64_be(const uint8_t *p) {
+    return (int64_t)((uint64_t)p[0] << 56 | (uint64_t)p[1] << 48 |
+                     (uint64_t)p[2] << 40 | (uint64_t)p[3] << 32 |
+                     (uint64_t)p[4] << 24 | (uint64_t)p[5] << 16 |
+                     (uint64_t)p[6] << 8  | p[7]);
+}
+static inline int64_t od_load_i32_be(const uint8_t *p) {
+    uint32_t v = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                 (uint32_t)p[2] << 8 | p[3];
+    return (int64_t)(int32_t)v;
+}
+static inline int64_t od_load_i16_be(const uint8_t *p) {
+    uint16_t v = (uint16_t)p[0] << 8 | p[1];
+    return (int64_t)(int16_t)v;
+}
+static inline double od_load_f64(const uint8_t *p) {
+    double v; memcpy(&v, p, 8); return v;
+}
+static inline float od_load_f32_le(const uint8_t *p) {
+    float v; memcpy(&v, p, 4); return v;
 }
 
 /* ============================================================
@@ -481,6 +547,1900 @@ done:
 }
 
 /* ============================================================
+ * seg_scan_o_direct_match — inline-match O_DIRECT scan
+ * ========================================================= */
+
+/*
+ * Zero-callback variant: walks live slots, extracts the value, and
+ * calls match_typed() or an inlined per-type matcher directly —
+ * no function-pointer indirection. Counts matches in *out_count.
+ *
+ * On-disk record layout:
+ *   [0..15]  hash16   — 16-byte xxh128
+ *   [16..17] klen     — uint16_t little-endian
+ *   [18]     flag     — 0=empty, 1=live, 2=tombstone
+ *   [19]     reserved
+ *   [20..23] vlen     — uint32_t little-endian
+ *   [24..]   key bytes, then value bytes, then zero-pad to slot_size
+ *
+ * Same double-buffer prefetch pattern as seg_scan_o_direct.
+ * QueryDeadline is checked once per chunk.
+ * Returns 0 on success, -errno on I/O error, -ETIMEDOUT on timeout.
+ * *out_count is always set (may be non-zero even on error).
+ */
+
+int seg_scan_o_direct_match(const char *seg_path, int slot_size,
+                             FieldSchema *fs,
+                             const CompiledCriterion *single_cc,
+                             const CriteriaNode *tree,
+                             QueryDeadline *dl,
+                             int64_t *out_count)
+{
+    if (!seg_path || slot_size < 32) return -EINVAL;
+    struct stat st;
+    if (stat(seg_path, &st) != 0) return -errno;
+    off_t file_size = st.st_size;
+    if (file_size == 0) { *out_count = 0; return 0; }
+    int fd = od_open(seg_path);
+    if (fd < 0) return -errno;
+
+    DbCtx dc;
+    int rc = dbctx_init(&dc, fd, file_size);
+    if (rc != 0) { close(fd); return rc; }
+
+    uint8_t *carry = malloc((size_t)slot_size);
+    if (!carry) {
+        free(dc.buf[0]); free(dc.buf[1]);
+        pthread_mutex_destroy(&dc.lock);
+        pthread_cond_destroy(&dc.prefetch_needed);
+        pthread_cond_destroy(&dc.prefetch_done);
+        close(fd);
+        return -ENOMEM;
+    }
+    int carry_len = 0;
+
+    pthread_t worker_tid;
+    if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
+        int e = errno;
+        free(carry);
+        free(dc.buf[0]); free(dc.buf[1]);
+        pthread_mutex_destroy(&dc.lock);
+        pthread_cond_destroy(&dc.prefetch_needed);
+        pthread_cond_destroy(&dc.prefetch_done);
+        close(fd);
+        return -e;
+    }
+    dbctx_kickoff(&dc);
+
+    int ret = 0;
+    int64_t local_count = 0;
+    int more = 1;
+    FieldSchema *fs_mut = fs;
+
+    /* ── Pre-loop setup: hoist all single_cc fields into locals ── */
+    int field_offset = 0;
+    int rhs_offset = 0;
+    int varchar_cmax = 0;
+    const char *s1 = NULL;
+    const char *needle = NULL;
+    size_t s1_len = 0;
+    size_t needle_len = 0;
+    int64_t i1 = 0, i2 = 0;
+    double d1 = 0.0, d2 = 0.0;
+    int8_t min_exc = 0, max_exc = 0;
+    const int64_t *in_i64 = NULL;
+    const double  *in_f64 = NULL;
+    uint16_t in_count = 0;
+
+    enum {
+        MATCH_FALLBACK = 0,
+        MATCH_VARCHAR_EQ,
+        MATCH_VARCHAR_NEQ,
+        MATCH_VARCHAR_CONTAINS,
+        MATCH_VARCHAR_NOT_CONTAINS,
+        MATCH_VARCHAR_STARTS,
+        MATCH_VARCHAR_ENDS,
+        MATCH_VARCHAR_EXISTS,
+        MATCH_VARCHAR_NOT_EXISTS,
+        MATCH_VARCHAR_LEN_EQ,
+        MATCH_VARCHAR_LEN_NEQ,
+        MATCH_VARCHAR_LEN_LESS,
+        MATCH_VARCHAR_LEN_GREATER,
+        MATCH_VARCHAR_LEN_LESS_EQ,
+        MATCH_VARCHAR_LEN_GREATER_EQ,
+        MATCH_VARCHAR_LEN_BETWEEN,
+        MATCH_INT64_EQ, MATCH_INT64_NEQ, MATCH_INT64_LESS, MATCH_INT64_GREATER,
+        MATCH_INT64_LESS_EQ, MATCH_INT64_GREATER_EQ, MATCH_INT64_BETWEEN,
+        MATCH_INT64_IN, MATCH_INT64_NOT_IN,
+        MATCH_INT32_EQ, MATCH_INT32_NEQ, MATCH_INT32_LESS, MATCH_INT32_GREATER,
+        MATCH_INT32_LESS_EQ, MATCH_INT32_GREATER_EQ, MATCH_INT32_BETWEEN,
+        MATCH_INT32_IN, MATCH_INT32_NOT_IN,
+        MATCH_SHORT_EQ, MATCH_SHORT_NEQ, MATCH_SHORT_LESS, MATCH_SHORT_GREATER,
+        MATCH_SHORT_LESS_EQ, MATCH_SHORT_GREATER_EQ, MATCH_SHORT_BETWEEN,
+        MATCH_SHORT_IN, MATCH_SHORT_NOT_IN,
+        MATCH_BYTE_EQ, MATCH_BYTE_NEQ, MATCH_BYTE_LESS, MATCH_BYTE_GREATER,
+        MATCH_BYTE_LESS_EQ, MATCH_BYTE_GREATER_EQ, MATCH_BYTE_BETWEEN,
+        MATCH_BYTE_IN, MATCH_BYTE_NOT_IN,
+        MATCH_DOUBLE_EQ, MATCH_DOUBLE_NEQ, MATCH_DOUBLE_LESS, MATCH_DOUBLE_GREATER,
+        MATCH_DOUBLE_LESS_EQ, MATCH_DOUBLE_GREATER_EQ, MATCH_DOUBLE_BETWEEN,
+        MATCH_FLOAT_EQ, MATCH_FLOAT_NEQ, MATCH_FLOAT_LESS, MATCH_FLOAT_GREATER,
+        MATCH_FLOAT_LESS_EQ, MATCH_FLOAT_GREATER_EQ, MATCH_FLOAT_BETWEEN,
+        MATCH_FLOAT_IN, MATCH_FLOAT_NOT_IN,
+
+        /* ── Field-vs-field inline matchers ── */
+        MATCH_FIELD_VARCHAR_EQ, MATCH_FIELD_VARCHAR_NEQ,
+        MATCH_FIELD_VARCHAR_LT, MATCH_FIELD_VARCHAR_GT,
+        MATCH_FIELD_VARCHAR_LTE, MATCH_FIELD_VARCHAR_GTE,
+
+        MATCH_FIELD_INT64_EQ, MATCH_FIELD_INT64_NEQ,
+        MATCH_FIELD_INT64_LT, MATCH_FIELD_INT64_GT,
+        MATCH_FIELD_INT64_LTE, MATCH_FIELD_INT64_GTE,
+
+        MATCH_FIELD_INT32_EQ, MATCH_FIELD_INT32_NEQ,
+        MATCH_FIELD_INT32_LT, MATCH_FIELD_INT32_GT,
+        MATCH_FIELD_INT32_LTE, MATCH_FIELD_INT32_GTE,
+
+        MATCH_FIELD_SHORT_EQ, MATCH_FIELD_SHORT_NEQ,
+        MATCH_FIELD_SHORT_LT, MATCH_FIELD_SHORT_GT,
+        MATCH_FIELD_SHORT_LTE, MATCH_FIELD_SHORT_GTE,
+
+        MATCH_FIELD_DOUBLE_EQ, MATCH_FIELD_DOUBLE_NEQ,
+        MATCH_FIELD_DOUBLE_LT, MATCH_FIELD_DOUBLE_GT,
+        MATCH_FIELD_DOUBLE_LTE, MATCH_FIELD_DOUBLE_GTE,
+
+        MATCH_FIELD_FLOAT_EQ, MATCH_FIELD_FLOAT_NEQ,
+        MATCH_FIELD_FLOAT_LT, MATCH_FIELD_FLOAT_GT,
+        MATCH_FIELD_FLOAT_LTE, MATCH_FIELD_FLOAT_GTE,
+
+        MATCH_FIELD_BYTE_EQ, MATCH_FIELD_BYTE_NEQ,
+        MATCH_FIELD_BYTE_LT, MATCH_FIELD_BYTE_GT,
+        MATCH_FIELD_BYTE_LTE, MATCH_FIELD_BYTE_GTE,
+
+        MATCH_FIELD_DATE_EQ, MATCH_FIELD_DATE_NEQ,
+        MATCH_FIELD_DATE_LT, MATCH_FIELD_DATE_GT,
+        MATCH_FIELD_DATE_LTE, MATCH_FIELD_DATE_GTE,
+
+        MATCH_FIELD_MISMATCH,  /* rhs_tf == NULL (type mismatch) */
+
+        MATCH_COUNT_ALL,
+        MATCH_COUNT_NONE,
+    } match_kind = MATCH_FALLBACK;
+
+    if (single_cc && single_cc->tf) {
+        field_offset = single_cc->tf->offset;
+
+        /* Field-vs-field ops: inline when types match */
+        int field_vs_field_op = (single_cc->op == OP_EQ_FIELD ||
+                                 single_cc->op == OP_NEQ_FIELD ||
+                                 single_cc->op == OP_LT_FIELD ||
+                                 single_cc->op == OP_GT_FIELD ||
+                                 single_cc->op == OP_LTE_FIELD ||
+                                 single_cc->op == OP_GTE_FIELD);
+        if (field_vs_field_op) {
+            if (!single_cc->rhs_tf) {
+                match_kind = MATCH_FIELD_MISMATCH;
+            } else {
+                rhs_offset = single_cc->rhs_tf->offset;
+                switch (single_cc->tf->type) {
+                case FT_VARCHAR:
+                    varchar_cmax = single_cc->tf->size - 2;
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_VARCHAR_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_VARCHAR_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_VARCHAR_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_VARCHAR_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_VARCHAR_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_VARCHAR_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_LONG: case FT_NUMERIC: case FT_TIMESTAMP:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_INT64_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_INT64_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_INT64_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_INT64_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_INT64_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_INT64_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_INT:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_INT32_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_INT32_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_INT32_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_INT32_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_INT32_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_INT32_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_SHORT:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_SHORT_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_SHORT_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_SHORT_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_SHORT_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_SHORT_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_SHORT_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_DOUBLE:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_DOUBLE_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_DOUBLE_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_DOUBLE_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_DOUBLE_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_DOUBLE_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_DOUBLE_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_FLOAT:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_FLOAT_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_FLOAT_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_FLOAT_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_FLOAT_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_FLOAT_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_FLOAT_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_BOOL: case FT_BYTE:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_BYTE_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_BYTE_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_BYTE_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_BYTE_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_BYTE_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_BYTE_GTE; break;
+                    default: break;
+                    }
+                    break;
+                case FT_DATE:
+                    switch (single_cc->op) {
+                    case OP_EQ_FIELD:  match_kind = MATCH_FIELD_DATE_EQ;  break;
+                    case OP_NEQ_FIELD: match_kind = MATCH_FIELD_DATE_NEQ; break;
+                    case OP_LT_FIELD:  match_kind = MATCH_FIELD_DATE_LT;  break;
+                    case OP_GT_FIELD:  match_kind = MATCH_FIELD_DATE_GT;  break;
+                    case OP_LTE_FIELD: match_kind = MATCH_FIELD_DATE_LTE; break;
+                    case OP_GTE_FIELD: match_kind = MATCH_FIELD_DATE_GTE; break;
+                    default: break;
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+        } else {
+            /* ── Existing scalar-constant setup (UNCHANGED) ── */
+            switch (single_cc->tf->type) {
+            /* ── VARCHAR ── */
+            case FT_VARCHAR: {
+                varchar_cmax = single_cc->tf->size - 2;
+                i1 = single_cc->i1; i2 = single_cc->i2;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EQUAL:       s1 = single_cc->s1; s1_len = (size_t)single_cc->s1_len; match_kind = MATCH_VARCHAR_EQ; break;
+                case OP_NOT_EQUAL:   s1 = single_cc->s1; s1_len = (size_t)single_cc->s1_len; match_kind = MATCH_VARCHAR_NEQ; break;
+                case OP_CONTAINS:    needle = single_cc->needle_lc; needle_len = (size_t)single_cc->needle_len; match_kind = MATCH_VARCHAR_CONTAINS; break;
+                case OP_NOT_CONTAINS: needle = single_cc->needle_lc; needle_len = (size_t)single_cc->needle_len; match_kind = MATCH_VARCHAR_NOT_CONTAINS; break;
+                case OP_STARTS_WITH: needle = single_cc->needle_lc; needle_len = (size_t)single_cc->needle_len; match_kind = MATCH_VARCHAR_STARTS; break;
+                case OP_ENDS_WITH:   needle = single_cc->needle_lc; needle_len = (size_t)single_cc->needle_len; match_kind = MATCH_VARCHAR_ENDS; break;
+                case OP_EXISTS:      match_kind = MATCH_VARCHAR_EXISTS; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_VARCHAR_NOT_EXISTS; break;
+                case OP_LEN_EQ:      match_kind = MATCH_VARCHAR_LEN_EQ; break;
+                case OP_LEN_NEQ:     match_kind = MATCH_VARCHAR_LEN_NEQ; break;
+                case OP_LEN_LESS:    match_kind = MATCH_VARCHAR_LEN_LESS; break;
+                case OP_LEN_GREATER: match_kind = MATCH_VARCHAR_LEN_GREATER; break;
+                case OP_LEN_LESS_EQ: match_kind = MATCH_VARCHAR_LEN_LESS_EQ; break;
+                case OP_LEN_GREATER_EQ: match_kind = MATCH_VARCHAR_LEN_GREATER_EQ; break;
+                case OP_LEN_BETWEEN: match_kind = MATCH_VARCHAR_LEN_BETWEEN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── INT64 (LONG / NUMERIC / TIMESTAMP) ── */
+            case FT_LONG: case FT_NUMERIC: case FT_TIMESTAMP: {
+                i1 = single_cc->i1; i2 = single_cc->i2;
+                in_i64 = single_cc->in_i64; in_f64 = single_cc->in_f64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_INT64_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_INT64_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_INT64_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_INT64_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_INT64_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_INT64_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_INT64_BETWEEN; break;
+                case OP_IN:          match_kind = MATCH_INT64_IN; break;
+                case OP_NOT_IN:      match_kind = MATCH_INT64_NOT_IN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── INT32 (INT) ── */
+            case FT_INT: {
+                i1 = single_cc->i1; i2 = single_cc->i2;
+                in_i64 = single_cc->in_i64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_INT32_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_INT32_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_INT32_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_INT32_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_INT32_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_INT32_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_INT32_BETWEEN; break;
+                case OP_IN:          match_kind = MATCH_INT32_IN; break;
+                case OP_NOT_IN:      match_kind = MATCH_INT32_NOT_IN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── DATE (falls back for zero-date semantics) ── */
+            case FT_DATE:
+                break;
+            /* ── SHORT ── */
+            case FT_SHORT: {
+                i1 = single_cc->i1; i2 = single_cc->i2;
+                in_i64 = single_cc->in_i64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_SHORT_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_SHORT_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_SHORT_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_SHORT_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_SHORT_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_SHORT_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_SHORT_BETWEEN; break;
+                case OP_IN:          match_kind = MATCH_SHORT_IN; break;
+                case OP_NOT_IN:      match_kind = MATCH_SHORT_NOT_IN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── BOOL / BYTE ── */
+            case FT_BOOL: case FT_BYTE: {
+                i1 = (int64_t)single_cc->b1; i2 = 0;
+                in_i64 = single_cc->in_i64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_BYTE_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_BYTE_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_BYTE_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_BYTE_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_BYTE_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_BYTE_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_BYTE_BETWEEN; break;
+                case OP_IN:          match_kind = MATCH_BYTE_IN; break;
+                case OP_NOT_IN:      match_kind = MATCH_BYTE_NOT_IN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── ENUM ── */
+            case FT_ENUM: {
+                i1 = single_cc->i1; i2 = single_cc->i2;
+                in_i64 = single_cc->in_i64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                /* 1-byte enums can use the BYTE inline matchers; 2-byte enums fall through. */
+                if (single_cc->tf && single_cc->tf->enum_width <= 1) {
+                    switch (single_cc->op) {
+                    case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                    case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                    case OP_EQUAL:       match_kind = MATCH_BYTE_EQ; break;
+                    case OP_NOT_EQUAL:   match_kind = MATCH_BYTE_NEQ; break;
+                    case OP_LESS:        match_kind = MATCH_BYTE_LESS; break;
+                    case OP_GREATER:     match_kind = MATCH_BYTE_GREATER; break;
+                    case OP_LESS_EQ:     match_kind = MATCH_BYTE_LESS_EQ; break;
+                    case OP_GREATER_EQ:  match_kind = MATCH_BYTE_GREATER_EQ; break;
+                    case OP_BETWEEN:     match_kind = MATCH_BYTE_BETWEEN; break;
+                    case OP_IN:          match_kind = MATCH_BYTE_IN; break;
+                    case OP_NOT_IN:      match_kind = MATCH_BYTE_NOT_IN; break;
+                    default: break;
+                    }
+                }
+                /* enum_width == 2 falls through to MATCH_FALLBACK */
+                break;
+            }
+            /* ── DOUBLE ── */
+            case FT_DOUBLE: {
+                d1 = single_cc->d1; d2 = single_cc->d2;
+                in_f64 = single_cc->in_f64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_DOUBLE_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_DOUBLE_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_DOUBLE_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_DOUBLE_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_DOUBLE_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_DOUBLE_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_DOUBLE_BETWEEN; break;
+                default: break;
+                }
+                break;
+            }
+            /* ── FLOAT ── */
+            case FT_FLOAT: {
+                float f1 = (float)single_cc->d1;
+                float f2 = (float)single_cc->d2;
+                d1 = (double)f1; d2 = (double)f2;
+                in_f64 = single_cc->in_f64; in_count = (uint16_t)single_cc->in_count;
+                min_exc = single_cc->raw ? (int8_t)single_cc->raw->min_exclusive : 0;
+                max_exc = single_cc->raw ? (int8_t)single_cc->raw->max_exclusive : 0;
+                switch (single_cc->op) {
+                case OP_EXISTS:      match_kind = MATCH_COUNT_ALL; break;
+                case OP_NOT_EXISTS:  match_kind = MATCH_COUNT_NONE; break;
+                case OP_EQUAL:       match_kind = MATCH_FLOAT_EQ; break;
+                case OP_NOT_EQUAL:   match_kind = MATCH_FLOAT_NEQ; break;
+                case OP_LESS:        match_kind = MATCH_FLOAT_LESS; break;
+                case OP_GREATER:     match_kind = MATCH_FLOAT_GREATER; break;
+                case OP_LESS_EQ:     match_kind = MATCH_FLOAT_LESS_EQ; break;
+                case OP_GREATER_EQ:  match_kind = MATCH_FLOAT_GREATER_EQ; break;
+                case OP_BETWEEN:     match_kind = MATCH_FLOAT_BETWEEN; break;
+                case OP_IN:          match_kind = MATCH_FLOAT_IN; break;
+                case OP_NOT_IN:      match_kind = MATCH_FLOAT_NOT_IN; break;
+                default: break;
+                }
+                break;
+            }
+            default: break;
+            }
+        }
+    }
+
+    const int field_base = 24 + field_offset;
+
+    /* ── Chunk loop ── */
+    while (more) {
+        ssize_t chunk_len = dc.active_len;
+        if (chunk_len <= 0) { if (chunk_len < 0) ret = (int)chunk_len; break; }
+        uint8_t *restrict chunk = dc.buf[dc.active];
+        size_t pos = 0;
+
+        /* Reassemble carry slot from previous chunk boundary. */
+        if (carry_len > 0) {
+            int need = slot_size - carry_len;
+            if ((ssize_t)need > chunk_len) {
+                memcpy(carry + carry_len, chunk, (size_t)chunk_len);
+                carry_len += (int)chunk_len;
+                goto do_swap_m;
+            }
+            memcpy(carry + carry_len, chunk, (size_t)need);
+            pos = (size_t)need;
+            carry_len = 0;
+            uint8_t flag = carry[18];
+            if (flag == 1) {
+                uint16_t klen; memcpy(&klen, carry + 16, 2);
+                const uint8_t *val = carry + 24 + (size_t)klen;
+                int matched;
+                if (single_cc) matched = match_typed(val, single_cc, fs_mut);
+                else if (tree) matched = criteria_match_tree(val, tree, fs_mut);
+                else matched = 1;
+                if (matched) local_count++;
+            }
+        }
+
+        /* Deadline: check once per chunk. */
+        if (dl && dl->timeout_ms > 0) {
+            if (atomic_load_explicit(&dl->timed_out, memory_order_relaxed))
+                { ret = -ETIMEDOUT; goto done_m; }
+            uint64_t now = now_ms_coarse();
+            if (now - dl->t0_ms > (uint64_t)dl->timeout_ms) {
+                atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+                ret = -ETIMEDOUT; goto done_m;
+            }
+        }
+
+        const int ss = slot_size;
+        const uint8_t *chunk_end = chunk + chunk_len - ss;
+        const uint8_t *rec = chunk + pos;
+
+        switch (match_kind) {
+
+        /* ── VARCHAR EQ/NEQ ── */
+        case MATCH_VARCHAR_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen == (int)s1_len && memcmp(p + 2, s1, s1_len) == 0)
+                    local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen != (int)s1_len || memcmp(p + 2, s1, s1_len) != 0)
+                    local_count++;
+            }
+            break;
+
+        /* ── VARCHAR CONTAINS/NOT_CONTAINS ── */
+        case MATCH_VARCHAR_CONTAINS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen >= (int)needle_len &&
+                    simd_memmem(p + 2, (size_t)elen, needle, needle_len) != NULL)
+                    local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_NOT_CONTAINS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen < (int)needle_len ||
+                    simd_memmem(p + 2, (size_t)elen, needle, needle_len) == NULL)
+                    local_count++;
+            }
+            break;
+
+        /* ── VARCHAR STARTS/ENDS ── */
+        case MATCH_VARCHAR_STARTS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen >= (int)needle_len && memcmp(p + 2, needle, needle_len) == 0)
+                    local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_ENDS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *p = rec + field_base + klen;
+                int elen = od_varchar_content_max(p);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if (elen >= (int)needle_len &&
+                    memcmp(p + 2 + elen - needle_len, needle, needle_len) == 0)
+                    local_count++;
+            }
+            break;
+
+        /* ── VARCHAR EXISTS/NOT_EXISTS ── */
+        case MATCH_VARCHAR_EXISTS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (od_likely(elen > 0 && varchar_cmax > 0))
+                    local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_NOT_EXISTS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (od_unlikely(elen == 0 || varchar_cmax == 0))
+                    local_count++;
+            }
+            break;
+
+        /* ── VARCHAR LEN_* ── */
+        case MATCH_VARCHAR_LEN_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen == i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen != i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen < i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen > i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen <= i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                if ((int64_t)elen >= i1) local_count++;
+            }
+            break;
+        case MATCH_VARCHAR_LEN_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int elen = od_varchar_content_max(rec + field_base + klen);
+                if (elen > varchar_cmax) elen = varchar_cmax;
+                int64_t v = (int64_t)elen;
+                int ok = 1;
+                if (min_exc ? (v <= i1) : (v < i1)) ok = 0;
+                if (max_exc ? (v >= i2) : (v > i2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+
+        /* ── INT64 ── */
+        case MATCH_INT64_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) == i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) != i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) < i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) > i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) <= i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i64_be(rec + 24 + klen + field_offset) >= i1) local_count++;
+            }
+            break;
+        case MATCH_INT64_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i64_be(rec + 24 + klen + field_offset);
+                int ok = 1;
+                if (min_exc ? (v <= i1) : (v < i1)) ok = 0;
+                if (max_exc ? (v >= i2) : (v > i2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+        case MATCH_INT64_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i64_be(rec + 24 + klen + field_offset);
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { local_count++; break; }
+            }
+            break;
+        case MATCH_INT64_NOT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i64_be(rec + 24 + klen + field_offset);
+                int found = 0;
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { found = 1; break; }
+                if (!found) local_count++;
+            }
+            break;
+
+        /* ── INT32 ── */
+        case MATCH_INT32_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) == i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) != i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) < i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) > i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) <= i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i32_be(rec + 24 + klen + field_offset) >= i1) local_count++;
+            }
+            break;
+        case MATCH_INT32_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i32_be(rec + 24 + klen + field_offset);
+                int ok = 1;
+                if (min_exc ? (v <= i1) : (v < i1)) ok = 0;
+                if (max_exc ? (v >= i2) : (v > i2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+        case MATCH_INT32_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i32_be(rec + 24 + klen + field_offset);
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { local_count++; break; }
+            }
+            break;
+        case MATCH_INT32_NOT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i32_be(rec + 24 + klen + field_offset);
+                int found = 0;
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { found = 1; break; }
+                if (!found) local_count++;
+            }
+            break;
+
+        /* ── SHORT ── */
+        case MATCH_SHORT_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) == i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) != i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) < i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) > i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) <= i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_i16_be(rec + 24 + klen + field_offset) >= i1) local_count++;
+            }
+            break;
+        case MATCH_SHORT_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i16_be(rec + 24 + klen + field_offset);
+                int ok = 1;
+                if (min_exc ? (v <= i1) : (v < i1)) ok = 0;
+                if (max_exc ? (v >= i2) : (v > i2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+        case MATCH_SHORT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i16_be(rec + 24 + klen + field_offset);
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { local_count++; break; }
+            }
+            break;
+        case MATCH_SHORT_NOT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = od_load_i16_be(rec + 24 + klen + field_offset);
+                int found = 0;
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { found = 1; break; }
+                if (!found) local_count++;
+            }
+            break;
+
+        /* ── BYTE/BOOL/ENUM(1-byte) ── */
+        case MATCH_BYTE_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] == i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] != i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] < i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] > i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] <= i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if ((int64_t)rec[24 + klen + field_offset] >= i1) local_count++;
+            }
+            break;
+        case MATCH_BYTE_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = (int64_t)rec[24 + klen + field_offset];
+                int ok = 1;
+                if (min_exc ? (v <= i1) : (v < i1)) ok = 0;
+                if (max_exc ? (v >= i2) : (v > i2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+        case MATCH_BYTE_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = (int64_t)rec[24 + klen + field_offset];
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { local_count++; break; }
+            }
+            break;
+        case MATCH_BYTE_NOT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t v = (int64_t)rec[24 + klen + field_offset];
+                int found = 0;
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (in_i64[j] == v) { found = 1; break; }
+                if (!found) local_count++;
+            }
+            break;
+
+        /* ── DOUBLE ── */
+        case MATCH_DOUBLE_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) == d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) != d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) < d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) > d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) <= d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f64(rec + 24 + klen + field_offset) >= d1) local_count++;
+            }
+            break;
+        case MATCH_DOUBLE_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double v = od_load_f64(rec + 24 + klen + field_offset);
+                int ok = 1;
+                if (min_exc ? (v <= d1) : (v < d1)) ok = 0;
+                if (max_exc ? (v >= d2) : (v > d2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+
+        /* ── FLOAT ── */
+        case MATCH_FLOAT_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) == (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) != (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_LESS:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) < (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_GREATER:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) > (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_LESS_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) <= (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_GREATER_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                if (od_load_f32_le(rec + 24 + klen + field_offset) >= (float)d1) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_BETWEEN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float v = od_load_f32_le(rec + 24 + klen + field_offset);
+                int ok = 1;
+                if (min_exc ? (v <= (float)d1) : (v < (float)d1)) ok = 0;
+                if (max_exc ? (v >= (float)d2) : (v > (float)d2)) ok = 0;
+                if (ok) local_count++;
+            }
+            break;
+        case MATCH_FLOAT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float v = od_load_f32_le(rec + 24 + klen + field_offset);
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (v == (float)in_f64[j]) { local_count++; break; }
+            }
+            break;
+        case MATCH_FLOAT_NOT_IN:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float v = od_load_f32_le(rec + 24 + klen + field_offset);
+                int found = 0;
+                for (uint16_t j = 0; j < in_count; j++)
+                    if (v == (float)in_f64[j]) { found = 1; break; }
+                if (!found) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD VARCHAR ── */
+        case MATCH_FIELD_VARCHAR_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                if (llen == rlen && memcmp(lhs + 2, rhs + 2, llen) == 0)
+                    local_count++;
+            }
+            break;
+        case MATCH_FIELD_VARCHAR_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                if (llen != rlen || memcmp(lhs + 2, rhs + 2, llen) != 0)
+                    local_count++;
+            }
+            break;
+        case MATCH_FIELD_VARCHAR_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                int cmp_n = llen < rlen ? llen : rlen;
+                int r = memcmp(lhs + 2, rhs + 2, cmp_n);
+                if (r < 0 || (r == 0 && llen < rlen))
+                    local_count++;
+            }
+            break;
+        case MATCH_FIELD_VARCHAR_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                int cmp_n = llen < rlen ? llen : rlen;
+                int r = memcmp(lhs + 2, rhs + 2, cmp_n);
+                if (r > 0 || (r == 0 && llen > rlen))
+                    local_count++;
+            }
+            break;
+        case MATCH_FIELD_VARCHAR_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                int cmp_n = llen < rlen ? llen : rlen;
+                int r = memcmp(lhs + 2, rhs + 2, cmp_n);
+                if (r < 0 || (r == 0 && llen <= rlen))
+                    local_count++;
+            }
+            break;
+        case MATCH_FIELD_VARCHAR_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *lhs = rec + 24 + klen + field_offset;
+                const uint8_t *rhs = rec + 24 + klen + rhs_offset;
+                int llen = od_varchar_content_max(lhs);
+                int rlen = od_varchar_content_max(rhs);
+                if (llen > varchar_cmax) llen = varchar_cmax;
+                if (rlen > varchar_cmax) rlen = varchar_cmax;
+                int cmp_n = llen < rlen ? llen : rlen;
+                int r = memcmp(lhs + 2, rhs + 2, cmp_n);
+                if (r > 0 || (r == 0 && llen >= rlen))
+                    local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD INT64 ── */
+        case MATCH_FIELD_INT64_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT64_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT64_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT64_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT64_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT64_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i64_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i64_be(rec + 24 + klen + rhs_offset);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD INT32 ── */
+        case MATCH_FIELD_INT32_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT32_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT32_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT32_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT32_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_INT32_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD SHORT ── */
+        case MATCH_FIELD_SHORT_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_SHORT_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_SHORT_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_SHORT_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_SHORT_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_SHORT_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i16_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i16_be(rec + 24 + klen + rhs_offset);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD DOUBLE ── */
+        case MATCH_FIELD_DOUBLE_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DOUBLE_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DOUBLE_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DOUBLE_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DOUBLE_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DOUBLE_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                double lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 8);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 8);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD FLOAT ── */
+        case MATCH_FIELD_FLOAT_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_FLOAT_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_FLOAT_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_FLOAT_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_FLOAT_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_FLOAT_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                float lhs, rhs;
+                memcpy(&lhs, rec + 24 + klen + field_offset, 4);
+                memcpy(&rhs, rec + 24 + klen + rhs_offset, 4);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD BYTE ── */
+        case MATCH_FIELD_BYTE_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_BYTE_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_BYTE_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_BYTE_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_BYTE_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_BYTE_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int lhs = (int)rec[24 + klen + field_offset];
+                int rhs = (int)rec[24 + klen + rhs_offset];
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD DATE ── */
+        case MATCH_FIELD_DATE_EQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs == rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DATE_NEQ:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs != rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DATE_LT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs < rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DATE_GT:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs > rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DATE_LTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs <= rhs) local_count++;
+            }
+            break;
+        case MATCH_FIELD_DATE_GTE:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                int64_t lhs = od_load_i32_be(rec + 24 + klen + field_offset);
+                int64_t rhs = od_load_i32_be(rec + 24 + klen + rhs_offset);
+                if (lhs >= rhs) local_count++;
+            }
+            break;
+
+        /* ── FIELD-VS-FIELD MISMATCH ── */
+        case MATCH_FIELD_MISMATCH:
+            /* Type mismatch — no record can match. Skip the chunk. */
+            rec = chunk + chunk_len;
+            break;
+
+        /* ── COUNT_ALL / COUNT_NONE (for EXISTS/NOT_EXISTS on non-varchar) ── */
+        case MATCH_COUNT_ALL:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec + ss * 2 <= chunk_end)
+                    od_prefetch(rec + ss * 2);
+                if (rec[18] == 1) local_count++;
+            }
+            break;
+        case MATCH_COUNT_NONE:
+            /* never matches — advance past chunk; count stays 0 */
+            rec = chunk + chunk_len;
+            break;
+
+        /* ── FALLBACK ── */
+        case MATCH_FALLBACK:
+        default:
+            for (; rec <= chunk_end; rec += ss) {
+                if (rec[18] != 1) continue;
+                uint16_t klen; memcpy(&klen, rec + 16, 2);
+                const uint8_t *val = rec + 24 + (size_t)klen;
+                int matched;
+                if (single_cc) matched = match_typed(val, single_cc, fs_mut);
+                else if (tree) matched = criteria_match_tree(val, tree, fs_mut);
+                else matched = 1;
+                if (matched) local_count++;
+            }
+            break;
+        }
+
+        pos = (size_t)(rec - chunk);
+
+        /* Save any partial slot at the chunk tail. */
+        if (pos < (size_t)chunk_len) {
+            carry_len = (int)((size_t)chunk_len - pos);
+            memcpy(carry, chunk + pos, (size_t)carry_len);
+        }
+
+    do_swap_m:
+        {
+            ssize_t next = dbctx_swap(&dc);
+            if (next < 0) { ret = (int)next; goto done_m; }
+            if (next == 0) { dc.active_len = 0; more = 0; }
+        }
+    }
+
+done_m:
+    dbctx_destroy(&dc, worker_tid);
+    free(carry);
+    close(fd);
+    *out_count = local_count;
+    return ret;
+}
+
+/* ============================================================
  * btree_leaf_scan_o_direct
  * ========================================================= */
 
@@ -531,26 +2491,83 @@ static inline uint16_t bts_slot_off(const uint8_t *page, uint32_t s)
     return off;
 }
 
-/* Resolve page_id to a pointer within the collected chunks. */
-static const uint8_t *bts_page(uint8_t **chunks, size_t n_chunks,
-                                size_t total_bytes,
-                                uint32_t pid, int page_sz)
+/* Decode every leaf in a contiguous byte range and call cb per live entry.
+ * `range` points to the first byte of the range, `range_len` is its length.
+ * `start_off` is the byte offset of `range[0]` in the file (used only by the
+ * page-0 header check on the first chunk).
+ *
+ * Pages are processed independently — prefix compression is leaf-local
+ * (anchors at every BT_LEAF_RESTART_K slots restart the prefix), so any
+ * leaf in any order decodes correctly without needing prior leaves.
+ * Non-leaf pages (internal nodes, empty) are skipped via page_type
+ * inspection.  Callback signals early-stop with non-zero return; bubble
+ * that up via *stop_out.
+ *
+ * Returns 0 on success, non-zero on validation/decode error. */
+static int btree_decode_leaves_in_range(const uint8_t *range, size_t range_len,
+                                        off_t start_off, int page_sz,
+                                        od_leaf_cb cb, void *ctx, int *stop_out)
 {
-    off_t byte_off = (off_t)pid * (off_t)page_sz;
-    if (byte_off < 0) return NULL;
-    if ((size_t)byte_off + (size_t)page_sz > total_bytes) return NULL;
-    size_t ci  = (size_t)byte_off / ODIRECT_BUF_SIZE;
-    size_t off = (size_t)byte_off % ODIRECT_BUF_SIZE;
-    if (ci >= n_chunks) return NULL;
-    /* Verify the entire page is within this chunk (true when
-       page_sz < ODIRECT_BUF_SIZE, which is always the case). */
-    if (off + (size_t)page_sz > ODIRECT_BUF_SIZE) {
-        /* Page straddles chunk boundary — shouldn't happen at bt_page_size
-           ≤ 64 KB << 4 MB, but be defensive: only possible if a page_sz
-           change lands exactly at a 4 MB boundary.  Skip silently. */
-        return NULL;
+    size_t off = 0;
+    /* Skip the file header on chunk 0 — page 0 holds BtFileHeader, not a
+     * BtPageHeader.  Everywhere else, every aligned page_sz-sized window
+     * starts with a BtPageHeader. */
+    if (start_off == 0 && range_len >= sizeof(BtFileHeader)) {
+        const BtFileHeader *fh = (const BtFileHeader *)range;
+        uint32_t magic; memcpy(&magic, &fh->magic, 4);
+        if (magic != BT_MAGIC) return -EINVAL;
+        uint64_t ec; memcpy(&ec, &fh->entry_count, 8);
+        if (ec == 0) { *stop_out = 1; return 0; }   /* empty btree → done */
+        off = (size_t)page_sz;                       /* skip page 0 (header) */
     }
-    return chunks[ci] + off;
+
+    char   key_buf[BT_MAX_VAL_LEN];
+    size_t key_len = 0;
+
+    while (off + (size_t)page_sz <= range_len) {
+        const uint8_t *pg = range + off;
+        const BtPageHeader *ph = (const BtPageHeader *)pg;
+        uint32_t ptype; memcpy(&ptype, &ph->page_type, 4);
+
+        /* Skip internal nodes (ptype==0) and any non-page bytes.
+         * Only leaves (ptype==1) carry user entries. */
+        if (ptype == 1) {
+            uint32_t cnt; memcpy(&cnt, &ph->count, 4);
+
+            for (uint32_t s = 0; s < cnt; s++) {
+                uint16_t eoff = bts_slot_off(pg, s);
+                if ((size_t)eoff + 3 > (size_t)page_sz) break;  /* corrupt */
+                const uint8_t *e = pg + eoff;
+                uint8_t  plen = bts_prefix_len(e);
+                size_t   slen = bts_suffix_len(e);
+
+                if ((s & (uint32_t)(BT_LEAF_RESTART_K - 1)) == 0) {
+                    key_len = slen;
+                    if (key_len > BT_MAX_VAL_LEN) key_len = BT_MAX_VAL_LEN;
+                    memcpy(key_buf, bts_suffix(e), key_len);
+                } else {
+                    size_t klen = (size_t)(plen & 0x7f) + slen;
+                    if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
+                    size_t take = (klen > (size_t)(plen & 0x7f))
+                                      ? (klen - (size_t)(plen & 0x7f)) : 0;
+                    memcpy(key_buf + (plen & 0x7f), bts_suffix(e), take);
+                    key_len = klen;
+                }
+
+                if (bts_is_tomb(e)) continue;
+
+                const uint8_t *hash16 = bts_hash(e);
+                if (cb((const uint8_t *)key_buf, key_len, hash16, ctx) != 0) {
+                    *stop_out = 1;
+                    return 0;
+                }
+            }
+        }
+        /* page_type==0 (internal) and unrecognised types are silently skipped. */
+
+        off += (size_t)page_sz;
+    }
+    return 0;
 }
 
 int btree_leaf_scan_o_direct(const char *btree_path,
@@ -569,161 +2586,126 @@ int btree_leaf_scan_o_direct(const char *btree_path,
     int fd = od_open(btree_path);
     if (fd < 0) return -errno;
 
-    /* ---- Collect all chunks via double-buffered I/O ---- */
-
+    /* Stream-decode strategy.
+     *
+     * For unordered leaf scans (the only caller — btree_dispatch's
+     * default branch for contains/like-substring/ends/regex/len_X/
+     * exists), we don't need to follow the leaf chain in sort order.
+     * Every leaf page in the file is independently decodable (prefix
+     * compression is leaf-local), so we can walk the file linearly,
+     * processing each leaf as it arrives in the double-buffered
+     * prefetch.
+     *
+     * The previous "gather every chunk into chunks[] then decode"
+     * pattern allocated file_size bytes of RAM upfront (300 MB for
+     * a 300 MB index) and serialised I/O with decode, defeating the
+     * whole point of the double-buffer.  Streaming uses O(2 buffers)
+     * = 8 MB total and pipelines I/O with decode (worker preads
+     * chunk N+1 while main decodes chunk N).
+     *
+     * Carry handling: pages are smaller than ODIRECT_BUF_SIZE (page_sz
+     * = 4 KB typical, buffer = 4 MB), so at most one page straddles
+     * each chunk boundary.  We stash the tail bytes and prepend to
+     * next chunk before parsing.  Same pattern as seg_scan_o_direct.
+     */
     DbCtx dc;
     int rc = dbctx_init(&dc, fd, file_size);
     if (rc != 0) { close(fd); return rc; }
 
-    /* Chunk pointer array. */
-    size_t   nchunks_cap = 64;
-    uint8_t **chunks     = malloc(nchunks_cap * sizeof(uint8_t *));
-    size_t   nchunks     = 0;
-    size_t   total_bytes = 0;
-
-    if (!chunks) {
+    uint8_t *carry = malloc((size_t)page_sz);
+    if (!carry) {
         free(dc.buf[0]); free(dc.buf[1]);
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
-        close(fd); return -ENOMEM;
+        close(fd);
+        return -ENOMEM;
     }
+    int carry_len = 0;
 
     pthread_t worker_tid;
     if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
         int e = errno;
-        free(chunks);
+        free(carry);
         free(dc.buf[0]); free(dc.buf[1]);
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
-        close(fd); return -e;
+        close(fd);
+        return -e;
     }
 
     dbctx_kickoff(&dc);
 
-    /* Gather all chunks. We cannot parse in-place because btree pages
-       are addressed by page_id (not sequential order); we need random
-       access across the whole file.  So collect, then decode. */
-    int gather_err = 0;
+    int ret = 0;
+    int stop = 0;
+    off_t chunk_off = 0;       /* byte offset of dc.buf[dc.active] in file */
+
     for (;;) {
         ssize_t chunk_len = dc.active_len;
         if (chunk_len <= 0) {
-            if (chunk_len < 0) gather_err = (int)(-chunk_len);
+            if (chunk_len < 0) ret = (int)chunk_len;
             break;
         }
 
-        /* Take ownership of this buffer: allocate a fresh one to replace
-           it in the DbCtx so the worker can reuse the slots safely.
-           Actually simpler: just memcpy out of the active buf, then swap.
-           The buffer belongs to DbCtx; we must copy it. */
-        if (nchunks >= nchunks_cap) {
-            nchunks_cap *= 2;
-            uint8_t **t = realloc(chunks, nchunks_cap * sizeof(uint8_t *));
-            if (!t) { gather_err = ENOMEM; break; }
-            chunks = t;
-        }
-        uint8_t *copy = od_alloc_buf();
-        if (!copy) { gather_err = ENOMEM; break; }
-        memcpy(copy, dc.buf[dc.active], (size_t)chunk_len);
-        chunks[nchunks++] = copy;
-        total_bytes += (size_t)chunk_len;
+        uint8_t *chunk = dc.buf[dc.active];
+        size_t   pos   = 0;
 
-        ssize_t next = dbctx_swap(&dc);
-        if (next < 0) { gather_err = (int)(-next); break; }
-        if (next == 0) { dc.active_len = 0; break; }  /* EOF */
-    }
-
-    dbctx_destroy(&dc, worker_tid);
-    close(fd);
-
-    if (gather_err) {
-        for (size_t i = 0; i < nchunks; i++) free(chunks[i]);
-        free(chunks);
-        return -gather_err;
-    }
-    if (nchunks == 0) { free(chunks); return 0; }
-
-    /* ---- Decode leaf pages ---- */
-
-    int ret = 0;
-
-    /* Validate file header (page 0). */
-    const uint8_t *hdr_page = bts_page(chunks, nchunks, total_bytes, 0, page_sz);
-    if (!hdr_page) goto done_free;
-
-    {
-        const BtFileHeader *fh = (const BtFileHeader *)hdr_page;
-        uint32_t magic; memcpy(&magic, &fh->magic, 4);
-        if (magic != BT_MAGIC) goto done_free;
-
-        uint64_t ec; memcpy(&ec, &fh->entry_count, 8);
-        if (ec == 0) goto done_free;
-    }
-
-    {
-        const BtFileHeader *fh = (const BtFileHeader *)hdr_page;
-
-        /* Walk internal nodes to find the first leaf. */
-        uint32_t page_id; memcpy(&page_id, &fh->root_page, 4);
-        for (;;) {
-            const uint8_t *pg = bts_page(chunks, nchunks, total_bytes,
-                                         page_id, page_sz);
-            if (!pg) goto done_free;
-            const BtPageHeader *ph = (const BtPageHeader *)pg;
-            uint32_t ptype; memcpy(&ptype, &ph->page_type, 4);
-            if (ptype == 1) break;   /* leaf */
-            uint32_t nlp; memcpy(&nlp, &ph->next_leaf, 4);
-            if (nlp == 0) goto done_free;
-            page_id = nlp;
-        }
-
-        /* Walk the leaf chain. */
-        char   key_buf[BT_MAX_VAL_LEN];
-        size_t key_len = 0;
-
-        while (page_id != 0) {
-            const uint8_t *pg = bts_page(chunks, nchunks, total_bytes,
-                                         page_id, page_sz);
-            if (!pg) break;
-            const BtPageHeader *ph = (const BtPageHeader *)pg;
-            uint32_t cnt; memcpy(&cnt, &ph->count, 4);
-
-            for (uint32_t s = 0; s < cnt; s++) {
-                uint16_t eoff = bts_slot_off(pg, s);
-                const uint8_t *e = pg + eoff;
-                uint8_t  plen = bts_prefix_len(e);
-                size_t   slen = bts_suffix_len(e);
-
-                if ((s & (uint32_t)(BT_LEAF_RESTART_K - 1)) == 0) {
-                    /* Anchor: full key. */
-                    key_len = slen;
-                    if (key_len > BT_MAX_VAL_LEN) key_len = BT_MAX_VAL_LEN;
-                    memcpy(key_buf, bts_suffix(e), key_len);
-                } else {
-                    /* Prefix-compressed. */
-                    size_t klen = (size_t)(plen & 0x7f) + slen;
-                    if (klen > BT_MAX_VAL_LEN) klen = BT_MAX_VAL_LEN;
-                    size_t take = (klen > (size_t)(plen & 0x7f))
-                                      ? (klen - (size_t)(plen & 0x7f)) : 0;
-                    memcpy(key_buf + (plen & 0x7f), bts_suffix(e), take);
-                    key_len = klen;
-                }
-
-                if (bts_is_tomb(e)) continue;
-
-                const uint8_t *hash16 = bts_hash(e);
-                int cbrc = cb((const uint8_t *)key_buf, key_len, hash16, ctx);
-                if (cbrc != 0) { ret = 1; goto done_free; }
+        /* Reassemble a page that straddled the previous chunk boundary. */
+        if (carry_len > 0) {
+            int need = page_sz - carry_len;
+            if ((ssize_t)need > chunk_len) {
+                /* Whole chunk still not enough (impossible at page_sz <
+                 * ODIRECT_BUF_SIZE, but defensive). */
+                memcpy(carry + carry_len, chunk, (size_t)chunk_len);
+                carry_len += (int)chunk_len;
+                goto next_chunk;
             }
+            memcpy(carry + carry_len, chunk, (size_t)need);
+            pos = (size_t)need;
+            carry_len = 0;
 
-            uint32_t nlp; memcpy(&nlp, &ph->next_leaf, 4);
-            page_id = nlp;
+            /* Decode the now-complete page (carry buf). */
+            int err = btree_decode_leaves_in_range(carry, (size_t)page_sz,
+                                                   /*start_off=*/chunk_off - page_sz + need,
+                                                   page_sz, cb, ctx, &stop);
+            if (err) { ret = err; goto done; }
+            if (stop) goto done;
+        }
+
+        /* Stride through full pages in this chunk.  The decoder skips
+         * page 0 internally when start_off==0. */
+        size_t whole_len = chunk_len - (chunk_len % (ssize_t)page_sz);
+        if (whole_len > pos) {
+            int err = btree_decode_leaves_in_range(chunk + pos, whole_len - pos,
+                                                   chunk_off + (off_t)pos,
+                                                   page_sz, cb, ctx, &stop);
+            if (err) { ret = err; goto done; }
+            if (stop) goto done;
+            pos = whole_len;
+        }
+
+        /* Save any partial page at the chunk tail. */
+        if (pos < (size_t)chunk_len) {
+            carry_len = (int)((size_t)chunk_len - pos);
+            memcpy(carry, chunk + pos, (size_t)carry_len);
+        }
+
+next_chunk:
+        {
+            chunk_off += (off_t)chunk_len;
+            ssize_t next = dbctx_swap(&dc);
+            if (next < 0) { ret = (int)next; goto done; }
+            if (next == 0) {
+                dc.active_len = 0;
+                break;
+            }
         }
     }
 
-done_free:
-    for (size_t i = 0; i < nchunks; i++) free(chunks[i]);
-    free(chunks);
+done:
+    dbctx_destroy(&dc, worker_tid);
+    free(carry);
+    close(fd);
     return ret;
 }
