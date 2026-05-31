@@ -319,6 +319,8 @@ typedef struct {
        these — the field is opt-in for the planner's same-field coalescer. */
     int min_exclusive;
     int max_exclusive;
+    int64_t len_target;    /* pre-parsed for OP_LEN_* ops, 0 otherwise */
+    int64_t len_target2;   /* second bound for OP_LEN_BETWEEN */
 } SearchCriterion;
 
 /* Like-kind for OP_LIKE / OP_ILIKE — determined at compile-criteria time

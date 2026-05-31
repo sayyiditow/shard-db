@@ -40,6 +40,9 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #   slotcask.c, simd.c — added 2026.06: query.c and storage.c now have
 #       v2-engine call sites and SIMD scan helpers. Linker needs the
 #       symbol bodies even though the fuzzer never enters those paths.
+#   io_direct.c — added 2026.06: query.c references seg_scan_o_direct
+#       and seg_scan_o_direct_match for the O_DIRECT full-scan path.
+#       Same rationale — linked for symbol resolution, never entered.
 #   bitmap.c, trigram.c — added 2026.05.7: query.c and index.c reference
 #       bm_* / tg_* symbols for the bitmap + trigram index types. Same
 #       rationale as above — linked for symbol resolution, never entered
@@ -55,6 +58,7 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/util.c src/db/keyset.c src/db/query.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/io_direct.c \
     src/db/bitmap.c src/db/trigram.c \
     -lpthread -latomic
 

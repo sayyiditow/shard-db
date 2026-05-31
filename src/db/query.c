@@ -340,7 +340,7 @@ static void *od_match_file_worker(void *raw) {
     /* Merge matches regardless of error — partial count is better than losing all.
        Error propagation would need a separate shared error flag (future work). */
     if (local_count > 0)
-        __atomic_add_fetch((_Atomic int64_t *)arg->out_count,
+        __atomic_add_fetch(arg->out_count,
                            local_count, __ATOMIC_RELAXED);
     (void)rc;  /* TODO: propagate errors via shared flag */
     return NULL;
@@ -7864,8 +7864,8 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
                fast path uses the precise length-prefix and is the canonical
                implementation. */
             int64_t L = (int64_t)strlen(val_str);
-            int64_t q1 = (int64_t)strtoll(c->value, NULL, 10);
-            int64_t q2 = (int64_t)strtoll(c->value2, NULL, 10);
+            int64_t q1 = c->len_target;
+            int64_t q2 = c->len_target2;
             switch (c->op) {
                 case OP_LEN_EQ:         return L == q1;
                 case OP_LEN_NEQ:        return L != q1;
@@ -9833,8 +9833,8 @@ static int op_is_length(enum SearchOp op) {
    tmp-string roundtrip in match_criterion for hot-path callbacks. */
 static int match_length_vlen(size_t vlen, const SearchCriterion *c) {
     int64_t L = (int64_t)vlen;
-    int64_t q1 = (int64_t)strtoll(c->value, NULL, 10);
-    int64_t q2 = (int64_t)strtoll(c->value2, NULL, 10);
+    int64_t q1 = c->len_target;
+    int64_t q2 = c->len_target2;
     switch (c->op) {
         case OP_LEN_EQ:         return L == q1;
         case OP_LEN_NEQ:        return L != q1;
@@ -11426,6 +11426,11 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     }
     free(v_raw);
     if (v2) { strncpy(c->value2, v2, sizeof(c->value2) - 1); free(v2); }
+    if (op_is_length(c->op)) {
+        c->len_target = strtoll(c->value, NULL, 10);
+        if (c->op == OP_LEN_BETWEEN)
+            c->len_target2 = strtoll(c->value2, NULL, 10);
+    }
 }
 
 /* Parse criteria from JSON — supports two forms:
