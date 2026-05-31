@@ -22522,6 +22522,49 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
     }
 }
 
+/* Callback + context for bitmap group_count dict-value collection.
+   bm_iter_values per shard; union unique raw values across shards. */
+typedef struct {
+    uint8_t  (*vals)[1024];
+    size_t   *vlens;
+    int      *n;
+    int       cap;
+} BmDictCollectCtx;
+
+static int bm_collect_uniq_cb(const uint8_t *value, size_t vlen, void *ctx) {
+    BmDictCollectCtx *c = (BmDictCollectCtx *)ctx;
+    for (int i = 0; i < *c->n; i++) {
+        if (c->vlens[i] == vlen && memcmp(c->vals[i], value, vlen) == 0)
+            return 0;
+    }
+    if (*c->n >= c->cap) return 0;
+    size_t cp = vlen < 1024 ? vlen : 1024;
+    memcpy(c->vals[*c->n], value, cp);
+    c->vlens[*c->n] = vlen;
+    (*c->n)++;
+    return 0;
+}
+
+/* Callback + context for slot-level bitmap intersect walk.
+   bm_walk per group_by dict value → tests all criteria bitmaps at each slot. */
+typedef struct {
+    BitmapShard **cbm;
+    uint8_t (*cvals)[1024];
+    size_t  *cvl;
+    int      nc;
+    unsigned long *count;
+} BmIntersectWalkCtx;
+
+static int bm_intersect_walk_cb(uint32_t slot, void *ctx) {
+    BmIntersectWalkCtx *x = (BmIntersectWalkCtx *)ctx;
+    for (int i = 0; i < x->nc; i++) {
+        if (!bm_test(x->cbm[i], x->cvals[i], x->cvl[i], slot))
+            return 0;
+    }
+    (*x->count)++;
+    return 0;
+}
+
 int cmd_aggregate(const char *db_root, const char *object,
                   const char *criteria_json, const char *group_by_json,
                   const char *aggregates_json, const char *having_json,
@@ -23915,8 +23958,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                clang. The `;` keeps us valid C11/17 without changing
                control flow. */
 
-    /* Fast path: indexed group_by (single field, btree exists). Walks the
-       group_by btree directly to bucket per encoded value; for any
+    /* Fast path: indexed group_by (single field, btree or bitmap). Walks the
+       group_by btree or bitmap directly to bucket per encoded value; for any
        sum/avg/min/max specs whose target field is also indexed and
        non-varchar, walks that field's btree and attributes each entry to
        its bucket via a hash16→bid map. Skips the per-record scan entirely
@@ -23924,7 +23967,9 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
        order_by / limit / emit pipeline.
 
        Eligibility:
-         - exactly one group_by field, indexed, non-composite (varchar OK)
+         - one or more group_by fields, each indexed (btree or bitmap),
+           non-composite (varchar OK); bitmap-only supports single field,
+           count-only, no criteria
          - every spec is one of:
              * AGG_COUNT (with no field, or non-varchar typed field)
              * AGG_SUM/AVG/MIN/MAX on an indexed non-varchar non-composite
@@ -23936,15 +23981,24 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
        no-criteria sum/avg/min/max btree fast path. */
     int igb_eligible = (ctx.ngroups >= 1 && ctx.ngroups <= MAX_FIELDS && fs.ts &&
                         agg_criteria_fully_covered(db_root, object, tree));
+    int igb_group_uses_bitmap = 0;
+    int igb_needs_hbm = 0;
     if (igb_eligible) {
         for (int g = 0; g < ctx.ngroups; g++) {
-            if (!ctx.group_tfs[g] ||
-                strchr(ctx.group_fields[g], '+') ||
-                !btree_idx_exists(db_root, object,
-                                  ctx.group_fields[g], sch.splits)) {
+            if (!ctx.group_tfs[g] || strchr(ctx.group_fields[g], '+')) {
                 igb_eligible = 0;
                 break;
             }
+            int has_btree_g = btree_idx_exists(db_root, object,
+                                                ctx.group_fields[g],
+                                                sch.splits);
+            if (!has_btree_g &&
+                !field_has_index_type(db_root, object,
+                                      ctx.group_fields[g], IT_BITMAP)) {
+                igb_eligible = 0;
+                break;
+            }
+            if (!has_btree_g) igb_group_uses_bitmap = 1;
             /* No varchar size threshold: measured indexed path beats the
                scan path even at 1M unique varchar values (one btree leaf
                walk + arena-backed bucket creation finishes faster than
@@ -23954,7 +24008,6 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                and non-composite". */
         }
     }
-    int igb_needs_hbm = 0;
     if (igb_eligible) {
         for (int i = 0; i < ctx.nspecs; i++) {
             AggSpec *sp = &ctx.specs[i];
@@ -23974,6 +24027,15 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             }
             igb_needs_hbm = 1;
         }
+    }
+    if (igb_eligible && igb_group_uses_bitmap &&
+        (ctx.ngroups > 1 || igb_needs_hbm)) {
+        /* Bitmap-only group_by with multi-field or sum/avg/min/max needs
+           a btree walk + hash bucket map, which fails for bitmap-only
+           group fields (no btree). Fall through to per-record scan.
+           Criteria alone no longer disqualifies — the slot-level bitmap
+           intersect path handles bitmap-only group_by + bitmap criteria. */
+        igb_eligible = 0;
     }
     /* Multi-spec indexed group_by (count + sum/avg/min/max on indexed
        non-varchar agg fields) stays on the indexed path. The earlier
@@ -24002,6 +24064,150 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
     }
 
     if (igb_eligible) {
+        /* Bitmap-only group_by fast path: single field, count-only.
+           Walk the bitmap dict across all shards, collect unique values,
+           then decide:
+             no criteria  → sum bm_count per value via parallel popcount;
+             bitmap-criteria → slot-level walk testing group_by bitmap
+             and criteria bitmaps simultaneously (no KeySet, no kf I/O).
+           Avoids 12.5M btree leaf entries at 25M. */
+        if (ctx.ngroups == 1 && !igb_needs_hbm && igb_group_uses_bitmap) {
+            const TypedField *gtf_bm = ctx.group_tfs[0];
+            uint8_t  bm_vals[256][1024];
+            size_t   bm_vlens[256];
+            int      bm_n = 0;
+            int      bm_dl = 0;
+            for (int s = 0; s < sch.splits; s++) {
+                if (query_deadline_tick(&dl, &bm_dl)) goto igb_skip;
+                char bp[1024];
+                bm_build_path(bp, sizeof(bp), db_root, object,
+                              ctx.group_fields[0], s);
+                BitmapShard *bms = bm_open(bp, 0, 0, 0, 0, 0);
+                if (!bms) continue;
+                BmDictCollectCtx dc = { .vals = bm_vals, .vlens = bm_vlens,
+                                        .n = &bm_n, .cap = 256 };
+                bm_iter_values(bms, bm_collect_uniq_cb, &dc);
+                bm_close(bms);
+            }
+            if (bm_n == 0) { igb_done = 1; goto igb_skip; }
+
+            if (!tree) {
+                for (int i = 0; i < bm_n; i++) {
+                    if (query_deadline_tick(&dl, &bm_dl)) break;
+                    size_t total = bm_popcount_one_value(
+                        db_root, object, ctx.group_fields[0],
+                        sch.splits, bm_vals[i], bm_vlens[i]);
+                    if (total == 0) continue;
+                    char display[512];
+                    if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
+                                          display, sizeof(display)) <= 0)
+                        continue;
+                    char *kvp[1] = { display };
+                    AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+                    if (!b) break;
+                    for (int j = 0; j < ctx.nspecs; j++) {
+                        if (ctx.specs[j].fn == AGG_COUNT)
+                            b->accums[j].count = (unsigned long)total;
+                    }
+                }
+                igb_done = 1;
+                goto igb_skip;
+            }
+
+            /* Criteria present: check eligibility for slot-level bitmap
+               intersect — requires all criteria leaves be bitmap equal
+               with no postfilter leaves (FP_BITMAP_SMALLER or FP_INTERSECT
+               with source_is_bitmap). */
+            int can_slot = 0;
+            int n_crit = 0;
+            if (igb_crit_fp.source_is_bitmap && igb_crit_fp.n_postfilter == 0) {
+                can_slot = 1;
+                for (int i = 0; i < igb_crit_fp.n_source; i++) {
+                    SearchCriterion *sc = igb_crit_fp.source_leaves[i];
+                    if (sc && sc->op == OP_EQUAL)
+                        n_crit++;
+                    else
+                        { can_slot = 0; break; }
+                }
+                if (n_crit == 0) can_slot = 0;
+            }
+
+            if (can_slot) {
+                uint8_t  cvals[MAX_INTERSECT_LEAVES][1024];
+                size_t   cvlens[MAX_INTERSECT_LEAVES];
+                for (int ci = 0; ci < n_crit; ci++) {
+                    SearchCriterion *sc = igb_crit_fp.source_leaves[ci];
+                    const TypedField *ctf = resolve_idx_field(fs.ts, sc->field);
+                    if (!ctf) { can_slot = 0; break; }
+                    encode_criterion_value(ctf, sc->value, strlen(sc->value),
+                                           cvals[ci], &cvlens[ci]);
+                    if (cvlens[ci] == 0) { can_slot = 0; break; }
+                }
+                if (can_slot) {
+                    unsigned long counts[256] = {0};
+                    for (int s = 0; s < sch.splits && !dl.timed_out; s++) {
+                        if (query_deadline_tick(&dl, &bm_dl)) break;
+                        char bp[1024];
+                        bm_build_path(bp, sizeof(bp), db_root, object,
+                                      ctx.group_fields[0], s);
+                        BitmapShard *gb_bm = bm_open(bp, 0, 0, 0, 0, 0);
+                        if (!gb_bm) continue;
+
+                        BitmapShard *c_bms[MAX_INTERSECT_LEAVES];
+                        int c_ok = 1;
+                        for (int ci = 0; ci < n_crit; ci++) {
+                            char cp[1024];
+                            bm_build_path(cp, sizeof(cp), db_root, object,
+                                          igb_crit_fp.source_leaves[ci]->field, s);
+                            c_bms[ci] = bm_open(cp, 0, 0, 0, 0, 0);
+                            if (!c_bms[ci]) { c_ok = 0; break; }
+                        }
+                        if (!c_ok) {
+                            for (int ci = 0; ci < n_crit; ci++)
+                                if (c_bms[ci]) bm_close(c_bms[ci]);
+                            bm_close(gb_bm);
+                            continue;
+                        }
+
+                        for (int v = 0; v < bm_n; v++) {
+                            BmIntersectWalkCtx wc = {
+                                .cbm = c_bms,
+                                .cvals = cvals,
+                                .cvl = cvlens,
+                                .nc = n_crit,
+                                .count = &counts[v]
+                            };
+                            bm_walk(gb_bm, bm_vals[v], bm_vlens[v],
+                                    bm_intersect_walk_cb, &wc);
+                        }
+
+                        for (int ci = 0; ci < n_crit; ci++) bm_close(c_bms[ci]);
+                        bm_close(gb_bm);
+                    }
+
+                    if (!dl.timed_out) {
+                        for (int i = 0; i < bm_n; i++) {
+                            if (counts[i] == 0) continue;
+                            char display[512];
+                            if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
+                                                  display, sizeof(display)) <= 0)
+                                continue;
+                            char *kvp[1] = { display };
+                            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+                            if (!b) break;
+                            for (int j = 0; j < ctx.nspecs; j++) {
+                                if (ctx.specs[j].fn == AGG_COUNT)
+                                    b->accums[j].count = counts[i];
+                            }
+                        }
+                    }
+                    igb_done = 1;
+                    goto igb_skip;
+                }
+            }
+
+            /* Not slot-eligible → fall through to btree/scan path. */
+        }
         const TypedField *gtf = ctx.group_tfs[0];
         int n_idx_g = index_splits_for(sch.splits);
         HashBktMap hbk = {0};
