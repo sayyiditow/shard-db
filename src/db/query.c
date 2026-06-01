@@ -9181,6 +9181,11 @@ static int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
 /* Forward decl — definition lives near btree_dispatch below. */
 static const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field);
 
+/* Forward decl — decode_idx_to_buf lives near L20692; declared here so
+   the btree-leaf callbacks above can decode binary index keys. */
+static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
+                              char *out, size_t outlen, int skip_zero);
+
 /* Btree search callback — captures the first hash hit. _Atomic on `found`
    because btree_idx_search fans out across idx_shards in parallel and
    multiple shard workers can race to invoke this cb on the shared hit
@@ -9660,6 +9665,7 @@ typedef struct {
     int collect_cap;            /* caller-supplied early-stop limit (0 = none) */
     SearchCriterion *primary_crit;
     int check_primary;
+    const TypedField *tf;
     QueryDeadline *deadline;
     int dl_counter;
     int budget_exceeded;        /* updated via __atomic_store_n */
@@ -9702,9 +9708,18 @@ static int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, 
         if (!match_length_vlen(vlen, cc->primary_crit)) return 0;
     } else if (cc->check_primary && cc->primary_crit) {
         char tmp[1028];
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, cc->primary_crit)) return 0;
+        int matched;
+        if (cc->tf) {
+            int dlen = decode_idx_to_buf(cc->tf, (const uint8_t*)val, vlen,
+                                          tmp, sizeof(tmp), 0);
+            if (dlen <= 0) return 0;
+            matched = match_criterion(tmp, cc->primary_crit);
+        } else {
+            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+            memcpy(tmp, val, cl); tmp[cl] = '\0';
+            matched = match_criterion_vlen(tmp, cl, cc->primary_crit);
+        }
+        if (!matched) return 0;
     }
 
     /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
@@ -9735,6 +9750,7 @@ typedef struct {
     KeySet           *ks;
     SearchCriterion  *primary_crit;
     int               check_primary;
+    const TypedField *tf;
     QueryDeadline    *deadline;
     int               dl_counter;
     _Atomic int       full;          /* set when keyset_insert returns -1 */
@@ -9747,9 +9763,18 @@ static int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16,
         if (!match_length_vlen(vlen, sk->primary_crit)) return 0;
     } else if (sk->check_primary && sk->primary_crit) {
         char tmp[1028];
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, sk->primary_crit)) return 0;
+        int matched;
+        if (sk->tf) {
+            int dlen = decode_idx_to_buf(sk->tf, (const uint8_t*)val, vlen,
+                                          tmp, sizeof(tmp), 0);
+            if (dlen <= 0) return 0;
+            matched = match_criterion(tmp, sk->primary_crit);
+        } else {
+            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+            memcpy(tmp, val, cl); tmp[cl] = '\0';
+            matched = match_criterion_vlen(tmp, cl, sk->primary_crit);
+        }
+        if (!matched) return 0;
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
@@ -10198,6 +10223,7 @@ typedef struct {
     size_t count;
     QueryDeadline *deadline;
     int dl_counter;
+    const TypedField *tf;
 } IdxCountCtx;
 
 /* Single-criterion inline counter. No record fetch — btree visit = match.
@@ -10244,9 +10270,18 @@ static int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, voi
         if (!match_length_vlen(vlen, ic->primary_crit)) return 0;
     } else if (ic->check_primary && ic->primary_crit) {
         char tmp[1028];
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, ic->primary_crit)) return 0;
+        int matched;
+        if (ic->tf) {
+            int dlen = decode_idx_to_buf(ic->tf, (const uint8_t*)val, vlen,
+                                          tmp, sizeof(tmp), 0);
+            if (dlen <= 0) return 0;
+            matched = match_criterion(tmp, ic->primary_crit);
+        } else {
+            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+            memcpy(tmp, val, cl); tmp[cl] = '\0';
+            matched = match_criterion_vlen(tmp, cl, ic->primary_crit);
+        }
+        if (!matched) return 0;
     }
     idx_count_local.pending++;
     /* Cap residency so a freak query (millions of matches in one shard
@@ -10677,6 +10712,7 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     cc.primary_crit = primary_crit;
     cc.check_primary = check_primary;
     cc.deadline = dl;
+    cc.tf = resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field);
 
     (void)primary_idx_path; /* path now derived per-shard inside btree_idx_*; arg kept for API stability */
     btree_dispatch(db_root, object, primary_crit->field, sch->splits,
@@ -10742,6 +10778,7 @@ typedef struct {
     const Schema     *sch;
     SearchCriterion  *primary_crit;
     int               check_primary;
+    const TypedField *tf;
     CriteriaNode     *tree;
     FieldSchema      *fs;
     ExcludedKeys     *excluded;
@@ -10779,9 +10816,18 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         if (!match_length_vlen(vlen, sc->primary_crit)) return 0;
     } else if (sc->check_primary && sc->primary_crit) {
         char tmp[1028];
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, sc->primary_crit)) return 0;
+        int matched;
+        if (sc->tf) {
+            int dlen = decode_idx_to_buf(sc->tf, (const uint8_t*)val, vlen,
+                                          tmp, sizeof(tmp), 0);
+            if (dlen <= 0) return 0;
+            matched = match_criterion(tmp, sc->primary_crit);
+        } else {
+            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+            memcpy(tmp, val, cl); tmp[cl] = '\0';
+            matched = match_criterion_vlen(tmp, cl, sc->primary_crit);
+        }
+        if (!matched) return 0;
     }
 
     /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
@@ -10898,6 +10944,7 @@ static int idx_find_streaming(const char *db_root, const char *object,
     sc.limit = limit;
     sc.deadline = dl;
     sc.parent_out = g_out;
+    sc.tf = resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field);
     pthread_mutex_init(&sc.lock, NULL);
 
     btree_dispatch(db_root, object, primary_crit->field, sch->splits,
@@ -13160,7 +13207,7 @@ static int bm_emit_cb(uint32_t slot, void *ctx) {
    (~L15596) but the generic bitmap dict-scan path needs it. Static
    to match the actual definition. */
 static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
-                              char *out, size_t outlen);
+                              char *out, size_t outlen, int skip_zero);
 
 /* Per-shard match collector. Walks the dict via bm_iter_values; for
    each entry, decodes it to display form and applies match_criterion
@@ -13183,7 +13230,7 @@ static int bm_dict_match_cb(const uint8_t *value, size_t vlen, void *ctx) {
         matched = match_length_vlen(vlen, c);
     } else {
         char buf[512];
-        int dlen = decode_idx_to_buf(m->tf, value, vlen, buf, sizeof(buf));
+        int dlen = decode_idx_to_buf(m->tf, value, vlen, buf, sizeof(buf), 0);
         if (dlen <= 0) return 0;
         matched = match_criterion(buf, c);
     }
@@ -15206,7 +15253,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 SearchCriterion pos = exists_leaf->leaf;
                 pos.op = OP_EXISTS;
                 const TypedField *pc_tf = &fs.ts->fields[fi];
-                IdxCountCtx ic = { &pos, 0, 0, &dl, 0 };
+                IdxCountCtx ic = { &pos, 0, 0, &dl, 0, pc_tf };
                 btree_dispatch(db_root, object, pos.field, sch.splits,
                                &pos, pc_tf, idx_count_cb, &ic);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -15333,7 +15380,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                    fields via its internal routing if the picker fell
                    back to btree for a non-trigram-prefer op. */
                 int pos_cp = op_needs_check_primary(pos.op);
-                IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
+                IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0, pc_tf };
                 btree_dispatch(db_root, object, pc->field, sch.splits,
                                &pos, pc_tf, idx_count_cb, &ic);
                 pos_count = ic.count;
@@ -15394,7 +15441,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", total);
             } else {
-                IdxCountCtx ic = { pc, check_primary, 0, &dl, 0 };
+                IdxCountCtx ic = { pc, check_primary, 0, &dl, 0, pc_tf };
                 btree_dispatch(db_root, object, pc->field, sch.splits,
                                pc, pc_tf, idx_count_cb, &ic);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -15440,6 +15487,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             cc.primary_crit = pc;
             cc.check_primary = check_primary;
             cc.deadline = &dl;
+            cc.tf = pc_tf;
             btree_dispatch(db_root, object, pc->field, sch.splits,
                            pc, pc_tf, collect_hash_cb, &cc);
 
@@ -15587,7 +15635,7 @@ static size_t idx_count_for_leaf(const char *db_root, const char *object,
 
     /* IT_BTREE (default) */
     int check_primary = op_needs_check_primary(leaf->op);
-    IdxCountCtx ic = { leaf, check_primary, 0, dl, 0 };
+    IdxCountCtx ic = { leaf, check_primary, 0, dl, 0, tf };
     btree_dispatch(db_root, object, leaf->field, sch->splits,
                    leaf, tf, idx_count_cb, &ic);
     idx_count_cb_flush_thread();
@@ -20690,7 +20738,7 @@ static int decode_index_key_to_double(const TypedField *f,
    "missing" semantics). Varchar is handled via direct byte copy — the
    index stores raw varchar content, so encoded bytes ARE the original. */
 static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
-                             char *buf, size_t bufsz) {
+                              char *buf, size_t bufsz, int skip_zero) {
     if (!f || !p) return 0;
     switch (f->type) {
     case FT_LONG: {
@@ -20700,7 +20748,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
-        if (v == 0) return 0;
+        if (skip_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%lld", (long long)v);
     }
     case FT_INT: {
@@ -20708,14 +20756,14 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t v = (int32_t)(u ^ 0x80000000u);
-        if (v == 0) return 0;
+        if (skip_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%d", v);
     }
     case FT_SHORT: {
         if (plen < 2) return 0;
         uint16_t u = ((uint16_t)p[0] << 8) | (uint16_t)p[1];
         int16_t v = (int16_t)(u ^ 0x8000u);
-        if (v == 0) return 0;
+        if (skip_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%d", v);
     }
     case FT_DOUBLE: {
@@ -20727,7 +20775,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (bits & (1ULL << 63)) bits ^= (1ULL << 63);
         else bits = ~bits;
         double v; memcpy(&v, &bits, 8);
-        if (v == 0.0) return 0;
+        if (skip_zero && v == 0.0) return 0;
         return snprintf(buf, bufsz, "%g", v);
     }
     case FT_FLOAT: {
@@ -20737,7 +20785,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (bits & 0x80000000u) bits ^= 0x80000000u;
         else bits = ~bits;
         float v; memcpy(&v, &bits, 4);
-        if (v == 0.0f) return 0;
+        if (skip_zero && v == 0.0f) return 0;
         return snprintf(buf, bufsz, "%g", (double)v);
     }
     case FT_BOOL:
@@ -20751,7 +20799,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t v = (int32_t)(u ^ 0x80000000u);
-        if (v == 0) return 0;
+        if (skip_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%08d", v);
     }
     case FT_DATETIME: {
@@ -20760,7 +20808,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
         uint16_t t = ((uint16_t)p[4] << 8) | (uint16_t)p[5];
-        if (d == 0 && t == 0) return 0;
+        if (skip_zero && d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
     }
@@ -20769,7 +20817,7 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (plen < 3) return 0;
         uint32_t u = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
         uint32_t secs = u ^ 0x800000u;
-        if (secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
+        if (skip_zero && secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
         return snprintf(buf, bufsz, "%02d:%02d:%02d", hh, mm, ss);
     }
@@ -21971,42 +22019,6 @@ static int agg_minmax_same_field_btree(
     return 1;
 }
 
-/* Indexed aggregate callback — fetches record inline + accumulates. No hash storage. */
-typedef struct {
-    AggCtx *agg;
-    const Schema *sch;
-    const char *db_root;
-    const char *object;
-    SearchCriterion *primary_crit;   /* pointer into tree (for check_primary pre-filter) */
-    int check_primary;
-} IdxAggCtx;
-
-static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw) __attribute__((unused));
-static int idx_agg_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw) {
-    IdxAggCtx *ia = (IdxAggCtx *)raw;
-    if (ia->check_primary && ia->primary_crit) {
-        char tmp[1028];
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        if (!match_criterion_vlen(tmp, cl, ia->primary_crit)) return 0;
-    }
-    /* Layout-agnostic fetch + invoke agg_scan_cb on the synthesized header. */
-    RecordRef rr;
-    if (read_record_ref(ia->db_root, ia->object, ia->sch, hash16, &rr) != 0)
-        return 0;
-    SlotHeader hdr;
-    memcpy(hdr.hash, hash16, 16);
-    hdr.flag      = 1;
-    hdr.key_len   = (uint16_t)rr.klen;
-    hdr.value_len = (uint32_t)rr.vlen;
-    /* block layout: key bytes followed by value bytes — matches v1 Zone B
-       and is exactly how RecordRef lays them out (whether v1's mmap or v2's
-       malloc'd copy). */
-    agg_scan_cb(&hdr, rr.key, ia->agg);
-    release_record_ref(&rr);
-    return 0;
-}
-
 /* Run the plan dispatcher into `ctx` for the given criteria tree.
    ctx must be already initialized (specs, group setup, deadline,
    shared_buffer_bytes). Mutates ctx.tree. Returns 0 on success,
@@ -22065,6 +22077,7 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             cc.primary_crit = pc;
             cc.check_primary = check_primary;
             cc.deadline = ctx->deadline;
+            cc.tf = resolve_idx_field(ctx->fs->ts, pc->field);
             btree_dispatch(db_root, object, pc->field, sch->splits,
                            pc,
                            resolve_idx_field(ctx->fs->ts, pc->field),
@@ -22179,12 +22192,12 @@ static void *igb_pass1_worker(void *arg) {
                 raw_key_len = (int)vlen;
                 /* For output, still need string */
                 int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
-                                           vlen, gbufs[0], sizeof(gbufs[0]));
+                                           vlen, gbufs[0], sizeof(gbufs[0]), 0);
                 if (n <= 0) continue;
                 gvals[0] = gbufs[0];
             } else {
                 int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
-                                           vlen, gbufs[0], sizeof(gbufs[0]));
+                                           vlen, gbufs[0], sizeof(gbufs[0]), 0);
                 if (n <= 0) continue;
                 gvals[0] = gbufs[0];
             }
@@ -23205,6 +23218,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                     .ks = ks, .primary_crit = crit,
                     .check_primary = op_needs_check_primary(crit->op),
                     .deadline = &dl, .dl_counter = 0, .full = 0,
+                    .tf = crit_tf,
                 };
                 btree_dispatch(db_root, object, crit->field, sch.splits,
                                crit, crit_tf, stream_keyset_cb, &sk);
@@ -23325,7 +23339,7 @@ int cmd_aggregate(const char *db_root, const char *object,
             pos.op = OP_EQUAL;
             int pos_cp = op_needs_check_primary(pos.op);
             const TypedField *pos_tf = resolve_idx_field(fs.ts, pos.field);
-            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0 };
+            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0, pos_tf };
             btree_dispatch(db_root, object, pos.field, sch.splits,
                            &pos, pos_tf, idx_count_cb, &ic);
             if (dl.timed_out) {
@@ -24100,7 +24114,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     if (total == 0) continue;
                     char display[512];
                     if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
-                                          display, sizeof(display)) <= 0)
+                                          display, sizeof(display), 0) <= 0)
                         continue;
                     char *kvp[1] = { display };
                     AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
@@ -24190,7 +24204,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                             if (counts[i] == 0) continue;
                             char display[512];
                             if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
-                                                  display, sizeof(display)) <= 0)
+                                                  display, sizeof(display), 0) <= 0)
                                 continue;
                             char *kvp[1] = { display };
                             AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
@@ -24349,7 +24363,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         char dbuf[512];
                         int dlen = decode_idx_to_buf(gtf_s,
                                                      (const uint8_t *)val,
-                                                     vlen, dbuf, sizeof(dbuf));
+                                                     vlen, dbuf, sizeof(dbuf), 0);
                         if (dlen <= 0) continue;
                         if (hsm_insert(&sec_maps[g], hash16, dbuf,
                                        (size_t)dlen) != 0) {
@@ -24661,12 +24675,12 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                             memcpy(raw_key, val, vlen);
                             raw_key_len = (int)vlen;
                             int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                                      vlen, gbufs[0], sizeof(gbufs[0]));
+                                                      vlen, gbufs[0], sizeof(gbufs[0]), 0);
                             if (n <= 0) continue;
                             gvals[0] = gbufs[0];
                         } else {
                             int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                                      vlen, gbufs[0], sizeof(gbufs[0]));
+                                                      vlen, gbufs[0], sizeof(gbufs[0]), 0);
                             if (n <= 0) continue;
                             gvals[0] = gbufs[0];
                         }
