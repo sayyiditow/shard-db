@@ -7633,6 +7633,7 @@ void free_excluded(ExcludedKeys *ex) {
 
 typedef struct {
     CriteriaNode *tree;
+    const CompiledCriterion *fast_cc;  /* pre-resolved single-leaf criterion (NULL = use tree) */
     int offset;
     int limit;
     /* `count` and `printed` are read lock-free in the per-record callback
@@ -9513,7 +9514,9 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     const char *raw = (const char *)block + hdr->key_len;
 
     /* Criteria match + join resolution are thread-local reads, lock-free. */
-    int match = criteria_match_tree((const uint8_t *)raw, sc->tree, sc->fs);
+    int match = sc->fast_cc
+        ? match_typed((const uint8_t *)raw, sc->fast_cc, sc->fs)
+        : criteria_match_tree((const uint8_t *)raw, sc->tree, sc->fs);
 
     if (match) {
         RecordRef     *join_refs = NULL;
@@ -17629,7 +17632,18 @@ int cmd_find(const char *db_root, const char *object,
     } else {
     find_full_scan: ;  /* empty stmt: pre-C23 disallows label→declaration directly */
         /* ===== FULL SCAN FALLBACK ===== */
-        AdvSearchCtx ctx = { tree, offset, limit, 0, 0,
+        /* Hoist single-leaf compiled criterion for inline matching
+           (mirrors the COUNT FP_FULL_SCAN path). */
+        const CompiledCriterion *fast_cc = NULL;
+        if (tree) {
+            const CriteriaNode *leaf = NULL;
+            if (tree->kind == CNODE_LEAF) leaf = tree;
+            else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                     tree->children[0]->kind == CNODE_LEAF) leaf = tree->children[0];
+            if (leaf && leaf->compiled) fast_cc = leaf->compiled;
+        }
+
+        AdvSearchCtx ctx = { tree, fast_cc, offset, limit, 0, 0,
                              proj_fields, proj_count, excluded, &driver_fs,
                              rows_fmt, dict_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0,
