@@ -1925,66 +1925,105 @@ static int cmp_int(const void *a, const void *b) {
     return (ia > ib) - (ia < ib);
 }
 
+/* Per-stream recovery worker arg. Used by recover_streams to fan out
+   independent per-stream I/O via parallel_for_io. */
+typedef struct {
+    SlotcaskDb *db;
+    int         sid;
+    int         rc;  /* 0 = success, -1 = error */
+} RecoverStreamArg;
+
+/* Walk every segment for a single stream, populate the in-memory free-slot
+   pool from flag=2 slots, and position reserve_off past the last live slot
+   in the highest-numbered segment. Returns 0 on success, -1 on error. */
+static int recover_one_stream(SlotcaskDb *db, int sid) {
+    char dir[PATH_MAX];
+    stream_dir_for(dir, db->data_dir, sid);
+    DIR *d = opendir(dir);
+    if (!d) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+    int *ids = NULL; size_t n_ids = 0, cap_ids = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        int id = data_file_id_from_name(de->d_name);
+        if (id < 0) continue;
+        if (n_ids == cap_ids) {
+            cap_ids = cap_ids ? cap_ids * 2 : 64;
+            ids = realloc(ids, cap_ids * sizeof(int));
+            if (!ids) { closedir(d); return -1; }
+        }
+        ids[n_ids++] = id;
+    }
+    closedir(d);
+    if (n_ids == 0) { free(ids); return 0; }
+    qsort(ids, n_ids, sizeof(int), cmp_int);
+
+    int last_id = ids[n_ids - 1];
+    off_t last_offset = 0;
+
+    for (size_t fi = 0; fi < n_ids; fi++) {
+        int file_id = ids[fi];
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0) != 0) { free(ids); return -1; }
+        off_t pos = 0;
+        off_t lim = (off_t)h.map_size;
+        while (pos + db->slot_size <= lim) {
+            uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
+            if (flag == 2) {
+                pool_push_free(&db->streams[sid], (uint16_t)file_id,
+                               (uint32_t)pos);
+            } else if (flag == 0) {
+                /* First empty slot in highest-numbered segment marks the
+                   reserve frontier. Earlier segments may have empty tails
+                   too (preallocated 128 MB), but only the latest one
+                   matters for reserve_off. */
+                if (file_id == last_id) break;
+            }
+            pos += db->slot_size;
+        }
+        if (file_id == last_id) last_offset = pos;
+        segcache_release(&h);
+    }
+    db->streams[sid].active_file_id = (uint32_t)last_id;
+    db->streams[sid].reserve_off = (uint64_t)last_offset;
+    free(ids);
+    return 0;
+}
+
+static void *recover_stream_worker(void *raw) {
+    RecoverStreamArg *a = (RecoverStreamArg *)raw;
+    a->rc = recover_one_stream(a->db, a->sid);
+    return NULL;
+}
+
 /* Walk every segment for every stream, populate the in-memory free-slot pool
    from flag=2 slots, and position each stream's reserve_off past the last
-   live slot in the highest-numbered segment. */
+   live slot in the highest-numbered segment.
+   Streams are independent — dispatched in parallel via parallel_for_io. */
 static int recover_streams(SlotcaskDb *db) {
-    for (int sid = 0; sid < db->num_streams; sid++) {
-        char dir[PATH_MAX];
-        stream_dir_for(dir, db->data_dir, sid);
-        DIR *d = opendir(dir);
-        if (!d) {
-            if (errno == ENOENT) continue;
-            return -1;
+    if (db->num_streams <= 1) {
+        if (db->num_streams == 1) {
+            return recover_one_stream(db, 0);
         }
-        int *ids = NULL; size_t n_ids = 0, cap_ids = 0;
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            int id = data_file_id_from_name(de->d_name);
-            if (id < 0) continue;
-            if (n_ids == cap_ids) {
-                cap_ids = cap_ids ? cap_ids * 2 : 64;
-                ids = realloc(ids, cap_ids * sizeof(int));
-                if (!ids) { closedir(d); return -1; }
-            }
-            ids[n_ids++] = id;
-        }
-        closedir(d);
-        if (n_ids == 0) { free(ids); continue; }
-        qsort(ids, n_ids, sizeof(int), cmp_int);
-
-        int last_id = ids[n_ids - 1];
-        off_t last_offset = 0;
-
-        for (size_t fi = 0; fi < n_ids; fi++) {
-            int file_id = ids[fi];
-            char path[PATH_MAX];
-            seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
-            SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 0, 0) != 0) { free(ids); return -1; }
-            off_t pos = 0;
-            off_t lim = (off_t)h.map_size;
-            while (pos + db->slot_size <= lim) {
-                uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
-                if (flag == 2) {
-                    pool_push_free(&db->streams[sid], (uint16_t)file_id,
-                                   (uint32_t)pos);
-                } else if (flag == 0) {
-                    /* First empty slot in highest-numbered segment marks the
-                       reserve frontier. Earlier segments may have empty tails
-                       too (preallocated 128 MB), but only the latest one
-                       matters for reserve_off. */
-                    if (file_id == last_id) break;
-                }
-                pos += db->slot_size;
-            }
-            if (file_id == last_id) last_offset = pos;
-            segcache_release(&h);
-        }
-        db->streams[sid].active_file_id = (uint32_t)last_id;
-        db->streams[sid].reserve_off = (uint64_t)last_offset;
-        free(ids);
+        return 0;
     }
+
+    RecoverStreamArg *args = calloc((size_t)db->num_streams, sizeof(RecoverStreamArg));
+    if (!args) return -1;
+    for (int i = 0; i < db->num_streams; i++) {
+        args[i].db = db;
+        args[i].sid = i;
+        args[i].rc = 0;
+    }
+    parallel_for_io(recover_stream_worker, args, db->num_streams, sizeof(RecoverStreamArg));
+    for (int i = 0; i < db->num_streams; i++) {
+        if (args[i].rc != 0) { free(args); return -1; }
+    }
+    free(args);
     return 0;
 }
 
