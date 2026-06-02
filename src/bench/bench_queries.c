@@ -900,6 +900,10 @@ static int bench_queries_run(void) {
        "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
        "{\"field\":\"category\",\"op\":\"eq\",\"value\":\"electronics\"},"
        "{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}]}");
+    BR("2 bitmap IN (active+category IN 2 val)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
+       "{\"field\":\"category\",\"op\":\"in\",\"value\":\"electronics,clothing\"}]}");
     bench_table_section_end();
 
     /* ---------- FIND — broad filter + selective seed + order_by ---------- */

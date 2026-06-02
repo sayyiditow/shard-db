@@ -153,6 +153,14 @@ int  bm_iter_values(const BitmapShard *bm,
    for selectivity-aware AND ordering. O(stride / 8). */
 uint32_t bm_count(const BitmapShard *bm, const uint8_t *value, size_t vlen);
 
+/* Return pointer to the bit-array for `value` in `bm`, or NULL if not
+ * found.  Sets *out_stride to the bitmap stride (bytes per value).  The
+ * returned pointer is valid while the bitmap remains open.
+ * Used by word-level AND intersect popcount — avoids exposing dict-lookup
+ * internals to callers outside bitmap.c. */
+const uint8_t *bm_get_value_bitmap(BitmapShard *bm, const uint8_t *value,
+                                    size_t vlen, uint32_t *out_stride);
+
 /* Grow the bitmap shard's stride to match a new `slots` value (called
    when the data shard doubles its slots_per_shard). Extends every
    bitmap with zero bytes. Returns 0 on success. */

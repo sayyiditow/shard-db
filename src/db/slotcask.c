@@ -99,7 +99,7 @@ static int shard_for_hash(const uint8_t hash[16], int num_shards) {
     return compute_record_shard(hash, num_shards);
 }
 
-static size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
+size_t kf_slot_for(const uint8_t hash[16], size_t cap) {
     uint64_t v;
     memcpy(&v, hash, 8);
     return (size_t)(v % cap);
@@ -128,7 +128,7 @@ static int mkdirp_local(const char *path) {
    The `data/` umbrella keeps engine internals out of the obj root, so
    fields.conf, indexes/, files/, etc. aren't visually mixed with kf/seg
    files. */
-static void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
+void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id) {
     snprintf(out, PATH_MAX, "%s/data/kf/%03d.kf", data_dir, shard_id);
 }
 
@@ -4773,6 +4773,34 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
     }
     kfcache_release(&kh);
     return 0;
+}
+
+int kf_find_slot_for_hash(const SlotcaskDb *db,
+                           const uint8_t hash16[16],
+                           uint32_t *out_slot) {
+    if (!db || !out_slot) return -1;
+    int sid_kf = shard_for_hash(hash16, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+    size_t cap = kh.capacity;
+    SlotcaskKfEntry *kf = kh.map;
+    size_t start = kf_slot_for(hash16, cap);
+    int found = -1;
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+        SlotcaskKfEntry *e = &kf[slot];
+        uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+        if (flag == 0) break;
+        if (flag != 1) continue;
+        if (memcmp(e->hash, hash16, 16) != 0) continue;
+        *out_slot = (uint32_t)slot;
+        found = 0;
+        break;
+    }
+    kfcache_release(&kh);
+    return found;
 }
 
 /* ============================================================ Compaction

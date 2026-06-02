@@ -8,6 +8,8 @@
 #include <math.h>
 #include <dirent.h>
 
+#define MAX_INTERSECT_LEAVES 8
+
 /* ========== Probing helpers ========== */
 
 /* Check if slot at given offset matches our key. Returns:
@@ -10508,31 +10510,216 @@ typedef struct {
     QueryDeadline *deadline;
     int dl_counter;
     size_t count;           /* result: matches in this shard */
+
+    /* Bitmap post-filter shortcut (populated by parallel_indexed_count) */
+    int n_bm_postfilter;                              // number of bitmap eq/in post-filter leaves
+    int all_postfilters_are_bm;                       // 1 = Case A1 (index-only), 0 = Case A2 or none
+    SearchCriterion *bm_criteria[MAX_INTERSECT_LEAVES]; // bitmap post-filter SearchCriterion*
+    uint8_t          bm_val[MAX_INTERSECT_LEAVES][1024]; // pre-encoded value for OP_EQUAL
+    size_t           bm_vlen[MAX_INTERSECT_LEAVES];
+    int              bm_in_count[MAX_INTERSECT_LEAVES];  // >1 for OP_IN
+    uint8_t          bm_in_vals[MAX_INTERSECT_LEAVES][8][1024]; // OP_IN values (cap at 8)
+    size_t           bm_in_vlens[MAX_INTERSECT_LEAVES][8];
+    /* Pre-opened bitmap handles for this worker's shard (one per bitmap leaf) */
+    void            *bm_handles[MAX_INTERSECT_LEAVES]; // BitmapShard* per leaf
 } ShardCountCtx;
 
 static void *shard_count_worker(void *arg) {
     ShardCountCtx *sc = (ShardCountCtx *)arg;
     if (sc->entry_count == 0) return NULL;
 
-    /* Layout-agnostic per-hash fetch via read_record_ref. */
+    /* Pre-open bitmap shards and KF handle for this worker's shard group.
+     * All entries in this group share the same hash[0..1] → same data shard. */
+    int shard_id = -1;
+    SlotcaskDb *sdb = NULL;
+    SlotcaskKfHandle kh;
+    memset(&kh, 0, sizeof(kh));
+    if (sc->n_bm_postfilter > 0 && sc->entry_count > 0) {
+        shard_id = compute_record_shard(sc->entries[0].hash, sc->sch->splits);
+        SlotcaskSchemaInfo info = {
+            .splits = sc->sch->splits,
+            .slot_size = sc->sch->slot_size,
+            .streams = sc->sch->streams,
+        };
+        sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
+        /* Pre-open KF handle — acquire once, probe inline in the hot
+         * loop without per-hash kfcache_acquire/release overhead. */
+        if (sdb) {
+            char kf_p[PATH_MAX];
+            kf_path_for(kf_p, sdb->data_dir, shard_id);
+            if (kfcache_acquire(&kh, kf_p, sdb->slots_per_shard, 0) != 0)
+                sdb = NULL;  // disable KF probe if acquire fails
+        }
+        for (int b = 0; b < sc->n_bm_postfilter; b++) {
+            char bp[PATH_MAX];
+            bm_build_path(bp, sizeof(bp), sc->db_root, sc->object,
+                          sc->bm_criteria[b]->field, shard_id);
+            sc->bm_handles[b] = bm_open(bp, 0, 0, 0, 0, 0);
+        }
+    }
+
     size_t local = 0;
     for (int ei = 0; ei < sc->entry_count; ei++) {
         if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
+
+        /* --- Bitmap post-filter shortcut --- */
+        int bm_indeterminate = 0;  // bitmap couldn't answer → must fetch record
+        if (sc->n_bm_postfilter > 0) {
+            /* Inline KF probe — kh is already acquired (rdlock held).
+             * Same logic as kf_find_slot_for_hash / slotcask_lookup_by_hash. */
+            uint32_t kf_slot = 0;
+            int kf_found = 0;
+            {
+                size_t cap = kh.capacity;
+                SlotcaskKfEntry *kf = kh.map;
+                size_t start = kf_slot_for(sc->entries[ei].hash, cap);
+                for (size_t pi = 0; pi < cap; pi++) {
+                    size_t slot = (start + pi) % cap;
+                    SlotcaskKfEntry *e = &kf[slot];
+                    uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+                    if (flag == 0) break;
+                    if (flag != 1) continue;
+                    if (memcmp(e->hash, sc->entries[ei].hash, 16) != 0) continue;
+                    kf_slot = (uint32_t)slot;
+                    kf_found = 1;
+                    break;
+                }
+            }
+            if (!kf_found) continue;
+
+            /* Step 2: test all bitmap post-filters */
+            int bm_pass = 1;
+            for (int b = 0; b < sc->n_bm_postfilter; b++) {
+                BitmapShard *bm = (BitmapShard *)sc->bm_handles[b];
+                if (!bm || kf_slot >= bm_slots(bm)) {
+                    bm_indeterminate = 1;  // can't determine from bitmap
+                    break;
+                }
+                /* Test all IN values (or single EQ value) */
+                int any_match = 0;
+                int nv = (sc->bm_in_count[b] > 0) ? sc->bm_in_count[b] : 1;
+                for (int v = 0; v < nv; v++) {
+                    const uint8_t *val = (sc->bm_in_count[b] > 0)
+                        ? sc->bm_in_vals[b][v] : sc->bm_val[b];
+                    size_t vlen = (sc->bm_in_count[b] > 0)
+                        ? sc->bm_in_vlens[b][v] : sc->bm_vlen[b];
+                    if (bm_test(bm, val, vlen, kf_slot)) { any_match = 1; break; }
+                }
+                if (!any_match) { bm_pass = 0; break; }
+            }
+            if (bm_indeterminate) {
+                /* Fall through to record fetch — bitmap can't answer */
+            } else if (!bm_pass) {
+                continue;  // bitmap rejection: skip hash, NO record fetch
+            } else if (sc->all_postfilters_are_bm) {
+                /* Case A1: all post-filters are bitmaps → index-only count */
+                local++;
+                continue;  // NO record fetch
+            }
+            /* Case A2: bitmaps passed, but non-bitmap post-filters need record */
+        }
+
+        /* --- Record fetch + full tree (existing path) --- */
         RecordRef rr;
         if (read_record_ref(sc->db_root, sc->object, sc->sch,
                              sc->entries[ei].hash, &rr) != 0) continue;
         if (criteria_match_tree(rr.val, sc->tree, sc->fs)) local++;
         release_record_ref(&rr);
     }
+
+    /* Cleanup: close pre-opened handles */
+    if (kh.map) kfcache_release(&kh);
+    for (int b = 0; b < sc->n_bm_postfilter; b++) {
+        if (sc->bm_handles[b]) bm_close((BitmapShard *)sc->bm_handles[b]);
+    }
+
     sc->count = local;
     return NULL;
+}
+
+/* Filter plan types — moved here so classify_bm_postfilters can reference
+ * FilterPlan before the full planning code below. */
+typedef enum {
+    FP_FULL_SCAN,        /* nothing indexed; cache-isolated scan + match_tree   (A5,B7,C2) */
+    FP_PRIMARY_LEAF,     /* one selective indexed leaf seeds; rest post-filtered (A1,A3,A4,B2,B4,C3,B5-fetch) */
+    FP_BITMAP_SMALLER,   /* lone/all-broad bitmap; smaller-of {match,complement} (A2,B3)   */
+    FP_INTERSECT,        /* 2+ indexed leaves intersected index-only             (B1/B6 count, B3) */
+    FP_UNION             /* pure OR, every child indexed; union keysets          (C1)   */
+} FilterPlanKind;
+
+typedef enum {
+    FP_ORDER_NONE,       /* no order_by */
+    FP_ORDER_COMPOSITE,  /* (filter+order) composite → sorted prefix scan       (D1) */
+    FP_ORDER_SORT,       /* bounded candidate set → sort in memory              (D2) */
+    FP_ORDER_INDEX_WALK  /* candidates too broad → walk order_by index to limit (D3) */
+} FilterOrderKind;
+
+typedef struct FilterPlan {
+    FilterPlanKind   kind;
+    FilterOrderKind  order;                              /* overlay; NONE when no order_by */
+    SearchCriterion *source_leaves[MAX_INTERSECT_LEAVES];/* seed: LEAF→[0]; INTERSECT→[0..n_source) */
+    int              n_source;
+    int              source_is_bitmap;                   /* primary seed is a bitmap (BITMAP_SMALLER, or bitmap primary) */
+    CriteriaNode    *or_node;                            /* FP_UNION */
+    SearchCriterion *postfilter_leaves[MAX_INTERSECT_LEAVES]; /* leaves not covered by source */
+    int              n_postfilter;
+    int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
+    int              fetching;                           /* dimension this plan was computed for */
+} FilterPlan;
+
+/* Classify post-filter leaves: which are bitmap eq/in that can be tested
+ * without record fetch. Populates the bitmap fields in ShardCountCtx. */
+static void classify_bm_postfilters(ShardCountCtx *ctx,
+                                     const FilterPlan *fp,
+                                     const char *db_root,
+                                     const char *object,
+                                     FieldSchema *fs) {
+    ctx->n_bm_postfilter = 0;
+    ctx->all_postfilters_are_bm = 0;
+    if (!fp || fp->n_postfilter == 0) return;
+
+    int n_bm = 0;
+    for (int i = 0; i < fp->n_postfilter; i++) {
+        SearchCriterion *c = fp->postfilter_leaves[i];
+        if (pick_index_for_leaf(db_root, object, c) != IT_BITMAP) continue;
+        if (c->op != OP_EQUAL && c->op != OP_IN) continue;
+        if (n_bm >= MAX_INTERSECT_LEAVES) break;
+
+        ctx->bm_criteria[n_bm] = c;
+        const TypedField *tf = resolve_idx_field(fs->ts, c->field);
+        if (c->op == OP_EQUAL) {
+            encode_criterion_value(tf, c->value, strlen(c->value),
+                                    ctx->bm_val[n_bm], &ctx->bm_vlen[n_bm]);
+            ctx->bm_in_count[n_bm] = 0;
+            n_bm++;
+        } else if (c->in_count <= 8) {
+            /* OP_IN: encode each value */
+            int nc = c->in_count;
+            ctx->bm_in_count[n_bm] = nc;
+            for (int v = 0; v < nc; v++) {
+                encode_criterion_value(tf, c->in_values[v], strlen(c->in_values[v]),
+                                        ctx->bm_in_vals[n_bm][v],
+                                        &ctx->bm_in_vlens[n_bm][v]);
+            }
+            n_bm++;
+            continue;
+        } else {
+            /* OP_IN with >8 values: skip bitmap classification.
+             * The leaf stays as a non-bitmap post-filter; other bitmap
+             * leaves still benefit from early rejection (Case A2). */
+            continue;
+        }
+    }
+    ctx->n_bm_postfilter = n_bm;
+    ctx->all_postfilters_are_bm = (n_bm > 0 && n_bm == fp->n_postfilter);
 }
 
 /* Orchestrate parallel indexed count: qsort by shard, fan out per-shard workers. */
 static size_t parallel_indexed_count(const char *db_root, const char *object,
                                      const Schema *sch, CollectedHash *batch,
                                      int batch_count, CriteriaNode *tree,
-                                     FieldSchema *fs, QueryDeadline *dl) {
+                                     FieldSchema *fs, QueryDeadline *dl,
+                                     const FilterPlan *fp) {
     int group_starts[1024], group_sizes[1024];
     int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
@@ -10546,6 +10733,7 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
         workers[g].tree = tree;
         workers[g].fs = fs;
         workers[g].deadline = dl;
+        classify_bm_postfilters(&workers[g], fp, db_root, object, fs);
     }
 
     if (batch_count < 1024 || nshard_groups <= 2) {
@@ -12092,8 +12280,6 @@ static CriteriaNode *find_fully_indexed_or(CriteriaNode *root,
     return NULL;
 }
 
-#define MAX_INTERSECT_LEAVES 8
-
 /* True if the operator yields a precise btree candidate set without needing
    per-record verification. Excludes substring/suffix ops (LIKE/CONTAINS/...
    need check_primary) and large-set ops (NEQ/NOT_IN/NOT_LIKE/NOT_CONTAINS —
@@ -12545,40 +12731,6 @@ static int leaf_is_selective(CardEst e, size_t N) {
     if (!e.estimable || e.saturated) return 0;
     return e.k <= selectivity_budget(N);
 }
-
-/* Estimate every indexed leaf once and pick the most-selective as the seed.
- * Ranking: estimable leaves ordered by ascending K; among equal/unestimable,
- * fall back to op_selectivity_rank; bitmaps deprioritized (rank pushes them
- * last) so a bitmap is the seed only when nothing else is indexed — per the
- * spec's "bitmap last; never the seed" rule. Returns the index into `leaves`
- * of the chosen primary, or -1 if none indexed. Fills est[] in parallel. */
-typedef enum {
-    FP_FULL_SCAN,        /* nothing indexed; cache-isolated scan + match_tree   (A5,B7,C2) */
-    FP_PRIMARY_LEAF,     /* one selective indexed leaf seeds; rest post-filtered (A1,A3,A4,B2,B4,C3,B5-fetch) */
-    FP_BITMAP_SMALLER,   /* lone/all-broad bitmap; smaller-of {match,complement} (A2,B3)   */
-    FP_INTERSECT,        /* 2+ indexed leaves intersected index-only             (B1/B6 count, B3) */
-    FP_UNION             /* pure OR, every child indexed; union keysets          (C1)   */
-} FilterPlanKind;
-
-typedef enum {
-    FP_ORDER_NONE,       /* no order_by */
-    FP_ORDER_COMPOSITE,  /* (filter+order) composite → sorted prefix scan       (D1) */
-    FP_ORDER_SORT,       /* bounded candidate set → sort in memory              (D2) */
-    FP_ORDER_INDEX_WALK  /* candidates too broad → walk order_by index to limit (D3) */
-} FilterOrderKind;
-
-typedef struct {
-    FilterPlanKind   kind;
-    FilterOrderKind  order;                              /* overlay; NONE when no order_by */
-    SearchCriterion *source_leaves[MAX_INTERSECT_LEAVES];/* seed: LEAF→[0]; INTERSECT→[0..n_source) */
-    int              n_source;
-    int              source_is_bitmap;                   /* primary seed is a bitmap (BITMAP_SMALLER, or bitmap primary) */
-    CriteriaNode    *or_node;                            /* FP_UNION */
-    SearchCriterion *postfilter_leaves[MAX_INTERSECT_LEAVES]; /* leaves not covered by source */
-    int              n_postfilter;
-    int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
-    int              fetching;                           /* dimension this plan was computed for */
-} FilterPlan;
 
 /* Pick the most-selective indexed leaf among `leaves` to seed the plan, and
  * fill est[i] for each. Returns the chosen index, or -1 if none is indexed.
@@ -13397,6 +13549,151 @@ static size_t bm_popcount_generic_for_crit(const char *db_root, const char *obje
     for (int s = 0; s < splits; s++) total += args[s].count;
     free(args);
     return total;
+}
+
+/* ========== Bitmap word-level intersect (all-bitmap AND COUNT) ==========
+ * For COUNT with 2+ bitmap EQ leaves: AND bit-arrays word-by-word,
+ * sum popcounts.  No KeySets, no hashes, O(splits × stride) constant
+ * memory.  Byte-level popcount for unaligned-safety on all architectures. */
+
+typedef struct {
+    const char       *db_root;
+    const char       *object;
+    int               shard_idx;
+    SearchCriterion  **leaves;
+    int               n_leaves;
+    const TypedSchema *ts;
+    size_t            count;      /* output */
+    QueryDeadline    *deadline;
+} BmIntersectShardArg;
+
+static void *bm_intersect_shard_worker(void *raw) {
+    BmIntersectShardArg *a = (BmIntersectShardArg *)raw;
+    a->count = 0;
+    if (a->n_leaves < 2 || a->n_leaves > MAX_INTERSECT_LEAVES) return NULL;
+
+    /* Pre-encode all leaf values */
+    uint8_t  vals[MAX_INTERSECT_LEAVES][1024];
+    size_t   vlens[MAX_INTERSECT_LEAVES];
+    for (int i = 0; i < a->n_leaves; i++) {
+        const TypedField *tf = resolve_idx_field(a->ts, a->leaves[i]->field);
+        if (!tf) return NULL;
+        encode_criterion_value(tf, a->leaves[i]->value,
+                                strlen(a->leaves[i]->value),
+                                vals[i], &vlens[i]);
+    }
+
+    /* Open all bitmaps for this shard.
+     * OP_EQUAL: single-value lookup.  OP_IN: OR together all matching
+     * value bit-arrays into a stack buffer.  Other ops: goto cleanup. */
+    BitmapShard *bm[MAX_INTERSECT_LEAVES] = {0};
+    const uint8_t *bmap_bytes[MAX_INTERSECT_LEAVES] = {0};
+    uint8_t *merged[MAX_INTERSECT_LEAVES] = {0};
+    uint32_t min_stride = UINT32_MAX;
+
+    for (int i = 0; i < a->n_leaves; i++) {
+        char bp[PATH_MAX];
+        bm_build_path(bp, sizeof(bp), a->db_root, a->object,
+                      a->leaves[i]->field, a->shard_idx);
+        bm[i] = bm_open(bp, 0, 0, 0, 0, 0);
+        if (!bm[i]) goto cleanup;
+
+        if (a->leaves[i]->op == OP_EQUAL) {
+            uint32_t this_stride = 0;
+            bmap_bytes[i] = bm_get_value_bitmap(bm[i], vals[i], vlens[i],
+                                                 &this_stride);
+            if (!bmap_bytes[i]) goto cleanup;  /* value not in dict → 0 matches */
+            if (this_stride < min_stride)
+                min_stride = this_stride;
+        } else if (a->leaves[i]->op == OP_IN) {
+            const TypedField *tf = resolve_idx_field(a->ts, a->leaves[i]->field);
+            if (!tf) goto cleanup;
+            uint32_t stride = bm_stride(bm[i]);
+            merged[i] = calloc(1, stride);
+            if (!merged[i]) goto cleanup;
+            int any = 0;
+            for (int v = 0; v < a->leaves[i]->in_count; v++) {
+                uint8_t enc[1024];
+                size_t elen;
+                encode_criterion_value(tf, a->leaves[i]->in_values[v],
+                                       strlen(a->leaves[i]->in_values[v]),
+                                       enc, &elen);
+                uint32_t vs;
+                const uint8_t *vmap = bm_get_value_bitmap(bm[i], enc, elen, &vs);
+                if (vmap) {
+                    any = 1;
+                    for (uint32_t b = 0; b < stride; b++)
+                        merged[i][b] |= vmap[b];
+                }
+            }
+            if (!any) goto cleanup;  /* no IN value in dict → 0 matches */
+            bmap_bytes[i] = merged[i];
+            if (stride < min_stride)
+                min_stride = stride;
+        } else {
+            goto cleanup;  /* unsupported op → fall through to KeySet path */
+        }
+    }
+
+    /* Byte-level AND + popcount.  Byte-level rather than uint64_t for
+     * unaligned-safety: stride is rarely a multiple of 8, so vidx>0
+     * bitmaps start at unaligned offsets.  Matches bm_count's pattern. */
+    size_t local = 0;
+    for (uint32_t b = 0; b < min_stride; b++) {
+        uint8_t and_byte = 0xFF;
+        for (int i = 0; i < a->n_leaves; i++)
+            and_byte &= bmap_bytes[i][b];
+        local += (size_t)__builtin_popcount(and_byte);
+    }
+    a->count = local;
+
+cleanup:
+    for (int i = 0; i < a->n_leaves; i++) {
+        if (bm[i]) bm_close(bm[i]);
+        free(merged[i]);
+    }
+    return NULL;
+}
+
+static size_t bm_popcount_intersect(const char *db_root, const char *object,
+                                     int splits,
+                                     SearchCriterion **leaves, int n_leaves,
+                                     const TypedSchema *ts,
+                                     QueryDeadline *dl) {
+    if (n_leaves < 2 || n_leaves > MAX_INTERSECT_LEAVES || splits <= 0)
+        return 0;
+
+    BmIntersectShardArg *args =
+        calloc((size_t)splits, sizeof(BmIntersectShardArg));
+    if (!args) {
+        /* malloc failed: fall back to serial */
+        size_t total = 0;
+        for (int s = 0; s < splits && (!dl || !dl->timed_out); s++) {
+            BmIntersectShardArg a = { .db_root = db_root, .object = object,
+                                       .shard_idx = s, .leaves = leaves,
+                                       .n_leaves = n_leaves, .ts = ts,
+                                       .count = 0, .deadline = dl };
+            bm_intersect_shard_worker(&a);
+            total += a.count;
+        }
+        return total;
+    }
+
+    for (int s = 0; s < splits; s++) {
+        args[s] = (BmIntersectShardArg){
+            .db_root = db_root, .object = object, .shard_idx = s,
+            .leaves = leaves, .n_leaves = n_leaves,
+            .ts = ts, .count = 0, .deadline = dl,
+        };
+    }
+    parallel_for(bm_intersect_shard_worker, args, splits,
+                  sizeof(BmIntersectShardArg));
+
+    size_t total = 0;
+    for (int s = 0; s < splits && (!dl || !dl->timed_out); s++)
+        total += args[s].count;
+    free(args);
+    return (!dl || !dl->timed_out) ? total : 0;
 }
 
 /* Walk a single shard's bitmap for `value`, emitting cb per live
@@ -15367,7 +15664,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                               .children = NULL, .n_children = 0 };
                     pos_count = parallel_indexed_count(db_root, object, &sch,
                                                        entries, (int)n,
-                                                       &pos_leaf, &fs, &dl);
+                                                       &pos_leaf, &fs, &dl, NULL);
                     free(entries);
                     keyset_free(tg_ks);
                     pos_ok = !dl.timed_out;
@@ -15427,7 +15724,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
                     size_t count = parallel_indexed_count(db_root, object, &sch,
                                                           entries, (int)n,
-                                                          tree, &fs, &dl);
+                                                          tree, &fs, &dl, &fp);
                     if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                     else OUT("%zu\n", count);
                     free(entries);
@@ -15480,7 +15777,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
                     size_t count = parallel_indexed_count(db_root, object, &sch,
                                                           entries, (int)n,
-                                                          tree, &fs, &dl);
+                                                          tree, &fs, &dl, &fp);
                     if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                     else OUT("%zu\n", count);
                     free(entries);
@@ -15512,12 +15809,35 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             }
             size_t count = parallel_indexed_count(db_root, object, &sch,
                                                   cc.entries, (int)cc.count,
-                                                  tree, &fs, &dl);
+                                                  tree, &fs, &dl, &fp);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
         }
     } else if (fp.kind == FP_INTERSECT) {
+        /* Fast path: all-bitmap eq/in AND → word-level intersect popcount.
+         * Beats KeySet materialization for any selectivity. */
+        if (fp.source_is_bitmap && fp.n_postfilter == 0) {
+            int all_supported = 1;
+            for (int i = 0; i < fp.n_source; i++) {
+                if (fp.source_leaves[i]->op != OP_EQUAL &&
+                    fp.source_leaves[i]->op != OP_IN) {
+                    all_supported = 0; break;
+                }
+            }
+            if (all_supported) {
+                size_t total = bm_popcount_intersect(db_root, object,
+                                                      sch.splits,
+                                                      fp.source_leaves,
+                                                      fp.n_source,
+                                                      fs.ts, &dl);
+                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else OUT("%zu\n", total);
+                free_criteria_tree(tree);
+                return 0;
+            }
+        }
+        /* Fall through to existing KeySet intersect path */
         /* FP_INTERSECT + n_postfilter==0: all AND leaves covered by source set
            → intersect index-only, keyset_size is the exact count (no record reads).
            FP_INTERSECT + n_postfilter>0: at least one leaf was dropped from the
@@ -15546,7 +15866,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             if (rc != 0 || batch_count == 0) { free(batch); OUT("0\n"); }
             else {
                 size_t n = parallel_indexed_count(db_root, object, &sch, batch,
-                                                  (int)batch_count, tree, &fs, &dl);
+                                                  (int)batch_count, tree, &fs, &dl, &fp);
                 free(batch);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", n);
@@ -15634,7 +15954,7 @@ static size_t idx_count_for_leaf(const char *db_root, const char *object,
                                    .children = NULL, .n_children = 0 };
         size_t cnt = parallel_indexed_count(db_root, object, sch,
                                             entries, (int)n,
-                                            &leaf_node, (FieldSchema *)fs, dl);
+                                            &leaf_node, (FieldSchema *)fs, dl, NULL);
         free(entries);
         keyset_free(tg_ks);
         return cnt;
@@ -16576,7 +16896,7 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
             if (entries && tree) {
                 n = parallel_indexed_count(db_root, object, sch,
                                            entries, (int)nh,
-                                           tree, fs, dl);
+                                           tree, fs, dl, fp);
                 if (!dl->timed_out) *out_null = 0;
             } else if (entries && !tree) {
                 /* No tree to verify against → every candidate is a match. */
