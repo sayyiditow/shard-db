@@ -918,6 +918,33 @@ static int bench_queries_run(void) {
        "\"fields\":[\"username\",\"created_at\"]}");
     bench_table_section_end();
 
+    /* ---------- FIND — starts candidate-count breakdown (D2 fetch cost) ---------- */
+    bench_table_section_begin("FIND — starts candidate-count breakdown (D2 fetch cost)");
+    /* Base: starts prefix walk, index-only (no fetches) */
+    BR("COUNT starts 'alice' (base)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"alice\"}]}");
+    /* +1 bitmap post-filter: fetch cost per candidate */
+    BR("COUNT starts 'alice' + active=false (filtered)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"alice\"},"
+       "{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}]}");
+    /* Full D2: fetch ALL candidates, sort by score, emit 25 */
+    BR("FIND starts 'alice' + active=false + order_by score (limit 25)",
+       "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"alice\"},"
+       "{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}],"
+       "\"order_by\":\"score\",\"order\":\"desc\",\"limit\":25,"
+       "\"fields\":[\"username\",\"score\"]}");
+    /* Broader starts: more candidates → more fetches → should be slower */
+    BR("FIND starts 'a' + active=false + order_by score (broad seed)",
+       "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"a\"},"
+       "{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"}],"
+       "\"order_by\":\"score\",\"order\":\"desc\",\"limit\":25,"
+       "\"fields\":[\"username\",\"score\"]}");
+    bench_table_section_end();
+
     /* ---------- CURSOR — keyset pagination by various indexed types ---------- */
     bench_table_section_begin("CURSOR (keyset pagination, limit 100)");
     BR("ASC by age            (int)",        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[],\"order_by\":\"age\",\"order\":\"asc\",\"limit\":100,\"cursor\":null,\"fields\":[\"username\",\"age\"]}");
