@@ -2384,7 +2384,7 @@ static int warmup_touch_file(const char *path) {
        anyway, so the macOS path skips the hint. The kernel still does
        its own read-ahead heuristics on a sequential file open. */
 #ifdef __linux__
-    posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    posix_fadvise(fd, 0, 4096, POSIX_FADV_WILLNEED);
 #endif
     /* Force the first page in synchronously so subsequent lookups don't
        page-fault. One page (~4 KB) is enough for every header-driven
