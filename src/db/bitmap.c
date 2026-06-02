@@ -695,6 +695,20 @@ uint32_t bm_count(const BitmapShard *bm, const uint8_t *value, size_t vlen) {
     return total;
 }
 
+/* Return pointer to the bit-array for `value`, or NULL if not found.
+   Sets *out_stride to the bitmap stride.  Used by word-level AND
+   intersect popcount so callers outside bitmap.c don't need to reach
+   into the opaque BitmapShard or call the static bm_dict_lookup. */
+const uint8_t *bm_get_value_bitmap(BitmapShard *bm, const uint8_t *value,
+                                    size_t vlen, uint32_t *out_stride) {
+    if (!bm || !value || !out_stride) return NULL;
+    int vidx = bm_dict_lookup(bm, value, vlen);
+    if (vidx < 0) return NULL;
+    *out_stride = bm->hdr.stride;
+    return (const uint8_t *)bm->mmap_ptr + bm->hdr.bitmaps_off +
+           (size_t)vidx * (size_t)bm->hdr.stride;
+}
+
 /* Iterate every (value, vlen) pair in the dictionary. Walks the on-disk
    layout described at the top of this file; respects the bool fast-path
    which doesn't have an explicit dict region. Used by the planner's

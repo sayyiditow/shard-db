@@ -657,4 +657,20 @@ int64_t slotcask_count_live(SlotcaskDb *db);
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                              SlotcaskScanCb cb, void *ctx);
 
+/* Probe the keyfile for a live entry matching hash16. Returns 0 and sets
+ * *out_slot if found, -1 if not. Does NOT read the segment file — stops
+ * after the KF probe. Used by bitmap post-filter to get the slot index
+ * needed for bm_test without paying the full record-fetch cost. */
+int kf_find_slot_for_hash(const SlotcaskDb *db,
+                           const uint8_t hash16[16],
+                           uint32_t *out_slot);
+
+/* Compute the starting slot index for hash in a KF of capacity `cap`.
+ * Public so hot loops can inline the probe without per-hash acquire. */
+size_t kf_slot_for(const uint8_t hash[16], size_t cap);
+
+/* Build the canonical kf shard path under a data_dir.
+ * Public so query workers can pre-open KF handles. */
+void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id);
+
 #endif
