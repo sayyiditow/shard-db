@@ -12890,16 +12890,24 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
              * Also the path for B2: selective btree + broad bitmap → leaf-on-btree. */
             if (fetching && prim_sel) { /* fall through to single-seed */ }
             else if (n_selective == 0) {
-                /* All indexed leaves are broad → intersect-to-narrow before fetch. */
-                fp.kind = FP_INTERSECT;
-                for (int i = 0; i < nL; i++) {
-                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
-                    if (it >= 0 && fp.n_source < MAX_INTERSECT_LEAVES)
-                        fp.source_leaves[fp.n_source++] = leaves[i];
-                    else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
-                        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                /* All indexed leaves are broad. For find: intersect-to-narrow
+                 * before fetch (build KeySets, intersect, then fetch+verify).
+                 * For count: fall through to single-seed — walk only the
+                 * least-broad index and post-filter the rest via the full
+                 * criteria tree. This avoids building KeySets for each leaf
+                 * (which can silently return 0 when memory exceeds budget). */
+                if (fetching) {
+                    fp.kind = FP_INTERSECT;
+                    for (int i = 0; i < nL; i++) {
+                        int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                        if (it >= 0 && fp.n_source < MAX_INTERSECT_LEAVES)
+                            fp.source_leaves[fp.n_source++] = leaves[i];
+                        else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
+                            fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                    }
+                    goto order_overlay;
                 }
-                goto order_overlay;
+                /* count: fall through to single-seed block below */
             }
             /* else: one selective leaf present, fetching=1 OR count with only
              * one selective leaf → fall through to single-seed PRIMARY_LEAF. */
@@ -12981,11 +12989,14 @@ order_overlay:
             /* D2 vs D3: if the seed leaf's candidate set is bounded (estimable
              * and not saturated), fetch + sort in memory (D2).  When it's broad
              * (saturated / unestimable), walk the order_by index directly (D3). */
-            const TypedField *seed_tf =
-                resolve_idx_field(fs->ts, fp.source_leaves[0]->field);
-            CardEst se = card_est_leaf(db_root, object, splits,
-                                       fp.source_leaves[0], seed_tf,
-                                       selectivity_budget(N));
+            /* Reuse est[prim] from most_selective_indexed. When order_by
+             * is set, skip_est is always false, so est[] is fully populated.
+             * On goto paths (B3 all-bitmap, all-broad intersect),
+             * fp.source_leaves[0] may differ from leaves[prim], but the
+             * D2/D3 fork depends only on saturated/estimable which are
+             * uniform across same-type leaves. Do not relax the skip_est
+             * condition without re-evaluating this reuse. */
+            CardEst se = est[prim];
             fp.order = (se.estimable && !se.saturated)
                        ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
         }
