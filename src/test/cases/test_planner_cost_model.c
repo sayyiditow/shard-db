@@ -752,17 +752,32 @@ static int test_planD3_walk_order(void) {
     char *resp3=NULL;
     tc_request(tc, req2, &resp3); free(resp3);
 
-    /* fetching=0 (count), both broad indexed → FP_INTERSECT (n_selective=0 path).
-     * source_leaves[0] = "by"="bob" → broad → saturated → FP_ORDER_INDEX_WALK. */
+    /* fetching=1 (find), both broad indexed → FP_INTERSECT (n_selective=0 path).
+     * source_leaves[0] = "by"="bob" → broad → saturated → FP_ORDER_INDEX_WALK.
+     * After Fix 2, count with all-broad falls through to single-seed
+     * PRIMARY_LEAF; only the find path still hits FP_INTERSECT here. */
     memset(f,0,sizeof(f)); memset(o,0,sizeof(o)); tc_val=-1;
     const char *k_d3b = plan_filter_kind_for_test(env.db_root, "default/d3b",
         "[{\"field\":\"by\",\"op\":\"eq\",\"value\":\"bob\"},"
          "{\"field\":\"cat\",\"op\":\"eq\",\"value\":\"x\"}]",
-        "by", 0,
+        "by", 1,
         f, sizeof(f), o, sizeof(o), &tc_val);
-    ASSERT_EQ_STR(k_d3b, "intersect", "D3: all-broad indexed → INTERSECT");
+    ASSERT_EQ_STR(k_d3b, "intersect", "D3: all-broad indexed find → INTERSECT");
     ASSERT_EQ_STR(o, "walk", "D3: broad seed + order_by → FP_ORDER_INDEX_WALK");
     ASSERT_EQ_INT(tc_val, 1, "D3: total_cheap=1 (INTERSECT materializes KeySet)");
+
+    /* After Fix 2: count with all-broad falls through to single-seed
+     * PRIMARY_LEAF instead of FP_INTERSECT. */
+    memset(f,0,sizeof(f)); memset(o,0,sizeof(o)); tc_val=-1;
+    const char *k_d3b_cnt = plan_filter_kind_for_test(env.db_root, "default/d3b",
+        "[{\"field\":\"by\",\"op\":\"eq\",\"value\":\"bob\"},"
+         "{\"field\":\"cat\",\"op\":\"eq\",\"value\":\"x\"}]",
+        "by", 0,
+        f, sizeof(f), o, sizeof(o), &tc_val);
+    ASSERT_EQ_STR(k_d3b_cnt, "leaf",
+        "D3 count: all-broad indexed count → PRIMARY_LEAF (not INTERSECT)");
+    ASSERT_EQ_STR(f, "by",
+        "D3 count: seed is most-selective indexed leaf");
 
     tc_close(tc); test_env_stop(&env);
     return 0;

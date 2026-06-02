@@ -339,7 +339,7 @@ static int bench_queries_run(void) {
        truth keeps the two modes from drifting. */
     static const char *const IDX_FIELDS[] = {
         "username", "email", "age", "user_id", "rank",
-        "score", "active", "level", "birthday",
+        "score", "active", "category", "level", "birthday",
         "created_at", "balance", "hourly_rate",
         /* Composite index — exercises the D1 composite-prefix executor
            and the DESC tree-descent in btree_range_iter_open (i.e. the
@@ -378,7 +378,7 @@ static int bench_queries_run(void) {
                             "\"balance:numeric:12,2\",\"hourly_rate:currency\","
                             "\"category:enum(electronics,clothing,books,home,sports)\"],"
                 "\"indexes\":[\"username\",\"email\",\"age\",\"user_id\",\"rank\","
-                             "\"score\",\"active\",\"level\",\"birthday\","
+                             "\"score\",\"active\",\"category\",\"level\",\"birthday\","
                              "\"created_at\",\"balance\",\"hourly_rate\","
                              "\"username+age\"]}",
                 SPLITS);
@@ -521,46 +521,29 @@ static int bench_queries_run(void) {
     BR("eq bio                (varchar non-idx)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"eq\",\"value\":\"DevOps engineer automating everything\"}]}");
     bench_table_section_end();
 
-    /* ---------- COUNT — neq on every indexed type ---------- */
+    /* ---------- COUNT — neq sampled (all same non-selective path) ---------- */
     bench_table_section_begin("COUNT — neq by field type");
     BR("neq active!=false     (bool)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"active\",\"op\":\"neq\",\"value\":\"false\"}]}");
     BR("neq age!=30           (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"neq\",\"value\":\"30\"}]}");
-    BR("neq user_id!=500000   (long)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"user_id\",\"op\":\"neq\",\"value\":\"500000\"}]}");
-    BR("neq rank!=42          (short)",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"rank\",\"op\":\"neq\",\"value\":\"42\"}]}");
-    BR("neq score!=50.0       (double)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"score\",\"op\":\"neq\",\"value\":\"50\"}]}");
-    BR("neq level!=128        (byte)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"level\",\"op\":\"neq\",\"value\":\"128\"}]}");
-    BR("neq birthday!=…       (date)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"neq\",\"value\":\"19850515\"}]}");
-    BR("neq created_at!=…     (datetime)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"created_at\",\"op\":\"neq\",\"value\":\"20240101000000\"}]}");
-    BR("neq balance!=1000.00  (numeric)",   "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"neq\",\"value\":\"1000.00\"}]}");
-    BR("neq hourly!=100       (currency)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"hourly_rate\",\"op\":\"neq\",\"value\":\"100.0000\"}]}");
     BR("neq username          (varchar idx)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"neq\",\"value\":\"alice.smith0\"}]}");
+    BR("neq balance!=1000.00  (numeric)",   "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"neq\",\"value\":\"1000.00\"}]}");
     bench_table_section_end();
 
-    /* ---------- COUNT — range (gt/lt/gte/lte/between) by type ---------- */
+    /* ---------- COUNT — range bounds sampled (gt + between per type) ---------- */
     bench_table_section_begin("COUNT — range bounds by field type (single-bound)");
     BR("gt age>50             (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"50\"}]}");
-    BR("lt age<25             (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"lt\",\"value\":\"25\"}]}");
-    BR("gte age>=60           (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"gte\",\"value\":\"60\"}]}");
-    BR("lte age<=20           (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"lte\",\"value\":\"20\"}]}");
     BR("between age 30..40    (int)",       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"age\",\"op\":\"between\",\"value\":\"30\",\"value2\":\"40\"}]}");
     BR("gt user_id>500000     (long)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"user_id\",\"op\":\"gt\",\"value\":\"500000\"}]}");
-    BR("lt user_id<200000     (long)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"user_id\",\"op\":\"lt\",\"value\":\"200000\"}]}");
     BR("gt rank>50            (short)",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"rank\",\"op\":\"gt\",\"value\":\"50\"}]}");
     BR("between rank 25..75   (short)",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"rank\",\"op\":\"between\",\"value\":\"25\",\"value2\":\"75\"}]}");
     BR("gt score>50           (double)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"score\",\"op\":\"gt\",\"value\":\"50\"}]}");
-    BR("lt score<25           (double)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"score\",\"op\":\"lt\",\"value\":\"25\"}]}");
     BR("gt level>200          (byte)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"level\",\"op\":\"gt\",\"value\":\"200\"}]}");
-    BR("lt level<32           (byte)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"level\",\"op\":\"lt\",\"value\":\"32\"}]}");
     BR("gte birthday>=2000    (date)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"gte\",\"value\":\"20000101\"}]}");
-    BR("lte birthday<=1980    (date)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"birthday\",\"op\":\"lte\",\"value\":\"19800101\"}]}");
     BR("gt created_at>jun     (datetime)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"created_at\",\"op\":\"gt\",\"value\":\"20240601000000\"}]}");
-    BR("lt created_at<feb     (datetime)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"created_at\",\"op\":\"lt\",\"value\":\"20240201000000\"}]}");
     BR("gt balance>0          (numeric)",   "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"gt\",\"value\":\"0\"}]}");
-    BR("lt balance<-100       (numeric)",   "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"balance\",\"op\":\"lt\",\"value\":\"-100\"}]}");
     BR("gt hourly>100         (currency)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"hourly_rate\",\"op\":\"gt\",\"value\":\"100\"}]}");
     BR("between hourly 50..200(currency)",  "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"hourly_rate\",\"op\":\"between\",\"value\":\"50\",\"value2\":\"200\"}]}");
     BR("gt username>'m'       (varchar idx)","{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"gt\",\"value\":\"m\"}]}");
-    BR("lt username<'d'       (varchar idx)","{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"lt\",\"value\":\"d\"}]}");
     BR("between email a..m    (varchar idx)","{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"email\",\"op\":\"between\",\"value\":\"a\",\"value2\":\"m\"}]}");
     bench_table_section_end();
 
@@ -630,14 +613,11 @@ static int bench_queries_run(void) {
     BR("like email 'al%'",              "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"email\",\"op\":\"like\",\"value\":\"al%\"}]}");
     bench_table_section_end();
 
-    /* ---------- COUNT — string operators on non-indexed bio (full scan) ---------- */
+    /* ---------- COUNT — string ops on non-indexed bio (full scan, sampled) ---------- */
     bench_table_section_begin("COUNT — string ops on non-indexed bio (full scan)");
+    BR("contains bio 'DevOps'",         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"contains\",\"value\":\"DevOps\"}]}");
     BR("starts bio 'Software'",         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"starts\",\"value\":\"Software\"}]}");
     BR("ends bio 'startup'",            "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"ends\",\"value\":\"startup\"}]}");
-    BR("contains bio 'DevOps'",         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"contains\",\"value\":\"DevOps\"}]}");
-    BR("not_contains bio 'DevOps'",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"not_contains\",\"value\":\"DevOps\"}]}");
-    BR("like bio '%engineer%'",         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"like\",\"value\":\"%engineer%\"}]}");
-    BR("icontains bio 'devops'",        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"bio\",\"op\":\"icontains\",\"value\":\"devops\"}]}");
     bench_table_section_end();
 
     /* ---------- COUNT — case-insensitive ---------- */
@@ -821,38 +801,21 @@ static int bench_queries_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"username\",\"op\":\"starts\",\"value\":\"user_50\"}],\"order_by\":\"age\",\"order\":\"desc\",\"limit\":25,\"fields\":[\"username\",\"age\"]}");
     bench_table_section_end();
 
-    /* ---------- AGGREGATE — single-fn standalone (per numeric type) ---------- */
+    /* ---------- AGGREGATE — single-fn sampled (representative types) ---------- */
     bench_table_section_begin("AGGREGATE — single-fn standalone");
     BR("count all",                "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
     BR("sum age              (int)",     "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"age\"}]}");
     BR("avg age              (int)",     "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"avg\",\"field\":\"age\"}]}");
-    BR("sum user_id          (long)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"user_id\"}]}");
-    BR("sum rank             (short)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"rank\"}]}");
     BR("sum score            (double)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"score\"}]}");
     BR("avg score            (double)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"avg\",\"field\":\"score\"}]}");
-    BR("sum level            (byte)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"level\"}]}");
     BR("sum balance          (numeric)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
     BR("avg balance          (numeric)", "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"avg\",\"field\":\"balance\"}]}");
-    BR("sum hourly_rate      (currency)","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"hourly_rate\"}]}");
-    BR("avg hourly_rate      (currency)","{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"avg\",\"field\":\"hourly_rate\"}]}");
     BR("min age            (int)",       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}");
     BR("max age            (int)",       "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"age\"}]}");
-    BR("min user_id        (long)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"user_id\"}]}");
-    BR("max user_id        (long)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"user_id\"}]}");
-    BR("min rank           (short)",     "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"rank\"}]}");
-    BR("max rank           (short)",     "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"rank\"}]}");
     BR("min score          (double)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"score\"}]}");
     BR("max score          (double)",    "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"score\"}]}");
-    BR("min level          (byte)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"level\"}]}");
-    BR("max level          (byte)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"level\"}]}");
-    BR("min birthday       (date)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\"}]}");
-    BR("max birthday       (date)",      "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"birthday\"}]}");
-    BR("min created_at     (datetime)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"created_at\"}]}");
-    BR("max created_at     (datetime)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"created_at\"}]}");
     BR("min balance        (numeric)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"balance\"}]}");
     BR("max balance        (numeric)",   "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"balance\"}]}");
-    BR("min hourly_rate    (currency)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"min\",\"field\":\"hourly_rate\"}]}");
-    BR("max hourly_rate    (currency)",  "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"aggregates\":[{\"fn\":\"max\",\"field\":\"hourly_rate\"}]}");
     bench_table_section_end();
 
     /* ---------- AGGREGATE — with criteria (post-filter cost) ---------- */
@@ -920,6 +883,39 @@ static int bench_queries_run(void) {
        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"active\",\"age\"],\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\"}]}");
     BR("group by age, level                   (2-field, both int)",
        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"users\",\"group_by\":[\"age\",\"level\"],\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}");
+    bench_table_section_end();
+
+    /* ---------- COUNT — broad multi-leaf AND (full-scan fallback target) ---------- */
+    bench_table_section_begin("COUNT — broad multi-leaf AND (full-scan fallback)");
+    BR("2 bitmap broad (active+category)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
+       "{\"field\":\"category\",\"op\":\"eq\",\"value\":\"electronics\"}]}");
+    BR("bitmap + btree broad (active+age)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
+       "{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}]}");
+    BR("3-way broad (active+category+age)",
+       "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
+       "{\"field\":\"category\",\"op\":\"eq\",\"value\":\"electronics\"},"
+       "{\"field\":\"age\",\"op\":\"gt\",\"value\":\"30\"}]}");
+    bench_table_section_end();
+
+    /* ---------- FIND — broad filter + selective seed + order_by ---------- */
+    bench_table_section_begin("FIND — broad filter + selective seed + order_by");
+    BR("broad + starts + order_by (score)",
+       "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"false\"},"
+       "{\"field\":\"username\",\"op\":\"starts\",\"value\":\"alice\"}],"
+       "\"order_by\":\"score\",\"order\":\"desc\",\"limit\":25,"
+       "\"fields\":[\"username\",\"score\"]}");
+    BR("range + order_by diff field",
+       "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"users\","
+       "\"criteria\":[{\"field\":\"user_id\",\"op\":\"gte\",\"value\":\"100000\"},"
+       "{\"field\":\"user_id\",\"op\":\"lte\",\"value\":\"200000\"}],"
+       "\"order_by\":\"created_at\",\"order\":\"desc\",\"limit\":50,"
+       "\"fields\":[\"username\",\"created_at\"]}");
     bench_table_section_end();
 
     /* ---------- CURSOR — keyset pagination by various indexed types ---------- */
