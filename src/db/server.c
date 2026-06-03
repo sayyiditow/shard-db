@@ -2494,9 +2494,9 @@ static void *warmup_thread(void *arg) {
     /* g_out only matters if the warmup ever emitted via OUT(); it doesn't.
        But pool worker threads (which this one is NOT) carry __thread g_out
        state, so we set it defensively in case any helper we call adopts
-       OUT() later. */
-    g_out = fopen("/dev/null", "w");
-    if (!g_out) g_out = stderr;
+       OUT() later. Kept in a local so we can fclose on exit. */
+    FILE *null_out = fopen("/dev/null", "w");
+    g_out = null_out ? null_out : stderr;
 
     uint64_t t0 = now_ms();
     _Atomic int kf_count = 0, idx_count = 0;
@@ -2592,6 +2592,7 @@ done_collect:
             objects, atomic_load(&kf_count), atomic_load(&idx_count),
             (unsigned long)(now_ms() - t0));
     free(a);
+    if (null_out) fclose(null_out);
     return NULL;
 }
 
