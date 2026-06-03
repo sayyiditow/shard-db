@@ -10663,6 +10663,7 @@ typedef struct FilterPlan {
     int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
     int              fetching;                           /* dimension this plan was computed for */
     char             composite_field[256];               /* set when order==FP_ORDER_COMPOSITE_EXACT */
+    SearchCriterion *order_range;     /* range/eq leaf on order_by to fold into the composite seek (EQ seed only) */
 } FilterPlan;
 
 /* Classify post-filter leaves: which are bitmap eq/in that can be tested
@@ -11282,6 +11283,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                                      SearchCriterion *seed,
                                      const char *order_by,
                                      int order_desc,
+                                     SearchCriterion *order_range,   /* NULL = whole-prefix walk */
                                      CriteriaNode *tree,
                                      ExcludedKeys *excluded,
                                      int offset, int limit,
@@ -11289,17 +11291,61 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                                      int dict_fmt,
                                      QueryDeadline *dl)
 {
-    /* 1. Encode the seed value — this becomes the prefix for the walk. */
-    uint8_t buf_lo[1024];
+    /* 1. Seed prefix = encode(seed value). */
+    uint8_t buf_lo[1024 + 8];
     size_t  len_lo = 0;
     const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
     encode_criterion_value(seed_tf, seed->value, strlen(seed->value), buf_lo, &len_lo);
+    size_t pfx_len = len_lo;
 
-    /* 2. Upper bound: seed prefix + 4 × 0xff  (the STARTS_WITH idiom). */
-    uint8_t buf_hi[1024 + 4];
+    /* 2. Upper bound: seed prefix + 4 × 0xff (STARTS_WITH idiom). */
+    uint8_t buf_hi[1024 + 8];
     memcpy(buf_hi, buf_lo, len_lo);
     memset(buf_hi + len_lo, 0xff, 4);
     size_t  len_hi = len_lo + 4;
+    int min_excl = 0, max_excl = 0;
+
+    /* 2b. If an order_by range/eq leaf is present (EQ seed only — guaranteed
+       by the planner), append its encoded value(s) to the seed prefix so the
+       btree seeks to T instead of walking the whole prefix and post-filtering.
+       Composite key = encode(seed) ‖ encode(order_by); appending encode(T)
+       after the (fixed-for-EQ) seed prefix is the exact seek point. */
+    if (order_range) {
+        const TypedField *ord_tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
+        /* low bound: >=, >, BETWEEN-low, or == */
+        const char *lowv = NULL; int low_excl = 0;
+        const char *highv = NULL; int high_excl = 0;
+        switch (order_range->op) {
+            case OP_GREATER_EQ: lowv = order_range->value; break;
+            case OP_GREATER:    lowv = order_range->value; low_excl = 1; break;
+            case OP_LESS_EQ:    highv = order_range->value; break;
+            case OP_LESS:       highv = order_range->value; high_excl = 1; break;
+            case OP_EQUAL:      lowv = highv = order_range->value; break;
+            case OP_BETWEEN:
+                lowv  = order_range->value;  low_excl  = order_range->min_exclusive;
+                highv = order_range->value2; high_excl = order_range->max_exclusive;
+                break;
+            default: break;   /* leave whole-prefix bounds */
+        }
+        if (lowv) {
+            uint8_t enc[1024]; size_t el = 0;
+            encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
+            if (pfx_len + el <= sizeof(buf_lo)) {
+                memcpy(buf_lo + pfx_len, enc, el);
+                len_lo = pfx_len + el;
+                min_excl = low_excl;
+            }
+        }
+        if (highv) {
+            uint8_t enc[1024]; size_t el = 0;
+            encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
+            if (pfx_len + el <= sizeof(buf_hi)) {
+                memcpy(buf_hi + pfx_len, enc, el);
+                len_hi = pfx_len + el;
+                max_excl = high_excl;
+            }
+        }
+    }
 
     /* 3. Build the composite index name "<seed_field>+<order_by>". */
     char composite_field[256];
@@ -11329,8 +11375,8 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
           delivers entries already sorted by (encoded_a || encoded_b) in
           the requested direction — asc or desc. */
     btree_idx_walk_ordered(db_root, object, composite_field, sch->splits,
-                           (const char *)buf_lo, len_lo, 0,
-                           (const char *)buf_hi, len_hi, 0,
+                           (const char *)buf_lo, len_lo, min_excl,
+                           (const char *)buf_hi, len_hi, max_excl,
                            order_desc, composite_prefix_cb, &ctx);
 
     return ctx.printed;
@@ -13275,11 +13321,24 @@ order_overlay:
             fp.source_leaves[0] = leaves[cc];
             fp.n_source         = 1;
             fp.order            = FP_ORDER_COMPOSITE;
+            fp.order_range = NULL;
+            if (leaves[cc]->op == OP_EQUAL) {
+                for (int i = 0; i < nL; i++) {
+                    if (strcmp(leaves[i]->field, order_by) != 0) continue;
+                    enum SearchOp o = leaves[i]->op;
+                    if (o == OP_GREATER || o == OP_GREATER_EQ || o == OP_LESS ||
+                        o == OP_LESS_EQ || o == OP_BETWEEN || o == OP_EQUAL) {
+                        fp.order_range = leaves[i];
+                        break;
+                    }
+                }
+            }
         } else if (composite_index_exists(db_root, object,
-                                   fp.source_leaves[0]->field, order_by)
+                                    fp.source_leaves[0]->field, order_by)
             && (fp.source_leaves[0]->op == OP_EQUAL ||
                 fp.source_leaves[0]->op == OP_STARTS_WITH)) {
             fp.order = FP_ORDER_COMPOSITE;
+            fp.order_range = NULL;
         } else {
             /* D2 vs D3: if the seed leaf's candidate set is bounded (estimable
              * and not saturated), fetch + sort in memory (D2).  When it's broad
@@ -17487,6 +17546,7 @@ int cmd_find(const char *db_root, const char *object,
             db_root, object, &sch,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             fp.source_leaves[0], order_by, desc,
+            fp.order_range,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         /* Close the envelope opened above and return.  When want_total,
