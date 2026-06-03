@@ -3114,7 +3114,41 @@ static void *mf_scan_worker(void *arg) {
                       w->descs[fi].name, w->kf_shard);
         w->fields[fi].bm = bm_open(bp, 0, 0 /* reopen existing */, 0, 0, 1 /* writer */);
     }
+
+    /* Pre-warm the kf shard into page cache with a sequential read before the
+       mmap walk. Without this, Zone B random accesses cause ~390K page faults
+       per shard; on NVMe at ~0.1ms each that is ~39s per shard regardless of
+       storage speed. A sequential read at full NVMe bandwidth (~3 GB/s) puts
+       every page into cache first, so the mmap walk costs µs per record instead. */
+    char kf_path[PATH_MAX];
+    slotcask_kf_path(kf_path, sizeof(kf_path), w->sdb->data_dir, w->kf_shard);
+    int kf_fd = open(kf_path, O_RDONLY);
+    if (kf_fd >= 0) {
+#ifdef __linux__
+        posix_fadvise(kf_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+        char buf[1 << 17]; /* 128 KB — large enough to amortise syscall cost */
+        while (read(kf_fd, buf, sizeof(buf)) > 0) {}
+        close(kf_fd);
+    }
+
     slotcask_walk_one_shard_slots(w->sdb, w->kf_shard, mf_record_cb, w);
+
+#ifdef __linux__
+    /* Release kf pages from page cache now that this shard is fully scanned.
+       The data won't be accessed again and caching 256 × ~200MB across 32
+       sequential batches would thrash a 16 GB machine. */
+    if (kf_fd >= 0) {
+        /* Re-open briefly just for the fadvise — the mmap inside
+           slotcask holds a separate fd, which we don't control. */
+        int drop_fd = open(kf_path, O_RDONLY);
+        if (drop_fd >= 0) {
+            posix_fadvise(drop_fd, 0, 0, POSIX_FADV_DONTNEED);
+            close(drop_fd);
+        }
+    }
+#endif
+
     for (int fi = 0; fi < w->n_fields; fi++) {
         if (w->descs[fi].type == MF_BITMAP) {
             if (w->fields[fi].bm) { bm_close(w->fields[fi].bm); w->fields[fi].bm = NULL; }
