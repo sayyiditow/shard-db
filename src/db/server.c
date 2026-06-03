@@ -1093,8 +1093,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *obj_f = json_obj_strdup(&req, "object");
         const char *df = (dir_f && dir_f[0]) ? dir_f : NULL;
         const char *of = (obj_f && obj_f[0]) ? obj_f : NULL;
-        cmd_reindex(g_db_root, df, of);
-        free(dir_f); free(obj_f); free(mode);
+        char *co_s = json_obj_strdup(&req, "composites_only");
+        int composites_only = (co_s && strcmp(co_s, "true") == 0);
+        cmd_reindex(g_db_root, df, of, composites_only);
+        free(dir_f); free(obj_f); free(co_s); free(mode);
         return;
     }
 

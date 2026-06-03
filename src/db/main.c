@@ -156,18 +156,39 @@ int main(int argc, char *argv[]) {
     /* reindex — rebuild every index for matching objects.
          shard-db reindex                   (all dirs × all objects)
          shard-db reindex <dir>             (all objects in one tenant)
-         shard-db reindex <dir> <obj>       (one object) */
+         shard-db reindex <dir> <obj>       (one object)
+         --composites-only                  only rebuild composite indexes (fields containing '+') */
     if (strcmp(cmd, "reindex") == 0) {
+        /* Pre-scan for --composites-only flag */
+        int composites_only = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--composites-only") == 0) {
+                composites_only = 1;
+                break;
+            }
+        }
+        /* Collect positional arguments (non-flag) */
+        const char *pos[2] = {NULL, NULL};
+        int npos = 0;
+        for (int i = 2; i < argc && npos < 2; i++) {
+            if (argv[i][0] == '-' && argv[i][1] == '-') continue;
+            pos[npos++] = argv[i];
+        }
         char json[512];
-        if (argc >= 4)
+        if (npos == 2)
             snprintf(json, sizeof(json),
-                "{\"mode\":\"reindex\",\"dir\":\"%s\",\"object\":\"%s\"}",
-                argv[2], argv[3]);
-        else if (argc == 3)
+                "{\"mode\":\"reindex\",\"dir\":\"%s\",\"object\":\"%s\"%s}",
+                pos[0], pos[1],
+                composites_only ? ",\"composites_only\":true" : "");
+        else if (npos == 1)
             snprintf(json, sizeof(json),
-                "{\"mode\":\"reindex\",\"dir\":\"%s\"}", argv[2]);
+                "{\"mode\":\"reindex\",\"dir\":\"%s\"%s}",
+                pos[0],
+                composites_only ? ",\"composites_only\":true" : "");
         else
-            snprintf(json, sizeof(json), "{\"mode\":\"reindex\"}");
+            snprintf(json, sizeof(json),
+                "{\"mode\":\"reindex\"%s}",
+                composites_only ? ",\"composites_only\":true" : "");
         return cmd_query_json(port, json);
     }
     /* estimate-index <dir> <obj> <field>:trigram — sample 1024 records,

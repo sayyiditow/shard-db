@@ -2982,7 +2982,7 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
    vacuum --splits or --compact that may have changed the layout under our
    feet). Returns the number of indexes rebuilt; 0 if the object has no
    index.conf or it's empty. */
-int reindex_object(const char *eff_root, const char *object) {
+int reindex_object(const char *eff_root, const char *object, int composites_only) {
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
              eff_root, object);
@@ -2996,6 +2996,7 @@ int reindex_object(const char *eff_root, const char *object) {
     while (fgets(fline, sizeof(fline), ic)) {
         fline[strcspn(fline, "\n")] = '\0';
         if (!fline[0]) continue;
+        if (composites_only && !strchr(fline, '+')) continue;
         int avail = (int)sizeof(fields_json) - pos - 8;
         if (avail <= 0) break;
         pos += snprintf(fields_json + pos, avail,
@@ -3054,7 +3055,7 @@ static void reindex_clean_legacy(const char *eff_root, const char *object) {
     closedir(d);
 }
 
-int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter) {
+int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter, int composites_only) {
     char scpath[PATH_MAX];
     snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
     FILE *sf = fopen(scpath, "r");
@@ -3096,7 +3097,7 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
            smaller than the old one — the very situation that bit users
            on the splits=64 → splits=32 path), and rebuilds via
            cmd_add_indexes(force=1). */
-        int n = reindex_object(eff_root, obj);
+        int n = reindex_object(eff_root, obj, composites_only);
         if (n > 0) {
             objects_rebuilt++;
             indexes_rebuilt += n;

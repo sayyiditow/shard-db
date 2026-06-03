@@ -5846,7 +5846,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     slotcask_registry_invalidate(db_root, object);
 
     int idx_rebuilt = 0;
-    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object, 0);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
@@ -6170,7 +6170,7 @@ int rebuild_object(const char *db_root, const char *object,
        data shards atomically with the splits change. Compact-only changes
        slot_size but not the hash routing, so idx layout stays valid. */
     int idx_rebuilt = 0;
-    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object, 0);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_splits, new_splits,
