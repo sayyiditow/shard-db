@@ -3286,8 +3286,14 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
         return -1;
     }
 
-    /* Phase 1: single parallel scan — one pass over all kf shards. */
-    parallel_for(mf_scan_worker, workers, n_kf, sizeof(MFWorker));
+    /* Phase 1: single scan pass across all kf shards.
+       Use parallel_for_io (independent threads, not the shared pool) so that
+       connection-handler threads blocked on objlock_rdlock (while we hold
+       objlock_wrlock) can't starve the scan workers out of the thread pool. */
+    for (int base = 0; base < n_kf; base += pool_size) {
+        int cnt = (base + pool_size <= n_kf) ? pool_size : (n_kf - base);
+        parallel_for_io(mf_scan_worker, workers + base, cnt, sizeof(MFWorker));
+    }
 
     int any_error = 0;
     for (int w = 0; w < n_kf; w++) {
@@ -3326,7 +3332,11 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
             margs[s].shard     = s;
             margs[s].spill_dir = spill_dir;
         }
-        parallel_for(merge_shard_worker_fn, margs, idx_n, sizeof(MergeShardArg));
+        /* Same reasoning as Phase 1: use parallel_for_io to avoid pool starvation. */
+        for (int base = 0; base < idx_n; base += pool_size) {
+            int cnt = (base + pool_size <= idx_n) ? pool_size : (idx_n - base);
+            parallel_for_io(merge_shard_worker_fn, margs + base, cnt, sizeof(MergeShardArg));
+        }
         for (int s = 0; s < idx_n; s++) if (margs[s].rc != 0) merge_rc = -1;
         free(margs);
         rmdir(spill_dir);
