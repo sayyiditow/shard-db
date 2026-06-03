@@ -218,6 +218,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_planner_cost_model.c \
     src/test/cases/test_d1_composite_executor.c \
     src/test/cases/test_composite_typed.c \
+    src/test/cases/test_composite_range_fold.c \
     src/test/cases/test_composite_prefix_routing.c \
     src/test/cases/test_d3_order_walk_executor.c \
     src/test/cases/test_ft_float_consistency.c \
