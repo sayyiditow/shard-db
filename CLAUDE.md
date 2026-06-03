@@ -10,6 +10,12 @@ Default workflow for non-trivial work, unless the user says otherwise for a give
 2. **Another model executes** the plan on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`.
 3. **Claude reviews and commits.** Review the diff (focus on the plan's flagged risks), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
 
+## Deployment (Netcup) — ship artifacts, never git
+
+Deploy by shipping **built artifacts only**, then restart the app. **Never** `git pull` or build on the server.
+- **shard-db:** build locally, copy `build/bin/` contents (`shard-db` + `shard-db-cli` + `migrate`) to the server's install dir, then restart the daemon (`./shard-db stop && ./shard-db start`). Run `./migrate` only when a release requires it.
+- **shard-db-hn-explorer:** build locally (`bun run build`), copy the `build/` folder to the server, restart the app.
+
 ## Overview
 
 shard-db is a high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64 + macOS (Apple Silicon, 2026.05.4+).
