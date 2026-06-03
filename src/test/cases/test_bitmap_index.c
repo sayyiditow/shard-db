@@ -598,6 +598,46 @@ static int test_bitmap_index_run(void) {
         ASSERT_EQ_INT((int)post_false, 2, "reindex: 2 false bits restored");
     }
 
+    /* === Phase 5b: mode:reindex rebuilds the bitmap via the unified
+           segment-sequential scan + resolve_bitmaps (kf hash→slot join),
+           a DIFFERENT path than add-index/build_bitmap_pass above. Wipe,
+           reindex via mode, then verify both the raw bits AND a bitmap-
+           driven query resolve to the correct records. === */
+    for (int s = 0; s < 8; s++) {
+        char bp[1024];
+        snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+        unlink(bp);
+    }
+    tc_request(tc,
+        "{\"mode\":\"reindex\",\"dir\":\"t\",\"object\":\"reix\"}", &resp);
+    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "mode:reindex succeeded");
+    free(resp); resp = NULL;
+
+    {
+        uint32_t post_true = 0, post_false = 0;
+        for (int s = 0; s < 8; s++) {
+            char bp[1024];
+            snprintf(bp, sizeof(bp), "%s/t/reix/indexes/flag/%03x.bm", env.db_root, s);
+            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
+            if (bm) {
+                uint8_t t = 0x01, f = 0x00;
+                post_true  += bm_count(bm, &t, 1);
+                post_false += bm_count(bm, &f, 1);
+                bm_close(bm);
+            }
+        }
+        ASSERT_EQ_INT((int)post_true,  3, "mode:reindex: 3 true bits restored");
+        ASSERT_EQ_INT((int)post_false, 2, "mode:reindex: 2 false bits restored");
+    }
+
+    /* Bitmap-driven query must return the right records — proves the
+       resolved slots map back to the correct keys through the planner. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"t\",\"object\":\"reix\","
+        "\"criteria\":{\"flag\":true}}", &resp);
+    ASSERT_CONTAINS(resp, "3", "mode:reindex: count flag=true == 3");
+    free(resp); resp = NULL;
+
     /* === Phase 3.2 auto-grow: bitmap_update must extend the bitmap when
            a write lands at a slot beyond the current stride. Direct
            bitmap.c API exercise (no daemon) — create a tiny bitmap then

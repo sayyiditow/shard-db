@@ -2749,8 +2749,14 @@ static int mf_worker_field_alloc(MFWorkerField *f, const MFFieldDesc *d,
    Correctness: on update/delete the superseded segment record is set to
    flag=2 (seg_write_flag(...,2)); a crash mid-emit leaves flag=0. So
    flag==1 == the current live version. The caller holds objlock_wrlock,
-   so no writes race the scan. (Bitmap fields are NOT built here — they
-   need the kf slot — see build_bitmap_pass.)
+   so no writes race the scan.
+
+   Bitmap fields are built in the SAME scan: a bitmap needs (kf_slot, value),
+   and the slot isn't in the segment record — only the keyfile has it. So we
+   capture (kf_shard, value, hash) during the scan into per-worker append
+   files, then a resolve phase reads the keyfile (sequential, 1.6GB) to turn
+   hash→slot and set the bits. One pass over the 151GB value store builds
+   btree, trigram, AND bitmap indexes.
    ==================================================================== */
 typedef struct { uint8_t sid; uint32_t fid; } SegRef;
 
@@ -2759,23 +2765,45 @@ typedef struct {
     int                splits, idx_n, slot_size, worker_idx;
     TypedSchema       *ts;
     int                n_fields;
-    const MFFieldDesc *descs;     /* spill (btree/trigram) descs only */
-    MFWorkerField     *fields;    /* [n_fields] */
+    const MFFieldDesc *descs;     /* all fields (btree/trigram/bitmap) */
+    MFWorkerField     *fields;    /* [n_fields]; sort buffers for btree/trigram */
+    SpillWriter       *bm_writers;/* [n_fields]; append file for bitmap fields */
     const SegRef      *segs;
     int                seg_start, seg_count;
     _Atomic int       *segs_done; /* progress counter (shared) */
     int                had_error;
 } SegScanWorker;
 
+/* Bitmap spill entry on disk: [u16 kf_shard][u16 vlen][vlen bytes][16B hash].
+   Unsorted append — bitmaps don't need ordering, just (value→slot) membership. */
+static void bm_spill_append(SpillWriter *bw, int kf_shard,
+                            const uint8_t *val, size_t vlen,
+                            const uint8_t hash[16], int *had_error) {
+    uint16_t s16 = (uint16_t)kf_shard, l16 = (uint16_t)vlen;
+    if (spill_writer_put(bw, &s16, 2) != 0 ||
+        spill_writer_put(bw, &l16, 2) != 0 ||
+        spill_writer_put(bw, val, vlen) != 0 ||
+        spill_writer_put(bw, hash, 16) != 0)
+        *had_error = 1;
+}
+
 static void *seg_scan_worker(void *arg) {
     SegScanWorker *w = (SegScanWorker *)arg;
 
-    /* Lazily open this worker's spill files (n_fields × idx_n). */
+    /* Lazily open this worker's spill files. btree/trigram → one file per
+       idx shard (sorted-run spill). bitmap → one append file per field. */
     for (int fi = 0; fi < w->n_fields; fi++) {
-        MFWorkerField *f = &w->fields[fi];
         char spill_dir[PATH_MAX];
         snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
                  w->db_root, w->object, w->descs[fi].name);
+        if (w->descs[fi].type == MF_BITMAP) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/bmw%d.bin", spill_dir, w->worker_idx);
+            if (spill_writer_open(&w->bm_writers[fi], path) != 0)
+                w->had_error = 1;
+            continue;
+        }
+        MFWorkerField *f = &w->fields[fi];
         for (int s = 0; s < w->idx_n; s++) {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/w%d_s%d.bin",
@@ -2815,9 +2843,31 @@ static void *seg_scan_worker(void *arg) {
                 uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
                 const uint8_t *hash  = rec;
                 const uint8_t *value = rec + 24 + klen;
-                for (int fi = 0; fi < w->n_fields; fi++)
-                    mf_append_field(&w->fields[fi], &w->descs[fi], hash, value,
+                for (int fi = 0; fi < w->n_fields; fi++) {
+                    const MFFieldDesc *d = &w->descs[fi];
+                    if (d->type == MF_BITMAP) {
+                        /* Extract the bitmap dict value (strip varchar len prefix). */
+                        int tidx = d->field_indices[0];
+                        if (tidx < 0) continue;
+                        const TypedField *tf = &w->ts->fields[tidx];
+                        const uint8_t *vb = value + tf->offset;
+                        const uint8_t *bval; size_t blen;
+                        if (tf->type == FT_VARCHAR) {
+                            uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
+                            if (al == 0) continue;
+                            bval = vb + 2; blen = al;
+                        } else {
+                            if (tf->size == 0) continue;
+                            bval = vb; blen = (size_t)tf->size;
+                        }
+                        int kf_shard = compute_record_shard(hash, w->splits);
+                        bm_spill_append(&w->bm_writers[fi], kf_shard, bval, blen,
+                                        hash, &w->had_error);
+                        continue;
+                    }
+                    mf_append_field(&w->fields[fi], d, hash, value,
                                     w->ts, w->splits, w->idx_n);
+                }
             }
             off += (off_t)(nslots * slot_size);
             if ((size_t)got < bufsz) break;  /* EOF */
@@ -2832,9 +2882,13 @@ static void *seg_scan_worker(void *arg) {
     }
     free(buf);
 
-    /* Final flush of every field's residual buffer. */
-    for (int fi = 0; fi < w->n_fields; fi++)
-        mf_flush_field(&w->fields[fi], w->splits, w->idx_n);
+    /* Final flush of btree/trigram buffers; drain+close bitmap append files. */
+    for (int fi = 0; fi < w->n_fields; fi++) {
+        if (w->descs[fi].type == MF_BITMAP)
+            spill_writer_close(&w->bm_writers[fi]);
+        else
+            mf_flush_field(&w->fields[fi], w->splits, w->idx_n);
+    }
     return NULL;
 }
 
@@ -2874,6 +2928,137 @@ static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_
 }
 
 /* Single segment-sequential build for a set of btree/trigram fields. */
+/* Read-only mmap of one kf shard for hash→slot probing. */
+typedef struct {
+    uint8_t                *map;       /* full mmap base (NULL if absent) */
+    size_t                  map_size;
+    const SlotcaskKfEntry  *ent;       /* map + 24 */
+    size_t                  cap;
+} KfMap;
+
+/* Open-addressed probe matching slotcask's lookup: stop at flag==0 (empty),
+   skip flag==2 (tombstone), match flag==1 + hash. Returns slot or -1. */
+static long kf_probe_slot(const KfMap *k, const uint8_t hash[16]) {
+    if (!k->map || k->cap == 0) return -1;
+    size_t start = kf_slot_for(hash, k->cap);
+    for (size_t i = 0; i < k->cap; i++) {
+        size_t slot = (start + i) % k->cap;
+        const SlotcaskKfEntry *e = &k->ent[slot];
+        if (e->flag == 0) return -1;
+        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) return (long)slot;
+    }
+    return -1;
+}
+
+/* Phase 2b — turn captured (kf_shard, value, hash) bitmap spills into .bm
+   files. Reads every keyfile shard once (sequential, ~1.6GB total) to map
+   hash→slot, then sets bits. Single-threaded: per field opens all `splits`
+   bm writers + holds `splits` kf mmaps, so fd use is ~2×splits. */
+static int resolve_bitmaps(const char *db_root, const char *object,
+                           const Schema *sch, TypedSchema *ts,
+                           SlotcaskDb *sdb,
+                           const MFFieldDesc *descs, int n_fields, int P) {
+    (void)ts;
+    int splits = sch->splits;
+    int n_bm = 0;
+    for (int fi = 0; fi < n_fields; fi++) if (descs[fi].type == MF_BITMAP) n_bm++;
+    if (n_bm == 0) return 0;
+
+    int slots = (int)slotcask_default_slots_for_splits(splits);
+    int rc = 0;
+
+    /* mmap every kf shard once, read-only, shared across all bitmap fields. */
+    KfMap *kf = calloc((size_t)splits, sizeof(KfMap));
+    if (!kf) return -1;
+    for (int s = 0; s < splits; s++) {
+        char kp[PATH_MAX];
+        slotcask_kf_path(kp, sizeof(kp), sdb->data_dir, s);
+        int fd = open(kp, O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && (size_t)st.st_size > 24) {
+            void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m != MAP_FAILED) {
+                kf[s].map = m;
+                kf[s].map_size = (size_t)st.st_size;
+                kf[s].ent = (const SlotcaskKfEntry *)((uint8_t *)m + 24);
+                kf[s].cap = ((size_t)st.st_size - 24) / sizeof(SlotcaskKfEntry);
+            }
+        }
+        close(fd);
+    }
+
+    LOG_WARN(LOG_SUB_BITMAP, "BUILD-BITMAP %s/%s: resolving %d bitmap field(s) via kf join",
+             db_root, object, n_bm);
+
+    for (int fi = 0; fi < n_fields; fi++) {
+        if (descs[fi].type != MF_BITMAP) continue;
+
+        /* Wipe + create every .bm shard, kept open as writer. */
+        BitmapShard **bm = calloc((size_t)splits, sizeof(BitmapShard *));
+        if (!bm) { rc = -1; continue; }
+        for (int s = 0; s < splits; s++) {
+            char bp[PATH_MAX];
+            bm_build_path(bp, sizeof(bp), db_root, object, descs[fi].name, s);
+            bm_cache_invalidate(bp);
+            unlink(bp);
+            bm[s] = bm_open(bp, slots, 1 /* create */,
+                            descs[fi].bm_bool_fastpath, descs[fi].bm_max_values,
+                            1 /* writer */);
+        }
+
+        char spill_dir[PATH_MAX];
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
+                 db_root, object, descs[fi].name);
+
+        for (int w = 0; w < P; w++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/bmw%d.bin", spill_dir, w);
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                uint8_t *m = mmap(NULL, (size_t)st.st_size, PROT_READ,
+                                  MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+#ifdef __linux__
+                    madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
+#endif
+                    size_t pos = 0, sz = (size_t)st.st_size;
+                    while (pos + 4 <= sz) {
+                        uint16_t kfs = (uint16_t)m[pos] | ((uint16_t)m[pos+1] << 8);
+                        uint16_t vl  = (uint16_t)m[pos+2] | ((uint16_t)m[pos+3] << 8);
+                        pos += 4;
+                        if (pos + (size_t)vl + 16 > sz) break;
+                        const uint8_t *val  = m + pos;
+                        const uint8_t *hash = m + pos + vl;
+                        pos += (size_t)vl + 16;
+                        if (kfs >= splits || !bm[kfs]) continue;
+                        long slot = kf_probe_slot(&kf[kfs], hash);
+                        if (slot >= 0)
+                            bm_set(bm[kfs], val, vl, (uint32_t)slot);
+                    }
+#ifdef __linux__
+                    madvise(m, (size_t)st.st_size, MADV_DONTNEED);
+#endif
+                    munmap(m, (size_t)st.st_size);
+                }
+            }
+            close(fd);
+            unlink(path);
+        }
+
+        for (int s = 0; s < splits; s++) if (bm[s]) bm_close(bm[s]);
+        free(bm);
+        rmdir(spill_dir);
+    }
+
+    for (int s = 0; s < splits; s++)
+        if (kf[s].map) munmap(kf[s].map, kf[s].map_size);
+    free(kf);
+    return rc;
+}
+
 static int seg_seq_build_spills(const char *db_root, const char *object,
                                 const Schema *sch, TypedSchema *ts,
                                 SlotcaskDb *sdb,
@@ -2932,8 +3117,11 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         workers[w].seg_count  = cnt;
         cursor += cnt;
         workers[w].fields = calloc((size_t)n_fields, sizeof(MFWorkerField));
-        if (!workers[w].fields) { alloc_ok = 0; break; }
+        workers[w].bm_writers = calloc((size_t)n_fields, sizeof(SpillWriter));
+        if (!workers[w].fields || !workers[w].bm_writers) { alloc_ok = 0; break; }
+        for (int fi = 0; fi < n_fields; fi++) workers[w].bm_writers[fi].fd = -1;
         for (int fi = 0; fi < n_fields && alloc_ok; fi++) {
+            if (descs[fi].type == MF_BITMAP) continue;  /* bitmap → append file, no sort buffers */
             if (mf_worker_field_alloc(&workers[w].fields[fi], &descs[fi],
                                       ts, per_field_budget, idx_n) != 0)
                 alloc_ok = 0;
@@ -2942,10 +3130,12 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
 
     if (!alloc_ok) {
         for (int w = 0; w < P; w++) {
-            if (!workers[w].fields) continue;
-            for (int fi = 0; fi < n_fields; fi++)
-                mf_worker_field_free_spill(&workers[w].fields[fi], idx_n);
-            free(workers[w].fields);
+            if (workers[w].fields) {
+                for (int fi = 0; fi < n_fields; fi++)
+                    mf_worker_field_free_spill(&workers[w].fields[fi], idx_n);
+                free(workers[w].fields);
+            }
+            free(workers[w].bm_writers);
         }
         free(workers); free(segs);
         return -1;
@@ -2969,14 +3159,17 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
             mf_worker_field_free_spill(&workers[w].fields[fi], idx_n);
         }
         free(workers[w].fields);
+        free(workers[w].bm_writers);
     }
     free(workers);
     free(segs);
 
-    /* Phase 2: merge per field. Spill files are w{0..P-1}_s{shard}.bin, so
-       the merge's "n_kf" arg is P (number of spill-producing workers). */
+    /* Phase 2a: merge btree/trigram spills per field. Spill files are
+       w{0..P-1}_s{shard}.bin, so the merge's "n_kf" arg is P. Bitmap fields
+       are resolved separately in Phase 2b (resolve_bitmaps). */
     int merge_rc = 0;
     for (int fi = 0; fi < n_fields; fi++) {
+        if (descs[fi].type == MF_BITMAP) continue;
         char spill_dir[PATH_MAX];
         snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
                  db_root, object, descs[fi].name);
@@ -3001,54 +3194,30 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         rmdir(spill_dir);
     }
 
-    return (any_error || merge_rc != 0) ? -1 : 0;
+    /* Phase 2b: resolve bitmap fields (kf hash→slot join). */
+    int bm_rc = resolve_bitmaps(db_root, object, sch, ts, sdb, descs, n_fields, P);
+
+    return (any_error || merge_rc != 0 || bm_rc != 0) ? -1 : 0;
 }
 
 /*
- * build_indexes_streaming_multi — build every index for one object.
- *
- * btree/trigram fields → one segment-sequential scan (seg_seq_build_spills):
- *   reads the value store once, front-to-back, no scattered kf I/O.
- * bitmap fields → build_bitmap_pass per field (needs the kf slot, so it
- *   walks kf shards; bitmaps are bool/enum and few, and are skipped
- *   entirely by reindex --composites-only).
+ * build_indexes_streaming_multi — build every index for one object in ONE
+ * sequential pass over the value store. btree/trigram/bitmap all extracted
+ * during the single segment scan (seg_seq_build_spills); bitmap slots are
+ * resolved from the keyfile afterwards (resolve_bitmaps).
  *
  * Caller holds the object's wrlock.
  */
 static int build_indexes_streaming_multi(const char *db_root, const char *object,
                                           const Schema *sch, TypedSchema *ts,
                                           const MFFieldDesc *descs, int n_fields) {
-    int rc = 0;
-
     SlotcaskSchemaInfo info = {
         .splits = sch->splits, .slot_size = sch->slot_size, .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) return -1;
 
-    /* btree/trigram fields → one segment-sequential scan over the value store. */
-    MFFieldDesc *spill = malloc((size_t)n_fields * sizeof(MFFieldDesc));
-    if (!spill) return -1;
-    int n_spill = 0;
-    for (int fi = 0; fi < n_fields; fi++)
-        if (descs[fi].type != MF_BITMAP) spill[n_spill++] = descs[fi];
-    if (n_spill > 0) {
-        if (seg_seq_build_spills(db_root, object, sch, ts, sdb, spill, n_spill) != 0)
-            rc = -1;
-    }
-    free(spill);
-
-    /* bitmap fields → kf-walk per field (build_bitmap_pass wipes + rebuilds
-       every .bm shard; it needs the kf slot so it can't use the seg scan).
-       Skipped entirely under reindex --composites-only. */
-    for (int fi = 0; fi < n_fields; fi++) {
-        if (descs[fi].type != MF_BITMAP) continue;
-        if (build_bitmap_pass(db_root, object, sch, ts, descs[fi].name,
-                              descs[fi].bm_max_values, 1 /* force */) != 0)
-            rc = -1;
-    }
-
-    return rc;
+    return seg_seq_build_spills(db_root, object, sch, ts, sdb, descs, n_fields);
 }
 
 /* ========== REINDEX ==========
