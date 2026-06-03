@@ -2402,9 +2402,13 @@ static void build_indexes_pass(const char *db_root, const char *object,
         }
     }
 
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: pass on %d fields, scanning %d kf shards...",
+             db_root, object, n, sch->splits);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
     scan_dispatch(db_root, object, sch, data_dir, multi_index_scan_cb, &mc);
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: scan done, partitioning...",
+             db_root, object);
     for (int fi = 0; fi < n; fi++) pthread_mutex_destroy(&mc.lock[fi]);
 
     ShardBuildArg *sb = malloc((size_t)n * idx_n * sizeof(ShardBuildArg));
@@ -2613,6 +2617,23 @@ int cmd_add_indexes(const char *db_root, const char *object,
 
             int n_batches = 0;
             int batch_start = 0;
+            /* Pre-count total batches so per-batch log can show X/N */
+            int total_batches = 0;
+            {
+                int bs = 0;
+                while (bs < actual_count) {
+                    size_t bb = 0;
+                    int be = bs;
+                    while (be < actual_count) {
+                        size_t next = per_field_bytes[be];
+                        if (be > bs && bb + next > budget) break;
+                        bb += next;
+                        be++;
+                    }
+                    total_batches++;
+                    bs = be;
+                }
+            }
             while (batch_start < actual_count) {
                 size_t batch_bytes = 0;
                 int batch_end = batch_start;
@@ -2622,6 +2643,9 @@ int cmd_add_indexes(const char *db_root, const char *object,
                     batch_bytes += next;
                     batch_end++;
                 }
+                LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: batch %d/%d (fields %d..%d, budget=%zu MB)...",
+                         db_root, object, n_batches + 1, total_batches,
+                         batch_start, batch_end - 1, budget / (1024 * 1024));
                 build_indexes_pass(db_root, object, &sch, ts, actual_fields,
                                    batch_start, batch_end - batch_start,
                                    (size_t)live_count);
@@ -3006,6 +3030,9 @@ int reindex_object(const char *eff_root, const char *object, int composites_only
     fclose(ic);
     snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
     if (nf == 0) return 0;
+
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: starting (%d indexes%s)...",
+             eff_root, object, nf, composites_only ? ", composites-only" : "");
 
     reindex_wipe_idx_dirs(eff_root, object);
 
