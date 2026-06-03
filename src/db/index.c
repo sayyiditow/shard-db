@@ -3107,6 +3107,24 @@ static int mf_record_cb(uint32_t slot, const uint8_t hash16[16],
 /* Phase 1 worker: scans one kf shard for all fields simultaneously. */
 static void *mf_scan_worker(void *arg) {
     MFWorker *w = (MFWorker *)arg;
+
+    /* Create spill files lazily here (not in the alloc loop) so that
+       256×6×16 = 24,576 file-creates don't block the alloc phase. */
+    for (int fi = 0; fi < w->n_fields; fi++) {
+        if (w->descs[fi].type == MF_BITMAP) continue;
+        MFWorkerField *f = &w->fields[fi];
+        char spill_dir[PATH_MAX];
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
+                 w->db_root, w->object, w->descs[fi].name);
+        for (int s = 0; s < w->idx_n; s++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/w%d_s%d.bin",
+                     spill_dir, w->kf_shard, s);
+            if (spill_writer_open(&f->spill_writers[s], path) != 0)
+                f->had_error = 1;
+        }
+    }
+
     for (int fi = 0; fi < w->n_fields; fi++) {
         if (w->descs[fi].type != MF_BITMAP) continue;
         char bp[PATH_MAX];
@@ -3294,16 +3312,11 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
 
             f->spill_writers = calloc((size_t)idx_n, sizeof(SpillWriter));
             if (!f->spill_writers) { alloc_ok = 0; break; }
-
-            char spill_dir[PATH_MAX];
-            snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
-                     db_root, object, descs[fi].name);
-            for (int s = 0; s < idx_n && alloc_ok; s++) {
-                char path[PATH_MAX];
-                snprintf(path, sizeof(path), "%s/w%d_s%d.bin", spill_dir, w, s);
-                if (spill_writer_open(&f->spill_writers[s], path) != 0)
-                    alloc_ok = 0;
-            }
+            /* calloc zeros fd to 0 (stdin); set -1 so spill_writer_close
+               never closes stdin if a worker exits before opening files. */
+            for (int s = 0; s < idx_n; s++) f->spill_writers[s].fd = -1;
+            /* Spill files are created lazily inside mf_scan_worker to avoid
+               opening 256×6×16 = 24,576 files upfront during alloc. */
         }
     }
 
@@ -3320,14 +3333,26 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
         return -1;
     }
 
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: alloc done, starting scan (%d shards, %d batches)...",
+             db_root, object, n_kf, (n_kf + pool_size - 1) / pool_size);
+
     /* Phase 1: single scan pass across all kf shards.
        Use parallel_for_io (independent threads, not the shared pool) so that
        connection-handler threads blocked on objlock_rdlock (while we hold
        objlock_wrlock) can't starve the scan workers out of the thread pool. */
+    uint64_t t_scan = now_ms_coarse();
+    int n_batches = (n_kf + pool_size - 1) / pool_size;
     for (int base = 0; base < n_kf; base += pool_size) {
+        int batch_num = base / pool_size + 1;
         int cnt = (base + pool_size <= n_kf) ? pool_size : (n_kf - base);
+        uint64_t tb = now_ms_coarse();
         parallel_for_io(mf_scan_worker, workers + base, cnt, sizeof(MFWorker));
+        LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: scan batch %d/%d done in %llums",
+                 db_root, object, batch_num, n_batches,
+                 (unsigned long long)(now_ms_coarse() - tb));
     }
+    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: scan done in %llums, starting merge...",
+             db_root, object, (unsigned long long)(now_ms_coarse() - t_scan));
 
     int any_error = 0;
     for (int w = 0; w < n_kf; w++) {
