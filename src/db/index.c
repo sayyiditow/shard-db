@@ -3001,11 +3001,11 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
 }
 
 /* Rebuild every index for one object: read index.conf for the field list,
-   wipe stale on-disk idx files (any layout), then cmd_add_indexes(force=1).
-   Used by both cmd_reindex (multi-object walk) and rebuild_object (after a
-   vacuum --splits or --compact that may have changed the layout under our
-   feet). Returns the number of indexes rebuilt; 0 if the object has no
-   index.conf or it's empty. */
+   wipe stale on-disk idx files, then rebuild each index via the per-field
+   streaming path (bounded memory; spill+external-merge, one kf-scan per field).
+   Caller must hold objlock_wrlock(eff_root, object) — cmd_reindex takes it
+   per-object; rebuild_object_v2 (vacuum) inherits it from the server dispatch.
+   Returns the number of indexes rebuilt; 0 if index.conf is absent or empty. */
 int reindex_object(const char *eff_root, const char *object, int composites_only) {
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
@@ -3013,38 +3013,73 @@ int reindex_object(const char *eff_root, const char *object, int composites_only
     FILE *ic = fopen(ic_path, "r");
     if (!ic) return 0;
 
-    char fields_json[8192];
-    int pos = snprintf(fields_json, sizeof(fields_json), "[");
+    /* Collect field specs from index.conf (each line may carry a type suffix
+       like :bitmap or :trigram; cmd_add_index handles the full canonical form). */
+    char (*field_specs)[512] = malloc((size_t)MAX_FIELDS * 512);
+    if (!field_specs) { fclose(ic); return 0; }
     int nf = 0;
     char fline[512];
-    while (fgets(fline, sizeof(fline), ic)) {
+    while (fgets(fline, sizeof(fline), ic) && nf < MAX_FIELDS) {
         fline[strcspn(fline, "\n")] = '\0';
         if (!fline[0]) continue;
         if (composites_only && !strchr(fline, '+')) continue;
-        int avail = (int)sizeof(fields_json) - pos - 8;
-        if (avail <= 0) break;
-        pos += snprintf(fields_json + pos, avail,
-                        "%s\"%s\"", nf ? "," : "", fline);
+        strncpy(field_specs[nf], fline, 511);
+        field_specs[nf][511] = '\0';
         nf++;
     }
     fclose(ic);
-    snprintf(fields_json + pos, sizeof(fields_json) - pos, "]");
-    if (nf == 0) return 0;
+    if (nf == 0) { free(field_specs); return 0; }
 
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: starting (%d indexes%s)...",
              eff_root, object, nf, composites_only ? ", composites-only" : "");
 
-    reindex_wipe_idx_dirs(eff_root, object);
+    if (!composites_only) {
+        /* Full reindex: wipe all index dirs so orphan shards from a prior
+           vacuum --splits (which changes idx_splits count) are cleaned up. */
+        reindex_wipe_idx_dirs(eff_root, object);
+    } else {
+        /* Composites-only: selectively wipe only the composite field dirs so
+           non-composite indexes remain intact. Strip any :bitmap/:trigram
+           type suffix to get the bare name used as the directory name. */
+        char idx_root[PATH_MAX];
+        snprintf(idx_root, sizeof(idx_root), "%s/%s/indexes", eff_root, object);
+        for (int i = 0; i < nf; i++) {
+            char fname[512]; strncpy(fname, field_specs[i], 511); fname[511] = '\0';
+            char *colon = strchr(fname, ':'); if (colon) *colon = '\0';
+            char fdir[PATH_MAX];
+            snprintf(fdir, sizeof(fdir), "%s/%s", idx_root, fname);
+            DIR *dd = opendir(fdir);
+            if (dd) {
+                struct dirent *de;
+                while ((de = readdir(dd))) {
+                    if (de->d_name[0] == '.') continue;
+                    char sp[PATH_MAX];
+                    snprintf(sp, sizeof(sp), "%s/%s", fdir, de->d_name);
+                    btree_cache_invalidate(sp);
+                }
+                closedir(dd);
+            }
+            rmrf(fdir);
+        }
+    }
 
-    /* cmd_add_indexes emits its own JSON to OUT; redirect to /dev/null so
-       reindex_object stays silent (callers wrap their own response). */
+    /* Rebuild each index via the per-field streaming path (one kf-scan per
+       field; spill-to-disk + external merge). This replaces the batched
+       in-RAM cmd_add_indexes path, which required multiple full scans when
+       any field's pair-count exceeded INDEX_BUILD_BUDGET_MB. cmd_add_index
+       emits JSON per field — redirect to /dev/null so callers get silence. */
     FILE *saved_out = g_out;
     FILE *devnull = fopen("/dev/null", "w");
     g_out = devnull ? devnull : saved_out;
-    cmd_add_indexes(eff_root, object, fields_json, 1);
+    for (int i = 0; i < nf; i++) {
+        LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: index %d/%d (%s)...",
+                 eff_root, object, i + 1, nf, field_specs[i]);
+        cmd_add_index(eff_root, object, field_specs[i], 1 /* force */);
+    }
     g_out = saved_out;
     if (devnull) fclose(devnull);
 
+    free(field_specs);
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
     return nf;
 }
@@ -3118,13 +3153,15 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
         char eff_root[PATH_MAX];
         snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
-        /* reindex_object handles everything: reads index.conf, wipes any
-           stale on-disk artefacts (including high-numbered idx shards left
-           behind by a vacuum --splits=N where the new index_splits is
-           smaller than the old one — the very situation that bit users
-           on the splits=64 → splits=32 path), and rebuilds via
-           cmd_add_indexes(force=1). */
+        /* Exclusive lock for the full wipe+rebuild cycle: inserts that
+           arrive after the wipe would write to fresh idx files that
+           build_btree_streaming(force=1) then discards. The lock queues
+           them until reindex completes. rebuild_object_v2 (vacuum) holds
+           this lock already via the server dispatch; reindex must take it
+           explicitly here since it bypasses that dispatch path. */
+        objlock_wrlock(eff_root, obj);
         int n = reindex_object(eff_root, obj, composites_only);
+        objlock_wrunlock(eff_root, obj);
         if (n > 0) {
             objects_rebuilt++;
             indexes_rebuilt += n;

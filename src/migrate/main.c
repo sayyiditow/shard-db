@@ -1,14 +1,15 @@
 /* migrate — one-shot per-release upgrade runner.
  *
- * For 2026.05.5:
+ * For 2026.05.7 (composite index typed binary encoding):
  *   1. Spawn `./shard-db start` and poll until ready.
- *   2. Run `./shard-db reindex` to rebuild every B+ tree under the new
- *      BTRH (value, hash)-sorted layout that 2026.05.5 expects.
+ *   2. Run `./shard-db reindex --composites-only` to rebuild composite
+ *      indexes (field1+field2) under the new typed binary sort key format.
+ *      Non-composite indexes are unchanged and do not need rebuilding.
  *   3. Stop the daemon.
  *
- * reindex is idempotent — running migrate on a fresh install or a
- * database already on BTRH format simply rewrites btrees in their
- * current format. No magic-number sniffing here.
+ * Prerequisite: must be on 2026.05.5+ (BTRH format). If upgrading from
+ * an earlier version, run 2026.05.4's ./migrate first, then 2026.05.5's
+ * ./migrate (full reindex), then this one.
  *
  * Reads DB_ROOT from db.env in the current working directory.
  */
@@ -73,7 +74,7 @@ int main(int argc, char **argv) {
     if (load_db_root("db.env", db_root, sizeof(db_root)) < 0) return 1;
     fprintf(stdout, "migrate: DB_ROOT=%s\n", db_root);
 
-    fprintf(stdout, "migrate: phase 1/1 — reindex (rebuild B+ trees under (value, hash) sort)\n");
+    fprintf(stdout, "migrate: phase 1/1 — reindex --composites-only (rebuild composite indexes under typed binary encoding)\n");
     if (system("./shard-db start") != 0) {
         fprintf(stderr, "migrate: ./shard-db start failed\n");
         return 1;
@@ -84,7 +85,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int reindex_rc = system("./shard-db reindex");
+    int reindex_rc = system("./shard-db reindex --composites-only");
     int stop_rc = system("./shard-db stop");
 
     if (reindex_rc != 0) {
