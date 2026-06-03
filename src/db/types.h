@@ -790,8 +790,8 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
 
 /* Build an index key from a typed record for a (possibly composite) spec.
    Single-field: binary-encoded bytes (typed_field_to_index_key).
-   Composite ("a+b+c"): ASCII-concatenated values — kept on the legacy string
-   path by design, since composite semantics are "whatever the user typed".
+    Composite ("a+b+c"): typed binary concatenated values
+    (typed_field_to_index_key per sub-field).
    Returns 1 on success with malloc'd *out_val and *out_len set; caller frees.
    Returns 0 if any sub-field is missing/empty or spec is unknown. */
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
@@ -801,7 +801,7 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
 /* Build an index key from a JSON object for a (possibly composite) spec.
    Extracts the necessary fields from json, then encodes:
      single-field → encode_field_for_index (binary),
-     composite    → ASCII concatenation (legacy path).
+      composite    → typed binary concatenation.
    Returns 1 on success with malloc'd *out_val and *out_len set; caller
    frees. ts may be NULL (untyped object) — in that case every field is
    treated as raw varchar text. Returns 0 on missing/empty values. */
@@ -987,9 +987,9 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
 
 /* index.c */
 /* Value is raw index-key bytes (see encode_field_for_index /
-   typed_field_to_index_key). Composite indexes pass the ASCII-concatenated
-   string + its strlen; single-field indexes pass encoded bytes + their true
-   length. vlen may be 0 (empty key sorts before all others). */
+   typed_field_to_index_key). Composite indexes pass the typed binary
+   concatenated sub-field index keys; single-field indexes pass encoded
+   bytes + their true length. vlen may be 0 (empty key sorts before all others). */
 void write_index_entry(const char *db_root, const char *object, const char *field,
                        int splits,
                        const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
