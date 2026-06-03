@@ -2,6 +2,14 @@
 
 Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
 
+## Working model (plan → delegate → review → commit)
+
+Default workflow for non-trivial work, unless the user says otherwise for a given task:
+
+1. **Claude plans.** Investigate and diagnose, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored). Each plan embeds its own execution rules: branch off `main`; do tasks in order; locate edits by searching the quoted anchor text (line numbers drift); build with `SKIP_TESTS=1 ./build.sh`, test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; stop and write `PLAN_NOTES.md` rather than guess if a referenced symbol/anchor isn't where expected.
+2. **Another model executes** the plan on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`.
+3. **Claude reviews and commits.** Review the diff (focus on the plan's flagged risks), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
+
 ## Overview
 
 shard-db is a high-performance database in C. Single static binary, single process, no external dependencies. Typed binary records, B+ tree indexes, joins, aggregates, CAS, multi-threaded TCP server with optional native TLS 1.3. Linux x86_64 / ARM64 + macOS (Apple Silicon, 2026.05.4+).
