@@ -1294,13 +1294,13 @@ static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
             char cat[4096]; int cp = 0; int ok = 1;
             for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
                 int tidx = sw->idx_field_indices[fi][si];
-                char *v = (tidx >= 0)
-                    ? typed_get_field_str(sw->ts, new_value, tidx)
-                    : NULL;
-                if (!v || !v[0]) { ok = 0; free(v); break; }
-                int sl = strlen(v);
-                if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
-                free(v);
+                if (tidx < 0) { ok = 0; break; }
+                size_t blen = 0;
+                typed_field_to_index_key(sw->ts, new_value, tidx,
+                                          (uint8_t *)cat + cp, &blen);
+                if (blen == 0) { ok = 0; break; }
+                if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
+                else { ok = 0; break; }
             }
             if (ok && cp > 0) {
                 key_buf = malloc((size_t)cp);
@@ -5846,7 +5846,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     slotcask_registry_invalidate(db_root, object);
 
     int idx_rebuilt = 0;
-    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object, 0);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
@@ -6170,7 +6170,7 @@ int rebuild_object(const char *db_root, const char *object,
        data shards atomically with the splits change. Compact-only changes
        slot_size but not the hash routing, so idx layout stays valid. */
     int idx_rebuilt = 0;
-    if (splits_changed) idx_rebuilt = reindex_object(db_root, object);
+    if (splits_changed) idx_rebuilt = reindex_object(db_root, object, 0);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD %s/%s: live=%d, splits=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_splits, new_splits,
@@ -9156,21 +9156,17 @@ static int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
         int pos = 0;
         char *save = NULL;
         char *tok = strtok_r(fb, "+", &save);
-        while (tok && pos < (int)bufsz - 1) {
+        while (tok) {
             int idx = driver_ts ? typed_field_index(driver_ts, tok) : -1;
-            if (idx >= 0) {
-                const TypedField *tf = &driver_ts->fields[idx];
-                char tmp[256];
-                int tl = typed_field_to_buf_raw(tf, driver_raw + tf->offset,
-                                                tmp, sizeof(tmp));
-                if (tl > 0 && pos + tl < (int)bufsz) {
-                    memcpy(buf + pos, tmp, tl);
-                    pos += tl;
-                }
-            }
+            if (idx < 0) { tok = strtok_r(NULL, "+", &save); continue; }
+            size_t blen = 0;
+            typed_field_to_index_key(driver_ts, driver_raw, idx,
+                                      (uint8_t *)buf + pos, &blen);
+            if (blen == 0) { tok = strtok_r(NULL, "+", &save); continue; }
+            if (pos + (int)blen < (int)bufsz) { pos += (int)blen; }
+            else break;
             tok = strtok_r(NULL, "+", &save);
         }
-        buf[pos] = '\0';
         return pos;
     }
     if (j->local_tf) {
@@ -9226,8 +9222,8 @@ static int lookup_remote(const JoinSpec *j, const char *db_root,
         const TypedField *rem_tf = resolve_idx_field(j->remote_fs.ts, j->remote_field);
         uint8_t keybuf[1032];
         size_t keylen;
-        if (rem_tf) {
-            encode_field_for_index(rem_tf, local_key, local_len, keybuf, &keylen);
+        if (rem_tf && !j->local_is_composite) {
+            encode_field_for_index(rem_tf, local_key, (int)local_len, keybuf, &keylen);
             btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
                              (const char *)keybuf, keylen, join_bt_first_cb, &hit);
         } else {

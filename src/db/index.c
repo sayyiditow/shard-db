@@ -642,7 +642,7 @@ void index_parallel(const char *db_root, const char *object, int splits,
         size_t key_len = 0;
 
         if (strchr(fields[i], '+')) {
-            /* Composite — ASCII concat of sub-field values (raw bytes). */
+            /* Composite — typed binary concat of sub-field values. */
             char fbuf[256];
             strncpy(fbuf, fields[i], 255); fbuf[255] = '\0';
             char result[4096];
@@ -650,15 +650,30 @@ void index_parallel(const char *db_root, const char *object, int splits,
             int all_present = 1;
             char *_tok_save = NULL; char *tok = strtok_r(fbuf, "+", &_tok_save);
             while (tok) {
+                int fidx = ts ? typed_field_index(ts, tok) : -1;
+                /* Find the extracted text value */
+                char *txt = NULL;
                 for (int j = 0; j < unique_count; j++) {
                     if (strcmp(unique_keys[j], tok) == 0) {
-                        if (!extracted[j] || extracted[j][0] == '\0') { all_present = 0; break; }
-                        int len = strlen(extracted[j]);
-                        if (pos + len < (int)sizeof(result)) {
-                            memcpy(result + pos, extracted[j], len);
-                            pos += len;
-                        }
+                        txt = extracted[j];
                         break;
+                    }
+                }
+                if (!txt || txt[0] == '\0') { all_present = 0; break; }
+                if (fidx >= 0) {
+                    const TypedField *f = &ts->fields[fidx];
+                    size_t blen = 0;
+                    encode_field_for_index(f, txt, strlen(txt),
+                                            (uint8_t *)result + pos, &blen);
+                    if (blen == 0) { all_present = 0; break; }
+                    if (pos + (int)blen < (int)sizeof(result)) { pos += (int)blen; }
+                    else { all_present = 0; break; }
+                } else {
+                    /* No schema — pass raw bytes */
+                    int len = strlen(txt);
+                    if (pos + len < (int)sizeof(result)) {
+                        memcpy(result + pos, txt, len);
+                        pos += len;
                     }
                 }
                 if (!all_present) break;
@@ -755,12 +770,11 @@ int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *recor
         while (tok) {
             int fi = typed_field_index(ts, tok);
             if (fi < 0) return 0;
-            char *v = typed_get_field_str(ts, record, fi);
-            if (!v) return 0;
-            size_t sl = strlen(v);
-            if (cp + sl > out_cap) { free(v); return -1; }
-            memcpy(out + cp, v, sl); cp += sl;
-            free(v);
+            size_t blen = 0;
+            typed_field_to_index_key(ts, record, fi, out + cp, &blen);
+            if (blen == 0) return 0;
+            if (cp + blen > out_cap) return -1;
+            cp += (int)blen;
             tok = strtok_r(NULL, "+", &_tok_save);
         }
         if (cp == 0) return 0;
@@ -788,18 +802,18 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
     *out_len = 0;
 
     if (strchr(spec, '+')) {
-        /* Composite — ASCII concat per field, stays on the string path. */
+        /* Composite — binary index-key concat per field. */
         char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
         char cat[4096]; int cp = 0; int ok = 1;
         char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
         while (tok) {
             int fi = typed_field_index(ts, tok);
             if (fi < 0) { ok = 0; break; }
-            char *v = typed_get_field_str(ts, record, fi);
-            if (!v) { ok = 0; break; }
-            int sl = strlen(v);
-            if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, v, sl); cp += sl; }
-            free(v);
+            size_t blen = 0;
+            typed_field_to_index_key(ts, record, fi, (uint8_t *)cat + cp, &blen);
+            if (blen == 0) { ok = 0; break; }
+            if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
+            else { ok = 0; break; }
             tok = strtok_r(NULL, "+", &_tok_save);
         }
         if (!ok || cp == 0) return 0;
@@ -833,7 +847,7 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
     *out_len = 0;
 
     if (strchr(spec, '+')) {
-        /* Composite — extract each sub-field and ASCII-concat. */
+        /* Composite — extract each sub-field and encode to index-key bytes. */
         char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
         const char *subs[16]; int nsub = 0;
         char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
@@ -843,8 +857,21 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         char cat[4096]; int cp = 0; int ok = 1;
         for (int i = 0; i < nsub; i++) {
             if (!vals[i] || vals[i][0] == '\0') { ok = 0; break; }
-            int sl = strlen(vals[i]);
-            if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, vals[i], sl); cp += sl; }
+            int fi = ts ? typed_field_index(ts, subs[i]) : -1;
+            if (fi >= 0) {
+                const TypedField *f = &ts->fields[fi];
+                size_t blen = 0;
+                encode_field_for_index(f, vals[i], strlen(vals[i]),
+                                        (uint8_t *)cat + cp, &blen);
+                if (blen == 0) { ok = 0; break; }
+                if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
+                else { ok = 0; break; }
+            } else {
+                /* No schema → fall back to raw string (backward compat) */
+                int sl = strlen(vals[i]);
+                if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, vals[i], sl); cp += sl; }
+                else { ok = 0; break; }
+            }
         }
         for (int i = 0; i < nsub; i++) free(vals[i]);
         if (!ok || cp == 0) return 0;
@@ -1193,8 +1220,12 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
         if (mc->is_composite[fi]) {
             char cat[4096]; int cpos = 0; int ok = 1;
             for (int si = 0; si < mc->field_index_count[fi]; si++) {
-                char *v = typed_get_field_str(mc->ts, (const uint8_t *)raw, mc->field_indices[fi][si]);
-                if (v) { int sl = strlen(v); memcpy(cat + cpos, v, sl); cpos += sl; free(v); }
+                size_t blen = 0;
+                typed_field_to_index_key(mc->ts, (const uint8_t *)raw,
+                                          mc->field_indices[fi][si],
+                                          (uint8_t *)cat + cpos, &blen);
+                if (blen == 0) { ok = 0; break; }
+                if (cpos + (int)blen < (int)sizeof(cat)) { cpos += (int)blen; }
                 else { ok = 0; break; }
             }
             if (ok && cpos > 0) {
@@ -1258,12 +1289,10 @@ static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void
     return 0;
 }
 
-/* Average ASCII width of typed_get_field_str(f) — used for composite keys,
-   which are built as ASCII concatenation of each child field's stringified
-   value (see multi_index_scan_cb's composite branch). Numbers come from
-   typed_get_field_str in config.c (FT_DATE → "%08d", FT_DATETIME → 14 chars,
-   FT_BOOL → "true"/"false", others via decode_field_to_buf). varchars use
-   50% fill of f->size-2, same as the single-field estimator. */
+/* Average index-key size per field for composite key budgeting.
+   Composites are now built by concatenating typed_field_to_index_key output
+   (binary, total-order encoded). Fixed-width types use f->size; varchars
+   use 50% fill of f->size-2, same as the single-field estimator. */
 static size_t typed_field_str_avg(const TypedField *f) {
     switch (f->type) {
     case FT_NONE:     return 16;  /* unassigned — conservative fallback */
@@ -1272,29 +1301,20 @@ static size_t typed_field_str_avg(const TypedField *f) {
         size_t avg = content_max / 2;
         return avg < 1 ? 1 : avg;
     }
-    case FT_BOOL:     return 5;   /* "true" / "false" */
-    case FT_BYTE:     return 3;   /* up to "255" */
-    case FT_SHORT:    return 6;   /* up to "-32768" */
-    case FT_INT:      return 11;  /* up to "-2147483648" */
-    case FT_LONG:     return 20;  /* up to "-9223372036854775808" */
-    case FT_DOUBLE:   return 15;  /* typical %g */
-    case FT_FLOAT:   return 12;  /* typical %g */
-    case FT_NUMERIC:  return 16;  /* sign + 12 digits + dot + scale */
-    case FT_DATE:     return 8;   /* YYYYMMDD via %08d */
-    case FT_DATETIME: return 14;  /* YYYYMMDDHHmmss */
-    case FT_TIME:     return 8;   /* HH:MM:SS */
-    case FT_TIMESTAMP: return 20; /* Unix epoch ms, up to 19 digits + sign */
-    case FT_UUID:     return 36;  /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
-    case FT_ENUM: {
-        /* Mean length of the declared value strings; pre-declared at
-           create-object, so the estimate is exact (not heuristic). */
-        if (!f->enum_values || f->n_enum_values <= 0) return 8;
-        size_t sum = 0;
-        for (int i = 0; i < f->n_enum_values; i++)
-            sum += f->enum_values[i] ? strlen(f->enum_values[i]) : 0;
-        size_t avg = sum / (size_t)f->n_enum_values;
-        return avg < 1 ? 1 : avg;
-    }
+    case FT_BOOL:
+    case FT_BYTE:     return 1;   /* single byte */
+    case FT_SHORT:    return 2;   /* int16 BE + total-order flip */
+    case FT_INT:      return 4;   /* int32 BE + total-order flip */
+    case FT_LONG:     return 8;   /* int64 BE + total-order flip */
+    case FT_DOUBLE:   return 8;   /* IEEE-754 total-order flip */
+    case FT_FLOAT:    return 4;   /* IEEE-754 total-order flip */
+    case FT_NUMERIC:  return 8;   /* int64 BE + total-order flip */
+    case FT_DATE:     return 4;   /* int32 BE + total-order flip */
+    case FT_DATETIME: return 6;   /* int32 BE date + uint16 BE time */
+    case FT_TIME:     return 3;   /* uint24 BE + total-order flip */
+    case FT_TIMESTAMP: return 8;  /* int64 BE + total-order flip */
+    case FT_UUID:     return 16;  /* raw 16 bytes */
+    case FT_ENUM:     return (size_t)f->enum_width;  /* 1 or 2 bytes BE */
     }
     return 16;
 }
@@ -1312,10 +1332,10 @@ static size_t estimate_field_build_bytes(const TypedSchema *ts,
     size_t key_avg = 16;
 
     if (strchr(field, '+')) {
-        /* Composite key — sum each child field's ASCII width. Composite keys
-           are built by concatenating typed_get_field_str(child) per child, so
-           the right estimate is the sum of typed_field_str_avg over children,
-           NOT a flat constant. status+invoiceDate is ~18 B, not 64. */
+        /* Composite key — sum each child field's binary index-key width.
+           Composite keys are built by concatenating typed_field_to_index_key
+           per child; the estimate is the sum of typed_field_str_avg over
+           children. status+invoiceDate ≈ 12 B (4+8), not 64. */
         char fb[256]; strncpy(fb, field, 255); fb[255] = '\0';
         size_t sum = 0;
         char *save = NULL;
@@ -2046,15 +2066,13 @@ static int stream_record_cb(uint32_t slot, const uint8_t hash16[16],
     if (w->is_composite) {
         char cat[4096]; int cpos = 0; int ok = 1;
         for (int i = 0; i < w->field_index_count; i++) {
-            char *v = typed_get_field_str(w->ts, (const uint8_t *)value,
-                                          w->field_indices[i]);
-            if (v) {
-                int sl = (int)strlen(v);
-                if (cpos + sl >= (int)sizeof(cat)) { free(v); ok = 0; break; }
-                memcpy(cat + cpos, v, (size_t)sl);
-                cpos += sl;
-                free(v);
-            } else { ok = 0; break; }
+            size_t blen = 0;
+            typed_field_to_index_key(w->ts, (const uint8_t *)value,
+                                      w->field_indices[i],
+                                      (uint8_t *)cat + cpos, &blen);
+            if (blen == 0) { ok = 0; break; }
+            if (cpos + (int)blen < (int)sizeof(cat)) { cpos += (int)blen; }
+            else { ok = 0; break; }
         }
         if (!ok || cpos == 0) return 0;
         key_len = (size_t)cpos;
@@ -2964,7 +2982,7 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
    vacuum --splits or --compact that may have changed the layout under our
    feet). Returns the number of indexes rebuilt; 0 if the object has no
    index.conf or it's empty. */
-int reindex_object(const char *eff_root, const char *object) {
+int reindex_object(const char *eff_root, const char *object, int composites_only) {
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
              eff_root, object);
@@ -2978,6 +2996,7 @@ int reindex_object(const char *eff_root, const char *object) {
     while (fgets(fline, sizeof(fline), ic)) {
         fline[strcspn(fline, "\n")] = '\0';
         if (!fline[0]) continue;
+        if (composites_only && !strchr(fline, '+')) continue;
         int avail = (int)sizeof(fields_json) - pos - 8;
         if (avail <= 0) break;
         pos += snprintf(fields_json + pos, avail,
@@ -3036,7 +3055,7 @@ static void reindex_clean_legacy(const char *eff_root, const char *object) {
     closedir(d);
 }
 
-int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter) {
+int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_filter, int composites_only) {
     char scpath[PATH_MAX];
     snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
     FILE *sf = fopen(scpath, "r");
@@ -3078,7 +3097,7 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
            smaller than the old one — the very situation that bit users
            on the splits=64 → splits=32 path), and rebuilds via
            cmd_add_indexes(force=1). */
-        int n = reindex_object(eff_root, obj);
+        int n = reindex_object(eff_root, obj, composites_only);
         if (n > 0) {
             objects_rebuilt++;
             indexes_rebuilt += n;
