@@ -10644,10 +10644,11 @@ typedef enum {
 } FilterPlanKind;
 
 typedef enum {
-    FP_ORDER_NONE,       /* no order_by */
-    FP_ORDER_COMPOSITE,  /* (filter+order) composite → sorted prefix scan       (D1) */
-    FP_ORDER_SORT,       /* bounded candidate set → sort in memory              (D2) */
-    FP_ORDER_INDEX_WALK  /* candidates too broad → walk order_by index to limit (D3) */
+    FP_ORDER_NONE,              /* no order_by */
+    FP_ORDER_COMPOSITE,         /* (filter+order) composite → sorted prefix scan       (D1) */
+    FP_ORDER_COMPOSITE_EXACT,   /* all composite fields pinned by eq → exact key lookup (Phase B) */
+    FP_ORDER_SORT,              /* bounded candidate set → sort in memory              (D2) */
+    FP_ORDER_INDEX_WALK         /* candidates too broad → walk order_by index to limit (D3) */
 } FilterOrderKind;
 
 typedef struct FilterPlan {
@@ -10661,6 +10662,7 @@ typedef struct FilterPlan {
     int              n_postfilter;
     int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
     int              fetching;                           /* dimension this plan was computed for */
+    char             composite_field[256];               /* set when order==FP_ORDER_COMPOSITE_EXACT */
 } FilterPlan;
 
 /* Classify post-filter leaves: which are bitmap eq/in that can be tested
@@ -11331,6 +11333,44 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                            (const char *)buf_hi, len_hi, 0,
                            order_desc, composite_prefix_cb, &ctx);
 
+    return ctx.printed;
+}
+
+/* Forward declarations (defined later in this file). */
+static int build_exact_composite_key(const FieldSchema *fs, const char *composite_field,
+                                     SearchCriterion **leaves, int nL,
+                                     uint8_t *out, size_t *out_len);
+
+/* Exact composite lookup: walk the composite btree for the single concatenated
+ * key built from the eq leaves. composite_prefix_cb fetches each hash and
+ * post-filters the full tree (so any non-composite siblings still apply). */
+static int find_via_composite_key(const char *db_root, const char *object,
+                                  const Schema *sch, FieldSchema *fs,
+                                  const char *composite_field,
+                                  SearchCriterion **eq_leaves, int n_eq,
+                                  CriteriaNode *tree, ExcludedKeys *excluded,
+                                  int offset, int limit,
+                                  const char **proj_fields, int proj_count,
+                                  int dict_fmt, QueryDeadline *dl) {
+    /* Rebuild the exact key in composite field order. eq_leaves are already in
+     * that order (planner filled them by walking the composite name). */
+    uint8_t key[1024]; size_t klen = 0;
+    if (!build_exact_composite_key(fs, composite_field, eq_leaves, n_eq, key, &klen)
+        || klen == 0)
+        return 0;
+
+    CompositePrefixCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db_root = db_root; ctx.object = object; ctx.sch = sch; ctx.fs = fs;
+    ctx.tree = tree; ctx.excluded = excluded;
+    ctx.proj_fields = proj_fields; ctx.proj_count = proj_count;
+    ctx.dict_fmt = dict_fmt;
+    ctx.skip_remaining = (offset > 0) ? offset : 0;
+    ctx.limit = (limit > 0) ? limit : INT_MAX;
+    ctx.dl = dl; ctx.parent_out = g_out;
+
+    btree_idx_search(db_root, object, composite_field, sch->splits,
+                     (const char *)key, klen, composite_prefix_cb, &ctx);
     return ctx.printed;
 }
 
@@ -12793,6 +12833,72 @@ static int composite_index_exists(const char *db_root, const char *object,
     return field_has_index_type(db_root, object, name, IT_BTREE);
 }
 
+/* Scan all AND-leaves for an EQ/STARTS_WITH leaf whose "<field>+<order_by>"
+ * composite btree exists.  Returns that leaf's index, or -1 if none.
+ *
+ * Why this exists: most_selective_indexed() prefers a non-bitmap leaf as the
+ * seed, so for `dead=… AND deleted=… AND type=X AND time>=T ORDER BY time`
+ * the seed is always `time` (the lone btree), never the bitmap `type` — even
+ * though `type+time` is exactly the composite that turns the ordered walk into
+ * a bounded prefix scan.  The D1 overlay must look past the single seed and
+ * find the leaf the composite actually covers.  EQ/STARTS_WITH only: those are
+ * the ops find_via_composite_prefix bounds correctly (see the D1 gate). */
+static int find_covering_composite(const char *db_root, const char *object,
+                                   SearchCriterion **leaves, int nL,
+                                   const char *order_by) {
+    if (!order_by || !order_by[0]) return -1;
+    for (int i = 0; i < nL; i++) {
+        if (leaves[i]->op != OP_EQUAL && leaves[i]->op != OP_STARTS_WITH) continue;
+        if (composite_index_exists(db_root, object, leaves[i]->field, order_by))
+            return i;
+    }
+    return -1;
+}
+
+/* Build the exact composite key for `composite_field` (e.g. "by+time") from
+ * eq leaves, in the composite's field order. encode_field_for_index is the
+ * same encoder typed_field_to_index_key uses at build time (config.c:1948),
+ * so the key is byte-identical to the stored composite key. Returns 1 with
+ * *out_len set iff EVERY sub-field is matched by an OP_EQUAL leaf. */
+static int build_exact_composite_key(const FieldSchema *fs, const char *composite_field,
+                                     SearchCriterion **leaves, int nL,
+                                     uint8_t *out, size_t *out_len) {
+    char buf[256]; strncpy(buf, composite_field, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+    size_t total = 0; char *save = NULL;
+    for (char *sub = strtok_r(buf, "+", &save); sub; sub = strtok_r(NULL, "+", &save)) {
+        SearchCriterion *m = NULL;
+        for (int i = 0; i < nL; i++)
+            if (leaves[i]->op == OP_EQUAL && strcmp(leaves[i]->field, sub) == 0) { m = leaves[i]; break; }
+        if (!m) return 0;  /* sub-field not pinned by an eq leaf */
+        const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, sub);
+        size_t l = 0;
+        encode_field_for_index(tf, m->value, strlen(m->value), out + total, &l);
+        total += l;
+    }
+    *out_len = total;
+    return 1;
+}
+
+/* Find a composite index fully covered by eq leaves. Returns its name in
+ * out_name (size>=256) and 1 if found, else 0. Iterates the object's index
+ * names (cache-backed; composites contain '+'). */
+static int find_exact_covering_composite(const char *db_root, const char *object,
+                                         const FieldSchema *fs,
+                                         SearchCriterion **leaves, int nL,
+                                         char *out_name) {
+    char names[MAX_FIELDS][256];
+    int n = load_index_fields(db_root, object, names, MAX_FIELDS);
+    for (int i = 0; i < n; i++) {
+        if (!strchr(names[i], '+')) continue;            /* composites only */
+        uint8_t key[1024]; size_t klen = 0;
+        if (build_exact_composite_key(fs, names[i], leaves, nL, key, &klen) && klen > 0) {
+            snprintf(out_name, 256, "%s", names[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* True if `order_by` has a btree index that can drive an ORDER_INDEX_WALK
  * (D3 from the decision table).  When this is the case the B5 demotion
  * (broad single leaf → FULL_SCAN) must be suppressed so the seed stays
@@ -12838,6 +12944,12 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     fp.fetching = fetching;
     fp.order = FP_ORDER_NONE;
     if (!tree) { fp.kind = FP_FULL_SCAN; return fp; }
+
+    /* Declared before the OR/UNION `goto order_overlay` jumps below so those
+     * paths can't skip its initialization (the overlay reads est[prim] only
+     * under an fp.n_source>0 guard the UNION paths don't satisfy, but leaving
+     * prim uninitialized on a jumped-over path is UB regardless). */
+    int prim = -1;
 
     /* (1b.4) OR / hybrid handling.
      *
@@ -12965,7 +13077,7 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     int skip_est_multi  = (nL >= 2) && fetching && limit > 0 &&
                           !(order_by && order_by[0]);
     int skip_est = skip_est_single || skip_est_multi;
-    int prim = -1;
+    prim = -1;
     if (skip_est) {
         for (int i = 0; i < nL; i++) {
             int it_i = pick_index_for_leaf(db_root, object, leaves[i]);
@@ -12986,6 +13098,30 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         prim = most_selective_indexed(db_root, object, splits, leaves, nL, fs, N, est);
     }
     if (prim < 0) { fp.kind = FP_FULL_SCAN; return fp; }   /* nothing indexed → A5/B7 */
+
+    /* Phase B: a composite fully pinned by eq leaves → exact key lookup,
+     * skipping the two-index intersect. Only without order_by (Phase A owns
+     * ordered prefix scans). */
+    if (!(order_by && order_by[0]) && nL >= 2) {
+        char cname[256];
+        if (find_exact_covering_composite(db_root, object, fs, leaves, nL, cname)) {
+            fp.kind = FP_PRIMARY_LEAF;
+            fp.order = FP_ORDER_COMPOSITE_EXACT;
+            snprintf(fp.composite_field, sizeof(fp.composite_field), "%s", cname);
+            /* All covered leaves go in source_leaves (composite order) so the
+             * executor can rebuild the key; siblings stay in the tree for
+             * post-filter. n_source>0 satisfies downstream guards. */
+            fp.n_source = 0;
+            char tmp[256]; strncpy(tmp, cname, sizeof(tmp)-1); tmp[sizeof(tmp)-1]='\0';
+            char *sv=NULL;
+            for (char *sub=strtok_r(tmp,"+",&sv); sub && fp.n_source<MAX_INTERSECT_LEAVES;
+                 sub=strtok_r(NULL,"+",&sv))
+                for (int i=0;i<nL;i++)
+                    if (leaves[i]->op==OP_EQUAL && strcmp(leaves[i]->field,sub)==0)
+                        { fp.source_leaves[fp.n_source++]=leaves[i]; break; }
+            return fp;
+        }
+    }
 
     int prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
     int prim_sel = leaf_is_selective(est[prim], N);
@@ -13128,7 +13264,18 @@ order_overlay:
          * per fetched record. (Symptom that surfaced: showcase trending
          * `time>=since order_by score` returned [] because the composite
          * prefix range didn't actually cover the seek range.) */
-        if (composite_index_exists(db_root, object,
+        /* D1 (preferred): any indexed eq/starts leaf whose <field>+<order_by>
+         * composite exists drives a sorted prefix scan, independent of which
+         * leaf most_selective_indexed chose. Fixes the bitmap-eq + ordered-range
+         * shape (e.g. type=job ... ORDER BY time) that previously fell to D3. */
+        int cc = find_covering_composite(db_root, object, leaves, nL, order_by);
+        if (cc >= 0) {
+            fp.kind            = FP_PRIMARY_LEAF;  /* composite executor requires this */
+            fp.source_is_bitmap = 0;               /* driving via composite btree, not a bitmap */
+            fp.source_leaves[0] = leaves[cc];
+            fp.n_source         = 1;
+            fp.order            = FP_ORDER_COMPOSITE;
+        } else if (composite_index_exists(db_root, object,
                                    fp.source_leaves[0]->field, order_by)
             && (fp.source_leaves[0]->op == OP_EQUAL ||
                 fp.source_leaves[0]->op == OP_STARTS_WITH)) {
@@ -13144,7 +13291,10 @@ order_overlay:
              * D2/D3 fork depends only on saturated/estimable which are
              * uniform across same-type leaves. Do not relax the skip_est
              * condition without re-evaluating this reuse. */
-            CardEst se = est[prim];
+            /* prim is always ≥0 here (guarded by `if (prim < 0) return` above);
+             * the explicit check keeps -Wmaybe-uninitialized quiet across the
+             * added composite branches without changing behaviour. */
+            CardEst se = (prim >= 0) ? est[prim] : (CardEst){0, 0, 0};
             fp.order = (se.estimable && !se.saturated)
                        ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
         }
@@ -13187,6 +13337,7 @@ static const char *fp_kind_str(FilterPlanKind k){
     case FP_UNION:return "union";} return "?"; }
 static const char *fp_order_str(FilterOrderKind o){
     switch(o){case FP_ORDER_NONE:return "none";case FP_ORDER_COMPOSITE:return "composite";
+    case FP_ORDER_COMPOSITE_EXACT:return "composite_exact";
     case FP_ORDER_SORT:return "sort";case FP_ORDER_INDEX_WALK:return "walk";} return "?"; }
 
 const char *plan_filter_kind_for_test(const char *db_root, const char *object,
@@ -16906,6 +17057,17 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
     }
     case FP_PRIMARY_LEAF:
     case FP_BITMAP_SMALLER: {
+        /* Composite-driven plans (Phase A ordered, Phase B exact) set
+         * kind=PRIMARY_LEAF but source_leaves[0] is only the seed / first
+         * composite sub-field — idx_count_for_leaf would count that leaf
+         * alone and ignore the other pinned fields + siblings, overcounting.
+         * Exact mode always has ≥2 pinned fields; ordered-composite overcounts
+         * only when the criteria tree has siblings beyond the seed leaf. Emit
+         * null total in those cases (rows are still correct; the client can
+         * fire a separate count). */
+        if (fp->order == FP_ORDER_COMPOSITE_EXACT) return 0;
+        if (fp->order == FP_ORDER_COMPOSITE && tree && tree->kind != CNODE_LEAF)
+            return 0;
         if (fp->n_source == 0 || fp->n_postfilter != 0) return 0;
         size_t n = idx_count_for_leaf(db_root, object, sch, fs,
                                       fp->source_leaves[0], dl);
@@ -17292,6 +17454,31 @@ int cmd_find(const char *db_root, const char *object,
        no rows_fmt (table envelope needs full collect), no csv_delim
        (header row needs full schema scan).  Those edge cases fall
        through to the existing ordered-collect + in-memory sort path. */
+    if (fp.order == FP_ORDER_COMPOSITE_EXACT &&
+        !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
+        find_via_composite_key(
+            db_root, object, &sch,
+            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+            fp.composite_field, fp.source_leaves, fp.n_source,
+            tree, &excluded, offset, limit,
+            proj_fields, proj_count, dict_fmt, &dl);
+        size_t ex_total = 0; int ex_null = 1;
+        if (want_total) ex_total = fp_compute_total(&fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &ex_null);
+        if (dict_fmt) {
+            if (!want_total) OUT("}\n");
+            else if (ex_null) OUT("},\"total\":null}\n");
+            else OUT("},\"total\":%zu}\n", ex_total);
+        } else {
+            if (!want_total) OUT("]\n");
+            else if (ex_null) OUT("],\"total\":null}\n");
+            else OUT("],\"total\":%zu}\n", ex_total);
+        }
+        free_excluded(&excluded);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return 0;
+    }
     if (fp.order == FP_ORDER_COMPOSITE && fp.kind == FP_PRIMARY_LEAF &&
         !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
         int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
