@@ -13053,7 +13053,7 @@ static int order_field_drivable(const char *db_root, const char *object,
  * a btree to walk, walk it (D3); the broad filter's high post-filter pass-rate
  * fills `limit` in ~limit fetches. Only fall back to sort when order_by isn't
  * drivable (no btree → nothing to walk; D2 is best-effort, bounded by
- * QUERY_BUFFER_MB). Mirrors the cursor path's ORDERED_FIND_KEYSET_MAX guard. */
+ * QUERY_BUFFER_MB). Mirrors the cursor path's g_ordered_find_keyset_max guard. */
 static FilterOrderKind pick_sort_or_walk(const char *db_root, const char *object,
                                          const char *order_by, CardEst se, size_t N) {
     int sel = leaf_is_selective(se, N);
@@ -13620,6 +13620,12 @@ int order_walk_bounds_for_test(const char *db_root, const char *object,
     free_criteria_tree(tree);
     return 0;
 }
+#endif
+
+#ifdef TEST_BUILD
+extern size_t g_ordered_find_keyset_max;
+void set_ordered_find_keyset_max_for_test(size_t v) { g_ordered_find_keyset_max = v; }
+size_t get_ordered_find_keyset_max_for_test(void)   { return g_ordered_find_keyset_max; }
 #endif
 
 /* ========== AND index-intersection (KeySet fast path) ==========
@@ -16862,6 +16868,36 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
                                       const Schema *sch,
                                       QueryDeadline *dl);
 
+#ifdef TEST_BUILD
+/* Returns 1 if build_keyset_from_plan materializes a KeySet for `criteria`
+   (count/no order_by plan), 0 if it skips (returns NULL → caller walks). */
+int plan_keyset_materializes_for_test(const char *db_root, const char *object,
+                                      const char *criteria_json) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) { size_t d=(size_t)(slash-object);
+        snprintf(eff_root,sizeof(eff_root),"%s/%.*s",db_root,(int)d,object);
+        snprintf(bare,sizeof(bare),"%s",slash+1);
+    } else { snprintf(eff_root,sizeof(eff_root),"%s",db_root);
+        snprintf(bare,sizeof(bare),"%s",object); }
+    const char *err = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return -1;
+    Schema sc = load_schema(eff_root, bare);
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    size_t N = (size_t)get_live_count(eff_root, bare);
+    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N,
+                                NULL /*order_by*/, 0 /*fetching*/, 0 /*limit*/);
+    QueryDeadline dl = { now_ms_coarse(), 0 /*no timeout*/, 0 };
+    KeySet *ks = build_keyset_from_plan(&fp, eff_root, bare, &sc, &dl);
+    int materialized = (ks != NULL);
+    if (ks) keyset_free(ks);
+    free_criteria_tree(tree);
+    return materialized;
+}
+#endif
+
 /* ============================================================
    D2 executor: fetch-and-sort with streaming top-N.
 
@@ -17152,7 +17188,10 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
    Tunable in db.env if a user finds their workload sits in the
    "100K candidates, scattered across the order_by range" regime
    where filter-first still wins (rare in practice). */
-#define ORDERED_FIND_KEYSET_MAX 100000
+/* Ordered-find prefilter cap: above this many candidates, materializing a
+   KeySet loses to walking the order_by index + post-filtering. A tunable
+   global (not a #define) so tests can lower it without inserting 100k rows. */
+size_t g_ordered_find_keyset_max = 100000;
 
 /* Build a candidate KeySet from any indexed-source query plan.
    Returns NULL if no indexed plan applies (PRIMARY_NONE), or if the
@@ -17180,7 +17219,7 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
         /* Cheap cardinality probe for bitmap-indexed leaves: the only
            consumers of build_keyset_from_plan are the two ordered-find
            prefilter sites, both of which discard any KeySet exceeding
-           ORDERED_FIND_KEYSET_MAX immediately after building. For a
+           g_ordered_find_keyset_max immediately after building. For a
            ~5M-match bitmap criterion that's ~37 s of materialization
            thrown away. bm_popcount_for_crit walks the per-shard bitmaps
            popcounting only — no KeySet entries enumerated — so the
@@ -17202,12 +17241,37 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
                                                     leaf->field, sch->splits,
                                                     leaf, tf);
             }
-            if (pop > ORDERED_FIND_KEYSET_MAX) return NULL;
+            if (pop > g_ordered_find_keyset_max) return NULL;
         }
         return build_keyset_from_leaf(db_root, object, sch->splits,
                                       leaf, dl);
     }
     case FP_INTERSECT: {
+        /* Broad-set guard (parity with FP_PRIMARY_LEAF above): when every
+           source leaf is a bitmap eq/in, the intersection cardinality is
+           computable by word-level AND popcount with NO KeySet materialized
+           (~ms). If it exceeds the cap, skip building — the only consumers
+           (ordered-find prefilter sites) discard oversized keysets anyway and
+           fall back to walk + per-record criteria_match. Building a ~5M
+           intersection just to throw it away wastes seconds (gap D). Mixed
+           bitmap/btree intersects have no cheap probe, so they fall through to
+           build (the reactive post-build size check still bounds them). */
+        int all_bitmap_eqin = fp->n_source >= 2;
+        for (int i = 0; i < fp->n_source; i++) {
+            SearchCriterion *lf = fp->source_leaves[i];
+            if (!lf || pick_index_for_leaf(db_root, object, lf) != IT_BITMAP ||
+                (lf->op != OP_EQUAL && lf->op != OP_IN)) {
+                all_bitmap_eqin = 0;
+                break;
+            }
+        }
+        if (all_bitmap_eqin) {
+            TypedSchema *ts = load_typed_schema(db_root, object);
+            size_t pop = bm_popcount_intersect(db_root, object, sch->splits,
+                                               (SearchCriterion **)fp->source_leaves,
+                                               fp->n_source, ts, dl);
+            if (pop > g_ordered_find_keyset_max) return NULL;
+        }
         int small_primary = 0;
         return intersect_indexed_leaves(db_root, object, sch->splits,
                                         (SearchCriterion **)fp->source_leaves,
@@ -17521,7 +17585,7 @@ int cmd_find(const char *db_root, const char *object,
                                                             db_root, object,
                                                             &sch, &cdl);
         if (cursor_prefilter_ks &&
-            keyset_size(cursor_prefilter_ks) > ORDERED_FIND_KEYSET_MAX) {
+            keyset_size(cursor_prefilter_ks) > g_ordered_find_keyset_max) {
             keyset_free(cursor_prefilter_ks);
             cursor_prefilter_ks = NULL;
         }
@@ -17856,7 +17920,7 @@ int cmd_find(const char *db_root, const char *object,
        ~100ns (hash check). For 0-match criteria the empty KeySet
        short-circuits the walk entirely. Falls back to no-KeySet
        walk (per-record criteria_match) when criteria is too broad
-       (KeySet build would exceed ORDERED_FIND_KEYSET_MAX) or
+       (KeySet build would exceed g_ordered_find_keyset_max) or
        PRIMARY_NONE (no indexed leaves). */
     if (has_order && btree_idx_exists(db_root, object, order_by, sch.splits) &&
         excluded.count == 0) {
@@ -17885,7 +17949,7 @@ int cmd_find(const char *db_root, const char *object,
             KeySet *prefilter_ks = build_keyset_from_plan(&fp, db_root,
                                                          object, &sch, &dl);
             if (prefilter_ks &&
-                keyset_size(prefilter_ks) > ORDERED_FIND_KEYSET_MAX) {
+                keyset_size(prefilter_ks) > g_ordered_find_keyset_max) {
                 keyset_free(prefilter_ks);
                 prefilter_ks = NULL;
             }
