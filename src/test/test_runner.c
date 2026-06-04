@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TEST_BUILD
+extern void test_reset_caches(void);
+#endif
+
 __thread TestCtx *t_ctx = NULL;
 
 static TestCaseEntry *g_head = NULL;
@@ -57,6 +61,9 @@ int test_run_all(const char *filter) {
         ran++;
         printf("# %s: %d passed, %d failed\n", p->name, ctx.passed, ctx.failed);
         t_ctx = NULL;
+#ifdef TEST_BUILD
+        test_reset_caches();
+#endif
     }
     printf("1..%d\n", ran);
     printf("# total: %d passed, %d failed across %d cases\n",

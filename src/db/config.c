@@ -3460,3 +3460,55 @@ void slot_cleanup(int *held) {
     if (held && *held) slot_release();
 }
 
+#ifdef TEST_BUILD
+/* Reset all process-global caches between test cases in run-all mode.
+   Each test case fork-execs its own daemon, but the parent process
+   holds stale cache entries that can pollute subsequent in-process
+   test hooks (plan introspection, cardinality estimates, etc.). */
+void test_reset_caches(void) {
+    /* schema cache */
+    pthread_mutex_lock(&g_schema_lock);
+    for (int i = 0; i < SCHEMA_BUCKETS; i++) {
+        if (g_schema_cache[i].used) {
+            g_schema_cache[i].used = 0;
+            g_schema_cache[i].name[0] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_schema_lock);
+
+    /* fields cache */
+    pthread_mutex_lock(&g_fields_lock);
+    for (int i = 0; i < FIELDS_BUCKETS; i++) {
+        if (g_fields_cache[i].used) {
+            g_fields_cache[i].used = 0;
+            g_fields_cache[i].name[0] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_fields_lock);
+
+    /* typed cache — need to free enum_values heap state */
+    pthread_mutex_lock(&g_typed_lock);
+    for (int i = 0; i < TYPED_BUCKETS; i++) {
+        if (g_typed_cache[i].used) {
+            TypedSchema *ts = &g_typed_cache[i].schema;
+            for (int fi = 0; fi < ts->nfields; fi++) {
+                free_enum_values(&ts->fields[fi]);
+            }
+            g_typed_cache[i].used = 0;
+            g_typed_cache[i].name[0] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_typed_lock);
+
+    /* index cache */
+    pthread_mutex_lock(&g_idx_lock);
+    for (int i = 0; i < IDX_BUCKETS; i++) {
+        if (g_idx_cache[i].used) {
+            g_idx_cache[i].used = 0;
+            g_idx_cache[i].name[0] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_idx_lock);
+}
+#endif
+

@@ -11279,6 +11279,60 @@ static int composite_prefix_cb(const char *val, size_t vlen,
     return (c->printed >= c->limit) ? -1 : 0;
 }
 
+/* K-way merge cursor for composite prefix walks.
+ * Replicates the per-shard merge from index.c but supports multiple
+ * (lo,hi) range pairs — one per IN value — in a single heap. */
+typedef struct {
+    BtRangeIter *iter;
+    char    value[BT_MAX_VAL_LEN];
+    size_t  vlen;
+    uint8_t hash[BT_HASH_SIZE];
+    int     has_entry;
+    int     stream_id;  /* which IN value this cursor belongs to */
+} CompMergeCursor;
+
+static int comp_cursor_cmp(const CompMergeCursor *a, const CompMergeCursor *b) {
+    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
+    int r = memcmp(a->value, b->value, m);
+    if (r != 0) return r;
+    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
+    r = memcmp(a->hash, b->hash, BT_HASH_SIZE);
+    if (r != 0) return r;
+    return a->stream_id - b->stream_id;
+}
+
+static void comp_cursor_pull(CompMergeCursor *c) {
+    const char *v; size_t vl; const uint8_t *h;
+    if (btree_range_iter_next(c->iter, &v, &vl, &h)) {
+        c->vlen = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
+        memcpy(c->value, v, c->vlen);
+        memcpy(c->hash, h, BT_HASH_SIZE);
+        c->has_entry = 1;
+    } else {
+        c->has_entry = 0;
+    }
+}
+
+static void comp_merge_sift_down(int *heap, int n, int i,
+                                 const CompMergeCursor *cursors, int desc) {
+    for (;;) {
+        int l = 2*i+1, r = 2*i+2, best = i;
+        if (l < n) {
+            int d = desc ? -comp_cursor_cmp(&cursors[heap[l]], &cursors[heap[best]])
+                         : comp_cursor_cmp(&cursors[heap[l]], &cursors[heap[best]]);
+            if (d < 0) best = l;
+        }
+        if (r < n) {
+            int d = desc ? -comp_cursor_cmp(&cursors[heap[r]], &cursors[heap[best]])
+                         : comp_cursor_cmp(&cursors[heap[r]], &cursors[heap[best]]);
+            if (d < 0) best = r;
+        }
+        if (best == i) return;
+        int t = heap[i]; heap[i] = heap[best]; heap[best] = t;
+        i = best;
+    }
+}
+
 /* D1 executor entry point.  seed is the equality leaf on the prefix field
    (e.g. by="alice"); order_by is the sort field (e.g. "time").
    Returns number of rows emitted (≥0) or -1 on deadline. */
@@ -11295,12 +11349,139 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                                      int dict_fmt,
                                      QueryDeadline *dl)
 {
-    /* 1. Seed prefix = encode(seed value). */
-    uint8_t buf_lo[1024 + 8];
-    size_t  len_lo = 0;
-    const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
-    encode_criterion_value(seed_tf, seed->value, strlen(seed->value), buf_lo, &len_lo);
-    size_t pfx_len = len_lo;
+    /* Composite index name = <seed_field>+<order_by>. */
+    char composite_field[256];
+    snprintf(composite_field, sizeof(composite_field), "%s+%s",
+             seed->field, order_by);
+
+    /* (C). OP_IN: k-way merge across per-value composite prefix ranges.
+     * Each IN value gets its own bounded sub-range; per-shard BtRangeIters
+     * from all values are merged in a single heap so the emitted stream is
+     * globally ordered by (encoded_value ‖ encoded_order_by). */
+    if (seed->op == OP_IN && seed->in_count > 0) {
+        int nv = seed->in_count;
+        int ns = index_splits_for(sch->splits);
+        CompMergeCursor *cursors = calloc((size_t)(ns * nv), sizeof(CompMergeCursor));
+        int *heap = calloc((size_t)(ns * nv), sizeof(int));
+        if (!cursors || !heap) { free(cursors); free(heap); return 0; }
+
+        const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
+
+        int nh = 0, ci = 0;
+        for (int iv = 0; iv < nv; iv++) {
+            uint8_t lo[1024 + 8]; size_t len_lo = 0;
+            encode_criterion_value(seed_tf, seed->in_values[iv],
+                                   strlen(seed->in_values[iv]), lo, &len_lo);
+            size_t pfx = len_lo;
+            uint8_t hi[1024 + 8];
+            memcpy(hi, lo, len_lo);
+            size_t len_hi;
+            if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
+                int pos = (int)len_lo - 1;
+                while (pos >= 0 && lo[pos] == 0xff) pos--;
+                if (pos >= 0) {
+                    memcpy(hi, lo, (size_t)pos);
+                    hi[pos] = lo[pos] + 1;
+                    len_hi = (size_t)pos + 1;
+                } else {
+                    memcpy(hi, lo, len_lo);
+                    hi[len_lo] = 0x00;
+                    len_hi = len_lo + 1;
+                }
+            } else {
+                memset(hi + len_lo, 0xff, 4);
+                len_hi = len_lo + 4;
+            }
+            int min_excl = 0, max_excl = 0;
+
+            /* order_range fold */
+            if (order_range) {
+                const TypedField *ord_tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
+                const char *lowv = NULL; int low_excl = 0;
+                const char *highv = NULL; int high_excl = 0;
+                switch (order_range->op) {
+                    case OP_GREATER_EQ: lowv = order_range->value; break;
+                    case OP_GREATER:    lowv = order_range->value; low_excl = 1; break;
+                    case OP_LESS_EQ:    highv = order_range->value; break;
+                    case OP_LESS:       highv = order_range->value; high_excl = 1; break;
+                    case OP_EQUAL:      lowv = highv = order_range->value; break;
+                    case OP_BETWEEN:
+                        lowv  = order_range->value;  low_excl  = order_range->min_exclusive;
+                        highv = order_range->value2; high_excl = order_range->max_exclusive;
+                        break;
+                    default: break;
+                }
+                if (lowv) {
+                    uint8_t enc[1024]; size_t el = 0;
+                    encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
+                    if (pfx + el <= sizeof(lo)) {
+                        memcpy(lo + pfx, enc, el); len_lo = pfx + el;
+                        min_excl = low_excl;
+                    }
+                }
+                if (highv) {
+                    uint8_t enc[1024]; size_t el = 0;
+                    encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
+                    if (pfx + el <= sizeof(hi)) {
+                        memcpy(hi + pfx, enc, el); len_hi = pfx + el;
+                        max_excl = high_excl;
+                    }
+                }
+            }
+
+            for (int s = 0; s < ns; s++) {
+                char ip[PATH_MAX];
+                build_idx_path(ip, sizeof(ip), db_root, object, composite_field, s);
+                cursors[ci].iter = btree_range_iter_open(ip,
+                                     (const char *)lo, len_lo, min_excl,
+                                     (const char *)hi, len_hi, max_excl,
+                                     order_desc);
+                cursors[ci].stream_id = iv;
+                if (cursors[ci].iter) comp_cursor_pull(&cursors[ci]);
+                if (cursors[ci].has_entry) heap[nh++] = ci;
+                ci++;
+            }
+        }
+
+        int total_cursors = ci;
+
+        for (int i = nh/2-1; i >= 0; i--)
+            comp_merge_sift_down(heap, nh, i, cursors, order_desc);
+
+        CompositePrefixCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.db_root = db_root; ctx.object = object; ctx.sch = sch; ctx.fs = fs;
+        ctx.tree = tree; ctx.excluded = excluded;
+        ctx.proj_fields = proj_fields; ctx.proj_count = proj_count;
+        ctx.dict_fmt = dict_fmt;
+        ctx.skip_remaining = (offset > 0) ? offset : 0;
+        ctx.limit = (limit > 0)  ? limit  : INT_MAX;
+        ctx.dl = dl; ctx.dl_counter = 0; ctx.parent_out = g_out;
+
+        while (nh > 0) {
+            CompMergeCursor *bc = &cursors[heap[0]];
+            if (composite_prefix_cb(bc->value, bc->vlen, bc->hash, &ctx) < 0) break;
+            comp_cursor_pull(bc);
+            if (bc->has_entry) {
+                comp_merge_sift_down(heap, nh, 0, cursors, order_desc);
+            } else {
+                heap[0] = heap[--nh];
+                if (nh > 0) comp_merge_sift_down(heap, nh, 0, cursors, order_desc);
+            }
+        }
+
+        for (int i = 0; i < total_cursors; i++)
+            if (cursors[i].iter) btree_range_iter_close(cursors[i].iter);
+        free(cursors); free(heap);
+        return ctx.printed;
+    }
+
+    /* (single-value). Seed prefix = encode(seed value). */
+    uint8_t buf_lo_sv[1024 + 8];
+    size_t  len_lo_sv = 0;
+    const TypedField *seed_tf_sv = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
+    encode_criterion_value(seed_tf_sv, seed->value, strlen(seed->value), buf_lo_sv, &len_lo_sv);
+    size_t pfx_len = len_lo_sv;
 
     /* 2. Upper bound: byte-successor of the seed prefix.
        For fixed-width types: append 0xff bytes (original STARTS_WITH idiom).
@@ -11309,23 +11490,23 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
        over-wide range for variable-length keys because shorter prefix + 0xff
        can let non-matching values through. */
     uint8_t buf_hi[1024 + 8];
-    memcpy(buf_hi, buf_lo, len_lo);
+    memcpy(buf_hi, buf_lo_sv, len_lo_sv);
     size_t len_hi;
-    if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
-        int pos = (int)len_lo - 1;
-        while (pos >= 0 && buf_lo[pos] == 0xff) pos--;
+    if (seed_tf_sv && seed_tf_sv->type == FT_VARCHAR && len_lo_sv > 0) {
+        int pos = (int)len_lo_sv - 1;
+        while (pos >= 0 && buf_lo_sv[pos] == 0xff) pos--;
         if (pos >= 0) {
-            memcpy(buf_hi, buf_lo, (size_t)pos);
-            buf_hi[pos] = buf_lo[pos] + 1;
+            memcpy(buf_hi, buf_lo_sv, (size_t)pos);
+            buf_hi[pos] = buf_lo_sv[pos] + 1;
             len_hi = (size_t)pos + 1;
         } else {
-            memcpy(buf_hi, buf_lo, len_lo);
-            buf_hi[len_lo] = 0x00;
-            len_hi = len_lo + 1;
+            memcpy(buf_hi, buf_lo_sv, len_lo_sv);
+            buf_hi[len_lo_sv] = 0x00;
+            len_hi = len_lo_sv + 1;
         }
     } else {
-        memset(buf_hi + len_lo, 0xff, 4);
-        len_hi = len_lo + 4;
+        memset(buf_hi + len_lo_sv, 0xff, 4);
+        len_hi = len_lo_sv + 4;
     }
     int min_excl = 0, max_excl = 0;
 
@@ -11354,9 +11535,9 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
         if (lowv) {
             uint8_t enc[1024]; size_t el = 0;
             encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
-            if (pfx_len + el <= sizeof(buf_lo)) {
-                memcpy(buf_lo + pfx_len, enc, el);
-                len_lo = pfx_len + el;
+            if (pfx_len + el <= sizeof(buf_lo_sv)) {
+                memcpy(buf_lo_sv + pfx_len, enc, el);
+                len_lo_sv = pfx_len + el;
                 min_excl = low_excl;
             }
         }
@@ -11370,11 +11551,6 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
             }
         }
     }
-
-    /* 3. Build the composite index name "<seed_field>+<order_by>". */
-    char composite_field[256];
-    snprintf(composite_field, sizeof(composite_field), "%s+%s",
-             seed->field, order_by);
 
     /* 4. Set up the callback context. */
     CompositePrefixCtx ctx;
@@ -11399,7 +11575,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
           delivers entries already sorted by (encoded_a || encoded_b) in
           the requested direction — asc or desc. */
     btree_idx_walk_ordered(db_root, object, composite_field, sch->splits,
-                           (const char *)buf_lo, len_lo, min_excl,
+                           (const char *)buf_lo_sv, len_lo_sv, min_excl,
                            (const char *)buf_hi, len_hi, max_excl,
                            order_desc, composite_prefix_cb, &ctx);
 
@@ -12472,34 +12648,40 @@ static CriteriaNode *find_fully_indexed_or(CriteriaNode *root,
     return NULL;
 }
 
-/* True if the operator yields a precise btree candidate set without needing
-   per-record verification. Excludes substring/suffix ops (LIKE/CONTAINS/...
-   need check_primary) and large-set ops (NEQ/NOT_IN/NOT_LIKE/NOT_CONTAINS —
-   intersecting with a near-everything set wastes work; the existing primary-
-   leaf path with subtraction shortcut is already tighter for these). */
-static int op_eligible_for_intersect(enum SearchOp op) {
-    return op == OP_EQUAL ||
-           op == OP_LESS || op == OP_GREATER ||
-           op == OP_LESS_EQ || op == OP_GREATER_EQ ||
-           op == OP_BETWEEN || op == OP_IN ||
-           op == OP_STARTS_WITH;
+/* Single source of truth for which operators can drive which plan capability.
+ * Replaces the per-site op whitelists (intersect / composite-seed / composite-
+ * exact / order-bound / trigram). Site-specific logic (trigram min length,
+ * card-est estimation, btree_dispatch bounds) stays at the site; this table
+ * only answers "is op X eligible for capability Y". Add an op or flip a flag
+ * here and every path sees it — no more one-gate-at-a-time drift. */
+typedef struct {
+    unsigned intersect      : 1;  /* can participate in PRIMARY_INTERSECT */
+    unsigned composite_seed : 1;  /* can seed a <field>+order_by prefix walk (D1) */
+    unsigned composite_exact: 1;  /* can pin a composite sub-field (Phase B) */
+    unsigned order_bound    : 1;  /* a leaf on order_by can bound the walk */
+    unsigned trigram_prefers: 1;  /* contains/icontains → prefer trigram */
+    unsigned trigram_starts : 1;  /* starts_with → trigram fallback ok */
+    int      rank;                /* selectivity rank: 0=most, 9=not applicable */
+} OpCaps;
+
+static OpCaps op_caps(enum SearchOp op) {
+    OpCaps c = {0};
+    c.rank = 9;  /* default: not applicable */
+    switch (op) {
+        case OP_EQUAL:        c.intersect=1; c.composite_seed=1; c.composite_exact=1; c.order_bound=1; c.rank=0; break;
+        case OP_STARTS_WITH:  c.intersect=1; c.composite_seed=1; c.trigram_starts=1; c.rank=1; break;
+        case OP_LESS: case OP_GREATER: case OP_LESS_EQ: case OP_GREATER_EQ: case OP_BETWEEN:
+                              c.intersect=1; c.order_bound=1; c.rank = (op==OP_BETWEEN) ? 2 : 4; break;
+        case OP_IN:           c.intersect=1; c.composite_seed=1; c.rank=3; break;
+        case OP_CONTAINS: case OP_ICONTAINS: c.trigram_prefers=1; break;
+        default: break;
+    }
+    return c;
 }
 
-/* Lower rank = more selective ⇒ walk first to bound the running intersection.
-   No stats yet; this is an operator-class heuristic, refined later. */
-static int op_selectivity_rank(enum SearchOp op) {
-    switch (op) {
-        case OP_EQUAL:       return 0;
-        case OP_STARTS_WITH: return 1;
-        case OP_BETWEEN:     return 2;
-        case OP_IN:          return 3;
-        case OP_LESS_EQ:
-        case OP_GREATER_EQ:
-        case OP_LESS:
-        case OP_GREATER:     return 4;
-        default:             return 9;
-    }
-}
+/* Thin wrappers that keep call sites untouched */
+static int op_eligible_for_intersect(enum SearchOp op) { return op_caps(op).intersect; }
+static int op_selectivity_rank(enum SearchOp op)      { return op_caps(op).rank; }
 
 /* Collect indexable AND-children whose ops are intersection-eligible, sorted
    by selectivity rank. Returns the count (≥2 → intersection plan viable).
@@ -13004,7 +13186,7 @@ static int find_covering_composite(const char *db_root, const char *object,
                                    const char *order_by) {
     if (!order_by || !order_by[0]) return -1;
     for (int i = 0; i < nL; i++) {
-        if (leaves[i]->op != OP_EQUAL && leaves[i]->op != OP_STARTS_WITH) continue;
+        if (!op_caps(leaves[i]->op).composite_seed) continue;
         if (composite_index_exists(db_root, object, leaves[i]->field, order_by))
             return i;
     }
@@ -13024,7 +13206,7 @@ static int build_exact_composite_key(const FieldSchema *fs, const char *composit
     for (char *sub = strtok_r(buf, "+", &save); sub; sub = strtok_r(NULL, "+", &save)) {
         SearchCriterion *m = NULL;
         for (int i = 0; i < nL; i++)
-            if (leaves[i]->op == OP_EQUAL && strcmp(leaves[i]->field, sub) == 0) { m = leaves[i]; break; }
+            if (op_caps(leaves[i]->op).composite_exact && strcmp(leaves[i]->field, sub) == 0) { m = leaves[i]; break; }
         if (!m) return 0;  /* sub-field not pinned by an eq leaf */
         const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, sub);
         size_t l = 0;
@@ -13566,14 +13748,24 @@ static int agg_criteria_fully_covered(const char *db_root, const char *object,
 }
 
 #ifdef TEST_BUILD
-static const char *fp_kind_str(FilterPlanKind k){
-    switch(k){case FP_FULL_SCAN:return "scan";case FP_PRIMARY_LEAF:return "leaf";
-    case FP_BITMAP_SMALLER:return "bitmap";case FP_INTERSECT:return "intersect";
-    case FP_UNION:return "union";} return "?"; }
-static const char *fp_order_str(FilterOrderKind o){
-    switch(o){case FP_ORDER_NONE:return "none";case FP_ORDER_COMPOSITE:return "composite";
-    case FP_ORDER_COMPOSITE_EXACT:return "composite_exact";
-    case FP_ORDER_SORT:return "sort";case FP_ORDER_INDEX_WALK:return "walk";} return "?"; }
+/* Per-capability test hooks — let test_planner_op_capability.c verify the
+ * OpCaps table directly without caring about the static linkage. */
+int op_intersect_eligible_for_test(enum SearchOp op) { return op_caps(op).intersect; }
+int op_composite_seed_eligible_for_test(enum SearchOp op) { return op_caps(op).composite_seed; }
+int op_composite_exact_eligible_for_test(enum SearchOp op) { return op_caps(op).composite_exact; }
+int op_order_bound_eligible_for_test(enum SearchOp op) { return op_caps(op).order_bound; }
+int op_trigram_prefers_for_test(enum SearchOp op) { return op_caps(op).trigram_prefers; }
+int op_trigram_starts_for_test(enum SearchOp op) { return op_caps(op).trigram_starts; }
+int op_selectivity_rank_for_test(enum SearchOp op) { return op_caps(op).rank; }
+
+ static const char *fp_kind_str(FilterPlanKind k){
+     switch(k){case FP_FULL_SCAN:return "scan";case FP_PRIMARY_LEAF:return "leaf";
+     case FP_BITMAP_SMALLER:return "bitmap";case FP_INTERSECT:return "intersect";
+     case FP_UNION:return "union";} return "?"; }
+ static const char *fp_order_str(FilterOrderKind o){
+     switch(o){case FP_ORDER_NONE:return "none";case FP_ORDER_COMPOSITE:return "composite";
+     case FP_ORDER_COMPOSITE_EXACT:return "composite_exact";
+     case FP_ORDER_SORT:return "sort";case FP_ORDER_INDEX_WALK:return "walk";} return "?"; }
 
 const char *plan_filter_kind_for_test(const char *db_root, const char *object,
         const char *criteria_json, const char *order_by, int fetching,
@@ -14208,13 +14400,13 @@ static int field_has_index_type(const char *db_root, const char *object,
  * Used everywhere the planner asks "what index should I drive this op
  * through" — leaf_is_indexed, build_keyset_from_leaf, the dispatcher. */
 static int op_prefers_trigram(enum SearchOp op) {
-    return op == OP_CONTAINS || op == OP_ICONTAINS;
+    return op_caps(op).trigram_prefers;
 }
 
 /* Returns 1 when the op can be served by a trigram index for starts_with
  * (prefix length ≥ 3 required, checked by caller). */
 static int op_allows_trigram_starts(enum SearchOp op) {
-    return op == OP_STARTS_WITH;
+    return op_caps(op).trigram_starts;
 }
 
 /* Crossover length between btree-leaf scan and trigram intersection
