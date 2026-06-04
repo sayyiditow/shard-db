@@ -11382,6 +11382,76 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
     return ctx.printed;
 }
 
+/* Encoded order-by walk bounds derived from the order_by-field range/eq leaves.
+ * Defaults to the full range ("" .. 0xffffffff). Only TOP-LEVEL AND leaves are
+ * consulted (OR/nested branches can't bound the walk). The walk's per-record
+ * criteria_match_tree still runs, so a loose/absent bound never changes the
+ * result set — it only narrows how far the index is walked. */
+typedef struct {
+    uint8_t lo[1024]; size_t lo_len; int lo_excl;
+    uint8_t hi[1024]; size_t hi_len; int hi_excl;
+    int has_lo;   /* a lower bound tighter than "" was set */
+    int has_hi;   /* an upper bound tighter than 0xffffffff was set */
+} OrderWalkBounds;
+
+/* Forward declaration: defined later in this file near other planner helpers. */
+static int collect_and_leaves(CriteriaNode *tree, SearchCriterion **out, int max);
+
+static void order_walk_bounds(CriteriaNode *tree, FieldSchema *fs,
+                              const char *order_by, OrderWalkBounds *b) {
+    memset(b, 0, sizeof(*b));
+    /* defaults: lo = "" (len 0), hi = 4 x 0xff */
+    memset(b->hi, 0xff, 4); b->hi_len = 4;
+    if (!order_by || !order_by[0]) return;
+
+    const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
+    if (!tf) return;
+
+    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
+    int nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
+    for (int i = 0; i < nL; i++) {
+        if (strcmp(leaves[i]->field, order_by) != 0) continue;
+        const char *lowv = NULL;  int low_excl = 0;
+        const char *highv = NULL; int high_excl = 0;
+        switch (leaves[i]->op) {
+            case OP_GREATER_EQ: lowv = leaves[i]->value; break;
+            case OP_GREATER:    lowv = leaves[i]->value; low_excl = 1; break;
+            case OP_LESS_EQ:    highv = leaves[i]->value; break;
+            case OP_LESS:       highv = leaves[i]->value; high_excl = 1; break;
+            case OP_EQUAL:      lowv = highv = leaves[i]->value; break;
+            case OP_BETWEEN:
+                lowv  = leaves[i]->value;  low_excl  = leaves[i]->min_exclusive;
+                highv = leaves[i]->value2; high_excl = leaves[i]->max_exclusive;
+                break;
+            default: break;   /* not a range/eq op → no bound */
+        }
+        if (lowv) {
+            uint8_t enc[1024]; size_t el = 0;
+            encode_criterion_value(tf, lowv, strlen(lowv), enc, &el);
+            /* Keep the TIGHTEST lower bound (largest encoded value). First one
+             * always wins over the "" default. memcmp is valid because the
+             * index encoding is order-preserving. */
+            if (el > 0 && (!b->has_lo ||
+                           el > b->lo_len ||
+                           (el == b->lo_len && memcmp(enc, b->lo, el) > 0))) {
+                memcpy(b->lo, enc, el); b->lo_len = el; b->lo_excl = low_excl;
+                b->has_lo = 1;
+            }
+        }
+        if (highv) {
+            uint8_t enc[1024]; size_t el = 0;
+            encode_criterion_value(tf, highv, strlen(highv), enc, &el);
+            /* Keep the TIGHTEST upper bound (smallest encoded value). */
+            if (el > 0 && (!b->has_hi ||
+                           el < b->hi_len ||
+                           (el == b->hi_len && memcmp(enc, b->hi, el) < 0))) {
+                memcpy(b->hi, enc, el); b->hi_len = el; b->hi_excl = high_excl;
+                b->has_hi = 1;
+            }
+        }
+    }
+}
+
 /* Forward declarations (defined later in this file). */
 static int build_exact_composite_key(const FieldSchema *fs, const char *composite_field,
                                      SearchCriterion **leaves, int nL,
@@ -11460,8 +11530,19 @@ typedef struct {
     FILE          *parent_out;
 } OrderIndexWalkCtx;
 
+#ifdef TEST_BUILD
+/* Counts index entries visited by the order-by walks, so a test can prove a
+ * windowed query stops at the window instead of scanning the whole index. */
+long g_order_walk_scanned = 0;
+long order_walk_scanned_for_test(void)   { return g_order_walk_scanned; }
+void order_walk_scanned_reset_for_test(void) { g_order_walk_scanned = 0; }
+#endif
+
 static int order_index_walk_cb(const char *val, size_t vlen,
                                 const uint8_t *hash16, void *ctx_ptr) {
+#ifdef TEST_BUILD
+    g_order_walk_scanned++;
+#endif
     (void)val; (void)vlen;   /* walk value not needed; hash16 is the record key */
     OrderIndexWalkCtx *c = (OrderIndexWalkCtx *)ctx_ptr;
     g_out = c->parent_out;
@@ -11564,12 +11645,17 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
                                      int dict_fmt,
                                      QueryDeadline *dl)
 {
-    /* Full range: lower = "" (len 0), upper = "\xff\xff\xff\xff" (len 4).
-       btree_idx_walk_ordered's desc flag handles walk direction. */
-    const char *lo = "";
-    size_t      lo_len = 0;
-    const char *hi = "\xff\xff\xff\xff";
-    size_t      hi_len = 4;
+    /* Bound the walk by any range/eq leaf on order_by so a sparse windowed
+       query stops at the window instead of scanning the whole index. The
+       per-record criteria_match_tree still runs, so this only narrows the walk. */
+    OrderWalkBounds owb;
+    order_walk_bounds(tree, fs, order_by, &owb);
+    const char *lo = owb.has_lo ? (const char *)owb.lo : "";
+    size_t      lo_len  = owb.has_lo ? owb.lo_len  : 0;
+    int         lo_excl = owb.has_lo ? owb.lo_excl : 0;
+    const char *hi = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
+    size_t      hi_len  = owb.has_hi ? owb.hi_len  : 4;
+    int         hi_excl = owb.has_hi ? owb.hi_excl : 0;
 
     /* Set up the callback context. */
     OrderIndexWalkCtx ctx;
@@ -11595,8 +11681,8 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
        per order_desc.  The callback post-filters each record against the
        full criteria tree and stops when limit is reached. */
     btree_idx_walk_ordered(db_root, object, order_by, sch->splits,
-                           lo, lo_len, 0,
-                           hi, hi_len, 0,
+                           lo, lo_len, lo_excl,
+                           hi, hi_len, hi_excl,
                            order_desc, order_index_walk_cb, &ctx);
 
     return ctx.printed;
@@ -13506,6 +13592,33 @@ int leaf_selective_for_test(const char *db_root, const char *object,
     CardEst e = card_est_leaf(eff_root, bare, sc.splits, &leaf, tf, selectivity_budget(N));
     if (out_k) *out_k = e.k;
     return leaf_is_selective(e, N);
+}
+#endif
+
+#ifdef TEST_BUILD
+/* Test hook: which sides of the order-by walk got bounded by a range/eq leaf
+ * on order_by. Mirrors plan_filter_kind_for_test's dir/object split. */
+int order_walk_bounds_for_test(const char *db_root, const char *object,
+                               const char *criteria_json, const char *order_by,
+                               int *out_has_lo, int *out_has_hi) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) { size_t d=(size_t)(slash-object);
+        snprintf(eff_root,sizeof(eff_root),"%s/%.*s",db_root,(int)d,object);
+        snprintf(bare,sizeof(bare),"%s",slash+1);
+    } else { snprintf(eff_root,sizeof(eff_root),"%s",db_root);
+        snprintf(bare,sizeof(bare),"%s",object); }
+    const char *err = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return -1;
+    FieldSchema fs; init_field_schema(&fs, eff_root, bare);
+    OrderWalkBounds b;
+    order_walk_bounds(tree, &fs, order_by, &b);
+    if (out_has_lo) *out_has_lo = b.has_lo;
+    if (out_has_hi) *out_has_hi = b.has_hi;
+    free_criteria_tree(tree);
+    return 0;
 }
 #endif
 
@@ -16515,6 +16628,9 @@ typedef struct {
 
 static int cursor_find_cb(const char *val, size_t vlen,
                           const uint8_t *hash16, void *ctx) {
+#ifdef TEST_BUILD
+    g_order_walk_scanned++;
+#endif
     CursorFindCtx *c = (CursorFindCtx *)ctx;
     /* Pool worker threads carry a thread-local g_out across requests.
        Force this request's socket so OUT() reaches the right client —
@@ -17452,26 +17568,36 @@ int cmd_find(const char *db_root, const char *object,
         /* Cursor response always uses the {rows:..., cursor:...} wrapper so
            clients get a single stable shape regardless of format. dict_fmt
            swaps the inner array for an object. */
+        OrderWalkBounds owb;
+        order_walk_bounds(tree, &driver_fs, order_by, &owb);
         OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
         if (desc) {
-            /* DESC: walk backward. Upper bound = cursor value (inclusive),
-               lower bound = "". Ties still handled in the callback. */
-            const char *max_val_bytes = has_cur_bytes
-                ? (const char *)cur_value_buf : "\xff\xff\xff\xff";
-            size_t max_val_len = has_cur_bytes ? cur_value_len : 4;
+            /* DESC: start (upper) = cursor when resuming, else window-high or
+               max; stop (lower) = window-low or "". */
+            const char *hi_b = has_cur_bytes ? (const char *)cur_value_buf
+                             : (owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff");
+            size_t hi_l = has_cur_bytes ? cur_value_len : (owb.has_hi ? owb.hi_len : 4);
+            int    hi_e = has_cur_bytes ? 0 : (owb.has_hi ? owb.hi_excl : 0);
+            const char *lo_b = owb.has_lo ? (const char *)owb.lo : "";
+            size_t lo_l = owb.has_lo ? owb.lo_len : 0;
+            int    lo_e = owb.has_lo ? owb.lo_excl : 0;
             btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
-                                   "", 0, 0,
-                                   max_val_bytes, max_val_len, 0,
+                                   lo_b, lo_l, lo_e,
+                                   hi_b, hi_l, hi_e,
                                    1, cursor_find_cb, &cc);
         } else {
-            /* ASC: walk forward. Lower bound = cursor value (inclusive),
-               upper bound = "\xff\xff\xff\xff". Ties handled in callback. */
-            const char *min_val_bytes = has_cur_bytes
-                ? (const char *)cur_value_buf : "";
-            size_t min_val_len = has_cur_bytes ? cur_value_len : 0;
+            /* ASC: start (lower) = cursor when resuming, else window-low or "";
+               stop (upper) = window-high or max. */
+            const char *lo_b = has_cur_bytes ? (const char *)cur_value_buf
+                             : (owb.has_lo ? (const char *)owb.lo : "");
+            size_t lo_l = has_cur_bytes ? cur_value_len : (owb.has_lo ? owb.lo_len : 0);
+            int    lo_e = has_cur_bytes ? 0 : (owb.has_lo ? owb.lo_excl : 0);
+            const char *hi_b = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
+            size_t hi_l = owb.has_hi ? owb.hi_len : 4;
+            int    hi_e = owb.has_hi ? owb.hi_excl : 0;
             btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
-                                   min_val_bytes, min_val_len, 0,
-                                   "\xff\xff\xff\xff", 4, 0,
+                                   lo_b, lo_l, lo_e,
+                                   hi_b, hi_l, hi_e,
                                    0, cursor_find_cb, &cc);
         }
         OUT(dict_fmt ? "}" : "]");
@@ -17927,10 +18053,20 @@ int cmd_find(const char *db_root, const char *object,
             cc.prefilter_ks    = prefilter_ks;
             cc.parent_out      = g_out;
 
-            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
-                                   "", 0, 0,
-                                   "\xff\xff\xff\xff", 4, 0,
-                                   desc, cursor_find_cb, &cc);
+            {
+                OrderWalkBounds owb;
+                order_walk_bounds(tree, &driver_fs, order_by, &owb);
+                const char *lo_b = owb.has_lo ? (const char *)owb.lo : "";
+                size_t lo_l = owb.has_lo ? owb.lo_len : 0;
+                int    lo_e = owb.has_lo ? owb.lo_excl : 0;
+                const char *hi_b = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
+                size_t hi_l = owb.has_hi ? owb.hi_len : 4;
+                int    hi_e = owb.has_hi ? owb.hi_excl : 0;
+                btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+                                       lo_b, lo_l, lo_e,
+                                       hi_b, hi_l, hi_e,
+                                       desc, cursor_find_cb, &cc);
+            }
             if (dict_fmt)
                 OUT(want_total ? "},\"total\":null}\n" : "}\n");
             else if (rows_fmt)
