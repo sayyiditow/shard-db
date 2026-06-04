@@ -11186,6 +11186,10 @@ typedef struct {
 
 static int composite_prefix_cb(const char *val, size_t vlen,
                                 const uint8_t *hash16, void *ctx) {
+#ifdef TEST_BUILD
+    extern long g_order_walk_scanned;
+    g_order_walk_scanned++;
+#endif
     (void)val; (void)vlen;   /* composite leaf value not needed; hash16 is the key */
     CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
     g_out = c->parent_out;
@@ -11298,11 +11302,31 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
     encode_criterion_value(seed_tf, seed->value, strlen(seed->value), buf_lo, &len_lo);
     size_t pfx_len = len_lo;
 
-    /* 2. Upper bound: seed prefix + 4 × 0xff (STARTS_WITH idiom). */
+    /* 2. Upper bound: byte-successor of the seed prefix.
+       For fixed-width types: append 0xff bytes (original STARTS_WITH idiom).
+       For VARCHAR: increment the last byte < 0xff, or append 0x00 if all 0xff,
+       producing a tight exclusive bound. The old 0xff*4 approach creates an
+       over-wide range for variable-length keys because shorter prefix + 0xff
+       can let non-matching values through. */
     uint8_t buf_hi[1024 + 8];
     memcpy(buf_hi, buf_lo, len_lo);
-    memset(buf_hi + len_lo, 0xff, 4);
-    size_t  len_hi = len_lo + 4;
+    size_t len_hi;
+    if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
+        int pos = (int)len_lo - 1;
+        while (pos >= 0 && buf_lo[pos] == 0xff) pos--;
+        if (pos >= 0) {
+            memcpy(buf_hi, buf_lo, (size_t)pos);
+            buf_hi[pos] = buf_lo[pos] + 1;
+            len_hi = (size_t)pos + 1;
+        } else {
+            memcpy(buf_hi, buf_lo, len_lo);
+            buf_hi[len_lo] = 0x00;
+            len_hi = len_lo + 1;
+        }
+    } else {
+        memset(buf_hi + len_lo, 0xff, 4);
+        len_hi = len_lo + 4;
+    }
     int min_excl = 0, max_excl = 0;
 
     /* 2b. If an order_by range/eq leaf is present (EQ seed only — guaranteed
@@ -13054,15 +13078,29 @@ static int order_field_drivable(const char *db_root, const char *object,
  * fills `limit` in ~limit fetches. Only fall back to sort when order_by isn't
  * drivable (no btree → nothing to walk; D2 is best-effort, bounded by
  * QUERY_BUFFER_MB). Mirrors the cursor path's g_ordered_find_keyset_max guard. */
+/* Crossover for fetch+sort (D2) vs order-index walk (D3). D2 cost ≈ K (fetch+
+ * sort all candidates). D3 cost ≈ (offset+limit)/pass_rate ≈ (offset+limit)*N/K
+ * (walk the order index until `limit` matches fill). They cross at
+ * K ≈ sqrt((offset+limit)*N): below it sort wins, above it walk wins. This
+ * replaces the limit-agnostic N/g_random_seq_ratio cutoff and the fixed
+ * SMALL_PREFILTER_THRESHOLD with one decision. */
+static int prefer_fetch_sort(size_t candidates, size_t N, int offset, int limit) {
+    if (candidates == 0) return 1;
+    size_t want = (size_t)((offset > 0 ? offset : 0) + (limit > 0 ? limit : 1));
+    /* sort wins when candidates*candidates < want*N (avoids sqrt/float). */
+    return candidates * candidates < want * N;
+}
+
 static FilterOrderKind pick_sort_or_walk(const char *db_root, const char *object,
-                                         const char *order_by, CardEst se, size_t N) {
-    int sel = leaf_is_selective(se, N);
+                                         const char *order_by, CardEst se, size_t N,
+                                         int offset, int limit) {
     int driv = order_field_drivable(db_root, object, order_by);
-    if (sel)
-        return FP_ORDER_SORT;                       /* small known set → sort */
-    if (driv)
-        return FP_ORDER_INDEX_WALK;                 /* broad → walk order index */
-    return FP_ORDER_SORT;                            /* broad, but no order btree */
+    /* Unestimable/saturated → can't size the set; only walk if drivable. */
+    if (!se.estimable || se.saturated)
+        return driv ? FP_ORDER_INDEX_WALK : FP_ORDER_SORT;
+    if (prefer_fetch_sort(se.k, N, offset, limit) || !driv)
+        return FP_ORDER_SORT;
+    return FP_ORDER_INDEX_WALK;
 }
 
 /* Flatten a tree into its AND-leaves (the implicit-AND children, or a lone
@@ -13470,7 +13508,7 @@ order_overlay:
                 /* Drive on the most-selective seed instead (pre-overlay fp.kind /
                  * source_leaves already point at prim). D2 if bounded, else D3. */
                 CardEst se = est[prim];
-                fp.order = pick_sort_or_walk(db_root, object, order_by, se, N);
+                fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit);
             }
         } else if (composite_index_exists(db_root, object,
                                     fp.source_leaves[0]->field, order_by)
@@ -13493,7 +13531,7 @@ order_overlay:
              * the explicit check keeps -Wmaybe-uninitialized quiet across the
              * added composite branches without changing behaviour. */
             CardEst se = (prim >= 0) ? est[prim] : (CardEst){0, 0, 0};
-            fp.order = pick_sort_or_walk(db_root, object, order_by, se, N);
+            fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit);
         }
     }
     return fp;
@@ -17603,6 +17641,98 @@ int cmd_find(const char *db_root, const char *object,
             return 0;
         }
 
+        /* C1 — cursor fetch+sort shortcut.  When the prefilter keyset
+           is small (bounded by prefer_fetch_sort) the candidate
+           records can be fetched, filtered, sorted and emitted in
+           memory, beating a btree walk that must scan past non-matching
+           order_index entries.  Matches the non-cursor D2 shortcut. */
+        if (cursor_prefilter_ks &&
+            prefer_fetch_sort(keyset_size(cursor_prefilter_ks),
+                              cursor_N_live, offset, limit) &&
+            order_tf && driver_fs.ts && order_field_idx >= 0) {
+            size_t n_pre = keyset_size(cursor_prefilter_ks);
+            SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
+            if (sp_rows) {
+                SmallPrefilterCollect ca = { sp_rows, n_pre, 0 };
+                keyset_iter(cursor_prefilter_ks, small_prefilter_collect_cb, &ca);
+                int n_kept = 0;
+                for (size_t i = 0; i < n_pre; i++) {
+                    RecordRef rr;
+                    if (read_record_ref(db_root, object, &sch,
+                                        sp_rows[i].hash, &rr) != 0) continue;
+                    if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                                      tree, &driver_fs)) {
+                        release_record_ref(&rr);
+                        continue;
+                    }
+                    if (n_kept != (int)i)
+                        memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
+                    typed_field_to_index_key(driver_fs.ts,
+                                             (const uint8_t *)rr.val,
+                                             order_field_idx,
+                                             sp_rows[n_kept].sort_key,
+                                             &sp_rows[n_kept].sort_key_len);
+                    n_kept++;
+                    release_record_ref(&rr);
+                }
+                qsort(sp_rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
+                      desc ? small_prefilter_cmp_desc
+                           : small_prefilter_cmp_asc);
+                CursorFindCtx cc;
+                memset(&cc, 0, sizeof(cc));
+                cc.cursor_value_bytes = has_cur_bytes ? cur_value_buf : NULL;
+                cc.cursor_value_len   = cur_value_len;
+                cc.has_cursor         = cur.present;
+                if (cur.present) {
+                    compute_hash_raw(cur.key, cur.klen, cc.cursor_hash16);
+                }
+                cc.db_root         = db_root;
+                cc.object          = object;
+                cc.sch             = &sch;
+                cc.fs              = (driver_fs.ts || driver_fs.nfields > 0)
+                                      ? &driver_fs : NULL;
+                cc.desc            = desc;
+                cc.remaining       = tree;
+                cc.proj_fields     = proj_count > 0 ? proj_fields : NULL;
+                cc.proj_count      = proj_count;
+                cc.rows_fmt        = rows_fmt;
+                cc.dict_fmt        = dict_fmt;
+                cc.limit           = limit;
+                cc.printed         = 0;
+                cc.order_tf        = order_tf;
+                cc.order_field_idx = order_field_idx;
+                cc.skip_remaining  = offset > 0 ? offset : 0;
+                cc.offset_mode     = 1;
+                cc.deadline        = &cdl;
+                cc.prefilter_ks    = NULL;
+                cc.parent_out      = g_out;
+                OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
+                for (int i = 0; i < n_kept; i++) {
+                    if (cursor_find_cb((const char *)sp_rows[i].sort_key,
+                                       sp_rows[i].sort_key_len,
+                                       sp_rows[i].hash, &cc) < 0) break;
+                }
+                OUT(dict_fmt ? "}" : "]");
+                if (cc.printed >= limit && cc.last_value_str
+                    && cc.last_key_str) {
+                    OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}}",
+                        order_by, cc.last_value_str, cc.last_key_str);
+                } else {
+                    OUT(",\"cursor\":null}");
+                }
+                OUT("\n");
+                free(sp_rows);
+                free(cc.last_value_str);
+                free(cc.last_key_str);
+                keyset_free(cursor_prefilter_ks);
+                free_joins(joins, njoins);
+                free_criteria_tree(tree);
+                free_excluded(&excluded);
+                return 0;
+            }
+            /* calloc failed — fall through to btree-walk path. */
+        }
+
         CursorFindCtx cc;
         memset(&cc, 0, sizeof(cc));
         cc.cursor_value_bytes = has_cur_bytes ? cur_value_buf : NULL;
@@ -17998,7 +18128,7 @@ int cmd_find(const char *db_root, const char *object,
                 }
             }
             if (prefilter_ks &&
-                keyset_size(prefilter_ks) <= SMALL_PREFILTER_THRESHOLD &&
+                prefer_fetch_sort(keyset_size(prefilter_ks), find_N_live, offset, limit) &&
                 order_tf && driver_fs.ts && order_field_idx >= 0) {
                 size_t n_pre = keyset_size(prefilter_ks);
                 SmallPrefilterRow *rows = calloc(n_pre, sizeof(SmallPrefilterRow));
@@ -25839,4 +25969,147 @@ igb_skip:
     agg_free(&ctx);
     return 0;
 }
+
+#ifdef TEST_BUILD
+int composite_prefix_walk_for_test(const char *db_root, const char *object,
+                                    const char *criteria_json,
+                                    const char *order_by, int order_desc,
+                                    int limit) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t d = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s", db_root, (int)d, object);
+        snprintf(bare, sizeof(bare), "%s", slash + 1);
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        snprintf(bare, sizeof(bare), "%s", object);
+    }
+    const char *err = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return -1;
+    Schema sc = load_schema(eff_root, bare);
+    if (sc.splits <= 0) { free_criteria_tree(tree); return -1; }
+    FieldSchema fs;
+    init_field_schema(&fs, eff_root, bare);
+    if (!fs.ts) { free_criteria_tree(tree); return -1; }
+    size_t N = (size_t)get_live_count(eff_root, bare);
+    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N,
+                                 order_by, 1, limit);
+    if (fp.order != FP_ORDER_COMPOSITE || fp.kind != FP_PRIMARY_LEAF ||
+        fp.n_source < 1 || !fp.source_leaves[0]) {
+        free_criteria_tree(tree);
+        return -2;
+    }
+    FILE *saved_out = g_out;
+    g_out = fopen("/dev/null", "w");
+    if (!g_out) { g_out = saved_out; free_criteria_tree(tree); return -1; }
+    ExcludedKeys excluded = {0};
+    QueryDeadline dl = { .t0_ms = 0, .timeout_ms = 0, .timed_out = 0 };
+    g_order_walk_scanned = 0;
+    find_via_composite_prefix(
+        eff_root, bare, &sc,
+        (fs.ts || fs.nfields > 0) ? &fs : NULL,
+        fp.source_leaves[0], order_by, order_desc,
+        fp.order_range,
+        tree, &excluded, 0, limit,
+        NULL, 0, 0, &dl);
+    long scanned = g_order_walk_scanned;
+    fclose(g_out);
+    g_out = saved_out;
+    free_criteria_tree(tree);
+    return (int)scanned;
+}
+
+/* Test-only helper: compute the composite-prefix upper-bound bytes for a
+   seed value. Returns the bound length, or -1 on error. The bound bytes
+   are written to out_hi (up to 1024+8). Tests use this to verify the
+   successor approach produces a tight bound for VARCHAR seeds. */
+int composite_prefix_bound_for_test(const char *db_root, const char *object,
+                                     const char *criteria_json,
+                                     const char *order_by,
+                                     uint8_t *out_hi, size_t *out_hi_len,
+                                     uint8_t *out_lo, size_t *out_lo_len,
+                                     int *out_min_excl, int *out_max_excl) {
+    snprintf(g_db_root, PATH_MAX, "%s", db_root);
+    char eff_root[PATH_MAX], bare[256];
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t d = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s", db_root, (int)d, object);
+        snprintf(bare, sizeof(bare), "%s", slash + 1);
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        snprintf(bare, sizeof(bare), "%s", object);
+    }
+    const char *err = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &err);
+    if (!tree) return -1;
+    Schema sc = load_schema(eff_root, bare);
+    if (sc.splits <= 0) { free_criteria_tree(tree); return -1; }
+    FieldSchema fs;
+    init_field_schema(&fs, eff_root, bare);
+    if (!fs.ts) { free_criteria_tree(tree); return -1; }
+    size_t N = (size_t)get_live_count(eff_root, bare);
+    FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N,
+                                 order_by, 1, 0);
+    if (fp.order != FP_ORDER_COMPOSITE || fp.kind != FP_PRIMARY_LEAF ||
+        fp.n_source < 1 || !fp.source_leaves[0]) {
+        free_criteria_tree(tree);
+        return -2;
+    }
+    const TypedField *seed_tf = resolve_idx_field(fs.ts, fp.source_leaves[0]->field);
+    uint8_t buf_lo[1024 + 8];
+    size_t len_lo = 0;
+    encode_criterion_value(seed_tf, fp.source_leaves[0]->value,
+                           strlen(fp.source_leaves[0]->value), buf_lo, &len_lo);
+    uint8_t buf_hi[1024 + 8];
+    memcpy(buf_hi, buf_lo, len_lo);
+    size_t len_hi;
+    int min_excl = 0, max_excl = 0;
+    if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
+        int pos = (int)len_lo - 1;
+        while (pos >= 0 && buf_lo[pos] == 0xff) pos--;
+        if (pos >= 0) {
+            memcpy(buf_hi, buf_lo, (size_t)pos);
+            buf_hi[pos] = buf_lo[pos] + 1;
+            len_hi = (size_t)pos + 1;
+        } else {
+            memcpy(buf_hi, buf_lo, len_lo);
+            buf_hi[len_lo] = 0x00;
+            len_hi = len_lo + 1;
+        }
+    } else {
+        memset(buf_hi + len_lo, 0xff, 4);
+        len_hi = len_lo + 4;
+    }
+    if (fp.order_range) {
+        const TypedField *ord_tf = resolve_idx_field(fs.ts, order_by);
+        const char *highv = NULL; int high_excl = 0;
+        switch (fp.order_range->op) {
+            case OP_LESS_EQ:    highv = fp.order_range->value; break;
+            case OP_LESS:       highv = fp.order_range->value; high_excl = 1; break;
+            case OP_EQUAL:      highv = fp.order_range->value; break;
+            case OP_BETWEEN:    highv = fp.order_range->value2; high_excl = fp.order_range->max_exclusive; break;
+            default: break;
+        }
+        if (highv) {
+            uint8_t enc[1024]; size_t el = 0;
+            encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
+            if (len_lo + el <= sizeof(buf_hi)) {
+                memcpy(buf_hi + len_lo, enc, el);
+                len_hi = len_lo + el;
+                max_excl = high_excl;
+            }
+        }
+    }
+    if (out_hi && out_hi_len) { memcpy(out_hi, buf_hi, len_hi); *out_hi_len = len_hi; }
+    if (out_lo && out_lo_len) { memcpy(out_lo, buf_lo, len_lo); *out_lo_len = len_lo; }
+    if (out_min_excl) *out_min_excl = min_excl;
+    if (out_max_excl) *out_max_excl = max_excl;
+    free_criteria_tree(tree);
+    return (int)len_hi;
+}
+#endif
 
