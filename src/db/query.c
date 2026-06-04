@@ -12956,6 +12956,29 @@ static int order_field_drivable(const char *db_root, const char *object,
     return field_has_index_type(db_root, object, order_by, IT_BTREE);
 }
 
+/* D2 (fetch+sort) vs D3 (walk order index, post-filter to limit).
+ *
+ * D2 only pays off when the candidate set is genuinely small: it materializes
+ * and sorts every match before applying limit. A *bitmap* seed yields an EXACT
+ * count (estimable && !saturated) that can still be enormous (k ≈ N) — sorting
+ * that many rows times out (observed: `type in (...) ORDER BY score` over 4.3M
+ * → 30s). So gate on magnitude, not just estimability: when the most-selective
+ * seed is still broad (fails the N/g_random_seq_ratio budget) and order_by has
+ * a btree to walk, walk it (D3); the broad filter's high post-filter pass-rate
+ * fills `limit` in ~limit fetches. Only fall back to sort when order_by isn't
+ * drivable (no btree → nothing to walk; D2 is best-effort, bounded by
+ * QUERY_BUFFER_MB). Mirrors the cursor path's ORDERED_FIND_KEYSET_MAX guard. */
+static FilterOrderKind pick_sort_or_walk(const char *db_root, const char *object,
+                                         const char *order_by, CardEst se, size_t N) {
+    int sel = leaf_is_selective(se, N);
+    int driv = order_field_drivable(db_root, object, order_by);
+    if (sel)
+        return FP_ORDER_SORT;                       /* small known set → sort */
+    if (driv)
+        return FP_ORDER_INDEX_WALK;                 /* broad → walk order index */
+    return FP_ORDER_SORT;                            /* broad, but no order btree */
+}
+
 /* Flatten a tree into its AND-leaves (the implicit-AND children, or a lone
  * leaf). OR sub-trees and nested AND are handled by the caller; here we only
  * collect direct LEAF children for the per-leaf cost pass. Returns count. */
@@ -13361,8 +13384,7 @@ order_overlay:
                 /* Drive on the most-selective seed instead (pre-overlay fp.kind /
                  * source_leaves already point at prim). D2 if bounded, else D3. */
                 CardEst se = est[prim];
-                fp.order = (se.estimable && !se.saturated)
-                           ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
+                fp.order = pick_sort_or_walk(db_root, object, order_by, se, N);
             }
         } else if (composite_index_exists(db_root, object,
                                     fp.source_leaves[0]->field, order_by)
@@ -13385,8 +13407,7 @@ order_overlay:
              * the explicit check keeps -Wmaybe-uninitialized quiet across the
              * added composite branches without changing behaviour. */
             CardEst se = (prim >= 0) ? est[prim] : (CardEst){0, 0, 0};
-            fp.order = (se.estimable && !se.saturated)
-                       ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
+            fp.order = pick_sort_or_walk(db_root, object, order_by, se, N);
         }
     }
     return fp;
