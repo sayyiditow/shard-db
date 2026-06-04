@@ -220,8 +220,10 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_planner_sort_vs_walk.c \
     src/test/cases/test_planner_cost_model.c \
     src/test/cases/test_planner_materialization_guard.c \
+    src/test/cases/test_planner_op_capability.c \
     src/test/cases/test_d1_composite_executor.c \
     src/test/cases/test_composite_varchar_bound.c \
+    src/test/cases/test_composite_in_fold.c \
     src/test/cases/test_composite_typed.c \
     src/test/cases/test_composite_selectivity_guard.c \
     src/test/cases/test_composite_range_fold.c \

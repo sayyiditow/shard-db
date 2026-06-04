@@ -132,3 +132,50 @@ static int test_card_est_trigram(void) {
     return 0;
 }
 TEST_REGISTER("test-card-est-trigram", test_card_est_trigram)
+
+/* Part B issue-C: bitmap OP_IN estimate sums ALL values, not just the first.
+ * Field `val:varchar:4` with bitmap index; values a(100), b(50), c(10).
+ * COUNT query with tag in (a,b,c) should return 160, not 100. */
+static int test_card_est_bitmap_in_sum(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
+    char *resp = NULL;
+    TestClientCfg cfg = { .port = env.port };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ce_in\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[\"val:varchar:4\"],"
+        "\"indexes\":[\"val:bitmap\"]}", &resp); free(resp); resp=NULL;
+    char body[16384]; size_t p=0; int k=0;
+    SB_APPEND(body,p,sizeof(body),"{");
+    for (int i=0;i<100;i++){SB_APPEND(body,p,sizeof(body),"%s\"k%d\":{\"val\":\"a\"}",k==0?"":",",k);k++;}
+    for (int i=0;i<50; i++){SB_APPEND(body,p,sizeof(body),",\"k%d\":{\"val\":\"b\"}",k);k++;}
+    for (int i=0;i<10; i++){SB_APPEND(body,p,sizeof(body),",\"k%d\":{\"val\":\"c\"}",k);k++;}
+    SB_APPEND(body,p,sizeof(body),"}");
+    char req[17408];
+    snprintf(req,sizeof(req),
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ce_in\","
+        "\"records\":%s}",body);
+    tc_request(tc, req, &resp); free(resp); resp=NULL;
+
+    /* COUNT: val in (a,b,c) → should be 160 */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ce_in\","
+                    "\"criteria\":[{\"field\":\"val\",\"op\":\"in\",\"value\":\"a,b,c\"}]}",
+               &resp);
+    ASSERT_CONTAINS(resp, "160", "bitmap IN count: a(100)+b(50)+c(10) = 160");
+    free(resp);
+
+    /* Single-value counts still correct */
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ce_in\","
+                    "\"criteria\":[{\"field\":\"val\",\"op\":\"eq\",\"value\":\"a\"}]}",
+               &resp);
+    ASSERT_CONTAINS(resp, "100", "bitmap EQ count: a = 100");
+    free(resp);
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-card-est-bitmap-in-sum", test_card_est_bitmap_in_sum)
