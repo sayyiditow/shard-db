@@ -13316,22 +13316,53 @@ order_overlay:
          * shape (e.g. type=job ... ORDER BY time) that previously fell to D3. */
         int cc = find_covering_composite(db_root, object, leaves, nL, order_by);
         if (cc >= 0) {
-            fp.kind            = FP_PRIMARY_LEAF;  /* composite executor requires this */
-            fp.source_is_bitmap = 0;               /* driving via composite btree, not a bitmap */
-            fp.source_leaves[0] = leaves[cc];
-            fp.n_source         = 1;
-            fp.order            = FP_ORDER_COMPOSITE;
-            fp.order_range = NULL;
+            /* Find an order_by range/eq leaf (used both for the range-fold and
+             * the guard below). EQ-seed only — STARTS seeds don't fold. */
+            SearchCriterion *obr = NULL;
             if (leaves[cc]->op == OP_EQUAL) {
                 for (int i = 0; i < nL; i++) {
                     if (strcmp(leaves[i]->field, order_by) != 0) continue;
                     enum SearchOp o = leaves[i]->op;
                     if (o == OP_GREATER || o == OP_GREATER_EQ || o == OP_LESS ||
                         o == OP_LESS_EQ || o == OP_BETWEEN || o == OP_EQUAL) {
-                        fp.order_range = leaves[i];
+                        obr = leaves[i];
                         break;
                     }
                 }
+            }
+
+            /* Selectivity guard. A composite ordered by order_by walks the whole
+             * seed prefix and post-filters siblings, so it's only cheap when:
+             *   - the seed prefix is itself selective (small partition), OR
+             *   - order_by carries the range (walk seeks / fills fast), OR
+             *   - there's no more-selective sibling to drive a better plan.
+             * When the seed is provably broad AND a selective sibling exists on
+             * a non-order_by field AND order_by has no range, the composite walk
+             * would scan the whole broad partition (e.g. type=story ≈ all rows,
+             * ORDER BY score, time>=T post-filtered) — far worse than letting the
+             * selective sibling (time>=T) drive a fetch+sort. Skip it. */
+            int seed_broad = est[cc].estimable && !leaf_is_selective(est[cc], N);
+            int has_sel_other = 0;
+            for (int i = 0; i < nL; i++) {
+                if (i == cc) continue;
+                if (strcmp(leaves[i]->field, order_by) == 0) continue; /* order_by sibling → range-fold */
+                if (leaf_is_selective(est[i], N)) { has_sel_other = 1; break; }
+            }
+            int skip_composite = seed_broad && !obr && has_sel_other;
+
+            if (!skip_composite) {
+                fp.kind             = FP_PRIMARY_LEAF;  /* composite executor requires this */
+                fp.source_is_bitmap = 0;
+                fp.source_leaves[0] = leaves[cc];
+                fp.n_source         = 1;
+                fp.order            = FP_ORDER_COMPOSITE;
+                fp.order_range      = obr;
+            } else {
+                /* Drive on the most-selective seed instead (pre-overlay fp.kind /
+                 * source_leaves already point at prim). D2 if bounded, else D3. */
+                CardEst se = est[prim];
+                fp.order = (se.estimable && !se.saturated)
+                           ? FP_ORDER_SORT : FP_ORDER_INDEX_WALK;
             }
         } else if (composite_index_exists(db_root, object,
                                     fp.source_leaves[0]->field, order_by)
