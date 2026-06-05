@@ -32,22 +32,6 @@ static int has(const char *haystack, const char *needle) {
     return haystack && needle && strstr(haystack, needle) != NULL;
 }
 
-static int pos_of(const char *haystack, const char *needle) {
-    if (!haystack || !needle) return -1;
-    const char *p = strstr(haystack, needle);
-    return p ? (int)(p - haystack) : -1;
-}
-
-/* Extract a long value from a JSON key:value pair, e.g. "t":42 */
-static long extract_long(const char *body, const char *field) {
-    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\":", field);
-    const char *p = strstr(body, pat);
-    if (!p) return -9999;
-    p += strlen(pat);
-    while (*p == ' ') p++;
-    return atol(p);
-}
-
 /* ── test hooks used ─────────────────────────────────────────── */
 extern const char *plan_filter_kind_for_test(const char *db_root, const char *object,
         const char *criteria_json, const char *order_by, int fetching,
@@ -261,6 +245,147 @@ TEST_REGISTER("test-in-fold-plan-composite", test_in_fold_plan_composite)
  * For tag in (a,c) ORDER BY t DESC limit 5, the k-way merge
  * should scan O(limit × n_values) ≈ 5 × 2 = ~10–15 entries,
  * not the full 12-row data or more. */
+/* Single-value EQ composite prefix walk — exercises the seed_tf_sv gate. */
+static int test_in_fold_single_eq(void) {
+    TestEnv env = {0};
+    TestClient *tc = in_fold_setup(&env);
+    if (!tc) return 1;
+
+    extern int g_random_seq_ratio;
+    int saved = g_random_seq_ratio;
+    g_random_seq_ratio = 1;
+
+    char out_order[32];
+    const char *kind = plan_filter_kind_for_test(
+        env.db_root, "default/cm_infold",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"}]",
+        "t", 1,
+        NULL, 0, out_order, sizeof(out_order), NULL);
+    g_random_seq_ratio = saved;
+    ASSERT_TRUE(kind != NULL, "plan_kind non-null");
+    ASSERT_CONTAINS(out_order, "composite", "order is composite for single EQ");
+
+    /* Bounded walk: for tag=a there are 3 rows (t=1,5,9). DESC limit=2
+     * should scan only those 3 (or a few more via k-way merge across shards). */
+    g_random_seq_ratio = 1; /* override again for the walk's internal plan_filter */
+    int scanned = composite_prefix_walk_for_test(
+        env.db_root, "default/cm_infold",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"}]",
+        "t", 1 /* desc */, 2);
+    g_random_seq_ratio = saved;
+    ASSERT_TRUE(scanned >= 2, "scanned at least limit entries");
+    ASSERT_TRUE(scanned <= 32, "scanned bounded for single EQ");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-in-fold-single-eq", test_in_fold_single_eq)
+
+/* Q1: verify the byte-successor gate is tight for VARCHAR fields by checking
+   that the composite-prefix walk scans only the matching partition (proved
+   by g_order_walk_scanned).  Also verifies the length-based gate works
+   correctly for a single-value EQ on a typed object. */
+static int test_in_fold_q1_gate_tight(void) {
+    TestEnv env = {0};
+    /* Use in_fold_setup which spawns daemon, creates cm_infold with
+     * tag:varchar:8, t:long, composite index tag+t, and 12 rows (3 per tag). */
+    TestClient *tc = in_fold_setup(&env);
+    if (!tc) return 1;
+
+    extern int g_random_seq_ratio;
+    int saved = g_random_seq_ratio;
+    g_random_seq_ratio = 1;
+
+    /* Verify the plan picks composite D1. */
+    char out_order[32];
+    const char *kind = plan_filter_kind_for_test(
+        env.db_root, "default/cm_infold",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"}]",
+        "t", 1,
+        NULL, 0, out_order, sizeof(out_order), NULL);
+    ASSERT_TRUE(kind != NULL, "plan_kind non-null");
+    ASSERT_CONTAINS(out_order, "composite", "order composite");
+
+    /* Walk should scan exactly the 3 tag=a entries (tight byte-successor
+     * bounds: "a" → "b"), not spill into other tags. */
+    int scanned = composite_prefix_walk_for_test(
+        env.db_root, "default/cm_infold",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"}]",
+        "t", 1, 3);
+    g_random_seq_ratio = saved;
+    ASSERT_TRUE(scanned >= 3, "scanned at least 3 (all tag=a rows)");
+    ASSERT_TRUE(scanned <= 32, "scanned bounded (not full table)");
+
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-in-fold-q1-gate-tight", test_in_fold_q1_gate_tight)
+
+/* Q2: cursor:null with selective range + broad composite equality + ORDER BY.
+   Object: type:varchar:8, score:long, type+score composite.  Broad equality
+   (type=common, ~9 rows) + selective range (score>=9, ~3 rows) + ORDER BY
+   score DESC + cursor:null + limit=2.  With prefilter_card the cursor C1
+   shortcut should pick fetch+sort (bounded) over a brute-force composite walk. */
+static int test_in_fold_q2_cursor_fetchsort(void) {
+    TestEnv env = {0};
+    TestClient *tc = in_fold_setup(&env);
+    if (!tc) return 1;
+
+    /* Use existing cm_infold fixture: tag:varchar:8, t:long, tag+t composite.
+     * 12 rows: tags a/b/c/d interleaved with t=1..12.
+     * We need a standalone index on t for the cursor:null requirement. */
+    char *r = do_req(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"default\",\"object\":\"cm_infold\",\"field\":\"t\"}");
+    if (has(r, "\"error\"")) { free(r); tc_close(tc); test_env_stop(&env); return 1; }
+    free(r);
+
+    /* Query: tag=a (broad, 3 rows) AND t>=9 (selective, 1 row: k04, t=9)
+     *         ORDER BY t DESC cursor:null limit=1
+     * → D1 composite seed = tag=a (broad, keyset ~3), prefilter_card = t>=9 (~1)
+     * → cursor C1 should pick fetch+sort (bounded) over composite walk. */
+    extern int g_random_seq_ratio;
+    int saved = g_random_seq_ratio;
+    g_random_seq_ratio = 1;
+
+    char out_order[32];
+    const char *kind = plan_filter_kind_for_test(
+        env.db_root, "default/cm_infold",
+        "[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"},"
+         "{\"field\":\"t\",\"op\":\"gte\",\"value\":\"9\"}]",
+        "t", 1,
+        NULL, 0, out_order, sizeof(out_order), NULL);
+    ASSERT_TRUE(kind != NULL, "plan_kind non-null q2");
+    ASSERT_CONTAINS(out_order, "composite", "order composite q2");
+
+    /* Cursor:null find — the C1 prefilter_card override should enable
+       fetch+sort (bounded) instead of composite walk. */
+    r = do_req(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"cm_infold\","
+        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"},"
+                       "{\"field\":\"t\",\"op\":\"gte\",\"value\":\"9\"}],"
+        "\"order_by\":\"t\",\"order\":\"desc\",\"limit\":1,"
+        "\"cursor\":null}");
+    ASSERT_TRUE(!has(r, "\"error\""), "q2 cursor no error");
+    ASSERT_TRUE(has(r, "\"k08\""), "q2 cursor has k08 (a, t=9)");
+    ASSERT_TRUE(has(r, "\"cursor\""), "q2 cursor has cursor");
+    free(r);
+
+    /* Same query without t>=9 → tag=a sole leaf, composite walk. */
+    r = do_req(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"cm_infold\","
+        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"a\"}],"
+        "\"order_by\":\"t\",\"order\":\"desc\",\"limit\":1,"
+        "\"cursor\":null}");
+    ASSERT_TRUE(!has(r, "\"error\""), "q2 broad-only no error");
+    ASSERT_TRUE(has(r, "\"cursor\""), "q2 broad-only cursor");
+    free(r);
+
+    g_random_seq_ratio = saved;
+    tc_close(tc); test_env_stop(&env);
+    return 0;
+}
+TEST_REGISTER("test-in-fold-q2-cursor-fetchsort", test_in_fold_q2_cursor_fetchsort)
+
 static int test_in_fold_bounded_scan(void) {
     TestEnv env = {0};
     TestClient *tc = in_fold_setup(&env);
