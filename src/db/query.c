@@ -17146,6 +17146,72 @@ static int small_prefilter_cmp_desc(const void *a, const void *b) {
     return -small_prefilter_cmp_asc(a, b);
 }
 
+/* ========== C1 batched fetch worker ==========
+ * Groups hashes by shard before fetching to improve cache locality and
+ * enable parallel execution across shard groups. Populates
+ * SmallPrefilterRow arrays for sort+emit in the C1 cursor path.
+ *
+ * Mirrors ShardWorkCtx / ShardCountCtx shape. */
+typedef struct {
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    CollectedHash *entries;
+    int            entry_count;
+    CriteriaNode  *tree;
+    FieldSchema   *fs;
+    int            order_field_idx;
+    TypedSchema   *ts;
+    SmallPrefilterRow *results;   /* output array, caller frees */
+    int            result_count;
+    int            result_cap;
+    QueryDeadline *deadline;
+    int            dl_counter;
+} CursorFetchCtx;
+
+static void *cursor_fetch_worker(void *arg) {
+    CursorFetchCtx *ctx = (CursorFetchCtx *)arg;
+    if (ctx->entry_count == 0) return NULL;
+
+    for (int ei = 0; ei < ctx->entry_count; ei++) {
+        if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) break;
+        CollectedHash *e = &ctx->entries[ei];
+
+        RecordRef rr;
+        if (read_record_ref(ctx->db_root, ctx->object, ctx->sch,
+                             e->hash, &rr) != 0) continue;
+
+        if (ctx->tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                               ctx->tree, ctx->fs)) {
+            release_record_ref(&rr);
+            continue;
+        }
+
+        /* Append to results array */
+        if (ctx->result_count >= ctx->result_cap) {
+            int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
+            SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
+                (size_t)new_cap * sizeof(SmallPrefilterRow));
+            if (!t) {
+                ctx->results = NULL;
+                ctx->result_count = 0;
+                ctx->result_cap = 0;
+                release_record_ref(&rr);
+                return NULL;
+            }
+            ctx->results = t;
+            ctx->result_cap = new_cap;
+        }
+        SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
+        memcpy(row->hash, e->hash, 16);
+        typed_field_to_index_key(ctx->ts, (const uint8_t *)rr.val,
+                                 ctx->order_field_idx,
+                                 row->sort_key, &row->sort_key_len);
+        release_record_ref(&rr);
+    }
+    return NULL;
+}
+
 /* Forward declaration — defined further down alongside the other
    filter-plan adapters; the D2 executor below uses it. */
 static KeySet *build_keyset_from_plan(const FilterPlan *fp,
@@ -17945,28 +18011,113 @@ int cmd_find(const char *db_root, const char *object,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
             if (sp_rows) {
-                SmallPrefilterCollect ca = { sp_rows, n_pre, 0 };
-                keyset_iter(cursor_prefilter_ks, small_prefilter_collect_cb, &ca);
                 clock_gettime(CLOCK_MONOTONIC, &t2);
                 int n_kept = 0;
-                for (size_t i = 0; i < n_pre; i++) {
-                    RecordRef rr;
-                    if (read_record_ref(db_root, object, &sch,
-                                        sp_rows[i].hash, &rr) != 0) continue;
-                    if (tree && !criteria_match_tree((const uint8_t *)rr.val,
-                                                      tree, &driver_fs)) {
-                        release_record_ref(&rr);
-                        continue;
+
+                /* Batched fetch: group hashes by shard for cache locality,
+                   parallelize across shard groups for large keysets. */
+                CollectedHash *cf_entries;
+                size_t cf_entry_count;
+                if (keyset_to_collected_hashes(cursor_prefilter_ks, sch.splits,
+                                               &cf_entries, &cf_entry_count) == 0
+                    && cf_entry_count > 0) {
+                    int group_starts[1024], group_sizes[1024];
+                    int nshard_groups = shard_group_batch(
+                        cf_entries, (int)cf_entry_count,
+                        group_starts, group_sizes, 1024);
+
+                    if (cf_entry_count < 1024 || nshard_groups <= 2) {
+                        /* Sequential: per-shard-group, no thread overhead */
+                        for (int g = 0; g < nshard_groups; g++) {
+                            CursorFetchCtx fc;
+                            memset(&fc, 0, sizeof(fc));
+                            fc.db_root         = db_root;
+                            fc.object          = object;
+                            fc.sch             = &sch;
+                            fc.entries         = &cf_entries[group_starts[g]];
+                            fc.entry_count     = group_sizes[g];
+                            fc.tree            = tree;
+                            fc.fs              = &driver_fs;
+                            fc.order_field_idx = order_field_idx;
+                            fc.ts              = driver_fs.ts;
+                            fc.deadline        = &cdl;
+                            cursor_fetch_worker(&fc);
+                            for (int r = 0; r < fc.result_count; r++) {
+                                sp_rows[n_kept++] = fc.results[r];
+                            }
+                            free(fc.results);
+                        }
+                    } else {
+                        /* Parallel: one worker per shard group */
+                        CursorFetchCtx *workers = calloc(
+                            nshard_groups, sizeof(CursorFetchCtx));
+                        if (workers) {
+                            for (int g = 0; g < nshard_groups; g++) {
+                                workers[g].db_root         = db_root;
+                                workers[g].object          = object;
+                                workers[g].sch             = &sch;
+                                workers[g].entries     = &cf_entries[group_starts[g]];
+                                workers[g].entry_count = group_sizes[g];
+                                workers[g].tree            = tree;
+                                workers[g].fs              = &driver_fs;
+                                workers[g].order_field_idx = order_field_idx;
+                                workers[g].ts              = driver_fs.ts;
+                                workers[g].deadline        = &cdl;
+                            }
+                            parallel_for(cursor_fetch_worker, workers,
+                                         nshard_groups, sizeof(CursorFetchCtx));
+                            for (int g = 0; g < nshard_groups; g++) {
+                                for (int r = 0; r < workers[g].result_count; r++) {
+                                    sp_rows[n_kept++] = workers[g].results[r];
+                                }
+                                free(workers[g].results);
+                            }
+                            free(workers);
+                        } else {
+                            /* OOM: fallback to sequential grouped */
+                            for (int g = 0; g < nshard_groups; g++) {
+                                CursorFetchCtx fc;
+                                memset(&fc, 0, sizeof(fc));
+                                fc.db_root         = db_root;
+                                fc.object          = object;
+                                fc.sch             = &sch;
+                                fc.entries         = &cf_entries[group_starts[g]];
+                                fc.entry_count     = group_sizes[g];
+                                fc.tree            = tree;
+                                fc.fs              = &driver_fs;
+                                fc.order_field_idx = order_field_idx;
+                                fc.ts              = driver_fs.ts;
+                                fc.deadline        = &cdl;
+                                cursor_fetch_worker(&fc);
+                                for (int r = 0; r < fc.result_count; r++) {
+                                    sp_rows[n_kept++] = fc.results[r];
+                                }
+                                free(fc.results);
+                            }
+                        }
                     }
-                    if (n_kept != (int)i)
-                        memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
-                    typed_field_to_index_key(driver_fs.ts,
-                                             (const uint8_t *)rr.val,
-                                             order_field_idx,
-                                             sp_rows[n_kept].sort_key,
-                                             &sp_rows[n_kept].sort_key_len);
-                    n_kept++;
-                    release_record_ref(&rr);
+                    free(cf_entries);
+                } else {
+                    /* Fallback: original sequential loop (OOM or empty) */
+                    for (size_t i = 0; i < n_pre; i++) {
+                        RecordRef rr;
+                        if (read_record_ref(db_root, object, &sch,
+                                            sp_rows[i].hash, &rr) != 0) continue;
+                        if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                                          tree, &driver_fs)) {
+                            release_record_ref(&rr);
+                            continue;
+                        }
+                        if (n_kept != (int)i)
+                            memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
+                        typed_field_to_index_key(driver_fs.ts,
+                                                 (const uint8_t *)rr.val,
+                                                 order_field_idx,
+                                                 sp_rows[n_kept].sort_key,
+                                                 &sp_rows[n_kept].sort_key_len);
+                        n_kept++;
+                        release_record_ref(&rr);
+                    }
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t3);
                 qsort(sp_rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
