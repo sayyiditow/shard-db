@@ -814,6 +814,105 @@ static int run_streaming_stress_assertions(TestEnv *env) {
     return 0;
 }
 
+/* Phase 7 — reindex completeness vs add-index. Build an object with
+   multiple indexes (n_fields > 1) so per_field_budget is divided; insert
+   records with long titles that produce many distinct trigrams; reindex
+   and compare the `icontains` count against add-index. Catches silent
+   trigram drops when pairs_cap < TG_MAX_DISTINCT during reindex. */
+static int run_reindex_completeness_assertions(TestEnv *env) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 120000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return 1;
+
+    char *resp = NULL;
+    int rc = 0;
+
+    /* Create object with 3 indexes: one trigram + two btree.
+       n_fields=3 → per_field_budget is divided, shrinking pairs_cap. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"c\",\"object\":\"pages\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"title:varchar:1024\",\"body:varchar:256\",\"status:varchar:32\"],"
+        "\"indexes\":[\"title:trigram\",\"body\",\"status\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "completeness: create-object");
+    free(resp); resp = NULL;
+
+    /* Build a long title template (~860 chars, repeated "the quick brown fox"
+       phrase). Each record occupies ~1 KB in the JSON payload. */
+    char title_buf[1024];
+    size_t tpos = 0;
+    for (int j = 0; j < 20 && tpos < sizeof(title_buf) - 50; j++) {
+        tpos += (size_t)snprintf(title_buf + tpos, sizeof(title_buf) - tpos,
+                        "the quick brown fox jumps over the lazy dog ");
+    }
+    /* Ensure null-terminated (snprintf guarantees this). */
+    title_buf[sizeof(title_buf) - 1] = '\0';
+
+    /* Insert 50 records, each with the long title. */
+    for (int i = 0; i < 50; i++) {
+        char req[6144];
+        int n = snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"c\",\"object\":\"pages\","
+            "\"key\":\"k%d\",\"value\":{"
+            "\"title\":\"%s\",\"body\":\"sample body\",\"status\":\"active\"}}",
+            i, title_buf);
+        if (n < 0 || (size_t)n >= sizeof(req)) {
+            ASSERT_TRUE(0, "completeness: insert request too large");
+            tc_close(tc);
+            return 1;
+        }
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"inserted\"",
+                        "completeness: insert record");
+        free(resp); resp = NULL;
+    }
+
+    /* Reindex via wire — server-side rebuild. */
+    tc_request(tc, "{\"mode\":\"reindex\",\"dir\":\"c\",\"object\":\"pages\"}", &resp);
+    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "completeness: reindex no error");
+    free(resp); resp = NULL;
+
+    /* Count records where title icontains "the" after reindex. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"c\",\"object\":\"pages\","
+        "\"criteria\":[{\"field\":\"title\",\"op\":\"icontains\",\"value\":\"the\"}]}",
+        &resp);
+    int count_reindex = tu_parse_count(resp);
+    ASSERT_TRUE(count_reindex > 0, "completeness: reindex count > 0");
+    free(resp); resp = NULL;
+
+    /* Remove trigram index on title, then add it back via singular path. */
+    tc_request(tc,
+        "{\"mode\":\"remove-index\",\"dir\":\"c\",\"object\":\"pages\","
+        "\"field\":\"title:trigram\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"removed\"",
+                    "completeness: remove trigram");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"c\",\"object\":\"pages\","
+        "\"field\":\"title:trigram\",\"force\":true}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"",
+                    "completeness: add trigram back");
+    free(resp); resp = NULL;
+
+    /* Count again with the freshly built index. */
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"c\",\"object\":\"pages\","
+        "\"criteria\":[{\"field\":\"title\",\"op\":\"icontains\",\"value\":\"the\"}]}",
+        &resp);
+    int count_addindex = tu_parse_count(resp);
+    ASSERT_TRUE(count_addindex > 0, "completeness: add-index count > 0");
+    free(resp); resp = NULL;
+
+    /* The two counts must be identical — reindex must not drop trigrams. */
+    ASSERT_EQ_INT(count_reindex, count_addindex,
+                  "completeness: reindex count == add-index count");
+
+    tc_close(tc);
+    return rc;
+}
+
 static int test_trigram_index_run(void) {
     /* Phase 1 unit assertions: pure helpers, no daemon. */
     if (run_unit_assertions() != 0) return 1;
@@ -826,6 +925,7 @@ static int test_trigram_index_run(void) {
     if (rc == 0) rc = run_planner_assertions(&env);
     if (rc == 0) rc = run_singular_add_index_assertions(&env);
     if (rc == 0) rc = run_streaming_stress_assertions(&env);
+    if (rc == 0) rc = run_reindex_completeness_assertions(&env);
     test_env_stop(&env);
     return rc;
 }
