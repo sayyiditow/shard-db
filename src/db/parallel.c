@@ -91,6 +91,21 @@ int g_pool_chunk = 0;
    standalone in test/bench builds. */
 int g_max_threads = 0;
 
+/* I/O thread pool — persistent workers, separate queue.
+   Parallelises I/O-bound work (mmap page faults, segment file reads)
+   that benefits from oversubscription. Sized independently from the
+   CPU pool so long page-fault waits don't starve CPU-bound queries. */
+static pthread_t *g_io_pool_threads = NULL;
+static int        g_io_nthreads = 0;
+static _Atomic int g_io_running = 0;
+
+#define IO_QUEUE_CAP 8192
+static PoolTask   g_io_queue[IO_QUEUE_CAP];
+static int        g_io_q_head = 0, g_io_q_tail = 0, g_io_q_count = 0;
+static pthread_mutex_t g_io_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_io_q_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_io_q_not_full  = PTHREAD_COND_INITIALIZER;
+
 int parallel_threads(void) {
     if (g_max_threads > 0) return g_max_threads;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -108,6 +123,9 @@ int parallel_threads(void) {
        waiting, so the pool can never starve when (concurrent_outer ×
        inner_count) >= pool_size. This is the deadlock-prevention path. */
 static __thread int t_in_pool_task = 0;
+/* Same flag for IO pool workers — used by parallel_for_io's help-drain
+   to detect nested IO calls and drain the IO queue while waiting. */
+static __thread int t_in_io_task = 0;
 /* Read lock-free at parallel_pool_init/shutdown entry, parallel_pool_size,
    and parallel_for; written under g_q_lock at parallel_pool_shutdown and
    lock-free at parallel_pool_init. _Atomic gives correct cross-thread
@@ -129,6 +147,23 @@ static int try_pop_task(PoolTask *out) {
     g_q_count--;
     pthread_cond_signal(&g_q_not_full);
     pthread_mutex_unlock(&g_q_lock);
+    return 1;
+}
+
+/* Pop one IO task from the head of the IO queue if non-empty. Same pattern
+   as try_pop_task but operates on g_io_queue[] / g_io_q_lock. Used by
+   io_pool_worker and the help-drain loop in parallel_for_io. */
+static int try_pop_io_task(PoolTask *out) {
+    pthread_mutex_lock(&g_io_q_lock);
+    if (g_io_q_count == 0) {
+        pthread_mutex_unlock(&g_io_q_lock);
+        return 0;
+    }
+    *out = g_io_queue[g_io_q_head];
+    g_io_q_head = (g_io_q_head + 1) % IO_QUEUE_CAP;
+    g_io_q_count--;
+    pthread_cond_signal(&g_io_q_not_full);
+    pthread_mutex_unlock(&g_io_q_lock);
     return 1;
 }
 
@@ -317,65 +352,121 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     pthread_cond_destroy(&group.cv);
 }
 
-/* I/O-heavy parallel dispatch — spawns one pthread per task, joins all
-   at end. Bypasses the bounded CPU pool because I/O-blocking workloads
-   (bulk-insert page faults on mmap MAP_SHARED writes, fsync waits)
-   benefit from oversubscription that pure-CPU work doesn't.
+/* IO pool worker — runs tasks from the IO queue. Same pattern as
+   pool_worker but sets t_in_io_task instead of t_in_pool_task so
+   parallel_for_io can detect nested calls and help-drain. */
+static void *io_pool_worker(void *arg) {
+    (void)arg;
+    while (1) {
+        pthread_mutex_lock(&g_io_q_lock);
+        while (g_io_q_count == 0 && g_io_running)
+            pthread_cond_wait(&g_io_q_not_empty, &g_io_q_lock);
+        if (g_io_q_count == 0) { pthread_mutex_unlock(&g_io_q_lock); return NULL; }
+        PoolTask t = g_io_queue[g_io_q_head];
+        g_io_q_head = (g_io_q_head + 1) % IO_QUEUE_CAP;
+        g_io_q_count--;
+        pthread_cond_signal(&g_io_q_not_full);
+        pthread_mutex_unlock(&g_io_q_lock);
+        t_in_io_task = 1;
+        run_task_finish(t);
+        t_in_io_task = 0;
+    }
+}
 
-   Why not just use parallel_for with a bigger pool? Because the pool is
-   shared across all callers; CPU-bound queries on the same pool would
-   then peg every core, killing interactive responsiveness. Splitting
-   I/O work onto dedicated per-call pthreads keeps the CPU pool free for
-   the read paths that actually need it bounded.
+void parallel_io_pool_init(int nthreads) {
+    if (g_io_running) return;
+    if (nthreads <= 0) nthreads = parallel_threads() * 2;
+    if (nthreads < 2) nthreads = 2;
+    g_io_nthreads = nthreads;
+    g_io_pool_threads = malloc((size_t)nthreads * sizeof(pthread_t));
+    g_io_running = 1;
+    for (int i = 0; i < nthreads; i++)
+        db_thread_create(&g_io_pool_threads[i], io_pool_worker, NULL);
+}
 
-   pthread_create cost is ~10-30 µs each — negligible vs the multi-ms
-   per-task work this is meant for. n is typically the per-object
-   shard/worker count (64-256) so total spawn cost stays well under 1ms.
-
-   Callers who'd rather use the bounded pool (CPU-bound, low task count)
-   should keep using parallel_for. */
-typedef struct {
-    void *(*fn)(void *);
-    void  *arg;
-} ParallelIoTask;
-
-static void *parallel_io_thread(void *raw) {
-    ParallelIoTask *t = (ParallelIoTask *)raw;
-    t->fn(t->arg);
-    return NULL;
+void parallel_io_pool_shutdown(void) {
+    if (!g_io_running) return;
+    pthread_mutex_lock(&g_io_q_lock);
+    g_io_running = 0;
+    pthread_cond_broadcast(&g_io_q_not_empty);
+    pthread_mutex_unlock(&g_io_q_lock);
+    for (int i = 0; i < g_io_nthreads; i++)
+        pthread_join(g_io_pool_threads[i], NULL);
+    free(g_io_pool_threads);
+    g_io_pool_threads = NULL;
+    g_io_nthreads = 0;
 }
 
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (n == 1) {
-        fn(args);
-        return;
-    }
-    pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
-    char *valid = calloc((size_t)n, sizeof(char));
-    ParallelIoTask *tasks = malloc((size_t)n * sizeof(ParallelIoTask));
-    if (!threads || !valid || !tasks) {
-        /* OOM fallback — run sequentially. Slow but correct. */
-        free(threads); free(valid); free(tasks);
+    if (!g_io_running || n == 1) {
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
-    for (int i = 0; i < n; i++) {
-        tasks[i].fn = fn;
-        tasks[i].arg = (char *)args + (size_t)i * stride;
-        if (db_thread_create(&threads[i], parallel_io_thread, &tasks[i]) == 0) {
-            valid[i] = 1;
-        } else {
-            /* Spawn failure (typically EAGAIN under thread limit) — run
-               this one inline so caller still sees correct semantics.
-               valid[i] stays 0 so the join loop skips this slot —
-               threads[i] would be uninitialised garbage and pthread_join
-               on garbage is undefined behaviour (can hang). */
-            fn(tasks[i].arg);
+
+    PoolGroup group;
+    pthread_mutex_init(&group.mu, NULL);
+    pthread_cond_init(&group.cv, NULL);
+    atomic_init(&group.remaining, n);
+    atomic_init(&group.finishing, 0);
+
+    /* Enqueue in chunks to avoid holding g_io_q_lock for the full batch.
+       Same rationale as parallel_for's chunked submission. */
+    static _Atomic int IO_SUBMIT_CHUNK = 0;
+    int chunk = atomic_load_explicit(&IO_SUBMIT_CHUNK, memory_order_relaxed);
+    if (chunk == 0) {
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        chunk = (nproc > 0) ? (int)nproc : 16;
+        atomic_store_explicit(&IO_SUBMIT_CHUNK, chunk, memory_order_relaxed);
+    }
+    for (int i = 0; i < n; i += chunk) {
+        int end = i + chunk;
+        if (end > n) end = n;
+        pthread_mutex_lock(&g_io_q_lock);
+        for (int j = i; j < end; j++) {
+            PoolTask t = { fn, (char *)args + (size_t)j * stride, &group };
+            while (g_io_q_count >= IO_QUEUE_CAP)
+                pthread_cond_wait(&g_io_q_not_full, &g_io_q_lock);
+            g_io_queue[g_io_q_tail] = t;
+            g_io_q_tail = (g_io_q_tail + 1) % IO_QUEUE_CAP;
+            g_io_q_count++;
+            pthread_cond_signal(&g_io_q_not_empty);
         }
+        pthread_mutex_unlock(&g_io_q_lock);
     }
-    for (int i = 0; i < n; i++) {
-        if (valid[i]) pthread_join(threads[i], NULL);
+
+    if (t_in_io_task) {
+        /* Nested IO call — help-drain the IO queue while waiting so the
+           pool can never starve when (concurrent IO callers × inner tasks)
+           >= IO pool size. Same pattern as parallel_for's help-drain. */
+        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
+            PoolTask t;
+            if (try_pop_io_task(&t)) {
+                run_task_finish(t);
+                continue;
+            }
+            pthread_mutex_lock(&group.mu);
+            if (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 1000000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&group.cv, &group.mu, &ts);
+            }
+            pthread_mutex_unlock(&group.mu);
+        }
+    } else {
+        /* Top-level or CPU-pool caller — plain cond_wait. IO pool has
+           its own workers to drain the queue. */
+        pthread_mutex_lock(&group.mu);
+        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
+            pthread_cond_wait(&group.cv, &group.mu);
+        pthread_mutex_unlock(&group.mu);
     }
-    free(threads); free(valid); free(tasks);
+
+    while (atomic_load_explicit(&group.finishing, memory_order_acquire) > 0)
+        sched_yield();
+
+    pthread_mutex_destroy(&group.mu);
+    pthread_cond_destroy(&group.cv);
 }

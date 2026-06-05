@@ -8,7 +8,12 @@ int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
 /* g_max_threads (+ parallel_threads getter) and g_pool_chunk live in
    parallel.c so test/bench binaries that link parallel.c without
    config.c don't get an undefined symbol at link time. config.c still
-   writes g_max_threads when parsing db.env (extern). */
+   writes g_max_threads when parsing db.env (extern).
+
+   I/O thread pool size (IO_THREADS in db.env). 0 = auto (2 × nproc).
+   Defined here so config.c's parse loop can set it; declared extern in
+   types.h. parallel.c reads it at init time. */
+int g_io_threads = 0;
 int g_index_page_size = 4096;
 int g_global_limit = 100000;
 int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
@@ -430,6 +435,8 @@ int load_db_root(char *out, size_t outlen) {
             if (ps >= 1024 && ps <= 65536) g_index_page_size = ps;
         } else if (strncmp(p, "THREADS=", 8) == 0) {
             g_max_threads = atoi(p + 8);
+        } else if (strncmp(p, "IO_THREADS=", 11) == 0) {
+            g_io_threads = atoi(p + 11);
         } else if (strncmp(p, "POOL_CHUNK=", 11) == 0) {
             g_pool_chunk = atoi(p + 11);
         } else if (strncmp(p, "WORKERS=", 8) == 0) {

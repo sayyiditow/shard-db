@@ -338,6 +338,10 @@ export RANDOM_SEQ_COST_RATIO=8
 export THREADS=0
 export POOL_CHUNK=0
 export WORKERS=0
+# I/O thread pool size. 0 = auto = 2 × nproc. Separate from the CPU pool
+# (THREADS) — I/O threads wait on page faults and benefit from
+# oversubscription without starving CPU-bound queries.
+export IO_THREADS=0
 # Max queries in flight. 0 = auto = max(4, min(nproc, 32)).
 # Worst-case query-buffer RAM = MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB.
 # Clients hitting the cap get {"error":"server at capacity"} immediately

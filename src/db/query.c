@@ -458,30 +458,6 @@ int read_record_ref(const char *db_root, const char *object,
     if (!sdb) return -1;
     slotcask_lookup_by_hash(sdb, hash, v2_record_capture_cb, out);
     return out->v2_buf ? 0 : -1;
-    int shard_id, start_slot;
-    shard_id = compute_record_shard(hash, sch->splits);
-    start_slot = 0;
-    char shard_path[PATH_MAX];
-    build_shard_path(shard_path, sizeof(shard_path), db_root, object, shard_id);
-    FcacheRead fc = fcache_get_read(shard_path);
-    if (!fc.map) return -1;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask  = slots - 1;
-    for (uint32_t p = 0; p < slots; p++) {
-        uint32_t s = ((uint32_t)start_slot + p) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag != 1) continue;
-        if (memcmp(h->hash, hash, 16) != 0) continue;
-        out->fc   = fc;
-        out->key  = fc.map + zoneB_off(s, slots, sch->slot_size);
-        out->klen = h->key_len;
-        out->val  = out->key + h->key_len;
-        out->vlen = h->value_len;
-        return 0;
-    }
-    fcache_release(fc);
-    return -1;
 }
 
 void release_record_ref(RecordRef *r) {
@@ -693,23 +669,6 @@ typedef struct {
    batch matchers.  Keep only the LikeKind forward decl for code that still
    references the name directly. */
 
-/* Fetch a record by its hex hash and print as JSON. Returns 1 if found. */
-int fetch_record_by_hash(const char *db_root, const char *object,
-                                const Schema *sch, const uint8_t hash16[16], int *printed,
-                                void *fs) {
-    RecordRef rr;
-    if (read_record_ref(db_root, object, sch, hash16, &rr) != 0) return 0;
-    char *rkey = malloc(rr.klen + 1);
-    memcpy(rkey, rr.key, rr.klen);
-    rkey[rr.klen] = '\0';
-    char *rval = decode_value((const char *)rr.val, (uint32_t)rr.vlen, fs);
-    OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", rkey, rval);
-    free(rkey); free(rval);
-    (*printed)++;
-    release_record_ref(&rr);
-    return 1;
-}
-
 /* ========== Parallel fetch: collect hashes → group by shard → parallel fetch ========== */
 
 /* Shared hash entry for collected B+ tree results (used by find) */
@@ -746,155 +705,6 @@ static int shard_group_batch(CollectedHash *batch, int batch_count,
     }
     if (n > 0) group_sizes[n - 1] = batch_count - group_starts[n - 1];
     return n;
-}
-
-/* Collecting callback for B+ tree traversal */
-typedef struct {
-    CollectedHash *entries;
-    size_t count;
-    size_t cap;
-    int splits;
-    size_t limit;   /* max results to collect, 0 = unlimited */
-} SearchCollectCtx;
-
-static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) __attribute__((unused));
-static int search_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
-    SearchCollectCtx *sc = (SearchCollectCtx *)ctx;
-    if (sc->limit > 0 && sc->count >= sc->limit) return 1; /* stop */
-    if (sc->count >= sc->cap) {
-        size_t new_cap = sc->cap * 2;
-        CollectedHash *t = xrealloc_or_free(sc->entries, new_cap * sizeof(CollectedHash));
-        if (!t) { sc->entries = NULL; sc->count = 0; return 1; /* abort scan on OOM */ }
-        sc->entries = t;
-        sc->cap = new_cap;
-    }
-    CollectedHash *e = &sc->entries[sc->count++];
-    memcpy(e->hash, hash16, 16);
-    e->shard_id = compute_record_shard(hash16, sc->splits);
-    e->start_slot = 0;
-    return 0;
-}
-
-/* Per-shard fetch worker (no secondary filter, just decode + output) */
-#define SEARCH_MODE_FULL  0  /* key + value JSON */
-#define SEARCH_MODE_KEYS  1  /* keys only */
-
-typedef struct {
-    char *key;
-    char *value;  /* NULL for keys-only mode */
-} SearchResult;
-
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const Schema *sch;
-    CollectedHash *entries;
-    int entry_count;
-    FieldSchema *fs;
-    int mode;
-    SearchResult *results;
-    int result_count;
-} SearchShardWork;
-
-static void *search_shard_worker(void *arg) {
-    SearchShardWork *sw = (SearchShardWork *)arg;
-    if (sw->entry_count == 0) return NULL;
-
-    int sid = sw->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
-
-    /* Use fcache to avoid re-mmapping the same shard file across multiple searches */
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    for (int ei = 0; ei < sw->entry_count; ei++) {
-        CollectedHash *e = &sw->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, e->hash, 16) != 0) continue;
-
-            SearchResult *r = &sw->results[sw->result_count++];
-            r->key = malloc(h->key_len + 1);
-            memcpy(r->key, fc.map + zoneB_off(s, slots, sw->sch->slot_size), h->key_len);
-            r->key[h->key_len] = '\0';
-
-            if (sw->mode == SEARCH_MODE_FULL) {
-                const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
-                r->value = decode_value(raw, h->value_len, sw->fs);
-            } else {
-                r->value = NULL;
-            }
-            break;
-        }
-    }
-    fcache_release(fc);
-    return NULL;
-}
-
-/* Parallel fetch: collect hashes, group by shard, parallel shard reads, output */
-static int parallel_fetch_and_print(const char *db_root, const char *object,
-                                    const Schema *sch, CollectedHash *entries, size_t count,
-                                    FieldSchema *fs, int mode) __attribute__((unused));
-static int parallel_fetch_and_print(const char *db_root, const char *object,
-                                    const Schema *sch, CollectedHash *entries, size_t count,
-                                    FieldSchema *fs, int mode) {
-    if (count == 0) return 0;
-
-    /* For small result sets, sequential is faster (no thread overhead) */
-    if (count <= 64 && mode == SEARCH_MODE_FULL) {
-        int printed = 0;
-        for (size_t i = 0; i < count; i++)
-            fetch_record_by_hash(db_root, object, sch, entries[i].hash, &printed, fs);
-        return printed;
-    }
-
-    /* Sort by shard_id and split into per-shard groups (heap arrays — count
-       can exceed the stack-friendly cap used by other call sites). */
-    int *group_starts = malloc((count + 1) * sizeof(int));
-    int *group_sizes  = malloc((count + 1) * sizeof(int));
-    int nshard_groups = shard_group_batch(entries, (int)count, group_starts, group_sizes, (int)count + 1);
-
-    /* Allocate per-shard workers */
-    SearchShardWork *workers = calloc(nshard_groups, sizeof(SearchShardWork));
-    for (int g = 0; g < nshard_groups; g++) {
-        workers[g].db_root = db_root;
-        workers[g].object = object;
-        workers[g].sch = sch;
-        workers[g].entries = &entries[group_starts[g]];
-        workers[g].entry_count = group_sizes[g];
-        workers[g].fs = fs;
-        workers[g].mode = mode;
-        workers[g].results = malloc(group_sizes[g] * sizeof(SearchResult));
-        workers[g].result_count = 0;
-    }
-
-    parallel_for(search_shard_worker, workers, nshard_groups, sizeof(SearchShardWork));
-
-    /* Output results */
-    int printed = 0;
-    for (int g = 0; g < nshard_groups; g++) {
-        for (int r = 0; r < workers[g].result_count; r++) {
-            SearchResult *sr = &workers[g].results[r];
-            if (mode == SEARCH_MODE_FULL)
-                OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", sr->key, sr->value);
-            else
-                OUT("%s\"%s\"", printed ? "," : "", sr->key);
-            printed++;
-            free(sr->key);
-            free(sr->value);
-        }
-        free(workers[g].results);
-    }
-    free(workers);
-    free(group_starts);
-    free(group_sizes);
-    return printed;
 }
 
 /* ========== BULK INSERT ========== */
@@ -6958,37 +6768,8 @@ int cmd_exists(const char *db_root, const char *object,
     int rc = slotcask_exists(sdb, key, klen);
     OUT("%s\n", rc == 1 ? "true" : "false");
     return rc == 1 ? 0 : 1;
-
-    uint8_t hash[16]; int shard_id, start_slot;
-    compute_hash_raw(key, klen, hash);
-    shard_id = compute_record_shard(hash, sc.splits);
-    start_slot = 0;
-
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) { OUT("false\n"); return 1; }
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    for (uint32_t i = 0; i < slots; i++) {
-        uint32_t s = ((uint32_t)start_slot + i) & mask;
-        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-        if (h->flag == 0 && h->key_len == 0) break;
-        if (h->flag == 2) continue;
-        if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-            h->key_len == klen &&
-            memcmp(fc.map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
-            fcache_release(fc);
-            OUT("true\n");
-            return 0;
-        }
-    }
-    fcache_release(fc);
-    OUT("false\n");
-    return 1;
 }
+
 
 
 /* ========== KEYS ========== */
@@ -10312,189 +10093,9 @@ void idx_count_cb_flush_thread(void) {
     }
 }
 
-/* Per-shard worker — opens shard once, processes all entries, applies secondary filters */
-typedef struct {
-    char *key;
-    char *json;
-} MatchResult;
-
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const Schema *sch;
-    CollectedHash *entries;
-    int entry_count;
-    CriteriaNode *tree;            /* compiled criteria tree; full re-match per candidate */
-    ExcludedKeys *excluded;
-    const char **proj_fields;
-    int proj_count;
-    FieldSchema *fs;
-    /* Joins (tabular path when njoins > 0) */
-    JoinSpec *joins;
-    int njoins;
-    char csv_delim;                /* 0 = JSON tabular row, else CSV with this delimiter */
-    QueryDeadline *deadline;
-    int dl_counter;
-    MatchResult *results;
-    int result_count;
-    int result_cap;
-} ShardWorkCtx;
-
-static void *shard_find_worker(void *arg) {
-    ShardWorkCtx *sw = (ShardWorkCtx *)arg;
-    if (sw->entry_count == 0) return NULL;
-
-    int sid = sw->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sw->db_root, sw->object, sid);
-
-    /* Use the persistent shard mmap cache. Per-call open + mmap + munmap
-       was paying ~100µs of page-fault + TLB-flush per shard per query —
-       visible on `find` indexed paths as a 2-3x slowdown vs the README
-       baseline despite the actual btree work being microseconds. */
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint8_t *map = fc.map;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
-
-    for (int ei = 0; ei < sw->entry_count; ei++) {
-        if (query_deadline_tick(sw->deadline, &sw->dl_counter)) break;
-        CollectedHash *e = &sw->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, e->hash, 16) != 0) continue;
-
-            char *key = malloc(h->key_len + 1);
-            memcpy(key, map + zoneB_off(s, slots, sw->sch->slot_size), h->key_len);
-            key[h->key_len] = '\0';
-
-            if (is_excluded(sw->excluded, key)) { free(key); break; }
-
-            const char *raw = (const char *)(map + zoneB_off(s, slots, sw->sch->slot_size) + h->key_len);
-            size_t raw_len = h->value_len;
-
-            int match = criteria_match_tree((const uint8_t *)raw, sw->tree, sw->fs);
-
-            if (match) {
-                /* Apply joins if present — inner-drop on no-match. */
-                RecordRef     *jrr = NULL;
-                const uint8_t **jraws = NULL;  /* parallel value-ptr array for emit helpers */
-                int dropped = 0;
-                if (sw->njoins > 0) {
-                    jrr = calloc(sw->njoins, sizeof(RecordRef));
-                    jraws = calloc(sw->njoins, sizeof(const uint8_t *));
-                    for (int i = 0; i < sw->njoins; i++) {
-                        char lk[1024];
-                        int llen = extract_local_key(&sw->joins[i], (const uint8_t *)raw,
-                                                     sw->fs ? sw->fs->ts : NULL,
-                                                     lk, sizeof(lk));
-                        int found = 0;
-                        if (llen > 0) {
-                            found = lookup_remote(&sw->joins[i], sw->db_root, lk, (size_t)llen,
-                                                  &jrr[i]);
-                            if (found) jraws[i] = jrr[i].val;
-                        }
-                        if (!found && sw->joins[i].type == JOIN_INNER) { dropped = 1; break; }
-                    }
-                }
-
-                if (!dropped) {
-                    if (sw->result_count >= sw->result_cap) {
-                        size_t new_cap = sw->result_cap ? sw->result_cap * 2 : 64;
-                        MatchResult *t = xrealloc_or_free(sw->results, new_cap * sizeof(MatchResult));
-                        if (!t) {
-                            sw->results = NULL;
-                            sw->result_count = 0;
-                            sw->result_cap = 0;
-                            free(key);
-                            if (sw->njoins > 0) {
-                                for (int i = 0; i < sw->njoins; i++) release_record_ref(&jrr[i]);
-                                free(jrr); free(jraws);
-                            }
-                            fcache_release(fc);
-                            return NULL;
-                        }
-                        sw->results = t;
-                        sw->result_cap = new_cap;
-                    }
-                    MatchResult *mr = &sw->results[sw->result_count++];
-                    mr->key = key;
-                    if (sw->njoins > 0 && sw->csv_delim) {
-                        /* Pre-render CSV joined row "<key><d>v1<d>...\n" so the
-                           main thread's emit loop just streams it out. */
-                        size_t bsz = 16384;
-                        mr->json = malloc(bsz);
-                        build_joined_csv_row(
-                            key, (const uint8_t *)raw, sw->fs,
-                            sw->proj_count > 0 ? sw->proj_fields : NULL, sw->proj_count,
-                            sw->joins, sw->njoins, jraws, sw->csv_delim,
-                            mr->json, bsz);
-                    } else if (sw->njoins > 0) {
-                        /* Build tabular JSON row: [driver.key, driver fields..., join fields...] */
-                        size_t bsz = 16384;
-                        mr->json = malloc(bsz);
-                        int pos = snprintf(mr->json, bsz, "[\"%s\"", key);
-                        pos += buf_driver_values((const uint8_t *)raw, sw->fs,
-                                                 sw->proj_count > 0 ? sw->proj_fields : NULL,
-                                                 sw->proj_count,
-                                                 mr->json + pos, bsz - pos);
-                        for (int i = 0; i < sw->njoins && pos < (int)bsz - 2; i++)
-                            pos += buf_join_values(&sw->joins[i], jraws[i],
-                                                   mr->json + pos, bsz - pos);
-                        snprintf(mr->json + pos, bsz - pos, "]");
-                    } else if (sw->proj_count > 0) {
-                        /* Sum the actual sizes per field — the prior 256-byte-per-
-                           field heuristic underestimated when long varchars were
-                           projected. CodeQL flagged the unchecked snprintf advance. */
-                        size_t bsz = 256;
-                        char **decoded = calloc(sw->proj_count, sizeof(char *));
-                        for (int fi = 0; fi < sw->proj_count; fi++) {
-                            decoded[fi] = decode_field(raw, raw_len,
-                                                       sw->proj_fields[fi], sw->fs);
-                            if (decoded[fi])
-                                bsz += strlen(sw->proj_fields[fi]) +
-                                       strlen(decoded[fi]) + 16;
-                        }
-                        mr->json = malloc(bsz);
-                        size_t pos = 0;
-                        SB_APPEND(mr->json, pos, bsz, "{");
-                        int first = 1;
-                        for (int fi = 0; fi < sw->proj_count; fi++) {
-                            if (!decoded[fi]) continue;
-                            SB_APPEND(mr->json, pos, bsz, "%s\"%s\":\"%s\"",
-                                      first ? "" : ",",
-                                      sw->proj_fields[fi], decoded[fi]);
-                            first = 0;
-                            free(decoded[fi]);
-                        }
-                        free(decoded);
-                        SB_APPEND(mr->json, pos, bsz, "}");
-                    } else {
-                        mr->json = decode_value(raw, raw_len, sw->fs);
-                    }
-                    key = NULL;
-                }
-
-                if (sw->njoins > 0) {
-                    for (int i = 0; i < sw->njoins; i++) release_record_ref(&jrr[i]);
-                    free(jrr); free(jraws);
-                }
-            }
-            free(key);
-            break;
-        }
-    }
-    fcache_release(fc);
-    return NULL;
-}
-
 /* ========== Indexed count with multi-criteria: parallel per-shard ==========
-   Mirrors shard_find_worker's shape but accumulates a counter instead of
-   collecting MatchResult — called when cmd_count has secondary criteria. */
+   Mirrors the old shard_find_worker's shape but accumulates a counter instead
+   of collecting per-record results — called when cmd_count has secondary criteria. */
 typedef struct {
     const char *db_root;
     const char *object;
@@ -10534,8 +10135,9 @@ static int count_batch_cb(const uint8_t hash[16],
     (void)hash; (void)key; (void)klen;
     CountBatchCbCtx *c = (CountBatchCbCtx *)ctx_ptr;
     if (query_deadline_tick(c->sc->deadline, &c->sc->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, c->sc->tree, c->sc->fs))
-        (*c->local)++;
+    if (criteria_match_tree((const uint8_t *)value, c->sc->tree, c->sc->fs)) {
+        __atomic_add_fetch(c->local, 1, __ATOMIC_RELAXED);
+    }
     return 0;
 }
 
@@ -10578,7 +10180,7 @@ static void *shard_count_worker(void *arg) {
        resolve them). We'll batch these to amortise cache operations. */
     int n_need_fetch = 0;
     uint8_t (*fetch_hashes)[16] = NULL;
-    int *fetch_idx = NULL;
+    SlotcaskResolvedRec *resolved = NULL;
 
     if (sc->entry_count <= 0) {
         sc->count = 0;
@@ -10594,13 +10196,9 @@ static void *shard_count_worker(void *arg) {
             memcpy(fetch_hashes[ei], sc->entries[ei].hash, 16);
     } else {
         /* Bitmap post-filters present: two-pass approach.
-           Pass 1: run bitmap pre-filter, track needs-fetch entries. */
-        fetch_hashes = calloc((size_t)sc->entry_count, sizeof(*fetch_hashes));
-        fetch_idx = malloc((size_t)sc->entry_count * sizeof(int));
-        if (!fetch_hashes || !fetch_idx) {
-            free(fetch_hashes); free(fetch_idx);
-            sc->count = 0; goto cleanup;
-        }
+           Pass 1: run bitmap pre-filter, capture resolved locations. */
+        resolved = calloc((size_t)sc->entry_count, sizeof(*resolved));
+        if (!resolved) { sc->count = 0; goto cleanup; }
 
         for (int ei = 0; ei < sc->entry_count; ei++) {
             if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
@@ -10608,6 +10206,9 @@ static void *shard_count_worker(void *arg) {
             /* --- Bitmap pre-filter --- */
             uint32_t kf_slot = 0;
             int kf_found = 0;
+            uint8_t found_sid = 0;
+            uint16_t found_fid = 0;
+            uint32_t found_off = 0;
             {
                 size_t cap = kh.capacity;
                 SlotcaskKfEntry *kf = kh.map;
@@ -10621,6 +10222,11 @@ static void *shard_count_worker(void *arg) {
                     if (memcmp(e->hash, sc->entries[ei].hash, 16) != 0) continue;
                     kf_slot = (uint32_t)slot;
                     kf_found = 1;
+                    /* Capture resolved location during KF probe —
+                       eliminates re-probe in fetch phase. */
+                    found_sid = e->stream_id;
+                    found_fid = e->file_id;
+                    found_off = e->offset;
                     break;
                 }
             }
@@ -10649,8 +10255,10 @@ static void *shard_count_worker(void *arg) {
 
             if (bm_indeterminate) {
                 /* Fall through — needs record fetch */
-                memcpy(fetch_hashes[n_need_fetch], sc->entries[ei].hash, 16);
-                fetch_idx[n_need_fetch] = ei;
+                memcpy(resolved[n_need_fetch].hash, sc->entries[ei].hash, 16);
+                resolved[n_need_fetch].sid = found_sid;
+                resolved[n_need_fetch].fid = found_fid;
+                resolved[n_need_fetch].off = found_off;
                 n_need_fetch++;
             } else if (!bm_pass) {
                 continue;  /* bitmap rejection: skip */
@@ -10659,8 +10267,10 @@ static void *shard_count_worker(void *arg) {
                 continue;
             } else {
                 /* Bitmaps passed, non-bitmap post-filters need record fetch */
-                memcpy(fetch_hashes[n_need_fetch], sc->entries[ei].hash, 16);
-                fetch_idx[n_need_fetch] = ei;
+                memcpy(resolved[n_need_fetch].hash, sc->entries[ei].hash, 16);
+                resolved[n_need_fetch].sid = found_sid;
+                resolved[n_need_fetch].fid = found_fid;
+                resolved[n_need_fetch].off = found_off;
                 n_need_fetch++;
             }
         }
@@ -10677,17 +10287,23 @@ static void *shard_count_worker(void *arg) {
         if (!batch_sdb)
             batch_sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
         if (batch_sdb) {
-            if (shard_id < 0)
-                shard_id = compute_record_shard(fetch_hashes[0], sc->sch->splits);
             CountBatchCbCtx cb_ctx = { sc, &local };
-            slotcask_bulk_lookup_by_hash(batch_sdb, shard_id,
-                                          fetch_hashes, (size_t)n_need_fetch,
-                                          count_batch_cb, &cb_ctx);
+            if (resolved) {
+                /* Bitmap path: already have resolved locations, skip KF re-probe */
+                slotcask_bulk_fetch_resolved(batch_sdb, resolved,
+                                              (size_t)n_need_fetch,
+                                              &cb_ctx, count_batch_cb);
+            } else {
+                /* Non-bitmap path: use combined resolve+fetch */
+                slotcask_bulk_resolve_and_fetch(batch_sdb, fetch_hashes,
+                                                  (size_t)n_need_fetch,
+                                                  &cb_ctx, count_batch_cb);
+            }
         }
     }
 
     free(fetch_hashes);
-    free(fetch_idx);
+    free(resolved);
 
 cleanup:
     /* Close pre-opened handles */
@@ -10817,128 +10433,6 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
     return total;
 }
 
-/* Process a batch of hashes: group by shard, parallel shard reads + filter.
-   Returns total matches found. Appends output to stdout. */
-static int process_batch(CollectedHash *batch, int batch_count,
-                         const char *db_root, const char *object, const Schema *sch,
-                         CriteriaNode *tree,
-                         ExcludedKeys *excluded, const char **proj_fields, int proj_count,
-                         FieldSchema *fs, int offset, int limit, int *count, int *printed,
-                         int rows_fmt, int dict_fmt, char csv_delim,
-                         JoinSpec *joins, int njoins, QueryDeadline *dl) {
-
-    int group_starts[1024], group_sizes[1024]; /* max 1K shards in a batch */
-    int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
-
-    /* Allocate workers */
-    ShardWorkCtx *workers = calloc(nshard_groups, sizeof(ShardWorkCtx));
-    for (int g = 0; g < nshard_groups; g++) {
-        workers[g].db_root = db_root;
-        workers[g].object = object;
-        workers[g].sch = sch;
-        workers[g].entries = &batch[group_starts[g]];
-        workers[g].entry_count = group_sizes[g];
-        workers[g].tree = tree;
-        workers[g].excluded = excluded;
-        workers[g].proj_fields = proj_fields;
-        workers[g].proj_count = proj_count;
-        workers[g].fs = fs;
-        workers[g].joins = joins;
-        workers[g].njoins = njoins;
-        workers[g].csv_delim = csv_delim;
-        workers[g].deadline = dl;
-    }
-
-    /* < 1K entries: sequential (grouped by shard, each shard opened once — no thread overhead)
-       >= 1K entries: parallel across shard groups */
-    if (batch_count < 1024 || nshard_groups <= 2) {
-        for (int g = 0; g < nshard_groups; g++)
-            shard_find_worker(&workers[g]);
-    } else {
-        parallel_for(shard_find_worker, workers, nshard_groups, sizeof(ShardWorkCtx));
-    }
-
-    /* Output matches, respecting offset/limit */
-    int batch_matches = 0;
-    for (int g = 0; g < nshard_groups && (limit <= 0 || *printed < limit); g++) {
-        for (int r = 0; r < workers[g].result_count && (limit <= 0 || *printed < limit); r++) {
-            (*count)++;
-            batch_matches++;
-            if (*count > offset) {
-                MatchResult *mr = &workers[g].results[r];
-                if (njoins > 0 && csv_delim) {
-                    /* mr->json already holds the full CSV row ending in \n. */
-                    OUT("%s", mr->json);
-                } else if (njoins > 0) {
-                    /* mr->json already holds the JSON tabular row "[...]"; just emit. */
-                    OUT("%s%s", *printed ? "," : "", mr->json);
-                } else if (csv_delim || rows_fmt) {
-                    /* Projection emit — parse mr->json once per row rather than
-                       walking it N times (once per projected field). On a
-                       100-match find projecting 3 fields this drops from 300
-                       json walks to 100 parses + 300 O(1) struct lookups. */
-                    JsonObj mjo;
-                    json_parse_object(mr->json, strlen(mr->json), &mjo);
-                    if (csv_delim) {
-                        csv_emit_cell(mr->key, csv_delim);
-                        if (proj_count > 0) {
-                            for (int fi = 0; fi < proj_count; fi++) {
-                                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                                char *pv = json_obj_strdup(&mjo, proj_fields[fi]);
-                                csv_emit_cell(pv, csv_delim);
-                                free(pv);
-                            }
-                        } else if (fs && fs->ts) {
-                            for (int fi = 0; fi < fs->ts->nfields; fi++) {
-                                if (fs->ts->fields[fi].removed) continue;
-                                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                                char *pv = json_obj_strdup(&mjo, fs->ts->fields[fi].name);
-                                csv_emit_cell(pv, csv_delim);
-                                free(pv);
-                            }
-                        }
-                        OUT("\n");
-                    } else {
-                        /* rows_fmt */
-                        OUT("%s[\"%s\"", *printed ? "," : "", mr->key);
-                        if (proj_count > 0) {
-                            for (int fi = 0; fi < proj_count; fi++) {
-                                char *pv = json_obj_strdup(&mjo, proj_fields[fi]);
-                                OUT(",\"%s\"", pv ? pv : "");
-                                free(pv);
-                            }
-                        } else if (fs && fs->ts) {
-                            for (int fi = 0; fi < fs->ts->nfields; fi++) {
-                                if (fs->ts->fields[fi].removed) continue;
-                                char *pv = json_obj_strdup(&mjo, fs->ts->fields[fi].name);
-                                OUT(",\"%s\"", pv ? pv : "");
-                                free(pv);
-                            }
-                        }
-                        OUT("]");
-                    }
-                } else if (dict_fmt) {
-                    OUT("%s\"%s\":%s", *printed ? "," : "", mr->key, mr->json);
-                } else {
-                    OUT("%s{\"key\":\"%s\",\"value\":%s}", *printed ? "," : "", mr->key, mr->json);
-                }
-                (*printed)++;
-            }
-        }
-    }
-
-    /* Cleanup */
-    for (int g = 0; g < nshard_groups; g++) {
-        for (int r = 0; r < workers[g].result_count; r++) {
-            free(workers[g].results[r].key);
-            free(workers[g].results[r].json);
-        }
-        free(workers[g].results);
-    }
-    free(workers);
-    return batch_matches;
-}
-
 /* Forward decl — keyset_emit_find lives further down. v2 path calls it. */
 static int keyset_emit_find(const char *db_root, const char *object,
                             const Schema *sch, KeySet *ks,
@@ -11001,15 +10495,6 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     keyset_free(ks);
     collect_ctx_destroy(&cc);
     return rc;
-
-    int count = 0, printed = 0;
-    process_batch(cc.entries, cc.count, db_root, object, sch,
-                 tree, excluded,
-                 proj_fields, proj_count, fs, offset, limit, &count, &printed,
-                 rows_fmt, dict_fmt, csv_delim, joins, njoins, dl);
-
-    collect_ctx_destroy(&cc);
-    return printed;
 }
 
 /* ============================================================
@@ -12873,7 +12358,7 @@ static int find_intersect_leaves(CriteriaNode *root,
  *
  * PRODUCTION code — the cost model wires it in at runtime in Phase 1b.
  * __attribute__((unused)) keeps -Wunused-function quiet until then (same
- * idiom as search_collect_cb / idx_build_worker above).
+ * idiom as idx_build_worker above (both are __attribute__((unused))).
  *
  * cap is carried in the signature for those future callers; the bitmap
  * path ignores it (bitmap counts are exact, not bounded). */
@@ -16014,35 +15499,102 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
 /* Walk a pre-built KeySet and feed each record through agg_scan_cb. agg_scan_cb
    reads ctx->tree internally — caller nullifies tree to skip rematch (used by
    AND-intersection where the keyset is already exact). */
+typedef struct {
+    void          *agg_ctx;
+    pthread_mutex_t lock;      /* guards agg_scan_cb from concurrent IO threads */
+    QueryDeadline *dl;
+    int            dl_counter;
+} KeysetEmitAggCtx;
+
+/* Callback for keyset_emit_agg: decodes value and feeds agg_scan_cb.
+   agg_scan_cb mutates the AggCtx hash table, which is not thread-safe —
+   the lock guards it across concurrent IO pool workers. */
+static int keyset_emit_agg_cb(const uint8_t hash[16],
+                               const void *key, size_t klen,
+                               const void *value, size_t vlen,
+                               void *ctx_ptr) {
+    KeysetEmitAggCtx *ctx = (KeysetEmitAggCtx *)ctx_ptr;
+    if (query_deadline_tick(ctx->dl, &ctx->dl_counter)) return 1;
+
+    SlotHeader hdr = {0};
+    memcpy(hdr.hash, hash, 16);
+    hdr.flag = 1;
+    hdr.key_len = (uint16_t)klen;
+    hdr.value_len = (uint32_t)vlen;
+    uint8_t stk[2048];
+    uint8_t *block = (klen + vlen + 1 < sizeof(stk))
+        ? stk : malloc(klen + vlen);
+    if (block) {
+        memcpy(block, key, klen);
+        memcpy(block + klen, value, vlen);
+        pthread_mutex_lock(&ctx->lock);
+        agg_scan_cb(&hdr, block, ctx->agg_ctx);
+        pthread_mutex_unlock(&ctx->lock);
+        if (block != stk) free(block);
+    }
+    return 0;
+}
+
 static void keyset_emit_agg(const char *db_root, const char *object,
                             const Schema *sch, KeySet *ks, void *agg_ctx,
                             QueryDeadline *dl) {
-    int dl_counter = 0;
-    for (size_t b = 0; b < ks->cap; b++) {
-        if (query_deadline_tick(dl, &dl_counter)) break;
-        if (ks->state[b] != 2) continue;
+    /* Count hashes in the keyset */
+    size_t n = 0;
+    for (size_t b = 0; b < ks->cap; b++)
+        if (ks->state[b] == 2) n++;
 
-        /* Layout-agnostic per-hash fetch (v1 Zone A probe / v2 slotcask
-           lookup). Synthesise a SlotHeader for agg_scan_cb so the same
-           callback works under both backends. */
-        RecordRef rr;
-        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
-        SlotHeader hdr = {0};
-        memcpy(hdr.hash, ks->keys[b], 16);
-        hdr.flag = 1;
-        hdr.key_len = (uint16_t)rr.klen;
-        hdr.value_len = (uint32_t)rr.vlen;
-        uint8_t stk[2048];
-        uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
-            ? stk : malloc(rr.klen + rr.vlen);
-        if (block) {
-            memcpy(block, rr.key, rr.klen);
-            memcpy(block + rr.klen, rr.val, rr.vlen);
-            agg_scan_cb(&hdr, block, agg_ctx);
-            if (block != stk) free(block);
+    if (n == 0) return;
+
+    /* Collect hashes */
+    uint8_t (*hashes)[16] = malloc(n * sizeof(*hashes));
+    if (!hashes) {
+        /* Fallback: sequential per-record */
+        int dl_counter = 0;
+        for (size_t b = 0; b < ks->cap; b++) {
+            if (query_deadline_tick(dl, &dl_counter)) break;
+            if (ks->state[b] != 2) continue;
+            RecordRef rr;
+            if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
+            SlotHeader hdr = {0};
+            memcpy(hdr.hash, ks->keys[b], 16);
+            hdr.flag = 1;
+            hdr.key_len = (uint16_t)rr.klen;
+            hdr.value_len = (uint32_t)rr.vlen;
+            uint8_t stk[2048];
+            uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
+                ? stk : malloc(rr.klen + rr.vlen);
+            if (block) {
+                memcpy(block, rr.key, rr.klen);
+                memcpy(block + rr.klen, rr.val, rr.vlen);
+                agg_scan_cb(&hdr, block, agg_ctx);
+                if (block != stk) free(block);
+            }
+            release_record_ref(&rr);
         }
-        release_record_ref(&rr);
+        return;
     }
+
+    size_t idx = 0;
+    for (size_t b = 0; b < ks->cap; b++)
+        if (ks->state[b] == 2)
+            memcpy(hashes[idx++], ks->keys[b], 16);
+
+    /* Batch resolve+fetch */
+    SlotcaskSchemaInfo sinfo = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    if (sdb) {
+        KeysetEmitAggCtx cb_ctx;
+        memset(&cb_ctx, 0, sizeof(cb_ctx));
+        cb_ctx.agg_ctx = agg_ctx;
+        cb_ctx.dl = dl;
+        pthread_mutex_init(&cb_ctx.lock, NULL);
+        slotcask_bulk_resolve_and_fetch(sdb, hashes, n, &cb_ctx, keyset_emit_agg_cb);
+        pthread_mutex_destroy(&cb_ctx.lock);
+    }
+    free(hashes);
 }
 
 static void keyset_agg_from_or(const char *db_root, const char *object,
@@ -17189,6 +16741,88 @@ static int small_prefilter_collect_cb(const uint8_t hash[16], void *ctx) {
     return 0;
 }
 
+/* ============================================================ D2 batch fetch
+ *
+ * Context + callback for batch fetching records in D2 (sort-in-memory) paths.
+ * The callback uses bsearch on a sorted hash-to-index map to find which row
+ * a fetched record corresponds to, then runs criteria_match_tree + sort key
+ * extraction inline.
+ *
+ * The original code iterated per-record via read_record_ref; the batch
+ * version fires callbacks in arbitrary order (parallel segment reads), so
+ * we need the map to associate fetched records back to their rows. */
+
+typedef struct {
+    uint8_t hash[16];
+    int     idx;
+} D2HashIdxEntry;
+
+static int d2_hash_idx_cmp(const void *a, const void *b) {
+    return memcmp(((const D2HashIdxEntry *)a)->hash,
+                  ((const D2HashIdxEntry *)b)->hash, 16);
+}
+
+static D2HashIdxEntry *d2_build_hash_map(const SmallPrefilterRow *rows, size_t n) {
+    D2HashIdxEntry *map = malloc(n * sizeof(D2HashIdxEntry));
+    if (!map) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(map[i].hash, rows[i].hash, 16);
+        map[i].idx = (int)i;
+    }
+    qsort(map, n, sizeof(D2HashIdxEntry), d2_hash_idx_cmp);
+    return map;
+}
+
+typedef struct {
+    /* Input */
+    SmallPrefilterRow *rows;
+    size_t             n_total;
+    CriteriaNode      *tree;
+    FieldSchema       *fs;
+    TypedSchema       *ts;
+    int                order_field_idx;
+    QueryDeadline     *deadline;
+    int               *dl_counter;
+    D2HashIdxEntry    *hash_map;        /* sorted map for bsearch */
+    /* Output tracking — pass/fail per original row index.
+       -1 = unprocessed, 0 = rejected, 1 = passed (sort_key stored in rows[i]). */
+    int               *passed;          /* malloc'd per-row flags: 0=reject, 1=pass */
+    int               *n_kept;          /* incremented on each pass */
+} D2BatchCtx;
+
+static int d2_batch_cb(const uint8_t hash16[16],
+                        const void *key, size_t klen,
+                        const void *value, size_t vlen,
+                        void *ctx_ptr) {
+    (void)key; (void)klen;
+    D2BatchCtx *ctx = (D2BatchCtx *)ctx_ptr;
+    if (ctx->deadline && query_deadline_tick(ctx->deadline, ctx->dl_counter)) return 1;
+
+    D2HashIdxEntry lookup;
+    memcpy(lookup.hash, hash16, 16);
+    D2HashIdxEntry *found = bsearch(&lookup, ctx->hash_map, ctx->n_total,
+                                     sizeof(D2HashIdxEntry), d2_hash_idx_cmp);
+    if (!found) return 0;
+    int i = found->idx;
+
+    if (ctx->passed[i]) return 0;  /* already processed (hash collision edge) */
+
+    /* Run criteria match tree on this record */
+    if (ctx->tree && !criteria_match_tree((const uint8_t *)value,
+                                           ctx->tree, ctx->fs))
+        return 0;  /* reject — leave passed[i]=0 */
+
+    /* Pass: extract sort key at the ORIGINAL row position.
+       Compaction happens after all callbacks complete (see call site). */
+    ctx->passed[i] = 1;
+    __sync_fetch_and_add(ctx->n_kept, 1);
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+                             ctx->order_field_idx,
+                             ctx->rows[i].sort_key,
+                             &ctx->rows[i].sort_key_len);
+    return 0;
+}
+
 /* Memcmp on the index-encoded sort_key bytes — they're produced by
  * typed_field_to_index_key, which mirrors the btree's storage encoding
  * (varchar = raw bytes, int/long/short/byte = top-bit-flipped BE so
@@ -17234,6 +16868,7 @@ typedef struct {
     int            result_cap;
     QueryDeadline *deadline;
     int            dl_counter;
+    pthread_mutex_t lock;         /* guards results[] growth + append */
 } CursorFetchCtx;
 
 /* cursor_fetch_cb — callback for batch lookup in cursor_fetch_worker.
@@ -17252,6 +16887,7 @@ static int cursor_fetch_cb(const uint8_t hash[16],
         return 0;
 
     /* Append to results array */
+    pthread_mutex_lock(&ctx->lock);
     if (ctx->result_count >= ctx->result_cap) {
         int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
         SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
@@ -17260,12 +16896,19 @@ static int cursor_fetch_cb(const uint8_t hash[16],
             ctx->results = NULL;
             ctx->result_count = 0;
             ctx->result_cap = 0;
+            pthread_mutex_unlock(&ctx->lock);
             return 1;
         }
         ctx->results = t;
         ctx->result_cap = new_cap;
     }
     SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
+    memcpy(row->hash, hash, 16);
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+                             ctx->order_field_idx,
+                             row->sort_key, &row->sort_key_len);
+    pthread_mutex_unlock(&ctx->lock);
+    return 0;
     memcpy(row->hash, hash, 16);
     typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
                              ctx->order_field_idx,
@@ -17277,7 +16920,6 @@ static void *cursor_fetch_worker(void *arg) {
     CursorFetchCtx *ctx = (CursorFetchCtx *)arg;
     if (ctx->entry_count == 0) return NULL;
 
-    int sid = compute_record_shard(ctx->entries[0].hash, ctx->sch->splits);
     SlotcaskSchemaInfo info = {
         .splits = ctx->sch->splits,
         .slot_size = ctx->sch->slot_size,
@@ -17292,10 +16934,13 @@ static void *cursor_fetch_worker(void *arg) {
     for (int i = 0; i < ctx->entry_count; i++)
         memcpy(hashes[i], ctx->entries[i].hash, 16);
 
-    /* Batch lookup — callback fires for each found record while the
-       segcache handle is held, so value pointer is valid. */
-    slotcask_bulk_lookup_by_hash(sdb, sid, hashes, (size_t)ctx->entry_count,
-                                  cursor_fetch_cb, ctx);
+    /* Batch resolve+fetch — two-phase model resolves all KF shards internally
+       and parallelizes segment reads across unique segment files. The callback
+       fires for each found record while the segcache handle is held. */
+    pthread_mutex_init(&ctx->lock, NULL);
+    slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)ctx->entry_count,
+                                     ctx, cursor_fetch_cb);
+    pthread_mutex_destroy(&ctx->lock);
 
     free(hashes);
     return NULL;
@@ -18188,25 +17833,79 @@ int cmd_find(const char *db_root, const char *object,
                     }
                     free(cf_entries);
                 } else {
-                    /* Fallback: original sequential loop (OOM or empty) */
-                    for (size_t i = 0; i < n_pre; i++) {
-                        RecordRef rr;
-                        if (read_record_ref(db_root, object, &sch,
-                                            sp_rows[i].hash, &rr) != 0) continue;
-                        if (tree && !criteria_match_tree((const uint8_t *)rr.val,
-                                                          tree, &driver_fs)) {
-                            release_record_ref(&rr);
-                            continue;
+                    /* Fallback: batch resolve+fetch via two-phase model */
+                    {
+                        SlotcaskSchemaInfo sinfo = {
+                            .splits = sch.splits, .slot_size = sch.slot_size,
+                            .streams = sch.streams,
+                        };
+                        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+                        if (sdb) {
+                            uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
+                            int *passed = calloc(n_pre, sizeof(int));
+                            D2HashIdxEntry *hmap = d2_build_hash_map(sp_rows, n_pre);
+                            if (hashes && passed && hmap) {
+                                for (size_t i = 0; i < n_pre; i++)
+                                    memcpy(hashes[i], sp_rows[i].hash, 16);
+                                int dl_counter = 0;
+                                D2BatchCtx d2_ctx = {
+                                    .rows = sp_rows, .n_total = n_pre,
+                                    .tree = tree, .fs = &driver_fs,
+                                    .ts = driver_fs.ts,
+                                    .order_field_idx = order_field_idx,
+                                    .deadline = &cdl, .dl_counter = &dl_counter,
+                                    .hash_map = hmap,
+                                    .passed = passed, .n_kept = &n_kept,
+                                };
+                                slotcask_bulk_resolve_and_fetch(sdb, hashes,
+                                                                 n_pre, &d2_ctx,
+                                                                 d2_batch_cb);
+                                /* Compact passed records to front */
+                                if (n_kept > 0) {
+                                    int keep = 0;
+                                    for (size_t i = 0; i < n_pre; i++) {
+                                        if (passed[i]) {
+                                            if (keep != (int)i)
+                                                memcpy(sp_rows[keep].hash, sp_rows[i].hash, 16);
+                                            if (keep != (int)i) {
+                                                memcpy(sp_rows[keep].sort_key,
+                                                       sp_rows[i].sort_key,
+                                                       sp_rows[i].sort_key_len);
+                                                sp_rows[keep].sort_key_len = sp_rows[i].sort_key_len;
+                                            }
+                                            keep++;
+                                        }
+                                    }
+                                    n_kept = keep;
+                                }
+                            }
+                            free(hashes);
+                            free(passed);
+                            free(hmap);
                         }
-                        if (n_kept != (int)i)
-                            memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
-                        typed_field_to_index_key(driver_fs.ts,
-                                                 (const uint8_t *)rr.val,
-                                                 order_field_idx,
-                                                 sp_rows[n_kept].sort_key,
-                                                 &sp_rows[n_kept].sort_key_len);
-                        n_kept++;
-                        release_record_ref(&rr);
+                    }
+                    /* Pure fallback: sequential per-record fetch (OOM, no sdb,
+                       or batch found zero) */
+                    if (n_kept == 0) {
+                        for (size_t i = 0; i < n_pre; i++) {
+                            RecordRef rr;
+                            if (read_record_ref(db_root, object, &sch,
+                                                sp_rows[i].hash, &rr) != 0) continue;
+                            if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                                              tree, &driver_fs)) {
+                                release_record_ref(&rr);
+                                continue;
+                            }
+                            if (n_kept != (int)i)
+                                memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
+                            typed_field_to_index_key(driver_fs.ts,
+                                                     (const uint8_t *)rr.val,
+                                                     order_field_idx,
+                                                     sp_rows[n_kept].sort_key,
+                                                     &sp_rows[n_kept].sort_key_len);
+                            n_kept++;
+                            release_record_ref(&rr);
+                        }
                     }
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t3);
@@ -18705,24 +18404,81 @@ int cmd_find(const char *db_root, const char *object,
                        extract the order-key bytes via the same encoder
                        the btree uses so memcmp orders them correctly. */
                     int n_kept = 0;
-                    for (size_t i = 0; i < n_pre; i++) {
-                        RecordRef rr;
-                        if (read_record_ref(db_root, object, &sch,
-                                             rows[i].hash, &rr) != 0) continue;
-                        if (tree && !criteria_match_tree((const uint8_t *)rr.val,
-                                                          tree, &driver_fs)) {
-                            release_record_ref(&rr);
-                            continue;
+                    {   /* Batch resolve+fetch via two-phase model */
+                        SlotcaskSchemaInfo sinfo = {
+                            .splits = sch.splits, .slot_size = sch.slot_size,
+                            .streams = sch.streams,
+                        };
+                        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+                        if (sdb) {
+                            uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
+                            int *passed = calloc(n_pre, sizeof(int));
+                            D2HashIdxEntry *hmap = d2_build_hash_map(rows, n_pre);
+                            if (hashes && passed && hmap) {
+                                for (size_t i = 0; i < n_pre; i++)
+                                    memcpy(hashes[i], rows[i].hash, 16);
+                                int dl_counter = 0;
+                                D2BatchCtx d2_ctx = {
+                                    .rows = rows, .n_total = n_pre,
+                                    .tree = tree, .fs = &driver_fs,
+                                    .ts = driver_fs.ts,
+                                    .order_field_idx = order_field_idx,
+                                    .deadline = &dl, .dl_counter = &dl_counter,
+                                    .hash_map = hmap,
+                                    .passed = passed, .n_kept = &n_kept,
+                                };
+                                slotcask_bulk_resolve_and_fetch(sdb, hashes,
+                                                                 n_pre, &d2_ctx,
+                                                                 d2_batch_cb);
+                            }
+                            /* Compact: move passed records to the front.
+                               Sort key is already stored at rows[i] by callback. */
+                            if (n_kept > 0 && hashes && passed && hmap) {
+                                int keep = 0;
+                                for (size_t i = 0; i < n_pre; i++) {
+                                    if (passed[i]) {
+                                        if (keep != (int)i)
+                                            memcpy(rows[keep].hash, rows[i].hash, 16);
+                                        /* sort_key already at rows[i]; copy to keep if
+                                           positions differ (for sort_key we already stored
+                                           at rows[i] so it's safe to read from rows[i]) */
+                                        if (keep != (int)i) {
+                                            memcpy(rows[keep].sort_key, rows[i].sort_key,
+                                                   rows[i].sort_key_len);
+                                            rows[keep].sort_key_len = rows[i].sort_key_len;
+                                        }
+                                        keep++;
+                                    }
+                                }
+                                n_kept = keep;
+                            }
+                            free(hashes);
+                            free(passed);
+                            free(hmap);
                         }
-                        if (n_kept != (int)i)
-                            memcpy(rows[n_kept].hash, rows[i].hash, 16);
-                        typed_field_to_index_key(driver_fs.ts,
-                                                 (const uint8_t *)rr.val,
-                                                 order_field_idx,
-                                                 rows[n_kept].sort_key,
-                                                 &rows[n_kept].sort_key_len);
-                        n_kept++;
-                        release_record_ref(&rr);
+                    }
+                    /* Fallback: sequential per-record fetch (OOM, sdb failed,
+                       or batch found zero records due to error) */
+                    if (n_kept == 0) {
+                        for (size_t i = 0; i < n_pre; i++) {
+                            RecordRef rr;
+                            if (read_record_ref(db_root, object, &sch,
+                                                 rows[i].hash, &rr) != 0) continue;
+                            if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                                                               tree, &driver_fs)) {
+                                release_record_ref(&rr);
+                                continue;
+                            }
+                            if (n_kept != (int)i)
+                                memcpy(rows[n_kept].hash, rows[i].hash, 16);
+                            typed_field_to_index_key(driver_fs.ts,
+                                                     (const uint8_t *)rr.val,
+                                                     order_field_idx,
+                                                     rows[n_kept].sort_key,
+                                                     &rows[n_kept].sort_key_len);
+                            n_kept++;
+                            release_record_ref(&rr);
+                        }
                     }
 
                     qsort(rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
@@ -23298,6 +23054,7 @@ typedef struct {
     CollectedHash *entries;
     int entry_count;
     AggCtx local;
+    pthread_mutex_t lock;   /* guards local during parallel_for_io callbacks */
     QueryDeadline *deadline;
     int dl_counter;
 } ShardAggCtx;
@@ -23323,7 +23080,9 @@ static int agg_batch_cb(const uint8_t hash[16],
     if (block) {
         memcpy(block, key, klen);
         memcpy(block + klen, value, vlen);
+        pthread_mutex_lock(&sa->lock);
         agg_scan_cb(&hdr, block, &sa->local);
+        pthread_mutex_unlock(&sa->lock);
         if (block != stk) free(block);
     }
     return 0;
@@ -23333,7 +23092,6 @@ static void *shard_agg_worker(void *arg) {
     ShardAggCtx *sa = (ShardAggCtx *)arg;
     if (sa->entry_count == 0) return NULL;
 
-    int sid = compute_record_shard(sa->entries[0].hash, sa->sch->splits);
     SlotcaskSchemaInfo info = {
         .splits = sa->sch->splits,
         .slot_size = sa->sch->slot_size,
@@ -23348,10 +23106,13 @@ static void *shard_agg_worker(void *arg) {
     for (int ei = 0; ei < sa->entry_count; ei++)
         memcpy(hashes[ei], sa->entries[ei].hash, 16);
 
-    /* Batch lookup — callback fires for each found record. The callback
-       copies key+val into its own buffer (pointers transient). */
-    slotcask_bulk_lookup_by_hash(sdb, sid, hashes, (size_t)sa->entry_count,
-                                  agg_batch_cb, sa);
+    /* Batch resolve+fetch — callback fires for each found record. The new
+       two-phase model resolves all KF shards internally (no pre-grouping
+       needed) and parallelizes segment reads across unique segment files. */
+    pthread_mutex_init(&sa->lock, NULL);
+    slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)sa->entry_count,
+                                     sa, agg_batch_cb);
+    pthread_mutex_destroy(&sa->lock);
 
     free(hashes);
     return NULL;
