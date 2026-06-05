@@ -345,37 +345,47 @@ static void *parallel_io_thread(void *raw) {
     return NULL;
 }
 
+/* Spawn up to cap concurrent pthreads per call. For I/O-bound work
+   (mmap page faults) the sweet spot is ~nproc — enough to keep the
+   kernel's page cache pipeline saturated without scheduler thrash from
+   excessive context switching. This cap applies per parallel_for_io
+   call, not globally (multiple concurrent callers may sum higher). */
+#define PARALLEL_IO_CAP(n, cap) \
+    ((cap) > 0 && (cap) < (n) ? (cap) : (n))
+
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
     if (n == 1) {
         fn(args);
         return;
     }
-    pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
-    char *valid = calloc((size_t)n, sizeof(char));
-    ParallelIoTask *tasks = malloc((size_t)n * sizeof(ParallelIoTask));
-    if (!threads || !valid || !tasks) {
-        /* OOM fallback — run sequentially. Slow but correct. */
-        free(threads); free(valid); free(tasks);
-        for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        tasks[i].fn = fn;
-        tasks[i].arg = (char *)args + (size_t)i * stride;
-        if (db_thread_create(&threads[i], parallel_io_thread, &tasks[i]) == 0) {
-            valid[i] = 1;
-        } else {
-            /* Spawn failure (typically EAGAIN under thread limit) — run
-               this one inline so caller still sees correct semantics.
-               valid[i] stays 0 so the join loop skips this slot —
-               threads[i] would be uninitialised garbage and pthread_join
-               on garbage is undefined behaviour (can hang). */
-            fn(tasks[i].arg);
+    int cap = parallel_threads();
+    if (cap < 1) cap = 1;
+    int batch_n = PARALLEL_IO_CAP(n, cap);
+    for (int base = 0; base < n; base += batch_n) {
+        int todo = n - base;
+        if (todo > batch_n) todo = batch_n;
+        pthread_t *threads = malloc((size_t)todo * sizeof(pthread_t));
+        char *valid = calloc((size_t)todo, sizeof(char));
+        ParallelIoTask *tasks = malloc((size_t)todo * sizeof(ParallelIoTask));
+        if (!threads || !valid || !tasks) {
+            free(threads); free(valid); free(tasks);
+            for (int j = 0; j < todo; j++)
+                fn((char *)args + (size_t)(base + j) * stride);
+            continue;
         }
+        for (int j = 0; j < todo; j++) {
+            tasks[j].fn = fn;
+            tasks[j].arg = (char *)args + (size_t)(base + j) * stride;
+            if (db_thread_create(&threads[j], parallel_io_thread, &tasks[j]) == 0) {
+                valid[j] = 1;
+            } else {
+                fn(tasks[j].arg);
+            }
+        }
+        for (int j = 0; j < todo; j++) {
+            if (valid[j]) pthread_join(threads[j], NULL);
+        }
+        free(threads); free(valid); free(tasks);
     }
-    for (int i = 0; i < n; i++) {
-        if (valid[i]) pthread_join(threads[i], NULL);
-    }
-    free(threads); free(valid); free(tasks);
 }
