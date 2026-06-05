@@ -15501,11 +15501,14 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
    AND-intersection where the keyset is already exact). */
 typedef struct {
     void          *agg_ctx;
+    pthread_mutex_t lock;      /* guards agg_scan_cb from concurrent IO threads */
     QueryDeadline *dl;
     int            dl_counter;
 } KeysetEmitAggCtx;
 
-/* Callback for keyset_emit_agg: decodes value and feeds agg_scan_cb. */
+/* Callback for keyset_emit_agg: decodes value and feeds agg_scan_cb.
+   agg_scan_cb mutates the AggCtx hash table, which is not thread-safe —
+   the lock guards it across concurrent IO pool workers. */
 static int keyset_emit_agg_cb(const uint8_t hash[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
@@ -15524,7 +15527,9 @@ static int keyset_emit_agg_cb(const uint8_t hash[16],
     if (block) {
         memcpy(block, key, klen);
         memcpy(block + klen, value, vlen);
+        pthread_mutex_lock(&ctx->lock);
         agg_scan_cb(&hdr, block, ctx->agg_ctx);
+        pthread_mutex_unlock(&ctx->lock);
         if (block != stk) free(block);
     }
     return 0;
@@ -15581,10 +15586,13 @@ static void keyset_emit_agg(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
     if (sdb) {
-        KeysetEmitAggCtx cb_ctx = {
-            .agg_ctx = agg_ctx, .dl = dl, .dl_counter = 0,
-        };
+        KeysetEmitAggCtx cb_ctx;
+        memset(&cb_ctx, 0, sizeof(cb_ctx));
+        cb_ctx.agg_ctx = agg_ctx;
+        cb_ctx.dl = dl;
+        pthread_mutex_init(&cb_ctx.lock, NULL);
         slotcask_bulk_resolve_and_fetch(sdb, hashes, n, &cb_ctx, keyset_emit_agg_cb);
+        pthread_mutex_destroy(&cb_ctx.lock);
     }
     free(hashes);
 }
@@ -16860,6 +16868,7 @@ typedef struct {
     int            result_cap;
     QueryDeadline *deadline;
     int            dl_counter;
+    pthread_mutex_t lock;         /* guards results[] growth + append */
 } CursorFetchCtx;
 
 /* cursor_fetch_cb — callback for batch lookup in cursor_fetch_worker.
@@ -16878,6 +16887,7 @@ static int cursor_fetch_cb(const uint8_t hash[16],
         return 0;
 
     /* Append to results array */
+    pthread_mutex_lock(&ctx->lock);
     if (ctx->result_count >= ctx->result_cap) {
         int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
         SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
@@ -16886,12 +16896,19 @@ static int cursor_fetch_cb(const uint8_t hash[16],
             ctx->results = NULL;
             ctx->result_count = 0;
             ctx->result_cap = 0;
+            pthread_mutex_unlock(&ctx->lock);
             return 1;
         }
         ctx->results = t;
         ctx->result_cap = new_cap;
     }
     SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
+    memcpy(row->hash, hash, 16);
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+                             ctx->order_field_idx,
+                             row->sort_key, &row->sort_key_len);
+    pthread_mutex_unlock(&ctx->lock);
+    return 0;
     memcpy(row->hash, hash, 16);
     typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
                              ctx->order_field_idx,
@@ -16920,8 +16937,10 @@ static void *cursor_fetch_worker(void *arg) {
     /* Batch resolve+fetch — two-phase model resolves all KF shards internally
        and parallelizes segment reads across unique segment files. The callback
        fires for each found record while the segcache handle is held. */
+    pthread_mutex_init(&ctx->lock, NULL);
     slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)ctx->entry_count,
                                      ctx, cursor_fetch_cb);
+    pthread_mutex_destroy(&ctx->lock);
 
     free(hashes);
     return NULL;

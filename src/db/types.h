@@ -425,6 +425,7 @@ extern int g_port;
 extern int g_max_threads;
 extern int g_workers;
 extern int g_pool_chunk;
+extern int g_io_threads;
 extern int g_index_page_size;
 extern int g_global_limit;
 extern int g_max_concurrent_queries;
@@ -590,11 +591,13 @@ void parallel_pool_shutdown(void);
 int  parallel_pool_size(void);
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
 
-/* I/O-heavy variant — spawns one dedicated pthread per task instead of
-   submitting to the bounded CPU pool. Use for bulk-insert / bulk-update /
-   bulk-delete worker dispatch and other write-heavy paths that benefit
-   from oversubscription (page faults on mmap MAP_SHARED writes,
-   fsync waits) without polluting the CPU pool that read paths share. */
+/* I/O thread pool — persistent workers, separate queue.
+   Parallelises I/O-bound work (mmap page faults, segment file reads)
+   that benefits from oversubscription. Sized independently from the
+   CPU pool so long page-fault waits don't starve CPU-bound queries.
+   Uses the same PoolGroup / PoolTask types as the CPU pool. */
+void parallel_io_pool_init(int nthreads);
+void parallel_io_pool_shutdown(void);
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object,
                     const char *query, uint32_t duration_ms);

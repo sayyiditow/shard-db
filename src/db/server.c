@@ -3071,6 +3071,11 @@ int cmd_server(const char *db_root, int daemonize) {
                   : (int)(nproc > 2 ? nproc - 2 : nproc);
     if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
+    /* I/O pool — sized independently so long page-fault waits don't
+       starve CPU-bound queries. Defaults to 2 × nproc. */
+    int io_pool_sz = g_io_threads > 0 ? g_io_threads : (int)(nproc * 2);
+    if (io_pool_sz < 2) io_pool_sz = 2;
+    parallel_io_pool_init(io_pool_sz);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);
     load_allowed_ips_conf(db_root);
@@ -3196,6 +3201,7 @@ int cmd_server(const char *db_root, int daemonize) {
     for (int i = 0; i < 300 && in_flight_writes > 0; i++) usleep(100000);
 
     remove_pid_file(db_root);
+    parallel_io_pool_shutdown();
     parallel_pool_shutdown();
     counts_flush_all();        /* persist in-memory atomic counts → disk */
     fcache_shutdown();
