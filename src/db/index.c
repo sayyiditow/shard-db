@@ -2636,17 +2636,36 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
         uint8_t tg[TG_MAX_DISTINCT][3];
         size_t n = tg_extract_distinct(vb + 2, al, tg, TG_MAX_DISTINCT);
         if (n == 0) return;
-        if (f->pair_count + n > f->pairs_cap || f->arena_used + n * 3 > f->arena_cap)
-            mf_flush_field(f, splits, idx_n);
-        if (n > f->pairs_cap || n * 3 > f->arena_cap) return;
-        for (size_t i = 0; i < n; i++) {
-            size_t off = f->arena_used;
-            memcpy(f->arena + off, tg[i], 3);
-            f->arena_used += 3;
-            f->pairs[f->pair_count].value = (const char *)(uintptr_t)off;
-            f->pairs[f->pair_count].vlen  = 3;
-            memcpy(f->pairs[f->pair_count].hash, hash16, BT_HASH_SIZE);
-            f->pair_count++;
+        /* Process trigrams in batches to handle n > pairs_cap.
+           When reindex builds multiple indexes, per_field_budget is divided
+           by n_fields, reducing pairs_cap below TG_MAX_DISTINCT. Records with
+           many distinct trigrams would be silently dropped. Batch processing
+           flushes between chunks so all trigrams are indexed. */
+        size_t i = 0;
+        while (i < n) {
+            /* Flush if buffer is full or would overflow with next trigram */
+            if (f->pair_count >= f->pairs_cap || f->arena_used + 3 > f->arena_cap) {
+                mf_flush_field(f, splits, idx_n);
+            }
+
+            /* Add as many trigrams as will fit in this batch */
+            size_t batch = 0;
+            while (i + batch < n &&
+                   f->pair_count + batch + 1 <= f->pairs_cap &&
+                   f->arena_used + (batch + 1) * 3 <= f->arena_cap) {
+                size_t off = f->arena_used;
+                memcpy(f->arena + off, tg[i + batch], 3);
+                f->arena_used += 3;
+                f->pairs[f->pair_count + batch].value = (const char *)(uintptr_t)off;
+                f->pairs[f->pair_count + batch].vlen  = 3;
+                memcpy(f->pairs[f->pair_count + batch].hash, hash16, BT_HASH_SIZE);
+                batch++;
+            }
+            f->pair_count += batch;
+            i += batch;
+
+            /* Safety: if batch == 0, we're stuck (shouldn't happen with proper caps) */
+            if (batch == 0) break;
         }
         return;
     }
