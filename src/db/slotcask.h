@@ -651,11 +651,30 @@ int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
 int64_t slotcask_count_live(SlotcaskDb *db);
 
 /* Look up by hash16 only (index-driven access). Walks the keyfile shard for
-   `hash16`, invokes cb for each live entry whose hash matches. Almost
-   always 0 or 1 invocation per call (hash collisions are rare). cb returning
-   1 stops further probing. */
+ * `hash16`, invokes cb for each live entry whose hash matches. Almost
+ * always 0 or 1 invocation per call (hash collisions are rare). cb returning
+ * 1 stops further probing. */
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                              SlotcaskScanCb cb, void *ctx);
+
+/* Hash-based bulk lookup with per-record callback.
+   Same batching pattern as slotcask_bulk_lookup_in_kfshard but takes
+   pre-computed hashes instead of keys:
+
+     Phase 1 — one kfcache_acquire (rdlock), probe all hashes via
+               kf_lookup_no_verify, record (sid, fid, off) per hit.
+     Phase 2 — sort hits by (sid, fid), for each unique segment file
+               acquire segcache once, verify via seg_rec_live_with_hash,
+               fire cb for each live record under the held handle.
+               cb returning 1 stops further processing.
+
+   All `hashes` must route to the same kf_shard_id (caller's responsibility
+   — use compute_record_shard or shard_group_batch). Returns 0 on success,
+   -1 on hard error. Pointer args (key, value) passed to cb are transient
+   and valid only during the cb invocation. */
+int slotcask_bulk_lookup_by_hash(SlotcaskDb *db, int kf_shard_id,
+                                  const uint8_t (*hashes)[16], size_t n,
+                                  SlotcaskScanCb cb, void *ctx);
 
 /* Probe the keyfile for a live entry matching hash16. Returns 0 and sets
  * *out_slot if found, -1 if not. Does NOT read the segment file — stops

@@ -10520,6 +10520,25 @@ typedef struct {
     void            *bm_handles[MAX_INTERSECT_LEAVES]; // BitmapShard* per leaf
 } ShardCountCtx;
 
+/* count_batch_cb — callback for batch lookup in shard_count_worker.
+   Runs criteria_match_tree; increments count on match. */
+typedef struct {
+    ShardCountCtx *sc;
+    size_t        *local;
+} CountBatchCbCtx;
+
+static int count_batch_cb(const uint8_t hash[16],
+                           const void *key, size_t klen,
+                           const void *value, size_t vlen,
+                           void *ctx_ptr) {
+    (void)hash; (void)key; (void)klen;
+    CountBatchCbCtx *c = (CountBatchCbCtx *)ctx_ptr;
+    if (query_deadline_tick(c->sc->deadline, &c->sc->dl_counter)) return 1;
+    if (criteria_match_tree((const uint8_t *)value, c->sc->tree, c->sc->fs))
+        (*c->local)++;
+    return 0;
+}
+
 static void *shard_count_worker(void *arg) {
     ShardCountCtx *sc = (ShardCountCtx *)arg;
     if (sc->entry_count == 0) return NULL;
@@ -10555,14 +10574,38 @@ static void *shard_count_worker(void *arg) {
     }
 
     size_t local = 0;
-    for (int ei = 0; ei < sc->entry_count; ei++) {
-        if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
+    /* Collect hashes that need actual record fetch (bitmap path couldn't
+       resolve them). We'll batch these to amortise cache operations. */
+    int n_need_fetch = 0;
+    uint8_t (*fetch_hashes)[16] = NULL;
+    int *fetch_idx = NULL;
 
-        /* --- Bitmap post-filter shortcut --- */
-        int bm_indeterminate = 0;  // bitmap couldn't answer → must fetch record
-        if (sc->n_bm_postfilter > 0) {
-            /* Inline KF probe — kh is already acquired (rdlock held).
-             * Same logic as kf_find_slot_for_hash / slotcask_lookup_by_hash. */
+    if (sc->entry_count <= 0) {
+        sc->count = 0;
+        goto cleanup;
+    }
+
+    if (shard_id < 0) {
+        /* No bitmap post-filters — all entries need record fetch. */
+        n_need_fetch = sc->entry_count;
+        fetch_hashes = calloc((size_t)n_need_fetch, sizeof(*fetch_hashes));
+        if (!fetch_hashes) { sc->count = 0; goto cleanup; }
+        for (int ei = 0; ei < n_need_fetch; ei++)
+            memcpy(fetch_hashes[ei], sc->entries[ei].hash, 16);
+    } else {
+        /* Bitmap post-filters present: two-pass approach.
+           Pass 1: run bitmap pre-filter, track needs-fetch entries. */
+        fetch_hashes = calloc((size_t)sc->entry_count, sizeof(*fetch_hashes));
+        fetch_idx = malloc((size_t)sc->entry_count * sizeof(int));
+        if (!fetch_hashes || !fetch_idx) {
+            free(fetch_hashes); free(fetch_idx);
+            sc->count = 0; goto cleanup;
+        }
+
+        for (int ei = 0; ei < sc->entry_count; ei++) {
+            if (query_deadline_tick(sc->deadline, &sc->dl_counter)) break;
+
+            /* --- Bitmap pre-filter --- */
             uint32_t kf_slot = 0;
             int kf_found = 0;
             {
@@ -10583,15 +10626,15 @@ static void *shard_count_worker(void *arg) {
             }
             if (!kf_found) continue;
 
-            /* Step 2: test all bitmap post-filters */
+            /* Test all bitmap post-filters */
             int bm_pass = 1;
+            int bm_indeterminate = 0;
             for (int b = 0; b < sc->n_bm_postfilter; b++) {
                 BitmapShard *bm = (BitmapShard *)sc->bm_handles[b];
                 if (!bm || kf_slot >= bm_slots(bm)) {
-                    bm_indeterminate = 1;  // can't determine from bitmap
+                    bm_indeterminate = 1;
                     break;
                 }
-                /* Test all IN values (or single EQ value) */
                 int any_match = 0;
                 int nv = (sc->bm_in_count[b] > 0) ? sc->bm_in_count[b] : 1;
                 for (int v = 0; v < nv; v++) {
@@ -10603,27 +10646,51 @@ static void *shard_count_worker(void *arg) {
                 }
                 if (!any_match) { bm_pass = 0; break; }
             }
-            if (bm_indeterminate) {
-                /* Fall through to record fetch — bitmap can't answer */
-            } else if (!bm_pass) {
-                continue;  // bitmap rejection: skip hash, NO record fetch
-            } else if (sc->all_postfilters_are_bm) {
-                /* Case A1: all post-filters are bitmaps → index-only count */
-                local++;
-                continue;  // NO record fetch
-            }
-            /* Case A2: bitmaps passed, but non-bitmap post-filters need record */
-        }
 
-        /* --- Record fetch + full tree (existing path) --- */
-        RecordRef rr;
-        if (read_record_ref(sc->db_root, sc->object, sc->sch,
-                             sc->entries[ei].hash, &rr) != 0) continue;
-        if (criteria_match_tree(rr.val, sc->tree, sc->fs)) local++;
-        release_record_ref(&rr);
+            if (bm_indeterminate) {
+                /* Fall through — needs record fetch */
+                memcpy(fetch_hashes[n_need_fetch], sc->entries[ei].hash, 16);
+                fetch_idx[n_need_fetch] = ei;
+                n_need_fetch++;
+            } else if (!bm_pass) {
+                continue;  /* bitmap rejection: skip */
+            } else if (sc->all_postfilters_are_bm) {
+                local++;  /* index-only count, no record fetch */
+                continue;
+            } else {
+                /* Bitmaps passed, non-bitmap post-filters need record fetch */
+                memcpy(fetch_hashes[n_need_fetch], sc->entries[ei].hash, 16);
+                fetch_idx[n_need_fetch] = ei;
+                n_need_fetch++;
+            }
+        }
     }
 
-    /* Cleanup: close pre-opened handles */
+    /* Pass 2: batch fetch all needs-fetch entries */
+    if (n_need_fetch > 0) {
+        SlotcaskSchemaInfo info = {
+            .splits = sc->sch->splits,
+            .slot_size = sc->sch->slot_size,
+            .streams = sc->sch->streams,
+        };
+        SlotcaskDb *batch_sdb = sdb;
+        if (!batch_sdb)
+            batch_sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
+        if (batch_sdb) {
+            if (shard_id < 0)
+                shard_id = compute_record_shard(fetch_hashes[0], sc->sch->splits);
+            CountBatchCbCtx cb_ctx = { sc, &local };
+            slotcask_bulk_lookup_by_hash(batch_sdb, shard_id,
+                                          fetch_hashes, (size_t)n_need_fetch,
+                                          count_batch_cb, &cb_ctx);
+        }
+    }
+
+    free(fetch_hashes);
+    free(fetch_idx);
+
+cleanup:
+    /* Close pre-opened handles */
     if (kh.map) kfcache_release(&kh);
     for (int b = 0; b < sc->n_bm_postfilter; b++) {
         if (sc->bm_handles[b]) bm_close((BitmapShard *)sc->bm_handles[b]);
@@ -17169,46 +17236,68 @@ typedef struct {
     int            dl_counter;
 } CursorFetchCtx;
 
+/* cursor_fetch_cb — callback for batch lookup in cursor_fetch_worker.
+   Runs criteria_match_tree + typed_field_to_index_key per found record
+   while the segcache handle is held (pointers transient). */
+static int cursor_fetch_cb(const uint8_t hash[16],
+                            const void *key, size_t klen,
+                            const void *value, size_t vlen,
+                            void *ctx_ptr) {
+    (void)key; (void)klen;
+    CursorFetchCtx *ctx = (CursorFetchCtx *)ctx_ptr;
+    if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
+
+    if (ctx->tree && !criteria_match_tree((const uint8_t *)value,
+                                           ctx->tree, ctx->fs))
+        return 0;
+
+    /* Append to results array */
+    if (ctx->result_count >= ctx->result_cap) {
+        int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
+        SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
+            (size_t)new_cap * sizeof(SmallPrefilterRow));
+        if (!t) {
+            ctx->results = NULL;
+            ctx->result_count = 0;
+            ctx->result_cap = 0;
+            return 1;
+        }
+        ctx->results = t;
+        ctx->result_cap = new_cap;
+    }
+    SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
+    memcpy(row->hash, hash, 16);
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+                             ctx->order_field_idx,
+                             row->sort_key, &row->sort_key_len);
+    return 0;
+}
+
 static void *cursor_fetch_worker(void *arg) {
     CursorFetchCtx *ctx = (CursorFetchCtx *)arg;
     if (ctx->entry_count == 0) return NULL;
 
-    for (int ei = 0; ei < ctx->entry_count; ei++) {
-        if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) break;
-        CollectedHash *e = &ctx->entries[ei];
+    int sid = compute_record_shard(ctx->entries[0].hash, ctx->sch->splits);
+    SlotcaskSchemaInfo info = {
+        .splits = ctx->sch->splits,
+        .slot_size = ctx->sch->slot_size,
+        .streams = ctx->sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(ctx->db_root, ctx->object, &info);
+    if (!sdb) return NULL;
 
-        RecordRef rr;
-        if (read_record_ref(ctx->db_root, ctx->object, ctx->sch,
-                             e->hash, &rr) != 0) continue;
+    /* Extract hashes from entries */
+    uint8_t (*hashes)[16] = malloc((size_t)ctx->entry_count * sizeof(*hashes));
+    if (!hashes) return NULL;
+    for (int i = 0; i < ctx->entry_count; i++)
+        memcpy(hashes[i], ctx->entries[i].hash, 16);
 
-        if (ctx->tree && !criteria_match_tree((const uint8_t *)rr.val,
-                                               ctx->tree, ctx->fs)) {
-            release_record_ref(&rr);
-            continue;
-        }
+    /* Batch lookup — callback fires for each found record while the
+       segcache handle is held, so value pointer is valid. */
+    slotcask_bulk_lookup_by_hash(sdb, sid, hashes, (size_t)ctx->entry_count,
+                                  cursor_fetch_cb, ctx);
 
-        /* Append to results array */
-        if (ctx->result_count >= ctx->result_cap) {
-            int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
-            SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
-                (size_t)new_cap * sizeof(SmallPrefilterRow));
-            if (!t) {
-                ctx->results = NULL;
-                ctx->result_count = 0;
-                ctx->result_cap = 0;
-                release_record_ref(&rr);
-                return NULL;
-            }
-            ctx->results = t;
-            ctx->result_cap = new_cap;
-        }
-        SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
-        memcpy(row->hash, e->hash, 16);
-        typed_field_to_index_key(ctx->ts, (const uint8_t *)rr.val,
-                                 ctx->order_field_idx,
-                                 row->sort_key, &row->sort_key_len);
-        release_record_ref(&rr);
-    }
+    free(hashes);
     return NULL;
 }
 
@@ -18003,9 +18092,10 @@ int cmd_find(const char *db_root, const char *object,
             if (cursor_fp.prefilter_card > 0 &&
                 cursor_fp.prefilter_card < c1_ks)
                 c1_ks = cursor_fp.prefilter_card;
-            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
-                                 cursor_fp.source_is_bitmap) &&
-                order_tf && driver_fs.ts && order_field_idx >= 0) {
+            if (cursor_fp.order != FP_ORDER_COMPOSITE &&
+                 prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
+                                  cursor_fp.source_is_bitmap) &&
+                 order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
             struct timespec t1, t2, t3, t4;
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -18130,7 +18220,7 @@ int cmd_find(const char *db_root, const char *object,
                     (t3.tv_nsec - t2.tv_nsec) / 1000000.0;
                 double sort_ms = (t4.tv_sec - t3.tv_sec) * 1000.0 +
                     (t4.tv_nsec - t3.tv_nsec) / 1000000.0;
-                LOG_INFO(LOG_SUB_QUERY, "C1_TIMING: n_pre=%zu, n_kept=%d, collect=%.1fms, fetch+filter=%.1fms, sort=%.1fms",
+                LOG_DEBUG(LOG_SUB_QUERY, "C1_TIMING: n_pre=%zu, n_kept=%d, collect=%.1fms, fetch+filter=%.1fms, sort=%.1fms",
                          n_pre, n_kept, collect_ms, fetch_ms, sort_ms);
                 CursorFindCtx cc;
                 memset(&cc, 0, sizeof(cc));
@@ -23212,65 +23302,58 @@ typedef struct {
     int dl_counter;
 } ShardAggCtx;
 
+/* agg_batch_cb — callback for batch lookup in shard_agg_worker.
+   Copies key+val into a temp block and calls agg_scan_cb. */
+static int agg_batch_cb(const uint8_t hash[16],
+                         const void *key, size_t klen,
+                         const void *value, size_t vlen,
+                         void *ctx_ptr) {
+    ShardAggCtx *sa = (ShardAggCtx *)ctx_ptr;
+    if (query_deadline_tick(sa->deadline, &sa->dl_counter)) return 1;
+
+    SlotHeader hdr = {0};
+    memcpy(hdr.hash, hash, 16);
+    hdr.flag = 1;
+    hdr.key_len = (uint16_t)klen;
+    hdr.value_len = (uint32_t)vlen;
+
+    uint8_t stk[2048];
+    uint8_t *block = (klen + vlen + 1 < sizeof(stk))
+        ? stk : malloc(klen + vlen);
+    if (block) {
+        memcpy(block, key, klen);
+        memcpy(block + klen, value, vlen);
+        agg_scan_cb(&hdr, block, &sa->local);
+        if (block != stk) free(block);
+    }
+    return 0;
+}
+
 static void *shard_agg_worker(void *arg) {
     ShardAggCtx *sa = (ShardAggCtx *)arg;
     if (sa->entry_count == 0) return NULL;
 
-    /* v2: layout-agnostic per-hash fetch via read_record_ref. The
-       shard grouping the planner did was a v1 locality hint; v2
-       slotcask routes per-hash internally so we just iterate. */
-    for (int ei = 0; ei < sa->entry_count; ei++) {
-        if (query_deadline_tick(sa->deadline, &sa->dl_counter)) break;
-        RecordRef rr;
-        if (read_record_ref(sa->db_root, sa->object, sa->sch,
-                             sa->entries[ei].hash, &rr) != 0) continue;
-        /* Synthesise a SlotHeader for the cb. block = key bytes
-           followed by value bytes — exactly what agg_scan_cb walks. */
-        SlotHeader hdr = {0};
-        memcpy(hdr.hash, sa->entries[ei].hash, 16);
-        hdr.flag = 1;
-        hdr.key_len = (uint16_t)rr.klen;
-        hdr.value_len = (uint32_t)rr.vlen;
-        uint8_t stk[2048];
-        uint8_t *block = (rr.klen + rr.vlen + 1 < sizeof(stk))
-            ? stk : malloc(rr.klen + rr.vlen);
-        if (block) {
-            memcpy(block, rr.key, rr.klen);
-            memcpy(block + rr.klen, rr.val, rr.vlen);
-            agg_scan_cb(&hdr, block, &sa->local);
-            if (block != stk) free(block);
-        }
-        release_record_ref(&rr);
-    }
-    return NULL;
+    int sid = compute_record_shard(sa->entries[0].hash, sa->sch->splits);
+    SlotcaskSchemaInfo info = {
+        .splits = sa->sch->splits,
+        .slot_size = sa->sch->slot_size,
+        .streams = sa->sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(sa->db_root, sa->object, &info);
+    if (!sdb) return NULL;
 
-    int sid = sa->entries[0].shard_id;
-    char shard[PATH_MAX];
-    build_shard_path(shard, sizeof(shard), sa->db_root, sa->object, sid);
+    /* Extract hashes from entries */
+    uint8_t (*hashes)[16] = malloc((size_t)sa->entry_count * sizeof(*hashes));
+    if (!hashes) return NULL;
+    for (int ei = 0; ei < sa->entry_count; ei++)
+        memcpy(hashes[ei], sa->entries[ei].hash, 16);
 
-    /* Use the persistent shard mmap cache. Per-call mmap+munmap was paying
-       page-fault + TLB-flush per shard per query — visible as a 4-5x agg
-       slowdown vs README baseline before this fix. */
-    FcacheRead fc = fcache_get_read(shard);
-    if (!fc.map) return NULL;
-    uint32_t slots = fc.slots_per_shard;
-    uint32_t mask = slots - 1;
+    /* Batch lookup — callback fires for each found record. The callback
+       copies key+val into its own buffer (pointers transient). */
+    slotcask_bulk_lookup_by_hash(sdb, sid, hashes, (size_t)sa->entry_count,
+                                  agg_batch_cb, sa);
 
-    for (int ei = 0; ei < sa->entry_count; ei++) {
-        if (query_deadline_tick(sa->deadline, &sa->dl_counter)) break;
-        CollectedHash *e = &sa->entries[ei];
-        for (uint32_t p = 0; p < slots; p++) {
-            uint32_t s = ((uint32_t)e->start_slot + p) & mask;
-            SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-            if (h->flag == 0 && h->key_len == 0) break;
-            if (h->flag != 1) continue;
-            if (memcmp(h->hash, e->hash, 16) != 0) continue;
-            const uint8_t *block = fc.map + zoneB_off(s, slots, sa->sch->slot_size);
-            agg_scan_cb(h, block, &sa->local);
-            break;
-        }
-    }
-    fcache_release(fc);
+    free(hashes);
     return NULL;
 }
 

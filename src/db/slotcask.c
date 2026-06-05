@@ -3997,6 +3997,95 @@ int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     return 0;
 }
 
+/* ============================================================ Hash-based bulk lookup
+ *
+ * Same batching pattern as slotcask_bulk_lookup_in_kfshard but takes
+ * pre-computed hashes instead of keys.  Phase 2 verifies via
+ * seg_rec_live_with_hash (hash match only — no key bytes needed). */
+int slotcask_bulk_lookup_by_hash(SlotcaskDb *db, int kf_shard_id,
+                                  const uint8_t (*hashes)[16], size_t n,
+                                  SlotcaskScanCb cb, void *ctx) {
+    if (n == 0) return 0;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+
+    /* Phase 1: probe all hashes under one KF rdlock */
+    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    for (size_t i = 0; i < n; i++) {
+        uint8_t flag = 0;
+        size_t slot;
+        int rc = kf_lookup_no_verify(&kh, hashes[i], &flag,
+                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
+        if (rc < 0) continue;
+        st[i].kf_found = 1;
+    }
+    kfcache_release(&kh);
+
+    /* Phase 2: sort hits by (sid, fid) for batched segcache access */
+    int *vidx = malloc(n * sizeof(int));
+    if (!vidx) { free(st); return -1; }
+
+    int vcount = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].kf_found) vidx[vcount++] = (int)i;
+    }
+    for (int a = 1; a < vcount; a++) {
+        int tmp = vidx[a];
+        uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
+        int b = a - 1;
+        while (b >= 0) {
+            int bi = vidx[b];
+            if (st[bi].sid < ta_sid ||
+                (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
+            vidx[b + 1] = vidx[b];
+            b--;
+        }
+        vidx[b + 1] = tmp;
+    }
+
+    /* Process each unique segment file once */
+    int stop = 0;
+    int k = 0;
+    while (k < vcount && !stop) {
+        int run_end = k + 1;
+        uint8_t  sid = st[vidx[k]].sid;
+        uint16_t fid = st[vidx[k]].fid;
+        while (run_end < vcount &&
+               st[vidx[run_end]].sid == sid &&
+               st[vidx[run_end]].fid == fid)
+            run_end++;
+
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, sid, fid);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0) != 0) {
+            k = run_end;
+            continue;
+        }
+
+        for (int j = k; j < run_end && !stop; j++) {
+            int i = vidx[j];
+            const uint8_t *rec = h.map + st[i].off;
+            if (!seg_rec_live_with_hash(rec, hashes[i])) continue;
+            uint16_t klen = seg_rec_klen(rec);
+            uint32_t vlen = seg_rec_vlen(rec);
+            if (cb(hashes[i], rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+                stop = 1;
+        }
+        segcache_release(&h);
+        k = run_end;
+    }
+
+    free(vidx);
+    free(st);
+    return 0;
+}
+
 int slotcask_delete_with_hooks(SlotcaskDb *db,
                                 const void *key, size_t klen,
                                 const SlotcaskDeleteOpts *opts,
