@@ -10664,6 +10664,9 @@ typedef struct FilterPlan {
     int              fetching;                           /* dimension this plan was computed for */
     char             composite_field[256];               /* set when order==FP_ORDER_COMPOSITE_EXACT */
     SearchCriterion *order_range;     /* range/eq leaf on order_by to fold into the composite seek (EQ seed only) */
+    size_t           prefilter_card;  /* estimated lower-bound cardinality for cursor prefilter sizing;
+                                         0 = unknown (use keyset_size directly) */
+    SearchCriterion *prefilter_source_leaf; /* the leaf that gave prefilter_card (NULL = no narrow leaf) */
 } FilterPlan;
 
 /* Classify post-filter leaves: which are bitmap eq/in that can be tested
@@ -11376,7 +11379,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
             uint8_t hi[1024 + 8];
             memcpy(hi, lo, len_lo);
             size_t len_hi;
-            if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
+            if (len_lo > 0 && (!seed_tf || len_lo < (size_t)seed_tf->size)) {
                 int pos = (int)len_lo - 1;
                 while (pos >= 0 && lo[pos] == 0xff) pos--;
                 if (pos >= 0) {
@@ -11485,14 +11488,18 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
 
     /* 2. Upper bound: byte-successor of the seed prefix.
        For fixed-width types: append 0xff bytes (original STARTS_WITH idiom).
-       For VARCHAR: increment the last byte < 0xff, or append 0x00 if all 0xff,
-       producing a tight exclusive bound. The old 0xff*4 approach creates an
-       over-wide range for variable-length keys because shorter prefix + 0xff
-       can let non-matching values through. */
+       For variable-length encodings (VARCHAR or raw bytes): increment the last
+       byte < 0xff, or append 0x00 if all 0xff, producing a tight exclusive
+       bound.  The old 0xff*4 approach creates an over-wide range for
+       variable-length keys because shorter prefix + 0xff can let non-matching
+       values through.  Detected by comparing the encoded length to the field's
+       fixed storage size (seed_tf_sv->size); when they match, the encoding is
+       fixed-width; when encoded < size or seed_tf_sv is NULL (raw), it's
+       variable-length. */
     uint8_t buf_hi[1024 + 8];
     memcpy(buf_hi, buf_lo_sv, len_lo_sv);
     size_t len_hi;
-    if (seed_tf_sv && seed_tf_sv->type == FT_VARCHAR && len_lo_sv > 0) {
+    if (len_lo_sv > 0 && (!seed_tf_sv || len_lo_sv < (size_t)seed_tf_sv->size)) {
         int pos = (int)len_lo_sv - 1;
         while (pos >= 0 && buf_lo_sv[pos] == 0xff) pos--;
         if (pos >= 0) {
@@ -13686,6 +13693,26 @@ order_overlay:
                 fp.n_source         = 1;
                 fp.order            = FP_ORDER_COMPOSITE;
                 fp.order_range      = obr;
+                /* prefilter_card: smallest estimable K among non-cc leaves.
+                   In the cursor path this overrides the composite seed's KeySet size
+                   for the prefer_fetch_sort decision — without it, a broad composite
+                   seed (e.g. type=job ~17k) masks a narrow real match set
+                   (time>=T ~6) and the cursor wrongly chooses walk-over-limit. */
+                fp.prefilter_card = 0;
+                fp.prefilter_source_leaf = NULL;
+                size_t best_k = SIZE_MAX;
+                int best_i = -1;
+                for (int i_ = 0; i_ < nL; i_++) {
+                    if (i_ == cc) continue;
+                    if (est[i_].estimable && !est[i_].saturated && est[i_].k < best_k) {
+                        best_k = est[i_].k;
+                        best_i = i_;
+                    }
+                }
+                if (best_k < SIZE_MAX) {
+                    fp.prefilter_card = best_k;
+                    fp.prefilter_source_leaf = leaves[best_i];
+                }
             } else {
                 /* Drive on the most-selective seed instead (pre-overlay fp.kind /
                  * source_leaves already point at prim). D2 if bounded, else D3. */
@@ -17326,6 +17353,20 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
     if (!prefilter_ks) return 0;
     if (keyset_size(prefilter_ks) == 0) { keyset_free(prefilter_ks); return 0; }
 
+    /* For D1 composite plans where a more-selective non-seed leaf exists,
+       replace the broad composite-seed KeySet with a narrow KeySet built
+       from the most-selective leaf. */
+    if (fp->prefilter_source_leaf &&
+        fp->prefilter_card > 0 &&
+        fp->prefilter_card < keyset_size(prefilter_ks)) {
+        KeySet *narrow = build_keyset_from_leaf(db_root, object, sch->splits,
+                                                 fp->prefilter_source_leaf, dl);
+        if (narrow) {
+            keyset_free(prefilter_ks);
+            prefilter_ks = narrow;
+        }
+    }
+
     /* Set up the top-N heap (or fall back to unbounded materialization
        when limit==0). offset is included in the heap capacity so the
        skip is honored after sort. */
@@ -17820,6 +17861,21 @@ int cmd_find(const char *db_root, const char *object,
             cursor_prefilter_ks = NULL;
         }
 
+        /* For D1 composite plans where a more-selective non-seed leaf exists,
+           replace the broad composite-seed KeySet with a narrow KeySet built
+           from the most-selective leaf.  This makes the C1 fetch+sort iterate
+           ~the actual matches instead of the full composite partition. */
+        if (cursor_prefilter_ks && cursor_fp.prefilter_source_leaf &&
+            cursor_fp.prefilter_card > 0 &&
+            cursor_fp.prefilter_card < keyset_size(cursor_prefilter_ks)) {
+            KeySet *narrow = build_keyset_from_leaf(db_root, object, sch.splits,
+                                                     cursor_fp.prefilter_source_leaf, &cdl);
+            if (narrow) {
+                keyset_free(cursor_prefilter_ks);
+                cursor_prefilter_ks = narrow;
+            }
+        }
+
         /* Empty KeySet → no possible matches. Emit empty page +
            null cursor and return. */
         if (cursor_prefilter_ks &&
@@ -17837,11 +17893,23 @@ int cmd_find(const char *db_root, const char *object,
            is small (bounded by prefer_fetch_sort) the candidate
            records can be fetched, filtered, sorted and emitted in
            memory, beating a btree walk that must scan past non-matching
-           order_index entries.  Matches the non-cursor D2 shortcut. */
-        if (cursor_prefilter_ks &&
-            prefer_fetch_sort(keyset_size(cursor_prefilter_ks),
-                              cursor_N_live, offset, limit) &&
-            order_tf && driver_fs.ts && order_field_idx >= 0) {
+           order_index entries.  Matches the non-cursor D2 shortcut.
+
+           prefilter_card: when set (nonzero and smaller than the KeySet
+           size), it overrides the KeySet size for the decision.  This
+           handles the case where the D1 composite overlay reseeded the
+           plan with a broader leaf (e.g. type=job ~17k) while the true
+           candidate set is narrower (e.g. after time>=T, ~6).  The
+           KeySet is still built from the composite seed (correct for
+           pre-filtering the walk), but the sizing decision reflects the
+           tighter bound. */
+        if (cursor_prefilter_ks) {
+            size_t c1_ks = keyset_size(cursor_prefilter_ks);
+            if (cursor_fp.prefilter_card > 0 &&
+                cursor_fp.prefilter_card < c1_ks)
+                c1_ks = cursor_fp.prefilter_card;
+            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit) &&
+                order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
             SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
             if (sp_rows) {
@@ -17924,6 +17992,7 @@ int cmd_find(const char *db_root, const char *object,
             }
             /* calloc failed — fall through to btree-walk path. */
         }
+        } /* if (cursor_prefilter_ks) */
 
         CursorFindCtx cc;
         memset(&cc, 0, sizeof(cc));
@@ -18276,6 +18345,21 @@ int cmd_find(const char *db_root, const char *object,
                 prefilter_ks = NULL;
             }
 
+            /* For D1 composite plans where a more-selective non-seed
+               leaf exists, replace the broad composite-seed KeySet with
+               a narrow KeySet built from the most-selective leaf. */
+            if (prefilter_ks && fp.prefilter_source_leaf &&
+                fp.prefilter_card > 0 &&
+                fp.prefilter_card < keyset_size(prefilter_ks)) {
+                KeySet *narrow = build_keyset_from_leaf(db_root, object,
+                                                         sch.splits,
+                                                         fp.prefilter_source_leaf, &dl);
+                if (narrow) {
+                    keyset_free(prefilter_ks);
+                    prefilter_ks = narrow;
+                }
+            }
+
             /* Empty KeySet → no candidate could possibly match.
                The opening envelope is ALREADY emitted upstream (line
                14045/14047: `{` for dict, `[` for default, the rows
@@ -18319,9 +18403,12 @@ int cmd_find(const char *db_root, const char *object,
                     }
                 }
             }
-            if (prefilter_ks &&
-                prefer_fetch_sort(keyset_size(prefilter_ks), find_N_live, offset, limit) &&
-                order_tf && driver_fs.ts && order_field_idx >= 0) {
+            if (prefilter_ks) {
+                size_t pfs_n = keyset_size(prefilter_ks);
+                if (fp.prefilter_card > 0 && fp.prefilter_card < pfs_n)
+                    pfs_n = fp.prefilter_card;
+                if (prefer_fetch_sort(pfs_n, find_N_live, offset, limit) &&
+                    order_tf && driver_fs.ts && order_field_idx >= 0) {
                 size_t n_pre = keyset_size(prefilter_ks);
                 SmallPrefilterRow *rows = calloc(n_pre, sizeof(SmallPrefilterRow));
                 if (rows) {
@@ -18416,6 +18503,7 @@ int cmd_find(const char *db_root, const char *object,
                 }
                 /* calloc failed — fall through to the btree-walk path. */
             }
+            } /* if (prefilter_ks) */
 
             CursorFindCtx cc;
             memset(&cc, 0, sizeof(cc));
