@@ -13713,6 +13713,13 @@ order_overlay:
                 fp.n_source         = 1;
                 fp.order            = FP_ORDER_COMPOSITE;
                 fp.order_range      = obr;
+                /* Populate postfilter_leaves with all non-composite-seed leaves */
+                fp.n_postfilter = 0;
+                for (int i = 0; i < nL && fp.n_postfilter < MAX_INTERSECT_LEAVES; i++) {
+                    if (i != cc) {
+                        fp.postfilter_leaves[fp.n_postfilter++] = leaves[i];
+                    }
+                }
                 /* prefilter_card: smallest estimable K among non-cc leaves.
                    In the cursor path this overrides the composite seed's KeySet size
                    for the prefer_fetch_sort decision — without it, a broad composite
@@ -17934,10 +17941,13 @@ int cmd_find(const char *db_root, const char *object,
                                  cursor_fp.source_is_bitmap) &&
                 order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
+            struct timespec t1, t2, t3, t4;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
             SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
             if (sp_rows) {
                 SmallPrefilterCollect ca = { sp_rows, n_pre, 0 };
                 keyset_iter(cursor_prefilter_ks, small_prefilter_collect_cb, &ca);
+                clock_gettime(CLOCK_MONOTONIC, &t2);
                 int n_kept = 0;
                 for (size_t i = 0; i < n_pre; i++) {
                     RecordRef rr;
@@ -17958,9 +17968,19 @@ int cmd_find(const char *db_root, const char *object,
                     n_kept++;
                     release_record_ref(&rr);
                 }
+                clock_gettime(CLOCK_MONOTONIC, &t3);
                 qsort(sp_rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
                       desc ? small_prefilter_cmp_desc
                            : small_prefilter_cmp_asc);
+                clock_gettime(CLOCK_MONOTONIC, &t4);
+                double collect_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 +
+                    (t2.tv_nsec - t1.tv_nsec) / 1000000.0;
+                double fetch_ms = (t3.tv_sec - t2.tv_sec) * 1000.0 +
+                    (t3.tv_nsec - t2.tv_nsec) / 1000000.0;
+                double sort_ms = (t4.tv_sec - t3.tv_sec) * 1000.0 +
+                    (t4.tv_nsec - t3.tv_nsec) / 1000000.0;
+                LOG_INFO(LOG_SUB_QUERY, "C1_TIMING: n_pre=%zu, n_kept=%d, collect=%.1fms, fetch+filter=%.1fms, sort=%.1fms",
+                         n_pre, n_kept, collect_ms, fetch_ms, sort_ms);
                 CursorFindCtx cc;
                 memset(&cc, 0, sizeof(cc));
                 cc.cursor_value_bytes = has_cur_bytes ? cur_value_buf : NULL;

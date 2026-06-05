@@ -140,6 +140,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_length_ops.c \
     src/test/cases/test_unknown_field_validation.c \
     src/test/cases/test_small_prefilter_orderby.c \
+    src/test/cases/test_cursor_bitmap_intersect.c \
     src/test/cases/test_float_field_type.c \
     src/test/cases/test_all_field_types.c \
     src/test/cases/test_case_sensitivity.c \
