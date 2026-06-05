@@ -12682,17 +12682,11 @@ static int most_selective_indexed(const char *db_root, const char *object,
         const TypedField *tf = resolve_idx_field(fs->ts, leaves[i]->field);
         est[i] = card_est_leaf(db_root, object, splits, leaves[i], tf, budget);
         if (best < 0) { best = i; continue; }
-        /* Compare i vs best. Bitmaps deprioritized: a non-bitmap estimable
-         * leaf usually beats a bitmap (btree/trigram yield records in a
-         * useful order; bitmap is popcount-then-decode).  Exception: when
-         * the non-bitmap leaf saturated its capped walk and the bitmap
-         * has an exact K below that cap, we KNOW the bitmap is smaller —
-         * prefer it.  Without this exception the planner would seed
-         * `active=false AND age>50` on the saturated btree (true K
-         * unknown, possibly ≥ N) over the bitmap with K=3.4M exact,
-         * making unbounded find walk far more records than necessary.
-         * For limit-bounded find the streaming path stops at limit
-         * regardless of seed, so this exception is mostly a no-op there. */
+        /* Compare i vs best. Bitmaps deprioritized when the non-bitmap has a
+         * smaller K (btree/trigram yield records in a useful order for direct
+         * leaf walks).  When the bitmap has the smaller K and both estimates
+         * are reliable, cardinality wins — the primary feeds a prefilter set
+         * whose order is irrelevant (always a hash table for D2/D3/count). */
         int it_best = pick_index_for_leaf(db_root, object, leaves[best]);
         int i_bm = (it == IT_BITMAP), b_bm = (it_best == IT_BITMAP);
         if (i_bm != b_bm) {
@@ -12708,7 +12702,18 @@ static int most_selective_indexed(const char *db_root, const char *object,
                 best = bm_i;
                 continue;
             }
-            if (b_bm) best = i;       /* default: prefer non-bitmap */
+            /* Both reliable — smaller K wins regardless of index type.
+               Old code did `if (b_bm) best = i` which ignores cardinality.
+               For prefilter/KeySet builds (D2, D3, count, aggregate) only
+               cardinality matters — index type doesn't affect prefilter
+               quality and D1 composite detection is independent. */
+            if (est[bm_i].estimable && !est[bm_i].saturated &&
+                est[oth_i].estimable && !est[oth_i].saturated) {
+                if (est[bm_i].k < est[oth_i].k) best = bm_i;
+                else if (est[oth_i].k < est[bm_i].k) best = oth_i;
+                continue;
+            }
+            if (b_bm) best = i;       /* fallback: one unreliable estimate */
             continue;
         }
         int i_e = est[i].estimable && !est[i].saturated;
