@@ -13711,7 +13711,11 @@ order_overlay:
                 }
                 if (best_k < SIZE_MAX) {
                     fp.prefilter_card = best_k;
-                    fp.prefilter_source_leaf = leaves[best_i];
+                    // Only replace KeySet when ORDER BY is the post-filter field
+                    // (composite walk can't stop early in that case)
+                    if (strcmp(order_by, leaves[best_i]->field) == 0) {
+                        fp.prefilter_source_leaf = leaves[best_i];
+                    }
                 }
             } else {
                 /* Drive on the most-selective seed instead (pre-overlay fp.kind /
