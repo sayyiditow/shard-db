@@ -13273,21 +13273,35 @@ static int order_field_drivable(const char *db_root, const char *object,
  * K ≈ sqrt((offset+limit)*N): below it sort wins, above it walk wins. This
  * replaces the limit-agnostic N/g_random_seq_ratio cutoff and the fixed
  * SMALL_PREFILTER_THRESHOLD with one decision. */
-static int prefer_fetch_sort(size_t candidates, size_t N, int offset, int limit) {
+static int prefer_fetch_sort(size_t candidates, size_t N, int offset, int limit,
+                             int is_bitmap_seed) {
     if (candidates == 0) return 1;
     size_t want = (size_t)((offset > 0 ? offset : 0) + (limit > 0 ? limit : 1));
-    /* sort wins when candidates*candidates < want*N (avoids sqrt/float). */
+
+    /* For bitmap seeds, the uniform distribution assumption often fails
+       (sparse bitmaps are clustered, not spread). The walk cost scales as
+       want × N² / K² instead of want × N / K. Crossover: K³ < want × N².
+       Use __int128 to avoid overflow for large N (up to 4 billion). */
+    if (is_bitmap_seed) {
+        unsigned __int128 k3 = (unsigned __int128)candidates * candidates * candidates;
+        unsigned __int128 want_n2 = (unsigned __int128)want * N * N;
+        if (k3 < want_n2) return 1;
+    }
+
+    /* Cost model: K² < want × N (crossover where fetch+sort beats walk).
+       Assumes uniform distribution — valid for non-bitmap seeds and
+       large bitmap seeds (> 5% of N). */
     return candidates * candidates < want * N;
 }
 
 static FilterOrderKind pick_sort_or_walk(const char *db_root, const char *object,
                                          const char *order_by, CardEst se, size_t N,
-                                         int offset, int limit) {
+                                         int offset, int limit, int is_bitmap_seed) {
     int driv = order_field_drivable(db_root, object, order_by);
     /* Unestimable/saturated → can't size the set; only walk if drivable. */
     if (!se.estimable || se.saturated)
         return driv ? FP_ORDER_INDEX_WALK : FP_ORDER_SORT;
-    if (prefer_fetch_sort(se.k, N, offset, limit) || !driv)
+    if (prefer_fetch_sort(se.k, N, offset, limit, is_bitmap_seed) || !driv)
         return FP_ORDER_SORT;
     return FP_ORDER_INDEX_WALK;
 }
@@ -13331,7 +13345,9 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
      * paths can't skip its initialization (the overlay reads est[prim] only
      * under an fp.n_source>0 guard the UNION paths don't satisfy, but leaving
      * prim uninitialized on a jumped-over path is UB regardless). */
-    int prim = -1;
+    int prim    = -1;
+    int prim_it = IT_BTREE;   /* safe default for goto-overlay paths; set below */
+    int prim_sel = 0;         /* safe default for goto-overlay paths; set below */
 
     /* (1b.4) OR / hybrid handling.
      *
@@ -13505,8 +13521,12 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         }
     }
 
-    int prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
-    int prim_sel = leaf_is_selective(est[prim], N);
+    /* prim is always >= 0 when we reach here (normal path); on goto-overlay
+       paths prim stays -1 and prim_it/prim_sel keep their safe defaults. */
+    if (prim >= 0) {
+        prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
+        prim_sel = leaf_is_selective(est[prim], N);
+    }
 
     /* Multi-leaf AND (Task 1b.3): count indexed + selective leaves among all
      * AND-leaves, then decide: pure-bitmap → intersect; count + 2 selective →
@@ -13688,7 +13708,7 @@ order_overlay:
 
             if (!skip_composite) {
                 fp.kind             = FP_PRIMARY_LEAF;  /* composite executor requires this */
-                fp.source_is_bitmap = 0;
+                fp.source_is_bitmap = (pick_index_for_leaf(db_root, object, leaves[cc]) == IT_BITMAP);
                 fp.source_leaves[0] = leaves[cc];
                 fp.n_source         = 1;
                 fp.order            = FP_ORDER_COMPOSITE;
@@ -13721,7 +13741,8 @@ order_overlay:
                 /* Drive on the most-selective seed instead (pre-overlay fp.kind /
                  * source_leaves already point at prim). D2 if bounded, else D3. */
                 CardEst se = est[prim];
-                fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit);
+                fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit,
+                                            (prim >= 0) ? (prim_it == IT_BITMAP) : 0);
             }
         } else if (composite_index_exists(db_root, object,
                                     fp.source_leaves[0]->field, order_by)
@@ -13744,7 +13765,8 @@ order_overlay:
              * the explicit check keeps -Wmaybe-uninitialized quiet across the
              * added composite branches without changing behaviour. */
             CardEst se = (prim >= 0) ? est[prim] : (CardEst){0, 0, 0};
-            fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit);
+            fp.order = pick_sort_or_walk(db_root, object, order_by, se, N, 0, limit,
+                                        (prim >= 0) ? (prim_it == IT_BITMAP) : 0);
         }
     }
     return fp;
@@ -17912,7 +17934,8 @@ int cmd_find(const char *db_root, const char *object,
             if (cursor_fp.prefilter_card > 0 &&
                 cursor_fp.prefilter_card < c1_ks)
                 c1_ks = cursor_fp.prefilter_card;
-            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit) &&
+            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
+                                 cursor_fp.source_is_bitmap) &&
                 order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
             SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
@@ -18411,7 +18434,8 @@ int cmd_find(const char *db_root, const char *object,
                 size_t pfs_n = keyset_size(prefilter_ks);
                 if (fp.prefilter_card > 0 && fp.prefilter_card < pfs_n)
                     pfs_n = fp.prefilter_card;
-                if (prefer_fetch_sort(pfs_n, find_N_live, offset, limit) &&
+                if (prefer_fetch_sort(pfs_n, find_N_live, offset, limit,
+                                     fp.source_is_bitmap) &&
                     order_tf && driver_fs.ts && order_field_idx >= 0) {
                 size_t n_pre = keyset_size(prefilter_ks);
                 SmallPrefilterRow *rows = calloc(n_pre, sizeof(SmallPrefilterRow));
