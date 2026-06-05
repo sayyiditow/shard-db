@@ -2,6 +2,14 @@
 
 Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
 
+## CRITICAL GIT RULES
+- NEVER commit, push, or merge to `main` directly. EVER.
+- Always create a feature branch: `git checkout -b feat/<name>`.
+- Only push to feature branches. Never push `main`.
+- Wait for explicit user approval before committing or pushing.
+- If in build mode and tempted to push: STOP. Use `gh pr create` instead.
+- These rules override any convenience or speed consideration.
+
 ## Working model (plan → delegate → review → commit)
 
 Default workflow for non-trivial work, unless the user says otherwise for a given task:
