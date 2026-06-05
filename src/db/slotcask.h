@@ -236,6 +236,18 @@ int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
    file). Holds each shard's wrlock for the rebuild duration. */
 int  slotcask_compact_kf(SlotcaskDb *db);
 
+/* ============================================================ Two-phase bulk fetch
+ *
+ * Resolved record location — output of phase 1 KF probe.
+ * 24 bytes: 16B hash + 1B sid + 2B fid + 4B off + 1B padding.
+ * Phase 2 (fetch) reads segment files at these locations. */
+typedef struct __attribute__((packed)) {
+    uint8_t  hash[16];
+    uint8_t  sid;          /* stream id */
+    uint16_t fid;          /* file id */
+    uint32_t off;          /* byte offset in segment file */
+} SlotcaskResolvedRec;
+
 /* ============================================================ Public CRUD */
 
 /* Insert a NEW key. Returns 0 on success, -2 if key already exists, -1 on error.
@@ -454,15 +466,9 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
  * records so all hash to `kf_shard_id` (use compute_record_shard).
  *
  * bulk_lookup: rec.status = 0 (found+verified), -2 (not found / hash
- * collision miss), -1 (hard error). Reads no value bytes.
- *
- * bulk_get: same status codes, plus out_values[i] / out_vlens[i] gets
- * a malloc'd value buffer on found (caller frees), NULL on miss. */
+ * collision miss), -1 (hard error). Reads no value bytes. */
 int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                       SlotcaskBulkRec *recs, size_t n);
-int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
-                                   SlotcaskBulkRec *recs, size_t n,
-                                   void **out_values, size_t *out_vlens);
 
 /* For shard-id mapping use compute_record_shard(hash, splits) from
    types.h — the single version-aware helper that slotcask itself
@@ -657,24 +663,38 @@ int64_t slotcask_count_live(SlotcaskDb *db);
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                              SlotcaskScanCb cb, void *ctx);
 
-/* Hash-based bulk lookup with per-record callback.
-   Same batching pattern as slotcask_bulk_lookup_in_kfshard but takes
-   pre-computed hashes instead of keys:
+/* ============================================================ Two-phase bulk fetch */
 
-     Phase 1 — one kfcache_acquire (rdlock), probe all hashes via
-               kf_lookup_no_verify, record (sid, fid, off) per hit.
-     Phase 2 — sort hits by (sid, fid), for each unique segment file
-               acquire segcache once, verify via seg_rec_live_with_hash,
-               fire cb for each live record under the held handle.
-               cb returning 1 stops further processing.
+/* Resolve hashes to segment file + offset locations.
+   Takes a flat array of hashes (any KF shards).
+   Buckets by shard_for_hash internally, probes each KF shard sequentially.
+   Returns malloc'd array of SlotcaskResolvedRec. *out_n = count of found records.
+   Caller free()s the returned pointer. Returns NULL on error/not found. */
+SlotcaskResolvedRec *slotcask_bulk_resolve_hashes(SlotcaskDb *db,
+                                                   const uint8_t (*hashes)[16],
+                                                   size_t n,
+                                                   size_t *out_n);
 
-   All `hashes` must route to the same kf_shard_id (caller's responsibility
-   — use compute_record_shard or shard_group_batch). Returns 0 on success,
-   -1 on hard error. Pointer args (key, value) passed to cb are transient
-   and valid only during the cb invocation. */
-int slotcask_bulk_lookup_by_hash(SlotcaskDb *db, int kf_shard_id,
-                                  const uint8_t (*hashes)[16], size_t n,
-                                  SlotcaskScanCb cb, void *ctx);
+/* Fetch records from pre-resolved locations.
+   Groups input by (sid, fid) and dispatches parallel_for_io across
+   unique segment files. Each segment file is opened once via segcache.
+   Records are verified via seg_rec_live_with_hash before callback.
+   Callback signature matches existing SlotcaskScanCb.
+   Returns 0 on success, -1 on error. */
+int slotcask_bulk_fetch_resolved(SlotcaskDb *db,
+                                  const SlotcaskResolvedRec *recs,
+                                  size_t n,
+                                  void *ctx,
+                                  SlotcaskScanCb cb);
+
+/* Resolve + fetch in one call (wraps both phases above).
+   Same callback signature as slotcask_bulk_fetch_resolved.
+   This is the primary entry point for callers with hashes. */
+int slotcask_bulk_resolve_and_fetch(SlotcaskDb *db,
+                                     const uint8_t (*hashes)[16],
+                                     size_t n,
+                                     void *ctx,
+                                     SlotcaskScanCb cb);
 
 /* Probe the keyfile for a live entry matching hash16. Returns 0 and sets
  * *out_slot if found, -1 if not. Does NOT read the segment file — stops

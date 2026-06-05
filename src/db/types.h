@@ -1148,7 +1148,6 @@ int  read_record_ref(const char *db_root, const char *object,
                      const Schema *sch, const uint8_t hash[16],
                      RecordRef *out);
 void release_record_ref(RecordRef *r);
-int fetch_record_by_hash(const char *db_root, const char *object, const Schema *sch, const uint8_t hash16[16], int *printed, void *fs);
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);
 int cmd_count(const char *db_root, const char *object, const char *criteria_json);

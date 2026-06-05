@@ -2367,15 +2367,29 @@ typedef struct {
     FieldSchema *fs;
 } MultiGetShardWork;
 
+/* Callback for multi-get: decodes value inline into entry's result_json. */
+static int multi_get_fetch_cb(const uint8_t hash[16],
+                               const void *key, size_t klen,
+                               const void *value, size_t vlen,
+                               void *ctx_ptr) {
+    (void)key; (void)klen;
+    MultiGetShardWork *sw = (MultiGetShardWork *)ctx_ptr;
+    for (int ei = 0; ei < sw->count; ei++) {
+        if (memcmp(sw->entries[ei].hash, hash, 16) == 0) {
+            char *decoded = sw->fs ? typed_decode(sw->fs->ts,
+                                                   (const uint8_t *)value,
+                                                   (uint32_t)vlen) : NULL;
+            sw->entries[ei].result_json = decoded ? decoded : strdup("null");
+            break;
+        }
+    }
+    return 0;
+}
+
 static void *multi_get_shard_worker(void *arg) {
     MultiGetShardWork *sw = (MultiGetShardWork *)arg;
     if (sw->count == 0) return NULL;
 
-    /* bulk_get_in_kfshard amortises kfcache + segcache across the
-       worker's records (vs per-record slotcask_get which would take
-       both caches per call). typed_decode still happens per record
-       (it's per-record-shape work). The dispatcher already aligned
-       shard_id with compute_record_shard. */
     SlotcaskSchemaInfo info = {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
         .streams = sw->sch->streams,
@@ -2383,39 +2397,18 @@ static void *multi_get_shard_worker(void *arg) {
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) return NULL;
 
-    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-    void **vals = calloc(sw->count, sizeof(void *));
-    size_t *vlens = calloc(sw->count, sizeof(size_t));
-    if (!batch || !vals || !vlens) {
-        free(batch); free(vals); free(vlens);
-        return NULL;
-    }
-    for (int ei = 0; ei < sw->count; ei++) {
-        MultiGetEntry *e = &sw->entries[ei];
-        batch[ei].key       = e->key;
-        batch[ei].klen      = e->klen;
-        batch[ei].value     = NULL;
-        batch[ei].vlen      = 0;
-        batch[ei].user_ctx  = NULL;
-        batch[ei].old_value = NULL;
-        batch[ei].old_vlen  = 0;
-        batch[ei].status    = 0;
-        batch[ei].was_update = 0;
-    }
-    int kf_shard_id = sw->entries[0].shard_id;
-    slotcask_bulk_get_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count,
-                                   vals, vlens);
-    for (int ei = 0; ei < sw->count; ei++) {
-        MultiGetEntry *e = &sw->entries[ei];
-        if (batch[ei].status == 0 && vals[ei]) {
-            char *decoded = sw->fs ? typed_decode(sw->fs->ts,
-                                                   (const uint8_t *)vals[ei],
-                                                   (uint32_t)vlens[ei]) : NULL;
-            e->result_json = decoded ? decoded : strdup("null");
-            free(vals[ei]);
-        }
-    }
-    free(batch); free(vals); free(vlens);
+    /* Extract pre-computed hashes from entries */
+    uint8_t (*hashes)[16] = malloc((size_t)sw->count * sizeof(*hashes));
+    if (!hashes) return NULL;
+    for (int ei = 0; ei < sw->count; ei++)
+        memcpy(hashes[ei], sw->entries[ei].hash, 16);
+
+    /* Batch resolve+fetch — two-phase model resolves KF shards internally
+       and parallelizes segment reads. Callback decodes each found record. */
+    slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)sw->count,
+                                     sw, multi_get_fetch_cb);
+
+    free(hashes);
     return NULL;
 }
 

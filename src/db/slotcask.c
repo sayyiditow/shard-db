@@ -3884,206 +3884,214 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     return 0;
 }
 
-/* For each rec: sets rec->status = 0 and out_values[i] / out_vlens[i]
-   to a malloc'd value buffer (caller frees) if found, status = -2 if
-   not. */
-int slotcask_bulk_get_in_kfshard(SlotcaskDb *db, int kf_shard_id,
-                                   SlotcaskBulkRec *recs, size_t n,
-                                   void **out_values, size_t *out_vlens) {
-    if (n == 0) return 0;
+/* ============================================================ Two-phase bulk fetch */
 
-    for (size_t i = 0; i < n; i++) { out_values[i] = NULL; out_vlens[i] = 0; }
+/* Internal parallel_for_io worker for one segment file.
+   Reads all records at their offsets, calls cb per live verified record. */
+typedef struct {
+    char                    path[PATH_MAX];
+    SlotcaskResolvedRec    *recs;
+    size_t                  count;
+    void                   *ctx;
+    SlotcaskScanCb          cb;
+} SegFetchArg;
 
-    char kf_path[PATH_MAX];
-    kf_path_for(kf_path, db->data_dir, kf_shard_id);
-    SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
 
-    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
-    if (!st) { kfcache_release(&kh); return -1; }
+static void *seg_fetch_worker(void *arg) {
+    SegFetchArg *fa = (SegFetchArg *)arg;
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, fa->path, 0, 0) != 0) return NULL;
+    for (size_t i = 0; i < fa->count; i++) {
+        const uint8_t *rec = h.map + fa->recs[i].off;
+        if (!seg_rec_live_with_hash(rec, fa->recs[i].hash)) continue;
+        uint16_t klen = seg_rec_klen(rec);
+        uint32_t vlen = seg_rec_vlen(rec);
+        if (fa->cb(fa->recs[i].hash, rec + 24, klen,
+                     rec + 24 + klen, vlen, fa->ctx) != 0)
+            break;
+    }
+    segcache_release(&h);
+    return NULL;
+}
+
+/* qsort comparison: sort by (sid, fid). */
+static int compare_sid_fid(const void *a, const void *b) {
+    const SlotcaskResolvedRec *ra = (const SlotcaskResolvedRec *)a;
+    const SlotcaskResolvedRec *rb = (const SlotcaskResolvedRec *)b;
+    if (ra->sid != rb->sid) return (int)ra->sid - (int)rb->sid;
+    return (int)ra->fid - (int)rb->fid;
+}
+
+/* Phase 1: resolve hashes to segment locations.
+   Buckets by shard, probes each KF shard sequentially. */
+SlotcaskResolvedRec *slotcask_bulk_resolve_hashes(SlotcaskDb *db,
+                                                    const uint8_t (*hashes)[16],
+                                                    size_t n,
+                                                    size_t *out_n) {
+    if (n == 0 || !out_n) { if (out_n) *out_n = 0; return NULL; }
+
+    SlotcaskResolvedRec *resolved = calloc(n, sizeof(SlotcaskResolvedRec));
+    if (!resolved) { *out_n = 0; return NULL; }
+
+    size_t resolved_n = 0;
+    int nshards = db->num_shards;
+
+    /* Pass 1: count hashes per KF shard */
+    size_t *per_shard_count = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_count) { free(resolved); *out_n = 0; return NULL; }
 
     for (size_t i = 0; i < n; i++) {
-        SlotcaskBulkRec *r = &recs[i];
-        r->status = 0;
-        r->was_update = 0;
-        if (r->klen > UINT16_MAX) { r->status = -1; continue; }
-        compute_hash(r->key, r->klen, st[i].hash);
-        uint8_t flag = 0;
-        size_t slot;
-        int rc = kf_lookup_no_verify(&kh, st[i].hash, &flag,
-                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
-        if (rc < 0) { r->status = -2; continue; }
-        st[i].kf_found = 1;
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_count[sid]++;
     }
-    kfcache_release(&kh);
 
-    /* Batched verify + value-copy: one segcache rdlock per unique
-       (sid, fid). Records that fail verify get status=-2. */
-    int *gidx = malloc(n * sizeof(int));
-    if (gidx) {
-        int gcount = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (recs[i].status == 0 && st[i].kf_found) gidx[gcount++] = (int)i;
+    /* Pass 2: allocate per-shard index arrays */
+    size_t **per_shard_idxs = calloc((size_t)nshards, sizeof(size_t *));
+    size_t *per_shard_pos   = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_idxs || !per_shard_pos) {
+        free(per_shard_count);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    int alloc_ok = 1;
+    for (int s = 0; s < nshards; s++) {
+        if (per_shard_count[s] > 0) {
+            per_shard_idxs[s] = malloc(per_shard_count[s] * sizeof(size_t));
+            if (!per_shard_idxs[s]) { alloc_ok = 0; break; }
         }
-        for (int a = 1; a < gcount; a++) {
-            int tmp = gidx[a];
-            uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
-            int b = a - 1;
-            while (b >= 0) {
-                int bi = gidx[b];
-                if (st[bi].sid < ta_sid ||
-                    (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
-                gidx[b + 1] = gidx[b];
-                b--;
+    }
+    if (!alloc_ok) {
+        for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(per_shard_count);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    /* Pass 3: fill per-shard index arrays */
+    for (size_t i = 0; i < n; i++) {
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_idxs[sid][per_shard_pos[sid]++] = i;
+    }
+
+    /* Pass 4: for each non-empty shard, acquire KF, probe all its hashes */
+    char kf_path[PATH_MAX];
+    for (int s = 0; s < nshards; s++) {
+        size_t cnt = per_shard_count[s];
+        if (cnt == 0) continue;
+
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0)
+            continue;  /* skip shard on error */
+
+        for (size_t j = 0; j < cnt; j++) {
+            size_t hash_idx = per_shard_idxs[s][j];
+            uint8_t flag = 0;
+            uint8_t sid;
+            uint16_t fid;
+            uint32_t off;
+            size_t slot;
+            int rc = kf_lookup_no_verify(&kh, hashes[hash_idx], &flag,
+                                          &sid, &fid, &off, &slot);
+            if (rc == 0) {
+                SlotcaskResolvedRec *rr = &resolved[resolved_n++];
+                memcpy(rr->hash, hashes[hash_idx], 16);
+                rr->sid = sid;
+                rr->fid = fid;
+                rr->off = off;
             }
-            gidx[b + 1] = tmp;
         }
-        int k = 0;
-        while (k < gcount) {
-            int run_end = k + 1;
-            uint8_t  sid = st[gidx[k]].sid;
-            uint16_t fid = st[gidx[k]].fid;
-            while (run_end < gcount &&
-                   st[gidx[run_end]].sid == sid &&
-                   st[gidx[run_end]].fid == fid)
-                run_end++;
-            char path[PATH_MAX];
-            seg_path_for(path, db->data_dir, sid, fid);
-            SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 0, 0) != 0) {
-                for (int j = k; j < run_end; j++) recs[gidx[j]].status = -1;
-                k = run_end;
-                continue;
-            }
-            for (int j = k; j < run_end; j++) {
-                int i = gidx[j];
-                SlotcaskBulkRec *r = &recs[i];
-                const uint8_t *rec = h.map + st[i].off;
-                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -2; continue; }
-                uint16_t k_stored = seg_rec_klen(rec);
-                uint32_t v_stored = seg_rec_vlen(rec);
-                if (k_stored != r->klen ||
-                    memcmp(rec + 24, r->key, r->klen) != 0) {
-                    r->status = -2;
-                    continue;
-                }
-                void *buf = malloc(v_stored ? v_stored : 1);
-                if (!buf) { r->status = -1; continue; }
-                if (v_stored) memcpy(buf, rec + 24 + r->klen, v_stored);
-                out_values[i] = buf;
-                out_vlens[i]  = v_stored;
-            }
-            segcache_release(&h);
-            k = run_end;
-        }
-        free(gidx);
+        kfcache_release(&kh);
+    }
+
+    /* Cleanup per-shard structures */
+    for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+    free(per_shard_idxs);
+    free(per_shard_pos);
+    free(per_shard_count);
+
+    *out_n = resolved_n;
+    if (resolved_n == 0) { free(resolved); return NULL; }
+    return resolved;
+}
+
+/* Phase 2: fetch records from pre-resolved locations.
+   Groups by (sid, fid), dispatches parallel_for_io across unique segment files. */
+int slotcask_bulk_fetch_resolved(SlotcaskDb *db,
+                                  const SlotcaskResolvedRec *recs,
+                                  size_t n,
+                                  void *ctx,
+                                  SlotcaskScanCb cb) {
+    if (n == 0 || !cb) return 0;
+
+    /* Sort a copy by (sid, fid) */
+    SlotcaskResolvedRec *sorted = malloc(n * sizeof(SlotcaskResolvedRec));
+    if (!sorted) return -1;
+    memcpy(sorted, recs, n * sizeof(SlotcaskResolvedRec));
+    qsort(sorted, n, sizeof(SlotcaskResolvedRec), compare_sid_fid);
+
+    /* Count unique (sid, fid) pairs */
+    int nfiles = 1;
+    for (size_t i = 1; i < n; i++) {
+        if (sorted[i].sid != sorted[i-1].sid ||
+            sorted[i].fid != sorted[i-1].fid)
+            nfiles++;
+    }
+
+    /* Build SegFetchArg array — one per unique segment file */
+    SegFetchArg *args = calloc((size_t)nfiles, sizeof(SegFetchArg));
+    if (!args) { free(sorted); return -1; }
+
+    int fi = 0;
+    size_t run_start = 0;
+    for (size_t i = 0; i < n; i++) {
+        int last = (i == n - 1);
+        if (!last && sorted[i].sid == sorted[i+1].sid &&
+                     sorted[i].fid == sorted[i+1].fid)
+            continue;
+
+        seg_path_for(args[fi].path, db->data_dir,
+                     sorted[run_start].sid, sorted[run_start].fid);
+        args[fi].recs  = &sorted[run_start];
+        args[fi].count = i - run_start + 1;
+        args[fi].ctx   = ctx;
+        args[fi].cb    = cb;
+        fi++;
+        run_start = i + 1;
+    }
+
+    /* Dispatch: sequential for few files, parallel for many */
+    if (nfiles <= 3) {
+        for (int i = 0; i < nfiles; i++)
+            seg_fetch_worker(&args[i]);
     } else {
-        /* OOM fallback — per-record verify + read via the existing helper. */
-        for (size_t i = 0; i < n; i++) {
-            if (recs[i].status != 0 || !st[i].kf_found) continue;
-            uint8_t *buf = NULL;
-            size_t vlen = 0;
-            if (read_record_value(db, st[i].sid, st[i].fid, st[i].off,
-                                    recs[i].key, recs[i].klen, &buf, &vlen) == 0) {
-                out_values[i] = buf;
-                out_vlens[i]  = vlen;
-            } else {
-                recs[i].status = -2;
-            }
-        }
+        parallel_for_io(seg_fetch_worker, args, nfiles, sizeof(SegFetchArg));
     }
 
-    free(st);
+    free(args);
+    free(sorted);
     return 0;
 }
 
-/* ============================================================ Hash-based bulk lookup
- *
- * Same batching pattern as slotcask_bulk_lookup_in_kfshard but takes
- * pre-computed hashes instead of keys.  Phase 2 verifies via
- * seg_rec_live_with_hash (hash match only — no key bytes needed). */
-int slotcask_bulk_lookup_by_hash(SlotcaskDb *db, int kf_shard_id,
-                                  const uint8_t (*hashes)[16], size_t n,
-                                  SlotcaskScanCb cb, void *ctx) {
-    if (n == 0) return 0;
-
-    char kf_path[PATH_MAX];
-    kf_path_for(kf_path, db->data_dir, kf_shard_id);
-    SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
-
-    /* Phase 1: probe all hashes under one KF rdlock */
-    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
-    if (!st) { kfcache_release(&kh); return -1; }
-
-    for (size_t i = 0; i < n; i++) {
-        uint8_t flag = 0;
-        size_t slot;
-        int rc = kf_lookup_no_verify(&kh, hashes[i], &flag,
-                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
-        if (rc < 0) continue;
-        st[i].kf_found = 1;
-    }
-    kfcache_release(&kh);
-
-    /* Phase 2: sort hits by (sid, fid) for batched segcache access */
-    int *vidx = malloc(n * sizeof(int));
-    if (!vidx) { free(st); return -1; }
-
-    int vcount = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (st[i].kf_found) vidx[vcount++] = (int)i;
-    }
-    for (int a = 1; a < vcount; a++) {
-        int tmp = vidx[a];
-        uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
-        int b = a - 1;
-        while (b >= 0) {
-            int bi = vidx[b];
-            if (st[bi].sid < ta_sid ||
-                (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
-            vidx[b + 1] = vidx[b];
-            b--;
-        }
-        vidx[b + 1] = tmp;
-    }
-
-    /* Process each unique segment file once */
-    int stop = 0;
-    int k = 0;
-    while (k < vcount && !stop) {
-        int run_end = k + 1;
-        uint8_t  sid = st[vidx[k]].sid;
-        uint16_t fid = st[vidx[k]].fid;
-        while (run_end < vcount &&
-               st[vidx[run_end]].sid == sid &&
-               st[vidx[run_end]].fid == fid)
-            run_end++;
-
-        char path[PATH_MAX];
-        seg_path_for(path, db->data_dir, sid, fid);
-        SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0) != 0) {
-            k = run_end;
-            continue;
-        }
-
-        for (int j = k; j < run_end && !stop; j++) {
-            int i = vidx[j];
-            const uint8_t *rec = h.map + st[i].off;
-            if (!seg_rec_live_with_hash(rec, hashes[i])) continue;
-            uint16_t klen = seg_rec_klen(rec);
-            uint32_t vlen = seg_rec_vlen(rec);
-            if (cb(hashes[i], rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
-                stop = 1;
-        }
-        segcache_release(&h);
-        k = run_end;
-    }
-
-    free(vidx);
-    free(st);
-    return 0;
+/* Combined resolve + fetch. */
+int slotcask_bulk_resolve_and_fetch(SlotcaskDb *db,
+                                     const uint8_t (*hashes)[16],
+                                     size_t n,
+                                     void *ctx,
+                                     SlotcaskScanCb cb) {
+    size_t resolved_n = 0;
+    SlotcaskResolvedRec *resolved = slotcask_bulk_resolve_hashes(db, hashes, n, &resolved_n);
+    if (!resolved || resolved_n == 0) return 0;
+    int rc = slotcask_bulk_fetch_resolved(db, resolved, resolved_n, ctx, cb);
+    free(resolved);
+    return rc;
 }
 
 int slotcask_delete_with_hooks(SlotcaskDb *db,
