@@ -168,6 +168,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bulk_cas.c \
     src/test/cases/test_token_perms.c \
     src/test/cases/test_csv_export.c \
+    src/test/cases/test_cursor_sparse_prefetch.c \
     src/test/cases/test_vacuum_addfield.c \
     src/test/cases/test_vacuum_streams_mismatch.c \
     src/test/cases/test_slotcask_resplit.c \
