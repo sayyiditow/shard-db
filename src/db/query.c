@@ -10497,6 +10497,67 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
     return rc;
 }
 
+/* ========== BatchFetchBuf — batch KF-resolve + segment-fetch ========== */
+
+typedef struct BatchFetchBuf_ {
+    uint8_t   (*pending)[16];
+    size_t     pending_n;
+    size_t     pending_cap;
+    SlotcaskDb *sdb;
+    int (*record_cb)(const uint8_t hash16[16],
+                     const void *key, size_t klen,
+                     const void *value, size_t vlen,
+                     void *ctx);
+    void       *record_ctx;
+    volatile int stop;
+} BatchFetchBuf;
+
+static int batch_buf_init(BatchFetchBuf *b, SlotcaskDb *sdb,
+                           size_t slot_size, int fetch_limit) {
+    size_t base_cap = g_query_buffer_max_bytes / (16 + slot_size);
+    if (base_cap > 65536) base_cap = 65536;
+    if (fetch_limit > 0) {
+        size_t lim_cap = (size_t)fetch_limit * 2;
+        b->pending_cap = base_cap < lim_cap ? base_cap : lim_cap;
+    } else {
+        b->pending_cap = base_cap;
+    }
+    if (b->pending_cap < 1) b->pending_cap = 1;
+    b->pending = calloc(b->pending_cap, 16);
+    b->pending_n = 0;
+    b->sdb = sdb;
+    b->record_cb = NULL;
+    b->record_ctx = NULL;
+    b->stop = 0;
+    return b->pending ? 0 : -1;
+}
+
+static void batch_buf_flush(BatchFetchBuf *b) {
+    if (b->pending_n == 0 || __atomic_load_n(&b->stop, __ATOMIC_ACQUIRE)) return;
+    slotcask_bulk_resolve_and_fetch(b->sdb, b->pending, b->pending_n,
+                                     b->record_ctx, b->record_cb);
+    b->pending_n = 0;
+}
+
+static int batch_buf_collect_cb(const char *val, size_t vlen,
+                                 const uint8_t *hash16, void *ctx) {
+    (void)val; (void)vlen;
+    BatchFetchBuf *b = (BatchFetchBuf *)ctx;
+    if (__atomic_load_n(&b->stop, __ATOMIC_ACQUIRE)) return -1;
+    memcpy(b->pending[b->pending_n], hash16, 16);
+    b->pending_n++;
+    if (b->pending_n >= b->pending_cap) {
+        batch_buf_flush(b);
+    }
+    return 0;
+}
+
+static void batch_buf_destroy(BatchFetchBuf *b) {
+    batch_buf_flush(b);
+    free(b->pending);
+    b->pending = NULL;
+}
+
 /* ============================================================
    Streaming indexed find — fetch + post-filter + emit per btree match.
    Replaces collect-then-emit for the limit-bound case where post-filter
@@ -10537,6 +10598,9 @@ typedef struct {
     QueryDeadline    *deadline;
     FILE             *parent_out;
 
+    /* Batch-fetch buffer. */
+    BatchFetchBuf     bfb;
+
     /* Mutable shared state. */
     pthread_mutex_t   lock;
     int               passed;     /* records that passed both filters */
@@ -10544,16 +10608,84 @@ typedef struct {
     int               stop;       /* atomic — set when printed >= limit */
 } StreamFindCtx;
 
+static int stream_find_record_cb(const uint8_t hash16[16],
+                                  const void *key, size_t klen,
+                                  const void *value, size_t vlen,
+                                  void *ctx) {
+    (void)hash16; (void)vlen;
+    StreamFindCtx *sc = (StreamFindCtx *)ctx;
+    g_out = sc->parent_out;
+
+    char keybuf[1100];
+    {
+        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
+                              ? &sc->fs->auto_key_schema_snapshot : NULL;
+        format_wire_key(sc_p, (const char *)key, klen, keybuf, sizeof(keybuf));
+    }
+
+    if (is_excluded(sc->excluded, keybuf)) return 0;
+
+    if (!criteria_match_tree(value, sc->tree, sc->fs)) return 0;
+
+    pthread_mutex_lock(&sc->lock);
+    int my_seq = ++sc->passed;
+    int will_emit = (my_seq > sc->offset &&
+                     (sc->limit <= 0 || sc->printed < sc->limit));
+    if (will_emit) {
+        const uint8_t *raw = (const uint8_t *)value;
+        if (sc->csv_delim) {
+            csv_emit_row(keybuf, raw, (uint32_t)vlen,
+                          sc->proj_count > 0 ? sc->proj_fields : NULL,
+                          sc->proj_count, sc->fs, sc->csv_delim);
+        } else if (sc->dict_fmt) {
+            OUT("%s\"%s\":", sc->printed ? "," : "", keybuf);
+            if (sc->proj_count > 0) {
+                OUT("{");
+                int first = 1;
+                for (int j = 0; j < sc->proj_count; j++) {
+                    char *pv = decode_field((const char *)raw, (uint32_t)vlen,
+                                             sc->proj_fields[j], sc->fs);
+                    if (!pv) continue;
+                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                    first = 0;
+                    free(pv);
+                }
+                OUT("}");
+            } else {
+                char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs);
+                OUT("%s", v);
+                free(v);
+            }
+        } else if (sc->proj_count > 0) {
+            OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
+            int first = 1;
+            for (int j = 0; j < sc->proj_count; j++) {
+                char *pv = decode_field((const char *)raw, (uint32_t)vlen,
+                                         sc->proj_fields[j], sc->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}}");
+        } else {
+            char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs);
+            OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", keybuf, v);
+            free(v);
+        }
+        sc->printed++;
+    }
+    int done = (sc->limit > 0 && sc->printed >= sc->limit);
+    if (done) __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&sc->lock);
+    return done ? -1 : 0;
+}
+
 static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw_ctx) {
     StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
     if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
 
-    /* Worker thread must always point at the CALLER's output stream — `if
-       (!g_out)` was wrong, because pool workers retain g_out across
-       requests (thread-local, only set when first used). On a reused
-       worker, g_out points to a *previous* request's socket and OUT()
-       writes to a closed/wrong fd, giving the current client a silent
-       []. Setting unconditionally is the only correct choice. */
+    BatchFetchBuf *bfb = &sc->bfb;
     g_out = sc->parent_out;
 
     /* Primary check (LEN_*, like patterns where check_primary == 1). */
@@ -10575,85 +10707,11 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         if (!matched) return 0;
     }
 
-    /* Fetch the full record (v2 path: slotcask_lookup_by_hash via wrapper). */
-    RecordRef rr;
-    if (read_record_ref(sc->db_root, sc->object, sc->sch, hash16, &rr) != 0) return 0;
-
-    /* Render key per the object's auto_key mode (AK_NONE → verbatim). */
-    char keybuf[1100];
-    {
-        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
-                              ? &sc->fs->auto_key_schema_snapshot : NULL;
-        format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
-    }
-
-    if (is_excluded(sc->excluded, keybuf)) { release_record_ref(&rr); return 0; }
-
-    /* Full-tree post-filter — this is where the sibling criteria get
-       applied. The collect-then-emit path applied this AFTER materialising
-       offset+limit candidates from the btree walk; we apply it inline so
-       the btree walk only needs to run until enough records PASS. */
-    if (!criteria_match_tree(rr.val, sc->tree, sc->fs)) {
-        release_record_ref(&rr);
-        return 0;
-    }
-
-    pthread_mutex_lock(&sc->lock);
-    int my_seq = ++sc->passed;
-    int will_emit = (my_seq > sc->offset &&
-                     (sc->limit <= 0 || sc->printed < sc->limit));
-    if (will_emit) {
-        const uint8_t *raw = rr.val;
-        uint32_t value_len = (uint32_t)rr.vlen;
-        if (sc->csv_delim) {
-            csv_emit_row(keybuf, raw, value_len,
-                          sc->proj_count > 0 ? sc->proj_fields : NULL,
-                          sc->proj_count, sc->fs, sc->csv_delim);
-        } else if (sc->dict_fmt) {
-            OUT("%s\"%s\":", sc->printed ? "," : "", keybuf);
-            if (sc->proj_count > 0) {
-                OUT("{");
-                int first = 1;
-                for (int j = 0; j < sc->proj_count; j++) {
-                    char *pv = decode_field((const char *)raw, value_len,
-                                             sc->proj_fields[j], sc->fs);
-                    if (!pv) continue;
-                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
-                    first = 0;
-                    free(pv);
-                }
-                OUT("}");
-            } else {
-                char *v = decode_value((const char *)raw, value_len, sc->fs);
-                OUT("%s", v);
-                free(v);
-            }
-        } else if (sc->proj_count > 0) {
-            OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
-            int first = 1;
-            for (int j = 0; j < sc->proj_count; j++) {
-                char *pv = decode_field((const char *)raw, value_len,
-                                         sc->proj_fields[j], sc->fs);
-                if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}}");
-        } else {
-            char *v = decode_value((const char *)raw, value_len, sc->fs);
-            OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", keybuf, v);
-            free(v);
-        }
-        sc->printed++;
-    }
-    int done = (sc->limit > 0 && sc->printed >= sc->limit);
-    pthread_mutex_unlock(&sc->lock);
-
-    release_record_ref(&rr);
-    if (done) {
-        __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
-        return -1;
+    /* Buffer hash for batch fetch. Flush when full. */
+    memcpy(bfb->pending[bfb->pending_n], hash16, 16);
+    bfb->pending_n++;
+    if (bfb->pending_n >= bfb->pending_cap) {
+        batch_buf_flush(bfb);
     }
     return 0;
 }
@@ -10671,6 +10729,11 @@ static int idx_find_streaming(const char *db_root, const char *object,
                                FieldSchema *fs,
                                int rows_fmt, int dict_fmt, char csv_delim,
                                QueryDeadline *dl) {
+    SlotcaskSchemaInfo sinfo = { .splits = sch->splits,
+                                 .slot_size = sch->slot_size,
+                                 .streams = sch->streams };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+
     StreamFindCtx sc = {0};
     sc.db_root = db_root;
     sc.object = object;
@@ -10692,11 +10755,19 @@ static int idx_find_streaming(const char *db_root, const char *object,
     sc.tf = resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field);
     pthread_mutex_init(&sc.lock, NULL);
 
+    if (batch_buf_init(&sc.bfb, sdb, sch->slot_size, limit) != 0) {
+        pthread_mutex_destroy(&sc.lock);
+        return 0;
+    }
+    sc.bfb.record_cb = stream_find_record_cb;
+    sc.bfb.record_ctx = &sc;
+
     btree_dispatch(db_root, object, primary_crit->field, sch->splits,
                     primary_crit,
                     resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
                     stream_find_cb, &sc);
 
+    batch_buf_destroy(&sc.bfb);
     pthread_mutex_destroy(&sc.lock);
     return sc.printed;
 }
@@ -10737,6 +10808,7 @@ typedef struct {
     QueryDeadline *dl;
     int            dl_counter;
     FILE          *parent_out;    /* caller's socket stream */
+    pthread_mutex_t lock;          /* guards printed/skip_remaining in batch path */
 } CompositePrefixCtx;
 
 static int composite_prefix_cb(const char *val, size_t vlen,
@@ -10832,6 +10904,79 @@ static int composite_prefix_cb(const char *val, size_t vlen,
     c->printed++;
     release_record_ref(&rr);
     return (c->printed >= c->limit) ? -1 : 0;
+}
+
+static int composite_prefix_record_cb(const uint8_t hash16[16],
+                                       const void *key, size_t klen,
+                                       const void *value, size_t vlen,
+                                       void *ctx) {
+    (void)hash16; (void)vlen;
+    CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
+    g_out = c->parent_out;
+
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t kl = klen < sizeof(keybuf) - 1 ? klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key, kl); keybuf[kl] = '\0';
+        if (is_excluded(c->excluded, keybuf)) return 0;
+    }
+
+    if (c->tree && !criteria_match_tree(value, c->tree, c->fs)) return 0;
+
+    pthread_mutex_lock(&c->lock);
+    if (c->skip_remaining > 0) {
+        c->skip_remaining--;
+        pthread_mutex_unlock(&c->lock);
+        return 0;
+    }
+
+    char key_buf[1024];
+    size_t kl = klen < sizeof(key_buf) - 1 ? klen : sizeof(key_buf) - 1;
+    memcpy(key_buf, key, kl);
+    key_buf[kl] = '\0';
+
+    if (c->dict_fmt) {
+        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
+        if (c->proj_count > 0) {
+            OUT("{");
+            int first = 1;
+            for (int i = 0; i < c->proj_count; i++) {
+                char *pv = decode_field((const char *)value, (uint32_t)vlen,
+                                        c->proj_fields[i], c->fs);
+                if (!pv) continue;
+                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                first = 0;
+                free(pv);
+            }
+            OUT("}");
+        } else {
+            char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs);
+            OUT("%s", dv ? dv : "{}");
+            free(dv);
+        }
+    } else if (c->proj_count > 0) {
+        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
+        int first = 1;
+        for (int i = 0; i < c->proj_count; i++) {
+            char *pv = decode_field((const char *)value, (uint32_t)vlen,
+                                    c->proj_fields[i], c->fs);
+            if (!pv) continue;
+            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            first = 0;
+            free(pv);
+        }
+        OUT("}}");
+    } else {
+        char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs);
+        OUT("%s{\"key\":\"%s\",\"value\":%s}",
+            c->printed ? "," : "", key_buf, dv ? dv : "{}");
+        free(dv);
+    }
+
+    c->printed++;
+    int done = (c->limit > 0 && c->printed >= c->limit);
+    pthread_mutex_unlock(&c->lock);
+    return done ? -1 : 0;
 }
 
 /* K-way merge cursor for composite prefix walks.
@@ -11012,6 +11157,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
         ctx.skip_remaining = (offset > 0) ? offset : 0;
         ctx.limit = (limit > 0)  ? limit  : INT_MAX;
         ctx.dl = dl; ctx.dl_counter = 0; ctx.parent_out = g_out;
+        pthread_mutex_init(&ctx.lock, NULL);
 
         while (nh > 0) {
             CompMergeCursor *bc = &cursors[heap[0]];
@@ -11025,6 +11171,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
             }
         }
 
+        pthread_mutex_destroy(&ctx.lock);
         for (int i = 0; i < total_cursors; i++)
             if (cursors[i].iter) btree_range_iter_close(cursors[i].iter);
         free(cursors); free(heap);
@@ -11129,6 +11276,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
     ctx.dl             = dl;
     ctx.dl_counter     = 0;
     ctx.parent_out     = g_out;
+    pthread_mutex_init(&ctx.lock, NULL);
 
     /* 5. Walk the composite btree.  The k-way merge across index shards
           delivers entries already sorted by (encoded_a || encoded_b) in
@@ -11138,6 +11286,7 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                            (const char *)buf_hi, len_hi, max_excl,
                            order_desc, composite_prefix_cb, &ctx);
 
+    pthread_mutex_destroy(&ctx.lock);
     return ctx.printed;
 }
 
@@ -11234,6 +11383,11 @@ static int find_via_composite_key(const char *db_root, const char *object,
         || klen == 0)
         return 0;
 
+    SlotcaskSchemaInfo sinfo = { .splits = sch->splits,
+                                 .slot_size = sch->slot_size,
+                                 .streams = sch->streams };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+
     CompositePrefixCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.db_root = db_root; ctx.object = object; ctx.sch = sch; ctx.fs = fs;
@@ -11243,9 +11397,18 @@ static int find_via_composite_key(const char *db_root, const char *object,
     ctx.skip_remaining = (offset > 0) ? offset : 0;
     ctx.limit = (limit > 0) ? limit : INT_MAX;
     ctx.dl = dl; ctx.parent_out = g_out;
+    pthread_mutex_init(&ctx.lock, NULL);
 
-    btree_idx_search(db_root, object, composite_field, sch->splits,
-                     (const char *)key, klen, composite_prefix_cb, &ctx);
+    BatchFetchBuf bfb;
+    if (batch_buf_init(&bfb, sdb, sch->slot_size, limit) == 0) {
+        bfb.record_cb = composite_prefix_record_cb;
+        bfb.record_ctx = &ctx;
+        btree_idx_search(db_root, object, composite_field, sch->splits,
+                         (const char *)key, klen, batch_buf_collect_cb, &bfb);
+        batch_buf_destroy(&bfb);
+    }
+
+    pthread_mutex_destroy(&ctx.lock);
     return ctx.printed;
 }
 
