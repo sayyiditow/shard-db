@@ -17059,6 +17059,10 @@ typedef struct {
     size_t         n_matched;        /* total records passing the filter */
     QueryDeadline *dl;
     int            dl_counter;
+
+    /* Mutex for parallel bulk-fetch callbacks.  Guards heap/fullbuf
+       mutations run from concurrent IO pool workers. */
+    pthread_mutex_t lock;
 } FetchSortCtx;
 
 /* Heap ordering: root holds the "drop candidate" — the worst entry in
@@ -17162,6 +17166,51 @@ static int fetch_sort_collect_cb(const uint8_t hash[16], void *ctx_ptr) {
     return 0;
 }
 
+/* slotcask_bulk_resolve_and_fetch callback: same logic as
+   fetch_sort_collect_cb but receives the record data directly
+   instead of calling read_record_ref. */
+static int fetch_sort_batch_cb(const uint8_t hash16[16],
+                                const void *key, size_t klen,
+                                const void *value, size_t vlen,
+                                void *ctx_ptr) {
+    FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
+
+    if (c->tree && !criteria_match_tree((const uint8_t *)value,
+                                         c->tree, c->fs)) return 0;
+    if (c->excluded && c->excluded->count > 0) {
+        char keybuf[1024];
+        size_t kl = klen < sizeof(keybuf) - 1 ? klen : sizeof(keybuf) - 1;
+        memcpy(keybuf, key, kl); keybuf[kl] = '\0';
+        if (is_excluded(c->excluded, keybuf)) return 0;
+    }
+
+    __sync_fetch_and_add(&c->n_matched, 1);
+
+    SmallPrefilterRow cur;
+    memcpy(cur.hash, hash16, 16);
+    typed_field_to_index_key(c->fs->ts, (const uint8_t *)value,
+                             c->order_field_idx,
+                             cur.sort_key, &cur.sort_key_len);
+
+    pthread_mutex_lock(&c->lock);
+    if (c->heap_cap > 0) {
+        d2_topn_push(c->heap, &c->heap_n, c->heap_cap, &cur, c->desc);
+    } else {
+        if (c->full_oom) { pthread_mutex_unlock(&c->lock); return 0; }
+        if (c->full_n == c->full_cap) {
+            int new_cap = c->full_cap ? c->full_cap * 2 : 64;
+            SmallPrefilterRow *bigger = realloc(c->fullbuf,
+                                                (size_t)new_cap * sizeof(SmallPrefilterRow));
+            if (!bigger) { c->full_oom = 1; pthread_mutex_unlock(&c->lock); return 0; }
+            c->fullbuf = bigger; c->full_cap = new_cap;
+        }
+        c->fullbuf[c->full_n++] = cur;
+    }
+    pthread_mutex_unlock(&c->lock);
+    return 0;
+}
+
 /* D2 executor entry point.  Caller has already opened the JSON envelope
    and verified !has_joins/!rows_fmt/!csv_delim.
 
@@ -17238,9 +17287,50 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
     fc.desc            = desc;
     fc.dl              = dl;
 
-    /* Stream the KeySet: one fetch+filter+heap-push per candidate. */
-    keyset_iter(prefilter_ks, fetch_sort_collect_cb, &fc);
-    keyset_free(prefilter_ks);
+    pthread_mutex_init(&fc.lock, NULL);
+
+    /* Batch-fetch candidates via the IO pool.  Chunk the KeySet entries
+       and issue slotcask_bulk_resolve_and_fetch per chunk — parallel
+       across IO workers, amortizing cold page faults. */
+    {
+        SlotcaskSchemaInfo sinfo = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+#define FS_BATCH 1024
+        uint8_t batch[FS_BATCH][16];
+        int batch_n = 0;
+
+        for (size_t b = 0; b < prefilter_ks->cap; b++) {
+            uint32_t s = atomic_load_explicit(
+                (_Atomic uint32_t *)&prefilter_ks->state[b],
+                memory_order_acquire);
+            if (s != 2) continue;
+
+            memcpy(batch[batch_n], prefilter_ks->keys[b], 16);
+            batch_n++;
+            if (batch_n == FS_BATCH) {
+                if (sdb)
+                    slotcask_bulk_resolve_and_fetch(sdb, batch, FS_BATCH,
+                                                     &fc, fetch_sort_batch_cb);
+                else
+                    for (int i = 0; i < FS_BATCH; i++)
+                        fetch_sort_collect_cb(batch[i], &fc);
+                batch_n = 0;
+            }
+        }
+        if (batch_n > 0) {
+            if (sdb)
+                slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)batch_n,
+                                                 &fc, fetch_sort_batch_cb);
+            else
+                for (int i = 0; i < batch_n; i++)
+                    fetch_sort_collect_cb(batch[i], &fc);
+        }
+        keyset_free(prefilter_ks);
+    }
+    pthread_mutex_destroy(&fc.lock);
 
     /* Sort the kept rows.  For the bounded path the heap holds at most
        M ≪ K rows; for the unbounded path it's everything that matched. */
