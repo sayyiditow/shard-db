@@ -143,7 +143,7 @@ static void shard_walk_dispatch(const char *db_root, const char *object,
         args[s].cb = cb;
         args[s].ctx = ctx;
     }
-    parallel_for(shard_walk_worker, args, n, sizeof(ShardWalkArg));
+    parallel_for_io(shard_walk_worker, args, n, sizeof(ShardWalkArg));
     free(args);
 }
 

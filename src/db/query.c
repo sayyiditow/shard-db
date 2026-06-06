@@ -127,7 +127,7 @@ void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ct
     for (int i = 0; i < path_count; i++) {
         args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, g_out };
     }
-    parallel_for(scan_worker, args, path_count, sizeof(ScanWorkerArg));
+    parallel_for_io(scan_worker, args, path_count, sizeof(ScanWorkerArg));
     free(args);
 
     for (int i = 0; i < path_count; i++) free(paths[i]);
@@ -316,7 +316,7 @@ void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
 run:
     if (nargs == 0) { free(args); return; }
     g_scan_stop = 0;
-    parallel_for(od_seg_file_worker, args, (int)nargs, sizeof(OdSegFileArg));
+    parallel_for_io(od_seg_file_worker, args, (int)nargs, sizeof(OdSegFileArg));
     free(args);
 }
 
@@ -396,7 +396,7 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
 
 run_match:
     if (nargs == 0) { free(args); return; }
-    parallel_for(od_match_file_worker, args, (int)nargs, sizeof(OdMatchFileArg));
+    parallel_for_io(od_match_file_worker, args, (int)nargs, sizeof(OdMatchFileArg));
     free(args);
 }
 
@@ -9771,7 +9771,7 @@ static void btree_idx_full_leaf_scan_o_direct(
         args[s].cb  = cb;
         args[s].ctx = ctx;
     }
-    parallel_for(btree_od_shard_worker, args, idx_n, sizeof(BtreeOdShardArg));
+    parallel_for_io(btree_od_shard_worker, args, idx_n, sizeof(BtreeOdShardArg));
     free(args);
 }
 
@@ -9814,7 +9814,7 @@ static void btree_dispatch(const char *db_root, const char *object,
                         .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
                     };
                 }
-                parallel_for(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
+                parallel_for_io(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
             }
             free(args);
             return;
@@ -9839,7 +9839,7 @@ static void btree_dispatch(const char *db_root, const char *object,
                 .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
             };
         }
-        parallel_for(bm_generic_shard_worker, gargs, splits, sizeof(BmGenericShardArg));
+        parallel_for_io(bm_generic_shard_worker, gargs, splits, sizeof(BmGenericShardArg));
         free(gargs);
         return;
     }
@@ -10424,7 +10424,7 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
     if (batch_count < 1024 || nshard_groups <= 2) {
         for (int g = 0; g < nshard_groups; g++) shard_count_worker(&workers[g]);
     } else {
-        parallel_for(shard_count_worker, workers, nshard_groups, sizeof(ShardCountCtx));
+        parallel_for_io(shard_count_worker, workers, nshard_groups, sizeof(ShardCountCtx));
     }
 
     size_t total = 0;
@@ -13776,7 +13776,7 @@ static size_t bm_popcount_generic_for_crit(const char *db_root, const char *obje
             .shard_idx = s, .crit = crit, .tf = tf, .count = 0,
         };
     }
-    parallel_for(bm_popcount_generic_shard_worker, args, splits,
+    parallel_for_io(bm_popcount_generic_shard_worker, args, splits,
                  sizeof(BmPopcountGenericShardArg));
     size_t total = 0;
     for (int s = 0; s < splits; s++) total += args[s].count;
@@ -13919,7 +13919,7 @@ static size_t bm_popcount_intersect(const char *db_root, const char *object,
             .ts = ts, .count = 0, .deadline = dl,
         };
     }
-    parallel_for(bm_intersect_shard_worker, args, splits,
+    parallel_for_io(bm_intersect_shard_worker, args, splits,
                   sizeof(BmIntersectShardArg));
 
     size_t total = 0;
@@ -14191,7 +14191,7 @@ static size_t bm_popcount_one_value(const char *db_root, const char *object,
             .shard_idx = s, .value = value, .vlen = vlen, .count = 0,
         };
     }
-    parallel_for(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
+    parallel_for_io(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
     size_t total = 0;
     for (int s = 0; s < splits; s++) total += args[s].count;
     free(args);
@@ -17817,7 +17817,7 @@ int cmd_find(const char *db_root, const char *object,
                                 workers[g].ts              = driver_fs.ts;
                                 workers[g].deadline        = &cdl;
                             }
-                            parallel_for(cursor_fetch_worker, workers,
+                            parallel_for_io(cursor_fetch_worker, workers,
                                          nshard_groups, sizeof(CursorFetchCtx));
                             for (int g = 0; g < nshard_groups; g++) {
                                 for (int r = 0; r < workers[g].result_count; r++) {
@@ -19732,7 +19732,7 @@ int cmd_recount(const char *db_root, const char *object) {
         }
         for (int i = 0; i < path_count; i++)
             args[i] = (RecountWorkerArg){ paths[i], sch.slot_size, &total };
-        parallel_for(recount_worker, args, path_count, sizeof(RecountWorkerArg));
+        parallel_for_io(recount_worker, args, path_count, sizeof(RecountWorkerArg));
         free(args);
     }
 
@@ -23055,7 +23055,7 @@ static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
         };
     }
     g_scan_stop = 0;
-    parallel_for(agg_v2_scan_worker, workers, n, sizeof(AggV2ScanWork));
+    parallel_for_io(agg_v2_scan_worker, workers, n, sizeof(AggV2ScanWork));
     for (int s = 0; s < n; s++) {
         if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
         agg_ctx_merge(main_ctx, &workers[s].local);
@@ -23158,7 +23158,7 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
     if (batch_count < 1024 || nshard_groups <= 2) {
         for (int g = 0; g < nshard_groups; g++) shard_agg_worker(&workers[g]);
     } else {
-        parallel_for(shard_agg_worker, workers, nshard_groups, sizeof(ShardAggCtx));
+        parallel_for_io(shard_agg_worker, workers, nshard_groups, sizeof(ShardAggCtx));
     }
 
     for (int g = 0; g < nshard_groups; g++) {
