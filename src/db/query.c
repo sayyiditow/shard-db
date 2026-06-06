@@ -10503,6 +10503,7 @@ typedef struct BatchFetchBuf_ {
     uint8_t   (*pending)[16];
     size_t     pending_n;
     size_t     pending_cap;
+    pthread_mutex_t lock;
     SlotcaskDb *sdb;
     int (*record_cb)(const uint8_t hash16[16],
                      const void *key, size_t klen,
@@ -10514,28 +10515,27 @@ typedef struct BatchFetchBuf_ {
 
 static int batch_buf_init(BatchFetchBuf *b, SlotcaskDb *sdb,
                            size_t slot_size, int fetch_limit) {
-    size_t base_cap = g_query_buffer_max_bytes / (16 + slot_size);
-    if (base_cap > 65536) base_cap = 65536;
-    if (fetch_limit > 0) {
-        size_t lim_cap = (size_t)fetch_limit * 2;
-        b->pending_cap = base_cap < lim_cap ? base_cap : lim_cap;
-    } else {
-        b->pending_cap = base_cap;
-    }
+    size_t max_cap = g_query_buffer_max_bytes / (16 + slot_size);
+    if (max_cap > 65536) max_cap = 65536;
+    b->pending_cap = max_cap;
+    if (fetch_limit > 0 && (size_t)fetch_limit < b->pending_cap)
+        b->pending_cap = (size_t)fetch_limit;
     if (b->pending_cap < 1) b->pending_cap = 1;
     b->pending = calloc(b->pending_cap, 16);
+    if (!b->pending) return -1;
     b->pending_n = 0;
+    pthread_mutex_init(&b->lock, NULL);
     b->sdb = sdb;
     b->record_cb = NULL;
     b->record_ctx = NULL;
     b->stop = 0;
-    return b->pending ? 0 : -1;
+    return 0;
 }
 
 static void batch_buf_flush(BatchFetchBuf *b) {
-    if (b->pending_n == 0 || __atomic_load_n(&b->stop, __ATOMIC_ACQUIRE)) return;
+    if (b->pending_n == 0) return;
     slotcask_bulk_resolve_and_fetch(b->sdb, b->pending, b->pending_n,
-                                     b->record_ctx, b->record_cb);
+                                    b->record_ctx, b->record_cb);
     b->pending_n = 0;
 }
 
@@ -10543,17 +10543,25 @@ static int batch_buf_collect_cb(const char *val, size_t vlen,
                                  const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     BatchFetchBuf *b = (BatchFetchBuf *)ctx;
-    if (__atomic_load_n(&b->stop, __ATOMIC_ACQUIRE)) return -1;
+    pthread_mutex_lock(&b->lock);
+    if (__atomic_load_n(&b->stop, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&b->lock);
+        return -1;
+    }
+    if (b->pending_n >= b->pending_cap) {
+        slotcask_bulk_resolve_and_fetch(b->sdb, b->pending, b->pending_n,
+                                        b->record_ctx, b->record_cb);
+        b->pending_n = 0;
+    }
     memcpy(b->pending[b->pending_n], hash16, 16);
     b->pending_n++;
-    if (b->pending_n >= b->pending_cap) {
-        batch_buf_flush(b);
-    }
+    pthread_mutex_unlock(&b->lock);
     return 0;
 }
 
 static void batch_buf_destroy(BatchFetchBuf *b) {
     batch_buf_flush(b);
+    pthread_mutex_destroy(&b->lock);
     free(b->pending);
     b->pending = NULL;
 }
@@ -10707,12 +10715,17 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         if (!matched) return 0;
     }
 
-    /* Buffer hash for batch fetch. Flush when full. */
+    /* Buffer hash for batch fetch.  Flush when full under the lock
+       so concurrent workers don't race on pending_n / pending[]. */
+    pthread_mutex_lock(&bfb->lock);
+    if (bfb->pending_n >= bfb->pending_cap) {
+        slotcask_bulk_resolve_and_fetch(bfb->sdb, bfb->pending, bfb->pending_n,
+                                        bfb->record_ctx, bfb->record_cb);
+        bfb->pending_n = 0;
+    }
     memcpy(bfb->pending[bfb->pending_n], hash16, 16);
     bfb->pending_n++;
-    if (bfb->pending_n >= bfb->pending_cap) {
-        batch_buf_flush(bfb);
-    }
+    pthread_mutex_unlock(&bfb->lock);
     return 0;
 }
 
@@ -13091,7 +13104,8 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     }
 
     SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
-    int nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
+    int nL = 0;
+    nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
     if (nL == 0) {
         /* No LEAF children — could be CNODE_AND whose only children are OR
          * nodes (the array form [{"or":[...]}] produces this). Try the OR
