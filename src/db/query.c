@@ -15244,6 +15244,33 @@ static KeySet *build_or_keyset(const char *db_root, const char *object, int spli
    tree, and emit per the requested format. Used by both OR-union and AND-
    intersection paths (the difference is just how the KeySet was built and
    whether rematch is needed). Caller owns the KeySet lifecycle. */
+
+typedef struct {
+    uint8_t (*hashes)[16];
+    size_t   n;
+    uint8_t **keys; size_t *klens;
+    uint8_t **vals; size_t *vlens;
+    int     *found;
+} KefFetchCtx;
+
+static int kef_fetch_cb(const uint8_t hash16[16],
+                         const void *key, size_t klen,
+                         const void *value, size_t vlen,
+                         void *ctx_ptr) {
+    KefFetchCtx *c = (KefFetchCtx *)ctx_ptr;
+    for (size_t i = 0; i < c->n; i++) {
+        if (memcmp(hash16, c->hashes[i], 16) == 0) {
+            c->keys[i] = malloc(klen);
+            if (c->keys[i]) { memcpy(c->keys[i], key, klen); c->klens[i] = klen; }
+            c->vals[i] = malloc(vlen);
+            if (c->vals[i]) { memcpy(c->vals[i], value, vlen); c->vlens[i] = vlen; }
+            c->found[i] = 1;
+            break;
+        }
+    }
+    return 0;
+}
+
 static int keyset_emit_find(const char *db_root, const char *object,
                             const Schema *sch, KeySet *ks,
                             CriteriaNode *tree_for_rematch,  /* NULL = skip */
@@ -15255,128 +15282,194 @@ static int keyset_emit_find(const char *db_root, const char *object,
     CriteriaNode *tree = tree_for_rematch;
     (void)tree;  /* used only when need_rematch */
 
-    int count = 0, printed = 0;
-    int dl_counter = 0;
-    for (size_t b = 0; b < ks->cap && (limit <= 0 || printed < limit); b++) {
-        if (query_deadline_tick(dl, &dl_counter)) break;
-        if (ks->state[b] != 2) continue;
+    /* Phase 1: collect hashes from KeySet and batch-fetch. */
+    size_t n_fetch = 0;
+    for (size_t b = 0; b < ks->cap; b++)
+        if (ks->state[b] == 2) n_fetch++;
 
-        /* slotcask fetch returns a malloc'd copy of key+value owned by
-           the RecordRef; caller releases via release_record_ref. The
-           dispatch helper returns key+val together in one shot. */
-        RecordRef rr;
-        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
+    int printed = 0;
+    if (n_fetch == 0) return 0;
 
-        char keybuf[1100];
-        {
-            const Schema *sc_p = (fs && fs->auto_key != AK_NONE)
-                                  ? &fs->auto_key_schema_snapshot : NULL;
-            format_wire_key(sc_p, (const char *)rr.key, rr.klen, keybuf, sizeof(keybuf));
+    uint8_t (*hashes)[16] = malloc(n_fetch * sizeof(*hashes));
+    int *key_to_fetch = malloc(ks->cap * sizeof(int));
+    if (!hashes || !key_to_fetch) {
+        free(hashes); free(key_to_fetch);
+        return 0;
+    }
+    for (size_t b = 0; b < ks->cap; b++) key_to_fetch[b] = -1;
+
+    {
+        size_t idx = 0;
+        for (size_t b = 0; b < ks->cap; b++) {
+            if (ks->state[b] == 2) {
+                memcpy(hashes[idx], ks->keys[b], 16);
+                key_to_fetch[b] = (int)idx;
+                idx++;
+            }
         }
+    }
 
-        if (is_excluded(excluded, keybuf)) { release_record_ref(&rr); continue; }
+    SlotcaskSchemaInfo sinfo = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
 
-        const uint8_t *raw = rr.val;
-        uint32_t value_len = (uint32_t)rr.vlen;
-        if (need_rematch && !criteria_match_tree(raw, tree, fs)) { release_record_ref(&rr); continue; }
+    /* Batch-fetch results: parallel arrays indexed by hash position. */
+    uint8_t **fkeys = calloc(n_fetch, sizeof(*fkeys));
+    size_t  *fklens = calloc(n_fetch, sizeof(*fklens));
+    uint8_t **fvals = calloc(n_fetch, sizeof(*fvals));
+    size_t  *fvlens = calloc(n_fetch, sizeof(*fvlens));
+    int     *ffound = calloc(n_fetch, sizeof(*ffound));
+    if (!fkeys || !fklens || !fvals || !fvlens || !ffound) {
+        free(hashes); free(key_to_fetch);
+        free(fkeys); free(fklens); free(fvals); free(fvlens); free(ffound);
+        return 0;
+    }
 
-        {  /* Single-iteration block — no probe loop in the dispatched path. */
+    KefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, ffound };
 
-            /* Match. Apply joins (inner-drop), offset, emit. */
-            RecordRef *jrr = NULL;
-            const uint8_t **jraws = NULL;  /* parallel value-ptr array for emit helpers */
-            int dropped = 0;
-            if (njoins > 0) {
-                jrr = calloc(njoins, sizeof(RecordRef));
-                jraws = calloc(njoins, sizeof(const uint8_t *));
-                for (int i = 0; i < njoins; i++) {
-                    char lk[1024];
-                    int llen = extract_local_key(&joins[i], raw,
-                                                 fs ? fs->ts : NULL, lk, sizeof(lk));
-                    int jfound = 0;
-                    if (llen > 0) {
-                        jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
-                                               &jrr[i]);
-                        if (jfound) jraws[i] = jrr[i].val;
-                    }
-                    if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
-                }
+#define KEF_BATCH 1024
+    {
+        size_t processed = 0;
+        while (processed < n_fetch) {
+            size_t batch = n_fetch - processed;
+            if (batch > KEF_BATCH) batch = KEF_BATCH;
+            slotcask_bulk_resolve_and_fetch(sdb, hashes + processed,
+                                             batch, &fctx, kef_fetch_cb);
+            processed += batch;
+        }
+    }
+#undef KEF_BATCH
+
+    /* Phase 2: sequential emit using fetched records. */
+    {
+        int count = 0;
+        int dl_counter = 0;
+        for (size_t b = 0; b < ks->cap && (limit <= 0 || printed < limit); b++) {
+            if (query_deadline_tick(dl, &dl_counter)) break;
+            if (ks->state[b] != 2) continue;
+            int fi = key_to_fetch[b];
+            if (fi < 0 || !ffound[fi]) continue;
+
+            char keybuf[1100];
+            {
+                const Schema *sc_p = (fs && fs->auto_key != AK_NONE)
+                                      ? &fs->auto_key_schema_snapshot : NULL;
+                format_wire_key(sc_p, (const char *)fkeys[fi], fklens[fi], keybuf, sizeof(keybuf));
             }
 
-            if (!dropped) {
-                count++;
-                if (count > offset && (limit <= 0 || printed < limit)) {
-                    if (njoins > 0 && csv_delim) {
-                        /* CSV joined row: pre-render the whole line into buf,
-                           OUT it under the lock so concurrent shards don't
-                           interleave half-rows. */
-                        char buf[16384];
-                        size_t n = build_joined_csv_row(
-                            keybuf, raw, fs,
-                            proj_count > 0 ? proj_fields : NULL, proj_count,
-                            joins, njoins, jraws, csv_delim,
-                            buf, sizeof(buf));
-                        OUT("%.*s", (int)n, buf);
-                    } else if (njoins > 0) {
-                        /* Tabular row for joins. SB_APPEND keeps `pos` clamped
-                           inside the 16K buffer if the row is unusually wide;
-                           buf_driver_values / buf_join_values already cap their
-                           own writes, so a clamp here is the safety net for the
-                           literal-string segments. */
-                        char buf[16384];
-                        size_t pos = 0;
-                        SB_APPEND(buf, pos, sizeof(buf), "[\"%s\"", keybuf);
-                        size_t wrote = buf_driver_values(
-                                            raw, fs,
-                                            proj_count > 0 ? proj_fields : NULL,
-                                            proj_count,
-                                            buf + pos, sizeof(buf) - pos);
-                        pos += wrote;
-                        if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
-                        for (int i = 0; i < njoins; i++) {
-                            if (!jraws[i]) {
-                                int ncols = joins[i].proj_count > 0
-                                            ? joins[i].proj_count
-                                            : (joins[i].remote_fs.ts
-                                               ? joins[i].remote_fs.ts->nfields : 0);
-                                if (joins[i].include_remote_key) ncols++;
-                                for (int k = 0; k < ncols; k++)
-                                    SB_APPEND(buf, pos, sizeof(buf), ",null");
+            if (is_excluded(excluded, keybuf)) continue;
+
+            const uint8_t *raw = fvals[fi];
+            uint32_t value_len = (uint32_t)fvlens[fi];
+            if (need_rematch && !criteria_match_tree(raw, tree, fs)) continue;
+
+            {  /* Single-iteration block — no probe loop in the dispatched path. */
+
+                RecordRef *jrr = NULL;
+                const uint8_t **jraws = NULL;
+                int dropped = 0;
+                if (njoins > 0) {
+                    jrr = calloc(njoins, sizeof(RecordRef));
+                    jraws = calloc(njoins, sizeof(const uint8_t *));
+                    for (int i = 0; i < njoins; i++) {
+                        char lk[1024];
+                        int llen = extract_local_key(&joins[i], raw,
+                                                     fs ? fs->ts : NULL, lk, sizeof(lk));
+                        int jfound = 0;
+                        if (llen > 0) {
+                            jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
+                                                   &jrr[i]);
+                            if (jfound) jraws[i] = jrr[i].val;
+                        }
+                        if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
+                    }
+                }
+
+                if (!dropped) {
+                    count++;
+                    if (count > offset && (limit <= 0 || printed < limit)) {
+                        if (njoins > 0 && csv_delim) {
+                            char buf[16384];
+                            size_t n = build_joined_csv_row(
+                                keybuf, raw, fs,
+                                proj_count > 0 ? proj_fields : NULL, proj_count,
+                                joins, njoins, jraws, csv_delim,
+                                buf, sizeof(buf));
+                            OUT("%.*s", (int)n, buf);
+                        } else if (njoins > 0) {
+                            char buf[16384];
+                            size_t pos = 0;
+                            SB_APPEND(buf, pos, sizeof(buf), "[\"%s\"", keybuf);
+                            size_t wrote = buf_driver_values(
+                                                raw, fs,
+                                                proj_count > 0 ? proj_fields : NULL,
+                                                proj_count,
+                                                buf + pos, sizeof(buf) - pos);
+                            pos += wrote;
+                            if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
+                            for (int i = 0; i < njoins; i++) {
+                                if (!jraws[i]) {
+                                    int ncols = joins[i].proj_count > 0
+                                                ? joins[i].proj_count
+                                                : (joins[i].remote_fs.ts
+                                                   ? joins[i].remote_fs.ts->nfields : 0);
+                                    if (joins[i].include_remote_key) ncols++;
+                                    for (int k = 0; k < ncols; k++)
+                                        SB_APPEND(buf, pos, sizeof(buf), ",null");
+                                } else {
+                                    wrote = buf_join_values(&joins[i], jraws[i],
+                                                            buf + pos, sizeof(buf) - pos);
+                                    pos += wrote;
+                                    if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
+                                }
+                            }
+                            SB_APPEND(buf, pos, sizeof(buf), "]");
+                            OUT("%s%s", printed ? "," : "", buf);
+                        } else if (csv_delim) {
+                            csv_emit_row(keybuf, raw, value_len,
+                                         proj_count > 0 ? proj_fields : NULL,
+                                         proj_count, fs, csv_delim);
+                        } else if (rows_fmt) {
+                            OUT("%s[\"%s\"", printed ? "," : "", keybuf);
+                            if (proj_count > 0) {
+                                for (int j = 0; j < proj_count; j++) {
+                                    char *pv = decode_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs);
+                                    OUT(",\"%s\"", pv ? pv : "");
+                                    free(pv);
+                                }
+                            } else if (fs && fs->ts) {
+                                for (int j = 0; j < fs->ts->nfields; j++) {
+                                    if (fs->ts->fields[j].removed) continue;
+                                    char *pv = typed_get_field_str(fs->ts, raw, j);
+                                    OUT(",\"%s\"", pv ? pv : "");
+                                    free(pv);
+                                }
+                            }
+                            OUT("]");
+                        } else if (dict_fmt) {
+                            OUT("%s\"%s\":", printed ? "," : "", keybuf);
+                            if (proj_count > 0) {
+                                OUT("{");
+                                int first = 1;
+                                for (int j = 0; j < proj_count; j++) {
+                                    char *pv = decode_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs);
+                                    if (!pv) continue;
+                                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                                    first = 0;
+                                    free(pv);
+                                }
+                                OUT("}");
                             } else {
-                                wrote = buf_join_values(&joins[i], jraws[i],
-                                                        buf + pos, sizeof(buf) - pos);
-                                pos += wrote;
-                                if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
+                                char *v = decode_value((const char *)raw, value_len, fs);
+                                OUT("%s", v);
+                                free(v);
                             }
-                        }
-                        SB_APPEND(buf, pos, sizeof(buf), "]");
-                        OUT("%s%s", printed ? "," : "", buf);
-                    } else if (csv_delim) {
-                        csv_emit_row(keybuf, raw, value_len,
-                                     proj_count > 0 ? proj_fields : NULL,
-                                     proj_count, fs, csv_delim);
-                    } else if (rows_fmt) {
-                        OUT("%s[\"%s\"", printed ? "," : "", keybuf);
-                        if (proj_count > 0) {
-                            for (int j = 0; j < proj_count; j++) {
-                                char *pv = decode_field((const char *)raw, value_len,
-                                                        proj_fields[j], fs);
-                                OUT(",\"%s\"", pv ? pv : "");
-                                free(pv);
-                            }
-                        } else if (fs && fs->ts) {
-                            for (int j = 0; j < fs->ts->nfields; j++) {
-                                if (fs->ts->fields[j].removed) continue;
-                                char *pv = typed_get_field_str(fs->ts, raw, j);
-                                OUT(",\"%s\"", pv ? pv : "");
-                                free(pv);
-                            }
-                        }
-                        OUT("]");
-                    } else if (dict_fmt) {
-                        OUT("%s\"%s\":", printed ? "," : "", keybuf);
-                        if (proj_count > 0) {
-                            OUT("{");
+                        } else if (proj_count > 0) {
+                            OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
                             int first = 1;
                             for (int j = 0; j < proj_count; j++) {
                                 char *pv = decode_field((const char *)raw, value_len,
@@ -15386,40 +15479,30 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                 first = 0;
                                 free(pv);
                             }
-                            OUT("}");
+                            OUT("}}");
                         } else {
                             char *v = decode_value((const char *)raw, value_len, fs);
-                            OUT("%s", v);
+                            OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", keybuf, v);
                             free(v);
                         }
-                    } else if (proj_count > 0) {
-                        OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
-                        int first = 1;
-                        for (int j = 0; j < proj_count; j++) {
-                            char *pv = decode_field((const char *)raw, value_len,
-                                                    proj_fields[j], fs);
-                            if (!pv) continue;
-                            OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
-                            first = 0;
-                            free(pv);
-                        }
-                        OUT("}}");
-                    } else {
-                        char *v = decode_value((const char *)raw, value_len, fs);
-                        OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", keybuf, v);
-                        free(v);
+                        printed++;
                     }
-                    printed++;
+                }
+
+                if (jrr) {
+                    for (int i = 0; i < njoins; i++) release_record_ref(&jrr[i]);
+                    free(jrr); free(jraws);
                 }
             }
-
-            if (jrr) {
-                for (int i = 0; i < njoins; i++) release_record_ref(&jrr[i]);
-                free(jrr); free(jraws);
-            }
         }
-        release_record_ref(&rr);
     }
+
+    /* Cleanup batch-fetched records. */
+    for (size_t i = 0; i < n_fetch; i++) {
+        free(fkeys[i]); free(fvals[i]);
+    }
+    free(hashes); free(key_to_fetch);
+    free(fkeys); free(fklens); free(fvals); free(fvlens); free(ffound);
 
     return printed;
 }
@@ -15659,6 +15742,26 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
     return small_primary;
 }
 
+typedef struct {
+    CriteriaNode  *tree;
+    FieldSchema   *fs;
+    QueryDeadline *dl;
+    int            dl_counter;
+    size_t         count;
+} OrCountCtx;
+
+static int or_count_batch_cb(const uint8_t hash16[16],
+                              const void *key, size_t klen,
+                              const void *value, size_t vlen,
+                              void *ctx_ptr) {
+    (void)hash16; (void)key; (void)klen;
+    OrCountCtx *c = (OrCountCtx *)ctx_ptr;
+    if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
+    if (criteria_match_tree((const uint8_t *)value, c->tree, c->fs))
+        __sync_fetch_and_add(&c->count, 1);
+    return 0;
+}
+
 /* Count records matching `tree` by iterating a KeySet built from the OR branch.
    For pure-OR trees (root IS the or_node), returns |KeySet| directly.
    For hybrid (AND + OR), re-matches each keyed record against the full tree. */
@@ -15685,19 +15788,63 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
         return n;
     }
 
-    /* Hybrid: fetch each keyed record, apply full tree match. */
-    size_t n = 0;
-    int dl_counter = 0;
-    for (size_t b = 0; b < ks->cap; b++) {
-        if (query_deadline_tick(dl, &dl_counter)) break;
-        if (ks->state[b] != 2) continue;
-        RecordRef rr;
-        if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
-        if (criteria_match_tree(rr.val, tree, fs)) n++;
-        release_record_ref(&rr);
+    /* Hybrid: batch-fetch keyed records and apply full tree match. */
+    {
+        size_t n_hashes = 0;
+        for (size_t b = 0; b < ks->cap; b++)
+            if (ks->state[b] == 2) n_hashes++;
+
+        if (n_hashes == 0) { keyset_free(ks); return 0; }
+
+        uint8_t (*hashes)[16] = malloc(n_hashes * sizeof(*hashes));
+        if (!hashes) {
+            /* Fallback: sequential per-record */
+            size_t n = 0;
+            int dl_counter = 0;
+            for (size_t b = 0; b < ks->cap; b++) {
+                if (query_deadline_tick(dl, &dl_counter)) break;
+                if (ks->state[b] != 2) continue;
+                RecordRef rr;
+                if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
+                if (criteria_match_tree(rr.val, tree, fs)) n++;
+                release_record_ref(&rr);
+            }
+            keyset_free(ks);
+            return n;
+        }
+
+        size_t idx = 0;
+        for (size_t b = 0; b < ks->cap; b++)
+            if (ks->state[b] == 2)
+                memcpy(hashes[idx++], ks->keys[b], 16);
+
+        SlotcaskSchemaInfo sinfo = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams,
+        };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+
+        OrCountCtx cb_ctx;
+        memset(&cb_ctx, 0, sizeof(cb_ctx));
+        cb_ctx.tree = tree;
+        cb_ctx.fs   = fs;
+        cb_ctx.dl   = dl;
+
+#define CB_BATCH 1024
+        size_t processed = 0;
+        while (processed < n_hashes) {
+            size_t batch_n = n_hashes - processed;
+            if (batch_n > CB_BATCH) batch_n = CB_BATCH;
+            slotcask_bulk_resolve_and_fetch(sdb, hashes + processed,
+                                             batch_n, &cb_ctx, or_count_batch_cb);
+            processed += batch_n;
+        }
+#undef CB_BATCH
+
+        free(hashes);
+        keyset_free(ks);
+        return cb_ctx.count;
     }
-    keyset_free(ks);
-    return n;
 }
 
 /* ========== COUNT with criteria ========== */
@@ -17117,57 +17264,7 @@ static void d2_topn_push(SmallPrefilterRow *heap, int *n, int cap,
 }
 
 /* keyset_iter callback: one fetch + filter + heap-push per candidate. */
-static int fetch_sort_collect_cb(const uint8_t hash[16], void *ctx_ptr) {
-    FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
-    if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;  /* stop iter */
-
-    RecordRef rr;
-    if (read_record_ref(c->db_root, c->object, c->sch, hash, &rr) != 0) return 0;
-
-    if (c->tree && !criteria_match_tree((const uint8_t *)rr.val, c->tree, c->fs)) {
-        release_record_ref(&rr);
-        return 0;
-    }
-    if (c->excluded && c->excluded->count > 0) {
-        char keybuf[1024];
-        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, rr.key, klen); keybuf[klen] = '\0';
-        if (is_excluded(c->excluded, keybuf)) {
-            release_record_ref(&rr);
-            return 0;
-        }
-    }
-
-    c->n_matched++;
-
-    SmallPrefilterRow cur;
-    memcpy(cur.hash, hash, 16);
-    typed_field_to_index_key(c->fs->ts, (const uint8_t *)rr.val,
-                             c->order_field_idx,
-                             cur.sort_key, &cur.sort_key_len);
-    release_record_ref(&rr);
-
-    if (c->heap_cap > 0) {
-        d2_topn_push(c->heap, &c->heap_n, c->heap_cap, &cur, c->desc);
-    } else {
-        /* Unbounded (limit==0): grow a flat buffer.  Allocation failure
-           is sticky — once OOM we stop appending but keep counting via
-           n_matched (correct total even if output truncates). */
-        if (c->full_oom) return 0;
-        if (c->full_n == c->full_cap) {
-            int new_cap = c->full_cap ? c->full_cap * 2 : 64;
-            SmallPrefilterRow *bigger = realloc(c->fullbuf,
-                                                (size_t)new_cap * sizeof(SmallPrefilterRow));
-            if (!bigger) { c->full_oom = 1; return 0; }
-            c->fullbuf = bigger; c->full_cap = new_cap;
-        }
-        c->fullbuf[c->full_n++] = cur;
-    }
-    return 0;
-}
-
-/* slotcask_bulk_resolve_and_fetch callback: same logic as
-   fetch_sort_collect_cb but receives the record data directly
+/* slotcask_bulk_resolve_and_fetch callback: receives the record data directly
    instead of calling read_record_ref. */
 static int fetch_sort_batch_cb(const uint8_t hash16[16],
                                 const void *key, size_t klen,
@@ -17311,22 +17408,14 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             memcpy(batch[batch_n], prefilter_ks->keys[b], 16);
             batch_n++;
             if (batch_n == FS_BATCH) {
-                if (sdb)
-                    slotcask_bulk_resolve_and_fetch(sdb, batch, FS_BATCH,
-                                                     &fc, fetch_sort_batch_cb);
-                else
-                    for (int i = 0; i < FS_BATCH; i++)
-                        fetch_sort_collect_cb(batch[i], &fc);
+                slotcask_bulk_resolve_and_fetch(sdb, batch, FS_BATCH,
+                                                 &fc, fetch_sort_batch_cb);
                 batch_n = 0;
             }
         }
         if (batch_n > 0) {
-            if (sdb)
-                slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)batch_n,
-                                                 &fc, fetch_sort_batch_cb);
-            else
-                for (int i = 0; i < batch_n; i++)
-                    fetch_sort_collect_cb(batch[i], &fc);
+            slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)batch_n,
+                                             &fc, fetch_sort_batch_cb);
         }
         keyset_free(prefilter_ks);
     }
@@ -17941,59 +18030,54 @@ int cmd_find(const char *db_root, const char *object,
                     }
                     free(cf_entries);
                 } else {
-                    /* Fallback: batch resolve+fetch via two-phase model */
+                    /* Batch resolve+fetch via two-phase model */
                     {
                         SlotcaskSchemaInfo sinfo = {
                             .splits = sch.splits, .slot_size = sch.slot_size,
                             .streams = sch.streams,
                         };
                         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
-                        if (sdb) {
-                            uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
-                            int *passed = calloc(n_pre, sizeof(int));
-                            D2HashIdxEntry *hmap = d2_build_hash_map(sp_rows, n_pre);
-                            if (hashes && passed && hmap) {
-                                for (size_t i = 0; i < n_pre; i++)
-                                    memcpy(hashes[i], sp_rows[i].hash, 16);
-                                int dl_counter = 0;
-                                D2BatchCtx d2_ctx = {
-                                    .rows = sp_rows, .n_total = n_pre,
-                                    .tree = tree, .fs = &driver_fs,
-                                    .ts = driver_fs.ts,
-                                    .order_field_idx = order_field_idx,
-                                    .deadline = &cdl, .dl_counter = &dl_counter,
-                                    .hash_map = hmap,
-                                    .passed = passed, .n_kept = &n_kept,
-                                };
-                                slotcask_bulk_resolve_and_fetch(sdb, hashes,
-                                                                 n_pre, &d2_ctx,
-                                                                 d2_batch_cb);
-                                /* Compact passed records to front */
-                                if (n_kept > 0) {
-                                    int keep = 0;
-                                    for (size_t i = 0; i < n_pre; i++) {
-                                        if (passed[i]) {
-                                            if (keep != (int)i)
-                                                memcpy(sp_rows[keep].hash, sp_rows[i].hash, 16);
-                                            if (keep != (int)i) {
-                                                memcpy(sp_rows[keep].sort_key,
-                                                       sp_rows[i].sort_key,
-                                                       sp_rows[i].sort_key_len);
-                                                sp_rows[keep].sort_key_len = sp_rows[i].sort_key_len;
-                                            }
-                                            keep++;
+                        uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
+                        int *passed = calloc(n_pre, sizeof(int));
+                        D2HashIdxEntry *hmap = d2_build_hash_map(sp_rows, n_pre);
+                        if (hashes && passed && hmap) {
+                            for (size_t i = 0; i < n_pre; i++)
+                                memcpy(hashes[i], sp_rows[i].hash, 16);
+                            int dl_counter = 0;
+                            D2BatchCtx d2_ctx = {
+                                .rows = sp_rows, .n_total = n_pre,
+                                .tree = tree, .fs = &driver_fs,
+                                .ts = driver_fs.ts,
+                                .order_field_idx = order_field_idx,
+                                .deadline = &cdl, .dl_counter = &dl_counter,
+                                .hash_map = hmap,
+                                .passed = passed, .n_kept = &n_kept,
+                            };
+                            slotcask_bulk_resolve_and_fetch(sdb, hashes,
+                                                             n_pre, &d2_ctx,
+                                                             d2_batch_cb);
+                            if (n_kept > 0) {
+                                int keep = 0;
+                                for (size_t i = 0; i < n_pre; i++) {
+                                    if (passed[i]) {
+                                        if (keep != (int)i)
+                                            memcpy(sp_rows[keep].hash, sp_rows[i].hash, 16);
+                                        if (keep != (int)i) {
+                                            memcpy(sp_rows[keep].sort_key,
+                                                   sp_rows[i].sort_key,
+                                                   sp_rows[i].sort_key_len);
+                                            sp_rows[keep].sort_key_len = sp_rows[i].sort_key_len;
                                         }
+                                        keep++;
                                     }
-                                    n_kept = keep;
                                 }
+                                n_kept = keep;
                             }
-                            free(hashes);
-                            free(passed);
-                            free(hmap);
                         }
+                        free(hashes);
+                        free(passed);
+                        free(hmap);
                     }
-                    /* Pure fallback: sequential per-record fetch (OOM, no sdb,
-                       or batch found zero) */
                     if (n_kept == 0) {
                         for (size_t i = 0; i < n_pre; i++) {
                             RecordRef rr;
@@ -18518,55 +18602,46 @@ int cmd_find(const char *db_root, const char *object,
                             .streams = sch.streams,
                         };
                         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
-                        if (sdb) {
-                            uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
-                            int *passed = calloc(n_pre, sizeof(int));
-                            D2HashIdxEntry *hmap = d2_build_hash_map(rows, n_pre);
-                            if (hashes && passed && hmap) {
-                                for (size_t i = 0; i < n_pre; i++)
-                                    memcpy(hashes[i], rows[i].hash, 16);
-                                int dl_counter = 0;
-                                D2BatchCtx d2_ctx = {
-                                    .rows = rows, .n_total = n_pre,
-                                    .tree = tree, .fs = &driver_fs,
-                                    .ts = driver_fs.ts,
-                                    .order_field_idx = order_field_idx,
-                                    .deadline = &dl, .dl_counter = &dl_counter,
-                                    .hash_map = hmap,
-                                    .passed = passed, .n_kept = &n_kept,
-                                };
-                                slotcask_bulk_resolve_and_fetch(sdb, hashes,
-                                                                 n_pre, &d2_ctx,
-                                                                 d2_batch_cb);
-                            }
-                            /* Compact: move passed records to the front.
-                               Sort key is already stored at rows[i] by callback. */
-                            if (n_kept > 0 && hashes && passed && hmap) {
-                                int keep = 0;
-                                for (size_t i = 0; i < n_pre; i++) {
-                                    if (passed[i]) {
-                                        if (keep != (int)i)
-                                            memcpy(rows[keep].hash, rows[i].hash, 16);
-                                        /* sort_key already at rows[i]; copy to keep if
-                                           positions differ (for sort_key we already stored
-                                           at rows[i] so it's safe to read from rows[i]) */
-                                        if (keep != (int)i) {
-                                            memcpy(rows[keep].sort_key, rows[i].sort_key,
-                                                   rows[i].sort_key_len);
-                                            rows[keep].sort_key_len = rows[i].sort_key_len;
-                                        }
-                                        keep++;
-                                    }
-                                }
-                                n_kept = keep;
-                            }
-                            free(hashes);
-                            free(passed);
-                            free(hmap);
+                        uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
+                        int *passed = calloc(n_pre, sizeof(int));
+                        D2HashIdxEntry *hmap = d2_build_hash_map(rows, n_pre);
+                        if (hashes && passed && hmap) {
+                            for (size_t i = 0; i < n_pre; i++)
+                                memcpy(hashes[i], rows[i].hash, 16);
+                            int dl_counter = 0;
+                            D2BatchCtx d2_ctx = {
+                                .rows = rows, .n_total = n_pre,
+                                .tree = tree, .fs = &driver_fs,
+                                .ts = driver_fs.ts,
+                                .order_field_idx = order_field_idx,
+                                .deadline = &dl, .dl_counter = &dl_counter,
+                                .hash_map = hmap,
+                                .passed = passed, .n_kept = &n_kept,
+                            };
+                            slotcask_bulk_resolve_and_fetch(sdb, hashes,
+                                                             n_pre, &d2_ctx,
+                                                             d2_batch_cb);
                         }
+                        if (n_kept > 0 && hashes && passed && hmap) {
+                            int keep = 0;
+                            for (size_t i = 0; i < n_pre; i++) {
+                                if (passed[i]) {
+                                    if (keep != (int)i)
+                                        memcpy(rows[keep].hash, rows[i].hash, 16);
+                                    if (keep != (int)i) {
+                                        memcpy(rows[keep].sort_key, rows[i].sort_key,
+                                               rows[i].sort_key_len);
+                                        rows[keep].sort_key_len = rows[i].sort_key_len;
+                                    }
+                                    keep++;
+                                }
+                            }
+                            n_kept = keep;
+                        }
+                        free(hashes);
+                        free(passed);
+                        free(hmap);
                     }
-                    /* Fallback: sequential per-record fetch (OOM, sdb failed,
-                       or batch found zero records due to error) */
                     if (n_kept == 0) {
                         for (size_t i = 0; i < n_pre; i++) {
                             RecordRef rr;
