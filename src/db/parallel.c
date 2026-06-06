@@ -397,6 +397,8 @@ void parallel_io_pool_shutdown(void) {
     g_io_nthreads = 0;
 }
 
+int parallel_io_pool_size(void) { return g_io_nthreads; }
+
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
     if (!g_io_running || n == 1) {

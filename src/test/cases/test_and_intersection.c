@@ -18,6 +18,7 @@
 #include <string.h>
 
 
+
 static int do_count(TestClient *tc, const char *crit) {
     char req[1024];
     snprintf(req, sizeof(req),

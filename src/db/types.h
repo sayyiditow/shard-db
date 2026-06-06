@@ -598,6 +598,7 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
    Uses the same PoolGroup / PoolTask types as the CPU pool. */
 void parallel_io_pool_init(int nthreads);
 void parallel_io_pool_shutdown(void);
+int  parallel_io_pool_size(void);
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object,
                     const char *query, uint32_t duration_ms);

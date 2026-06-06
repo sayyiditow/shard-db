@@ -2045,6 +2045,7 @@ static void build_indexes_pass(const char *db_root, const char *object,
 
     ShardBuildArg *sb = malloc((size_t)n * idx_n * sizeof(ShardBuildArg));
     int sb_count = 0;
+    if (n <= 0) return;
     BtEntry **parted_per_field = calloc((size_t)n, sizeof(BtEntry *));
     size_t  **offsets_per_field = calloc((size_t)n, sizeof(size_t *));
     size_t  **counts_per_field  = calloc((size_t)n, sizeof(size_t *));
