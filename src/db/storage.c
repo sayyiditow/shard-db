@@ -2114,7 +2114,7 @@ static void multi_bucket_dispatch(MultiExistsEntry *entries, int key_count,
         workers[w].entries[workers[w].count++] = entries[i];
     }
 
-    parallel_for(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
+    parallel_for_io(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
 
     /* Copy results back via orig_idx (no sorted[] indirection). */
     for (int g = 0; g < nshard; g++)
@@ -2486,7 +2486,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
     }
 
     /* Parallel fetch */
-    parallel_for(multi_get_shard_worker, workers, nshard, sizeof(MultiGetShardWork));
+    parallel_for_io(multi_get_shard_worker, workers, nshard, sizeof(MultiGetShardWork));
 
     /* Copy results back to entries[] via orig_idx. */
     for (int g = 0; g < nshard; g++)

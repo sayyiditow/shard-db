@@ -375,7 +375,7 @@ static void *io_pool_worker(void *arg) {
 
 void parallel_io_pool_init(int nthreads) {
     if (g_io_running) return;
-    if (nthreads <= 0) nthreads = parallel_threads() * 2;
+    if (nthreads <= 0) nthreads = parallel_threads() * 4;
     if (nthreads < 2) nthreads = 2;
     g_io_nthreads = nthreads;
     g_io_pool_threads = malloc((size_t)nthreads * sizeof(pthread_t));

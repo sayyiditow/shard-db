@@ -2576,7 +2576,7 @@ done_collect:
        fault — granular enough that the pool can saturate the disk's
        queue depth even on a single tenant with one object. */
     if (n_kf > 0 && server_running) {
-        parallel_for(warmup_kf_task_fn, kf_tasks, (int)n_kf, sizeof(WarmupKfTask));
+        parallel_for_io(warmup_kf_task_fn, kf_tasks, (int)n_kf, sizeof(WarmupKfTask));
     }
     free(kf_tasks);
 
@@ -2584,7 +2584,7 @@ done_collect:
        phase 2; runs after kf so the most latency-sensitive caches
        (count/size queries) are ready first. */
     if (n_idx > 0 && server_running) {
-        parallel_for(warmup_idx_task_fn, idx_tasks, (int)n_idx, sizeof(WarmupIdxTask));
+        parallel_for_io(warmup_idx_task_fn, idx_tasks, (int)n_idx, sizeof(WarmupIdxTask));
     }
     free(idx_tasks);
 
@@ -3072,8 +3072,8 @@ int cmd_server(const char *db_root, int daemonize) {
     if (pool_sz < 2) pool_sz = 2;
     parallel_pool_init(pool_sz);
     /* I/O pool — sized independently so long page-fault waits don't
-       starve CPU-bound queries. Defaults to 2 × nproc. */
-    int io_pool_sz = g_io_threads > 0 ? g_io_threads : (int)(nproc * 2);
+       starve CPU-bound queries. Defaults to 4 × nproc. */
+    int io_pool_sz = g_io_threads > 0 ? g_io_threads : (int)(nproc * 4);
     if (io_pool_sz < 2) io_pool_sz = 2;
     parallel_io_pool_init(io_pool_sz);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
