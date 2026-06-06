@@ -13262,6 +13262,19 @@ order_overlay:
                 if (leaf_is_selective(est[i], N)) { has_sel_other = 1; break; }
             }
             int skip_composite = seed_broad && !obr && has_sel_other;
+            /* Also skip when a non-order_by sibling is more selective (smaller K).
+               The composite prefix scan walks the entire seed partition — if another
+               leaf can produce fewer candidates, it's cheaper to filter via that leaf
+               and then sort or walk the order_by index (D2/D3). Range-fold (obr)
+               already limits the walk, so skip when obr is set. */
+            if (!skip_composite && !obr && est[cc].estimable) {
+                for (int i = 0; i < nL && !skip_composite; i++) {
+                    if (i == cc || strcmp(leaves[i]->field, order_by) == 0) continue;
+                    if (est[i].estimable && leaf_is_selective(est[i], N) &&
+                        est[i].k < est[cc].k)
+                        skip_composite = 1;
+                }
+            }
 
             if (!skip_composite) {
                 fp.kind             = FP_PRIMARY_LEAF;  /* composite executor requires this */
