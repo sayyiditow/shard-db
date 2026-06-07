@@ -13115,6 +13115,8 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     int prim    = -1;
     int prim_it = IT_BTREE;   /* safe default for goto-overlay paths; set below */
     int prim_sel = 0;         /* safe default for goto-overlay paths; set below */
+    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
+    int nL = 0;               /* safe default for goto-overlay paths; set below */
 
     /* (1b.4) OR / hybrid handling.
      *
@@ -13137,8 +13139,6 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         fp.kind = FP_FULL_SCAN; return fp;
     }
 
-    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
-    int nL = 0;
     nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
     if (nL == 0) {
         /* No LEAF children — could be CNODE_AND whose only children are OR
