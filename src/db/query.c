@@ -18145,8 +18145,7 @@ int cmd_find(const char *db_root, const char *object,
             if (cursor_fp.prefilter_card > 0 &&
                 cursor_fp.prefilter_card < c1_ks)
                 c1_ks = cursor_fp.prefilter_card;
-            if (cursor_fp.order != FP_ORDER_COMPOSITE &&
-                 prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
+            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
                                   cursor_fp.source_is_bitmap) &&
                  order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
