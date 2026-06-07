@@ -14,9 +14,17 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
 
 Default workflow for non-trivial work, unless the user says otherwise for a given task:
 
-1. **Claude plans.** Investigate and diagnose, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored). Each plan embeds its own execution rules: branch off `main`; do tasks in order; locate edits by searching the quoted anchor text (line numbers drift); build with `SKIP_TESTS=1 ./build.sh`, test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; stop and write `PLAN_NOTES.md` rather than guess if a referenced symbol/anchor isn't where expected.
-2. **Another model executes** the plan on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`.
-3. **Claude reviews and commits.** Review the diff (focus on the plan's flagged risks), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
+1. **Sonnet plans.** Investigate and diagnose, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored).
+
+   **Plan quality requirements** — the plan must be complete enough that Haiku can execute it with zero design decisions:
+   - Every insertion/edit locates its site by **quoted anchor text** (not line numbers, which drift).
+   - Full code blocks for every new function, struct, and modified hunk — no prose descriptions of what to write.
+   - Explicit invariants and edge cases with required behavior spelled out.
+   - Embedded execution rules at the top of the plan: branch off `main`; do tasks in order; build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; if a quoted anchor is not found exactly, stop and write `PLAN_NOTES.md` — do not guess or reinterpret.
+
+2. **Haiku executes** the plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. When the user says "execute" or "implement", spawn a Haiku subagent via `Agent(model: "haiku", ...)` with the plan file path and a strict prompt: implement the plan exactly as written, no design decisions, no reinterpretation, stop and surface blockers rather than improvise.
+
+3. **Sonnet reviews and commits.** Inspect the actual `git diff` (not Haiku's summary), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
 
 ## Deployment (Netcup) — ship artifacts, never git
 
