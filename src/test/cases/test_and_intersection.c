@@ -141,7 +141,7 @@ static int test_and_intersection_run(void) {
     /* Sanity: every result has status=paid and region=us. */
     {
         int bad = 0;
-        const char *p = resp;
+        const char *p = resp ? resp : "";
         while ((p = strstr(p, "\"value\":")) != NULL) {
             const char *end = strchr(p, '}');
             if (!end) break;

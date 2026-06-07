@@ -188,6 +188,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_slotcask_v2_wire.c \
     src/test/cases/test_slotcask_v2_query.c \
     src/test/cases/test_slotcask_v2_bulk.c \
+    src/test/cases/test_bulk_delete_criteria_indexed.c \
     src/test/cases/test_slotcask_v2_parity.c \
     src/test/cases/test_slotcask_v2_schema.c \
     src/test/cases/test_slotcask_v2_crash.c \
