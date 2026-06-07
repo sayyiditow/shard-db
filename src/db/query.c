@@ -22758,6 +22758,19 @@ static int hsm_get(const HashStrMap *m, const uint8_t hash[16],
    the caller falls through to the keyset/intersect path which guarantees
    completeness regardless of selectivity. */
 
+/* Forward declaration for wfc_batch_cb */
+static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *out);
+
+typedef struct {
+    CriteriaNode     *tree;
+    FieldSchema      *fs;
+    const TypedField *agg_tf;
+    int               desc;     /* 0 = MIN (ASC walk), 1 = MAX (DESC) */
+    double           *best;
+    int              *found;
+    pthread_mutex_t   mu;
+} WfcBatchCtx;
+
 typedef struct {
     const char       *db_root;
     const char       *object;
@@ -22778,8 +22791,54 @@ typedef struct {
     int     dl_counter;
 } WfcArg;
 
+static int wfc_batch_cb(const uint8_t hash16[16],
+                         const void *key, size_t klen,
+                         const void *value, size_t vlen,
+                         void *ctx) {
+    (void)hash16; (void)key; (void)klen; (void)vlen;
+    WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
+    if (!criteria_match_tree(value, bc->tree, bc->fs)) return 0;
+    double v;
+    if (!typed_field_to_double(bc->agg_tf,
+                               (const uint8_t *)value + bc->agg_tf->offset,
+                               &v))
+        return 0;
+    pthread_mutex_lock(&bc->mu);
+    if (!*bc->found ||
+        (!bc->desc && v < *bc->best) ||
+        ( bc->desc && v > *bc->best)) {
+        *bc->best  = v;
+        *bc->found = 1;
+    }
+    pthread_mutex_unlock(&bc->mu);
+    return 0;
+}
+
+static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
+                             uint8_t (*batch)[16], int bn,
+                             WfcBatchCtx *bc) {
+    if (sdb) {
+        slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)bn, bc, wfc_batch_cb);
+    } else {
+        for (int i = 0; i < bn; i++) {
+            RecordRef rr;
+            if (read_record_ref(w->db_root, w->object, w->sch,
+                                batch[i], &rr) != 0) continue;
+            wfc_batch_cb(batch[i], NULL, 0, rr.val, rr.vlen, bc);
+            release_record_ref(&rr);
+        }
+    }
+}
+
 static void *wfc_worker(void *arg) {
     WfcArg *w = (WfcArg *)arg;
+
+    SlotcaskSchemaInfo info = {
+        .splits = w->sch->splits, .slot_size = w->sch->slot_size,
+        .streams = w->sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
+
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path),
                    w->db_root, w->object, w->agg_field, w->shard_id);
@@ -22789,6 +22848,19 @@ static void *wfc_worker(void *arg) {
 
     const char *val; size_t vlen; const uint8_t *hash16;
     int walks = 0;
+#define WFC_BATCH 64
+    uint8_t batch[WFC_BATCH][16];
+    int bn = 0;
+    WfcBatchCtx bc = {
+        .tree   = w->tree,
+        .fs     = w->fs,
+        .agg_tf = w->agg_tf,
+        .desc   = w->desc,
+        .best   = &w->best,
+        .found  = &w->found,
+        .mu     = PTHREAD_MUTEX_INITIALIZER,
+    };
+
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         if (query_deadline_tick(w->deadline, &w->dl_counter)) break;
         if (++walks > w->budget) { w->budget_exceeded = 1; break; }
@@ -22797,18 +22869,18 @@ static void *wfc_worker(void *arg) {
         if (!decode_index_key_to_double(w->agg_tf, (const uint8_t *)val,
                                         vlen, &v)) continue;
 
-        /* Fetch the record via the storage-version-agnostic dispatcher. */
-        RecordRef rr;
-        if (read_record_ref(w->db_root, w->object, w->sch, hash16, &rr) != 0)
-            continue;
-        int matched = criteria_match_tree(rr.val, w->tree, w->fs);
-        release_record_ref(&rr);
-        if (matched) {
-            w->best = v;
-            w->found = 1;
-            break;  /* first match per shard is the local min/max */
+        memcpy(batch[bn], hash16, 16);
+        bn++;
+
+        if (bn >= WFC_BATCH) {
+            flush_wfc_batch(sdb, w, batch, bn, &bc);
+            bn = 0;
+            if (w->found) break;   /* first batch with a match → done */
         }
     }
+    if (bn > 0 && !w->found)
+        flush_wfc_batch(sdb, w, batch, bn, &bc);
+
     btree_range_iter_close(it);
     return NULL;
 }
