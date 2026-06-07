@@ -13115,6 +13115,8 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     int prim    = -1;
     int prim_it = IT_BTREE;   /* safe default for goto-overlay paths; set below */
     int prim_sel = 0;         /* safe default for goto-overlay paths; set below */
+    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
+    int nL = 0;               /* safe default for goto-overlay paths; set below */
 
     /* (1b.4) OR / hybrid handling.
      *
@@ -13137,8 +13139,6 @@ static FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         fp.kind = FP_FULL_SCAN; return fp;
     }
 
-    SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
-    int nL = 0;
     nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
     if (nL == 0) {
         /* No LEAF children — could be CNODE_AND whose only children are OR
@@ -18145,8 +18145,7 @@ int cmd_find(const char *db_root, const char *object,
             if (cursor_fp.prefilter_card > 0 &&
                 cursor_fp.prefilter_card < c1_ks)
                 c1_ks = cursor_fp.prefilter_card;
-            if (cursor_fp.order != FP_ORDER_COMPOSITE &&
-                 prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
+            if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
                                   cursor_fp.source_is_bitmap) &&
                  order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
