@@ -1,6 +1,6 @@
 # Plan: wfc_worker Batch-fetch (MIN/MAX + criteria fast path)
 
-**Status:** Draft — reviewed but not yet implemented.
+**Status:** Draft — ready for execution.
 
 ## Problem
 
@@ -17,6 +17,34 @@ in batches of 64 hashes.  The batch callback runs `criteria_match_tree` and
 re-decodes the aggregate value via `typed_field_to_double` from the full
 record bytes.
 
+## Bugs in the original draft (fixed below)
+
+### Bug 1 — First-match ordering broken
+
+`slotcask_bulk_resolve_and_fetch` internally sorts resolved records by
+`(sid, fid)` and for >3 segment files dispatches them in **parallel** via
+`parallel_for_io` (see `slotcask_bulk_fetch_resolved`, line ~4071).  Records
+are therefore delivered to the callback in segment-file order, not in the
+original btree order.
+
+If 2+ records within a batch of 64 satisfy the criteria, the old callback took
+the first one in seg-file order — which may have a larger aggregate value than
+an earlier btree entry, giving the wrong MIN/MAX.
+
+**Fix**: scan **all** records in the batch, update `best` whenever a record's
+value is better (smaller for MIN, larger for MAX), then break the outer btree
+walk after the batch if any match was found.  This requires passing `desc`
+into `WfcBatchCtx`.
+
+### Bug 2 — Data race on `*bc->best` / `*bc->found`
+
+When `parallel_for_io` is used, multiple `seg_fetch_worker` threads invoke
+the callback concurrently.  The old callback wrote `*bc->best` and `*bc->found`
+without synchronisation — undefined behaviour in C.
+
+**Fix**: add `pthread_mutex_t mu` to `WfcBatchCtx` and lock it around the
+`best` / `found` update.
+
 ## Changes (all in `src/db/query.c`)
 
 ### 1. New struct `WfcBatchCtx` (before `WfcArg`, ~line 22760)
@@ -26,13 +54,19 @@ typedef struct {
     CriteriaNode     *tree;
     FieldSchema      *fs;
     const TypedField *agg_tf;
+    int               desc;     /* 0 = MIN (ASC walk), 1 = MAX (DESC) */
     double           *best;
     int              *found;
-    volatile int      stop;
+    pthread_mutex_t   mu;
 } WfcBatchCtx;
 ```
 
 ### 2. New callback `wfc_batch_cb` (before `wfc_worker`)
+
+Scans every record in the batch; keeps the best value seen so far.
+Always returns 0 (continue) so all seg workers complete — necessary
+because multiple workers run in parallel and we need the extremal match,
+not just the first one delivered.
 
 ```c
 static int wfc_batch_cb(const uint8_t hash16[16],
@@ -41,17 +75,21 @@ static int wfc_batch_cb(const uint8_t hash16[16],
                          void *ctx) {
     (void)hash16; (void)key; (void)klen; (void)vlen;
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
-    if (__atomic_load_n(&bc->stop, __ATOMIC_ACQUIRE)) return -1;
     if (!criteria_match_tree(value, bc->tree, bc->fs)) return 0;
     double v;
-    if (typed_field_to_double(bc->agg_tf,
-                              (const uint8_t *)value + bc->agg_tf->offset,
-                              &v)) {
-        *bc->best = v;
+    if (!typed_field_to_double(bc->agg_tf,
+                               (const uint8_t *)value + bc->agg_tf->offset,
+                               &v))
+        return 0;
+    pthread_mutex_lock(&bc->mu);
+    if (!*bc->found ||
+        (!bc->desc && v < *bc->best) ||
+        ( bc->desc && v > *bc->best)) {
+        *bc->best  = v;
         *bc->found = 1;
-        __atomic_store_n(&bc->stop, 1, __ATOMIC_RELEASE);
     }
-    return -1;
+    pthread_mutex_unlock(&bc->mu);
+    return 0;
 }
 ```
 
@@ -62,7 +100,7 @@ static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
                              uint8_t (*batch)[16], int bn,
                              WfcBatchCtx *bc) {
     if (sdb) {
-        slotcask_bulk_resolve_and_fetch(sdb, batch, bn, bc, wfc_batch_cb);
+        slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)bn, bc, wfc_batch_cb);
     } else {
         for (int i = 0; i < bn; i++) {
             RecordRef rr;
@@ -70,7 +108,6 @@ static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
                                 batch[i], &rr) != 0) continue;
             wfc_batch_cb(batch[i], NULL, 0, rr.val, rr.vlen, bc);
             release_record_ref(&rr);
-            if (__atomic_load_n(&bc->stop, __ATOMIC_ACQUIRE)) break;
         }
     }
 }
@@ -100,8 +137,15 @@ static void *wfc_worker(void *arg) {
 #define WFC_BATCH 64
     uint8_t batch[WFC_BATCH][16];
     int bn = 0;
-    WfcBatchCtx bc = { w->tree, w->fs, w->agg_tf,
-                        &w->best, &w->found, 0 };
+    WfcBatchCtx bc = {
+        .tree   = w->tree,
+        .fs     = w->fs,
+        .agg_tf = w->agg_tf,
+        .desc   = w->desc,
+        .best   = &w->best,
+        .found  = &w->found,
+        .mu     = PTHREAD_MUTEX_INITIALIZER,
+    };
 
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         if (query_deadline_tick(w->deadline, &w->dl_counter)) break;
@@ -117,10 +161,10 @@ static void *wfc_worker(void *arg) {
         if (bn >= WFC_BATCH) {
             flush_wfc_batch(sdb, w, batch, bn, &bc);
             bn = 0;
-            if (__atomic_load_n(&bc.stop, __ATOMIC_ACQUIRE)) break;
+            if (w->found) break;   /* first batch with a match → done */
         }
     }
-    if (bn > 0 && !__atomic_load_n(&bc.stop, __ATOMIC_ACQUIRE))
+    if (bn > 0 && !w->found)
         flush_wfc_batch(sdb, w, batch, bn, &bc);
 
     btree_range_iter_close(it);
@@ -132,14 +176,15 @@ static void *wfc_worker(void *arg) {
 
 | Concern | Status |
 |---|---|
-| **First-match semantics** | Callback sets `bc.stop = 1` and returns `-1`. `slotcask_bulk_resolve_and_fetch` stops processing further hashes. Remainder check guards against stale flush. |
+| **First-match semantics** | Callback scans all records in the batch; keeps the min (ASC) or max (DESC) value via locked compare-and-update. After each flush the outer loop breaks if any match was found — subsequent btree entries can only have worse (or equal) values. Correct. |
+| **Race on best/found** | Protected by `bc.mu` (PTHREAD_MUTEX_INITIALIZER). One mutex per `wfc_worker` invocation; doesn't affect cross-shard parallelism. |
 | **Zero values** | `decode_index_key_to_double` (main loop) skips zeros before batching; `typed_field_to_double` (callback) also skips zeros — same semantics as today. |
-| **Aggregate value** | Decoded from full record via `agg_tf->offset`. No parallel-array storage needed. |
-| **Deadlock (nested pools)** | `parallel_for` → `parallel_for_io` is safe — both pools have help-draining. |
-| **sdb == NULL** | Falls back to `read_record_ref` + direct callback per record. Same I/O as today. |
-| **Budget/deadline mid-batch** | Main loop breaks; remainder flushed (or skipped if stop already set). |
-| **Stack size** | `batch[64][16]` = 1024 bytes, within-safe. |
+| **Aggregate value** | Decoded from full record via `agg_tf->offset`. Equivalent to the btree-key decode per the comment at line ~22308. |
+| **Deadlock (nested pools)** | `parallel_for` → `parallel_for_io` is safe — both pools have help-draining. The per-batch mutex (`bc.mu`) is only held during a tiny compare-and-update, never across a blocking call. |
+| **sdb == NULL** | Falls back to `read_record_ref` + sequential direct callback. Correct. |
+| **Budget/deadline mid-batch** | Main loop breaks before filling batch; remainder flushed (or skipped if found is already set). |
+| **Stack size** | `batch[64][16]` = 1024 bytes + mutex. Within-safe. |
 
 ## Net diff
 
-~+40 lines (55 new, ~15 replaced).
+~+55 lines (65 new, ~10 replaced).
