@@ -4655,6 +4655,14 @@ int cmd_bulk_update_json_string(const char *db_root, const char *object, char *j
  * non-zero return skips the record (CAS rejection) so the kf entry
  * stays live. */
 typedef struct {
+    int              field_idx;   /* index into w->idx_fields[] */
+    enum IndexType   itype;
+    uint8_t          hash[16];
+    uint8_t         *idx_key;     /* heap-alloc'd; freed by bulk_delete_flush_drops */
+    size_t           idx_key_len;
+} BulkDelCritDropEntry;
+
+typedef struct {
     SlotcaskDb     *sdb;
     const char     *db_root;
     const char     *object;
@@ -4671,6 +4679,11 @@ typedef struct {
     char          **keys;
     uint8_t       (*hashes)[16];
     int             count;
+    /* per-worker deferred index drop buffer (collected during Phase 2,
+       flushed in bulk after parallel_for returns) */
+    BulkDelCritDropEntry *drop_entries;
+    int                   drop_count;
+    int                   drop_cap;
     /* result */
     int             deleted;
     int             skipped;
@@ -4694,23 +4707,25 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
     if (w->nidx > 0 && w->ts) {
         for (int fi = 0; fi < w->nidx; fi++) {
             uint8_t *buf = NULL; size_t blen = 0;
-            if (build_index_key_from_record(w->ts, old->value,
-                                              w->idx_fields[fi], &buf, &blen)) {
-                enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
-                if (itype == IT_TRIGRAM) {
-                    UpdateIdxArg a = {0};
-                    a.db_root = w->db_root; a.object = w->object;
-                    a.field = w->idx_fields[fi]; a.splits = w->sch->splits;
-                    a.new_key = NULL; a.new_len = 0;
-                    a.old_key = buf;  a.old_len = blen;
-                    a.hash = w->hashes[ki]; a.type = IT_TRIGRAM;
-                    update_idx_fn(&a);
-                } else {
-                    delete_index_entry(w->db_root, w->object, w->idx_fields[fi],
-                                        w->sch->splits, buf, blen, w->hashes[ki]);
-                }
-                free(buf);
+            if (!build_index_key_from_record(w->ts, old->value,
+                                               w->idx_fields[fi], &buf, &blen))
+                continue;
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            /* Grow drop buffer if needed */
+            if (w->drop_count >= w->drop_cap) {
+                int new_cap = w->drop_cap ? w->drop_cap * 2 : 16;
+                BulkDelCritDropEntry *tmp = realloc(w->drop_entries,
+                    (size_t)new_cap * sizeof(BulkDelCritDropEntry));
+                if (!tmp) { free(buf); continue; }
+                w->drop_entries = tmp;
+                w->drop_cap = new_cap;
             }
+            BulkDelCritDropEntry *e = &w->drop_entries[w->drop_count++];
+            e->field_idx  = fi;
+            e->itype      = itype;
+            memcpy(e->hash, w->hashes[ki], 16);
+            e->idx_key    = buf;   /* ownership transferred; freed by flush */
+            e->idx_key_len = blen;
         }
     }
     return 0;
@@ -4761,6 +4776,76 @@ static void *bulk_del_crit_shard_worker(void *arg) {
     return NULL;
 }
 
+/* Comparator for bulk_delete_flush_drops: sort by (field_idx, hash[0:2])
+   so drops to the same btree shard are adjacent (cache locality). */
+static int cmp_bulk_del_drop(const void *a, const void *b) {
+    const BulkDelCritDropEntry *ea = a, *eb = b;
+    if (ea->field_idx != eb->field_idx) return ea->field_idx - eb->field_idx;
+    return memcmp(ea->hash, eb->hash, 2);
+}
+
+/* Merge all per-worker drop buffers, sort for locality, process in order.
+   Called after Phase 2's parallel_for returns. Workers own their idx_key
+   buffers; this function frees them. */
+static void bulk_delete_flush_drops(BulkDelCritShardWork *workers,
+                                     int nshard_groups,
+                                     const char *db_root,
+                                     const char *object,
+                                     int splits,
+                                     char idx_fields[][256],
+                                     const enum IndexType *idx_types) {
+    /* Count total entries */
+    int total = 0;
+    for (int g = 0; g < nshard_groups; g++) total += workers[g].drop_count;
+    if (total == 0) return;
+
+    BulkDelCritDropEntry *all = malloc((size_t)total * sizeof(BulkDelCritDropEntry));
+    if (!all) {
+        /* OOM: free idx_key buffers in workers to avoid leaks */
+        for (int g = 0; g < nshard_groups; g++)
+            for (int i = 0; i < workers[g].drop_count; i++)
+                free(workers[g].drop_entries[i].idx_key);
+        return;
+    }
+    int pos = 0;
+    for (int g = 0; g < nshard_groups; g++) {
+        memcpy(&all[pos], workers[g].drop_entries,
+               (size_t)workers[g].drop_count * sizeof(BulkDelCritDropEntry));
+        pos += workers[g].drop_count;
+    }
+
+    qsort(all, (size_t)total, sizeof(BulkDelCritDropEntry), cmp_bulk_del_drop);
+
+    for (int i = 0; i < total; i++) {
+        BulkDelCritDropEntry *e = &all[i];
+        if (e->itype == IT_TRIGRAM) {
+            UpdateIdxArg a = {0};
+            a.db_root  = db_root; a.object = object;
+            a.field    = idx_fields[e->field_idx];
+            a.splits   = splits;
+            a.new_key  = NULL; a.new_len = 0;
+            a.old_key  = e->idx_key; a.old_len = e->idx_key_len;
+            a.hash     = e->hash; a.type = IT_TRIGRAM;
+            update_idx_fn(&a);
+        } else {
+            delete_index_entry(db_root, object, idx_fields[e->field_idx],
+                                splits, e->idx_key, e->idx_key_len, e->hash);
+        }
+        free(e->idx_key);
+    }
+    free(all);
+}
+
+/* Forward declaration: implemented after build_keyset_from_plan (which it
+   depends on). Uses plan_filter + build_keyset_from_plan to resolve matching
+   hashes from the index, then fetches keys. Returns 1 on success (out_ctx
+   populated), 0 if caller must fall back to scan_dispatch. */
+static int bulk_delete_phase1_indexed(const char *db_root, const char *object,
+                                       const Schema *sch, FieldSchema *fs,
+                                       CriteriaNode *tree, int limit,
+                                       QueryDeadline *dl,
+                                       BulkCriteriaCtx *out_ctx);
+
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              const char *criteria_json, const char *if_json,
                              int limit, int dry_run) {
@@ -4784,7 +4869,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         parse_criteria_json(if_json, &cas_crit, &cas_ncrit);
     }
 
-    /* Phase 1: Scan — collect matching keys (read-only) */
+    /* Phase 1: resolve matching keys — indexed path first, full scan fallback */
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
     char data_dir[PATH_MAX];
@@ -4794,7 +4879,10 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
                             PTHREAD_MUTEX_INITIALIZER };
-    scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
+    if (!bulk_delete_phase1_indexed(db_root, object, &sch, &fs,
+                                     tree, limit, &dl, &ctx)) {
+        scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
+    }
     pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
 
@@ -4931,6 +5019,12 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         free(workers[g].keys);
         free(workers[g].hashes);
     }
+    /* Phase 3: flush deferred index drops in sorted (field, shard) order */
+    bulk_delete_flush_drops(workers, nshard_groups,
+                             db_root, object, sch.splits,
+                             idx_fields, idx_types);
+    for (int g = 0; g < nshard_groups; g++)
+        free(workers[g].drop_entries);
     free(workers); free(hashes); free(shard_ids);
     free(shard_counts); free(worker_shards); free(shard_to_worker);
 
@@ -17797,6 +17891,117 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
         return NULL;
     }
 }
+
+/* SlotcaskScanCb for bulk_delete_phase1_indexed: receives key + value from a
+   slotcask_bulk_resolve_and_fetch call, re-verifies the full criteria tree,
+   and appends the key to the BulkCriteriaCtx if it matches. Same locking and
+   budget logic as bulk_criteria_scan_cb, different callback signature. */
+static int bulk_criteria_indexed_cb(const uint8_t hash16[16],
+                                     const void *key, size_t klen,
+                                     const void *value, size_t vlen,
+                                     void *raw_ctx) {
+    (void)hash16; (void)vlen;
+    BulkCriteriaCtx *bc = (BulkCriteriaCtx *)raw_ctx;
+    if (bc->budget_exceeded) return 0;
+    if (bc->limit > 0 && bc->count >= bc->limit) return 0;
+    if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 0;
+
+    /* Re-verify full criteria tree (index may be slightly stale) */
+    if (!criteria_match_tree(value, bc->tree, bc->fs)) return 0;
+
+    char *k = malloc(klen + 1);
+    if (!k) return 0;
+    memcpy(k, key, klen);
+    k[klen] = '\0';
+
+    pthread_mutex_lock(&bc->lock);
+    if (bc->budget_exceeded || (bc->limit > 0 && bc->count >= bc->limit)) {
+        pthread_mutex_unlock(&bc->lock);
+        free(k);
+        return 0;
+    }
+    size_t key_bytes = sizeof(char *) + klen + 1;
+    if (bc->buffer_bytes + key_bytes > g_query_buffer_max_bytes) {
+        bc->budget_exceeded = 1;
+        pthread_mutex_unlock(&bc->lock);
+        free(k);
+        return 0;
+    }
+    bc->buffer_bytes += key_bytes;
+    if (bc->count >= bc->cap) {
+        int new_cap = bc->cap ? bc->cap * 2 : 64;
+        char **nk = realloc(bc->keys, (size_t)new_cap * sizeof(char *));
+        if (!nk) {
+            bc->budget_exceeded = 1;
+            pthread_mutex_unlock(&bc->lock);
+            free(k);
+            return 0;
+        }
+        bc->keys = nk;
+        bc->cap  = new_cap;
+    }
+    bc->keys[bc->count++] = k;
+    pthread_mutex_unlock(&bc->lock);
+    return 0;
+}
+
+/* Index-aware Phase 1 for cmd_bulk_delete_criteria.
+   Returns 1 and populates out_ctx->keys[] when the planner finds a usable
+   index. Returns 0 when the caller must fall back to scan_dispatch.
+   Never returns 0 with out_ctx partially populated. */
+static int bulk_delete_phase1_indexed(const char *db_root, const char *object,
+                                       const Schema *sch, FieldSchema *fs,
+                                       CriteriaNode *tree, int limit,
+                                       QueryDeadline *dl,
+                                       BulkCriteriaCtx *out_ctx) {
+    size_t N = (size_t)get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, fs,
+                                sch->splits, N,
+                                NULL, 0 /* fetching=0, count semantics */,
+                                limit);
+    if (fp.kind == FP_FULL_SCAN) return 0;
+
+    KeySet *ks = build_keyset_from_plan(&fp, db_root, object, sch, dl);
+    if (!ks) return 0;
+    if (dl->timed_out) { keyset_free(ks); return 0; }
+
+    if (keyset_size(ks) == 0) {
+        /* Zero index matches → out_ctx already has count=0, correct. */
+        keyset_free(ks);
+        return 1;
+    }
+
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { keyset_free(ks); return 0; }
+
+    /* Iterate keyset and resolve in batches of 1024 (same as ordered-find). */
+#define BDI_BATCH 1024
+    uint8_t batch[BDI_BATCH][16];
+    int batch_n = 0;
+    for (size_t b = 0; b < ks->cap; b++) {
+        uint32_t s = atomic_load_explicit(
+            (_Atomic uint32_t *)&ks->state[b], memory_order_acquire);
+        if (s != 2) continue;
+        memcpy(batch[batch_n++], ks->keys[b], 16);
+        if (batch_n == BDI_BATCH) {
+            slotcask_bulk_resolve_and_fetch(sdb, batch, BDI_BATCH,
+                                             out_ctx, bulk_criteria_indexed_cb);
+            batch_n = 0;
+            if (out_ctx->budget_exceeded || dl->timed_out) break;
+            if (limit > 0 && out_ctx->count >= limit) break;
+        }
+    }
+    if (batch_n > 0 && !out_ctx->budget_exceeded && !dl->timed_out)
+        slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)batch_n,
+                                         out_ctx, bulk_criteria_indexed_cb);
+    keyset_free(ks);
+    return 1;
+}
+#undef BDI_BATCH
 
 /* Phase 1d follow-up: compute the true match count for a FilterPlan when the
  * dispatch path didn't produce one for free.  Called by cmd_find's
