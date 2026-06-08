@@ -2,6 +2,7 @@
 #include "bitmap.h"
 #include "trigram.h"
 #include "slotcask.h"
+#include "io_direct.h"
 
 /* Per-shard build worker shared by cmd_add_index and cmd_add_indexes; defined
    below alongside the partition_by_shard helper. */
@@ -2807,6 +2808,39 @@ static void bm_spill_append(SpillWriter *bw, int kf_shard,
         *had_error = 1;
 }
 
+static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
+                           const uint8_t hash16[16], void *ctx) {
+    SegScanWorker *w = (SegScanWorker *)ctx;
+    uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
+    const uint8_t *value = rec + 24 + klen;
+    (void)vlen;
+    for (int fi = 0; fi < w->n_fields; fi++) {
+        const MFFieldDesc *d = &w->descs[fi];
+        if (d->type == MF_BITMAP) {
+            int tidx = d->field_indices[0];
+            if (tidx < 0) continue;
+            const TypedField *tf = &w->ts->fields[tidx];
+            const uint8_t *vb = value + tf->offset;
+            const uint8_t *bval; size_t blen;
+            if (tf->type == FT_VARCHAR) {
+                uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
+                if (al == 0) continue;
+                bval = vb + 2; blen = al;
+            } else {
+                if (tf->size == 0) continue;
+                bval = vb; blen = (size_t)tf->size;
+            }
+            int kf_shard = compute_record_shard(hash16, w->splits);
+            bm_spill_append(&w->bm_writers[fi], kf_shard, bval, blen,
+                            hash16, &w->had_error);
+            continue;
+        }
+        mf_append_field(&w->fields[fi], d, hash16, value,
+                        w->ts, w->splits, w->idx_n);
+    }
+    return 0;
+}
+
 static void *seg_scan_worker(void *arg) {
     SegScanWorker *w = (SegScanWorker *)arg;
 
@@ -2833,74 +2867,15 @@ static void *seg_scan_worker(void *arg) {
         }
     }
 
-    size_t slot_size = (size_t)w->slot_size;
-    if (slot_size < 32) slot_size = 32;
-    size_t chunk_slots = (4u << 20) / slot_size;
-    if (chunk_slots < 1) chunk_slots = 1;
-    size_t bufsz = chunk_slots * slot_size;
-    uint8_t *buf = malloc(bufsz);
-    if (!buf) { w->had_error = 1; return NULL; }
-
     for (int si = w->seg_start; si < w->seg_start + w->seg_count; si++) {
         const SegRef *sr = &w->segs[si];
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/data/streams/%03d/%06u.dat",
                  w->data_dir, (int)sr->sid, (unsigned)sr->fid);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
-#ifdef __linux__
-        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
-        off_t off = 0;
-        for (;;) {
-            ssize_t got = pread(fd, buf, bufsz, off);
-            if (got <= 0) break;
-            size_t nslots = (size_t)got / slot_size;
-            if (nslots == 0) break;
-            for (size_t s = 0; s < nslots; s++) {
-                const uint8_t *rec = buf + s * slot_size;
-                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) continue;
-                uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
-                const uint8_t *hash  = rec;
-                const uint8_t *value = rec + 24 + klen;
-                for (int fi = 0; fi < w->n_fields; fi++) {
-                    const MFFieldDesc *d = &w->descs[fi];
-                    if (d->type == MF_BITMAP) {
-                        /* Extract the bitmap dict value (strip varchar len prefix). */
-                        int tidx = d->field_indices[0];
-                        if (tidx < 0) continue;
-                        const TypedField *tf = &w->ts->fields[tidx];
-                        const uint8_t *vb = value + tf->offset;
-                        const uint8_t *bval; size_t blen;
-                        if (tf->type == FT_VARCHAR) {
-                            uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
-                            if (al == 0) continue;
-                            bval = vb + 2; blen = al;
-                        } else {
-                            if (tf->size == 0) continue;
-                            bval = vb; blen = (size_t)tf->size;
-                        }
-                        int kf_shard = compute_record_shard(hash, w->splits);
-                        bm_spill_append(&w->bm_writers[fi], kf_shard, bval, blen,
-                                        hash, &w->had_error);
-                        continue;
-                    }
-                    mf_append_field(&w->fields[fi], d, hash, value,
-                                    w->ts, w->splits, w->idx_n);
-                }
-            }
-            off += (off_t)(nslots * slot_size);
-            if ((size_t)got < bufsz) break;  /* EOF */
-        }
-#ifdef __linux__
-        /* Drop this segment's pages — they won't be touched again, and
-           caching the whole value store would thrash a memory-bound box. */
-        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-        close(fd);
+        int rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
+        if (rc < 0) w->had_error = 1;
         if (w->segs_done) atomic_fetch_add(w->segs_done, 1);
     }
-    free(buf);
 
     /* Final flush of btree/trigram buffers; drain+close bitmap append files. */
     for (int fi = 0; fi < w->n_fields; fi++) {
