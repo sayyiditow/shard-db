@@ -4851,45 +4851,90 @@ int64_t slotcask_count_live(SlotcaskDb *db) {
    repoints get skipped correctly there. The skip count can be off by
    a tiny amount under heavy concurrent writes; cursor pagination has
    never promised exact resume across writes. */
+/* O_DIRECT sequential scan of a KF shard file. Reads entries in chunks of
+   12 MB (aligned to both ODIRECT_ALIGN=4096 and sizeof(SlotcaskKfEntry)=24).
+   Calls cb(entry, ctx) for every entry including empty and tombstoned ones —
+   the caller decides which flags to act on. Stops early if cb returns != 0. */
+#define KF_OD_BUF_SIZE (12 * 1024 * 1024)  /* 12 MB: lcm(4096,24)*1024 */
+static int kf_scan_o_direct(const char *kf_path,
+                              int (*cb)(const SlotcaskKfEntry *, void *),
+                              void *ctx) {
+    int fd = od_open(kf_path);
+    if (fd < 0) return -1;
+    uint8_t *buf = aligned_alloc(ODIRECT_ALIGN, KF_OD_BUF_SIZE);
+    if (!buf) { close(fd); return -1; }
+
+    off_t file_off = 0;
+    int stopped = 0;
+    while (!stopped) {
+        ssize_t nr = od_pread(fd, buf, KF_OD_BUF_SIZE, file_off);
+        if (nr <= 0) break;
+        /* First chunk: skip the 24-byte KF file header. */
+        size_t start = (file_off == 0) ? SLOTCASK_KF_HDR_SIZE : 0;
+        for (size_t off = start;
+             off + sizeof(SlotcaskKfEntry) <= (size_t)nr && !stopped;
+             off += sizeof(SlotcaskKfEntry)) {
+            if (cb((const SlotcaskKfEntry *)(buf + off), ctx) != 0)
+                stopped = 1;
+        }
+        file_off += (off_t)nr;
+    }
+
+    free(buf);
+    close(fd);
+    return 0;
+}
+
+/* Callback context for slotcask_walk_live_skip's O_DIRECT KF scan. */
+typedef struct {
+    SlotcaskDb    *db;
+    int64_t        remaining_skip;
+    int            stop;
+    SlotcaskScanCb cb;
+    void          *ctx;
+} KfOdSkipCtx;
+
+static int kf_od_skip_emit_cb(const SlotcaskKfEntry *e, void *raw) {
+    KfOdSkipCtx *c = (KfOdSkipCtx *)raw;
+    if (c->stop) return 1;
+    if (e->flag != 1) return 0;
+
+    /* Cheap skip: count live entries without touching segments. */
+    if (c->remaining_skip > 0) { c->remaining_skip--; return 0; }
+
+    /* Past the skip window — load the segment record and emit. */
+    char seg_path[PATH_MAX];
+    seg_path_for(seg_path, c->db->data_dir, e->stream_id, e->file_id);
+    SlotcaskSegHandle sh;
+    if (segcache_acquire(&sh, seg_path, 0, 0) != 0) return 0;
+    const uint8_t *rec = sh.map + e->offset;
+    if (!seg_rec_live_with_hash(rec, e->hash)) {
+        segcache_release(&sh);
+        return 0;
+    }
+    uint16_t klen = seg_rec_klen(rec);
+    uint32_t vlen = seg_rec_vlen(rec);
+    const uint8_t *key   = rec + 24;
+    const uint8_t *value = rec + 24 + klen;
+    if (c->cb(e->hash, key, klen, value, vlen, c->ctx) != 0) {
+        c->stop = 1;
+        segcache_release(&sh);
+        return 1;
+    }
+    segcache_release(&sh);
+    return 0;
+}
+
 int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
                               SlotcaskScanCb cb, void *ctx) {
     if (!db || !cb) return -1;
-    int64_t remaining_skip = skip_n;
-    int stop = 0;
-    for (int s = 0; s < db->num_shards && !stop; s++) {
+    KfOdSkipCtx c = {
+        .db = db, .remaining_skip = skip_n, .stop = 0, .cb = cb, .ctx = ctx
+    };
+    for (int s = 0; s < db->num_shards && !c.stop; s++) {
         char kf_path[PATH_MAX];
         kf_path_for(kf_path, db->data_dir, s);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) continue;
-
-        size_t cap = kh.capacity;
-        SlotcaskKfEntry *kf = kh.map;
-        for (size_t i = 0; i < cap && !stop; i++) {
-            SlotcaskKfEntry *e = &kf[i];
-            uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
-            if (flag != 1) continue;
-
-            /* Cheap skip: count this live entry, no segcache touch. */
-            if (remaining_skip > 0) { remaining_skip--; continue; }
-
-            /* Past the skip window — load the seg and emit. */
-            char seg_path[PATH_MAX];
-            seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
-            SlotcaskSegHandle sh;
-            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
-            const uint8_t *rec = sh.map + e->offset;
-            if (!seg_rec_live_with_hash(rec, e->hash)) {
-                segcache_release(&sh);
-                continue;
-            }
-            uint16_t klen = seg_rec_klen(rec);
-            uint32_t vlen = seg_rec_vlen(rec);
-            const uint8_t *key   = rec + 24;
-            const uint8_t *value = rec + 24 + klen;
-            if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
-            segcache_release(&sh);
-        }
-        kfcache_release(&kh);
+        kf_scan_o_direct(kf_path, kf_od_skip_emit_cb, &c);
     }
     return 0;
 }
