@@ -3070,11 +3070,14 @@ int cmd_server(const char *db_root, int daemonize) {
                   ? g_max_threads
                   : (int)(nproc > 2 ? nproc - 2 : nproc);
     if (pool_sz < 2) pool_sz = 2;
+    if (pool_sz > (int)nproc) pool_sz = (int)nproc; /* CPU tasks never benefit from > nproc threads */
     parallel_pool_init(pool_sz);
     /* I/O pool — sized independently so long page-fault waits don't
        starve CPU-bound queries. Defaults to 4 × nproc. */
     int io_pool_sz = g_io_threads > 0 ? g_io_threads : (int)(nproc * 4);
-    if (io_pool_sz < 2) io_pool_sz = 2;
+    if (io_pool_sz < (int)nproc) io_pool_sz = (int)nproc; /* floor: at least one thread per core */
+    if (io_pool_sz < 4) io_pool_sz = 4;                   /* absolute floor on single/dual-core */
+    if (io_pool_sz > (int)nproc * 8) io_pool_sz = (int)nproc * 8; /* cap: beyond 8× scheduler thrash dominates */
     parallel_io_pool_init(io_pool_sz);
     /* load_dirs() already called pre-fork (see validate_metadata block). */
     load_tokens_conf(db_root);

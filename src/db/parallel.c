@@ -253,8 +253,12 @@ static void enqueue_locked(PoolTask t) {
 
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_pool_running || n == 1) {
-        /* Pool unavailable (e.g. CLI mode) or only one task — run inline. */
+    if (!g_pool_running || n == 1 || t_in_pool_task) {
+        /* Pool unavailable (e.g. CLI mode), single task, or already inside a
+           pool task. The last case prevents help-drain from picking up tasks
+           that re-enter a shared data structure (e.g. a flush buffer) whose
+           "done" signal only the current thread can issue — the same
+           self-deadlock that t_in_io_task guards against in parallel_for_io. */
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
@@ -401,7 +405,13 @@ int parallel_io_pool_size(void) { return g_io_nthreads; }
 
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_io_running || n == 1) {
+    if (!g_io_running || n == 1 || t_in_io_task) {
+        /* Run inline when already inside an IO task. The help-drain loop
+           would otherwise pop arbitrary IO tasks (e.g. btree shard walkers)
+           that can re-enter a BatchFetchBuf whose flusher is this very
+           thread, causing pthread_cond_wait to deadlock on a broadcast that
+           only the flusher thread can issue. Inline execution avoids the
+           re-entry entirely at the cost of serialising the nested fetch. */
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
