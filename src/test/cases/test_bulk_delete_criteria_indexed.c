@@ -67,18 +67,22 @@ static int test_bulk_delete_criteria_indexed_run(void) {
         "\"records\":[");
 
     for (int i = 0; i < 200; i++) {
-        if (i > 0) offset += snprintf(bulk_insert + offset, 200000 - offset, ",");
-        offset += snprintf(bulk_insert + offset, 200000 - offset,
+        int rem = 200000 - offset;
+        if (i > 0 && rem > 0) offset += snprintf(bulk_insert + offset, (size_t)rem, ",");
+        rem = 200000 - offset;
+        if (rem > 0) offset += snprintf(bulk_insert + offset, (size_t)rem,
             "{\"key\":\"paid_%d\",\"value\":{\"status\":\"paid\",\"score\":%d}}",
             i, i % 100);
     }
     for (int i = 0; i < 300; i++) {
-        offset += snprintf(bulk_insert + offset, 200000 - offset, ",");
-        offset += snprintf(bulk_insert + offset, 200000 - offset,
+        int rem = 200000 - offset;
+        if (rem > 0) offset += snprintf(bulk_insert + offset, (size_t)rem, ",");
+        rem = 200000 - offset;
+        if (rem > 0) offset += snprintf(bulk_insert + offset, (size_t)rem,
             "{\"key\":\"pending_%d\",\"value\":{\"status\":\"pending\",\"score\":%d}}",
             i, i % 100);
     }
-    offset += snprintf(bulk_insert + offset, 200000 - offset, "]}");
+    { int rem = 200000 - offset; if (rem > 0) offset += snprintf(bulk_insert + offset, (size_t)rem, "]}"); }
 
     tc_request(tc, bulk_insert, &resp);
     ASSERT_CONTAINS(resp, "\"inserted\":500", "bulk-insert: 500 inserted");
