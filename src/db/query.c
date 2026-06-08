@@ -4809,6 +4809,7 @@ static void bulk_delete_flush_drops(BulkDelCritShardWork *workers,
     }
     int pos = 0;
     for (int g = 0; g < nshard_groups; g++) {
+        if (workers[g].drop_count == 0) continue;
         memcpy(&all[pos], workers[g].drop_entries,
                (size_t)workers[g].drop_count * sizeof(BulkDelCritDropEntry));
         pos += workers[g].drop_count;
