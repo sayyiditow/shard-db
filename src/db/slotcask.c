@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <pthread.h>
+#include "io_direct.h"
 
 /* Single source of truth for primary-key hashing — defined in util.c. We
    forward-declare it instead of pulling in types.h so slotcask stays
@@ -1933,6 +1934,60 @@ typedef struct {
     int         rc;  /* 0 = success, -1 = error */
 } RecoverStreamArg;
 
+/* Compute a buffer size that is a multiple of both ODIRECT_ALIGN and
+   slot_size. This guarantees every chunk holds an integer number of slots
+   so the scan loop needs no carry-over state.
+   slot_size is always a multiple of 8 (floor 32) so gcd(4096, slot_size)
+   >= 8 and the computed lcm is always manageable (< 8 MB for any valid
+   slot_size). */
+static size_t recover_od_buf_size(int slot_size) {
+    size_t a = (size_t)ODIRECT_ALIGN;
+    size_t b = (size_t)slot_size;
+    size_t x = a, y = b;
+    while (y) { size_t t = x % y; x = y; y = t; }  /* x = gcd(a,b) */
+    size_t lcm = a / x * b;
+    /* Scale up to ~4 MB so we amortise syscall overhead across many slots. */
+    size_t n = (ODIRECT_BUF_SIZE_DEFAULT + lcm - 1) / lcm;
+    if (n < 1) n = 1;
+    return lcm * n;
+}
+
+/* O_DIRECT scan of a non-active segment file for tombstoned (flag==2) slots.
+   Pages never enter the page cache. Called for every file_id != last_id
+   in recover_one_stream. Returns 0 on success; errors are non-fatal
+   (missed tombstones just reduce free-pool size until next vacuum). */
+static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
+                                       int file_id, const char *path) {
+    int fd = od_open(path);
+    if (fd < 0) return -1;
+
+    size_t buf_size = recover_od_buf_size(db->slot_size);
+    uint8_t *buf = aligned_alloc(ODIRECT_ALIGN, buf_size);
+    if (!buf) { close(fd); return -1; }
+
+    int slot_size = db->slot_size;
+    off_t file_off = 0;
+    for (;;) {
+        ssize_t nr = od_pread(fd, buf, buf_size, file_off);
+        if (nr <= 0) break;
+        /* buf_size is a multiple of slot_size, so nr is also a multiple
+           (or a short final read whose incomplete trailing bytes are safely
+           skipped by the <= condition). */
+        for (ssize_t off = 0; off + slot_size <= nr; off += slot_size) {
+            if (buf[off + 18] == 2) {
+                pool_push_free(&db->streams[sid], (uint16_t)file_id,
+                               (uint32_t)(file_off + off));
+            }
+        }
+        file_off += (off_t)nr;
+        if (nr < (ssize_t)buf_size) break; /* EOF */
+    }
+
+    free(buf);
+    close(fd);
+    return 0;
+}
+
 /* Walk every segment for a single stream, populate the in-memory free-slot
    pool from flag=2 slots, and position reserve_off past the last live slot
    in the highest-numbered segment. Returns 0 on success, -1 on error. */
@@ -1967,6 +2022,18 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         int file_id = ids[fi];
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
+
+        if (file_id != last_id) {
+            /* Non-active segment: O_DIRECT scan for tombstones only.
+               Read-once at startup, never written — pages must not enter
+               the page cache and displace KF/index pages loaded by warmup. */
+            recover_scan_tombstones_od(db, sid, file_id, path);
+            continue;
+        }
+
+        /* Active (last) segment: mmap via segcache so the first post-startup
+           insert doesn't take a cold segcache miss. Also scans tombstones
+           and locates the reserve frontier. */
         SlotcaskSegHandle h;
         if (segcache_acquire(&h, path, 0, 0) != 0) { free(ids); return -1; }
         off_t pos = 0;
@@ -1977,15 +2044,11 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
                 pool_push_free(&db->streams[sid], (uint16_t)file_id,
                                (uint32_t)pos);
             } else if (flag == 0) {
-                /* First empty slot in highest-numbered segment marks the
-                   reserve frontier. Earlier segments may have empty tails
-                   too (preallocated 128 MB), but only the latest one
-                   matters for reserve_off. */
-                if (file_id == last_id) break;
+                break;
             }
             pos += db->slot_size;
         }
-        if (file_id == last_id) last_offset = pos;
+        last_offset = pos;
         segcache_release(&h);
     }
     db->streams[sid].active_file_id = (uint32_t)last_id;
