@@ -10599,6 +10599,7 @@ typedef struct BatchFetchBuf_ {
     size_t     pending_n;
     size_t     pending_cap;
     pthread_mutex_t lock;
+    pthread_cond_t  flush_done;  /* signalled when flushing transitions 1→0 */
     int             flushing;
     SlotcaskDb *sdb;
     int (*record_cb)(const uint8_t hash16[16],
@@ -10621,6 +10622,7 @@ static int batch_buf_init(BatchFetchBuf *b, SlotcaskDb *sdb,
     if (!b->pending) return -1;
     b->pending_n = 0;
     pthread_mutex_init(&b->lock, NULL);
+    pthread_cond_init(&b->flush_done, NULL);
     b->flushing = 0;
     b->sdb = sdb;
     b->record_cb = NULL;
@@ -10675,10 +10677,25 @@ static int batch_buf_collect_hash(BatchFetchBuf *b, const uint8_t hash16[16]) {
             pthread_mutex_unlock(&b->lock);
             return 0;
         }
-        if (b->flushing) {
+        while (b->flushing) {
+            /* Block until the flushing thread completes rather than
+               spinning. On overloaded runners (arm64 CI, 2 cores, 200+
+               concurrent test daemons) the sched_yield() loop starved the
+               flush thread, causing 60 s timeouts in test-and-intersection. */
+            pthread_cond_wait(&b->flush_done, &b->lock);
+        }
+        /* After waiting: the flush drained the buffer. Add this hash
+           directly if there is now space — avoids cascading empty flushes
+           where every woken waiter sets flushing=1 and re-enters
+           batch_buf_flush_copy on an already-empty buffer. Each such empty
+           flush still broadcasts flush_done, and under TSan the broadcast
+           overhead scales with the thread count, pushing the total per-query
+           time past the 60 s client timeout on assertion-14. */
+        if (b->pending_n < b->pending_cap) {
+            memcpy(b->pending[b->pending_n], hash16, 16);
+            b->pending_n++;
             pthread_mutex_unlock(&b->lock);
-            sched_yield();
-            continue;
+            return 0;
         }
         b->flushing = 1;
         pthread_mutex_unlock(&b->lock);
@@ -10687,9 +10704,8 @@ static int batch_buf_collect_hash(BatchFetchBuf *b, const uint8_t hash16[16]) {
 
         pthread_mutex_lock(&b->lock);
         b->flushing = 0;
+        pthread_cond_broadcast(&b->flush_done);
         pthread_mutex_unlock(&b->lock);
-
-        continue;
     }
 }
 
@@ -10701,6 +10717,7 @@ static int batch_buf_collect_cb(const char *val, size_t vlen,
 
 static void batch_buf_destroy(BatchFetchBuf *b) {
     batch_buf_flush(b);
+    pthread_cond_destroy(&b->flush_done);
     pthread_mutex_destroy(&b->lock);
     free(b->pending);
     b->pending = NULL;
