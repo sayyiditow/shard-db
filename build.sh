@@ -374,8 +374,8 @@ export INDEX_BUILD_BUDGET_MB=1024
 # Full-scan O_DIRECT chunk size (MB). Each parallel worker reads shard data
 # in chunks of this size using O_DIRECT (cache-bypassing pread). Larger chunks
 # reduce syscall overhead on fast NVMe; smaller chunks reduce peak RAM.
-# Default 4 MB if unset. Peak O_DIRECT RAM ~ 2 × DB_ODIRECT_BUF_MB × workers.
-export DB_ODIRECT_BUF_MB=4
+# Default 32 MB if unset. Peak O_DIRECT RAM ~ 2 × DB_ODIRECT_BUF_MB × workers.
+export DB_ODIRECT_BUF_MB=32
 
 # Auth + access
 export TOKEN_CAP=1024
