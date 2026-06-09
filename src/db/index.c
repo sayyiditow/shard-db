@@ -1181,7 +1181,7 @@ int cmd_add_index(const char *db_root, const char *object,
         if (af) { fprintf(af, "%s\n", canon); fclose(af); }
     }
 
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     uint64_t duration_ms = now_ms() - t_start;
     int records = get_live_count(db_root, object);
     if (records < 0) records = 0;
@@ -2358,7 +2358,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
         }
     }
 
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     uint64_t duration_ms = now_ms() - t_start;
     int records = get_live_count(db_root, object);
     if (records < 0) records = 0;
@@ -2477,7 +2477,7 @@ int cmd_remove_index(const char *db_root, const char *object, const char *field)
     }
 
     unlink_index_by_line(db_root, object, matched_line, sch.splits);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
 
     LOG_AUDIT(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %s", db_root, object, field);
     OUT("{\"status\":\"removed\",\"field\":\"%s\"}\n", field);
@@ -2559,7 +2559,7 @@ int cmd_remove_indexes(const char *db_root, const char *object, const char *fiel
         }
     }
 
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     LOG_AUDIT(LOG_SUB_INDEX, "REMOVE-INDEX %s/%s: %d removed, %d not_indexed", db_root, object, removed, missing);
     OUT("{\"status\":\"removed\",\"count\":%d,\"not_indexed\":%d}\n", removed, missing);
     return 0;
