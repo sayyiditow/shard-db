@@ -16,15 +16,15 @@ Default workflow for non-trivial work, unless the user says otherwise for a give
 
 1. **Sonnet plans.** Investigate and diagnose, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored).
 
-   **Plan quality requirements** — the plan must be complete enough that Haiku can execute it with zero design decisions:
-   - Every insertion/edit locates its site by **quoted anchor text** (not line numbers, which drift).
+   **Plan quality requirements** — the plan must be complete enough that any model can execute it with zero design decisions:
+   - Every insertion/edit locates its site by **quoted anchor text** (not line numbers, which drift). Note: another model may be working concurrently on a separate branch, so line numbers will drift — anchors are the only reliable locator.
    - Full code blocks for every new function, struct, and modified hunk — no prose descriptions of what to write.
    - Explicit invariants and edge cases with required behavior spelled out.
    - Embedded execution rules at the top of the plan: branch off `main`; do tasks in order; build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; if a quoted anchor is not found exactly, stop and write `PLAN_NOTES.md` — do not guess or reinterpret.
 
-2. **Haiku executes** the plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. When the user says "execute" or "implement", spawn a Haiku subagent via `Agent(model: "haiku", ...)` with the plan file path and a strict prompt: implement the plan exactly as written, no design decisions, no reinterpretation, stop and surface blockers rather than improvise.
+2. **An external model executes** the plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. Execution is handled by models outside the Claude family (e.g. Gemini, GPT) — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user who runs the executing model separately.
 
-3. **Sonnet reviews and commits.** Inspect the actual `git diff` (not Haiku's summary), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
+3. **Sonnet reviews and commits.** Inspect the actual `git diff` (not the executing model's summary), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
 
 ## Deployment (Netcup) — ship artifacts, never git
 
