@@ -23762,7 +23762,7 @@ static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
             a->slot_size   = sdb->slot_size;
             agg_ctx_clone_shared(&a->local, main_ctx);
             a->wrap.cb     = agg_scan_cb;
-            a->wrap.ctx    = &a->local;
+            /* wrap.ctx set in fixup pass below — realloc may move args */
             a->stop_flag   = &stop_flag;
             a->parent_out  = parent_out;
             nargs++;
@@ -23772,6 +23772,9 @@ static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
 
 run:
     if (nargs == 0) { free(args); return; }
+    /* Fixup: args is final — set wrap.ctx now so pointers are valid. */
+    for (size_t i = 0; i < nargs; i++)
+        args[i].wrap.ctx = &args[i].local;
     g_scan_stop = 0;
     parallel_for_io(agg_od_seg_worker, args, (int)nargs, sizeof(AggOdSegArg));
     for (size_t i = 0; i < nargs; i++) {
@@ -23782,53 +23785,6 @@ run:
     free(args);
 }
 
-/* Per-kf-shard aggregate types and worker (mmap-based, proven path). */
-typedef struct {
-    V2ScanWrap   wrap;
-    V2ShardArg   arg;
-    AggCtx       local;
-} AggV2ScanWork;
-
-static void *agg_v2_scan_worker(void *arg) {
-    AggV2ScanWork *w = (AggV2ScanWork *)arg;
-    g_out = w->arg.parent_out ? w->arg.parent_out : stdout;
-    if (w->arg.stop_flag &&
-        __atomic_load_n(w->arg.stop_flag, __ATOMIC_ACQUIRE)) return NULL;
-    int rc = slotcask_walk_one_shard(w->arg.db, w->arg.kf_shard_id,
-                                      w->arg.scb, w->arg.sctx,
-                                      w->arg.stop_flag);
-    if (rc != 0 && w->arg.stop_flag)
-        __atomic_store_n(w->arg.stop_flag, 1, __ATOMIC_RELEASE);
-    return NULL;
-}
-
-static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
-    int n = sdb->num_shards;
-    if (n <= 0) return;
-    AggV2ScanWork *workers = calloc((size_t)n, sizeof(AggV2ScanWork));
-    if (!workers) return;
-    int stop_flag = 0;
-    FILE *parent_out = g_out;
-    for (int s = 0; s < n; s++) {
-        agg_ctx_clone_shared(&workers[s].local, main_ctx);
-        workers[s].wrap.cb = agg_scan_cb;
-        workers[s].wrap.ctx = &workers[s].local;
-        workers[s].arg = (V2ShardArg){
-            .db = sdb, .kf_shard_id = s,
-            .scb = v2_scan_wrap_cb, .sctx = &workers[s].wrap,
-            .stop_flag = &stop_flag,
-            .parent_out = parent_out,
-        };
-    }
-    g_scan_stop = 0;
-    parallel_for_io(agg_v2_scan_worker, workers, n, sizeof(AggV2ScanWork));
-    for (int s = 0; s < n; s++) {
-        if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
-        agg_ctx_merge(main_ctx, &workers[s].local);
-        agg_ctx_free_local(&workers[s].local);
-    }
-    free(workers);
-}
 
 /* Per-shard aggregate worker: own AggCtx, processes this shard's hashes. */
 typedef struct {
