@@ -22,7 +22,7 @@
 
 #include "types.h"  /* FieldSchema, CompiledCriterion, CriteriaNode, QueryDeadline */
 
-#define ODIRECT_BUF_SIZE_DEFAULT  (4 * 1024 * 1024)   /* 4 MB fallback          */
+#define ODIRECT_BUF_SIZE_DEFAULT  (32 * 1024 * 1024)  /* 32 MB: fits one shard at splits≤256 */
 #define ODIRECT_ALIGN            4096                 /* O_DIRECT alignment unit */
 
 /* Configurable chunk size. Override via env var DB_ODIRECT_BUF_MB=N (integer MB).
