@@ -24155,6 +24155,61 @@ static void agg_ctx_free_local(AggCtx *ctx) {
     ctx->total_buckets = 0;
 }
 
+/* Per-shard worker for building one secondary group_by field's hash16→string
+   map in parallel. Each worker processes one btree shard of one secondary
+   field, inserting decoded string values into a pre-initialised HashStrMap.
+   hsm_insert is NOT thread-safe; each worker operates on a distinct shard
+   range of the same map.  Because HashStrMap uses open addressing keyed by
+   the 16-byte hash16, two workers inserting different hash16s into the same
+   table can race.  Therefore each worker writes into its own LOCAL HashStrMap;
+   the orchestrator merges all per-worker maps into the shared sec_maps[g]
+   serially after join. */
+typedef struct {
+    int              shard_id;
+    const char      *db_root;
+    const char      *object;
+    const char      *gfield_s;       /* secondary field name */
+    const TypedField *gtf_s;
+    KeySet          *crit_ks;        /* shared read-only filter (may be NULL) */
+    HashStrMap       local_map;      /* per-worker output */
+    int              cap_hint;       /* hsm_init capacity hint */
+    int              arena_hint;     /* hsm_init arena hint */
+    int              aborted;
+    int              dl_counter;
+    QueryDeadline   *dl;
+} SecMapBuildWorker;
+
+static void *sec_map_build_worker(void *arg) {
+    SecMapBuildWorker *w = (SecMapBuildWorker *)arg;
+    if (hsm_init(&w->local_map, (size_t)w->cap_hint,
+                  (size_t)w->arena_hint) != 0) {
+        w->aborted = 1;
+        return NULL;
+    }
+    char idx_path[PATH_MAX];
+    build_idx_path(idx_path, sizeof(idx_path), w->db_root, w->object,
+                   w->gfield_s, w->shard_id);
+    BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
+                                             "\xff\xff\xff\xff", 4, 0, 0);
+    if (!it) return NULL;
+    const char *val; size_t vlen; const uint8_t *hash16;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        if (query_deadline_tick(w->dl, &w->dl_counter)) {
+            w->aborted = 1; break;
+        }
+        if (w->crit_ks && !keyset_contains(w->crit_ks, hash16)) continue;
+        char dbuf[512];
+        int dlen = decode_idx_to_buf(w->gtf_s, (const uint8_t *)val,
+                                      vlen, dbuf, sizeof(dbuf), 0);
+        if (dlen <= 0) continue;
+        if (hsm_insert(&w->local_map, hash16, dbuf, (size_t)dlen) != 0) {
+            w->aborted = 1; break;
+        }
+    }
+    btree_range_iter_close(it);
+    return NULL;
+}
+
 /* Per-shard worker for parallel indexed group_by Pass 1.
 
    Each worker walks ONE btree shard of the primary group field, builds
@@ -26479,7 +26534,6 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
            the per-record scan path. */
          n_sec = ctx.ngroups - 1;
         sec_maps = NULL;
-        int dl_counter_sec = 0;
         if (n_sec > 0) {
             sec_maps = calloc((size_t)n_sec, sizeof(HashStrMap));
             if (!sec_maps) {
@@ -26514,33 +26568,52 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 const TypedField *gtf_s = ctx.group_tfs[g + 1];
                 const char *gfld_s = ctx.group_fields[g + 1];
                 int sec_aborted = 0;
+                int live_s = get_live_count(db_root, object);
+                if (live_s <= 0) live_s = 1024;
+                int per_s_hint = (live_s + n_idx_s - 1) / n_idx_s;
+                int per_s_arena = per_s_hint * 12; /* avg 8-12B per entry */
+                SecMapBuildWorker *sw = calloc((size_t)n_idx_s,
+                                               sizeof(SecMapBuildWorker));
+                if (!sw) { sec_aborted = 1; goto sec_aborted_label; }
+                for (int s = 0; s < n_idx_s; s++) {
+                    sw[s].shard_id   = s;
+                    sw[s].db_root    = db_root;
+                    sw[s].object     = object;
+                    sw[s].gfield_s   = gfld_s;
+                    sw[s].gtf_s      = gtf_s;
+                    sw[s].crit_ks    = crit_ks;
+                    sw[s].cap_hint   = per_s_hint;
+                    sw[s].arena_hint = per_s_arena;
+                    sw[s].dl         = &dl;
+                }
+                parallel_for_io(sec_map_build_worker, sw, n_idx_s,
+                                sizeof(SecMapBuildWorker));
+                /* Serial merge: walk each per-worker local_map and insert
+                   into the shared sec_maps[g].  hsm_insert on a single map
+                   is safe here because the main thread is the only writer.
+                   HashStrEntry stores value as (off, len) into local_map.arena;
+                   dereference via lm->arena + he->off. */
                 for (int s = 0; s < n_idx_s && !sec_aborted; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                   object, gfld_s, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        if (query_deadline_tick(&dl, &dl_counter_sec)) {
-                            sec_aborted = 1; break;
-                        }
-                        /* Filter by crit_ks here too so we don't waste arena
-                           on records the criteria excludes. */
-                        if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
-                        char dbuf[512];
-                        int dlen = decode_idx_to_buf(gtf_s,
-                                                     (const uint8_t *)val,
-                                                     vlen, dbuf, sizeof(dbuf), 0);
-                        if (dlen <= 0) continue;
-                        if (hsm_insert(&sec_maps[g], hash16, dbuf,
-                                       (size_t)dlen) != 0) {
+                    if (sw[s].aborted) { sec_aborted = 1; break; }
+                    HashStrMap *lm = &sw[s].local_map;
+                    if (!lm->entries) continue;
+                    for (size_t bi = 0; bi < lm->cap; bi++) {
+                        HashStrEntry *he = &lm->entries[bi];
+                        if (!he->occupied) continue;
+                        const char *sval = lm->arena + he->off;
+                        size_t      slen = he->len;
+                        if (hsm_insert(&sec_maps[g], he->hash, sval,
+                                        slen) != 0) {
                             sec_aborted = 1; break;
                         }
                     }
-                    btree_range_iter_close(it);
+                    hsm_free(lm);
                 }
+                for (int s = 0; s < n_idx_s; s++) {
+                    if (sw[s].local_map.entries) hsm_free(&sw[s].local_map);
+                }
+                free(sw); sw = NULL;
+sec_aborted_label:
                 if (sec_aborted) {
                     for (int k = 0; k <= g; k++) hsm_free(&sec_maps[k]);
                     free(sec_maps); sec_maps = NULL;
@@ -26607,8 +26680,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         agg_ctx_clone_shared(&workers[s].local, &ctx);
                     }
 
-                    parallel_for(igb_pass1_worker, workers, n_idx_g,
-                                 sizeof(IgbPass1Worker));
+                    parallel_for_io(igb_pass1_worker, workers, n_idx_g,
+                                   sizeof(IgbPass1Worker));
 
                     int budget_exceeded = 0;
                     for (int s = 0; s < n_idx_g; s++) {
