@@ -24564,6 +24564,33 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
     }
 }
 
+/* Bitmap emit → hbk adapter.
+   Called by bitmap_emit_for_shard once per matching record (via bm_emit_cb).
+   Inserts (hash16 → bucket) into the caller's hbk.
+   NOT thread-safe: must be called from a single thread or with external
+   serialization. The bitmap IGB+hbm Phase 1b walks shards serially so
+   this invariant holds. */
+typedef struct {
+    HashBktMap       *hbk;
+    struct AggBucket *bucket;
+    AggCtx           *actx;       /* agg context for spec lookup */
+} BmHbkInsertCtx;
+
+static int bm_hbk_insert_cb(const char *value, size_t vlen,
+                             const uint8_t *hash16, void *ctx) {
+    (void)value; (void)vlen;
+    BmHbkInsertCtx *bx = (BmHbkInsertCtx *)ctx;
+    hbk_insert(bx->hbk, hash16, bx->bucket);
+    /* Increment count accumulators for every AGG_COUNT spec
+       (same semantics as agg_scan_cb — each record matched by the
+       bitmap contributes one to every count spec). */
+    for (int i = 0; i < bx->actx->nspecs; i++) {
+        if (bx->actx->specs[i].fn == AGG_COUNT)
+            bx->bucket->accums[i].count++;
+    }
+    return 0;
+}
+
 /* Callback + context for bitmap group_count dict-value collection.
    bm_iter_values per shard; union unique raw values across shards. */
 typedef struct {
@@ -26071,13 +26098,11 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             igb_needs_hbm = 1;
         }
     }
-    if (igb_eligible && igb_group_uses_bitmap &&
-        (ctx.ngroups > 1 || igb_needs_hbm)) {
-        /* Bitmap-only group_by with multi-field or sum/avg/min/max needs
-           a btree walk + hash bucket map, which fails for bitmap-only
-           group fields (no btree). Fall through to per-record scan.
-           Criteria alone no longer disqualifies — the slot-level bitmap
-           intersect path handles bitmap-only group_by + bitmap criteria. */
+    if (igb_eligible && igb_group_uses_bitmap && ctx.ngroups > 1) {
+        /* Multi-field group_by where the primary field is bitmap-only:
+           no btree → secondary-map hash16 routing impossible.
+           Single-field bitmap + hbm is handled in the bitmap IGB branch
+           below (Phase 1b). */
         igb_eligible = 0;
     }
     /* Multi-spec indexed group_by (count + sum/avg/min/max on indexed
@@ -26107,6 +26132,13 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
     }
 
     if (igb_eligible) {
+        HashBktMap   hbk = {0};
+        int          hbk_ready = 0;
+        KeySet      *crit_ks = NULL;
+        HashStrMap  *sec_maps = NULL;
+        int          n_sec = 0;
+        int          aborted = 0;
+        int          dl_counter = 0;
         /* Bitmap-only group_by fast path: single field, count-only.
            Walk the bitmap dict across all shards, collect unique values,
            then decide:
@@ -26251,10 +26283,119 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
 
             /* Not slot-eligible → fall through to btree/scan path. */
         }
+
+        /* Phase 1b: bitmap-only group field + hbm (sum/avg/min/max agg specs
+           on indexed non-varchar agg fields).
+
+           Strategy:
+             1. Collect unique bitmap dict values (reuse bm_n / bm_vals /
+                bm_vlens already filled above — we re-run collection if
+                bm_n==0 because this branch is also reached when ngroups==1
+                && igb_needs_hbm even without going through the count-only
+                block).
+             2. Check hbk memory budget; bail to igb_skip if over.
+             3. For each unique value create an AggBucket (count specs
+                populated lazily in the bitmap walk; hbm used by Pass 2).
+             4. Walk each shard's bitmap serially, emitting hash16→bucket
+                into hbk via bm_hbk_insert_cb.
+             5. Set hbk_ready=1 so the shared Pass 2 block (btree agg-field
+                walk) runs normally and accumulates into the right buckets.
+
+           Limit: hbk memory check gates this to ≤ ~6 M records at default
+           QUERY_BUFFER_MB=256. At larger scale the else branch below falls
+           to O_DIRECT as before. */
+        if (igb_group_uses_bitmap && igb_needs_hbm && !tree) {
+            /* Re-collect unique values if not already done by count-only branch. */
+            uint8_t  bm_vals_h[256][1024];
+            size_t   bm_vlens_h[256];
+            int      bm_n_h = 0;
+            const TypedField *gtf_bm_h = ctx.group_tfs[0];
+            int      bm_dl_h = 0;
+            for (int s = 0; s < sch.splits; s++) {
+                if (query_deadline_tick(&dl, &bm_dl_h)) goto igb_skip;
+                char bp[1024];
+                bm_build_path(bp, sizeof(bp), db_root, object,
+                              ctx.group_fields[0], s);
+                BitmapShard *bms = bm_open(bp, 0, 0, 0, 0, 0);
+                if (!bms) continue;
+                BmDictCollectCtx dc = { .vals = bm_vals_h, .vlens = bm_vlens_h,
+                                        .n = &bm_n_h, .cap = 256 };
+                bm_iter_values(bms, bm_collect_uniq_cb, &dc);
+                bm_close(bms);
+            }
+            if (bm_n_h == 0) { igb_done = 1; goto igb_skip; }
+
+            /* hbk memory budget check (same formula as btree IGB path below). */
+            {
+                int live_h = get_live_count(db_root, object);
+                if (live_h <= 0) live_h = 1024;
+                size_t cap_h = 64;
+                while (cap_h * 3 < (size_t)live_h * 4) cap_h <<= 1;
+                size_t hbk_bytes_h = cap_h * sizeof(HashBktEntry);
+                if (hbk_bytes_h > g_query_buffer_max_bytes / 2) goto igb_skip;
+            }
+
+            /* Initialise the shared hbk used by Pass 2. */
+            {
+                int live_h2 = get_live_count(db_root, object);
+                if (live_h2 <= 0) live_h2 = 1024;
+                HashBktMap hbk_bm = {0};
+                if (hbk_init(&hbk_bm, (size_t)live_h2) != 0) goto igb_skip;
+
+                /* Need sdb for kf path inside bitmap_emit_for_shard. */
+                SlotcaskSchemaInfo bm_info = {
+                    .splits   = sch.splits,
+                    .slot_size = sch.slot_size,
+                    .streams  = sch.streams
+                };
+                SlotcaskDb *bm_sdb = slotcask_registry_get(db_root, object,
+                                                             &bm_info);
+                if (!bm_sdb) { hbk_free(&hbk_bm); goto igb_skip; }
+
+                int bm_aborted = 0;
+                for (int v = 0; v < bm_n_h && !bm_aborted; v++) {
+                    /* Decode display string for bucket key. */
+                    char display_h[512];
+                    if (decode_idx_to_buf(gtf_bm_h,
+                                          bm_vals_h[v], bm_vlens_h[v],
+                                          display_h, sizeof(display_h), 0) <= 0)
+                        continue;
+                    char *kvp_h[1] = { display_h };
+                    AggBucket *bkt_h = agg_find_or_create(&ctx, kvp_h, 1,
+                                                           NULL, 0);
+                    if (!bkt_h) { bm_aborted = 1; break; }
+
+                    /* Walk all bitmap shards for this value; emit hash16 → hbk. */
+                    BmHbkInsertCtx bx = { .hbk = &hbk_bm, .bucket = bkt_h, .actx = &ctx };
+                    for (int s = 0; s < sch.splits && !bm_aborted; s++) {
+                        if (query_deadline_tick(&dl, &bm_dl_h)) {
+                            bm_aborted = 1; break;
+                        }
+                        bitmap_emit_for_shard(db_root, object,
+                                              ctx.group_fields[0], s,
+                                              bm_vals_h[v], bm_vlens_h[v],
+                                              bm_hbk_insert_cb, &bx, bm_sdb);
+                    }
+                }
+
+                if (bm_aborted) { hbk_free(&hbk_bm); goto igb_skip; }
+
+                /* Hand the hbk off to Pass 2.  The Pass 2 block below checks
+                   `hbk_ready` and uses the `hbk` local declared at the top of
+                   the btree path.  We need to assign into that variable.
+                   Declare hbk + hbk_ready at the top of the outer igb_eligible
+                   block instead of deep in the btree-only path — see Task 4. */
+                hbk      = hbk_bm;
+                hbk_ready = 1;
+                crit_ks   = NULL;  /* no criteria KeySet for bitmap path */
+                sec_maps  = NULL;  /* single group field, no sec maps */
+                n_sec     = 0;
+                /* Pass 2 runs below; skip btree Pass 1 by jumping past it. */
+                goto igb_pass2;
+            }
+        }
         const TypedField *gtf = ctx.group_tfs[0];
         int n_idx_g = index_splits_for(sch.splits);
-        HashBktMap hbk = {0};
-        int hbk_ready = 0;
         if (igb_needs_hbm) {
             int live = get_live_count(db_root, object);
             if (live <= 0) live = 1024;
@@ -26279,7 +26420,6 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
            (with small-primary fallthrough since that path needs record-rematch
            which we don't do here), FP_UNION → build_or_keyset. On any
            failure, fall through to the scan path. */
-        KeySet *crit_ks = NULL;
         if (tree) {
             if (igb_crit_fp.kind == FP_PRIMARY_LEAF || igb_crit_fp.kind == FP_BITMAP_SMALLER) {
                 SearchCriterion *igb_prim = igb_crit_fp.n_source > 0 ? igb_crit_fp.source_leaves[0] : NULL;
@@ -26337,8 +26477,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
            plus arena (avg 8-16B per varchar value) — capped at
            QUERY_BUFFER_MB/(2*n_sec) per map; if over, falls through to
            the per-record scan path. */
-        int n_sec = ctx.ngroups - 1;
-        HashStrMap *sec_maps = NULL;
+         n_sec = ctx.ngroups - 1;
+        sec_maps = NULL;
         int dl_counter_sec = 0;
         if (n_sec > 0) {
             sec_maps = calloc((size_t)n_sec, sizeof(HashStrMap));
@@ -26434,9 +26574,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
            on each repeat. The cache only fires for ngroups==1 since the
            composite bucket key for multi-field includes secondaries that
            vary per record even when primary repeats. */
-        int aborted = 0;
-        int run_serial = 1;
-        int dl_counter = 0;        /* shared by Pass 1 (serial fallback) + Pass 2 */
+         int run_serial = 1;
         int live_for_pass1 = get_live_count(db_root, object);
         if (live_for_pass1 <= 0) live_for_pass1 = 1024;
         if (n_idx_g >= 4 && live_for_pass1 >= 100000) {
@@ -26762,6 +26900,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             goto igb_skip;
         }
 
+igb_pass2:
         /* Pass 2 (only when there are non-count specs on indexed agg
            fields): walk each distinct agg field's btree ONCE, even when
            multiple specs target the same field (e.g. min(balance) +
