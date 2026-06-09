@@ -24,7 +24,46 @@ Default workflow for non-trivial work, unless the user says otherwise for a give
 
 2. **An external model executes** the plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. Execution is handled by models outside the Claude family (e.g. Gemini, GPT) — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user who runs the executing model separately.
 
-3. **Sonnet reviews and commits.** Inspect the actual `git diff` (not the executing model's summary), run the full suite locally, never commit on red. Commit only on the user's approval, with the authorship the user specifies for that task.
+3. **Sonnet reviews only.** Inspect the actual `git diff` (not the executing model's summary). Report any anchor mismatches, correctness issues, or test failures. **All git operations are done outside Claude** — see the Git operations section below.
+
+## Git operations (done outside Claude)
+
+Claude does not commit, push, open PRs, or merge. After Sonnet gives a review pass, the user (or the executing model under user direction) runs these steps:
+
+```bash
+# 1. Commit (on the feature branch, work already staged or unstaged)
+git add <files>
+git commit -m "$(cat <<'EOF'
+type: short description
+
+Longer explanation if needed.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+EOF
+)"
+
+# 2. Push and open PR
+git push -u origin <branch>
+gh pr create --title "type: short description" --body "$(cat <<'EOF'
+## Summary
+- bullet points
+
+## Test plan
+- [ ] relevant test cases
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+)"
+
+# 3. Admin merge (once CI is green)
+gh pr merge <number> --merge --admin
+
+# 4. Clean up (optional — GitHub auto-deletes branch on merge if configured)
+git branch -d <branch>
+git push origin --delete <branch>
+```
+
+**Co-author line**: always include `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>` in commits that Claude planned or reviewed.
 
 ## Deployment (Netcup) — ship artifacts, never git
 

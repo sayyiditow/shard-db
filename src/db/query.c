@@ -23703,53 +23703,88 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     src->total_buckets = 0;
 }
 
-/* Per-kf-shard aggregate types and worker (mmap-based, proven path). */
+/* ── O_DIRECT per-segment aggregate fan-out ─────────────────────────────
+ * One AggOdSegArg per .dat file. Each worker runs seg_scan_o_direct on its
+ * file, accumulating results into a private local AggCtx. After
+ * parallel_for_io joins, all locals are merged into main_ctx.
+ *
+ * Uses the existing od_seg_record_cb / OdSegAdapterCtx adapter so the
+ * per-record hot path is identical to scan_shards_v2_o_direct. */
 typedef struct {
-    V2ScanWrap   wrap;
-    V2ShardArg   arg;
-    AggCtx       local;
-} AggV2ScanWork;
+    char       seg_path[PATH_MAX];
+    int        slot_size;
+    AggCtx     local;         /* per-segment private accumulator */
+    V2ScanWrap wrap;          /* .cb = agg_scan_cb, .ctx = &this->local */
+    int       *stop_flag;
+    FILE      *parent_out;
+} AggOdSegArg;
 
-static void *agg_v2_scan_worker(void *arg) {
-    AggV2ScanWork *w = (AggV2ScanWork *)arg;
-    g_out = w->arg.parent_out ? w->arg.parent_out : stdout;
-    if (w->arg.stop_flag &&
-        __atomic_load_n(w->arg.stop_flag, __ATOMIC_ACQUIRE)) return NULL;
-    int rc = slotcask_walk_one_shard(w->arg.db, w->arg.kf_shard_id,
-                                      w->arg.scb, w->arg.sctx,
-                                      w->arg.stop_flag);
-    if (rc != 0 && w->arg.stop_flag)
-        __atomic_store_n(w->arg.stop_flag, 1, __ATOMIC_RELEASE);
+static void *agg_od_seg_worker(void *raw) {
+    AggOdSegArg *arg = (AggOdSegArg *)raw;
+    g_out = arg->parent_out ? arg->parent_out : stdout;
+    if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
+    OdSegAdapterCtx actx = { .wrap = &arg->wrap, .stop_flag = arg->stop_flag };
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    count_scan_cb_flush_thread();
     return NULL;
 }
 
-static void parallel_agg_scan_shards_v2(AggCtx *main_ctx, SlotcaskDb *sdb) {
-    int n = sdb->num_shards;
-    if (n <= 0) return;
-    AggV2ScanWork *workers = calloc((size_t)n, sizeof(AggV2ScanWork));
-    if (!workers) return;
+static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
+                                               SlotcaskDb *sdb) {
+    if (!sdb || sdb->num_streams <= 0) return;
+
+    AggOdSegArg *args = NULL;
+    size_t nargs = 0, cap = 0;
     int stop_flag = 0;
     FILE *parent_out = g_out;
-    for (int s = 0; s < n; s++) {
-        agg_ctx_clone_shared(&workers[s].local, main_ctx);
-        workers[s].wrap.cb = agg_scan_cb;
-        workers[s].wrap.ctx = &workers[s].local;
-        workers[s].arg = (V2ShardArg){
-            .db = sdb, .kf_shard_id = s,
-            .scb = v2_scan_wrap_cb, .sctx = &workers[s].wrap,
-            .stop_flag = &stop_flag,
-            .parent_out = parent_out,
-        };
+
+    for (int s = 0; s < sdb->num_streams; s++) {
+        char stream_dir[PATH_MAX];
+        snprintf(stream_dir, sizeof(stream_dir),
+                 "%s/data/streams/%03d", sdb->data_dir, s);
+        DIR *dh = opendir(stream_dir);
+        if (!dh) continue;
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
+                continue;
+            if (nargs >= cap) {
+                size_t newcap = cap ? cap * 2 : 64;
+                AggOdSegArg *t = realloc(args, newcap * sizeof(AggOdSegArg));
+                if (!t) { closedir(dh); goto run; }
+                args = t;
+                cap  = newcap;
+            }
+            AggOdSegArg *a = &args[nargs];
+            memset(a, 0, sizeof(*a));
+            snprintf(a->seg_path, PATH_MAX, "%s/%s", stream_dir, de->d_name);
+            a->slot_size   = sdb->slot_size;
+            agg_ctx_clone_shared(&a->local, main_ctx);
+            a->wrap.cb     = agg_scan_cb;
+            /* wrap.ctx set in fixup pass below — realloc may move args */
+            a->stop_flag   = &stop_flag;
+            a->parent_out  = parent_out;
+            nargs++;
+        }
+        closedir(dh);
     }
+
+run:
+    if (nargs == 0) { free(args); return; }
+    /* Fixup: args is final — set wrap.ctx now so pointers are valid. */
+    for (size_t i = 0; i < nargs; i++)
+        args[i].wrap.ctx = &args[i].local;
     g_scan_stop = 0;
-    parallel_for_io(agg_v2_scan_worker, workers, n, sizeof(AggV2ScanWork));
-    for (int s = 0; s < n; s++) {
-        if (workers[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
-        agg_ctx_merge(main_ctx, &workers[s].local);
-        agg_ctx_free_local(&workers[s].local);
+    parallel_for_io(agg_od_seg_worker, args, (int)nargs, sizeof(AggOdSegArg));
+    for (size_t i = 0; i < nargs; i++) {
+        if (args[i].local.budget_exceeded) main_ctx->budget_exceeded = 1;
+        agg_ctx_merge(main_ctx, &args[i].local);
+        agg_ctx_free_local(&args[i].local);
     }
-    free(workers);
+    free(args);
 }
+
 
 /* Per-shard aggregate worker: own AggCtx, processes this shard's hashes. */
 typedef struct {
@@ -24099,7 +24134,7 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             .streams = sch->streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (sdb) parallel_agg_scan_shards_v2(ctx, sdb);
+        if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
     }
 
     if (ctx->deadline->timed_out) return -1;
