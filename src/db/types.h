@@ -723,7 +723,7 @@ int load_index_fields(const char *db_root, const char *object, char fields[][256
    each indexed field at the same position. Returns the same count. Legacy
    bare lines (no :type suffix) default to IT_BTREE. */
 int load_index_types(const char *db_root, const char *object, enum IndexType *types, int max_fields);
-void invalidate_idx_cache(const char *object);
+void invalidate_idx_cache(const char *db_root, const char *object);
 
 /* Parsed index spec from a wire string or index.conf line. Centralises
    the suffix-recognition logic so create-object, add-index, and the

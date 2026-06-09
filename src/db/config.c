@@ -958,7 +958,7 @@ int load_fields_conf(const char *db_root, const char *object,
    Lines on disk are either `field` (legacy → IT_BTREE) or `field:type`. */
 #define IDX_BUCKETS 256
 struct IdxCache {
-    char name[256];
+    char name[512];
     char fields[MAX_FIELDS][256];
     enum IndexType types[MAX_FIELDS];
     int nfields;
@@ -1058,13 +1058,15 @@ static void split_index_spec(const char *line, char *name_out, size_t name_cap,
    internally. Reading index.conf happens outside the lock; insertion is
    guarded so two concurrent misses don't double-populate. */
 static int idx_cache_ensure(const char *db_root, const char *object) {
-    uint32_t hash = str_hash(object);
+    char key[512];
+    snprintf(key, sizeof(key), "%s:%s", db_root, object);
+    uint32_t hash = str_hash(key);
 
     pthread_mutex_lock(&g_idx_lock);
     for (int i = 0; i < IDX_BUCKETS; i++) {
         int slot = (hash + i) % IDX_BUCKETS;
         if (!g_idx_cache[slot].used) break;
-        if (strcmp(g_idx_cache[slot].name, object) == 0) {
+        if (strcmp(g_idx_cache[slot].name, key) == 0) {
             pthread_mutex_unlock(&g_idx_lock);
             return slot;
         }
@@ -1097,13 +1099,13 @@ static int idx_cache_ensure(const char *db_root, const char *object) {
     int return_slot = -1;
     for (int i = 0; i < IDX_BUCKETS; i++) {
         int slot = (hash + i) % IDX_BUCKETS;
-        if (g_idx_cache[slot].used && strcmp(g_idx_cache[slot].name, object) == 0) {
+        if (g_idx_cache[slot].used && strcmp(g_idx_cache[slot].name, key) == 0) {
             return_slot = slot;
             break;
         }
         if (!g_idx_cache[slot].used) {
-            strncpy(g_idx_cache[slot].name, object, 255);
-            g_idx_cache[slot].name[255] = '\0';
+            strncpy(g_idx_cache[slot].name, key, 511);
+            g_idx_cache[slot].name[511] = '\0';
             g_idx_cache[slot].nfields = count;
             for (int j = 0; j < count; j++) {
                 memcpy(g_idx_cache[slot].fields[j], tmp_fields[j], 256);
@@ -1148,13 +1150,15 @@ int load_index_types(const char *db_root, const char *object,
 }
 
 /* Invalidate index cache for an object (after add-index) */
-void invalidate_idx_cache(const char *object) {
-    uint32_t idx = str_hash(object) % IDX_BUCKETS;
+void invalidate_idx_cache(const char *db_root, const char *object) {
+    char key[512];
+    snprintf(key, sizeof(key), "%s:%s", db_root, object);
+    uint32_t idx = str_hash(key) % IDX_BUCKETS;
     pthread_mutex_lock(&g_idx_lock);
     for (int i = 0; i < IDX_BUCKETS; i++) {
         int slot = (idx + i) % IDX_BUCKETS;
         if (!g_idx_cache[slot].used) break;
-        if (strcmp(g_idx_cache[slot].name, object) == 0) {
+        if (strcmp(g_idx_cache[slot].name, key) == 0) {
             g_idx_cache[slot].used = 0;
             break;
         }
@@ -3316,7 +3320,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     int dropped = drop_indexes_for_fields(db_root, object, names, nnames);
 
     invalidate_schema_caches(db_root, object);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REMOVE-FIELD %s/%s: %d fields tombstoned, %d indexes dropped",
             db_root, object, nnames, dropped);
@@ -3404,7 +3408,7 @@ int cmd_rename_field(const char *db_root, const char *object,
 
     /* Invalidate all caches (including idx cache) */
     invalidate_schema_caches(db_root, object);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "RENAME-FIELD %s/%s: %s -> %s", db_root, object, old_name, new_name);
     OUT("{\"status\":\"renamed\",\"old\":\"%s\",\"new\":\"%s\"}\n", old_name, new_name);

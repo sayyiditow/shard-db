@@ -5741,7 +5741,7 @@ static int rebuild_object_v2(const char *db_root, const char *object,
                                            streams_changed ? new_sch->streams : 0);
 
     invalidate_schema_caches(db_root, object);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     reset_deleted_count(db_root, object);
     set_count(db_root, object, live_count);
 
@@ -6056,7 +6056,7 @@ int rebuild_object(const char *db_root, const char *object,
     }
 
     invalidate_schema_caches(db_root, object);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     reset_deleted_count(db_root, object);
     set_count(db_root, object, live_count);
 
@@ -20015,7 +20015,7 @@ int cmd_restore(const char *db_root, const char *object,
        fd+mmap per <field>/<NNN>.idx, so walk indexes/ explicitly (same
        pattern as index.c::reindex_clean_legacy). */
     fcache_invalidate(obj_dir);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     invalidate_schema_caches(db_root, object);
     {
         /* Walk indexes/<field>/ trees and drop btree cache entries for each
@@ -20353,7 +20353,7 @@ int cmd_truncate(const char *db_root, const char *object) {
         return 1;
     }
     fcache_invalidate(obj_dir);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     counts_invalidate(db_root, object);
 
     /* Drop the cached slotcask handle so the rmrf below doesn't tug on
@@ -21214,7 +21214,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     #undef FIELD_TYPE_IS
 
     /* All validation passed — invalidate caches (in case object is being recreated) */
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     char inv_path[PATH_MAX];
     snprintf(inv_path, sizeof(inv_path), "%s/%s/%s", db_root, dir, object);
     fcache_invalidate(inv_path);
@@ -21494,7 +21494,7 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
 
     fcache_invalidate(obj_dir);
     slotcask_registry_invalidate(eff_root, object);
-    invalidate_idx_cache(object);
+    invalidate_idx_cache(db_root, object);
     invalidate_schema_caches(db_root, object);
     counts_invalidate(eff_root, object);
 
