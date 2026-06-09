@@ -109,12 +109,79 @@ void odirect_init_buf_size(void)
 
 
 /* ============================================================
+ * Page-cache residency probe (Linux only)
+ * ========================================================= */
+
+#ifdef __linux__
+#include <sys/mman.h>
+
+/* Returns 1 if at least `threshold_pct` percent of the file's pages
+   are resident in the OS page cache, 0 otherwise (including any error).
+   Uses N_SAMPLES evenly-spaced page probes so the cost is O(1) regardless
+   of file size — no full mincore vec allocation.
+
+   Mechanism:
+     mmap(PROT_NONE | MAP_PRIVATE | MAP_NORESERVE) reserves virtual address
+     space without touching any physical pages.  mincore() then queries which
+     4 KB pages in that mapping are backed by the page cache.  munmap releases
+     the virtual reservation.  Total syscall cost: ~5–15 µs per file.
+
+   Conservative on error: returns 0 so the caller falls through to O_DIRECT. */
+#define OD_MINCORE_SAMPLES 8
+static int file_is_resident(const char *path, int threshold_pct)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0)
+        return 0;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    size_t sz = (size_t)st.st_size;
+    void *addr = mmap(NULL, sz, PROT_NONE,
+                      MAP_PRIVATE | MAP_NORESERVE, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) return 0;
+
+    long pgsz = sysconf(_SC_PAGESIZE);
+    if (pgsz <= 0) pgsz = 4096;
+    long total_pages = ((long)sz + pgsz - 1) / pgsz;
+
+    int resident = 0;
+    for (int i = 0; i < OD_MINCORE_SAMPLES; i++) {
+        long page_idx = (long)i * total_pages / OD_MINCORE_SAMPLES;
+        unsigned char vec = 0;
+        /* mincore on a single page at each sample offset. */
+        if (mincore((char *)addr + page_idx * pgsz,
+                    (size_t)pgsz, &vec) == 0 && (vec & 1))
+            resident++;
+    }
+    munmap(addr, sz);
+
+    return resident * 100 / OD_MINCORE_SAMPLES >= threshold_pct;
+}
+#undef OD_MINCORE_SAMPLES
+#endif /* __linux__ */
+
+
+/* ============================================================
  * Low-level helpers
  * ========================================================= */
 
 int od_open(const char *path)
 {
     int fd = -1;
+
+#ifdef __linux__
+    /* If the file is already resident in the page cache, open it buffered.
+       od_pread is plain pread() so it works on any fd.  RAM bandwidth
+       (~30–50 GB/s) far exceeds NVMe O_DIRECT bandwidth (~3–4 GB/s), so
+       skipping O_DIRECT on warm files is a strict win.
+       Threshold 80%: tolerates a few evicted pages at the edges of a large
+       file without wrongly forcing O_DIRECT. */
+    if (file_is_resident(path, 80))
+        return open(path, O_RDONLY);
+#endif
 
 #if defined(__APPLE__)
     fd = open(path, O_RDONLY);

@@ -34,9 +34,10 @@ extern size_t odirect_buf_size;
  * ------------------------------------------------------------------------- */
 
 /* Open `path` for unbuffered scanning.  Returns fd >= 0 on success.
- * Linux: tries O_DIRECT; macOS: applies F_NOCACHE.
- * On failure to enable cache-bypass (EINVAL / ENOTSUP / unsupported):
- *   silently opens buffered and applies posix_fadvise(SEQUENTIAL|DONTNEED).
+ * Linux: probes page-cache residency via mincore first; if ≥80% of sampled
+ *   pages are resident, opens buffered (RAM speed beats O_DIRECT on warm data).
+ *   Otherwise tries O_DIRECT; falls back to buffered+FADV_DONTNEED on EINVAL.
+ * macOS: applies F_NOCACHE via fcntl after open.
  * Caller cannot distinguish buffered from unbuffered — that is intentional. */
 int od_open(const char *path);
 
