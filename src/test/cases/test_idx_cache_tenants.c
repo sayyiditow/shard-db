@@ -23,9 +23,9 @@ static int test_idx_cache_tenants_run(void) {
     char *resp = NULL;
 
     /* Two tenants, same object name "products". */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"ict_alpha\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"ict_alpha\"}", &resp);
     free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"ict_beta\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"ict_beta\"}", &resp);
     free(resp); resp = NULL;
 
     /* alpha/products — index on "price" */

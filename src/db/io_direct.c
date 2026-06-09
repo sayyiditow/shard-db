@@ -191,6 +191,7 @@ typedef struct {
     int               work_pending;  /* level-triggered: 1 = worker has a job */
     int               worker_quit;   /* set by destroy to tell worker to exit  */
     int               err;           /* errno from worker I/O failure          */
+    int               single_shot;   /* 1 = file fits in buf[0]; no thread     */
 } DbCtx;
 
 /* Worker: waits for prefetch_needed, fills buf[inactive], signals prefetch_done. */
@@ -261,20 +262,29 @@ static void *prefetch_worker(void *arg)
  *   2. Call dbctx_kickoff() to start the first async prefetch into buf[1].
  *   3. Parse buf[0] (dc.active=0, dc.active_len bytes valid).
  */
-static int dbctx_init(DbCtx *c, int fd, off_t file_size)
+static int dbctx_init(DbCtx *c, int fd, off_t file_size, int single_shot)
 {
     memset(c, 0, sizeof(*c));
-    c->fd        = fd;
-    c->file_size = file_size;
-    c->active    = 0;
-    c->inactive  = 1;
-    c->state     = DBS_IDLE;
+    c->fd          = fd;
+    c->file_size   = file_size;
+    c->active      = 0;
+    c->inactive    = 1;
+    c->state       = DBS_IDLE;
+    c->single_shot = single_shot;
 
-    c->buf[0] = od_alloc_buf();
-    c->buf[1] = od_alloc_buf();
-    if (!c->buf[0] || !c->buf[1]) {
-        free(c->buf[0]); free(c->buf[1]);
-        return -ENOMEM;
+    if (single_shot) {
+        /* Allocate exactly what we need — no second buffer. */
+        size_t exact = ((size_t)file_size + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
+        if (posix_memalign((void **)&c->buf[0], ODIRECT_ALIGN, exact) != 0)
+            return -ENOMEM;
+        c->buf[1] = NULL;
+    } else {
+        c->buf[0] = od_alloc_buf();
+        c->buf[1] = od_alloc_buf();
+        if (!c->buf[0] || !c->buf[1]) {
+            free(c->buf[0]); free(c->buf[1]);
+            return -ENOMEM;
+        }
     }
 
     pthread_mutex_init(&c->lock, NULL);
@@ -283,9 +293,14 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size)
 
     /* Fill buf[0] synchronously. */
     off_t  fsz  = file_size;
-    size_t want = (fsz >= (off_t)odirect_buf_size) ? odirect_buf_size : (size_t)fsz;
-    size_t wanta = (want + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
-    if (wanta > odirect_buf_size) wanta = odirect_buf_size;
+    size_t wanta;
+    if (single_shot) {
+        wanta = ((size_t)fsz + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
+    } else {
+        size_t want = (fsz >= (off_t)odirect_buf_size) ? odirect_buf_size : (size_t)fsz;
+        wanta = (want + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
+        if (wanta > odirect_buf_size) wanta = odirect_buf_size;
+    }
 
     ssize_t got = pread(fd, c->buf[0], wanta, 0);
     if (got < 0) {
@@ -297,7 +312,7 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size)
         return -e;
     }
     c->active_len = got;
-    c->next_off   = (off_t)got;    /* worker starts from here */
+    c->next_off   = (off_t)got;
     return 0;
 }
 
@@ -322,6 +337,9 @@ static void dbctx_kickoff(DbCtx *c)
  */
 static ssize_t dbctx_swap(DbCtx *c)
 {
+    /* Single-shot: whole file was in buf[0]; no worker, no more data. */
+    if (c->single_shot) return 0;
+
     pthread_mutex_lock(&c->lock);
 
     /* Wait until worker has finished its current fill (READY or DONE). */
@@ -359,14 +377,16 @@ static ssize_t dbctx_swap(DbCtx *c)
 
 static void dbctx_destroy(DbCtx *c, pthread_t worker_tid)
 {
-    pthread_mutex_lock(&c->lock);
-    c->worker_quit  = 1;
-    c->work_pending = 1;   /* ensure worker unblocks from its wait */
-    pthread_cond_signal(&c->prefetch_needed);
-    pthread_cond_signal(&c->prefetch_done);
-    pthread_mutex_unlock(&c->lock);
+    if (!c->single_shot) {
+        pthread_mutex_lock(&c->lock);
+        c->worker_quit  = 1;
+        c->work_pending = 1;   /* ensure worker unblocks from its wait */
+        pthread_cond_signal(&c->prefetch_needed);
+        pthread_cond_signal(&c->prefetch_done);
+        pthread_mutex_unlock(&c->lock);
 
-    pthread_join(worker_tid, NULL);
+        pthread_join(worker_tid, NULL);
+    }
 
     free(c->buf[0]);
     free(c->buf[1]);
@@ -428,22 +448,28 @@ int seg_scan_o_direct(const char *seg_path, int slot_size,
 {
     if (!seg_path || slot_size < 32 || !cb) return -EINVAL;
 
+    if (odirect_buf_size == 0) odirect_init_buf_size();
+
     struct stat st;
     if (stat(seg_path, &st) != 0) return -errno;
     off_t file_size = st.st_size;
     if (file_size == 0) return 0;
 
+    /* Single-shot when the shard fits in one read — no prefetch thread needed. */
+    int single_shot = (file_size <= (off_t)odirect_buf_size);
+
     int fd = od_open(seg_path);
     if (fd < 0) return -errno;
 
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size);
+    int rc = dbctx_init(&dc, fd, file_size, single_shot);
     if (rc != 0) { close(fd); return rc; }
 
     /* Carry buffer: holds partial slot at a chunk boundary. */
     uint8_t *carry = malloc((size_t)slot_size);
     if (!carry) {
-        free(dc.buf[0]); free(dc.buf[1]);
+        if (single_shot) free(dc.buf[0]);
+        else { free(dc.buf[0]); free(dc.buf[1]); }
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
@@ -452,20 +478,22 @@ int seg_scan_o_direct(const char *seg_path, int slot_size,
     }
     int carry_len = 0;
 
-    pthread_t worker_tid;
-    if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
-        int e = errno;
-        free(carry);
-        free(dc.buf[0]); free(dc.buf[1]);
-        pthread_mutex_destroy(&dc.lock);
-        pthread_cond_destroy(&dc.prefetch_needed);
-        pthread_cond_destroy(&dc.prefetch_done);
-        close(fd);
-        return -e;
-    }
+    pthread_t worker_tid = (pthread_t)0;
+    if (!single_shot) {
+        if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
+            int e = errno;
+            free(carry);
+            free(dc.buf[0]); free(dc.buf[1]);
+            pthread_mutex_destroy(&dc.lock);
+            pthread_cond_destroy(&dc.prefetch_needed);
+            pthread_cond_destroy(&dc.prefetch_done);
+            close(fd);
+            return -e;
+        }
 
-    /* Kick off the first async prefetch of buf[1]. */
-    dbctx_kickoff(&dc);
+        /* Kick off the first async prefetch of buf[1]. */
+        dbctx_kickoff(&dc);
+    }
 
     int ret = 0;
 
@@ -577,20 +605,26 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
                              int64_t *out_count)
 {
     if (!seg_path || slot_size < 32) return -EINVAL;
+    if (odirect_buf_size == 0) odirect_init_buf_size();
+
     struct stat st;
     if (stat(seg_path, &st) != 0) return -errno;
     off_t file_size = st.st_size;
     if (file_size == 0) { *out_count = 0; return 0; }
+
+    int single_shot = (file_size <= (off_t)odirect_buf_size);
+
     int fd = od_open(seg_path);
     if (fd < 0) return -errno;
 
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size);
+    int rc = dbctx_init(&dc, fd, file_size, single_shot);
     if (rc != 0) { close(fd); return rc; }
 
     uint8_t *carry = malloc((size_t)slot_size);
     if (!carry) {
-        free(dc.buf[0]); free(dc.buf[1]);
+        if (single_shot) free(dc.buf[0]);
+        else { free(dc.buf[0]); free(dc.buf[1]); }
         pthread_mutex_destroy(&dc.lock);
         pthread_cond_destroy(&dc.prefetch_needed);
         pthread_cond_destroy(&dc.prefetch_done);
@@ -599,18 +633,20 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
     }
     int carry_len = 0;
 
-    pthread_t worker_tid;
-    if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
-        int e = errno;
-        free(carry);
-        free(dc.buf[0]); free(dc.buf[1]);
-        pthread_mutex_destroy(&dc.lock);
-        pthread_cond_destroy(&dc.prefetch_needed);
-        pthread_cond_destroy(&dc.prefetch_done);
-        close(fd);
-        return -e;
+    pthread_t worker_tid = (pthread_t)0;
+    if (!single_shot) {
+        if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
+            int e = errno;
+            free(carry);
+            free(dc.buf[0]); free(dc.buf[1]);
+            pthread_mutex_destroy(&dc.lock);
+            pthread_cond_destroy(&dc.prefetch_needed);
+            pthread_cond_destroy(&dc.prefetch_done);
+            close(fd);
+            return -e;
+        }
+        dbctx_kickoff(&dc);
     }
-    dbctx_kickoff(&dc);
 
     int ret = 0;
     int64_t local_count = 0;
@@ -2609,7 +2645,7 @@ int btree_leaf_scan_o_direct(const char *btree_path,
      * next chunk before parsing.  Same pattern as seg_scan_o_direct.
      */
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size);
+    int rc = dbctx_init(&dc, fd, file_size, 0);
     if (rc != 0) { close(fd); return rc; }
 
     uint8_t *carry = malloc((size_t)page_sz);
