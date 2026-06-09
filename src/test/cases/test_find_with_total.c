@@ -164,7 +164,7 @@ static int test_find_with_total_empty(void) {
 }
 TEST_REGISTER("test-find-with-total-empty", test_find_with_total_empty)
 
-/* find with "total":true AND "cursor":{} → error (mutually exclusive) */
+/* find with "total":true AND "cursor":{} → now allowed (mutual exclusion lifted) */
 static int test_find_total_cursor_conflict(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "fwt4",
@@ -179,9 +179,8 @@ static int test_find_total_cursor_conflict(void) {
         "\"total\":true,\"cursor\":{}}",
         &resp);
     ASSERT_NOT_NULL(resp, "total+cursor response not null");
-    ASSERT_CONTAINS(resp, "\"error\"", "total+cursor → error response");
-    ASSERT_CONTAINS(resp, "mutually exclusive",
-                    "total+cursor → mentions mutually exclusive");
+    ASSERT_TRUE(strstr(resp, "mutually exclusive") == NULL,
+                "total+cursor → no longer an error");
     free(resp);
 
     tc_close(tc); test_env_stop(&env);

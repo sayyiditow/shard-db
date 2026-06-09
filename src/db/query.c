@@ -18204,17 +18204,6 @@ int cmd_find(const char *db_root, const char *object,
 
     compile_criteria_tree(tree, driver_fs.ts);
 
-    /* Mutual exclusion: total and cursor conflict — cursor implies streaming
-       pagination with a continuation token; total implies a fixed-page count.
-       Reject early so neither path has to handle the combination. */
-    if (want_total && cursor_json && cursor_json[0] &&
-        strcmp(cursor_json, "null") != 0) {
-        OUT("{\"error\":\"\\\"total\\\" and \\\"cursor\\\" are mutually exclusive\"}\n");
-        free_joins(joins, njoins);
-        free_criteria_tree(tree);
-        free_excluded(&excluded);
-        return -1;
-    }
 
     /* total+csv is not supported (CSV has no envelope to wrap). */
     if (want_total && csv_delim) {
@@ -18340,8 +18329,12 @@ int cmd_find(const char *db_root, const char *object,
            null cursor and return. */
         if (cursor_prefilter_ks &&
             keyset_size(cursor_prefilter_ks) == 0) {
-            OUT(dict_fmt ? "{\"rows\":{},\"cursor\":null}\n"
-                         : "{\"rows\":[],\"cursor\":null}\n");
+            if (want_total)
+                OUT(dict_fmt ? "{\"rows\":{},\"cursor\":null,\"total\":0}\n"
+                             : "{\"rows\":[],\"cursor\":null,\"total\":0}\n");
+            else
+                OUT(dict_fmt ? "{\"rows\":{},\"cursor\":null}\n"
+                             : "{\"rows\":[],\"cursor\":null}\n");
             keyset_free(cursor_prefilter_ks);
             free_joins(joins, njoins);
             free_criteria_tree(tree);
@@ -18583,12 +18576,24 @@ int cmd_find(const char *db_root, const char *object,
                 OUT(dict_fmt ? "}" : "]");
                 if (cc.printed >= limit && cc.last_value_str
                     && cc.last_key_str) {
-                    OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}}",
+                    OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}",
                         order_by, cc.last_value_str, cc.last_key_str);
                 } else {
-                    OUT(",\"cursor\":null}");
+                    OUT(",\"cursor\":null");
                 }
-                OUT("\n");
+                if (want_total) {
+                    FilterPlan count_fp = plan_filter(tree, db_root, object,
+                        &driver_fs, sch.splits, cursor_N_live,
+                        NULL, 0 /*fetching*/, 0 /*limit*/);
+                    int tnull = 1;
+                    size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
+                                                     object, &sch, &driver_fs,
+                                                     &cdl, &tnull);
+                    if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
+                    if (tnull) OUT(",\"total\":null");
+                    else       OUT(",\"total\":%zu", ctotal);
+                }
+                OUT("}\n");
                 free(sp_rows);
                 free(cc.last_value_str);
                 free(cc.last_key_str);
@@ -18668,12 +18673,24 @@ int cmd_find(const char *db_root, const char *object,
         /* Emit next-page cursor if we actually hit the limit (there might be
            more). If printed < limit the walk drained to the end → null. */
         if (cc.printed >= limit && cc.last_value_str && cc.last_key_str) {
-            OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}}",
+            OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}",
                 order_by, cc.last_value_str, cc.last_key_str);
         } else {
-            OUT(",\"cursor\":null}");
+            OUT(",\"cursor\":null");
         }
-        OUT("\n");
+        if (want_total) {
+            FilterPlan count_fp = plan_filter(tree, db_root, object,
+                &driver_fs, sch.splits, cursor_N_live,
+                NULL, 0 /*fetching*/, 0 /*limit*/);
+            int tnull = 1;
+            size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
+                                             object, &sch, &driver_fs,
+                                             &cdl, &tnull);
+            if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
+            if (tnull) OUT(",\"total\":null");
+            else       OUT(",\"total\":%zu", ctotal);
+        }
+        OUT("}\n");
 
         if (cursor_prefilter_ks) keyset_free(cursor_prefilter_ks);
         free(cc.last_value_str);
