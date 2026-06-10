@@ -18031,10 +18031,13 @@ static int bulk_delete_phase1_indexed(const char *db_root, const char *object,
  * Sets *out_null = 0 + returns the count when computed; *out_null = 1
  * + returns 0 when we can't cheaply compute (e.g. FP_FULL_SCAN, or
  * postfilter-bearing plans where the count would need a full recheck). */
+/* hint_ks: when non-NULL and the plan is FP_PRIMARY_LEAF+postfilter, borrow this
+   pre-built KeySet instead of re-walking the primary index.  Caller retains ownership. */
 static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
                                const char *db_root, const char *object,
                                const Schema *sch, FieldSchema *fs,
-                               QueryDeadline *dl, int *out_null) {
+                               QueryDeadline *dl, int *out_null,
+                               KeySet *hint_ks) {
     (void)tree;
     *out_null = 1;
     if (!fp || dl->timed_out) return 0;
@@ -18090,7 +18093,33 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
         if (fp->order == FP_ORDER_COMPOSITE_EXACT) return 0;
         if (fp->order == FP_ORDER_COMPOSITE && tree && tree->kind != CNODE_LEAF)
             return 0;
-        if (fp->n_source == 0 || fp->n_postfilter != 0) return 0;
+        if (fp->n_source == 0) return 0;
+        if (fp->n_postfilter != 0) {
+            /* Count via KeySet + full-tree verify.  Prefer hint_ks (built by
+               cursor path) to avoid re-walking the primary index. */
+            KeySet *ks = hint_ks;
+            int built = 0;
+            if (!ks) {
+                ks = build_keyset_from_leaf(db_root, object, sch->splits,
+                                            fp->source_leaves[0], dl);
+                built = 1;
+            }
+            if (!ks || dl->timed_out) { if (built && ks) keyset_free(ks); return 0; }
+            CollectedHash *entries = NULL; size_t nh = 0;
+            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
+            size_t n = 0;
+            if (entries && tree) {
+                n = parallel_indexed_count(db_root, object, sch,
+                                           entries, (int)nh,
+                                           tree, fs, dl, fp);
+                if (!dl->timed_out) *out_null = 0;
+            } else if (entries && !tree) {
+                n = nh; *out_null = 0;
+            }
+            free(entries);
+            if (built) keyset_free(ks);
+            return n;
+        }
         size_t n = idx_count_for_leaf(db_root, object, sch, fs,
                                       fp->source_leaves[0], dl);
         if (!dl->timed_out) *out_null = 0;
@@ -18588,7 +18617,8 @@ int cmd_find(const char *db_root, const char *object,
                     int tnull = 1;
                     size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
                                                      object, &sch, &driver_fs,
-                                                     &cdl, &tnull);
+                                                     &cdl, &tnull,
+                                                     cursor_prefilter_ks);
                     if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
                     if (tnull) OUT(",\"total\":null");
                     else       OUT(",\"total\":%zu", ctotal);
@@ -18685,7 +18715,8 @@ int cmd_find(const char *db_root, const char *object,
             int tnull = 1;
             size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
                                              object, &sch, &driver_fs,
-                                             &cdl, &tnull);
+                                             &cdl, &tnull,
+                                             cursor_prefilter_ks);
             if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
             if (tnull) OUT(",\"total\":null");
             else       OUT(",\"total\":%zu", ctotal);
@@ -18781,7 +18812,7 @@ int cmd_find(const char *db_root, const char *object,
             proj_fields, proj_count, dict_fmt, &dl);
         size_t ex_total = 0; int ex_null = 1;
         if (want_total) ex_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &ex_null);
+                                                    &sch, &driver_fs, &dl, &ex_null, NULL);
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (ex_null) OUT("},\"total\":null}\n");
@@ -18813,7 +18844,7 @@ int cmd_find(const char *db_root, const char *object,
          * consolidates it into the find round-trip). */
         size_t d1_total = 0; int d1_null = 1;
         if (want_total) d1_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d1_null);
+                                                    &sch, &driver_fs, &dl, &d1_null, NULL);
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (d1_null) OUT("},\"total\":null}\n");
@@ -18852,7 +18883,7 @@ int cmd_find(const char *db_root, const char *object,
          * compute the real match count via fp_compute_total. */
         size_t d3_total = 0; int d3_null = 1;
         if (want_total) d3_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d3_null);
+                                                    &sch, &driver_fs, &dl, &d3_null, NULL);
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (d3_null) OUT("},\"total\":null}\n");
@@ -19588,7 +19619,7 @@ int cmd_find(const char *db_root, const char *object,
         if (find_total_null && !dl.timed_out) {
             int helper_null = 1;
             size_t n = fp_compute_total(&fp, tree, db_root, object,
-                                         &sch, &driver_fs, &dl, &helper_null);
+                                         &sch, &driver_fs, &dl, &helper_null, NULL);
             if (!helper_null) {
                 find_total = n;
                 find_total_null = 0;
