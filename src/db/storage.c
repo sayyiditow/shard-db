@@ -50,11 +50,7 @@ void build_idx_path(char *buf, size_t buflen,
    refactor — for now a single mutex is correct and cheap: cache ops
    hit no I/O on warm hits and run in microseconds, so global
    serialisation is not visible in profiles. */
-static UCacheEntry     *g_ucache = NULL;
-static int              g_ucache_slots = 0;
-static int              g_ucache_count = 0;
-static pthread_mutex_t  g_ucache_table_mutex;
-static volatile uint64_t g_ucache_clock = 0;  /* monotonic counter for LRU */
+/* g_ucache* moved to ShardDb struct */
 
 uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     uint8_t *p = mmap(addr, len, prot, flags, fd, off);
@@ -113,6 +109,24 @@ void fcache_shutdown(void) {
     g_ucache = NULL;
     g_ucache_slots = 0;
     g_ucache_count = 0;
+}
+
+void ucache_shutdown(void) {
+    pthread_mutex_lock(&g_ucache_table_mutex);
+    if (g_ucache) {
+        for (int i = 0; i < g_ucache_slots; i++) {
+            UCacheEntry *e = &g_ucache[i];
+            if (e->map && e->map_size)
+                munmap(e->map, e->map_size);
+            if (e->fd >= 0)
+                close(e->fd);
+        }
+        free(g_ucache);
+        g_ucache = NULL;
+        g_ucache_slots = 0;
+        g_ucache_count = 0;
+    }
+    pthread_mutex_unlock(&g_ucache_table_mutex);
 }
 
 /* Probe hash table for path. Returns slot index, or -1 if the table is
@@ -718,19 +732,9 @@ static void counts_write_locked(const char *cpath, int live, int del) {
  * server stop, plus opportunistically every FLUSH_INTERVAL atomic
  * updates). Counts may be slightly stale on crash; recount rebuilds.
  */
-typedef struct {
-    char             path[PATH_MAX];
-    _Atomic int64_t  live;
-    _Atomic int64_t  deleted;
-    _Atomic uint64_t pending_writes;   /* atomic ops since last flush */
-    _Atomic int      used;             /* atomic so the lookup hot path can be lock-free */
-} CountsCacheEntry;
-
-#define COUNTS_CACHE_BUCKETS 1024
+/* CountsCacheEntry, COUNTS_CACHE_BUCKETS moved to shard_db_internal.h;
+   g_counts_cache, g_counts_lock moved to ShardDb struct */
 #define COUNTS_FLUSH_INTERVAL 10000   /* atomic updates between auto-flushes */
-
-static CountsCacheEntry g_counts_cache[COUNTS_CACHE_BUCKETS];
-static pthread_mutex_t  g_counts_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned counts_hash_path(const char *p) {
     unsigned h = 5381;

@@ -17,7 +17,7 @@
    0 = empty slot (can write here)
   -1 = tombstone (deleted, can write here on insert, skip on get)
   -2 = occupied by different key (continue probing) */
-_Atomic int g_scan_stop = 0; /* shared stop flag for parallel scan */
+/* g_scan_stop moved to ShardDb struct */
 
 void scan_one_shard(const char *binpath, int slot_size,
                            scan_callback cb, void *ctx) {

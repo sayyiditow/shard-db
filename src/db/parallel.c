@@ -194,6 +194,7 @@ static void run_task_finish(PoolTask t) {
 
 static void *pool_worker(void *arg) {
     (void)arg;
+    g_db = g_shard_db_instance;
     while (1) {
         pthread_mutex_lock(&g_q_lock);
         while (g_q_count == 0 && g_pool_running)
@@ -361,6 +362,7 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
    parallel_for_io can detect nested calls and help-drain. */
 static void *io_pool_worker(void *arg) {
     (void)arg;
+    g_db = g_shard_db_instance;
     while (1) {
         pthread_mutex_lock(&g_io_q_lock);
         while (g_io_q_count == 0 && g_io_running)

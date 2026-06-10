@@ -6,6 +6,7 @@
 
 #ifdef TEST_BUILD
 extern void test_reset_caches(void);
+extern void test_init_process_db(void);  /* ensures g_db is set for in-process tests */
 #endif
 
 __thread TestCtx *t_ctx = NULL;
@@ -32,6 +33,9 @@ static int run_case(const TestCaseEntry *tc) {
     TestCtx ctx = { .name = tc->name };
     t_ctx = &ctx;
     printf("# %s\n", tc->name);
+#ifdef TEST_BUILD
+    test_init_process_db();
+#endif
     int rc = tc->fn();
     if (rc != 0 && ctx.failed == 0) ctx.failed = 1; /* fn signalled fail without assert */
     printf("# %s: %d passed, %d failed\n", tc->name, ctx.passed, ctx.failed);
@@ -54,6 +58,9 @@ int test_run_all(const char *filter) {
         TestCtx ctx = { .name = p->name };
         t_ctx = &ctx;
         printf("# %s\n", p->name);
+#ifdef TEST_BUILD
+        test_init_process_db();
+#endif
         int rc = p->fn();
         if (rc != 0 && ctx.failed == 0) ctx.failed = 1;
         total_fail += ctx.failed;

@@ -40,11 +40,7 @@ static uint32_t str_hash(const char *s) {
 }
 
 /* --- IP allowlist: hash set, loaded from $DB_ROOT/allowed_ips.conf --- */
-#define IP_SET_BUCKETS 128
-static char g_ip_set[IP_SET_BUCKETS][46];
-static int g_ip_set_used[IP_SET_BUCKETS];
-int g_ip_set_count = 0;
-static pthread_mutex_t g_ip_lock = PTHREAD_MUTEX_INITIALIZER;
+/* IP_SET_BUCKETS, g_ip_set*, g_ip_lock moved to ShardDb struct */
 
 static void ip_set_add(const char *ip) {
     uint32_t idx = str_hash(ip) % IP_SET_BUCKETS;
@@ -131,13 +127,7 @@ int is_ip_trusted(const char *ip) {
    perm) — on lookup we match the request's (dir, obj) against the slot's
    scope after the string compare. Five parallel heap arrays sized at startup
    from g_token_cap. --- */
-static char   (*g_token_set)[256]       = NULL;
-static char   (*g_token_scope)[256]     = NULL;   /* "" = global, else dir */
-static char   (*g_token_scope_obj)[256] = NULL;   /* "" = dir-or-global, else object */
-static uint8_t *g_token_perm            = NULL;   /* PERM_R / PERM_RW / PERM_RWX */
-static int     *g_token_set_used        = NULL;
-int g_token_count = 0;
-static pthread_mutex_t g_token_lock = PTHREAD_MUTEX_INITIALIZER;
+/* g_token_set*, g_token_count, g_token_lock moved to ShardDb struct */
 
 static void token_store_init(void) {
     if (g_token_set) return;
@@ -1836,6 +1826,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 _Atomic int server_running = 1;
 _Atomic int active_threads = 0;
 _Atomic int in_flight_writes = 0;    /* write/schema modes; shutdown waits for these */
+
+ShardDb *g_shard_db_instance = NULL; /* set by cmd_server before threads spawn */
 pthread_mutex_t thread_count_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Per-worker active client fd (indexed by worker id; -1 = idle). On SIGTERM
@@ -2152,6 +2144,10 @@ void *worker_thread(void *arg) {
         pthread_mutex_lock(&thread_count_lock);
         active_threads++;
         pthread_mutex_unlock(&thread_count_lock);
+
+        /* Bind thread-local g_db to the server-wide instance so all
+           g_* macros work during request dispatch. */
+        g_db = g_shard_db_instance;
 
         /* Get client IP for auth decisions */
         struct sockaddr_in peer_addr;
@@ -2474,6 +2470,9 @@ static void warmup_collect_idx(const char *dir, const char **ext_list,
 static void *warmup_thread(void *arg) {
     WarmupArg *a = (WarmupArg *)arg;
 
+    /* Bind thread-local g_db so all g_* macros work. */
+    g_db = g_shard_db_instance;
+
     /* g_out only matters if the warmup ever emitted via OUT(); it doesn't.
        But pool worker threads (which this one is NOT) carry __thread g_out
        state, so we set it defensively in case any helper we call adopts
@@ -2581,6 +2580,9 @@ done_collect:
 
 static void *auto_vacuum_thread(void *arg) {
     AutoVacuumArg *a = (AutoVacuumArg *)arg;
+
+    /* Bind thread-local g_db so all g_* macros work. */
+    g_db = g_shard_db_instance;
 
     /* Discard cmd_vacuum's JSON output — there's no client connection.
        /dev/null open failure shouldn't kill the thread; fall back to
@@ -2821,6 +2823,17 @@ static int validate_metadata(const char *db_root) {
 }
 
 int cmd_server(const char *db_root, int daemonize) {
+    /* Allocate and initialise the ShardDb instance. Must happen before
+       any code that uses g_* macros (which are now field accesses via
+       the thread-local g_db pointer). */
+    g_shard_db_instance = shard_db_open_internal(db_root);
+    if (!g_shard_db_instance) {
+        fprintf(stderr, "shard-db: shard_db_open_internal failed for DB_ROOT=%s\n",
+                db_root);
+        return 1;
+    }
+    g_db = g_shard_db_instance;
+
     int port = g_port;
 
     /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
@@ -3280,9 +3293,11 @@ static int ensure_tls_client_ctx(void) {
     if (g_tls_client_ctx) return 0;
     if (tried) return -1;
     tried = 1;
-    if (g_tls_skip_verify)
+    int skip_verify = g_db ? g_tls_skip_verify : 0;
+    const char *ca   = g_db ? g_tls_ca        : "";
+    if (skip_verify)
         fprintf(stderr, "WARN: TLS_SKIP_VERIFY=1 — server certificate is NOT verified (development only)\n");
-    return tls_client_init(g_tls_ca, g_tls_skip_verify);
+    return tls_client_init(ca, skip_verify);
 }
 
 static int client_connect(int port, ClientConn *c) {
@@ -3298,7 +3313,7 @@ static int client_connect(int port, ClientConn *c) {
         close(sfd); return -1;
     }
     c->fd = sfd;
-    if (g_tls_enable) {
+    if (g_db && g_tls_enable) {
         if (ensure_tls_client_ctx() != 0) { close(sfd); c->fd = -1; return -1; }
         const char *server_name = getenv("TLS_SERVER_NAME");
         if (!server_name || !*server_name) server_name = "localhost";

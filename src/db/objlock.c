@@ -13,28 +13,15 @@
    name.
 */
 
-#define OBJLOCK_BUCKETS 256
-
-typedef struct {
-    char name[512];          /* "db_root:object" */
-    pthread_rwlock_t rwlock;
-    /* _Atomic: the fast-path lockless probe reads `used` without holding
-       the table mutex. Slow-path publication does strncpy(name) +
-       rwlock_init then atomic_store_release(used,1); fast-path
-       atomic_load_acquire(used)==1 synchronises-with that store, so
-       strcmp on `name` sees the fully-written bytes. Without this, TSan
-       flags both used and name as racy. */
-    _Atomic int used;
-} ObjLockEntry;
-
-static ObjLockEntry g_objlocks[OBJLOCK_BUCKETS];
-static pthread_mutex_t g_objlock_table_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ObjLockEntry + OBJLOCK_BUCKETS moved to shard_db_internal.h;
+   g_objlocks, g_objlock_table_lock moved to ShardDb struct */
 
 static uint32_t obj_str_hash(const char *s) {
     return (uint32_t)XXH3_64bits(s, strlen(s));
 }
 
 void objlock_init(void) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
     for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
         atomic_init(&g_objlocks[i].used, 0);
         g_objlocks[i].name[0] = '\0';
@@ -45,6 +32,7 @@ void objlock_init(void) {
    the table is completely full (OBJLOCK_BUCKETS objects), which would
    mean thousands of distinct objects — not a realistic scenario. */
 static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
     char key[512];
     snprintf(key, sizeof(key), "%s:%s", db_root, object);
     uint32_t idx = obj_str_hash(key) % OBJLOCK_BUCKETS;

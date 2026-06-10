@@ -2,100 +2,7 @@
 
 /* ========== Config ========== */
 
-uint32_t g_timeout = 30;
-int g_port = 9199;
-int g_workers = 0;      /* 0 = auto (nproc, min 4) — server thread pool */
-/* g_max_threads (+ parallel_threads getter) and g_pool_chunk live in
-   parallel.c so test/bench binaries that link parallel.c without
-   config.c don't get an undefined symbol at link time. config.c still
-   writes g_max_threads when parsing db.env (extern).
-
-   I/O thread pool size (IO_THREADS in db.env). 0 = auto (2 × nproc).
-   Defined here so config.c's parse loop can set it; declared extern in
-   types.h. parallel.c reads it at init time. */
-int g_io_threads = 0;
-int g_index_page_size = 4096;
-int g_global_limit = 100000;
-int g_max_request_size = 33554432; /* 32 MB default, configurable via MAX_REQUEST_SIZE */
-/* MAX_CONCURRENT_QUERIES — hard cap on simultaneously-running queries.
-   When the cap is reached, additional requests get an immediate
-   {"error":"server at capacity"} response so clients can retry. Bounded
-   concurrency means worst-case query RAM = max_concurrent × QUERY_BUFFER_MB
-   is predictable, which is the prerequisite for sane sizing on multi-
-   tenant deployments. 0 = auto, resolved at cmd_server startup to
-   max(4, min(nproc, 32)). */
-int g_max_concurrent_queries = 0;
-int g_fcache_cap = 4096;        /* shard mmap cache capacity, configurable via FCACHE_MAX
-                                   to one of {4096, 8192, 12288, 16384} */
-int g_btcache_cap = 1024;       /* B+ tree mmap cache capacity = g_fcache_cap / 4
-                                   (derived, not separately configurable) */
-/* 256 MB default — conservative cap that fits comfortably even with
-   MAX_CONCURRENT_QUERIES at its auto ceiling (32). cmd_server detects
-   the unchanged-default case and auto-tunes upward IF the per-slot
-   share of (25% of RAM, 4 GB cap) is bigger — i.e. when slot count
-   is low and host RAM is generous. Worst-case RAM for query buffers
-   stays bounded by max_concurrent × QUERY_BUFFER_MB regardless. */
-size_t g_query_buffer_max_bytes = 256ULL * 1024 * 1024;
-/* 1 GiB default keeps reindex memory bounded on modest VPS shapes. Big
-   prod servers with lots of indexed fields can raise this to fit more
-   fields per scan pass (INDEX_BUILD_BUDGET_MB in db.env). */
-size_t g_index_build_budget_bytes = 1024ULL * 1024 * 1024;
-int g_disable_localhost_trust = 0; /* default: 127.0.0.1/::1 bypass auth. Set via DISABLE_LOCALHOST_TRUST=1 for strict mode. */
-int g_token_cap = 1024;            /* token table bucket count, configurable via TOKEN_CAP (floor 64, ceiling 1M) */
 _Thread_local uint32_t g_request_timeout_ms = 0;  /* per-request override; 0 = use g_timeout */
-
-/* Native TLS — defaults: disabled. db.env opts in via TLS_ENABLE=1.
-   When enabled, both the daemon and the CLI speak TLS 1.3 only. */
-int g_tls_enable = 0;
-int g_tls_skip_verify = 0;
-char g_tls_cert[PATH_MAX] = {0};
-char g_tls_key[PATH_MAX] = {0};
-char g_tls_ca[PATH_MAX] = {0};
-
-/* Monitoring counters */
-uint64_t g_ucache_hits = 0;
-uint64_t g_ucache_misses = 0;
-uint64_t g_bt_cache_hits = 0;
-uint64_t g_bt_cache_misses = 0;
-uint64_t g_server_start_ms = 0;
-uint64_t g_slow_query_count = 0;
-int g_slow_query_ms = 500;  /* configurable via SLOW_QUERY_MS */
-int g_random_seq_ratio = 8;  /* configurable via RANDOM_SEQ_COST_RATIO */
-
-/* vacuum-check thresholds — drive the "vacuum":true recommendation in
-   `vacuum-check` AND the auto-vacuum thread's selection logic (one source
-   of truth). Defaults match the historic hardcoded values. */
-int g_vacuum_recommend_pct = 10;          /* tombstones / total ≥ N% */
-int g_vacuum_recommend_min_deleted = 1000;/* AND deleted ≥ N */
-
-/* Auto-vacuum thread — opt-in. When AUTO_VACUUM=1, a background thread
-   wakes every g_auto_vacuum_interval_sec, calls vacuum-check's selection
-   pass, and runs plain vacuum on candidates. NEVER auto-runs --compact
-   or --splits (both are heavy + need exclusive objlock). */
-int g_auto_vacuum_enable = 0;
-int g_auto_vacuum_interval_sec = 3600;
-
-/* Startup warmup — pulls every kf header + index shard file (.idx/.bm/.tg)
-   into the OS page cache on daemon start so the first user query doesn't
-   pay a cold disk read.
-   Modes:
-     async (default) — daemon accepts connections immediately, warmup runs
-                       in a detached background thread. First queries that
-                       race ahead of the warmup still pay cold cost for
-                       whatever the thread hasn't reached yet, but the
-                       wall-clock time to fully-warm drops drastically
-                       because the warmup runs in parallel with serving.
-     sync            — block startup until warmup completes. Restart blocks
-                       the listening socket for the full warmup time;
-                       useful for "warm before serving" production posture.
-     off             — no warmup. Lazy cold reads as before.
-   Stream segment files are intentionally NOT touched — they can be GBs
-   on populated objects and warming them all evicts the small/medium index
-   files that drive every find. Segs get warmed naturally by first queries. */
-char g_warmup_mode[16] = "async";
-SlowQueryEntry g_slow_queries[SLOW_QUERY_RING] = {0};
-int g_slow_query_head = 0;
-pthread_mutex_t g_slow_query_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t now_ms(void) {
     struct timespec ts;
@@ -122,13 +29,11 @@ extern char g_log_dir[PATH_MAX];
 
 /* log_slow_query — defined after LogEntry/ring declarations below. */
 __thread FILE *g_out = NULL;    /* per-thread output; init to stdout in main() */
-char g_db_root[PATH_MAX] = {0};
+/* g_db_root, g_log_level, g_log_retain_days — moved to ShardDb struct */
 
 /* Async logging — ring buffer + background flush thread (tinylog style)
    Two log files: info-YYYY-MM-DD.log and error-YYYY-MM-DD.log
    Levels: 0=off, 1=error, 2=warn, 3=info (writes), 4=debug (reads) */
-int g_log_level = 3;
-int g_log_retain_days = 7;
 
 #define LOG_RING_SIZE 8192
 #define LOG_MSG_MAX   4096
@@ -186,7 +91,7 @@ void purge_old_logs(void) {
 }
 
 void *log_writer_thread(void *arg) {
-    (void)arg;
+    g_db = (ShardDb *)arg;
     int flush_counter = 0;
     while (atomic_load_explicit(&g_log_running, memory_order_acquire) ||
            g_log_head != g_log_tail) {
@@ -252,7 +157,7 @@ void log_init(const char *db_root) {
         snprintf(g_log_dir, sizeof(g_log_dir), "%s/logs", db_root);
     mkdirp(g_log_dir);
     atomic_store_explicit(&g_log_running, 1, memory_order_release);
-    db_thread_create(&g_log_thread, log_writer_thread, NULL);
+    db_thread_create(&g_log_thread, log_writer_thread, g_db);
     purge_old_logs();
 }
 
@@ -414,12 +319,12 @@ int load_db_root(char *out, size_t outlen) {
             char *end = p + strlen(p) - 1;
             while (end > p && (*end == '\n' || *end == '\r' || *end == '"')) *end-- = '\0';
             snprintf(out, outlen, "%s", p);
-            snprintf(g_db_root, sizeof(g_db_root), "%s", p);
+            if (g_db) snprintf(g_db_root, sizeof(g_db_root), "%s", p);
             found_root = 1;
         } else if (strncmp(p, "TIMEOUT=", 8) == 0) {
-            g_timeout = (uint32_t)atoi(p + 8);
+            if (g_db) g_timeout = (uint32_t)atoi(p + 8);
         } else if (strncmp(p, "PORT=", 5) == 0) {
-            g_port = atoi(p + 5);
+            if (g_db) g_port = atoi(p + 5);
         } else if (strncmp(p, "LOG_DIR=", 8) == 0) {
             p += 8;
             if (*p == '"' || *p == '\'') p++;
@@ -427,12 +332,14 @@ int load_db_root(char *out, size_t outlen) {
             while (end2 > p && (*end2 == '\n' || *end2 == '\r' || *end2 == '"' || *end2 == '\'')) *end2-- = '\0';
             snprintf(g_log_dir, sizeof(g_log_dir), "%s", p);
         } else if (strncmp(p, "LOG_LEVEL=", 10) == 0) {
-            g_log_level = atoi(p + 10);
+            if (g_db) g_log_level = atoi(p + 10);
         } else if (strncmp(p, "LOG_RETAIN_DAYS=", 16) == 0) {
-            g_log_retain_days = atoi(p + 16);
+            if (g_db) g_log_retain_days = atoi(p + 16);
         } else if (strncmp(p, "INDEX_PAGE_SIZE=", 16) == 0) {
             int ps = atoi(p + 16);
-            if (ps >= 1024 && ps <= 65536) g_index_page_size = ps;
+            if (ps >= 1024 && ps <= 65536) {
+                if (g_db) g_index_page_size = ps;
+            }
         } else if (strncmp(p, "THREADS=", 8) == 0) {
             g_max_threads = atoi(p + 8);
         } else if (strncmp(p, "IO_THREADS=", 11) == 0) {
@@ -440,89 +347,88 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "POOL_CHUNK=", 11) == 0) {
             g_pool_chunk = atoi(p + 11);
         } else if (strncmp(p, "WORKERS=", 8) == 0) {
-            g_workers = atoi(p + 8);
+            if (g_db) g_workers = atoi(p + 8);
         } else if (strncmp(p, "GLOBAL_LIMIT=", 13) == 0) {
-            g_global_limit = atoi(p + 13);
+            if (g_db) g_global_limit = atoi(p + 13);
         } else if (strncmp(p, "MAX_CONCURRENT_QUERIES=", 23) == 0) {
-            g_max_concurrent_queries = atoi(p + 23);
-            if (g_max_concurrent_queries < 0) g_max_concurrent_queries = 0;
+            if (g_db) {
+                g_max_concurrent_queries = atoi(p + 23);
+                if (g_max_concurrent_queries < 0) g_max_concurrent_queries = 0;
+            }
         } else if (strncmp(p, "MAX_REQUEST_SIZE=", 17) == 0) {
             int sz = atoi(p + 17);
-            if (sz >= 1024) g_max_request_size = sz;
+            if (sz >= 1024 && g_db) g_max_request_size = sz;
         } else if (strncmp(p, "FCACHE_MAX=", 11) == 0) {
-            /* Strict allow-list: FCACHE_MAX ∈ {4096, 8192, 12288, 16384}
-               (4096 × N for N=1..4). BT_CACHE_MAX is derived (FCACHE_MAX/4),
-               so a single config value tunes both caches consistently. */
             int n = atoi(p + 11);
             if (n == 4096 || n == 8192 || n == 12288 || n == 16384) {
-                g_fcache_cap = n;
+                if (g_db) g_fcache_cap = n;
             } else {
                 fprintf(stderr,
                     "config: FCACHE_MAX=%d is not in {4096, 8192, 12288, 16384}; "
                     "falling back to default 4096.\n", n);
-                g_fcache_cap = 4096;
+                if (g_db) g_fcache_cap = 4096;
             }
-            g_btcache_cap = g_fcache_cap / 4;
+            if (g_db) g_btcache_cap = g_fcache_cap / 4;
         } else if (strncmp(p, "BT_CACHE_MAX=", 13) == 0) {
-            /* Ignored as of 2026.05.1 — BT_CACHE_MAX is derived from
-               FCACHE_MAX/4. Warn so users notice the change. */
-            fprintf(stderr,
+            if (g_db) fprintf(stderr,
                 "config: BT_CACHE_MAX is no longer configurable as of 2026.05.1 — "
                 "it is derived as FCACHE_MAX/4. Setting ignored.\n");
         } else if (strncmp(p, "QUERY_BUFFER_MB=", 16) == 0) {
             long mb = atol(p + 16);
-            if (mb >= 1 && mb <= 1048576)  /* 1 MB floor, 1 TB ceiling */
+            if (mb >= 1 && mb <= 1048576 && g_db)
                 g_query_buffer_max_bytes = (size_t)mb * 1024 * 1024;
         } else if (strncmp(p, "INDEX_BUILD_BUDGET_MB=", 22) == 0) {
             long mb = atol(p + 22);
-            if (mb >= 64 && mb <= 1048576)  /* 64 MB floor, 1 TB ceiling */
+            if (mb >= 64 && mb <= 1048576 && g_db)
                 g_index_build_budget_bytes = (size_t)mb * 1024 * 1024;
         } else if (strncmp(p, "DISABLE_LOCALHOST_TRUST=", 24) == 0) {
-            g_disable_localhost_trust = (atoi(p + 24) != 0);
+            if (g_db) g_disable_localhost_trust = (atoi(p + 24) != 0);
         } else if (strncmp(p, "TOKEN_CAP=", 10) == 0) {
             int n = atoi(p + 10);
-            if (n >= 64 && n <= 1048576) g_token_cap = n;
+            if (n >= 64 && n <= 1048576 && g_db) g_token_cap = n;
         } else if (strncmp(p, "SLOW_QUERY_MS=", 14) == 0) {
             int n = atoi(p + 14);
-            if (n == 0) {
-                g_slow_query_ms = 0;       /* explicit disable */
-            } else {
-                if (n < 100) n = 100;      /* floor: prevents log spam */
-                if (n > 600000) n = 600000;
-                g_slow_query_ms = n;
+            if (g_db) {
+                if (n == 0) {
+                    g_slow_query_ms = 0;       /* explicit disable */
+                } else {
+                    if (n < 100) n = 100;      /* floor: prevents log spam */
+                    if (n > 600000) n = 600000;
+                    g_slow_query_ms = n;
+                }
             }
         } else if (strncmp(p, "RANDOM_SEQ_COST_RATIO=", 22) == 0) {
             int n = atoi(p + 22);
             if (n < 1)   n = 1;
             if (n > 100) n = 100;
-            g_random_seq_ratio = n;
+            if (g_db) g_random_seq_ratio = n;
         } else if (strncmp(p, "VACUUM_RECOMMEND_TOMBSTONE_PCT=", 31) == 0) {
             int n = atoi(p + 31);
-            if (n >= 1 && n <= 100) g_vacuum_recommend_pct = n;
+            if (n >= 1 && n <= 100 && g_db) g_vacuum_recommend_pct = n;
         } else if (strncmp(p, "VACUUM_RECOMMEND_MIN_DELETED=", 29) == 0) {
             int n = atoi(p + 29);
-            if (n >= 0) g_vacuum_recommend_min_deleted = n;
+            if (n >= 0 && g_db) g_vacuum_recommend_min_deleted = n;
         } else if (strncmp(p, "AUTO_VACUUM=", 12) == 0) {
-            g_auto_vacuum_enable = (atoi(p + 12) != 0);
+            if (g_db) g_auto_vacuum_enable = (atoi(p + 12) != 0);
         } else if (strncmp(p, "AUTO_VACUUM_INTERVAL_SEC=", 25) == 0) {
             int n = atoi(p + 25);
-            if (n >= 60) g_auto_vacuum_interval_sec = n; /* 1-min floor */
+            if (n >= 60 && g_db) g_auto_vacuum_interval_sec = n; /* 1-min floor */
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
-            const char *v = p + 7;
-            if (strcmp(v, "async") == 0 || strcmp(v, "sync") == 0 ||
-                strcmp(v, "off") == 0) {
-                strncpy(g_warmup_mode, v, sizeof(g_warmup_mode) - 1);
-                g_warmup_mode[sizeof(g_warmup_mode) - 1] = '\0';
+            if (g_db) {
+                const char *v = p + 7;
+                if (strcmp(v, "async") == 0 || strcmp(v, "sync") == 0 ||
+                    strcmp(v, "off") == 0) {
+                    strncpy(g_warmup_mode, v, sizeof(g_warmup_mode) - 1);
+                    g_warmup_mode[sizeof(g_warmup_mode) - 1] = '\0';
+                }
             }
-            /* Unknown value silently keeps the previous (default) mode —
-               same forgiveness pattern as the other knobs. */
         } else if (strncmp(p, "TLS_ENABLE=", 11) == 0) {
-            g_tls_enable = (atoi(p + 11) != 0);
+            if (g_db) g_tls_enable = (atoi(p + 11) != 0);
         } else if (strncmp(p, "TLS_SKIP_VERIFY=", 16) == 0) {
-            g_tls_skip_verify = (atoi(p + 16) != 0);
-        } else if (strncmp(p, "TLS_CERT=", 9) == 0 ||
-                   strncmp(p, "TLS_KEY=", 8) == 0 ||
-                   strncmp(p, "TLS_CA=", 7) == 0) {
+            if (g_db) g_tls_skip_verify = (atoi(p + 16) != 0);
+        } else if ((strncmp(p, "TLS_CERT=", 9) == 0 ||
+                    strncmp(p, "TLS_KEY=", 8) == 0 ||
+                    strncmp(p, "TLS_CA=", 7) == 0) && g_db) {
             char *dst = NULL;
             size_t cap = 0;
             const char *vp;
@@ -555,11 +461,7 @@ static uint32_t str_hash(const char *s) {
 
 /* ========== dirs.conf — allowed tenant directories ========== */
 
-#define DIRS_BUCKETS 2048
-char g_dirs[DIRS_BUCKETS][256];
-int g_dirs_used[DIRS_BUCKETS];
-int g_dirs_count = 0;
-pthread_mutex_t g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
+/* DIRS_BUCKETS defined in types.h; g_dirs* moved to ShardDb struct */
 
 void load_dirs(void) {
     char path[PATH_MAX];
@@ -735,11 +637,7 @@ void build_effective_root(char *out, size_t outlen, const char *dir) {
     snprintf(out, outlen, "%s/%s", g_db_root, dir);
 }
 
-/* Schema cache — hash set, avoids re-reading schema.conf on every request */
-#define SCHEMA_BUCKETS 256
-struct SchemaCache { char name[512]; Schema schema; int used; };
-struct SchemaCache g_schema_cache[SCHEMA_BUCKETS];
-pthread_mutex_t g_schema_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Schema cache — moved to ShardDb struct */
 
 Schema load_schema(const char *effective_root, const char *object) {
     char cache_key[512];
@@ -887,16 +785,6 @@ int load_splits(const char *db_root, const char *object) {
 
 /* ========== fields.conf — columnar field order per object ========== */
 
-#define FIELDS_BUCKETS 256
-struct FieldsCache {
-    char name[256];       /* "db_root:object" */
-    char fields[MAX_FIELDS][256];
-    int nfields;
-    int used;
-};
-struct FieldsCache g_fields_cache[FIELDS_BUCKETS];
-pthread_mutex_t g_fields_lock = PTHREAD_MUTEX_INITIALIZER;
-
 int load_fields_conf(const char *db_root, const char *object,
                      char fields[][256], int max_fields) {
     /* Build cache key */
@@ -955,17 +843,8 @@ int load_fields_conf(const char *db_root, const char *object,
 
 /* Index fields cache — hash set, avoids re-reading index.conf on every insert.
    Stores both the bare field name (composite-aware) and its declared IndexType.
-   Lines on disk are either `field` (legacy → IT_BTREE) or `field:type`. */
-#define IDX_BUCKETS 256
-struct IdxCache {
-    char name[512];
-    char fields[MAX_FIELDS][256];
-    enum IndexType types[MAX_FIELDS];
-    int nfields;
-    int used;
-};
-struct IdxCache g_idx_cache[IDX_BUCKETS];
-pthread_mutex_t g_idx_lock = PTHREAD_MUTEX_INITIALIZER;
+   Lines on disk are either `field` (legacy → IT_BTREE) or `field:type`.
+   IdxCache struct and g_idx_* moved to ShardDb struct. */
 
 /* Canonical index-spec parser. Both create-object's wire validator
    and cmd_add_indexes's reindex path call this — single source of
@@ -1400,15 +1279,7 @@ void parse_field_type(const char *spec, TypedField *f) {
     }
 }
 
-/* Cache for typed schemas */
-#define TYPED_BUCKETS 256
-struct TypedCacheEntry {
-    char name[512];
-    TypedSchema schema;
-    int used;
-};
-static struct TypedCacheEntry g_typed_cache[TYPED_BUCKETS];
-static pthread_mutex_t g_typed_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Cache for typed schemas — moved to ShardDb struct */
 
 TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     char cache_key[512];
@@ -3430,10 +3301,7 @@ int cmd_rename_field(const char *db_root, const char *object,
  * keeps the cap right for both tiny dev boxes and big servers without
  * tuning required out-of-box. */
 
-#include <semaphore.h>
-
-static sem_t g_query_slots;
-static int   g_slots_inited = 0;
+/* g_query_slots, g_slots_inited — moved to ShardDb struct */
 
 void slot_init(void) {
     if (g_slots_inited) return;
@@ -3477,6 +3345,7 @@ void slot_cleanup(int *held) {
    holds stale cache entries that can pollute subsequent in-process
    test hooks (plan introspection, cardinality estimates, etc.). */
 void test_reset_caches(void) {
+    if (!g_db) return;  /* daemon-spawn tests: g_db only lives in the child process */
     /* schema cache */
     pthread_mutex_lock(&g_schema_lock);
     for (int i = 0; i < SCHEMA_BUCKETS; i++) {

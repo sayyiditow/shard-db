@@ -222,7 +222,7 @@ static int test_in_fold_plan_composite(void) {
      * triggers B5 demotion to FULL_SCAN before the order-by overlay ever
      * runs.  Temporarily set ratio=1 so budget=N and the leaf is selective,
      * letting the D1 composite check fire. */
-    extern int g_random_seq_ratio;
+    /* g_random_seq_ratio now a ShardDb macro */
     int saved = g_random_seq_ratio;
     g_random_seq_ratio = 1;
 
@@ -251,7 +251,7 @@ static int test_in_fold_single_eq(void) {
     TestClient *tc = in_fold_setup(&env);
     if (!tc) return 1;
 
-    extern int g_random_seq_ratio;
+    /* g_random_seq_ratio now a ShardDb macro */
     int saved = g_random_seq_ratio;
     g_random_seq_ratio = 1;
 
@@ -292,7 +292,7 @@ static int test_in_fold_q1_gate_tight(void) {
     TestClient *tc = in_fold_setup(&env);
     if (!tc) return 1;
 
-    extern int g_random_seq_ratio;
+    /* g_random_seq_ratio now a ShardDb macro */
     int saved = g_random_seq_ratio;
     g_random_seq_ratio = 1;
 
@@ -343,7 +343,7 @@ static int test_in_fold_q2_cursor_fetchsort(void) {
      *         ORDER BY t DESC cursor:null limit=1
      * → D1 composite seed = tag=a (broad, keyset ~3), prefilter_card = t>=9 (~1)
      * → cursor C1 should pick fetch+sort (bounded) over composite walk. */
-    extern int g_random_seq_ratio;
+    /* g_random_seq_ratio now a ShardDb macro */
     int saved = g_random_seq_ratio;
     g_random_seq_ratio = 1;
 
@@ -395,7 +395,7 @@ static int test_in_fold_bounded_scan(void) {
      * — the bounded scan path also goes through the planner so a
      * saturated IN leaf would demote to FULL_SCAN and never reach
      * the composite executor. */
-    extern int g_random_seq_ratio;
+    /* g_random_seq_ratio now a ShardDb macro */
     int saved = g_random_seq_ratio;
     g_random_seq_ratio = 1;
 
