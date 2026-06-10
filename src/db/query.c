@@ -10206,6 +10206,7 @@ typedef struct {
     /* Bitmap post-filter shortcut (populated by parallel_indexed_count) */
     int n_bm_postfilter;                              // number of bitmap eq/in post-filter leaves
     int all_postfilters_are_bm;                       // 1 = Case A1 (index-only), 0 = Case A2 or none
+    int no_bm_shortcut;                               // 1 = prevent all_postfilters_are_bm shortcut (trigram primary)
     SearchCriterion *bm_criteria[MAX_INTERSECT_LEAVES]; // bitmap post-filter SearchCriterion*
     uint8_t          bm_val[MAX_INTERSECT_LEAVES][1024]; // pre-encoded value for OP_EQUAL
     size_t           bm_vlen[MAX_INTERSECT_LEAVES];
@@ -10492,6 +10493,7 @@ static void classify_bm_postfilters(ShardCountCtx *ctx,
     }
     ctx->n_bm_postfilter = n_bm;
     ctx->all_postfilters_are_bm = (n_bm > 0 && n_bm == fp->n_postfilter);
+    if (ctx->no_bm_shortcut) ctx->all_postfilters_are_bm = 0;
 }
 
 /* Orchestrate parallel indexed count: qsort by shard, fan out per-shard workers. */
@@ -10499,7 +10501,8 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
                                      const Schema *sch, CollectedHash *batch,
                                      int batch_count, CriteriaNode *tree,
                                      FieldSchema *fs, QueryDeadline *dl,
-                                     const FilterPlan *fp) {
+                                     const FilterPlan *fp,
+                                     int no_bm_shortcut) {
     int group_starts[1024], group_sizes[1024];
     int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
@@ -10514,6 +10517,8 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
         workers[g].fs = fs;
         workers[g].deadline = dl;
         classify_bm_postfilters(&workers[g], fp, db_root, object, fs);
+        workers[g].no_bm_shortcut = no_bm_shortcut;
+        if (no_bm_shortcut) workers[g].all_postfilters_are_bm = 0;
     }
 
     if (batch_count < 1024 || nshard_groups <= 2) {
@@ -16434,7 +16439,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                               .children = NULL, .n_children = 0 };
                     pos_count = parallel_indexed_count(db_root, object, &sch,
                                                        entries, (int)n,
-                                                       &pos_leaf, &fs, &dl, NULL);
+                                                       &pos_leaf, &fs, &dl, NULL, 0);
                     free(entries);
                     keyset_free(tg_ks);
                     pos_ok = !dl.timed_out;
@@ -16494,7 +16499,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
                     size_t count = parallel_indexed_count(db_root, object, &sch,
                                                           entries, (int)n,
-                                                          tree, &fs, &dl, &fp);
+                                                          tree, &fs, &dl, &fp, 1);
                     if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                     else OUT("%zu\n", count);
                     free(entries);
@@ -16547,7 +16552,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
                     size_t count = parallel_indexed_count(db_root, object, &sch,
                                                           entries, (int)n,
-                                                          tree, &fs, &dl, &fp);
+                                                          tree, &fs, &dl, &fp, 1);
                     if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                     else OUT("%zu\n", count);
                     free(entries);
@@ -16579,7 +16584,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             }
             size_t count = parallel_indexed_count(db_root, object, &sch,
                                                   cc.entries, (int)cc.count,
-                                                  tree, &fs, &dl, &fp);
+                                                  tree, &fs, &dl, &fp, 0);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
@@ -16636,7 +16641,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             if (rc != 0 || batch_count == 0) { free(batch); OUT("0\n"); }
             else {
                 size_t n = parallel_indexed_count(db_root, object, &sch, batch,
-                                                  (int)batch_count, tree, &fs, &dl, &fp);
+                                                  (int)batch_count, tree, &fs, &dl, &fp, 0);
                 free(batch);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", n);
@@ -16724,7 +16729,7 @@ static size_t idx_count_for_leaf(const char *db_root, const char *object,
                                    .children = NULL, .n_children = 0 };
         size_t cnt = parallel_indexed_count(db_root, object, sch,
                                             entries, (int)n,
-                                            &leaf_node, (FieldSchema *)fs, dl, NULL);
+                                            &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
         free(entries);
         keyset_free(tg_ks);
         return cnt;
@@ -18068,7 +18073,7 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
             if (entries && tree) {
                 n = parallel_indexed_count(db_root, object, sch,
                                            entries, (int)nh,
-                                           tree, fs, dl, fp);
+                                           tree, fs, dl, fp, 0);
                 if (!dl->timed_out) *out_null = 0;
             } else if (entries && !tree) {
                 /* No tree to verify against → every candidate is a match. */
@@ -18109,9 +18114,14 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
             keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
             size_t n = 0;
             if (entries && tree) {
+                int no_bm_shortcut =
+                    (pick_index_for_leaf(db_root, object,
+                                         fp->source_leaves[0])
+                     == IT_TRIGRAM);
                 n = parallel_indexed_count(db_root, object, sch,
                                            entries, (int)nh,
-                                           tree, fs, dl, fp);
+                                           tree, fs, dl, fp,
+                                           no_bm_shortcut);
                 if (!dl->timed_out) *out_null = 0;
             } else if (entries && !tree) {
                 n = nh; *out_null = 0;
@@ -19428,9 +19438,9 @@ int cmd_find(const char *db_root, const char *object,
            intersection KeySet, so the primary-leaf count is only an upper bound
            (not the true intersection size). Emit null for FP_INTERSECT to stay
            consistent with keyset_find_from_intersect's small-primary behavior. */
-        if (want_total && fp.kind != FP_INTERSECT) {
+        if (want_total && fp.kind != FP_INTERSECT && fp.n_postfilter == 0) {
             find_total = idx_count_for_leaf(db_root, object, &sch, &driver_fs,
-                                            primary, &dl);
+                                             primary, &dl);
             if (!dl.timed_out) find_total_null = 0;
         }
     } else if (fp.kind == FP_INTERSECT) {
