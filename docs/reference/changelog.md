@@ -4,6 +4,60 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.06.1
+
+Query planner overhaul, O_DIRECT I/O series, batch-fetch consolidation, and cursor+total pagination. No `./migrate` required; wire-compatible with 2026.05.8.
+
+### Performance
+
+- **O_DIRECT series** — cache-bypassing pread in full-scan queries (find, count, aggregate), parallel aggregation fan-out, reindex worker streams, startup recovery (`recover_streams`), compact donor scan, and KF shard walks. Single-shot 32 MB fast path (`DB_ODIRECT_BUF_MB`) with adaptive mincore fallback (opens buffered when ≥80% pages resident).
+- **Batch-fetch consolidation** — two-phase bulk fetch, IO thread pool migration (`IO_THREADS`, default `4×nproc`), cursor pagination C1 path batch, streaming wfc_worker MIN/MAX batch-fetch. Separates I/O threads from CPU pool to avoid starvation on slow-disk workloads.
+- **Bitmap parallel popcount** — `GROUP BY <bitmap_field>` with aggregates (avg/sum/min/max) uses parallel bitmap popcount; slot-level bitmap intersect for criteria.
+- **k-way min-heap merge** — cursor pagination (`fetch+sort DESC`) now uses a k-way min-heap across per-shard btree iterators instead of linear scan, enabling stable O(log N)-per-step pagination.
+
+### Features
+
+- **Cursor+total in single request** — `"want_total":true` alongside `"cursor":{}` in find request returns both the page results and the full match count in one round-trip. Avoids the two-query pattern (cursor + separate count).
+- **Composite index improvements** — typed binary encoding, reindex `--composites-only` flag, eq+ORDER BY routing (D1/D2/D3 decision paths).
+- **Bitmap IGB+hbm** — `GROUP BY <bitmap_field>, avg/sum/min/max(...)` materializes only the selected aggregates, skipping irrelevant fields via itemized-group-by (IGB) + histogram metadata (hbm).
+- **Reindex flags** — new `--composites-only` for rebuilding only composite indexes without full-shard rescan.
+
+### Query planner
+
+Complete rewrite of the criteria-tree planner with decision-table executors, cardinality estimator, and composite-index routing:
+
+- **Decision-table executors (D1/D2/D3)** — indexed composite (field1+field2) queries now route to decision paths optimized for the operator pattern (eq+eq, eq+range, etc.).
+- **Broad-filter ordered finds** — `find` with `order_by` on non-indexed field now walks the order-by index to filter early, materializing only matched records rather than buffering all matches before sorting.
+- **Range-folding for pagination** — offset + limit translate to btree range bounds when the order-by field is indexed, avoiding the full-buffer sort.
+- **Materialization guards** — cancel eager record materialization when the KeySet is much larger than remaining page depth, falling back to lightweight scans.
+- **Selectivity guards** — skip expensive multi-index intersection or materialization when a single leaf's cardinality dominates, picking the fastest path.
+
+### Fixes
+
+- **Writer-preferring rwlock** — replaces reader-writer-fairness model to prevent writer starvation on high-read workloads. Writers now take priority once they arrive, so index builds and schema mutations proceed without unbounded delay.
+- **Condvar replacing sched_yield()** — batch_buf_collect_hash no longer spins; coordination waits on a condition variable with bounded wake-up latency.
+- **Cross-tenant index cache key scoping** — index cache keys now include tenant+object scope to prevent cross-tenant entry collision.
+- **Binary-key btree correctness** — btree callbacks now receive correctly-encoded binary keys for composite-index pagination.
+- **Help-drain deadlock prevention** — parallel_for help-drain path no longer deadlocks when nested work arrives while finalizing.
+- **Bulk_delete null memcpy guard** — bulk_delete no longer memcpy's from NULL when a record has no indexed fields.
+
+### Configuration
+
+New environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `IO_THREADS` | `4×nproc` | Separate I/O thread pool size (distinct from CPU-bound `THREADS` pool). |
+| `DB_ODIRECT_BUF_MB` | 32 | O_DIRECT buffer size per worker in MB. Peak RAM ~ `2×DB_ODIRECT_BUF_MB×IO_THREADS`. |
+| `WARMUP` | `async` | Startup cache warmth: `async` (detached), `sync` (block), `off` (skip). |
+| `AUTO_VACUUM` | 0 | Enable background vacuum thread (0/1). |
+| `AUTO_VACUUM_INTERVAL_SEC` | 3600 | Auto-vacuum poll interval in seconds (floor 60). |
+| `VACUUM_RECOMMEND_TOMBSTONE_PCT` | 10 | Tombstone ratio threshold for vacuum recommendation. |
+| `VACUUM_RECOMMEND_MIN_DELETED` | 1000 | Minimum deleted count before vacuum is recommended. |
+| `RANDOM_SEQ_COST_RATIO` | 8 | Planner cost ratio for random vs sequential I/O. Higher prefers full-scan. |
+
+All new variables are optional; defaults apply when unset. Existing configurations continue to work unchanged.
+
 ## 2026.05.8
 
 Correctness + perf release. Headline: **4800× speedup** on selective-filter + order_by queries when the matching record's order-key lands late in the sort walk. **Logging framework reshape** (typed `LOG_*` macros, new `<date>-audit.log`, structured `subsystem` field — operators with log-parsing regexes need to update). **Unknown-field queries error loudly** instead of silently returning empty results. No `./migrate` required, wire-compatible with 2026.05.7.x.
