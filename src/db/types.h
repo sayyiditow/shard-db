@@ -694,6 +694,7 @@ int  json_obj_copy(const JsonObj *o, const char *key, char *buf, size_t bufsz);
 /* malloc-based wrapper for callers that still need a heap-owned NUL-terminated
    string (e.g. for long-lived storage). Returns NULL if missing. Caller frees. */
 char *json_obj_strdup(const JsonObj *o, const char *key);
+int   json_obj_is_true(const JsonObj *o, const char *key);
 
 /* Raw span variant used for nested arrays/objects that the caller will parse
    further. Returns a malloc'd NUL-terminated copy including the surrounding

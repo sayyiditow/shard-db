@@ -442,6 +442,21 @@ int json_obj_copy(const JsonObj *o, const char *key, char *buf, size_t bufsz) {
     return (int)cl;
 }
 
+/* Returns 1 if the named field is the JSON boolean true OR the string "true";
+   0 for false, "false", absent, or any other value.  Uses json_obj_get (raw
+   span) so it works for both quoted string values and unquoted JSON booleans.
+   No allocation — safe to call from any hot path. */
+int json_obj_is_true(const JsonObj *o, const char *key)
+{
+    const char *v; size_t vl;
+    if (!json_obj_get(o, key, &v, &vl)) return 0;
+    /* JSON boolean: true (4 bytes, no quotes) */
+    if (vl == 4 && memcmp(v, "true", 4) == 0) return 1;
+    /* JSON string: "true" (6 bytes including surrounding quotes) */
+    if (vl == 6 && memcmp(v, "\"true\"", 6) == 0) return 1;
+    return 0;
+}
+
 char *json_obj_strdup(const JsonObj *o, const char *key) {
     const char *v; size_t vl;
     if (!json_obj_unquoted(o, key, &v, &vl)) return NULL;
