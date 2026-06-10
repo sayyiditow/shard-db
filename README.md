@@ -20,6 +20,35 @@ A high-performance database in C. Single static binary, single process, no exter
 
 **[HN Explorer](https://hn.shard-db.dev)** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · [Starter template](https://github.com/sayyiditow/shard-db-svelte-starter) (SvelteKit).
 
+## Why I built it
+
+Most projects reach for PostgreSQL by default. That's usually the right call — PostgreSQL is battle-hardened and general-purpose. shard-db is for a narrower problem:
+
+> Schema is fixed and known at design time. Queries are point lookups, range scans, or keyword searches. You need predictable latency and simple deployment. One machine is enough.
+
+In that envelope, a general-purpose SQL engine carries overhead you don't need: a query parser, a WAL, a lock manager, a planner that must handle arbitrary schema. shard-db trades that generality for a simpler execution model — typed binary records, a planner that knows your schema at startup, and cursor pagination that makes page 10,000 as cheap as page 1.
+
+## How it compares
+
+| Feature | shard-db | PostgreSQL | Redis / Valkey | SQLite |
+|---|---|---|---|---|
+| Single static binary | **Yes** | No | No | Yes (library) |
+| Zero-dependency deploy | **Yes** | No | No | Yes (embedded) |
+| Server process (multi-client TCP) | **Yes** | Yes | Yes | No |
+| SQL | No | **Yes** | No | **Yes** |
+| Fixed typed schema | **Yes** | Yes | No | Yes |
+| JSON / TCP wire protocol | **Yes** | No | RESP / TCP | No |
+| Built-in TLS (single port) | **Yes** | Via libssl | Via libssl | No |
+| B+ tree range queries | **Yes** | Yes | Sorted sets | Yes |
+| Bitmap index (bool / enum) | **Yes** | No | Bitfields | No |
+| Trigram full-text search | **Yes** | Extension | No | Extension |
+| Joins | **Yes** | Yes | No | Yes |
+| Aggregates + group by | **Yes** | Yes | Limited | Yes |
+| Cursor pagination (O(1) deep pages) | **Yes** | Requires keyset | No | Requires keyset |
+| ACID transactions | No | **Yes** | Partial | **Yes** |
+| Distributed | No | Extensions | **Cluster** | No |
+| Primary use case | Server DB, typed records, fast text search | General-purpose RDBMS | Cache, message broker | Embedded app storage |
+
 ## Highlights
 
 | Area | Highlights |
