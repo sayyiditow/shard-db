@@ -16,6 +16,7 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `LOG_RETAIN_DAYS` | `7` | Auto-prune logs older than N days. `0` = keep forever. |
 | `INDEX_PAGE_SIZE` | `4096` | B+ tree page size in bytes (power of 2, 1024–65536). |
 | `THREADS` | `0` (auto) | Parallel-for worker pool — drives every parallel hot path (shard scans, indexed find/count/aggregate fan-out, parallel index builds, bulk-insert phase 2). `0` = `4 × nproc`, minimum 4. |
+| `IO_THREADS` | `0` (auto) | Separate I/O thread pool size for cache-bypassing operations (O_DIRECT scans, bulk-fetch). `0` = `4 × nproc`. I/O threads wait on page faults and benefit from oversubscription without starving CPU-bound queries. |
 | `WORKERS` | `0` (auto) | Server-worker pool that accepts connections + dispatches request handlers. `0` = auto (CPU count, minimum 4). |
 | `POOL_CHUNK` | `0` (auto) | parallel_for submission chunk size. `0` = `nproc`. Tasks are enqueued in chunks of this many; larger chunks reduce queue-lock contention but serialise concurrent submitters. Rarely needs tuning. |
 | `GLOBAL_LIMIT` | `100000` | Default `limit` applied when a query omits one. Per-query `limit` is **not clamped** — pass any value to override. |
@@ -25,13 +26,16 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
 | `QUERY_BUFFER_MB` | `256` | Per-query intermediate buffer cap. With `MAX_CONCURRENT_QUERIES` bounding fan-in, worst-case RAM stays predictable. Auto-tunes upward on big-RAM hosts with low slot counts (floor: 256 MB). |
 | `INDEX_BUILD_BUDGET_MB` | `1024` | Peak per-pass memory budget for `reindex` / multi-field `add-index` / `migrate`'s phase-2 rebuild. Floor 64 MB. Multi-field builds group fields into passes that fit this cap; an oversized single field still runs alone. See [Tuning → INDEX_BUILD_BUDGET_MB](../operations/tuning.md). |
+| `DB_ODIRECT_BUF_MB` | `32` | O_DIRECT buffer size per worker in MB. Each parallel worker reads shard data in chunks of this size using cache-bypassing pread. Peak O_DIRECT RAM is approximately `2 × DB_ODIRECT_BUF_MB × IO_THREADS`. Larger chunks reduce syscall overhead on fast NVMe; smaller chunks reduce peak memory. |
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
 | `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
 | `SLOW_QUERY_MS` | `500` | Log queries slower than N ms to `slow-*.log` and the in-memory ring (`stats` endpoint). `0` = disable. Minimum 100 ms. |
-| `VACUUM_RECOMMEND_TOMBSTONE_PCT` | `10` | Tombstone ratio at which `vacuum-check` flags an object for cleanup (`deleted * 100 ≥ total * N`). Also drives auto-vacuum when enabled — same threshold for both manual and automated paths. |
-| `VACUUM_RECOMMEND_MIN_DELETED` | `1000` | Absolute floor on `deleted` count below which `vacuum-check` does **not** recommend cleanup, even if the percentage clears. Prevents tiny objects from triggering vacuum overhead that exceeds the work saved. |
+| `RANDOM_SEQ_COST_RATIO` | `8` | Planner cost model: random-read penalty vs sequential scan. Higher values prefer full-scan; the planner chooses fetch-and-check when `matches < live_count / RANDOM_SEQ_COST_RATIO`. Tuning knob for workload-specific I/O patterns. |
+| `WARMUP` | `async` | Cache warmth on startup. `async` = detached thread (first queries race cache population); `sync` = block startup until complete; `off` = skip (rely on lazy populate). Primes OS page cache for kf + index shards so the first user query enjoys warm caches. |
 | `AUTO_VACUUM` | `0` | `1` = enable a background thread that periodically polls `vacuum-check`'s recommendation logic and runs **plain `vacuum`** on objects that meet the thresholds. Never auto-runs `--compact` or `--splits` — both need an exclusive objlock for a long rebuild window and stay manual. |
 | `AUTO_VACUUM_INTERVAL_SEC` | `3600` | Auto-vacuum poll cadence in seconds. Floor 60. Sleep is sliced into 1-second chunks so SIGTERM brings the thread down within a second. |
+| `VACUUM_RECOMMEND_TOMBSTONE_PCT` | `10` | Tombstone ratio at which `vacuum-check` flags an object for cleanup (`deleted * 100 ≥ total * N`). Also drives auto-vacuum when enabled — same threshold for both manual and automated paths. |
+| `VACUUM_RECOMMEND_MIN_DELETED` | `1000` | Absolute floor on `deleted` count below which `vacuum-check` does **not** recommend cleanup, even if the percentage clears. Prevents tiny objects from triggering vacuum overhead that exceeds the work saved. |
 | `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. See [Operations → Deployment → Native TLS](../operations/deployment.md). |
 | `TLS_CERT` / `TLS_KEY` | (empty) | Server cert + private key paths (PEM). Required when `TLS_ENABLE=1`. |
 | `TLS_CA` | (empty) | Client-side CA bundle for verifying the server (defaults to OS trust store). |
@@ -49,6 +53,7 @@ export LOG_LEVEL=3
 export LOG_RETAIN_DAYS=14
 export INDEX_PAGE_SIZE=4096
 export THREADS=0
+export IO_THREADS=0
 export WORKERS=0
 export GLOBAL_LIMIT=100000
 export MAX_CONCURRENT_QUERIES=0
@@ -57,9 +62,14 @@ export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
 export QUERY_BUFFER_MB=256
 export INDEX_BUILD_BUDGET_MB=1024
+export DB_ODIRECT_BUF_MB=32
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0
 export SLOW_QUERY_MS=500
+export RANDOM_SEQ_COST_RATIO=8
+
+# Startup warmup — primes caches on startup
+export WARMUP=async
 
 # Auto-vacuum — opt-in. Same thresholds drive `vacuum-check` recommendations.
 export AUTO_VACUUM=0

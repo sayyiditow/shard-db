@@ -130,12 +130,14 @@ void odirect_init_buf_size(void)
 #define OD_MINCORE_SAMPLES 8
 static int file_is_resident(const char *path, int threshold_pct)
 {
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_size <= 0)
-        return 0;
-
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return 0;
+    }
 
     size_t sz = (size_t)st.st_size;
     void *addr = mmap(NULL, sz, PROT_NONE,
