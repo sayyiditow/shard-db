@@ -35,7 +35,7 @@ Required: `mode`, `dir`, `object`, `criteria`.
 | `excludedKeys` | string OR array | none | Skip these keys from results. Comma-separated or array. |
 | `order_by` | string | — | Sort by this field; matches are buffered and sorted before pagination. |
 | `order` | `"asc"` or `"desc"` | `"asc"` | Sort direction when `order_by` is set. |
-| `want_total` | bool | false | When `cursor` pagination is active, also return the total match count in a single round-trip. Adds O(1) metadata cost. |
+| `total` | bool | false | When `cursor` pagination is active, also return the total match count in a single round-trip. Adds O(1) metadata cost. |
 | `format` | `"rows"` / `"csv"` / `"dict"` | JSON array | See response shapes below. Ignored when `join` is present (always tabular). |
 | `join` | array | none | See [joins](joins.md). |
 
@@ -244,21 +244,21 @@ For deep pagination on large result sets, offset-based paging pays `O(matches)` 
 // Last page returns "cursor":null
 ```
 
-### Cursor with total count (`want_total`)
+### Cursor with total count (`total`)
 
 To get both the page results and the total match count in a single request:
 
 ```json
-// Page 1 — add "want_total":true to get the total count
+// Page 1 — add "total":true to get the total count
 {"mode":"find","dir":"t","object":"orders",
  "criteria":[{"field":"status","op":"eq","value":"paid"}],
- "order_by":"amount","order":"asc","limit":100,"cursor":null,"want_total":true}
+ "order_by":"amount","order":"asc","limit":100,"cursor":null,"total":true}
 
 // Response includes both the page and the total count
 {"rows":[...], "cursor":{"amount":"500.00","key":"ord_4912"}, "total":5234}
 ```
 
-The `total` field contains the complete match count against the criteria, allowing UI pagination controls to render "Page 1 of N" immediately. `want_total` has negligible cost (O(1) metadata read) and only applies when cursor pagination is active (`cursor:null` or `cursor:{...}`).
+The `total` field contains the complete match count against the criteria, allowing UI pagination controls to render "Page 1 of N" immediately. `total` has negligible cost (O(1) metadata read) and only applies when cursor pagination is active (`cursor:null` or `cursor:{...}`).
 
 ### Cursor rules
 
@@ -268,7 +268,7 @@ The `total` field contains the complete match count against the criteria, allowi
 - Omitting `cursor` entirely keeps backward-compat behaviour (unwrapped array, buffer-sort for `order_by`).
 - `format:"csv"` and `join` are not supported with cursor — use the non-cursor `find` path for those.
 - ASC + DESC both supported; the server-side k-way merge across per-shard btree iterators reconstructs global order.
-- `want_total` is only meaningful with active cursor pagination; it is ignored in non-cursor mode.
+- `total` is only meaningful with active cursor pagination; it is ignored in non-cursor mode.
 
 ## Projection
 

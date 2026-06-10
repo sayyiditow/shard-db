@@ -17,7 +17,7 @@ Query planner overhaul, O_DIRECT I/O series, batch-fetch consolidation, and curs
 
 ### Features
 
-- **Cursor+total in single request** — `"want_total":true` alongside `"cursor":{}` in find request returns both the page results and the full match count in one round-trip. Avoids the two-query pattern (cursor + separate count).
+- **Cursor+total in single request** — `"total":true` alongside `"cursor":{}` in find request returns both the page results and the full match count in one round-trip. Avoids the two-query pattern (cursor + separate count).
 - **Composite index improvements** — typed binary encoding, reindex `--composites-only` flag, eq+ORDER BY routing (D1/D2/D3 decision paths).
 - **Bitmap IGB+hbm** — `GROUP BY <bitmap_field>, avg/sum/min/max(...)` materializes only the selected aggregates, skipping irrelevant fields via itemized-group-by (IGB) + histogram metadata (hbm).
 - **Reindex flags** — new `--composites-only` for rebuilding only composite indexes without full-shard rescan.
