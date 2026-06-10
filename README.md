@@ -18,7 +18,7 @@ A high-performance database in C. Single static binary, single process, no exter
 
 ## In production
 
-**<a href="https://hn.shard-db.dev" target="_blank">HN Explorer</a>** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · [Starter template](https://github.com/sayyiditow/shard-db-svelte-starter) (SvelteKit).
+**[HN Explorer](https://hn.shard-db.dev)** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · [Starter template](https://github.com/sayyiditow/shard-db-svelte-starter) (SvelteKit).
 
 ## Highlights
 
