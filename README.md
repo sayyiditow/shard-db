@@ -16,6 +16,10 @@ A high-performance database in C. Single static binary, single process, no exter
 
 **Platform:** Linux x86_64 / ARM64 + macOS (Apple Silicon). License: **MIT**.
 
+## In production
+
+**[HN Explorer](https://hn.shard-db.dev)** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · [Starter template](https://github.com/sayyiditow/shard-db-svelte-starter) (SvelteKit).
+
 ## Highlights
 
 | Area | Highlights |
@@ -32,6 +36,12 @@ A high-performance database in C. Single static binary, single process, no exter
 | **Tools** | `shard-cli` ncurses TUI over the same TCP+TLS wire (separate binary, no daemon source linked). |
 
 Detailed feature reference: [docs/index.md](docs/index.md).
+
+## What it is not
+
+- **Not distributed.** Single-node, single-process. No built-in replication across hosts. Block-level replication (DRBD / BSR) is the recommended HA path and works transparently at the storage layer; application-level replication is on the roadmap.
+- **Not SQL.** The wire protocol is JSON-over-TCP; queries are JSON documents. This is intentional — the typed-record model gives the planner a fixed schema to optimise against rather than a general-purpose SQL parser.
+- **Not Windows.** Linux x86_64 / ARM64 and macOS Apple Silicon only.
 
 ## Quick start
 
@@ -70,14 +80,14 @@ For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/f
 
 | Workload | Result |
 |---|---|
-| Bulk insert (CSV, 10M, 1 conn) | **4.94 M/sec** |
-| Bulk insert (CSV, 10M, 5 conns × 2M) | **8.42 M/sec** |
+| Bulk insert (CSV, 10M, 1 conn) | **4.60 M/sec** |
+| Bulk insert (CSV, 10M, 5 conns × 2M) | **8.97 M/sec** |
 | Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, no idx) | **2.48 M/sec** |
 | Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, 14 idx) | **435 k/sec** |
-| Bulk EXISTS (10K keys per request) | **5.69 M/sec** |
-| Bulk DELETE (10K keys per request) | **1.87 M/sec** |
-| Bulk GET (10K keys per request) | **1.26 M/sec** |
-| Bulk UPDATE (10K keys per request) | **822 k/sec** |
+| Bulk EXISTS (10K keys per request) | **4.10 M/sec** |
+| Bulk DELETE (10K keys per request) | **1.76 M/sec** |
+| Bulk GET (10K keys per request) | **1.49 M/sec** |
+| Bulk UPDATE (10K keys per request) | **989 k/sec** |
 | Indexed `find` (1M users, limit 10) | **<1 ms** |
 | Indexed `count` / `aggregate` (warm cache) | **<1–296 ms** |
 | Single-conn GET ×10k (req-resp, 1 conn) | **33 k ops/sec** (28µs/op) |

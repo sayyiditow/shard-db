@@ -12,19 +12,19 @@ Schema: **16-byte hex key, one `varchar(100)` value** — the same record shape 
 
 | Operation | Throughput / Latency |
 |---|---|
-| Bulk insert (JSON, 10M in one request) | **3.46 M inserts/sec** (2.89 s) |
-| Bulk insert (CSV, 10M in one request) | **4.64 M inserts/sec** (2.15 s) |
-| **Bulk EXISTS (10K keys / request)** | **5.69 M ops/sec** (1.8 ms) |
-| **Bulk DELETE (10K keys / request)** | **1.87 M ops/sec** (5.3 ms) |
-| **Bulk GET (10K keys / request)** | **1.26 M ops/sec** (7.9 ms) |
-| **Bulk UPDATE (10K keys / request)** | **822 k ops/sec** (12.2 ms) |
-| GET ×10,000 (req-resp, 1 conn) | **33 k ops/sec** (mean 28µs / p50 28µs) |
-| EXISTS ×10,000 hits (req-resp) | **33 k ops/sec** (mean 29µs / p50 29µs) |
-| EXISTS ×10,000 all-miss (cold probe) | **35 k ops/sec** (mean 27µs / p50 27µs) |
-| UPDATE ×10,000 (req-resp) | **30 k ops/sec** (mean 31µs / p50 31µs) |
-| DELETE ×10,000 (req-resp) | **27 k ops/sec** (mean 35µs / p50 35µs) |
-| Parallel GET (5 conns × 10k) | **151 k ops/sec** (331 ms) |
-| Parallel UPDATE (5 conns × 10k) | **134 k ops/sec** (373 ms) |
+| Bulk insert (JSON, 10M in one request) | **2.69 M inserts/sec** (3.72 s) |
+| Bulk insert (CSV, 10M in one request) | **3.98 M inserts/sec** (2.51 s) |
+| **Bulk EXISTS (10K keys / request)** | **4.10 M ops/sec** (2.4 ms) |
+| **Bulk DELETE (10K keys / request)** | **1.76 M ops/sec** (5.7 ms) |
+| **Bulk GET (10K keys / request)** | **1.49 M ops/sec** (6.7 ms) |
+| **Bulk UPDATE (10K keys / request)** | **989 k ops/sec** (10.1 ms) |
+| GET ×10,000 (req-resp, 1 conn) | **34 k ops/sec** (p50 28µs) |
+| EXISTS ×10,000 hits (req-resp) | **34 k ops/sec** (p50 28µs) |
+| EXISTS ×10,000 all-miss (cold probe) | **36 k ops/sec** (p50 26µs) |
+| UPDATE ×10,000 (req-resp) | **27 k ops/sec** (p50 32µs) |
+| DELETE ×10,000 (req-resp) | **24 k ops/sec** (p50 39µs) |
+| Parallel GET (5 conns × 10k) | **154 k ops/sec** (323 ms) |
+| Parallel UPDATE (5 conns × 10k) | **131 k ops/sec** (381 ms) |
 | Disk footprint | 2.2 GB |
 
 **Bulk multi-key paths are 30-170× faster than single-conn.** The single-conn req-resp ceiling is ~30 µs/op (dominated by TCP framing + JSON parse/encode). One bulk request handling 10K keys at a time hits 1.3M+/sec on every multi-key op — `bulk_lookup_in_kfshard` / `bulk_get_in_kfshard` / `bulk_upsert_in_kfshard` / `bulk_delete_in_kfshard` each acquire one kf wrlock per worker (vs per-record), batch seg I/O sorted by `(stream_id, file_id)`, and use parallel_for fan-out across kf shards. Use bulk wire shapes (`{"mode":"get","keys":[...]}`, `{"mode":"bulk-delete","keys":[...]}`) when you have multi-key workloads.
@@ -37,14 +37,14 @@ Same schema, bulk insert fanned out across TCP connections. `SPLITS=128` is the 
 
 | Scenario | Time | Throughput |
 |---|---|---|
-| Single JSON, 10M | 2.80 s | **3.57 M/sec** |
-| Single CSV, 10M | 2.04 s | **4.91 M/sec** |
-| **Parallel JSON, 5 conns × 2M** | **1.37 s** | **7.29 M/sec** (2.04× single) |
-| **Parallel CSV, 5 conns × 2M** | **1.19 s** | **8.42 M/sec** (1.71× single) ← fastest |
+| Single JSON, 10M | 3.26 s | **3.07 M/sec** |
+| Single CSV, 10M | 2.17 s | **4.60 M/sec** |
+| **Parallel JSON, 5 conns × 2M** | **1.33 s** | **7.49 M/sec** (2.44× single) |
+| **Parallel CSV, 5 conns × 2M** | **1.12 s** | **8.97 M/sec** (1.95× single) ← fastest |
 
 Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even distribution (records stddev <1 %).
 
-**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **4.91 M/sec single-connection** (CSV) and scales to **8.42 M/sec at 5 connections × 2 M records each**, all over TCP with CSV parsing on the server. **Parallel keeps a 1.7–2.0× edge over single-conn** at this scale — multiple connections amortize per-call pipeline tail (parse, bucket, dispatch) against wider write fan-out. The slotcask v2 storage engine (2026.06+) improved parallel throughput by ~12 % over the prior layout while keeping single-conn rates similar. **Use single-connection for operational simplicity, parallel for headline throughput.**
+**How to read these numbers.** On 16 B / 100 B records LMDB publishes ~1 M on-disk inserts/sec (embedded, no network). shard-db sustains **4.60 M/sec single-connection** (CSV) and scales to **8.97 M/sec at 5 connections × 2 M records each**, all over TCP with CSV parsing on the server. **Parallel keeps a 1.9–2.4× edge over single-conn** at this scale — multiple connections amortize per-call pipeline tail (parse, bucket, dispatch) against wider write fan-out. **Use single-connection for operational simplicity, parallel for headline throughput.**
 
 <a id="shard-grow-pre-sizing"></a>
 **Pre-grow (2026.05.x):** when `bulk-insert` receives a batch, the dispatcher reads each shard's current `slots_per_shard` and live record count, computes the smallest power-of-2 that holds (live + incoming), and grows each shard to that target once before workers start. Pre-grows run in parallel via the worker pool. The previous behaviour (worker grew its shard every time it overflowed during the insert) caused 9 incremental grows per shard at SPLITS=128 / 10M records, each rebucketing the existing data; now that's 1 pre-grow per shard with zero rebucket (the shards are empty when pre-grow fires for a fresh load).
@@ -280,22 +280,29 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 | Operation | Result |
 |---|---|
-| Bulk insert (no indexes) | **357 k/sec** (2.80 s) |
-| Bulk insert (with 14 indexes) | **216 k/sec** (4.63 s) — 46% slowdown vs no-idx |
-| Add 14 indexes post-insert | **2.70 s** (per-shard parallel build — 14 workers × `index_splits_for(splits)` files each) |
-| GET ×1000 (req-resp, 1 conn) | **29 k ops/sec** (mean 34µs / p50 32µs) |
-| EXISTS ×1000 (req-resp) | **37 k ops/sec** (mean 27µs / p50 27µs) |
-| Indexed eq `find` (any of 14 indexes, limit 10) | **0.8–1.6 ms** |
-| Indexed `contains` via leaf scan | 0.8–10 ms |
-| Indexed IN (2 values) | <1 ms |
-| Composite index eq / starts | **0.5–0.9 ms** (composite index walk skips secondary post-filter) |
-| Indexed `range` (wide gte+lte on `invoiceDate` / `createdAt`, limit 10) | **<1 ms warm** (was 64–65 ms in earlier docs — that was first-touch cold; the post-2026.05.1 batched seg-acquire makes warm-cache range cheap) |
-| Indexed `OR` (two statuses) | **3.6 ms** (was 23 ms — kf-derived counts let the OR keyset size correctly without falling through to per-record scan) |
+| Bulk insert (no indexes) | **340 k/sec** (2.93 s) |
+| Bulk insert (with 14 indexes) | **200 k/sec** (4.96 s) — 41% slowdown vs no-idx |
+| Add 14 indexes post-insert | **2.59 s** (per-shard parallel build — 14 workers × `index_splits_for(splits)` files each) |
+| GET ×1000 (req-resp, 1 conn) | **29 k ops/sec** (mean 35µs / p50 31µs) |
+| EXISTS ×1000 (req-resp) | **38 k ops/sec** (mean 26µs / p50 26µs) |
+| `eq supplierId` (~10K matches, limit 10) | **1.3 ms** |
+| `eq buyerId` (~2K matches, limit 10) | **0.53 ms** |
+| `contains number` (idx leaf scan, limit 10) | 26.6 ms |
+| `contains batchNumber` (idx leaf scan, limit 10) | 13.7 ms |
+| `IN` indexed (2 statuses, limit 10) | **0.59 ms** |
+| `eq status + range amount` (AND, limit 10) | **1.0 ms** |
+| `eq status + non-indexed currency` (AND, limit 10) | 299 ms (currency not indexed — full scan after status filter) |
+| Composite `status+invoiceDate starts` (limit 10) | **0.54 ms** |
+| Composite `status+source eq` (limit 10) | **0.57 ms** |
+| Composite `irbmStatus+pdfSent eq` (limit 10) | **0.28 ms** |
+| `RANGE invoiceDate` (gte+lte, limit 10) | **0.40 ms** |
+| `RANGE createdAt` (gte+lte, limit 10) | **0.37 ms** |
+| `OR` two indexed statuses | **6.7 ms** |
 | Fetch page of 100 @ offset 5000 | <1 ms |
 | Keys (first 100) | **<0.2 ms** — limit-bound calls (limit ≤ 1000) route through `slotcask_walk_one_shard_streaming`, which fires cb per record and bails immediately on stop_flag instead of completing the buffered Pass-1 ref-collect. Buffered path stays for unbounded scans (full-scan `count` etc.) where per-segment batched acquire still wins. |
 | `count` full object | <1 ms |
-| **Single DELETE ×1000 (with 14 indexes)** | **15 k/sec** (mean 67µs / p50 63µs) |
-| **Bulk DELETE ×1000** | **143 k/sec** (7 ms) |
+| **Single DELETE ×1000 (with 14 indexes)** | **13 k/sec** (mean 77µs / p50 73µs) |
+| **Bulk DELETE ×1000** | **135 k/sec** (7.4 ms) |
 | VACUUM | **38 ms** (now actually rebuilds kf to drop tombstones — the previously-published 1 ms was the pre-2026.05.x reset_deleted_count path that lied about orphaned-count; the new vacuum is honest) |
 | RECOUNT | **<1 ms** (kf-header sum — was 13 ms walking kf entries) |
 | Disk footprint | 1.9 GB |
