@@ -17321,8 +17321,8 @@ static int d2_batch_cb(const uint8_t hash16[16],
  * (varchar = raw bytes, int/long/short/byte = top-bit-flipped BE so
  * memcmp orders signed values correctly, date/datetime/numeric/currency
  * = BE bytes). qsort is stable enough across libcs for our use; we
- * don't depend on tie-break stability since hash16 break-down is the
- * btree's responsibility, not ours.
+ * hash16 tiebreaker matches cursor_find_cb's skip logic so page boundaries
+ * inside equal-sort-key runs are handled consistently.
  *
  * Length-aware: shorter strings compare as smaller at the prefix-match
  * point, matching the btree's varchar order. */
@@ -17334,7 +17334,7 @@ static int small_prefilter_cmp_asc(const void *a, const void *b) {
     if (c != 0) return c;
     if (ra->sort_key_len < rb->sort_key_len) return -1;
     if (ra->sort_key_len > rb->sort_key_len) return 1;
-    return 0;
+    return memcmp(ra->hash, rb->hash, 16);
 }
 static int small_prefilter_cmp_desc(const void *a, const void *b) {
     return -small_prefilter_cmp_asc(a, b);
