@@ -1,0 +1,70 @@
+name: npm prebuilds
+
+on:
+  push:
+    tags:
+      - 'npm-v*'
+
+jobs:
+  prebuild:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            node: '22'
+          - os: ubuntu-latest
+            arch: arm64
+            node: '22'
+            cross: true
+          - os: macos-14
+            arch: arm64
+            node: '22'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies (Linux x64)
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y python3 make g++
+
+      - name: Install cross-compile tools (Linux arm64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: npm install
+        working-directory: npm
+        run: npm install --ignore-scripts
+
+      - name: prebuildify (linux-x64)
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        working-directory: npm
+        run: npm run prebuild
+
+      - name: prebuildify (linux-arm64 cross)
+        if: matrix.cross
+        working-directory: npm
+        env:
+          CC: aarch64-linux-gnu-gcc
+          CXX: aarch64-linux-gnu-g++
+        run: npx prebuildify --napi --strip --arch arm64
+
+      - name: prebuildify (darwin-arm64)
+        if: matrix.os == 'macos-14'
+        working-directory: npm
+        run: npm run prebuild
+
+      - name: Upload prebuilds to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: npm/prebuilds/**/*.node

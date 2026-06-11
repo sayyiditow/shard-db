@@ -63,6 +63,12 @@ crash-*
 leak-*
 timeout-*
 
+# npm package build artifacts
+npm/node_modules/
+npm/build/
+npm/prebuilds/
+npm/package-lock.json
+
 # Internal planning docs — kept local, never published.
 docs/superpowers/
 test-htest

@@ -1,0 +1,6 @@
+src/
+test/
+*.gyp
+*.gypi
+build/
+node_modules/

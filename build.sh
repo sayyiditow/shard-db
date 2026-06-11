@@ -113,6 +113,8 @@ for f in $LIB_SRCS; do
     LIB_OBJS="$LIB_OBJS $obj"
 done
 ar rcs build/bin/libshard-db.a $LIB_OBJS
+cp src/db/shard_db.h build/bin/shard_db.h
+echo "  -> build/bin/libshard-db.a + build/bin/shard_db.h"
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
 # pthread/daemon code. Self-contained connection helper in src/cli/conn.c.

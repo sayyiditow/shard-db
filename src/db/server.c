@@ -1,5 +1,22 @@
 #include "types.h"
+#ifndef EMBED_NO_TLS
 #include "tls.h"
+#else
+/* OpenSSL-free forward declarations for embedded/npm builds (tls_stub.c
+ * provides the no-op definitions; the TLS code paths are never entered
+ * because g_tls_enable defaults to 0). */
+struct ssl_ctx_st; typedef struct ssl_ctx_st SSL_CTX;
+struct ssl_st;     typedef struct ssl_st     SSL;
+extern SSL_CTX *g_tls_server_ctx;
+extern SSL_CTX *g_tls_client_ctx;
+int   tls_server_init(const char *cert_path, const char *key_path);
+int   tls_client_init(const char *ca_path, int skip_verify);
+void  tls_shutdown(void);
+SSL  *tls_accept(int fd);
+SSL  *tls_connect(int fd, const char *server_name);
+FILE *tls_fopen(SSL *ssl);
+void  tls_close(SSL *ssl, int fd);
+#endif
 #include "connio.h"
 #include "slotcask.h"
 #include "bitmap.h"
