@@ -36,7 +36,7 @@ extern const char *plan_filter_kind_for_test(const char *db_root, const char *ob
                                              char *out_field, size_t fsz,
                                              char *out_order, size_t osz,
                                              int *out_total_cheap);
-extern char g_db_root[];
+/* g_db_root is now a macro from ShardDb struct */
 #endif
 
 static int test_planner_trigram_over_bitmaps(void) {

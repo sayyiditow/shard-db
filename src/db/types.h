@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <regex.h>
+#include <semaphore.h>
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "btree.h"
@@ -420,28 +421,13 @@ typedef struct {
 } ExcludedKeys;
 
 /* ========== Global config ========== */
-extern uint32_t g_timeout;
-extern int g_port;
 extern int g_max_threads;
-extern int g_workers;
 extern int g_pool_chunk;
-extern int g_io_threads;
-extern int g_index_page_size;
-extern int g_global_limit;
-extern int g_max_concurrent_queries;
 /* Query concurrency slot allocator — see config.c. */
 void slot_init(void);
 int  slot_try_acquire(void);
 void slot_release(void);
 void slot_cleanup(int *held);
-extern size_t g_query_buffer_max_bytes;
-/* Peak per-pass memory budget for cmd_add_indexes / reindex. Multi-field
-   builds estimate per-field cost (BtEntry arrays + partition copy + key
-   buffers) from live_count and group fields into passes that fit under
-   this budget. Default 1 GiB; tune via INDEX_BUILD_BUDGET_MB in db.env. */
-extern size_t g_index_build_budget_bytes;
-extern int g_disable_localhost_trust;
-extern int g_token_cap;
 
 /* Per-request statement timeout override. Thread-local: the server's dispatch
    sets it from the JSON request's "timeout_ms" field before calling cmd_*,
@@ -449,10 +435,7 @@ extern int g_token_cap;
    resolve_timeout_ms() is the single read point used everywhere a
    QueryDeadline is constructed. */
 extern _Thread_local uint32_t g_request_timeout_ms;
-static inline uint32_t resolve_timeout_ms(void) {
-    return g_request_timeout_ms > 0 ? g_request_timeout_ms
-                                    : (uint32_t)(g_timeout * 1000);
-}
+/* resolve_timeout_ms defined after shard_db_internal.h include below */
 
 /* Token permission levels.
    r   = read-only ops (get/exists/find/count/aggregate/fetch/keys/get-file).
@@ -466,12 +449,7 @@ static inline uint32_t resolve_timeout_ms(void) {
 /* Canonical error message for per-query memory-cap exceeded. Single string so
    callers don't drift apart; emit via OUT() at any of the 7 collection sites. */
 #define QUERY_BUFFER_ERR "{\"error\":\"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor\"}\n"
-extern int g_max_request_size;
-extern int g_fcache_cap;
-extern int g_btcache_cap;
-extern char g_db_root[PATH_MAX];
 extern char g_log_dir[PATH_MAX];
-extern int g_log_level;
 
 /* Per-thread output stream — worker threads set this to their client socket FILE*.
    Defaults to stdout for CLI mode. All command output uses OUT() instead of printf(). */
@@ -515,31 +493,10 @@ static inline void *xrealloc_or_free(void *p, size_t new_sz) {
     (off) += ((size_t)_n < _rem) ? (size_t)_n : (_rem - 1);               \
 } while (0)
 
-extern int g_log_retain_days;
-
 /* Native TLS — when g_tls_enable=1, server requires TLS on PORT and CLI
    wraps every connection with TLS too. Plain connections are rejected.
-   Cert/key paths validated at startup; daemon refuses to start if missing. */
-extern int g_tls_enable;
-extern int g_tls_skip_verify;            /* client-side dev-only: skip CA verify */
-extern char g_tls_cert[PATH_MAX];
-extern char g_tls_key[PATH_MAX];
-extern char g_tls_ca[PATH_MAX];
-
-/* Monitoring / stats */
-extern uint64_t g_ucache_hits;
-extern uint64_t g_ucache_misses;
-extern uint64_t g_bt_cache_hits;
-extern uint64_t g_bt_cache_misses;
-extern uint64_t g_server_start_ms;
-extern uint64_t g_slow_query_count;
-extern int g_slow_query_ms;
-extern int g_random_seq_ratio;
-extern int g_vacuum_recommend_pct;
-extern int g_vacuum_recommend_min_deleted;
-extern int g_auto_vacuum_enable;
-extern int g_auto_vacuum_interval_sec;
-extern char g_warmup_mode[16];
+   Cert/key paths validated at startup; daemon refuses to start if missing.
+   All TLS config moved to ShardDb struct. */
 
 #define SLOW_QUERY_RING 64
 typedef struct {
@@ -550,10 +507,6 @@ typedef struct {
     char object[48];
     char query[512];          /* truncated request JSON — identifies WHICH query was slow */
 } SlowQueryEntry;
-extern SlowQueryEntry g_slow_queries[SLOW_QUERY_RING];
-extern int g_slow_query_head;
-extern pthread_mutex_t g_slow_query_lock;
-
 uint64_t now_ms(void);
 uint64_t now_ms_coarse(void);
 
@@ -913,6 +866,7 @@ typedef struct UCacheEntry {
 
 void       fcache_init(int cap);
 void       fcache_shutdown(void);
+void       ucache_shutdown(void);
 FcacheRead fcache_get_read(const char *path);
 void       fcache_release(FcacheRead h);
 /* Open (or create) a shard for writing. slot_size > 0 creates the file with
@@ -1121,7 +1075,6 @@ int  match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *f
 int  match_criterion(const char *val_str, const SearchCriterion *c);
 
 /* query.c */
-extern _Atomic int g_scan_stop; /* set to 1 to abort all in-flight shard scans */
 typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *ctx); /* return 0=continue, 1=stop */
 void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
 /* v2 scan bridge — adapts slotcask_walk_live to the SlotHeader-shaped
@@ -1338,12 +1291,15 @@ int criteria_match_tree(const uint8_t *rec, const CriteriaNode *node, FieldSchem
 int cas_check(TypedSchema *ts, const uint8_t *value_ptr, SearchCriterion *crit, int ncrit);
 
 
-/* config.c globals */
+/* config.c globals — moved to ShardDb struct (shard_db_internal.h) */
 #define DIRS_BUCKETS 2048
-extern char g_dirs[DIRS_BUCKETS][256];
-extern int g_dirs_used[DIRS_BUCKETS];
-extern int g_dirs_count;
-extern pthread_mutex_t g_dirs_lock;
+#include "shard_db_internal.h"
+
+/* resolve_timeout_ms — defined here so g_timeout macro is visible */
+static inline uint32_t resolve_timeout_ms(void) {
+    return g_request_timeout_ms > 0 ? g_request_timeout_ms
+                                    : (uint32_t)(g_timeout * 1000);
+}
 
 /* server.c */
 int cmd_server(const char *db_root, int daemonize);

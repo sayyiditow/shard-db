@@ -5,12 +5,11 @@
  */
 
 #define _GNU_SOURCE
+#include "types.h"
 #include "btree.h"
 int bt_page_size = 4096;
 
-/* Monitoring counters (defined in config.c, updated atomically). */
-extern uint64_t g_bt_cache_hits;
-extern uint64_t g_bt_cache_misses;
+/* Monitoring counters — now accessed via ShardDb struct macros */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -364,16 +363,6 @@ static int page_bsearch(uint8_t *page, const char *target, size_t target_len) {
    model for shard files. */
 
 typedef struct {
-    char     path[PATH_MAX];
-    int      fd;
-    uint8_t *map;
-    size_t   map_size;
-    pthread_rwlock_t rwlock;
-    int      used;
-    uint64_t last_access;
-} BtCacheEntry;
-
-typedef struct {
     int      slot;       /* cache slot index, or -1 if uncached fallback */
     int      writer;     /* 1 if held wrlock, 0 if rdlock (only when slot >= 0) */
     int      fd;         /* mirror of cache entry fd; used for grow remap */
@@ -381,11 +370,7 @@ typedef struct {
     size_t   map_size;
 } BtFile;
 
-static BtCacheEntry    *bt_cache = NULL;
-static int              bt_cache_slots = 0;  /* power of 2 */
-static int              bt_cache_count = 0;
-static pthread_mutex_t  bt_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile uint64_t bt_cache_clock = 0;  /* monotonic LRU counter */
+/* BtCacheEntry moved to shard_db_internal.h; bt_cache* moved to ShardDb struct */
 
 static int bt_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
@@ -2660,7 +2645,7 @@ static int bt_cmp_entry(const void *a, const void *b) {
 typedef struct { char path[PATH_MAX]; pthread_mutex_t mutex; int used; } BtMergeLock;
 #define BT_MERGE_LOCK_BUCKETS 256
 static BtMergeLock g_bt_merge_locks[BT_MERGE_LOCK_BUCKETS];
-static pthread_mutex_t g_bt_merge_table_lock = PTHREAD_MUTEX_INITIALIZER;
+/* g_bt_merge_table_lock moved to ShardDb struct */
 
 static pthread_mutex_t *bt_merge_lock_for(const char *path) {
     uint32_t idx = bt_path_hash(path) % BT_MERGE_LOCK_BUCKETS;

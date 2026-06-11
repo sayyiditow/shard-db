@@ -15,6 +15,7 @@
  */
 
 #define _GNU_SOURCE
+#include "types.h"
 #include "bitmap.h"
 
 #include <fcntl.h>
@@ -61,21 +62,7 @@ struct __attribute__((packed)) BmHeader {
    Initialised by bm_cache_init() at daemon startup, mirroring
    bt_cache_init(). If uninitialised, bm_open falls back to a fresh
    mmap per call (test fixtures use this — no cache thrash). */
-typedef struct {
-    char     path[PATH_MAX];
-    int      fd;
-    uint8_t *map;
-    size_t   map_size;
-    pthread_rwlock_t rwlock;
-    int      used;
-    uint64_t last_access;
-} BmCacheEntry;
-
-static BmCacheEntry    *g_bm_cache = NULL;
-static int              g_bm_cache_slots = 0;
-static int              g_bm_cache_count = 0;
-static pthread_mutex_t  g_bm_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile uint64_t g_bm_cache_clock = 0;
+/* BmCacheEntry moved to shard_db_internal.h; g_bm_cache* moved to ShardDb struct */
 
 static int bm_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
@@ -384,6 +371,7 @@ BitmapShard *bm_open(const char *path, int slots, int create,
         struct stat st;
         if (stat(path, &st) != 0) {
             if (!create) return NULL;
+            bm_cache_invalidate(path); /* evict stale entry if file was unlinked+recreated */
             if (bm_write_initial(path, (uint32_t)slots, bool_fastpath, max_values) != 0)
                 return NULL;
         }

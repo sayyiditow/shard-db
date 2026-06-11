@@ -47,14 +47,18 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #       bm_* / tg_* symbols for the bitmap + trigram index types. Same
 #       rationale as above — linked for symbol resolution, never entered
 #       by the fuzzer.
-# server.c, tls.c are NOT linked: the parser never reaches them; trying
-# to link tls.c without OpenSSL would fail the cleaner subset.
+# server.c, tls.c are NOT linked: the parser never reaches them and
+# tls.c requires OpenSSL. Instead, fuzz/stubs.c provides zero-valued
+# stub definitions for the two globals they export (g_db,
+# g_shard_db_instance) so the linker resolves the references from
+# objlock.c and parallel.c without pulling in TLS dependencies.
 echo "==> fuzz_criteria"
 # -latomic: storage.c does sub-word atomics on packed-struct members, which
 # clang emits as a libcall instead of an inline op (gcc inlines it). The
 # atomic libcall lives in libatomic.
 clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     fuzz/fuzz_criteria.c \
+    fuzz/stubs.c \
     src/db/util.c src/db/keyset.c src/db/query.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \

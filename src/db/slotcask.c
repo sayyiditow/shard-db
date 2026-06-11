@@ -149,23 +149,7 @@ static void seg_path_for(char out[PATH_MAX], const char *data_dir,
 }
 
 /* ============================================================ kfcache */
-
-typedef struct {
-    char     path[PATH_MAX];
-    int      fd;
-    uint8_t *base;              /* raw mmap pointer; header at base+0, slots at base+24 */
-    size_t   map_size;          /* total mmap bytes (header + slots) */
-    size_t   capacity;          /* slots = (map_size - 24) / 24 */
-    pthread_rwlock_t rwlock;
-    int      used;
-    uint64_t last_access;
-} KfCacheEntry;
-
-static KfCacheEntry    *g_kfcache = NULL;
-static int              g_kfcache_slots = 0;
-static int              g_kfcache_count = 0;
-static pthread_mutex_t  g_kfcache_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile uint64_t g_kfcache_clock = 0;
+/* KfCacheEntry moved to shard_db_internal.h; g_kfcache* moved to ShardDb struct */
 
 void kfcache_init(int cap) {
     if (g_kfcache) return;
@@ -506,22 +490,7 @@ void kfcache_release(SlotcaskKfHandle *h) {
 }
 
 /* ============================================================ segcache */
-
-typedef struct {
-    char     path[PATH_MAX];
-    int      fd;
-    uint8_t *map;
-    size_t   map_size;
-    pthread_rwlock_t rwlock;
-    int      used;
-    uint64_t last_access;
-} SegCacheEntry;
-
-static SegCacheEntry   *g_segcache = NULL;
-static int              g_segcache_slots = 0;
-static int              g_segcache_count = 0;
-static pthread_mutex_t  g_segcache_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile uint64_t g_segcache_clock = 0;
+/* SegCacheEntry moved to shard_db_internal.h; g_segcache* moved to ShardDb struct */
 
 void segcache_init(int cap) {
     if (g_segcache) return;
@@ -4257,17 +4226,7 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
 }
 
 /* ============================================================ Registry */
-
-#define SLOTCASK_REG_BUCKETS 1024
-
-typedef struct {
-    char        key[PATH_MAX];   /* "effective_root:object" */
-    SlotcaskDb *db;
-    int         used;
-} RegEntry;
-
-static RegEntry         g_reg[SLOTCASK_REG_BUCKETS];
-static pthread_mutex_t  g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+/* RegEntry + SLOTCASK_REG_BUCKETS moved to shard_db_internal.h; g_reg* moved to ShardDb struct */
 
 static void reg_key(char out[PATH_MAX], const char *effective_root,
                     const char *object) {

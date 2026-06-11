@@ -96,8 +96,23 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
+
+# libshard-db.a — embedded mode static library (all daemon sources except main.c)
+LIB_SRCS="src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c \
+          src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c \
+          src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c \
+          src/db/io_direct.c src/db/query.c src/db/server.c src/db/config.c \
+          src/db/embedded.c"
+LIB_OBJS=""
+mkdir -p build/bin build/obj
+for f in $LIB_SRCS; do
+    obj="build/obj/$(basename "${f%.c}").o"
+    gcc $MODE_CFLAGS -c "$f" -Isrc/db $OSSL_CFLAGS -o "$obj"
+    LIB_OBJS="$LIB_OBJS $obj"
+done
+ar rcs build/bin/libshard-db.a $LIB_OBJS
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
 # pthread/daemon code. Self-contained connection helper in src/cli/conn.c.
@@ -255,6 +270,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/db/query.c \
     src/db/server.c \
     src/db/config.c \
+    src/db/embedded.c \
     -Isrc/db -Isrc/test \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test
@@ -296,7 +312,9 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/simd.c \
     src/db/io_direct.c \
     src/db/query.c \
+    src/db/server.c \
     src/db/config.c \
+    src/db/embedded.c \
     -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
@@ -320,6 +338,7 @@ rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
 cp shard-db shard-cli shard-db-test shard-db-bench migrate build/bin/
+cp src/db/shard_db.h build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
 # overwriting the existing config when an upgrade tarball lands on top.
