@@ -20,8 +20,9 @@ declare class ShardDb {
 
 declare namespace ShardDb {
   /** Arbitrary field criteria — keys are schema field names, values are
-   *  scalars (exact match) or operator objects e.g. { gt: 100 }. */
-  type Criteria = Record<string, unknown>
+   *  scalars (exact match) or operator objects e.g. { gt: 100 }.
+   *  Also accepts an array of { field, op, value } filter objects. */
+  type Criteria = Record<string, unknown> | unknown[]
 
   interface Aggregate {
     fn: 'sum' | 'avg' | 'min' | 'max' | 'count'
@@ -60,12 +61,14 @@ declare namespace ShardDb {
         limit?: number
         offset?: number
         order_by?: string
-        order_dir?: 'asc' | 'desc'
+		order?: 'asc' | 'desc'
         /** Resume cursor from a previous paginated response. null = first page. */
         cursor?: Record<string, unknown> | null
         /** Return full match count alongside the page. */
         total?: boolean
-        fields?: string[] }
+        fields?: string[]
+        /** Response format — 'dict' returns a {key: value} object instead of an array. */
+        format?: 'dict' }
 
     | { mode: 'count'
         dir: string; object: string
