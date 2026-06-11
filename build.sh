@@ -312,6 +312,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/simd.c \
     src/db/io_direct.c \
     src/db/query.c \
+    src/db/server.c \
     src/db/config.c \
     src/db/embedded.c \
     -Isrc/db -Isrc/test -Isrc/bench \
