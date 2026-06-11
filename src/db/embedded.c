@@ -72,14 +72,6 @@ ShardDb *shard_db_open_internal(const char *db_root) {
     snprintf(db->db_root, sizeof(db->db_root), "%s", db_root);
     atomic_init(&db->scan_stop, 0);
 
-    /* Load db.env — try cwd first, then db_root parent. */
-    {
-        FILE *f = fopen("db.env", "r");
-        if (f) {
-            fclose(f);
-            load_db_root(db->db_root, sizeof(db->db_root));
-        }
-    }
 
     db->server_start_ms = now_ms();
     bt_page_size = db->index_page_size;
