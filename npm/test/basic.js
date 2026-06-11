@@ -76,6 +76,86 @@ try {
   })))
   assert(count2 === 0, 'count is 0 after delete')
 
+  // 8. Object form — query() accepts a plain object (no JSON.stringify needed)
+  const insertObj = JSON.parse(db.query({
+    mode: 'insert',
+    dir: 'test',
+    object: 'items',
+    key: 'k2',
+    value: { title: 'object form' }
+  }))
+  assert(!insertObj.error, 'object-form insert succeeds')
+
+  const fetchObj = JSON.parse(db.query({
+    mode: 'get',
+    dir: 'test',
+    object: 'items',
+    key: 'k2'
+  }))
+  assert(fetchObj.title === 'object form', 'object-form get returns correct value')
+
+  // 10. update
+  const updResp = JSON.parse(db.query({ mode: 'update', dir: 'test', object: 'items', key: 'k2', value: { title: 'updated' } }))
+  assert(!updResp.error, 'update succeeds')
+  const getUpd = JSON.parse(db.query({ mode: 'get', dir: 'test', object: 'items', key: 'k2' }))
+  assert(getUpd.title === 'updated', 'update persisted correct value')
+
+  // 11. exists — present and absent
+  const ex1 = JSON.parse(db.query({ mode: 'exists', dir: 'test', object: 'items', key: 'k2' }))
+  assert(ex1 === true, 'exists returns true for present key')
+  const ex2 = JSON.parse(db.query({ mode: 'exists', dir: 'test', object: 'items', key: 'missing' }))
+  assert(ex2 === false, 'exists returns false for absent key')
+
+  // 12. bulk-insert
+  const bulkIns = JSON.parse(db.query({ mode: 'bulk-insert', dir: 'test', object: 'items', records: [
+    { key: 'k3', value: { title: 'three' } },
+    { key: 'k4', value: { title: 'four'  } }
+  ]}))
+  assert(!bulkIns.error, 'bulk-insert succeeds')
+
+  // 13. find
+  const found = JSON.parse(db.query({ mode: 'find', dir: 'test', object: 'items', criteria: {}, limit: 10 }))
+  assert(Array.isArray(found) && found.length === 3, 'find returns all 3 records')
+
+  // 14. keys
+  const keysList = JSON.parse(db.query({ mode: 'keys', dir: 'test', object: 'items', limit: 10 }))
+  assert(Array.isArray(keysList) && keysList.length === 3, 'keys returns 3 keys')
+
+  // 15. fetch
+  const fetched = JSON.parse(db.query({ mode: 'fetch', dir: 'test', object: 'items', limit: 10 }))
+  assert(Array.isArray(fetched.results) && fetched.results.length === 3, 'fetch returns 3 records')
+
+  // 16. bulk-delete
+  const bulkDel = JSON.parse(db.query({ mode: 'bulk-delete', dir: 'test', object: 'items', keys: ['k3', 'k4'] }))
+  assert(!bulkDel.error, 'bulk-delete succeeds')
+  const countAfterBulk = JSON.parse(db.query({ mode: 'count', dir: 'test', object: 'items' }))
+  assert(countAfterBulk === 1, 'count is 1 after bulk-delete')
+
+  // 17. aggregate — separate object with numeric field
+  const createScores = JSON.parse(db.query({ mode: 'create-object', dir: 'test', object: 'scores', splits: 8, max_key: 64, fields: ['score:int'] }))
+  assert(!createScores.error, 'create-object scores succeeds')
+  db.query({ mode: 'bulk-insert', dir: 'test', object: 'scores', records: [
+    { key: 's1', value: { score: 10 } },
+    { key: 's2', value: { score: 20 } },
+    { key: 's3', value: { score: 30 } }
+  ]})
+  const agg = JSON.parse(db.query({ mode: 'aggregate', dir: 'test', object: 'scores', aggregates: [{ fn: 'sum', field: 'score', alias: 'total' }] }))
+  assert(agg && agg.total === 60, 'aggregate sum returns correct total')
+
+  // 18. list-objects
+  const objs = JSON.parse(db.query({ mode: 'list-objects', dir: 'test' }))
+  assert(Array.isArray(objs.objects) && objs.objects.includes('items'), 'list-objects includes items')
+
+  // 19. describe-object
+  const desc = JSON.parse(db.query({ mode: 'describe-object', dir: 'test', object: 'items' }))
+  assert(desc && !desc.error, 'describe-object returns schema')
+
+  // 20. drop-object
+  const drop = JSON.parse(db.query({ mode: 'drop-object', dir: 'test', object: 'scores' }))
+  assert(!drop.error, 'drop-object succeeds')
+  const objsAfterDrop = JSON.parse(db.query({ mode: 'list-objects', dir: 'test' }))
+  assert(!objsAfterDrop.objects.includes('scores'), 'dropped object no longer listed')
+
 } finally {
   if (db) db.close()
   fs.rmSync(tmp, { recursive: true, force: true })
