@@ -146,6 +146,10 @@ ShardDb *shard_db_open(const char *db_root) {
     ShardDb *db = shard_db_open_internal(db_root);
     if (!db) { atomic_store(&g_instance_open, 0); return NULL; }
 
+    /* Expose instance before starting pools so pool_worker / io_pool_worker
+       can bind their thread-local g_db on entry. */
+    g_shard_db_instance = db;
+
     /* Start CPU and I/O thread pools (shared process-global). */
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
     if (nproc <= 0) nproc = 4;

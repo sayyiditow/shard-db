@@ -106,9 +106,9 @@ LIB_SRCS="src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c \
           src/db/io_direct.c src/db/query.c src/db/server.c src/db/config.c \
           src/db/embedded.c"
 LIB_OBJS=""
+mkdir -p build/bin build/obj
 for f in $LIB_SRCS; do
     obj="build/obj/$(basename "${f%.c}").o"
-    mkdir -p build/obj
     gcc $MODE_CFLAGS -c "$f" -Isrc/db $OSSL_CFLAGS -o "$obj"
     LIB_OBJS="$LIB_OBJS $obj"
 done
