@@ -76,6 +76,24 @@ try {
   })))
   assert(count2 === 0, 'count is 0 after delete')
 
+  // 8. Object form — query() accepts a plain object (no JSON.stringify needed)
+  const insertObj = JSON.parse(db.query({
+    mode: 'insert',
+    dir: 'test',
+    object: 'items',
+    key: 'k2',
+    value: { title: 'object form' }
+  }))
+  assert(!insertObj.error, 'object-form insert succeeds')
+
+  const fetchObj = JSON.parse(db.query({
+    mode: 'get',
+    dir: 'test',
+    object: 'items',
+    key: 'k2'
+  }))
+  assert(fetchObj.title === 'object form', 'object-form get returns correct value')
+
 } finally {
   if (db) db.close()
   fs.rmSync(tmp, { recursive: true, force: true })
