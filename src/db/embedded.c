@@ -72,6 +72,20 @@ ShardDb *shard_db_open_internal(const char *db_root) {
     snprintf(db->db_root, sizeof(db->db_root), "%s", db_root);
     atomic_init(&db->scan_stop, 0);
 
+    /* Load db.env from CWD now that g_db is live so g_*-guarded settings
+       (TOKEN_CAP, FCACHE_MAX, PORT, TLS_*, etc.) are applied before the
+       caches they size are allocated below.  The DB_ROOT field in db.env
+       is discarded: the caller's db_root is always authoritative, so we
+       restore it after the call. */
+    {
+        FILE *f = fopen("db.env", "r");
+        if (f) {
+            fclose(f);
+            char env_root[PATH_MAX];
+            load_db_root(env_root, sizeof(env_root));
+            snprintf(db->db_root, sizeof(db->db_root), "%s", db_root);
+        }
+    }
 
     db->server_start_ms = now_ms();
     bt_page_size = db->index_page_size;
