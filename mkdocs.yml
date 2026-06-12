@@ -74,7 +74,7 @@ plugins:
   - search
 
 exclude_docs:
-  - plans/
+  "plans/"
 
 nav:
   - Home: index.md
