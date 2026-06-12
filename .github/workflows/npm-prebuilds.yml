@@ -10,7 +10,7 @@ permissions: read-all
 jobs:
   prebuild:
     permissions:
-      contents: write     # softprops/action-gh-release uploads .node assets
+      contents: read
     strategy:
       matrix:
         include:
@@ -68,7 +68,41 @@ jobs:
         working-directory: npm
         run: npm run prebuild
 
-      - name: Upload prebuilds to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+      - name: Upload prebuilds artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: npm/prebuilds/**/*.node
+          name: prebuilds-${{ matrix.os }}-${{ matrix.arch }}
+          path: npm/prebuilds/**/*.node
+          retention-days: 1
+
+  publish:
+    needs: prebuild
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm provenance
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          pattern: prebuilds-*
+          path: npm/prebuilds
+          merge-multiple: true
+
+      - name: npm install (no scripts — prebuilds already built)
+        working-directory: npm
+        run: npm ci --ignore-scripts
+
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
