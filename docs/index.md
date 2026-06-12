@@ -22,6 +22,7 @@ A high-performance database in C. Single static binary, single process, no exter
 - **Native TLS 1.3** — single binary, single port, OpenSSL-backed. Toggle via `TLS_ENABLE=1` in db.env. Reverse-proxy termination (nginx/HAProxy/stunnel) remains supported.
 - **Per-request statement timeout** — any query can carry `"timeout_ms":N`; thread-local override of the global `TIMEOUT`.
 - **shard-cli TUI** — separate ncurses client that connects over the same TCP+TLS wire; menus for browse / query / schema / maintenance / auth / live stats. See [CLI reference → shard-cli](cli/shard-cli.md).
+- **Embedded mode** — run shard-db in-process with no daemon and no TCP socket.  C API (`shard_db_open` / `shard_db_query` / `shard_db_close`) and a Node.js / Bun npm package (`shard-db`) with full TypeScript types and a log handler callback.
 
 **Platform:** Linux x86_64 / ARM64 and macOS Apple Silicon (2026.05.4+). Uses `mmap`, POSIX pthreads, and `poll(2)` for the accept loop on both platforms (the earlier Linux-only `epoll` path was retired in 2026.05.4 with the macOS port — single listen fd had nothing to gain from `epoll`'s selectivity). License: **MIT**.
 
@@ -59,3 +60,5 @@ Dive deeper in the [Quick start](getting-started/quickstart.md).
 | Deploy to production | [Operations → Deployment](operations/deployment.md) · [Tuning](operations/tuning.md) |
 | Find a limit or error | [Reference → Limits](reference/limits.md) · [Error codes](reference/error-codes.md) |
 | See what shipped | [Changelog](reference/changelog.md) |
+| Use shard-db in-process (C / C++) | [Embedded mode](getting-started/embedded-mode.md) |
+| Use shard-db from Node.js / Bun | [npm package](getting-started/npm.md) |
