@@ -7,6 +7,7 @@
 
 [![CI](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/ci.yml)
 [![Docs](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml/badge.svg)](https://github.com/sayyiditow/shard-db/actions/workflows/docs.yml)
+[![npm](https://img.shields.io/npm/v/shard-db)](https://www.npmjs.com/package/shard-db)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sayyiditow/shard-db/badge)](https://scorecard.dev/viewer/?uri=github.com/sayyiditow/shard-db)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12704/badge)](https://www.bestpractices.dev/projects/12704)
 [![Coverity Scan](https://scan.coverity.com/projects/33072/badge.svg?v=2026-05-05)](https://scan.coverity.com/projects/sayyiditow-shard-db)
@@ -18,7 +19,7 @@ A high-performance database in C. Single static binary, single process, no exter
 
 ## In production
 
-**[HN Explorer](https://hn.shard-db.dev)** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · [Starter template](https://github.com/sayyiditow/shard-db-svelte-starter) (SvelteKit).
+**[HN Explorer](https://hn.shard-db.dev)** — 30M+ Hacker News stories, comments, and users served from a single shard-db instance on an 8-core Netcup VPS. Browse by category, search with full-text, paginate deep into the archive at constant latency. Runs in **embedded mode** via the npm package — no separate daemon. [Source](https://github.com/sayyiditow/shard-db-hn-explorer) · Starters: [TCP](https://github.com/sayyiditow/shard-db-svelte-starter) · [Embedded](https://github.com/sayyiditow/shard-db-embedded-sveltekit-starter) (SvelteKit + Bun).
 
 ## Why I built it
 
@@ -91,6 +92,34 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 ```
 
 More: [Install](docs/getting-started/install.md) · [Quick start](docs/getting-started/quickstart.md) · [Client examples (Python / Java / Node.js)](docs/getting-started/clients.md)
+
+### Node.js / Bun (embedded — no daemon)
+
+Use shard-db in-process from Node.js or Bun. No TCP, no separate process.
+
+```bash
+npm install shard-db   # or: bun add shard-db
+```
+
+```js
+const ShardDb = require('shard-db')
+const db = new ShardDb('/path/to/data')
+
+await db.query({ mode: 'create-object', dir: 'myapp', object: 'users',
+  splits: 16, max_key: 128,
+  fields: ['name:varchar:100', 'email:varchar:200', 'age:int'],
+  indexes: ['email', 'age'] })
+
+await db.query({ mode: 'insert', dir: 'myapp', object: 'users', key: 'u1',
+  value: { name: 'Alice', email: 'a@x.com', age: 30 } })
+
+const results = JSON.parse(await db.query({ mode: 'find', dir: 'myapp', object: 'users',
+  criteria: { age: { gt: 25 } }, limit: 20 }))
+
+db.close()
+```
+
+Prebuilt binaries for Linux x64/arm64 and macOS Apple Silicon (Node ≥ 18, Bun ≥ 1.0). Full API and TypeScript types: [npm package](https://www.npmjs.com/package/shard-db) · [SvelteKit starter](https://github.com/sayyiditow/shard-db-embedded-sveltekit-starter).
 
 ### Upgrading from a prior release
 
