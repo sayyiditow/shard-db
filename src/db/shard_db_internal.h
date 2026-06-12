@@ -151,6 +151,12 @@ struct ShardDb {
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
+    /* embedded-mode log handler (set via shard_db_set_log_handler).
+       Called synchronously on the same thread as log emission when
+       g_log_running == 0 (no drain thread).  Must be thread-safe.
+       type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT 6=SLOW */
+    void (*log_handler)(int type, const char *msg, void *ud);
+    void *log_handler_ud;
 
     /* slow query ring */
     SlowQueryEntry slow_queries[SLOW_QUERY_RING];

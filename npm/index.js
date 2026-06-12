@@ -1,5 +1,7 @@
 'use strict'
 
+const LOG_TYPES = Object.freeze(['', 'error', 'warn', 'info', 'debug', 'audit', 'slow'])
+
 const binding = require('node-gyp-build')(__dirname)
 
 class ShardDb {
@@ -21,6 +23,11 @@ class ShardDb {
   close() {
     binding.close(this._handle)
   }
+
+  setLogHandler(fn) {
+    binding.setLogHandler(this._handle, fn ?? null)
+  }
 }
 
+ShardDb.LOG_TYPES = LOG_TYPES
 module.exports = ShardDb

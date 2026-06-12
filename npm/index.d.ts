@@ -14,11 +14,39 @@ declare class ShardDb {
   query(body: ShardDb.QueryBody): string
   query(json: string): string
 
+  /**
+   * Register a callback to receive log events (errors, warnings, slow queries, etc.).
+   * The callback fires synchronously after each query() call completes.
+   * Pass null to unregister.
+   *
+   * Log types: 1=error  2=warn  3=info  4=debug  5=audit  6=slow
+   * msg is a pre-formatted string: "YYYY-MM-DD HH:MM:SS LEVEL [subsystem] text\n"
+   *
+   * Note: handler is set after construction; startup logs during new ShardDb()
+   * are emitted before the handler is registered and will not be delivered.
+   */
+  setLogHandler(fn: ShardDb.LogHandler | null): void
+
   /** Close the database and release all resources. */
   close(): void
 }
 
 declare namespace ShardDb {
+  /**
+   * Log event type passed to the setLogHandler callback.
+   * 1=error  2=warn  3=info  4=debug  5=audit  6=slow-query
+   */
+  type LogType = 'error' | 'warn' | 'info' | 'debug' | 'audit' | 'slow'
+
+  /**
+   * Map from numeric C type (1–6) to LogType string.
+   * Index by the numeric type: ShardDb.LOG_TYPES[type] → LogType.
+   */
+  const LOG_TYPES: readonly ['', 'error', 'warn', 'info', 'debug', 'audit', 'slow']
+
+  /** Callback signature for setLogHandler. */
+  type LogHandler = (type: LogType, msg: string) => void
+
   /** Arbitrary field criteria — keys are schema field names, values are
    *  scalars (exact match) or operator objects e.g. { gt: 100 }.
    *  Also accepts an array of { field, op, value } filter objects. */
