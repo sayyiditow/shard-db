@@ -184,8 +184,9 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
 }
 
 void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
-    if (level > g_log_level ||
-        !atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    if (level > g_log_level) return;
+    int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
+    if (!_running && !(g_db && g_db->log_handler)) return;
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
     if (level < 1 || level > 4) level = LOG_LVL_INFO;
     const char *sub = subsystem ? subsystem : "unknown";
@@ -210,6 +211,11 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
         entry.msg[pos+1] = '\0';
     }
 
+    if (!_running && g_db && g_db->log_handler) {
+        g_db->log_handler(level, entry.msg, g_db->log_handler_ud);
+        return;
+    }
+
     pthread_mutex_lock(&g_log_lock);
     int next = (g_log_head + 1) % LOG_RING_SIZE;
     if (next != g_log_tail) {
@@ -222,7 +228,8 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
 
 
 void log_audit_sub(const char *subsystem, const char *fmt, ...) {
-    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
+    if (!_running && !(g_db && g_db->log_handler)) return;
     const char *sub = subsystem ? subsystem : "unknown";
 
     time_t now = time(NULL);
@@ -242,6 +249,11 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     if (pos < (int)sizeof(entry.msg) - 1) {
         entry.msg[pos]   = '\n';
         entry.msg[pos+1] = '\0';
+    }
+
+    if (!_running && g_db && g_db->log_handler) {
+        g_db->log_handler(5 /* SHARD_DB_LOG_AUDIT */, entry.msg, g_db->log_handler_ud);
+        return;
     }
 
     pthread_mutex_lock(&g_log_lock);
@@ -277,7 +289,8 @@ void log_slow_query(const char *mode, const char *dir,
        fopen+fprintf path).  is_slow=1 routes to slow-<date>.log via
        the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
        threshold is the filter. */
-    if (!atomic_load_explicit(&g_log_running, memory_order_relaxed)) return;
+    int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
+    if (!_running && !(g_db && g_db->log_handler)) return;
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
@@ -294,6 +307,11 @@ void log_slow_query(const char *mode, const char *dir,
              dir    ? dir    : "",
              object ? object : "",
              query  ? query  : "");
+
+    if (!_running && g_db && g_db->log_handler) {
+        g_db->log_handler(6 /* SHARD_DB_LOG_SLOW */, entry.msg, g_db->log_handler_ud);
+        return;
+    }
 
     pthread_mutex_lock(&g_log_lock);
     int next2 = (g_log_head + 1) % LOG_RING_SIZE;

@@ -222,6 +222,14 @@ static void db_mutexes_destroy(void) {
     pthread_mutex_destroy(&g_token_lock);
 }
 
+void shard_db_set_log_handler(ShardDb *db,
+    void (*fn)(int type, const char *msg, void *userdata),
+    void *userdata) {
+    if (!db) return;
+    db->log_handler    = fn;
+    db->log_handler_ud = userdata;
+}
+
 void shard_db_close(ShardDb *db) {
     if (!db) return;
     g_db = db;
