@@ -2851,6 +2851,15 @@ int cmd_server(const char *db_root, int daemonize) {
     }
     g_db = g_shard_db_instance;
 
+    /* Load db.env again now that g_db is live so every g_*-guarded
+       assignment in load_db_root() fires (PORT, TIMEOUT, WORKERS,
+       FCACHE_MAX, TLS_*, etc.).  The earlier call in main() ran before
+       g_db existed and silently skipped all of those. */
+    {
+        char dummy[PATH_MAX];
+        load_db_root(dummy, sizeof(dummy));
+    }
+
     int port = g_port;
 
     /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1

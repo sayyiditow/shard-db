@@ -10,7 +10,7 @@ extern "C" {
 typedef struct ShardDb ShardDb;
 
 /* Open a shard-db data directory for in-process use.
-   Reads db.env from the current working directory (same as the daemon).
+   db_root must be an existing, writable directory path.
    Returns NULL on error. Only one instance per process is allowed (V1). */
 ShardDb *shard_db_open(const char *db_root);
 

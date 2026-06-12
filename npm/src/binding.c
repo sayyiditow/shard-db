@@ -47,7 +47,7 @@ static napi_value napi_open(napi_env env, napi_callback_info info) {
     free(db_root);
 
     if (!db) {
-        napi_throw_error(env, NULL, "shard_db_open failed \u2014 check db_root path and db.env");
+        napi_throw_error(env, NULL, "shard_db_open failed \u2014 check db_root path");
         return NULL;
     }
 
