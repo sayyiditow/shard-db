@@ -74,3 +74,4 @@ docs/superpowers/
 test-htest
 *.gcno
 *.gcda
+site
