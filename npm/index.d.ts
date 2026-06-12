@@ -5,14 +5,14 @@ declare class ShardDb {
   constructor(dbRoot: string)
 
   /**
-   * Execute a query synchronously.
+   * Execute a query asynchronously.
    * Accepts a typed QueryBody object (recommended — enables autocomplete)
    * or a raw JSON string (backward compatible).
-   * Returns the JSON response string. Parse with JSON.parse().
-   * Thread-safe: multiple threads may call concurrently on the same instance.
+   * Returns a Promise that resolves to the JSON response string. Parse with JSON.parse().
+   * Multiple concurrent queries are safe — shard-db's worker pool handles parallelism.
    */
-  query(body: ShardDb.QueryBody): string
-  query(json: string): string
+  query(body: ShardDb.QueryBody): Promise<string>
+  query(json: string): Promise<string>
 
   /**
    * Register a callback to receive log events (errors, warnings, slow queries, etc.).

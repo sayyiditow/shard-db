@@ -35,6 +35,77 @@ typedef struct {
     pthread_mutex_t log_buf_lock;
 } DbHandle;
 
+typedef struct {
+    DbHandle       *h;
+    char           *json;       /* heap copy of the input JSON string */
+    char           *out;        /* result buffer — written by execute */
+    size_t          out_len;
+    int             rc;         /* return value of shard_db_query */
+    napi_deferred   deferred;   /* resolves / rejects the returned Promise */
+    napi_async_work work;
+} QueryWork;
+
+static void execute_query(napi_env env, void *data) {
+    (void)env;
+    QueryWork *w = (QueryWork *)data;
+    w->rc = shard_db_query(w->h->db, w->json, &w->out, &w->out_len);
+}
+
+static void complete_query(napi_env env, napi_status status, void *data) {
+    QueryWork *w = (QueryWork *)data;
+
+    if (status == napi_cancelled || w->h->closed) {
+        napi_value msg;
+        napi_create_string_utf8(env, "Query cancelled", NAPI_AUTO_LENGTH, &msg);
+        napi_value err;
+        napi_create_error(env, NULL, msg, &err);
+        napi_reject_deferred(env, w->deferred, err);
+        goto cleanup;
+    }
+
+    if (w->rc != 0) {
+        napi_value msg;
+        napi_create_string_utf8(env, "shard_db_query allocation failure",
+                                NAPI_AUTO_LENGTH, &msg);
+        napi_value err;
+        napi_create_error(env, NULL, msg, &err);
+        napi_reject_deferred(env, w->deferred, err);
+        goto cleanup;
+    }
+
+    /* Drain log buffer on the JS thread (same logic as the old sync path). */
+    if (w->h->log_fn_ref && w->h->log_buf_n > 0) {
+        pthread_mutex_lock(&w->h->log_buf_lock);
+        int n = w->h->log_buf_n; w->h->log_buf_n = 0;
+        LogBufEntry msgs[LOG_BUF_CAP];
+        memcpy(msgs, w->h->log_buf, (size_t)n * sizeof(LogBufEntry));
+        pthread_mutex_unlock(&w->h->log_buf_lock);
+
+        napi_value log_fn, global;
+        napi_get_reference_value(env, w->h->log_fn_ref, &log_fn);
+        napi_get_global(env, &global);
+        for (int i = 0; i < n; i++) {
+            napi_value argv[2];
+            napi_create_int32(env, msgs[i].type, &argv[0]);
+            napi_create_string_utf8(env, msgs[i].msg, NAPI_AUTO_LENGTH, &argv[1]);
+            napi_call_function(env, global, log_fn, 2, argv, NULL);
+        }
+    }
+
+    {
+        napi_value result;
+        napi_create_string_utf8(env, w->out ? w->out : "", w->out_len, &result);
+        shard_db_free_result(w->out);
+        w->out = NULL;
+        napi_resolve_deferred(env, w->deferred, result);
+    }
+
+cleanup:
+    napi_delete_async_work(env, w->work);
+    free(w->json);
+    free(w);
+}
+
 static void c_log_handler(int type, const char *msg, void *ud) {
     DbHandle *h = (DbHandle *)ud;
     pthread_mutex_lock(&h->log_buf_lock);
@@ -91,7 +162,7 @@ static napi_value napi_open(napi_env env, napi_callback_info info) {
     return handle;
 }
 
-/* query(handle, json: string) → string */
+/* query(handle, json: string) → Promise<string> */
 static napi_value napi_query(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value args[2];
@@ -117,40 +188,21 @@ static napi_value napi_query(napi_env env, napi_callback_info info) {
     if (!json) { napi_throw_error(env, NULL, "OOM"); return NULL; }
     NAPI_CALL(env, napi_get_value_string_utf8(env, args[1], json, len + 1, &len));
 
-    char  *out     = NULL;
-    size_t out_len = 0;
-    int rc = shard_db_query(h->db, json, &out, &out_len);
-    free(json);
+    QueryWork *w = calloc(1, sizeof(QueryWork));
+    if (!w) { free(json); napi_throw_error(env, NULL, "OOM"); return NULL; }
+    w->h    = h;
+    w->json = json;
 
-    if (rc != 0) {
-        napi_throw_error(env, NULL, "shard_db_query allocation failure");
-        return NULL;
-    }
+    napi_value promise;
+    NAPI_CALL(env, napi_create_promise(env, &w->deferred, &promise));
 
-    napi_value result;
-    NAPI_CALL(env, napi_create_string_utf8(env, out ? out : "", out_len, &result));
-    shard_db_free_result(out);
+    napi_value resource_name;
+    napi_create_string_utf8(env, "shard_db_query", NAPI_AUTO_LENGTH, &resource_name);
+    napi_create_async_work(env, NULL, resource_name,
+                           execute_query, complete_query, w, &w->work);
+    napi_queue_async_work(env, w->work);
 
-    /* Drain log buffer on the JS thread (safe for napi_call_function). */
-    if (h->log_fn_ref && h->log_buf_n > 0) {
-        pthread_mutex_lock(&h->log_buf_lock);
-        int n = h->log_buf_n; h->log_buf_n = 0;
-        LogBufEntry msgs[LOG_BUF_CAP];
-        memcpy(msgs, h->log_buf, (size_t)n * sizeof(LogBufEntry));
-        pthread_mutex_unlock(&h->log_buf_lock);
-
-        napi_value log_fn, global;
-        napi_get_reference_value(env, h->log_fn_ref, &log_fn);
-        napi_get_global(env, &global);
-        for (int i = 0; i < n; i++) {
-            napi_value argv[2];
-            napi_create_int32(env, msgs[i].type, &argv[0]);
-            napi_create_string_utf8(env, msgs[i].msg, NAPI_AUTO_LENGTH, &argv[1]);
-            napi_call_function(env, global, log_fn, 2, argv, NULL);
-        }
-    }
-
-    return result;
+    return promise;
 }
 
 /* setLogHandler(handle, fn | null) → undefined */

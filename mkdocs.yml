@@ -73,6 +73,9 @@ markdown_extensions:
 plugins:
   - search
 
+exclude_docs:
+  - plans/
+
 nav:
   - Home: index.md
   - Getting Started:
