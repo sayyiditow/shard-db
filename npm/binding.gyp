@@ -41,7 +41,7 @@
         ["OS=='mac'", {
           "libraries": [],
           "xcode_settings": {
-            "OTHER_CFLAGS": [ "-O2", "-std=c11", "-fno-strict-aliasing", "-D_GNU_SOURCE" ]
+            "OTHER_CFLAGS": [ "-O2", "-std=c11", "-fno-strict-aliasing", "-D_GNU_SOURCE", "-DNAPI_VERSION=8", "-DEMBED_NO_TLS" ]
           }
         }]
       ]
