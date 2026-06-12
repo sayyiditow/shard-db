@@ -48,7 +48,7 @@ jobs:
 
       - name: npm install
         working-directory: npm
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: prebuildify (linux-x64)
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
@@ -61,7 +61,7 @@ jobs:
         env:
           CC: aarch64-linux-gnu-gcc
           CXX: aarch64-linux-gnu-g++
-        run: npx prebuildify --napi --strip --arch arm64
+        run: ./node_modules/.bin/prebuildify --napi --strip --arch arm64
 
       - name: prebuildify (darwin-arm64)
         if: matrix.os == 'macos-14'
