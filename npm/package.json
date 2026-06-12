@@ -11,10 +11,16 @@
     "prebuild": "prebuildify --napi --strip -t 18.0.0 -t 20.0.0 -t 22.0.0",
     "test": "bun test/basic.js"
   },
-  "keywords": ["database", "embedded", "key-value", "btree", "native"],
+  "keywords": [
+    "database",
+    "embedded",
+    "key-value",
+    "btree",
+    "native"
+  ],
   "license": "MIT",
   "devDependencies": {
-    "node-gyp": "^10.0.0",
+    "node-gyp": "^13.0.0",
     "prebuildify": "^6.0.0"
   },
   "dependencies": {
