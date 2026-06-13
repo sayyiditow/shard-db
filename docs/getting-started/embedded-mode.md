@@ -136,8 +136,10 @@ LDFLAGS += -L/path/to/build/bin -lshard-db -lpthread
 - **One instance per process.**  A second `shard_db_open` call returns NULL
   until the first is closed.
 - **No TCP server.**  Daemon config knobs that relate to the TCP layer
-  (`PORT`, `TLS_*`, `THREADS`, `WORKERS`, `MAX_CONCURRENT_QUERIES`,
-  `MAX_REQUEST_SIZE`) are parsed from `db.env` if present but have no effect.
+  (`PORT`, `TLS_*`, `THREADS`, `WORKERS`, `MAX_REQUEST_SIZE`) are parsed
+  from `db.env` if present but have no effect.  `MAX_CONCURRENT_QUERIES`
+  does not cap concurrency in embedded mode but does influence the
+  per-query memory budget auto-tune.
 - **Startup logs not delivered.**  Events emitted during `shard_db_open`
   occur before the handler is registered.  If you need to capture them, start
   the daemon, redirect its log to your log pipeline, and use the TCP API
