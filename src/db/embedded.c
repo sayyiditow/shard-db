@@ -184,7 +184,23 @@ int shard_db_query(ShardDb *db, const char *json, char **out, size_t *out_len) {
     if (!mf) return -1;
 
     g_out = mf;
+    uint64_t _t0 = (g_slow_query_ms > 0) ? now_ms() : 0;
     dispatch_json_query(db->db_root, json, "127.0.0.1");
+    if (g_slow_query_ms > 0) {
+        uint64_t _dt = now_ms() - _t0;
+        if (_dt > (uint64_t)g_slow_query_ms) {
+            JsonObj _tmp;
+            json_parse_object(json, strlen(json), &_tmp);
+            char *_mode = json_obj_strdup(&_tmp, "mode");
+            char *_dir  = json_obj_strdup(&_tmp, "dir");
+            char *_obj  = json_obj_strdup(&_tmp, "object");
+            log_slow_query(_mode ? _mode : "",
+                           _dir  ? _dir  : "",
+                           _obj  ? _obj  : "",
+                           json, (uint32_t)_dt);
+            free(_mode); free(_dir); free(_obj);
+        }
+    }
     fflush(mf);
     fclose(mf);
     g_out = NULL;
