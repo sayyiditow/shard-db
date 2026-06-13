@@ -93,10 +93,11 @@ jobs:
       - name: Package binary tarball
         run: |
           tarball="shard-db-${{ github.ref_name }}-${{ matrix.target.name }}.tar.gz"
-          # build.sh emits everything inside build/bin/ (shard-db, shard-cli,
-          # db.env.example). Packaging that single dir keeps the tarball
-          # layout flat: extract → cd shard-db-<tag>/bin/ → ./shard-db start.
-          tar -czf "$tarball" -C build bin
+          # Only ship user-facing binaries. libshard-db.a, shard-db-test, and
+          # shard-db-bench live in build/bin/ for local dev but are not part of
+          # a user install.
+          tar -czf "$tarball" -C build/bin \
+            shard-db shard-cli migrate db.env.example
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
