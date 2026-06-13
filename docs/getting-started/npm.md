@@ -38,17 +38,19 @@ per process is supported.
 ## Queries
 
 `db.query()` accepts a `QueryBody` object (TypeScript autocomplete included)
-or a raw JSON string and returns the JSON response string synchronously.
+or a raw JSON string and returns a `Promise<string>` that resolves to the
+JSON response.  Queries run on worker threads — the event loop is never
+blocked, and multiple queries may be in flight concurrently.
 
 ```js
-const result = db.query({ mode: 'count', dir: 'default', object: 'users' })
+const result = await db.query({ mode: 'count', dir: 'default', object: 'users' })
 const count = JSON.parse(result)   // e.g. 42
 ```
 
 ### Create an object (table)
 
 ```js
-db.query({
+await db.query({
   mode: 'create-object',
   dir: 'default',
   object: 'users',
@@ -68,7 +70,7 @@ db.query({
 ### Insert a record
 
 ```js
-db.query({
+await db.query({
   mode: 'insert',
   dir: 'default',
   object: 'users',
@@ -80,7 +82,7 @@ db.query({
 ### Get a record
 
 ```js
-const raw = db.query({ mode: 'get', dir: 'default', object: 'users', key: 'u1' })
+const raw = await db.query({ mode: 'get', dir: 'default', object: 'users', key: 'u1' })
 const user = JSON.parse(raw)
 // { name: 'Alice', email: 'alice@example.com', age: 30, active: true, created: '...' }
 ```
@@ -89,7 +91,7 @@ const user = JSON.parse(raw)
 
 ```js
 // All users older than 25, newest first
-const raw = db.query({
+const raw = await db.query({
   mode: 'find',
   dir: 'default',
   object: 'users',
@@ -108,7 +110,7 @@ Common operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`,
 ### Count
 
 ```js
-const n = JSON.parse(db.query({
+const n = JSON.parse(await db.query({
   mode: 'count',
   dir: 'default',
   object: 'users',
@@ -119,7 +121,7 @@ const n = JSON.parse(db.query({
 ### Aggregate
 
 ```js
-const raw = db.query({
+const raw = await db.query({
   mode: 'aggregate',
   dir: 'default',
   object: 'users',
@@ -136,7 +138,7 @@ const rows = JSON.parse(raw)
 ### Bulk insert
 
 ```js
-db.query({
+await db.query({
   mode: 'bulk-insert',
   dir: 'default',
   object: 'users',
@@ -150,6 +152,18 @@ db.query({
 Bulk insert is an **upsert** — it overwrites existing keys and updates their
 index entries.
 
+### Concurrent queries
+
+Multiple queries may be awaited concurrently without any locking on the JS
+side — shard-db's internal worker pool handles parallelism:
+
+```js
+const [usersRaw, countRaw] = await Promise.all([
+  db.query({ mode: 'find', dir: 'default', object: 'users', limit: 20 }),
+  db.query({ mode: 'count', dir: 'default', object: 'users' })
+])
+```
+
 ### Cursor pagination
 
 Cursor pagination is O(limit) per page regardless of depth — prefer it over
@@ -157,7 +171,7 @@ Cursor pagination is O(limit) per page regardless of depth — prefer it over
 
 ```js
 // First page
-let raw = db.query({
+let page = JSON.parse(await db.query({
   mode: 'find',
   dir: 'default',
   object: 'users',
@@ -165,13 +179,12 @@ let raw = db.query({
   order: 'asc',
   limit: 20,
   cursor: null        // null = first page
-})
-let page = JSON.parse(raw)
-// page.items  — array of records
+}))
+// page.rows   — array of records
 // page.cursor — pass to next call, or null when exhausted
 
 // Next page
-raw = db.query({
+page = JSON.parse(await db.query({
   mode: 'find',
   dir: 'default',
   object: 'users',
@@ -179,7 +192,7 @@ raw = db.query({
   order: 'asc',
   limit: 20,
   cursor: page.cursor
-})
+}))
 ```
 
 `order_by` must be an indexed field.  See
@@ -215,8 +228,8 @@ Log types:
 
 Call `db.setLogHandler(null)` to unregister.
 
-> **Note:** The handler fires after `query()` returns, on the calling thread.
-> Startup events from `new ShardDb()` are not delivered.
+> **Note:** The handler fires on the JS thread after each query Promise
+> resolves.  Startup events from `new ShardDb()` are not delivered.
 
 ## Configuration
 
@@ -244,23 +257,17 @@ import ShardDb = require('shard-db')
 
 const db = new ShardDb(dbRoot)
 
-db.setLogHandler((type: ShardDb.LogType, msg: string) => {
-  if (type === 'error') console.error(msg.trim())
+db.setLogHandler((type: number, msg: string) => {
+  if (ShardDb.LOG_TYPES[type] === 'error') console.error(msg.trim())
 })
 
-const raw: string = db.query({ mode: 'count', dir: 'default', object: 'users' })
+const raw: string = await db.query({ mode: 'count', dir: 'default', object: 'users' })
 const count: number = JSON.parse(raw)
 ```
 
-Wait — `type` in the callback is a **number** (1–6), not the `LogType` string.
-Map it with `ShardDb.LOG_TYPES[type]` to get the string label.
+`type` in the log handler is a raw number (1–6).  Use `ShardDb.LOG_TYPES[type]`
+to get the string label.
 
 ## Limitations
 
-See [Embedded mode → Limitations](embedded-mode.md#limitations).  The npm
-package adds one more:
-
-- **Synchronous only.**  `db.query()` blocks the calling thread.  In a
-  Node.js HTTP server, run `new ShardDb()` once at startup and share the
-  handle — the underlying worker pool is multi-threaded even though the JS
-  call is synchronous.
+See [Embedded mode → Limitations](embedded-mode.md#limitations).

@@ -16,7 +16,9 @@ declare class ShardDb {
 
   /**
    * Register a callback to receive log events (errors, warnings, slow queries, etc.).
-   * The callback fires synchronously after each query() call completes.
+   * The callback fires on the JS thread after each query Promise resolves.
+   * Multiple queries may be in flight concurrently; the callback is called once
+   * per completed query, in completion order.
    * Pass null to unregister.
    *
    * Log types: 1=error  2=warn  3=info  4=debug  5=audit  6=slow
@@ -44,8 +46,8 @@ declare namespace ShardDb {
    */
   const LOG_TYPES: readonly ['', 'error', 'warn', 'info', 'debug', 'audit', 'slow']
 
-  /** Callback signature for setLogHandler. */
-  type LogHandler = (type: LogType, msg: string) => void
+  /** Callback signature for setLogHandler. type is a raw integer (1–6); use LOG_TYPES[type] to get the string name. */
+  type LogHandler = (type: number, msg: string) => void
 
   /** Arbitrary field criteria — keys are schema field names, values are
    *  scalars (exact match) or operator objects e.g. { gt: 100 }.
