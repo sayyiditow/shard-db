@@ -361,7 +361,7 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "THREADS=", 8) == 0) {
             g_max_threads = atoi(p + 8);
         } else if (strncmp(p, "IO_THREADS=", 11) == 0) {
-            g_io_threads = atoi(p + 11);
+            if (g_db) g_io_threads = atoi(p + 11);
         } else if (strncmp(p, "POOL_CHUNK=", 11) == 0) {
             g_pool_chunk = atoi(p + 11);
         } else if (strncmp(p, "WORKERS=", 8) == 0) {

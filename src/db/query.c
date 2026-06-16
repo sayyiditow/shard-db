@@ -16747,12 +16747,22 @@ static size_t idx_count_for_leaf(const char *db_root, const char *object,
         size_t n = 0;
         keyset_to_collected_hashes(tg_ks, sch->splits, &entries, &n);
         /* Build a single-leaf criteria node around `leaf` so
-           parallel_indexed_count verifies only that leaf (no tree). */
+           parallel_indexed_count verifies only that leaf (no tree).
+           Must compile it (compile_one) before use: parallel_indexed_count's
+           per-record verification checks node->compiled and treats NULL as
+           "never matches", so an uncompiled node here silently zeroes every
+           count. Heap-allocate cc: free_compiled_criteria() calls free() on
+           the array pointer itself (not just inner buffers), so it must be
+           paired with calloc, never a stack variable. */
+        CompiledCriterion *cc = calloc(1, sizeof(CompiledCriterion));
+        compile_one(cc, leaf, fs->ts);
         CriteriaNode leaf_node = { .kind = CNODE_LEAF, .leaf = *leaf,
+                                   .compiled = cc,
                                    .children = NULL, .n_children = 0 };
         size_t cnt = parallel_indexed_count(db_root, object, sch,
                                             entries, (int)n,
                                             &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+        free_compiled_criteria(cc, 1);
         free(entries);
         keyset_free(tg_ks);
         return cnt;
