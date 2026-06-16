@@ -177,4 +177,85 @@ static int test_json_escape_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+static int test_json_escape_agg_file_run(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    char *resp = NULL;
+
+    /* ── Create object for aggregate tests ── */
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"agg\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"category:varchar:64\"]}", &resp);
+    free(resp); resp = NULL;
+
+    /* Two records where category contains a JSON-breaking quote. */
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"key\":\"k1\",\"value\":{\"category\":\"He said \\\"hi\\\"\"}}",
+        &resp); free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"key\":\"k2\",\"value\":{\"category\":\"Plain\"}}",
+        &resp); free(resp); resp = NULL;
+
+    /* ── Aggregate group_by (standard bucket path) ── */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"group_by\":[\"category\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\\\"hi\\\"", "agg group_by: quote escaped");
+    ASSERT_CONTAINS(resp, "\"Plain\"", "agg group_by: plain value present");
+    free(resp); resp = NULL;
+
+    /* ── Aggregate top-N heap path (order_by + limit forces top-N) ── */
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"group_by\":[\"category\"],\"order_by\":\"n\",\"limit\":10}", &resp);
+    ASSERT_CONTAINS(resp, "\\\"hi\\\"", "agg top-N: quote escaped");
+    free(resp); resp = NULL;
+
+    /* ── valid_filename rejects embedded quotes ── */
+    tc_request(tc,
+        "{\"mode\":\"put-file\",\"dir\":\"agg\",\"object\":\"t\","
+        "\"filename\":\"bad\\\"name.txt\",\"data\":\"aGVsbG8=\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "put-file rejects filename with quote");
+    ASSERT_CONTAINS(resp, "invalid filename", "put-file: error message");
+    free(resp); resp = NULL;
+
+    /* ── list-files escapes pre-existing bad filenames ── */
+    /* Create a file with a quote in the name directly on disk. */
+    {
+        char fpath[1024];
+        snprintf(fpath, sizeof(fpath), "%s/agg/t/files", env.db_root);
+        mkdirp(fpath);
+        size_t flen = strlen(fpath);
+        snprintf(fpath + flen, sizeof(fpath) - flen, "/bad\"name.txt");
+        int fd = open(fpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write(fd, "hello", 5);
+            close(fd);
+        }
+    }
+    tc_request(tc,
+        "{\"mode\":\"list-files\",\"dir\":\"agg\",\"object\":\"t\"}", &resp);
+    ASSERT_CONTAINS(resp, "bad\\\"name.txt", "list-files: quote escaped in filename");
+    ASSERT_CONTAINS(resp, "\"files\":[", "list-files: response has files array");
+    free(resp); resp = NULL;
+
+    tc_close(tc);
+    test_env_stop(&env);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-json-escape", test_json_escape_run)
+TEST_REGISTER("test-json-escape-agg-file", test_json_escape_agg_file_run)

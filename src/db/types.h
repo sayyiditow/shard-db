@@ -1065,6 +1065,8 @@ typedef struct {
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object);
 char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs);
 char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs);
+char *json_escape_field(char *v);
+char *json_escape_const(const char *v);
 
 /* Typed-binary fast path: compile criteria against a TypedSchema once, then
    call match_typed() per record during scan. Composite/unknown fields fall

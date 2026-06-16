@@ -1303,8 +1303,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                             OUT("{\"key\":\"%s\",\"value\":{", key);
                             int first = 1;
                             for (int fi = 0; fi < nf; fi++) {
-                                char *pv = decode_field(raw, h->value_len, flds[fi],
-                                    (pfs.ts || pfs.nfields > 0) ? &pfs : NULL);
+                                char *pv = json_escape_field(decode_field(raw, h->value_len, flds[fi],
+                                    (pfs.ts || pfs.nfields > 0) ? &pfs : NULL));
                                 if (!pv) continue;
                                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", flds[fi], pv);
                                 first = 0; free(pv);
