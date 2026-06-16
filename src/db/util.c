@@ -265,7 +265,7 @@ int valid_filename(const char *name) {
     if (name[0] == '.' && (n == 1 || (n == 2 && name[1] == '.'))) return 0;
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)name[i];
-        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) return 0;
+        if (c == '/' || c == '\\' || c == '"' || c < 0x20 || c == 0x7F) return 0;
     }
     /* No component may be "..". Since we disallow '/', the whole name is one component;
        we already rejected "..". Done. */

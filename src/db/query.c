@@ -636,6 +636,29 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
     return NULL;
 }
 
+char *json_escape_field(char *v) {
+    if (!v) return NULL;
+    size_t len = strlen(v);
+    char *esc = malloc(len * 6 + 1);
+    if (!esc) { free(v); return NULL; }
+    int n = json_escape_into(esc, len * 6 + 1, v, len);
+    free(v);
+    if (n < 0) { free(esc); return NULL; }
+    esc[n] = '\0';
+    return esc;
+}
+
+char *json_escape_const(const char *v) {
+    if (!v) return NULL;
+    size_t len = strlen(v);
+    char *esc = malloc(len * 6 + 1);
+    if (!esc) return NULL;
+    int n = json_escape_into(esc, len * 6 + 1, v, len);
+    if (n < 0) { free(esc); return NULL; }
+    esc[n] = '\0';
+    return esc;
+}
+
 /* ========== Compiled criteria & Joins structs (definitions below) ========== */
 
 enum JoinType { JOIN_INNER = 0, JOIN_LEFT = 1 };
@@ -6964,7 +6987,7 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = decode_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[i], pv);
             first = 0; free(pv);
@@ -6992,7 +7015,7 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = decode_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[i], pv);
             first = 0;
@@ -7019,14 +7042,14 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
     OUT("%s[\"%s\"", *printed ? "," : "", key);
     if (proj_count > 0) {
         for (int i = 0; i < proj_count; i++) {
-            char *pv = decode_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
             OUT(",\"%s\"", pv ? pv : "");
             free(pv);
         }
     } else if (fs && fs->ts) {
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
-            char *pv = typed_get_field_str(fs->ts, (const uint8_t *)raw, i);
+            char *pv = json_escape_field(typed_get_field_str(fs->ts, (const uint8_t *)raw, i));
             OUT(",\"%s\"", pv ? pv : "");
             free(pv);
         }
@@ -9460,14 +9483,14 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     OUT("%s[\"%s\"", sc->printed ? "," : "", key);
                     if (sc->proj_count > 0) {
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
                             OUT(",\"%s\"", pv ? pv : "");
                             free(pv);
                         }
                     } else if (sc->fs && sc->fs->ts) {
                         for (int i = 0; i < sc->fs->ts->nfields; i++) {
                             if (sc->fs->ts->fields[i].removed) continue;
-                            char *pv = typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, i);
+                            char *pv = json_escape_field(typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, i));
                             OUT(",\"%s\"", pv ? pv : "");
                             free(pv);
                         }
@@ -9479,7 +9502,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                         OUT("{");
                         int first = 1;
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
                             if (!pv) continue;
                             OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[i], pv);
                             first = 0;
@@ -9495,7 +9518,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", key);
                     int first = 1;
                     for (int i = 0; i < sc->proj_count; i++) {
-                        char *pv = decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                        char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
                         if (!pv) continue;
                         OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[i], pv);
                         first = 0;
@@ -10813,8 +10836,8 @@ static int stream_find_record_cb(const uint8_t hash16[16],
                 OUT("{");
                 int first = 1;
                 for (int j = 0; j < sc->proj_count; j++) {
-                    char *pv = decode_field((const char *)raw, (uint32_t)vlen,
-                                             sc->proj_fields[j], sc->fs);
+                    char *pv = json_escape_field(decode_field((const char *)raw, (uint32_t)vlen,
+                                             sc->proj_fields[j], sc->fs));
                     if (!pv) continue;
                     OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
                     first = 0;
@@ -10830,8 +10853,8 @@ static int stream_find_record_cb(const uint8_t hash16[16],
             OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
             int first = 1;
             for (int j = 0; j < sc->proj_count; j++) {
-                char *pv = decode_field((const char *)raw, (uint32_t)vlen,
-                                         sc->proj_fields[j], sc->fs);
+                char *pv = json_escape_field(decode_field((const char *)raw, (uint32_t)vlen,
+                                         sc->proj_fields[j], sc->fs));
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
                 first = 0;
@@ -11033,8 +11056,8 @@ static int composite_prefix_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs));
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -11050,8 +11073,8 @@ static int composite_prefix_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -11105,8 +11128,8 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)value, (uint32_t)vlen,
-                                        c->proj_fields[i], c->fs);
+                char *pv = json_escape_field(decode_field((const char *)value, (uint32_t)vlen,
+                                        c->proj_fields[i], c->fs));
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -11122,8 +11145,8 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = decode_field((const char *)value, (uint32_t)vlen,
-                                    c->proj_fields[i], c->fs);
+            char *pv = json_escape_field(decode_field((const char *)value, (uint32_t)vlen,
+                                    c->proj_fields[i], c->fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -11680,8 +11703,8 @@ static int order_index_walk_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs));
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -11697,8 +11720,8 @@ static int order_index_walk_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -15763,15 +15786,15 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             OUT("%s[\"%s\"", printed ? "," : "", keybuf);
                             if (proj_count > 0) {
                                 for (int j = 0; j < proj_count; j++) {
-                                    char *pv = decode_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs);
+                                    char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs));
                                     OUT(",\"%s\"", pv ? pv : "");
                                     free(pv);
                                 }
                             } else if (fs && fs->ts) {
                                 for (int j = 0; j < fs->ts->nfields; j++) {
                                     if (fs->ts->fields[j].removed) continue;
-                                    char *pv = typed_get_field_str(fs->ts, raw, j);
+                                    char *pv = json_escape_field(typed_get_field_str(fs->ts, raw, j));
                                     OUT(",\"%s\"", pv ? pv : "");
                                     free(pv);
                                 }
@@ -15783,8 +15806,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                 OUT("{");
                                 int first = 1;
                                 for (int j = 0; j < proj_count; j++) {
-                                    char *pv = decode_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs);
+                                    char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs));
                                     if (!pv) continue;
                                     OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
                                     first = 0;
@@ -15800,8 +15823,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
                             int first = 1;
                             for (int j = 0; j < proj_count; j++) {
-                                char *pv = decode_field((const char *)raw, value_len,
-                                                        proj_fields[j], fs);
+                                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                                        proj_fields[j], fs));
                                 if (!pv) continue;
                                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
                                 first = 0;
@@ -17124,15 +17147,15 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
         if (c->proj_count > 0) {
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs));
                 OUT(",\"%s\"", pv ? pv : "");
                 free(pv);
             }
         } else if (c->fs && c->fs->ts) {
             for (int i = 0; i < c->fs->ts->nfields; i++) {
                 if (c->fs->ts->fields[i].removed) continue;
-                char *pv = typed_get_field_str(c->fs->ts, raw, i);
+                char *pv = json_escape_field(typed_get_field_str(c->fs->ts, raw, i));
                 OUT(",\"%s\"", pv ? pv : "");
                 free(pv);
             }
@@ -17144,8 +17167,8 @@ static int cursor_find_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs));
                 if (!pv) continue;
                 OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -17161,8 +17184,8 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs));
             if (!pv) continue;
             OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -17186,7 +17209,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
        the defensive pattern at the OrderedCollectCtx callback (line 8000)
        and silence Coverity's flow-insensitive FORWARD_NULL on c->fs. */
     c->last_value_str = (c->order_tf && c->fs && c->fs->ts)
-        ? typed_get_field_str(c->fs->ts, raw, c->order_field_idx)
+        ? json_escape_field(typed_get_field_str(c->fs->ts, raw, c->order_field_idx))
         : NULL;
     c->last_key_str = strndup(key_buf, klen);
 
@@ -19339,14 +19362,14 @@ int cmd_find(const char *db_root, const char *object,
                 OUT("%s[\"%s\"", printed ? "," : "", r->key);
                 if (proj_count > 0) {
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
                         OUT(",\"%s\"", pv ? pv : "");
                         free(pv);
                     }
                 } else if (driver_fs.ts) {
                     for (int j = 0; j < driver_fs.ts->nfields; j++) {
                         if (driver_fs.ts->fields[j].removed) continue;
-                        char *pv = typed_get_field_str(driver_fs.ts, val, j);
+                        char *pv = json_escape_field(typed_get_field_str(driver_fs.ts, val, j));
                         OUT(",\"%s\"", pv ? pv : "");
                         free(pv);
                     }
@@ -19358,7 +19381,7 @@ int cmd_find(const char *db_root, const char *object,
                     OUT("{");
                     int first = 1;
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
                         if (!pv) continue;
                         OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
                         first = 0;
@@ -19374,7 +19397,7 @@ int cmd_find(const char *db_root, const char *object,
                 OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", r->key);
                 int first = 1;
                 for (int j = 0; j < proj_count; j++) {
-                    char *pv = decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                    char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
                     if (!pv) continue;
                     OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
                     first = 0;
@@ -20491,6 +20514,10 @@ int cmd_put_file(const char *db_root, const char *object, const char *src) {
 }
 
 int cmd_get_file_path(const char *db_root, const char *object, const char *filename) {
+    if (!valid_filename(filename)) {
+        OUT("{\"error\":\"invalid filename\"}\n");
+        return 1;
+    }
     OUT("{\"path\":\"%s/%s/files/%s\"}\n", db_root, object, filename);
     return 0;
 }
@@ -20763,7 +20790,9 @@ int cmd_list_files(const char *db_root, const char *object,
     int emitted = 0;
     for (size_t i = (size_t)offset; i < count && emitted < limit; i++) {
         if (emitted) OUT(",");
-        OUT("\"%s\"", names[i]);
+        char *esc = json_escape_const(names[i]);
+        OUT("\"%s\"", esc ? esc : names[i]);
+        free(esc);
         emitted++;
     }
     OUT("],\"total\":%zu,\"offset\":%d,\"limit\":%d}\n", count, offset, limit);
@@ -22384,7 +22413,9 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
             memcpy(val_buf, gkeys[i], (size_t)vl);
             val_buf[vl] = '\0';
-            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+            char *esc = json_escape_const(val_buf);
+            OUT("\"%s\":\"%s\"", group_by_field, esc ? esc : "");
+            free(esc);
         } else if (ctx.gb_tf) {
             /* Numeric index key — decode to double and format as quoted
              * string to match the existing IGB/scan-path output shape
@@ -22404,7 +22435,9 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
             memcpy(val_buf, gkeys[i], (size_t)vl);
             val_buf[vl] = '\0';
-            OUT("\"%s\":\"%.*s\"", group_by_field, vl, val_buf);
+            char *esc = json_escape_const(val_buf);
+            OUT("\"%s\":\"%s\"", group_by_field, esc ? esc : "");
+            free(esc);
         }
 
         /* Emit aggregate values. */
@@ -27238,7 +27271,9 @@ igb_skip:
             /* Group fields */
             for (int g = 0; g < ctx.ngroups; g++) {
                 if (!first) OUT(",");
-                OUT("\"%s\":\"%s\"", ctx.group_fields[g], b->group_vals[g]);
+                char *gv = json_escape_const(b->group_vals[g]);
+                OUT("\"%s\":\"%s\"", ctx.group_fields[g], gv ? gv : "");
+                free(gv);
                 first = 0;
             }
             /* Aggregate values */
