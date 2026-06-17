@@ -37,6 +37,7 @@ typedef struct {
     pthread_rwlock_t rwlock;
     int      used;
     uint64_t last_access;
+    _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
 } KfCacheEntry;
 
 /* slotcask.c — segcache */
@@ -48,6 +49,7 @@ typedef struct {
     pthread_rwlock_t rwlock;
     int      used;
     uint64_t last_access;
+    _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
 } SegCacheEntry;
 
 #define SLOTCASK_REG_BUCKETS 1024

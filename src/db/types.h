@@ -836,6 +836,14 @@ typedef struct {
     int      slot;  /* cache slot index, -1 = invalid */
 } FcacheRead;
 
+/* A lightweight cache reference: cache-slot index + generation counter.
+   Validated with a single atomic load — no table lock needed on warm hits.
+   slot == -1 means "not yet populated" (safe initial value after calloc/memset). */
+typedef struct SlotRef {
+    int      slot;
+    uint64_t gen;
+} SlotRef;
+
 typedef struct UCacheEntry {
     char     path[PATH_MAX];
     int      fd;
@@ -857,6 +865,7 @@ typedef struct UCacheEntry {
     int      max_dirty_slot;
     int      dirty;
     uint64_t last_access;   /* monotonic counter for LRU eviction */
+    _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
     /* Old mapping retained after a grow so concurrent readers holding
        fc.map pointers stay valid; freed on next grow or shutdown. */
     uint8_t *retired_map;

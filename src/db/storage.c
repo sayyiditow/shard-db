@@ -247,6 +247,8 @@ static int ucache_ensure(const char *path, int slot_size_for_create) {
             victim->map = NULL; victim->fd = -1; victim->slot_bits = NULL;
             victim->used = 0; victim->path[0] = '\0';
             victim->map_size = 0; victim->dirty = 0; victim->max_dirty_slot = -1;
+            /* Invalidate any SlotRef pointing at this slot. */
+            atomic_fetch_add_explicit(&victim->gen, 1, memory_order_release);
             g_ucache_count--;
             slot = lru;
         } else {
@@ -676,6 +678,7 @@ void fcache_invalidate(const char *path_prefix) {
         e->slots_per_shard = 0;
         e->dirty = 0;
         e->max_dirty_slot = -1;
+        atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
         e->used = 0;
         e->path[0] = '\0';
         g_ucache_count--;

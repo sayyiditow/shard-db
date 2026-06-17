@@ -28,6 +28,13 @@
 #include <limits.h>
 #include <sys/param.h>
 
+typedef struct SlotRef SlotRef;   /* full definition in types.h; only the
+                                      tag is needed here so slotcask.h can
+                                      declare SlotRef-typed fields before
+                                      types.h is necessarily included
+                                      (slotcask.c includes this header
+                                      before types.h) */
+
 /* ============================================================ Tunables */
 
 /* Segment file rotation point. Chosen to keep individual files small enough for
@@ -120,6 +127,18 @@ int  kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                      size_t slots_capacity, int writer);
 void kfcache_release(SlotcaskKfHandle *h);
 
+/* Fast-path acquire for read-only callers that hold a SlotRef.
+   On gen match: takes rdlock and returns 0 without touching the table mutex.
+   On gen mismatch (eviction since last open): falls through to kfcache_acquire,
+   then updates *ref with the new (slot, gen). Always passes writer=0.
+   db and kf_shard_id are used only on the slow path to refresh *ref.
+   Note: void *db avoids a C scoping issue — struct SlotcaskDb is not yet
+   visible at this point in the header. The definition in .c casts to the
+   full type. */
+int  kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
+                             const char *path, size_t slots_capacity,
+                             void *db, int kf_shard_id);
+
 /* Build the canonical kf shard path under a slotcask data_dir. Public
    wrapper around the internal kf_path_for so query.c (bitmap index path)
    can construct kf paths without duplicating the layout convention. */
@@ -149,6 +168,13 @@ void segcache_shutdown(void);
 int  segcache_acquire(SlotcaskSegHandle *h, const char *path,
                       int create, int writer);
 void segcache_release(SlotcaskSegHandle *h);
+
+/* Fast-path acquire for read-only callers that hold a SlotRef.
+   On gen match: takes rdlock and returns 0 without touching g_segcache_lock.
+   On gen mismatch: falls through to segcache_acquire and updates *ref.
+   create must be 0 (read paths only). writer must be 0. */
+int  segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
+                              const char *path);
 
 /* ============================================================ Per-stream pool */
 
@@ -184,6 +210,18 @@ typedef struct SlotcaskDb {
                                 shards may have grown larger via auto-resplit */
 
     SlotcaskStream *streams;
+
+    /* Per-shard kf slot refs — populated at slotcask_open time, updated
+       on gen mismatch. Array of num_shards entries; slot==-1 means not
+       yet cached (safe initial value since the array is calloc'd). */
+    SlotRef *kf_slot_refs;
+
+    /* Per-stream segment slot refs. seg_slot_refs[stream_id] is an array
+       of seg_slot_caps[stream_id] entries indexed by file_id.
+       Allocated lazily (NULL until first segcache hit for that stream).
+       seg_slot_caps[stream_id] is the allocated capacity of that array. */
+    SlotRef **seg_slot_refs;
+    int      *seg_slot_caps;
 } SlotcaskDb;
 
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
