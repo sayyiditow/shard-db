@@ -253,6 +253,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_composite_prefix_routing.c \
     src/test/cases/test_d3_order_walk_executor.c \
     src/test/cases/test_ft_float_consistency.c \
+    src/test/cases/test_reindex_spill_collision.c \
     src/test/cases/test_slow_query_log.c \
     src/test/cases/test_find_with_total.c \
     src/test/cases/test_o_direct_scan.c \
