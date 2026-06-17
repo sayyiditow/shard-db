@@ -207,6 +207,10 @@ static void kfcache_drop_slot(int slot) {
     e->capacity = 0;
     e->used = 0;
     e->path[0] = '\0';
+    /* Increment gen under g_kfcache_lock (caller always holds it).
+       Any SlotRef pointing at this slot will fail its gen check after
+       this store, forcing the slow-path re-probe. */
+    atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_kfcache_count--;
 }
 
@@ -241,6 +245,7 @@ static void kfcache_invalidate_prefix(const char *prefix) {
             e->map_size = 0;
             e->capacity = 0;
             e->path[0] = '\0';
+            atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
             __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
             __sync_fetch_and_sub(&g_kfcache_count, 1);
         }
@@ -489,6 +494,60 @@ void kfcache_release(SlotcaskKfHandle *h) {
     h->capacity = 0;
 }
 
+/* Fast-path kfcache acquire for read-only callers that hold a SlotRef.
+ *
+ * Warm hit (common case, no lock):
+ *   1. Load ref->slot — skip if -1 (not yet populated).
+ *   2. Atomic-load e->gen and compare with ref->gen.
+ *   3. If equal: take per-slot rdlock, verify identity (path match + used),
+ *      fill handle, return 0. Total cost: 1 atomic load + 1 rdlock.
+ *
+ * Cold/evicted (uncommon):
+ *   Fall through to kfcache_acquire (existing slow path). On success,
+ *   update ref->slot and ref->gen so the next call is a warm hit.
+ *
+ * writer must be 0 — this function is for read-only callers only.
+ * db and kf_shard_id are accepted but only used to update ref on the
+ * slow path (so the caller's stored ref stays current after a miss).
+ */
+int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
+                            const char *path, size_t slots_capacity,
+                            void *db, int kf_shard_id) {
+    (void)db;          /* used only to make the signature future-proof */
+    (void)kf_shard_id; /* same */
+
+    if (ref && ref->slot >= 0) {
+        int s = ref->slot;
+        KfCacheEntry *e = &g_kfcache[s];
+        uint64_t cur_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+        if (cur_gen == ref->gen) {
+            /* Gen matches — slot should still hold our entry.
+               Take rdlock and verify identity before returning. */
+            pthread_rwlock_rdlock(&e->rwlock);
+            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+                strcmp(e->path, path) == 0) {
+                /* Warm hit confirmed. */
+                h->slot = s;
+                h->writer = 0;
+                kf_handle_from_entry(h, e);
+                return 0;
+            }
+            /* Identity check failed (concurrent eviction between gen-check
+               and rdlock). Drop lock and fall through to slow path. */
+            pthread_rwlock_unlock(&e->rwlock);
+        }
+    }
+
+    /* Slow path: standard kfcache_acquire, then refresh the SlotRef. */
+    int rc = kfcache_acquire(h, path, slots_capacity, 0);
+    if (rc == 0 && ref && h->slot >= 0) {
+        ref->slot = h->slot;
+        ref->gen  = atomic_load_explicit(&g_kfcache[h->slot].gen,
+                                          memory_order_acquire);
+    }
+    return rc;
+}
+
 /* ============================================================ segcache */
 /* SegCacheEntry moved to shard_db_internal.h; g_segcache* moved to ShardDb struct */
 
@@ -557,6 +616,7 @@ static void segcache_invalidate_prefix(const char *prefix) {
             e->fd = -1;
             e->map_size = 0;
             e->path[0] = '\0';
+            atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
             __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
             __sync_fetch_and_sub(&g_segcache_count, 1);
         }
@@ -575,6 +635,10 @@ static void segcache_drop_slot(int slot) {
     e->map_size = 0;
     e->used = 0;
     e->path[0] = '\0';
+    /* Increment gen under g_segcache_lock (caller always holds it).
+       Any SlotRef pointing at this slot will fail its gen check, forcing
+       the slow-path re-probe. */
+    atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_segcache_count--;
 }
 
@@ -750,6 +814,83 @@ void segcache_release(SlotcaskSegHandle *h) {
     h->fd = -1;
     h->map = NULL;
     h->map_size = 0;
+}
+
+/* Return a pointer to db->seg_slot_refs[stream_id][file_id], growing the
+   per-stream array if file_id is past the current capacity.  Returns NULL
+   on OOM (caller falls back to slow path).  Guarded by the stream's existing
+   pool_lock so concurrent read threads racing on the same stream_id cannot
+   race on the realloc. */
+static SlotRef *seg_ref_for(SlotcaskDb *db, int stream_id, uint32_t file_id) {
+    if (!db->seg_slot_refs || !db->seg_slot_caps) return NULL;
+    if (stream_id < 0 || stream_id >= db->num_streams) return NULL;
+    pthread_mutex_lock(&db->streams[stream_id].pool_lock);
+    int cap = db->seg_slot_caps[stream_id];
+    if ((int)file_id >= cap) {
+        int new_cap = cap ? cap * 2 : 4;
+        while (new_cap <= (int)file_id) new_cap *= 2;
+        SlotRef *arr = realloc(db->seg_slot_refs[stream_id],
+                                (size_t)new_cap * sizeof(SlotRef));
+        if (!arr) {
+            pthread_mutex_unlock(&db->streams[stream_id].pool_lock);
+            return NULL;
+        }
+        /* Zero-init the new portion (slot = 0, gen = 0 is NOT "invalid"
+           because slot 0 is a valid slot.  We distinguish "not yet populated"
+           by initialising slot to -1 in the new entries. */
+        for (int i = cap; i < new_cap; i++) arr[i].slot = -1;
+        db->seg_slot_refs[stream_id] = arr;
+        db->seg_slot_caps[stream_id] = new_cap;
+    }
+    SlotRef *result = &db->seg_slot_refs[stream_id][file_id];
+    pthread_mutex_unlock(&db->streams[stream_id].pool_lock);
+    return result;
+}
+
+/* Fast-path segcache acquire for read-only callers that hold a SlotRef.
+ *
+ * Warm hit (common case):
+ *   1. Atomic-load e->gen; compare with ref->gen.
+ *   2. If equal: take per-slot rdlock, verify identity, fill handle.
+ *      No g_segcache_lock touched. Cost: 1 atomic load + 1 rdlock.
+ *
+ * Cold/evicted: fall through to segcache_acquire(create=0, writer=0),
+ * then update *ref.
+ *
+ * IMPORTANT: ref may be NULL (if the per-stream array is not yet
+ * allocated, or if file_id >= seg_slot_caps[stream_id]). In that case
+ * we fall straight through to the slow path without crashing.
+ */
+int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
+                             const char *path) {
+    if (ref && ref->slot >= 0) {
+        int s = ref->slot;
+        SegCacheEntry *e = &g_segcache[s];
+        uint64_t cur_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+        if (cur_gen == ref->gen) {
+            pthread_rwlock_rdlock(&e->rwlock);
+            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+                strcmp(e->path, path) == 0) {
+                /* Warm hit confirmed. */
+                h->slot = s;
+                h->writer = 0;
+                h->fd = e->fd;
+                h->map = e->map;
+                h->map_size = e->map_size;
+                return 0;
+            }
+            pthread_rwlock_unlock(&e->rwlock);
+        }
+    }
+
+    /* Slow path. */
+    int rc = segcache_acquire(h, path, 0, 0);
+    if (rc == 0 && ref && h->slot >= 0) {
+        ref->slot = h->slot;
+        ref->gen  = atomic_load_explicit(&g_segcache[h->slot].gen,
+                                          memory_order_acquire);
+    }
+    return rc;
 }
 
 /* ============================================================ Init / shutdown */
@@ -1725,10 +1866,12 @@ int slotcask_get(SlotcaskDb *db,
     int sid_kf = shard_for_hash(hash, db->num_shards);
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
 
     for (int attempt = 0; attempt < SLOTCASK_GET_MAX_RETRIES; attempt++) {
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+        if (kfcache_acquire_direct(&kh, kf_ref, kf_path,
+                                    db->slots_per_shard, db, sid_kf) != 0) return -1;
         uint8_t flag, stream_id;
         uint16_t file_id;
         uint32_t offset;
@@ -1740,7 +1883,8 @@ int slotcask_get(SlotcaskDb *db,
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, stream_id, file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, path, 0, 0) != 0) return -1;
+        SlotRef *seg_ref = seg_ref_for(db, stream_id, file_id);
+        if (segcache_acquire_direct(&sh, seg_ref, path) != 0) return -1;
 
         const uint8_t *rec = sh.map + offset;
         if (!seg_rec_live_with_hash(rec, hash)) {
@@ -2093,6 +2237,16 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         seg_path_for(path, data_dir, i, 0);
         SlotcaskSegHandle h;
         if (segcache_acquire(&h, path, 1, 1) != 0) goto fail;
+        /* Prime the seg slot ref for file_id 0 so point reads hit the
+           fast path immediately after open. */
+        if (db->seg_slot_refs && h.slot >= 0) {
+            SlotRef *ref = seg_ref_for(db, i, 0);
+            if (ref) {
+                ref->slot = h.slot;
+                ref->gen  = atomic_load_explicit(&g_segcache[h.slot].gen,
+                                                  memory_order_acquire);
+            }
+        }
         segcache_release(&h);
     }
 
@@ -2120,6 +2274,33 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     for (int i = 0; i < num_shards; i++) {
         if (!open_args[i].ok) { free(open_args); goto fail; }
     }
+
+    /* Populate per-shard kf slot refs so the hot read path can skip the
+       table mutex on cache hits. The kfcache already has all shards
+       installed from the parallel init above; we re-acquire each one as
+       a reader (rdlock, no table mutation) solely to record (slot, gen). */
+    db->kf_slot_refs = calloc((size_t)num_shards, sizeof(SlotRef));
+    if (!db->kf_slot_refs) { free(open_args); goto fail; }
+    for (int i = 0; i < num_shards; i++) db->kf_slot_refs[i].slot = -1;
+    for (int i = 0; i < num_shards; i++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, data_dir, i);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) == 0) {
+            if (kh.slot >= 0) {
+                db->kf_slot_refs[i].slot = kh.slot;
+                db->kf_slot_refs[i].gen  =
+                    atomic_load_explicit(&g_kfcache[kh.slot].gen,
+                                         memory_order_acquire);
+            }
+            kfcache_release(&kh);
+        }
+    }
+
+    /* Allocate per-stream segment slot ref arrays (all start NULL / cap 0). */
+    db->seg_slot_refs = calloc((size_t)num_streams, sizeof(SlotRef *));
+    db->seg_slot_caps = calloc((size_t)num_streams, sizeof(int));
+    if (!db->seg_slot_refs || !db->seg_slot_caps) { free(open_args); goto fail; }
 
     /* Always run recover_streams — reserve_off / active_file_id aren't
        persisted, so a clean close + reopen would otherwise leave them
@@ -2186,6 +2367,13 @@ void slotcask_close(SlotcaskDb *db) {
         }
         free(db->streams);
     }
+    free(db->kf_slot_refs);
+    if (db->seg_slot_refs) {
+        for (int i = 0; i < db->num_streams; i++)
+            free(db->seg_slot_refs[i]);
+        free(db->seg_slot_refs);
+    }
+    free(db->seg_slot_caps);
     remove_dirty_marker(db);
     memset(db, 0, sizeof(*db));
 }
@@ -2305,7 +2493,9 @@ int slotcask_exists(SlotcaskDb *db, const void *key, size_t klen) {
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path,
+                                db->slots_per_shard, db, sid_kf) != 0) return -1;
     uint8_t flag, sid;
     uint16_t fid;
     uint32_t off;
@@ -3826,7 +4016,9 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, kf_shard_id);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[kf_shard_id] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path,
+                                db->slots_per_shard, db, kf_shard_id) != 0) return -1;
 
     SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
     if (!st) { kfcache_release(&kh); return -1; }
@@ -3882,7 +4074,8 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             char path[PATH_MAX];
             seg_path_for(path, db->data_dir, sid, fid);
             SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 0, 0) != 0) {
+            SlotRef *seg_ref = seg_ref_for(db, (int)sid, (uint32_t)fid);
+            if (segcache_acquire_direct(&h, seg_ref, path) != 0) {
                 for (int j = k; j < run_end; j++) recs[vidx[j]].status = -1;
                 k = run_end;
                 continue;

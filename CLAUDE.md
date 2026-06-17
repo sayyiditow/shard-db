@@ -127,12 +127,13 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 
 ## Storage model (high-level)
 
-- **Shard files**: `data/NNN.bin` (3 hex digits, max 4096 = `MAX_SPLITS`).
-- **Slot header** (24B): 16B xxh128 hash, 2B flag, 2B key_len, 4B value_len.
-- **Layout**: `[ShardHeader 32B][Zone A: slots × 24B headers][Zone B: slots × slot_size payloads]`.
-- **Addressing**: `shard = hash[0..1] % splits`, `slot = hash[2..5] % slots_per_shard`, linear probing.
-- **Dynamic growth**: 50% load → double `slots_per_shard`. `MAX_SPLITS=4096` caps shard *files*, not slots.
-- **I/O**: mmap throughout — MAP_SHARED for writes (via ucache), MAP_PRIVATE for reads.
+Two on-disk layers per object (under `<db_root>/<dir>/<object>/`):
+
+- **Keyfile shards** (`data/kf/NNN.kf`, 3 hex digits, max `MAX_SPLITS=4096`): open-addressed hash table mapping each key's xxh128 hash to its segment location. Each entry is a 24-byte slot header (16B hash, 2B key_len, 1B flag, 1B stream_id, 4B file_id) + key bytes. `flag`: 0=empty, 1=live, 2=tombstone. Shard routed by `hash[0..1] % splits`.
+- **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, padded to `slot_size`. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
+- **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = round-robin across `streams`.
+- **Dynamic growth**: 50% kf load → double `slots_per_shard`. `MAX_SPLITS=4096` caps shard *files*, not slots.
+- **I/O**: kf writes via ucache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
 - **Concurrency**: per-ucache-entry rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
 - **Index layout**: each indexed field shards into `index_splits_for(splits)` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`. The `index_splits_for` curve caps idx fan-out at high split counts: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128` (see `src/db/types.h` for the rationale).
@@ -303,7 +304,7 @@ Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single
 
 ## Limits / constants
 
-- `MAX_SPLITS = 4096` — max shards per object (3 hex digits in `NNN.bin`).
+- `MAX_SPLITS = 4096` — max kf shards per object (3 hex digits in `data/kf/NNN.kf`).
 - `DEFAULT_SPLITS = 8`, `MIN_SPLITS = 8` — `create-object` default. Sweet spot 78K–200K records/shard. Sizing table: [docs/operations/tuning.md](docs/operations/tuning.md).
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`.
 - `varchar` max content = **65535 bytes** (uint16 length prefix).
