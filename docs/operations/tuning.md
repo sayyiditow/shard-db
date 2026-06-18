@@ -24,6 +24,10 @@ Only change what the data says to change.
 
 > **THREADS vs WORKERS at a glance:** they look symmetric but aren't. **THREADS** is the *compute* pool — the parallel-for that fans a single scan / index build across shards. **WORKERS** is the *I/O* pool — one thread per in-flight TCP request. A request arrives on a WORKER, and if it triggers a parallel scan, that scan farms shard-level work onto the THREADS pool. Sizing them is independent.
 
+## Use explain before tuning
+
+Before changing settings, add [`"explain":true`](../query-protocol/explain.md) to slow `find`/`count`/`aggregate` queries. The planner's chosen strategy (`leaf`, `scan`, `intersect`, `union`) and hint recommendations (`add_index`, `composite_index`, `add_trigram_index`) tell you exactly what to fix. Don't guess — inspect.
+
 ## THREADS — scan parallelism
 
 Number of compute threads in the `parallel_for` pool used for parallel shard scans (`find`, `count`, `aggregate`), index builds, and bulk write phase 2.

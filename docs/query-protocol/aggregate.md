@@ -42,6 +42,19 @@ Required: `mode`, `dir`, `object`, `aggregates`.
 | `limit` | int | `GLOBAL_LIMIT` | Max groups returned. |
 | `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
+## Explain mode
+
+Set `"explain":true` to return the query plan without executing:
+
+```json
+{"mode":"aggregate","dir":"default","object":"users",
+ "criteria":[{"field":"status","op":"eq","value":"active"}],
+ "aggregates":[{"fn":"count","alias":"total"}],
+ "explain":true}
+```
+
+Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `source`, `postfilter`, and `hints` fields. No records are aggregated. See [explain](explain.md).
+
 ## Aggregate spec
 
 ```json

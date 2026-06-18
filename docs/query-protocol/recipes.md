@@ -58,7 +58,25 @@ A left-join on products (emit nulls if the SKU is missing), inner-join on users 
 
 `remote` is either `"key"` (primary-key lookup) or any **indexed** field on the joined object. Output columns: `orders.key`, `orders.{field}`, `user.{field}`, `product.{field}`.
 
-## 4. Safe bulk update with dry-run first
+## 4. Debug slow queries with explain
+
+Before running a slow query, inspect the plan to see which indexes the planner uses:
+
+```json
+{"mode":"find","dir":"acme","object":"orders",
+ "criteria":[
+   {"field":"status","op":"eq","value":"paid"},
+   {"field":"amount","op":"gt","value":"1000"}
+ ],
+ "order_by":"created_at",
+ "explain":true}
+```
+
+The response shows the plan strategy (`leaf`, `scan`, `intersect`, `union`), which criteria drive the index scan (`source`), which are post-filtered (`postfilter`), and optimisation hints. A `"plan":"scan"` with `"hints":[{"type":"add_index"...}]` tells you an index is missing. A `"hints":[{"type":"composite_index"...}]` suggests combining filter and sort fields into one composite index to skip the in-memory sort.
+
+Pair explain with [`stats`](diagnostics.md#stats) to correlate plan choices with actual query latency.
+
+## 5. Safe bulk update with dry-run first
 
 Mark all `pending` orders older than 7 days as `expired`. Dry-run first to see the blast radius, then run for real with a `limit` guard:
 

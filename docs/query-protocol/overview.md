@@ -68,6 +68,7 @@ Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or ab
 ### Data operations
 - [`get`](#get), `insert`, `update`, `delete`, `exists`, `not-exists`, `size` — per-record CRUD and existence checks
 - [`find`](find.md), [`count`](count.md), `keys`, `fetch` — queries
+- [`explain`](explain.md) — return the query plan for `find`, `count`, or `aggregate` without executing
 
 ### Aggregation and joins
 - [`aggregate`](aggregate.md) — count/sum/avg/min/max with group_by + having
@@ -211,6 +212,7 @@ echo '{"mode":"get","dir":"default","object":"users","key":"u1"}' | nc -q1 local
 
 - [`find`](find.md) — the most-used query mode; all 38 operators, joins, sorting, projection, cursor pagination.
 - [`aggregate`](aggregate.md) — group-by + having.
+- [`explain`](explain.md) — inspect the query plan before executing.
 - [CAS](cas.md) — conditional writes.
 - [Bulk](bulk.md) — bulk-insert, bulk-update, bulk-delete.
 - [Schema mutations](schema-mutations.md) — evolve objects without downtime.
