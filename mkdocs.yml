@@ -100,6 +100,7 @@ nav:
       - aggregate: query-protocol/aggregate.md
       - joins: query-protocol/joins.md
       - CAS: query-protocol/cas.md
+      - Explain: query-protocol/explain.md
       - Bulk operations: query-protocol/bulk.md
       - Schema mutations: query-protocol/schema-mutations.md
       - Index management: query-protocol/index-management.md
