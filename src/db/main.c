@@ -191,6 +191,42 @@ int main(int argc, char *argv[]) {
                 composites_only ? ",\"composites_only\":true" : "");
         return cmd_query_json(port, json);
     }
+    /* explain find|count|aggregate <dir> <obj> <criteria> [order_by]
+       Sends explain:true on the named mode to the running server.
+       shard-db explain find  <dir> <obj> '[{"field":"score","op":"gt","value":"50"}]'
+       shard-db explain count <dir> <obj> '[{"field":"active","op":"eq","value":"true"}]'
+       shard-db explain aggregate <dir> <obj> '[...]' [order_by_field] */
+    if (strcmp(cmd, "explain") == 0) {
+        if (argc < 6) {
+            fprintf(stderr, "Usage: shard-db explain find|count|aggregate <dir> <obj> <criteria> [order_by]\n");
+            return 1;
+        }
+        const char *subcmd  = argv[2];
+        const char *dir     = argv[3];
+        const char *object  = argv[4];
+        const char *criteria = argv[5];
+        const char *order_by = (argc > 6) ? argv[6] : NULL;
+
+        if (strcmp(subcmd, "find") != 0 && strcmp(subcmd, "count") != 0 &&
+            strcmp(subcmd, "aggregate") != 0) {
+            fprintf(stderr, "Unknown explain subcommand: %s (expected find, count, or aggregate)\n", subcmd);
+            return 1;
+        }
+
+        char json[4096];
+        if (order_by) {
+            snprintf(json, sizeof(json),
+                "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"criteria\":%s,\"order_by\":\"%s\",\"explain\":true}",
+                subcmd, dir, object, criteria, order_by);
+        } else {
+            snprintf(json, sizeof(json),
+                "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\","
+                "\"criteria\":%s,\"explain\":true}",
+                subcmd, dir, object, criteria);
+        }
+        return cmd_query_json(port, json);
+    }
     /* estimate-index <dir> <obj> <field>:trigram — sample 1024 records,
        project on-disk size for a hypothetical trigram index. Lets ops
        budget honestly before committing to add-index. */

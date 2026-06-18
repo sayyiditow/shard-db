@@ -1119,6 +1119,8 @@ int  read_record_ref(const char *db_root, const char *object,
 void release_record_ref(RecordRef *r);
 int cmd_size(const char *db_root, const char *object);
 int cmd_orphaned(const char *db_root, const char *object);
+void cmd_explain(const char *db_root, const char *object, const char *criteria_json,
+                 const char *order_by, int fetching);
 int cmd_count(const char *db_root, const char *object, const char *criteria_json);
 int cmd_exists(const char *db_root, const char *object,
                const char *key, size_t klen);

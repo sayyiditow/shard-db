@@ -40,6 +40,7 @@ Required: `mode`, `dir`, `object`, `aggregates`.
 | `order_by` | string | none | Sort groups by this alias (or group-by field). |
 | `order` | `"asc"` / `"desc"` | `"asc"` | Sort direction. |
 | `limit` | int | `GLOBAL_LIMIT` | Max groups returned. |
+| `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
 ## Aggregate spec
 

@@ -150,6 +150,7 @@ int tui_list_input(const char *title, const char *item_label,
 
 /* Display a multi-line text body in a scrollable pane. */
 void tui_show_text(const char *title, const char *body);
+char *format_explain_text(const char *json);
 
 /* Preview a JSON request and let the user copy / run / back-out. Returns
    1 = run, 0 = back to the previous form (re-show with sticky values).

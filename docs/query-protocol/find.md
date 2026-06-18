@@ -38,6 +38,7 @@ Required: `mode`, `dir`, `object`, `criteria`.
 | `total` | bool | false | When `cursor` pagination is active, also return the total match count in a single round-trip. Adds O(1) metadata cost. |
 | `format` | `"rows"` / `"csv"` / `"dict"` | JSON array | See response shapes below. Ignored when `join` is present (always tabular). |
 | `join` | array | none | See [joins](joins.md). |
+| `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
 ## Response
 

@@ -16280,6 +16280,243 @@ static void count_scan_cb_flush_thread(void) {
     }
 }
 
+/* cmd_explain -- emit query plan (FilterPlan + hints) without executing.
+   Hints are always emitted — EXPLAIN is a diagnostic tool and the user
+   explicitly asked for suggestions. The caller decides whether to act
+   on them based on their table size and workload.
+   Called from server dispatch and CLI with explain=true on find/count/aggregate. */
+void cmd_explain(const char *db_root, const char *object, const char *criteria_json,
+                 const char *order_by, int fetching) {
+    const char *perr = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json ? criteria_json : "[]", &perr);
+    if (perr) {
+        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
+        free_criteria_tree(tree);
+        return;
+    }
+
+    Schema sch = load_schema(db_root, object);
+    FieldSchema fs;
+    init_field_schema(&fs, db_root, object);
+
+    {
+        char verr[256];
+        if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
+            OUT("{\"error\":\"%s\"}\n", verr);
+            free_criteria_tree(tree);
+            return;
+        }
+    }
+    if (tree) compile_criteria_tree(tree, fs.ts);
+
+    /* Get table row count (O(1) metadata lookup) */
+    int table_rows = get_live_count(db_root, object);
+
+    /* Compute the FilterPlan; limit=0 means unbounded (we're not executing).
+       fetching=1 for find, 0 for count/aggregate. */
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
+                                 table_rows, order_by, fetching, 0);
+
+    /* Map FilterPlan kind to string */
+    const char *plan_str = "unknown";
+    switch (fp.kind) {
+        case FP_FULL_SCAN:       plan_str = "scan"; break;
+        case FP_PRIMARY_LEAF:    plan_str = "leaf"; break;
+        case FP_BITMAP_SMALLER:  plan_str = "bitmap"; break;
+        case FP_INTERSECT:       plan_str = "intersect"; break;
+        case FP_UNION:           plan_str = "union"; break;
+    }
+
+    /* Map FilterOrderKind to string */
+    const char *order_str = "none";
+    switch (fp.order) {
+        case FP_ORDER_NONE:              order_str = "none"; break;
+        case FP_ORDER_COMPOSITE:         order_str = "composite"; break;
+        case FP_ORDER_COMPOSITE_EXACT:   order_str = "composite_exact"; break;
+        case FP_ORDER_SORT:              order_str = "sort"; break;
+        case FP_ORDER_INDEX_WALK:        order_str = "index_walk"; break;
+    }
+
+    /* Emit plan header */
+    OUT("{\"plan\":\"%s\",\"order\":\"%s\",\"total_cheap\":%s,\"table_rows\":%d,"
+        "\"source\":[", plan_str, order_str, fp.total_cheap ? "true" : "false", table_rows);
+
+    /* Emit source leaves (indexed seed criteria) */
+    for (int i = 0; i < fp.n_source; i++) {
+        SearchCriterion *leaf = fp.source_leaves[i];
+        if (!leaf) continue;
+
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        const char *it_str = (it == IT_BTREE)    ? "btree"   :
+                             (it == IT_BITMAP)   ? "bitmap"  :
+                             (it == IT_TRIGRAM)  ? "trigram" : "none";
+
+        /* Estimate rows for this leaf via card_est_leaf.
+           card_est_leaf takes a single TypedField (not TypedSchema), and
+           needs a non-zero cap -- use selectivity_budget(table_rows). */
+        const TypedField *leaf_tf = resolve_idx_field(fs.ts, leaf->field);
+        CardEst est = card_est_leaf(db_root, object, sch.splits, leaf,
+                                    leaf_tf, selectivity_budget((size_t)table_rows));
+        size_t est_rows = est.k;  /* CardEst.k is the estimated match count */
+
+        if (i > 0) OUT(",");
+        OUT("{\"field\":\"%s\",\"op\":\"%s\",\"index\":\"%s\",\"role\":\"seed\",\"estimated_rows\":%zu}",
+            leaf->field, 
+            (leaf->op == OP_EQUAL) ? "eq" :
+            (leaf->op == OP_LESS) ? "lt" :
+            (leaf->op == OP_GREATER) ? "gt" :
+            (leaf->op == OP_LESS_EQ) ? "lte" :
+            (leaf->op == OP_GREATER_EQ) ? "gte" :
+            (leaf->op == OP_LIKE) ? "like" :
+            (leaf->op == OP_CONTAINS) ? "contains" :
+            (leaf->op == OP_STARTS_WITH) ? "starts" :
+            (leaf->op == OP_BETWEEN) ? "between" :
+            (leaf->op == OP_IN) ? "in" :
+            (leaf->op == OP_EXISTS) ? "exists" : "other",
+            it_str, est_rows);
+    }
+    OUT("],\"postfilter\":[");
+
+    /* Emit postfilter leaves. Report the actual index type on the field
+       (the index exists but the planner chose not to use it as the primary
+       driver), or null when the field truly has no index. */
+    for (int i = 0; i < fp.n_postfilter; i++) {
+        SearchCriterion *leaf = fp.postfilter_leaves[i];
+        if (!leaf) continue;
+
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        /* it < 0 means no usable index for this op/field combination */
+        const char *pf_it_str = (it == IT_BTREE) ? "\"btree\"" :
+                                (it == IT_BITMAP) ? "\"bitmap\"" :
+                                (it == IT_TRIGRAM) ? "\"trigram\"" : "null";
+
+        if (i > 0) OUT(",");
+        OUT("{\"field\":\"%s\",\"op\":\"%s\",\"index\":%s,\"role\":\"postfilter\",\"estimated_rows\":null}",
+            leaf->field,
+            (leaf->op == OP_EQUAL) ? "eq" :
+            (leaf->op == OP_LESS) ? "lt" :
+            (leaf->op == OP_GREATER) ? "gt" :
+            (leaf->op == OP_LESS_EQ) ? "lte" :
+            (leaf->op == OP_GREATER_EQ) ? "gte" :
+            (leaf->op == OP_LIKE) ? "like" :
+            (leaf->op == OP_CONTAINS) ? "contains" :
+            (leaf->op == OP_STARTS_WITH) ? "starts" :
+            (leaf->op == OP_BETWEEN) ? "between" :
+            (leaf->op == OP_IN) ? "in" :
+            (leaf->op == OP_EXISTS) ? "exists" : "other",
+            pf_it_str);
+    }
+    OUT("],\"hints\":[");
+
+    /* Generate hints */
+    int hint_count = 0;
+
+    /* Hint: add_index for unindexed postfilter leaves */
+    for (int i = 0; i < fp.n_postfilter; i++) {
+        SearchCriterion *leaf = fp.postfilter_leaves[i];
+        if (!leaf) continue;
+
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        if (it < 0) {  /* unindexed */
+            /* Suggest btree index for range/eq ops; trigram for text ops */
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH)) {
+                /* Will emit trigram hint below */
+            } else {
+                if (hint_count > 0) OUT(",");
+                OUT("{\"type\":\"add_index\",\"field\":\"%s\",\"reason\":\"unindexed field in postfilter; index avoids full record scan\"}", 
+                    leaf->field);
+                hint_count++;
+            }
+        }
+    }
+
+    /* Hint: add_trigram_index for varchar text-search ops (always emitted when applicable) */
+    /* First, walk source+postfilter leaves for non-full-scan plans. */
+    int trigram_checked = 0;
+    for (int j = 0; j < 2; j++) {  /* loop 0: source, 1: postfilter */
+        int n = (j == 0) ? fp.n_source : fp.n_postfilter;
+        SearchCriterion **leaves = (j == 0) ? fp.source_leaves : fp.postfilter_leaves;
+
+        for (int i = 0; i < n; i++) {
+            SearchCriterion *leaf = leaves[i];
+            if (!leaf) continue;
+            trigram_checked = 1;
+
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH ||
+                 leaf->op == OP_NOT_LIKE || leaf->op == OP_NOT_CONTAINS ||
+                 leaf->op == OP_INOT_LIKE || leaf->op == OP_INOT_CONTAINS ||
+                 leaf->op == OP_ENDS_WITH || leaf->op == OP_IENDS_WITH)) {
+
+                int it = pick_index_for_leaf(db_root, object, leaf);
+                if (it != IT_TRIGRAM) {  /* not already a trigram index */
+                    if (hint_count > 0) OUT(",");
+                    OUT("{\"type\":\"add_trigram_index\",\"field\":\"%s\",\"reason\":\"varchar text-search op on %s field; trigram index enables substring matching without full record scan\"}",
+                        leaf->field,
+                        (it < 0) ? "unindexed" : "non-trigram-indexed");
+                    hint_count++;
+                }
+            }
+        }
+    }
+
+    /* Fallback for full-scan plans: walk the raw criteria tree directly. */
+    if (!trigram_checked && tree) {
+        SearchCriterion *raw_ptrs[64];
+        int n_raw = collect_and_leaves(tree, raw_ptrs, 64);
+        for (int i = 0; i < n_raw; i++) {
+            SearchCriterion *leaf = raw_ptrs[i];
+            if (!leaf) continue;
+
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH ||
+                 leaf->op == OP_NOT_LIKE || leaf->op == OP_NOT_CONTAINS ||
+                 leaf->op == OP_INOT_LIKE || leaf->op == OP_INOT_CONTAINS ||
+                 leaf->op == OP_ENDS_WITH || leaf->op == OP_IENDS_WITH)) {
+
+                int it = pick_index_for_leaf(db_root, object, leaf);
+                if (it != IT_TRIGRAM) {
+                    if (hint_count > 0) OUT(",");
+                    OUT("{\"type\":\"add_trigram_index\",\"field\":\"%s\",\"reason\":\"varchar text-search op on %s field; trigram index enables substring matching without full record scan\"}",
+                        leaf->field,
+                        (it < 0) ? "unindexed" : "non-trigram-indexed");
+                    hint_count++;
+                }
+            }
+        }
+    }
+
+    /* Hint: composite_index -- only when the planner chose FP_ORDER_SORT,
+       meaning it has an indexed filter but no composite covering the order_by.
+       Do not emit when fp.order is already COMPOSITE/COMPOSITE_EXACT/INDEX_WALK
+       since the planner already found an index path for ordering. */
+    if (fp.order == FP_ORDER_SORT && order_by && fp.n_source > 0) {
+        SearchCriterion *seed = fp.source_leaves[0];
+        if (seed && strcmp(seed->field, order_by) != 0 &&
+            pick_index_for_leaf(db_root, object, seed) >= 0) {
+            if (hint_count > 0) OUT(",");
+            OUT("{\"type\":\"composite_index\",\"field\":\"%s+%s\","
+                "\"reason\":\"filter on %s + order_by %s; composite index avoids in-memory sort\"}",
+                seed->field, order_by, seed->field, order_by);
+            hint_count++;
+        }
+    }
+
+    OUT("]}\n");
+
+    free_criteria_tree(tree);
+}
+
 int cmd_count(const char *db_root, const char *object, const char *criteria_json) {
     /* No criteria = O(1) from metadata */
     if (!criteria_json || criteria_json[0] == '\0') {

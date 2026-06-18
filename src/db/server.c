@@ -1455,7 +1455,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(spec);
     } else if (strcmp(mode, "count") == 0) {
         char *criteria = json_obj_strdup_raw(&req, "criteria");
-        cmd_count(db_root, object, criteria);
+        if (json_obj_is_true(&req, "explain")) {
+            cmd_explain(db_root, object, criteria, NULL, 0);
+        } else {
+            cmd_count(db_root, object, criteria);
+        }
         free(criteria);
     } else if (strcmp(mode, "find") == 0) {
         char *criteria = json_obj_strdup_raw(&req, "criteria");
@@ -1472,11 +1476,15 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
         int want_total = json_obj_is_true(&req, "total");
-        if (criteria || join)
+        if (json_obj_is_true(&req, "explain")) {
+            cmd_explain(db_root, object, criteria ? criteria : "[]", ob, 1);
+        } else if (criteria || join) {
             cmd_find(db_root, object, criteria ? criteria : "[]",
                      off, lim, fields, excl, fmt, delim, join, ob, od, cur,
                      want_total);
-        else OUT("{\"error\":\"Missing criteria\"}\n");
+        } else {
+            OUT("{\"error\":\"Missing criteria\"}\n");
+        }
         free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
         free(delim); free(join); free(ob); free(od); free(cur);
     } else if (strcmp(mode, "keys") == 0) {
@@ -1790,20 +1798,25 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         free(pattern); free(prefix); free(match); free(off_s); free(lim_s);
     } else if (strcmp(mode, "aggregate") == 0) {
         char *crit = json_obj_strdup_raw(&req, "criteria");
-        char *grp = json_obj_strdup_raw(&req, "group_by");
-        char *aggs = json_obj_strdup_raw(&req, "aggregates");
-        char *hav = json_obj_strdup_raw(&req, "having");
-        char *ob = json_obj_strdup(&req, "order_by");
-        char *od = json_obj_strdup(&req, "order");
-        char *lim_s = json_obj_strdup(&req, "limit");
-        char *fmt = json_obj_strdup(&req, "format");
-        char *delim = json_obj_strdup(&req, "delimiter");
-        int desc = (od && strcmp(od, "desc") == 0);
-        int lim = lim_s ? atoi(lim_s) : 0;
-        int want_total = json_obj_is_true(&req, "total");
-        cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim, want_total);
-        free(crit); free(grp); free(aggs); free(hav);
-        free(ob); free(od); free(lim_s); free(fmt); free(delim);
+        char *ob   = json_obj_strdup(&req, "order_by");
+        if (json_obj_is_true(&req, "explain")) {
+            cmd_explain(db_root, object, crit, ob, 0);
+        } else {
+            char *grp   = json_obj_strdup_raw(&req, "group_by");
+            char *aggs  = json_obj_strdup_raw(&req, "aggregates");
+            char *hav   = json_obj_strdup_raw(&req, "having");
+            char *od    = json_obj_strdup(&req, "order");
+            char *lim_s = json_obj_strdup(&req, "limit");
+            char *fmt   = json_obj_strdup(&req, "format");
+            char *delim = json_obj_strdup(&req, "delimiter");
+            int desc = (od && strcmp(od, "desc") == 0);
+            int lim = lim_s ? atoi(lim_s) : 0;
+            int want_total = json_obj_is_true(&req, "total");
+            cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim, want_total);
+            free(grp); free(aggs); free(hav);
+            free(od); free(lim_s); free(fmt); free(delim);
+        }
+        free(crit); free(ob);
     } else if (strcmp(mode, "sequence") == 0) {
         char *name = json_obj_strdup(&req, "name");
         char *action = json_obj_strdup(&req, "action");
