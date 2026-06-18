@@ -4,6 +4,44 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.06.3
+
+Explain query mode, lock-free warm reads, and a reindex spill-file collision fix. No `./migrate` required; wire-compatible with 2026.06.2.
+
+Full notes: [`docs/release-notes/2026.06.3.md`](../release-notes/2026.06.3.md).
+
+### Features
+
+- **Explain mode** — `"explain":true` on any `find`, `count`, or `aggregate` request returns the query plan without executing it. Response includes plan type (`leaf`/`scan`/`intersect`/`union`), source leaves with index type and cardinality estimates, postfilter leaves, order strategy (`index_walk`/`composite`/`sort`/…), and optimization hints (`add_index`, `composite_index`, `add_trigram_index`, `add_bitmap_index`). CLI: `./shard-db explain <dir> <obj> '<criteria>'`. TUI: `e` key in query preview opens formatted explain output.
+
+### Performance
+
+- **Lock-free warm reads** — generation counters on the global cache table let warm reads (cache hits) skip the table lock entirely. Only cold misses and writers take the lock. Reduces contention under high-concurrency, warm-cache workloads.
+
+### Fixes
+
+- **Reindex spill collision** — btree and trigram builders on the same field previously shared one spill directory, causing mutual overwrites during multi-index reindex. Each builder now uses a private `<obj>/tmp/spill/<field>/<type>/` directory. Recommended upgrade if your objects have trigram indexes.
+
+## 2026.06.2
+
+Embedded mode, native Node.js/Bun npm package, and async Promise-based query API. No `./migrate` required; wire-compatible with 2026.06.1.
+
+Full notes: [`docs/release-notes/2026.06.2.md`](../release-notes/2026.06.2.md).
+
+### Features
+
+- **Embedded mode** — link shard-db as a library (`libshard-db.a`) into any C process. `ShardDb *db = shard_db_open(path); shard_db_query(db, json); shard_db_close(db)`. No daemon, TCP, or OpenSSL. Thread-safe; full engine in-process.
+- **npm package** — `npm install shard-db`. Native N-API addon for Node.js ≥ 18 and Bun ≥ 1. Prebuilts for linux-x64, linux-arm64, darwin-arm64. `db.query()` returns a `Promise<string>`; `QueryBody` discriminated union covers all modes with TypeScript autocomplete.
+- **Log handler callback** — register a C function to receive structured log events from the embedded engine (errors, warnings, slow queries, audit events).
+
+### Fixes
+
+- **C1 cursor tiebreaker** — `small_prefilter_cmp_asc` includes `hash16` as a secondary key; prevents duplicate/skipped results when multiple records share the same order-field value across cursor pages.
+- **JSON boolean flags** — `true` (JSON boolean) is now accepted wherever a boolean flag is expected; previously only `1` was accepted.
+- **`total` for PRIMARY_LEAF + post-filter** — queries with one indexed leaf and a post-filter sibling now correctly report `total` via the hint KeySet path.
+- **JSON-escape varchar field values** — varchar content is now JSON-escaped in all read responses (find/fetch/aggregate/file). Unescaped control characters or quotes in stored strings no longer break response parsing.
+- **`g_io_threads` NULL-deref guard + trigram leaf compilation for `find:total`** — fixes a startup crash when the IO thread pool is not initialized, and correctly compiles trigram criteria for `find` queries with `"total":true`.
+
 ## 2026.06.1
 
 Query planner overhaul, O_DIRECT I/O series, batch-fetch consolidation, and cursor+total pagination. No `./migrate` required; wire-compatible with 2026.05.8.
