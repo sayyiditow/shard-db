@@ -40,6 +40,18 @@ Required: `mode`, `dir`, `object`, `criteria`.
 | `join` | array | none | See [joins](joins.md). |
 | `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
+## Explain mode
+
+Set `"explain":true` to return the query plan without executing:
+
+```json
+{"mode":"find","dir":"default","object":"users",
+ "criteria":[{"field":"score","op":"gt","value":"50"}],
+ "explain":true}
+```
+
+Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `source`, `postfilter`, and `hints` fields. No records are fetched. See [explain](explain.md).
+
 ## Response
 
 **Default (JSON array of records):**

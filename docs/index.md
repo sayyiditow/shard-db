@@ -16,6 +16,7 @@ A high-performance database in C. Single static binary, single process, no exter
 - **CAS (conditional writes)** — `if_not_exists`, `if:{...}` on insert/update/delete; dry-run bulk ops.
 - **Cursor pagination** — keyset cursor on `find` over an indexed `order_by` field. O(limit) per page, ASC + DESC; tie-breaks on hash16. Preferred over `offset` for deep pages.
 - **AND-intersection** — `find/count/aggregate` with 2+ indexed leaves on rangeable ops automatically intersect candidate hash sets via a lock-free `KeySet`, skipping per-record fetch for `count`.
+- **Explain mode** — add `"explain":true` to any `find`/`count`/`aggregate` to return the query plan (source leaves, post-filter, hints) without executing. Use the TUI `e` key or CLI `shard-db explain` subcommand.
 - **File storage** — put/get arbitrary files keyed by filename, base64-over-TCP for remote clients, zero-copy server-local fast path. `list-files` lists with prefix + paginated.
 - **Schema mutations** — add/rename/remove fields; vacuum runs Direction-C segment compaction (pair-merges sparse non-active segments to reclaim disk) or rebuilds (`vacuum --compact` drops tombstoned bytes; `vacuum --splits=N` rehashes and reindexes).
 - **Multi-tenancy** — the `dir` parameter isolates tenants. Per-tenant and per-object tokens with scoped permissions (`r` / `rw` / `rwx`) on top of global tokens + IP allowlist.
