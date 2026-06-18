@@ -291,6 +291,14 @@ static void hint_cb(const char *o, size_t olen, void *ctx) {
     el->n++;
 }
 
+/* Safe snprintf wrapper: never lets bo exceed sizeof(buf)-1. */
+#define SAFE_SNPRINTF(buf, bo, ...) do {                                   \
+    size_t _room = sizeof(buf) - (size_t)(bo);                             \
+    int _n = snprintf((buf) + (size_t)(bo), _room, __VA_ARGS__);           \
+    if (_n > 0 && (size_t)_n < _room) (bo) += (size_t)_n;                  \
+    else if (_n > 0) (bo) += _room > 0 ? _room - 1 : 0;                    \
+} while (0)
+
 /* Format an explain JSON response into human-readable text.
    Returns malloc'd string; caller must free. */
 char *format_explain_text(const char *json) {
@@ -301,51 +309,51 @@ char *format_explain_text(const char *json) {
 
     v = json_find_key(json, "plan", &vlen);
     if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
-        bo += snprintf(buf+bo, sizeof(buf)-bo, "Plan:  %s\n", tmp); }
+        SAFE_SNPRINTF(buf, bo, "Plan:  %s\n", tmp); }
 
     v = json_find_key(json, "order", &vlen);
     if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
-        bo += snprintf(buf+bo, sizeof(buf)-bo, "Order: %s\n", tmp); }
+        SAFE_SNPRINTF(buf, bo, "Order: %s\n", tmp); }
 
     v = json_find_key(json, "total_cheap", &vlen);
     if (v)
-        bo += snprintf(buf+bo, sizeof(buf)-bo, "Cheap: %s\n",
+        SAFE_SNPRINTF(buf, bo, "Cheap: %s\n",
                        (vlen==4&&memcmp(v,"true",4)==0)?"yes":"no");
 
     v = json_find_key(json, "table_rows", &vlen);
     if (v) {
         char tmp[32]; size_t n = vlen<31?vlen:31; memcpy(tmp,v,n); tmp[n]=0;
-        bo += snprintf(buf+bo, sizeof(buf)-bo, "Rows:  %s\n\n", tmp);
+        SAFE_SNPRINTF(buf, bo, "Rows:  %s\n\n", tmp);
     }
 
     /* Source */
-    bo += snprintf(buf+bo, sizeof(buf)-bo, "Source:\n");
+    SAFE_SNPRINTF(buf, bo, "Source:\n");
     v = json_find_key(json, "source", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, source_cb, &el);
         for (int i = 0; i < el.n; i++)
-            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+            SAFE_SNPRINTF(buf, bo, "%s\n", el.lines[i]);
     }
 
     /* Post-filter */
-    bo += snprintf(buf+bo, sizeof(buf)-bo, "\nPost-filter:\n");
+    SAFE_SNPRINTF(buf, bo, "\nPost-filter:\n");
     v = json_find_key(json, "postfilter", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, postfilter_cb, &el);
         for (int i = 0; i < el.n; i++)
-            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+            SAFE_SNPRINTF(buf, bo, "%s\n", el.lines[i]);
     }
 
     /* Hints */
-    bo += snprintf(buf+bo, sizeof(buf)-bo, "\nHints:\n");
+    SAFE_SNPRINTF(buf, bo, "\nHints:\n");
     v = json_find_key(json, "hints", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, hint_cb, &el);
         for (int i = 0; i < el.n; i++)
-            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+            SAFE_SNPRINTF(buf, bo, "%s\n", el.lines[i]);
     }
 
     buf[bo] = '\0';
