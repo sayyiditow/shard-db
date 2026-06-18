@@ -39,6 +39,10 @@ See [find → OR criteria](find.md) for the full planner table.
 
 Returns the total active record count (same as `size`). Uses the cached `metadata/counts` value — O(1). For the deleted-but-not-vacuumed slot count, use the `orphaned` mode.
 
+## Explain mode
+
+Set `"explain":true` to return the query plan without executing. Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `source`, `postfilter`, and `hints` fields. No records are counted. See [explain](explain.md).
+
 ## Examples
 
 ### Count by status

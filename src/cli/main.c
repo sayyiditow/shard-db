@@ -954,6 +954,27 @@ static void query_aggregate(CliConn *c) {
 
                     int act = tui_preview_json(
                         "aggregate — query JSON (r=run  ←=back to edit)", req);
+                    if (act == 2) {
+                        /* explain: append flag and re-query */
+                        size_t req_len = strlen(req);
+                        if (req[req_len - 1] == '}') {
+                            char *req_exp = malloc(req_len + 20);
+                            memcpy(req_exp, req, req_len - 1);
+                            sprintf(req_exp + req_len - 1, ",\"explain\":true}");
+
+                            char *resp = NULL; size_t rlen = 0;
+                            int rc = cli_query(c, req_exp, &resp, &rlen);
+                            if (rc == 0 && resp) {
+                                char *fmt = format_explain_text(resp);
+                                tui_show_text("explain — aggregate plan", fmt ? fmt : resp);
+                                free(fmt);
+                                free(resp);
+                            }
+                            free(req_exp);
+                        }
+                        free(req);
+                        continue;
+                    }
                     if (act != 1) { free(req); continue; }
 
                     char *resp = NULL; size_t rlen = 0;
@@ -1003,6 +1024,27 @@ static void query_count(CliConn *c) {
         free(crit);
 
         int act = tui_preview_json("count — query JSON (r=run  ←=back to edit)", req);
+        if (act == 2) {
+            /* explain: append flag and re-query */
+            size_t req_len = strlen(req);
+            if (req[req_len - 1] == '}') {
+                char *req_exp = malloc(req_len + 20);
+                memcpy(req_exp, req, req_len - 1);
+                sprintf(req_exp + req_len - 1, ",\"explain\":true}");
+
+                char *resp = NULL; size_t rlen = 0;
+                int rc = cli_query(c, req_exp, &resp, &rlen);
+                if (rc == 0 && resp) {
+                    char *fmt = format_explain_text(resp);
+                    tui_show_text("explain — count plan", fmt ? fmt : resp);
+                    free(fmt);
+                    free(resp);
+                }
+                free(req_exp);
+            }
+            free(req);
+            continue;
+        }
         if (act != 1) { free(req); continue; }
 
         char *resp = NULL; size_t rlen = 0;
@@ -1111,6 +1153,27 @@ static void query_find(CliConn *c) {
                 oi.dir, oi.object, crit, offv, limv, fields_json, ob_clause);
 
             int act = tui_preview_json("find — query JSON (r=run  ←=back to edit)", req);
+            if (act == 2) {
+                /* explain: append flag and re-query */
+                size_t req_len = strlen(req);
+                if (req[req_len - 1] == '}') {
+                    char *req_exp = malloc(req_len + 20);
+                    memcpy(req_exp, req, req_len - 1);
+                    sprintf(req_exp + req_len - 1, ",\"explain\":true}");
+
+                    char *resp = NULL; size_t rlen = 0;
+                    int rc = cli_query(c, req_exp, &resp, &rlen);
+                    if (rc == 0 && resp) {
+                        char *fmt = format_explain_text(resp);
+                        tui_show_text("explain — find plan", fmt ? fmt : resp);
+                        free(fmt);
+                        free(resp);
+                    }
+                    free(req_exp);
+                }
+                free(req);
+                continue;
+            }
             if (act != 1) { free(req); continue; }
 
             char *resp = NULL; size_t rlen = 0;

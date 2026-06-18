@@ -182,7 +182,7 @@ int tui_preview_json(const char *title, const char *body) {
         }
         attron(COLOR_PAIR(3));
         mvprintw(rows - 3, 4,
-            "↑↓/jk scroll   r/⏎ run   ←/q/ESC back to edit   (line %d/%d)",
+            "↑↓/jk scroll   r/⏎ run   e=explain   ←/q/ESC back to edit   (line %d/%d)",
             top + 1, nlines);
         attroff(COLOR_PAIR(3));
         refresh();
@@ -203,10 +203,153 @@ int tui_preview_json(const char *title, const char *body) {
             case 'G': case KEY_END:  top = nlines - 1; break;
             case 'r': case '\n': case '\r': case KEY_ENTER:
                 return 1;
+            case 'e':
+                return 2;
             case 'q': case 27: case KEY_LEFT: case 'h':
                 return 0;
         }
     }
+}
+
+/* Iterate JSON array of objects, call cb for each {…} slice. */
+static void iter_array_objs(const char *vstart, size_t vlen,
+                            void (*cb)(const char *o, size_t olen, void *ctx),
+                            void *ctx) {
+    if (vlen < 2 || vstart[0] != '[') return;
+    const char *p = vstart + 1, *end = vstart + vlen - 1;
+    while (p < end) {
+        p = skip_ws(p);
+        if (*p == ']') break;
+        if (*p != '{') { p++; continue; }
+        const char *ostart = p;
+        int depth = 0;
+        while (p < end) {
+            if (*p == '{') depth++;
+            else if (*p == '}') { depth--; if (!depth) { p++; break; } }
+            p++;
+        }
+        cb(ostart, (size_t)(p - ostart), ctx);
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+}
+
+/* Callback context for collecting source entries */
+typedef struct { char lines[64][256]; int n; } ExplainLines;
+
+static void source_cb(const char *o, size_t olen, void *ctx) {
+    (void)olen;
+    ExplainLines *el = (ExplainLines *)ctx;
+    if (el->n >= 64) return;
+    size_t fvlen, opvlen, ixvlen, ervlen;
+    const char *f  = json_find_key(o, "field",          &fvlen);
+    const char *op = json_find_key(o, "op",             &opvlen);
+    const char *ix = json_find_key(o, "index",          &ixvlen);
+    const char *er = json_find_key(o, "estimated_rows", &ervlen);
+    if (!f) return;
+    char fld[64], opc[32], idxc[32], est[32] = "?";
+    json_string_into(f,  fvlen,  fld,  sizeof(fld));
+    json_string_into(op, opvlen, opc,  sizeof(opc));
+    json_string_into(ix, ixvlen, idxc, sizeof(idxc));
+    if (er) { size_t n = ervlen<31?ervlen:31; memcpy(est,er,n); est[n]=0; }
+    snprintf(el->lines[el->n], sizeof(el->lines[0]),
+             "  %s %s  [%s]  ~%s rows", fld, opc, idxc, est);
+    el->n++;
+}
+
+static void postfilter_cb(const char *o, size_t olen, void *ctx) {
+    (void)olen;
+    ExplainLines *el = (ExplainLines *)ctx;
+    if (el->n >= 64) return;
+    size_t fvlen, opvlen;
+    const char *f  = json_find_key(o, "field", &fvlen);
+    const char *op = json_find_key(o, "op",    &opvlen);
+    if (!f) return;
+    char fld[64], opc[32];
+    json_string_into(f,  fvlen,  fld, sizeof(fld));
+    json_string_into(op, opvlen, opc, sizeof(opc));
+    snprintf(el->lines[el->n], sizeof(el->lines[0]), "  %s %s", fld, opc);
+    el->n++;
+}
+
+static void hint_cb(const char *o, size_t olen, void *ctx) {
+    (void)olen;
+    ExplainLines *el = (ExplainLines *)ctx;
+    if (el->n >= 64) return;
+    size_t tvlen, rvlen;
+    const char *t = json_find_key(o, "type",   &tvlen);
+    const char *r = json_find_key(o, "reason", &rvlen);
+    if (!t) return;
+    char typ[64];
+    json_string_into(t, tvlen, typ, sizeof(typ));
+    if (r) {
+        char reas[512]; json_string_into(r, rvlen, reas, sizeof(reas));
+        snprintf(el->lines[el->n], sizeof(el->lines[0]), "  %s: %s", typ, reas);
+    } else {
+        snprintf(el->lines[el->n], sizeof(el->lines[0]), "  %s", typ);
+    }
+    el->n++;
+}
+
+/* Format an explain JSON response into human-readable text.
+   Returns malloc'd string; caller must free. */
+char *format_explain_text(const char *json) {
+    char buf[16384];
+    size_t bo = 0;
+    size_t vlen;
+    const char *v;
+
+    v = json_find_key(json, "plan", &vlen);
+    if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
+        bo += snprintf(buf+bo, sizeof(buf)-bo, "Plan:  %s\n", tmp); }
+
+    v = json_find_key(json, "order", &vlen);
+    if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
+        bo += snprintf(buf+bo, sizeof(buf)-bo, "Order: %s\n", tmp); }
+
+    v = json_find_key(json, "total_cheap", &vlen);
+    if (v)
+        bo += snprintf(buf+bo, sizeof(buf)-bo, "Cheap: %s\n",
+                       (vlen==4&&memcmp(v,"true",4)==0)?"yes":"no");
+
+    v = json_find_key(json, "table_rows", &vlen);
+    if (v) {
+        char tmp[32]; size_t n = vlen<31?vlen:31; memcpy(tmp,v,n); tmp[n]=0;
+        bo += snprintf(buf+bo, sizeof(buf)-bo, "Rows:  %s\n\n", tmp);
+    }
+
+    /* Source */
+    bo += snprintf(buf+bo, sizeof(buf)-bo, "Source:\n");
+    v = json_find_key(json, "source", &vlen);
+    if (v) {
+        ExplainLines el = {0};
+        iter_array_objs(v, vlen, source_cb, &el);
+        for (int i = 0; i < el.n; i++)
+            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+    }
+
+    /* Post-filter */
+    bo += snprintf(buf+bo, sizeof(buf)-bo, "\nPost-filter:\n");
+    v = json_find_key(json, "postfilter", &vlen);
+    if (v) {
+        ExplainLines el = {0};
+        iter_array_objs(v, vlen, postfilter_cb, &el);
+        for (int i = 0; i < el.n; i++)
+            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+    }
+
+    /* Hints */
+    bo += snprintf(buf+bo, sizeof(buf)-bo, "\nHints:\n");
+    v = json_find_key(json, "hints", &vlen);
+    if (v) {
+        ExplainLines el = {0};
+        iter_array_objs(v, vlen, hint_cb, &el);
+        for (int i = 0; i < el.n; i++)
+            bo += snprintf(buf+bo, sizeof(buf)-bo, "%s\n", el.lines[i]);
+    }
+
+    buf[bo] = '\0';
+    return strdup(buf);
 }
 
 void tui_show_text(const char *title, const char *body) {

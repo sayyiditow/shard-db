@@ -225,6 +225,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
+    src/test/cases/test_explain.c \
     src/test/cases/test_keyset.c \
     src/test/cases/test_objlock_unit.c \
     src/test/cases/test_parallel.c \
