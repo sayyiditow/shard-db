@@ -2848,8 +2848,8 @@ static void *seg_scan_worker(void *arg) {
        idx shard (sorted-run spill). bitmap → one append file per field. */
     for (int fi = 0; fi < w->n_fields; fi++) {
         char spill_dir[PATH_MAX];
-        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
-                 w->db_root, w->object, w->descs[fi].name);
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                 w->db_root, w->object, w->descs[fi].name, fi);
         if (w->descs[fi].type == MF_BITMAP) {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/bmw%d.bin", spill_dir, w->worker_idx);
@@ -3003,8 +3003,8 @@ static int resolve_bitmaps(const char *db_root, const char *object,
         }
 
         char spill_dir[PATH_MAX];
-        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
-                 db_root, object, descs[fi].name);
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                 db_root, object, descs[fi].name, fi);
 
         for (int w = 0; w < P; w++) {
             char path[PATH_MAX];
@@ -3063,8 +3063,8 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
 
     for (int fi = 0; fi < n_fields; fi++) {
         char spill_dir[PATH_MAX];
-        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
-                 db_root, object, descs[fi].name);
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                 db_root, object, descs[fi].name, fi);
         mkdirp(spill_dir);
     }
 
@@ -3166,8 +3166,8 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
     for (int fi = 0; fi < n_fields; fi++) {
         if (descs[fi].type == MF_BITMAP) continue;
         char spill_dir[PATH_MAX];
-        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill",
-                 db_root, object, descs[fi].name);
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                 db_root, object, descs[fi].name, fi);
         MergeShardArg *margs = calloc((size_t)idx_n, sizeof(MergeShardArg));
         if (!margs) { merge_rc = -1; continue; }
         for (int s = 0; s < idx_n; s++) {
