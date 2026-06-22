@@ -1,0 +1,319 @@
+# Natural Query Language — Grammar Spec
+
+Design document for the shard-db CLI natural query syntax.
+Not yet an implementation plan — see "Next steps" at the bottom.
+
+---
+
+## Command shapes
+
+```
+find      ::= "find"      dir obj [filter] [find-flags]
+count     ::= "count"     dir obj [filter]
+aggregate ::= "aggregate" dir obj [filter] agg-list [agg-flags]
+```
+
+```
+dir ::= bare-word
+obj ::= bare-word
+```
+
+`filter` is a single shell-quoted string. When absent, all records match (same as empty criteria `[]` in JSON).
+
+For `aggregate`, the parser distinguishes `filter` from `agg-list` by the presence of `(` in the token:
+if the positional argument contains `(`, it is `agg-list`; otherwise it is `filter` and the next positional is `agg-list`.
+
+---
+
+## Flags
+
+### find flags
+
+```
+--order-by  order-spec      # sort field(s)
+--limit     integer         # max records (default: GLOBAL_LIMIT)
+--offset    integer         # skip N records
+--fields    fields-spec     # projection: comma-separated field names
+--format    format-val      # output format
+```
+
+### aggregate flags
+
+```
+--group-by  fields-spec     # grouping keys (comma-separated)
+--having    filter          # post-aggregation filter (same grammar as filter)
+--order-by  order-spec      # sort by aggregate alias or group-by field
+--limit     integer
+```
+
+### Shared types
+
+```
+order-spec  ::= order-item ("," order-item)*
+order-item  ::= field [":" ("asc" | "desc")]   # default asc
+
+fields-spec ::= field ("," field)*
+
+format-val  ::= "json" | "rows" | "csv" | "dict"
+```
+
+---
+
+## Filter grammar (EBNF)
+
+Describes the content of the quoted filter string.
+
+```
+filter      ::= or-expr
+
+or-expr     ::= and-expr ("or" and-expr)*
+
+and-expr    ::= atom ("and" atom)*
+
+atom        ::= "(" or-expr ")"
+              | predicate
+
+predicate   ::= field no-val-op
+              | field "between" value "and" value
+              | field in-op   list
+              | field bin-op  value
+```
+
+AND binds tighter than OR. Parentheses override precedence. Max nesting depth: 16 (matches engine limit).
+
+### Operators
+
+```
+no-val-op   ::= "exists" | "not_exists" | "nexists"
+
+in-op       ::= "in"
+              | "not_in" | "not" "in"
+
+bin-op      ::= eq-op | cmp-op | str-op | len-op | field-op
+
+eq-op       ::= "eq"  | "="
+              | "neq" | "!="
+
+cmp-op      ::= "gt"  | ">"
+              | "lt"  | "<"
+              | "gte" | ">=" | "greater_eq"
+              | "lte" | "<=" | "less_eq"
+
+str-op      ::= "contains"    | "not_contains"    | "not" "contains"
+              | "starts"      | "not_starts"       | "not" "starts"
+              | "ends"        | "not_ends"         | "not" "ends"
+              | "like"        | "not_like"         | "not" "like"
+              | "icontains"   | "not_icontains"    | "not" "icontains"
+              | "istarts"     | "iends"
+              | "ilike"       | "not_ilike"        | "not" "ilike"
+              | "regex"       | "not_regex"        | "not" "regex"
+
+len-op      ::= "len_eq" | "len_gt" | "len_lt" | "len_gte" | "len_lte"
+
+field-op    ::= "eq_field"  | "neq_field"
+              | "lt_field"  | "lte_field"
+              | "gt_field"  | "gte_field"
+```
+
+`not <op>` (two tokens) normalizes to `not_<op>` before being sent to the query engine.
+Symbolic aliases (`=`, `!=`, `>`, `<`, `>=`, `<=`) are valid inside the quoted string since shell
+metacharacter expansion does not apply inside single or double quotes.
+
+### `between` disambiguation
+
+When the parser sees `between`, it consumes `value`, then expects the literal token `and`, then
+consumes the second `value`. That `and` token is consumed by `between` and does NOT count as the
+logical `and` in `and-expr`. This is the only case where `and` is not a logical combinator.
+
+### Values
+
+```
+value         ::= single-quoted | number | boolean | bare-word
+
+single-quoted ::= "'" chars "'"     # use \" to escape quotes inside double-quoted shell strings
+number        ::= "-"? [0-9]+ ("." [0-9]+)?
+boolean       ::= "true" | "false"
+bare-word     ::= [a-zA-Z0-9_.-]+   # unquoted, no spaces; use single-quoted for spaces
+```
+
+Values with spaces must be single-quoted: `username starts 'john doe'`.
+
+### List (for `in` / `not_in`)
+
+```
+list  ::= "(" value ("," value)* ")"
+        | "[" value ("," value)* "]"
+```
+
+Both bracket styles accepted. Spaces around commas are fine.
+
+### Field names
+
+```
+field ::= [a-zA-Z_][a-zA-Z0-9_]*
+```
+
+Composite index fields (`field1+field2`) are not expressible in filter syntax; composite indexes are
+used automatically when the engine's planner selects them for a criteria pair.
+
+---
+
+## Aggregate spec grammar
+
+```
+agg-list    ::= agg-spec ("," agg-spec)*
+agg-spec    ::= agg-fn "(" [field] ")"
+
+agg-fn      ::= "count" | "sum" | "avg" | "min" | "max"
+```
+
+`count()` — count all records in the group.
+`count(field)` — count non-null/non-empty values.
+
+Aliases are auto-generated by the engine (`sum_price`, `avg_amount`, `count`). The `--order-by`
+and `--having` flags reference these auto-generated names. If two aggregates on the same field
+produce the same auto-name the engine appends `_2`, `_3`, etc. (existing engine behavior).
+
+---
+
+## Examples
+
+### find
+
+```sh
+# simple equality
+./shard-db find default users "username = alice"
+
+# range with AND
+./shard-db find default users "age gt 18 and age lt 65"
+
+# symbolic operators (valid inside quotes)
+./shard-db find default users "age > 18 and age < 65"
+
+# OR with parentheses
+./shard-db find default users "(status = active or status = pending) and age gt 18"
+
+# in list
+./shard-db find default users "status in (active, pending, trial)"
+
+# between
+./shard-db find default users "age between 18 and 65"
+
+# string ops
+./shard-db find default users "username starts 'john'"
+./shard-db find default users "bio contains 'rust'"
+
+# exists
+./shard-db find default users "phone exists"
+./shard-db find default users "deleted_at not_exists"
+
+# order, limit, offset, fields
+./shard-db find default users "age gt 18" --order-by age:desc --limit 20 --offset 40 --fields name,email
+
+# multi-field order
+./shard-db find default users "status = active" --order-by rank:asc,score:desc --limit 10
+
+# no filter (all records)
+./shard-db find default users --limit 50
+```
+
+### count
+
+```sh
+./shard-db count default users "status = active"
+./shard-db count default users "age between 18 and 65 and status != deleted"
+./shard-db count default users   # all records (O(1) metadata path)
+```
+
+### aggregate
+
+```sh
+# whole-table count
+./shard-db aggregate default orders count()
+
+# sum + avg with filter
+./shard-db aggregate default orders "status = active" sum(amount),avg(amount)
+
+# group by with having
+./shard-db aggregate default orders sum(amount),count() \
+  --group-by status \
+  --having "count gt 100" \
+  --order-by sum_amount:desc \
+  --limit 10
+
+# multi-field group by
+./shard-db aggregate default orders "created_at > '2026-01-01'" \
+  sum(amount),avg(amount),min(amount),max(amount) \
+  --group-by status,currency \
+  --order-by sum_amount:desc
+```
+
+---
+
+## Normalization rules (parser responsibilities)
+
+| Input form        | Normalized to   |
+|-------------------|-----------------|
+| `=`               | `eq`            |
+| `!=`              | `neq`           |
+| `>`               | `gt`            |
+| `<`               | `lt`            |
+| `>=`              | `gte`           |
+| `<=`              | `lte`           |
+| `less_eq`         | `lte`           |
+| `greater_eq`      | `gte`           |
+| `nexists`         | `not_exists`    |
+| `not contains`    | `not_contains`  |
+| `not starts`      | `not_starts`    |
+| `not ends`        | `not_ends`      |
+| `not like`        | `not_like`      |
+| `not icontains`   | `not_icontains` |
+| `not ilike`       | `not_ilike`     |
+| `not regex`       | `not_regex`     |
+| `not in`          | `not_in`        |
+
+All normalized forms map 1:1 to JSON operator names accepted by the query engine.
+
+---
+
+## Output: JSON query constructed by the parser
+
+The natural language parser is a frontend that constructs the same JSON the engine already accepts.
+No engine changes are required. The parser lives entirely in the CLI layer (`src/db/main.c` or a
+new `src/db/nql.c`).
+
+Example translation:
+
+```
+"age > 18 and (status = active or status = pending)"
+```
+
+becomes:
+
+```json
+[
+  {"field":"age","op":"gt","value":"18"},
+  {"or":[
+    {"field":"status","op":"eq","value":"active"},
+    {"field":"status","op":"eq","value":"pending"}
+  ]}
+]
+```
+
+---
+
+## Open questions (resolve before implementation plan)
+
+None. All design decisions are settled.
+
+---
+
+## Next steps
+
+Convert this grammar spec into a full implementation plan (`2026-06-22-natural-query-language-impl.md`)
+covering:
+- Tokenizer for the filter string
+- Recursive-descent parser producing a criteria JSON string
+- Aggregate spec parser
+- CLI argument dispatch for find / count / aggregate
+- Test cases mirroring the examples above

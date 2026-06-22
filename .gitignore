@@ -74,3 +74,4 @@ test-htest
 *.gcno
 *.gcda
 site
+.serena

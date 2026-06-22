@@ -10,11 +10,13 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
 - If in build mode and tempted to push: STOP. Use `gh pr create` instead.
 - These rules override any convenience or speed consideration.
 
-## Working model (plan → delegate → review → commit)
+## Working model (plan → approve → execute → review → commit)
+
+**The user owns all feature and design decisions.** Agents investigate, propose, and implement — they do not decide what gets built or how it is designed. No execution happens without explicit user approval of the plan.
 
 Default workflow for non-trivial work, unless the user says otherwise for a given task:
 
-1. **Sonnet plans.** Investigate and diagnose, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored).
+1. **Sonnet investigates and plans.** Diagnose the problem or understand the feature request, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored). Present the plan to the user. If the approach involves a real design choice, surface the tradeoffs and ask — do not pick silently.
 
    **Plan quality requirements** — the plan must be complete enough that any model can execute it with zero design decisions:
    - Every insertion/edit locates its site by **quoted anchor text** (not line numbers, which drift). Note: another model may be working concurrently on a separate branch, so line numbers will drift — anchors are the only reliable locator.
@@ -22,9 +24,11 @@ Default workflow for non-trivial work, unless the user says otherwise for a give
    - Explicit invariants and edge cases with required behavior spelled out.
    - Embedded execution rules at the top of the plan: branch off `main`; do tasks in order; build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; if a quoted anchor is not found exactly, stop and write `PLAN_NOTES.md` — do not guess or reinterpret.
 
-2. **An external model executes** the plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. Execution is handled by models outside the Claude family (e.g. Gemini, GPT) — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user who runs the executing model separately.
+2. **User approves the plan.** The user reviews the plan and either approves it, requests changes, or rejects it. Sonnet revises until the user explicitly says to proceed. **No execution model is invoked until the user gives approval.**
 
-3. **Sonnet reviews only.** Inspect the actual `git diff` (not the executing model's summary). Report any anchor mismatches, correctness issues, or test failures. **All git operations are done outside Claude** — see the Git operations section below.
+3. **An external model executes** the approved plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. Execution is handled by models outside the Claude family (e.g. Gemini, GPT) — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user who runs the executing model separately.
+
+4. **Sonnet reviews only.** Inspect the actual `git diff` (not the executing model's summary). Report any anchor mismatches, correctness issues, or test failures. **All git operations are done outside Claude** — see the Git operations section below.
 
 ## Git operations (done outside Claude)
 
