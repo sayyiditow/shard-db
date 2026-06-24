@@ -303,6 +303,13 @@ int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
    Returns 0 on success. */
 int  slotcask_migrate_to_varlen(SlotcaskDb *db);
 
+/* Repack a VARIABLE-format object in-place, applying trim_fn to shorten each
+   value. Writes compacted records to a fresh file-ID range, repoints KF entries,
+   then deletes the old segment files. Idempotent across two calls (alternates
+   between MIGRATE_STREAM_BASE and COMPACT_STREAM_BASE ranges). Returns 0 on
+   success, -1 on error (object state is consistent on any partial failure). */
+int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx);
+
 /* Returns the pool bucket index (0-3) for a slot of given capacity.
    max_slot_size is db->slot_size (the object's schema max). */
 int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
