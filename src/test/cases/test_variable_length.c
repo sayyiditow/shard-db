@@ -9,6 +9,7 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include "slotcask.h"
+#include "types.h"   /* typed_encode_trim_len, TypedSchema (build uses -Isrc/db) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,12 +32,57 @@ static void unique_tmpdir(char out[256]) {
              base, (int)getpid(), (long)time(NULL));
 }
 
+static void test_trim_len_basics(void) {
+    /* Build a minimal schema: score:int(4B) + title:varchar:20(22B) + url:varchar:10(12B) */
+    /* Offsets: score=0, title=4, url=26. total_size=38. */
+    TypedSchema ts = {0};
+    ts.typed = 1;
+    ts.nfields = 3;
+    ts.total_size = 38;
+    TypedField fields[3] = {
+        { .name = "score", .type = FT_INT,     .size = 4,  .offset = 0  },
+        { .name = "title", .type = FT_VARCHAR,  .size = 22, .offset = 4  },
+        { .name = "url",   .type = FT_VARCHAR,  .size = 12, .offset = 26 },
+    };
+    memcpy(ts.fields, fields, sizeof(fields));
+
+    uint8_t buf[38];
+
+    /* All zeros: trim to 0 */
+    memset(buf, 0, 38);
+    ASSERT_EQ_INT((int)typed_encode_trim_len(&ts, buf, 38), 0, "all-zero trims to 0");
+
+    /* score=1, title="", url="": trim to end of score field (offset 4) */
+    memset(buf, 0, 38);
+    buf[3] = 1;  /* score = 1 (BE int32) */
+    ASSERT_EQ_INT((int)typed_encode_trim_len(&ts, buf, 38), 4, "score=1 trims to end of score");
+
+    /* score=0, title="hi" (2 chars), url="": trim to end of title field (offset 26) */
+    memset(buf, 0, 38);
+    buf[4] = 0; buf[5] = 2;   /* title length = 2 (BE uint16) */
+    buf[6] = 'h'; buf[7] = 'i';
+    ASSERT_EQ_INT((int)typed_encode_trim_len(&ts, buf, 38), 26, "title='hi' trims to end of title");
+
+    /* all three fields non-zero: trim to 38 */
+    memset(buf, 0, 38);
+    buf[3] = 5;           /* score=5 */
+    buf[4] = 0; buf[5] = 2; buf[6] = 'h'; buf[7] = 'i';
+    buf[26] = 0; buf[27] = 3;  /* url length=3 */
+    buf[28] = 'f'; buf[29] = 'o'; buf[30] = 'o';
+    ASSERT_EQ_INT((int)typed_encode_trim_len(&ts, buf, 38), 38, "all-fields non-zero trims to full");
+
+    printf("  trim_len_basics: passed\n");
+}
+
 static int test_variable_length_run(void) {
     char dir[256];
     unique_tmpdir(dir);
     rm_rf(dir);
 
     slotcask_init(16, 16);
+
+    /* Basic typed_encode_trim_len unit test */
+    test_trim_len_basics();
 
     /* ---------------------------------------------------------------
      * Phase 1: create a fixed-format DB, insert records, verify reads.

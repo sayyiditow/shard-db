@@ -1020,8 +1020,9 @@ int cmd_get(const char *db_root, const char *object,
 /* ========== CAS (Compare-and-Swap) helper ========== */
 
 /* Check all criteria against the current record value (typed binary).
-   Returns 1 if ALL criteria match, 0 on first failure. */
-int cas_check(TypedSchema *ts, const uint8_t *value_ptr,
+   value_len is the number of valid bytes in value_ptr (may be < ts->total_size
+   for trim-encoded records). Returns 1 if ALL criteria match, 0 on first failure. */
+int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len,
               SearchCriterion *crit, int ncrit) {
     for (int i = 0; i < ncrit; i++) {
         char *val_str = NULL;
@@ -1033,7 +1034,7 @@ int cas_check(TypedSchema *ts, const uint8_t *value_ptr,
             while (tok) {
                 int fi = typed_field_index(ts, tok);
                 if (fi >= 0) {
-                    char *v = typed_get_field_str(ts, value_ptr, fi);
+                    char *v = typed_get_field_str(ts, value_ptr, value_len, fi);
                     if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
                     else { ok = 0; break; }
                 } else { ok = 0; break; }
@@ -1043,7 +1044,7 @@ int cas_check(TypedSchema *ts, const uint8_t *value_ptr,
             val_str = (ok && cp > 0) ? strdup(cat) : NULL;
         } else {
             int fi = typed_field_index(ts, crit[i].field);
-            if (fi >= 0) val_str = typed_get_field_str(ts, value_ptr, fi);
+            if (fi >= 0) val_str = typed_get_field_str(ts, value_ptr, value_len, fi);
         }
         int matched = match_criterion(val_str, &crit[i]);
         free(val_str);
@@ -1086,7 +1087,7 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     if (c->ncrit > 0) {
         /* if_json criteria require an existing record; reject if missing. */
         if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
     }
     return 1;
 }
@@ -1456,7 +1457,7 @@ static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old) return 0;  /* require_existing handles this, but defensive */
     if (c->crit && c->ncrit > 0 &&
-        !cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+        !cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
     return 1;
 }
 
@@ -1596,7 +1597,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         if (if_json) {
             SearchCriterion *crit = NULL; int ncrit = 0;
             parse_criteria_json(if_json, &crit, &ncrit);
-            int pass = cas_check(ts, old_val, crit, ncrit);
+            int pass = cas_check(ts, old_val, (int)old_vlen, crit, ncrit);
             free_criteria(crit, ncrit);
             if (!pass) {
                 char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen);
@@ -1772,7 +1773,7 @@ static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
     if (c->ncrit > 0) {
         if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, c->crit, c->ncrit)) return 0;
+        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
     }
     return 1;
 }
@@ -1866,7 +1867,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         if (if_json) {
             SearchCriterion *crit = NULL; int ncrit = 0;
             parse_criteria_json(if_json, &crit, &ncrit);
-            int pass = cas_check(ts, val, crit, ncrit);
+            int pass = cas_check(ts, val, (int)vlen, crit, ncrit);
             if (!pass) {
                 char *cur = typed_decode(ts, val, (uint32_t)vlen);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",

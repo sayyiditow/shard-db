@@ -719,13 +719,24 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                           int out_size, const char *db_root, const char *object,
                           char *err_buf, size_t err_buf_size);
+/* Return minimum byte count to encode buf[0..full_len) at field boundaries.
+   Fields trimmed to 0 decode as zero/empty — safe for all field types. */
+size_t typed_encode_trim_len(const TypedSchema *ts, const uint8_t *buf,
+                              size_t full_len);
+
+/* SlotcaskTrimFn-compatible wrapper; ctx = const TypedSchema *. */
+size_t schema_trim_fn(const void *val, size_t vlen, void *ctx);
+
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
 /* Stream variant — writes the JSON object directly to `out` without
    allocating an intermediate string. Use on the GET hot path; saves one
    malloc + one memcpy per response vs. typed_decode + OUT("%s\n"). */
 void  typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                           int data_len, FILE *out);
-char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx);
+/* data_len is the number of valid bytes in data (may be < ts->total_size for
+   trim-encoded records). Fields beyond data_len return NULL (== empty/default). */
+char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
+                           int data_len, int field_idx);
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
 
@@ -1301,7 +1312,7 @@ void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
 /* Recursive match: AND short-circuits on first false, OR on first true. Passing
    NULL means "no criteria" → match-all (returns 1). */
 int criteria_match_tree(const uint8_t *rec, const CriteriaNode *node, FieldSchema *fs);
-int cas_check(TypedSchema *ts, const uint8_t *value_ptr, SearchCriterion *crit, int ncrit);
+int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len, SearchCriterion *crit, int ncrit);
 
 
 /* config.c globals — moved to ShardDb struct (shard_db_internal.h) */
