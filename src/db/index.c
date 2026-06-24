@@ -2783,7 +2783,7 @@ typedef struct { uint8_t sid; uint32_t fid; } SegRef;
 
 typedef struct {
     const char        *db_root, *object, *data_dir;
-    int                splits, idx_n, slot_size, worker_idx;
+    int                splits, idx_n, slot_size, format, worker_idx;
     TypedSchema       *ts;
     int                n_fields;
     const MFFieldDesc *descs;     /* all fields (btree/trigram/bitmap) */
@@ -2872,7 +2872,11 @@ static void *seg_scan_worker(void *arg) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/data/streams/%03d/%06u.dat",
                  w->data_dir, (int)sr->sid, (unsigned)sr->fid);
-        int rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
+        int rc;
+        if (w->format == SLOTCASK_FORMAT_VARIABLE)
+            rc = seg_scan_o_direct_varlen(path, reindex_seg_cb, w);
+        else
+            rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
         if (rc < 0) w->had_error = 1;
         if (w->segs_done) atomic_fetch_add(w->segs_done, 1);
     }
@@ -3103,6 +3107,7 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         workers[w].splits     = sch->splits;
         workers[w].idx_n      = idx_n;
         workers[w].slot_size  = sch->slot_size;
+        workers[w].format     = sdb->format;
         workers[w].worker_idx = w;
         workers[w].ts         = ts;
         workers[w].n_fields   = n_fields;

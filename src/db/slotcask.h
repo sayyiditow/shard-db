@@ -178,9 +178,23 @@ int  segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
 
 /* ============================================================ Per-stream pool */
 
+/* Format constants — stored in <data_dir>/segment_format file.
+   FIXED = original padded slots (slot_size bytes each).
+   VARIABLE = no padding; record is exactly 24 + klen + vlen bytes. */
+#define SLOTCASK_FORMAT_FIXED    0
+#define SLOTCASK_FORMAT_VARIABLE 1
+
+/* Number of size-class buckets in the per-stream free pool.
+   Bucket 0: capacity < 256B
+   Bucket 1: capacity < 1024B
+   Bucket 2: capacity < 8192B
+   Bucket 3: capacity <= max_slot_size (catch-all) */
+#define SLOTCASK_POOL_BUCKETS 4
+
 typedef struct {
     uint16_t file_id;
     uint32_t offset;
+    uint32_t capacity; /* actual slot size in bytes (24 + klen + vlen) */
 } SlotcaskFreeSlot;
 
 typedef struct {
@@ -192,11 +206,14 @@ typedef struct {
     uint32_t        active_file_id;
     uint64_t        reserve_off;
 
-    /* Free pool — try_lock pattern; only one consumer at a time */
-    pthread_mutex_t pool_lock;
-    SlotcaskFreeSlot *free_slots;
-    size_t          free_count;
-    size_t          free_cap;
+    /* Free pool — try_lock pattern; only one consumer at a time.
+       Bucketed by slot capacity for variable-length format:
+       bucket 0 < 256B, 1 < 1024B, 2 < 8192B, 3 = catch-all.
+       Fixed-format uses bucket 0 only (all slots same size). */
+    pthread_mutex_t   pool_lock;
+    SlotcaskFreeSlot *free_slots[SLOTCASK_POOL_BUCKETS];
+    size_t            free_count[SLOTCASK_POOL_BUCKETS];
+    size_t            free_cap[SLOTCASK_POOL_BUCKETS];
 } SlotcaskStream;
 
 /* ============================================================ DB handle */
@@ -205,7 +222,8 @@ typedef struct SlotcaskDb {
     char    data_dir[PATH_MAX];
     int     num_shards;
     int     num_streams;
-    int     slot_size;       /* fixed; set at open time from schema or arg */
+    int     slot_size;       /* max slot size; for varlen = 24 + max_key + max_value */
+    int     format;          /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     size_t  slots_per_shard; /* per-shard kf capacity floor; individual
                                 shards may have grown larger via auto-resplit */
 
@@ -266,6 +284,16 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
+
+/* Migrate an object's segment files from fixed-size to variable-length format.
+   Daemon must be stopped. Uses atomic rename: writes to streams.new/ + kf.new/,
+   renames atomically, writes segment_format file, cleans up old dirs.
+   Returns 0 on success. */
+int  slotcask_migrate_to_varlen(SlotcaskDb *db);
+
+/* Returns the pool bucket index (0-3) for a slot of given capacity.
+   max_slot_size is db->slot_size (the object's schema max). */
+int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
 
 /* Rebuild every kf shard in place, dropping flag=2 (tombstone) entries.
    After this, kf->total = live count and kf->deleted = 0 across all
@@ -422,6 +450,7 @@ typedef struct {
     /* output: callee fills */
     int         status;                /* 0=ok, -2=cond_not_met, -1=error */
     int         was_update;
+    uint32_t    slot_capacity;         /* on-disk capacity for this slot (varlen) */
     /* Physical location of the kf entry (insert: slot kf_put_new chose;
        update: slot kf_lookup found). Written BEFORE pre_commit fires so
        per-record bitmap updates can address the slot. */
@@ -606,8 +635,9 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
  */
 typedef struct {
     int splits;            /* num_shards for the keyfile */
-    int slot_size;         /* fixed per-record byte width */
+    int slot_size;         /* max per-record byte width (slot_size for fixed, max for variable) */
     int streams;           /* persisted at create time, hardcoded by nproc */
+    int format;            /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
 } SlotcaskSchemaInfo;
 
 SlotcaskDb *slotcask_registry_get(const char *effective_root,

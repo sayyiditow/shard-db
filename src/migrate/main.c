@@ -1,14 +1,12 @@
 /* migrate — one-shot per-release upgrade runner.
  *
- * For 2026.05.7 (composite index typed binary encoding):
- *   1. Spawn `./shard-db start` and poll until ready.
- *   2. Run `./shard-db reindex --composites-only` to rebuild composite
- *      indexes (field1+field2) under the new typed binary sort key format.
- *      Non-composite indexes are unchanged and do not need rebuilding.
- *   3. Stop the daemon.
+ * Offline (daemon must NOT be running):
+ *   Reads schema.conf, converts every registered object from fixed-slot to
+ *   variable-length segment format via ./shard-db migrate-varlen.
+ *   Idempotent: objects already in variable-length format are skipped.
  *
- * Prerequisite: must be on 2026.05.5+ (BTRH format). If upgrading from
- * an earlier version, run 2026.05.4's ./migrate first, then 2026.05.5's
+ * Prerequisite: must be on 2026.05.5+ (BTRH format). If upgrading from an
+ * earlier version, run 2026.05.4's ./migrate first, then 2026.05.5's
  * ./migrate (full reindex), then this one.
  *
  * Reads DB_ROOT from db.env in the current working directory.
@@ -58,13 +56,54 @@ static int load_db_root(const char *path, char *out, size_t out_sz) {
     return -1;
 }
 
-static int wait_daemon_ready(int timeout_sec) {
-    for (int i = 0; i < timeout_sec * 5; i++) {
-        if (system("./shard-db status > /dev/null 2>&1") == 0) return 0;
-        struct timespec ts = { 0, 200 * 1000000L };
-        nanosleep(&ts, NULL);
+typedef struct { char dir[256]; char obj[256]; } SchemaEntry;
+
+/* Parses <db_root>/schema.conf and returns all dir:obj pairs.
+   Caller frees *out.  Returns 0 on success (including empty schema). */
+static int parse_schema(const char *db_root, SchemaEntry **out, int *n_out) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/schema.conf", db_root);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        /* No schema.conf → nothing to migrate. */
+        *out = NULL;
+        *n_out = 0;
+        return 0;
     }
-    return -1;
+
+    SchemaEntry *list = NULL;
+    int n = 0, cap = 0;
+    char line[4096];
+
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || !*p) continue;
+
+        /* Format: dir:object:splits:max_key:2:streams[...] */
+        char *c1 = strchr(p, ':');
+        if (!c1) continue;
+        *c1 = '\0';
+        char *c2 = strchr(c1 + 1, ':');
+        if (!c2) continue;
+        *c2 = '\0';
+
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 16;
+            SchemaEntry *t = realloc(list, (size_t)nc * sizeof(SchemaEntry));
+            if (!t) { free(list); fclose(f); return -1; }
+            list = t;
+            cap = nc;
+        }
+        snprintf(list[n].dir, sizeof(list[n].dir), "%s", p);
+        snprintf(list[n].obj, sizeof(list[n].obj), "%s", c1 + 1);
+        n++;
+    }
+    fclose(f);
+    *out = list;
+    *n_out = n;
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -74,28 +113,34 @@ int main(int argc, char **argv) {
     if (load_db_root("db.env", db_root, sizeof(db_root)) < 0) return 1;
     fprintf(stdout, "migrate: DB_ROOT=%s\n", db_root);
 
-    fprintf(stdout, "migrate: phase 1/1 — reindex --composites-only (rebuild composite indexes under typed binary encoding)\n");
-    if (system("./shard-db start") != 0) {
-        fprintf(stderr, "migrate: ./shard-db start failed\n");
-        return 1;
-    }
-    if (wait_daemon_ready(30) < 0) {
-        fprintf(stderr, "migrate: daemon never came up within 30s\n");
-        system("./shard-db stop > /dev/null 2>&1");
+    /* Phase 1/2: varlen segment migration (offline). */
+    fprintf(stdout, "migrate: phase 1/2 — varlen segment migration (offline)\n");
+
+    SchemaEntry *objects = NULL;
+    int n_objects = 0;
+    if (parse_schema(db_root, &objects, &n_objects) != 0) {
+        fprintf(stderr, "migrate: failed to parse schema.conf\n");
         return 1;
     }
 
-    int reindex_rc = system("./shard-db reindex --composites-only");
-    int stop_rc = system("./shard-db stop");
+    for (int i = 0; i < n_objects; i++) {
+        char cmd[PATH_MAX + 512];
+        snprintf(cmd, sizeof(cmd), "./shard-db migrate-varlen %s %s",
+                 objects[i].dir, objects[i].obj);
+        fprintf(stdout, "migrate:   varlen %s/%s\n", objects[i].dir, objects[i].obj);
+        fflush(stdout);
+        int rc = system(cmd);
+        if (rc != 0) {
+            fprintf(stderr, "migrate: varlen migration failed for %s/%s (rc=%d)\n",
+                    objects[i].dir, objects[i].obj, rc);
+            free(objects);
+            return 1;
+        }
+    }
+    free(objects);
 
-    if (reindex_rc != 0) {
-        fprintf(stderr, "migrate: reindex failed (rc=%d)\n", reindex_rc);
-        return 1;
-    }
-    if (stop_rc != 0) {
-        fprintf(stderr, "migrate: warning — daemon stop returned %d; check status manually\n",
-                stop_rc);
-    }
+    if (n_objects == 0)
+        fprintf(stdout, "migrate:   no objects in schema.conf, nothing to migrate\n");
 
     fprintf(stdout, "migrate: complete\n");
     return 0;

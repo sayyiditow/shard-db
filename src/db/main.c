@@ -1,4 +1,5 @@
 #include "types.h"
+#include "slotcask.h"
 
 /* ========== MAIN ========== */
 
@@ -120,6 +121,59 @@ int main(int argc, char *argv[]) {
             "shard-db: 'migrate-files' moved to ./migrate in 2026.05.1.\n"
             "          Stop the daemon and run ./migrate instead.\n");
         return 1;
+    }
+
+    /* migrate-varlen — offline conversion of fixed-size segment records to
+       variable-length format.  Daemon must NOT be running. */
+    if (strcmp(cmd, "migrate-varlen") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: shard-db migrate-varlen <dir> <object>\n");
+            return 1;
+        }
+        const char *mig_dir = argv[2];
+        const char *mig_obj = argv[3];
+        char db_root[PATH_MAX];
+        if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
+        char eff_root[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, mig_dir);
+        shard_db_offline_init(db_root);
+        Schema sc = load_schema(eff_root, mig_obj);
+        if (sc.splits <= 0) {
+            fprintf(stderr, "migrate-varlen: cannot load schema for %s/%s\n",
+                    mig_dir, mig_obj);
+            return 1;
+        }
+        /* kfcache sized to hold all shards; segcache=256 holds source+dest
+           segment files without eviction during migration. */
+        slotcask_init(sc.splits, 256);
+        char obj_data[PATH_MAX];
+        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s",
+                 db_root, mig_dir, mig_obj);
+        /* Skip objects whose data directory does not yet exist — they have
+           no segments to migrate and slotcask_open would create the dir. */
+        {
+            char kf_probe[PATH_MAX];
+            snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
+            struct stat _st;
+            if (stat(kf_probe, &_st) != 0) {
+                fprintf(stdout, "migrate-varlen: %s/%s skipped (no data dir)\n",
+                        mig_dir, mig_obj);
+                return 0;
+            }
+        }
+        SlotcaskDb sdb;
+        if (slotcask_open(&sdb, obj_data, sc.splits, sc.streams, sc.slot_size) != 0) {
+            fprintf(stderr, "migrate-varlen: slotcask_open failed\n");
+            return 1;
+        }
+        int mrc = slotcask_migrate_to_varlen(&sdb);
+        slotcask_close(&sdb);
+        if (mrc != 0) {
+            fprintf(stderr, "migrate-varlen: migration failed\n");
+            return 1;
+        }
+        fprintf(stdout, "migrate-varlen: %s/%s done\n", mig_dir, mig_obj);
+        return 0;
     }
 
     /* All other commands — route through server via TCP */

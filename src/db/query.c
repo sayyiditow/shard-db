@@ -253,6 +253,7 @@ static int od_seg_record_cb(const uint8_t *rec, size_t vlen,
 typedef struct {
     char           seg_path[PATH_MAX];
     int            slot_size;
+    int            format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     V2ScanWrap    *wrap;
     int           *stop_flag;
     FILE          *parent_out;
@@ -263,7 +264,10 @@ static void *od_seg_file_worker(void *raw) {
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
-    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    if (arg->format == SLOTCASK_FORMAT_VARIABLE)
+        seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
+    else
+        seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     /* Drain per-thread count accumulator (count_scan_cb) so the
        orchestrator sees this worker's contribution after parallel_for
        joins.  No-op for callbacks that don't use the TLS counter. */
@@ -305,6 +309,7 @@ void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
             snprintf(args[nargs].seg_path, PATH_MAX,
                      "%s/%s", stream_dir, de->d_name);
             args[nargs].slot_size  = db->slot_size;
+            args[nargs].format     = db->format;
             args[nargs].wrap       = &wrap;
             args[nargs].stop_flag  = &stop_flag;
             args[nargs].parent_out = parent_out;
@@ -323,9 +328,40 @@ run:
 /* ── inline-match scan dispatcher (zero-callback, direct match_typed) ── */
 
 /* One entry in the per-file parallel_for array for the match path. */
+/* Match callback context for varlen inline-match scans. */
+typedef struct {
+    int64_t            *count;
+    FieldSchema        *fs;
+    const CompiledCriterion *single_cc;
+    const CriteriaNode  *tree;
+} VarlenMatchCtx;
+
+/* od_record_cb wrapper for varlen match scanning.  Extracts the value
+   from the record and runs match_typed / criteria_match_tree directly. */
+static int varlen_match_cb(const uint8_t *rec, size_t vlen,
+                            const uint8_t hash16[16], void *raw) {
+    VarlenMatchCtx *mc = (VarlenMatchCtx *)raw;
+    (void)hash16;
+    uint16_t klen;
+    memcpy(&klen, rec + 16, 2);
+    const uint8_t *value = rec + 24 + (size_t)klen;
+
+    int matched = 0;
+    if (mc->single_cc) {
+        if (match_typed(value, mc->single_cc, mc->fs) > 0)
+            matched = 1;
+    } else if (mc->tree) {
+        if (criteria_match_tree(value, mc->tree, mc->fs))
+            matched = 1;
+    }
+    if (matched && mc->count) (*mc->count)++;
+    return 0;
+}
+
 typedef struct {
     char                seg_path[PATH_MAX];
     int                 slot_size;
+    int                 format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     FieldSchema        *fs;
     const CompiledCriterion *single_cc;
     const CriteriaNode  *tree;
@@ -336,15 +372,23 @@ typedef struct {
 static void *od_match_file_worker(void *raw) {
     OdMatchFileArg *arg = (OdMatchFileArg *)raw;
     int64_t local_count = 0;
-    int rc = seg_scan_o_direct_match(arg->seg_path, arg->slot_size,
-                                      arg->fs, arg->single_cc, arg->tree,
-                                      arg->dl, &local_count);
-    /* Merge matches regardless of error — partial count is better than losing all.
-       Error propagation would need a separate shared error flag (future work). */
+
+    if (arg->format == SLOTCASK_FORMAT_VARIABLE) {
+        VarlenMatchCtx mc = {
+            .count = &local_count, .fs = arg->fs,
+            .single_cc = arg->single_cc, .tree = arg->tree,
+        };
+        seg_scan_o_direct_varlen(arg->seg_path, varlen_match_cb, &mc);
+    } else {
+        int rc = seg_scan_o_direct_match(arg->seg_path, arg->slot_size,
+                                          arg->fs, arg->single_cc, arg->tree,
+                                          arg->dl, &local_count);
+        (void)rc;
+    }
+
     if (local_count > 0)
         __atomic_add_fetch(arg->out_count,
                            local_count, __ATOMIC_RELAXED);
-    (void)rc;  /* TODO: propagate errors via shared flag */
     return NULL;
 }
 
@@ -384,6 +428,7 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
             snprintf(args[nargs].seg_path, PATH_MAX,
                      "%s/%s", stream_dir, de->d_name);
             args[nargs].slot_size  = db->slot_size;
+            args[nargs].format     = db->format;
             args[nargs].fs         = fs;
             args[nargs].single_cc  = single_cc;
             args[nargs].tree       = tree;
@@ -24034,6 +24079,7 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
 typedef struct {
     char       seg_path[PATH_MAX];
     int        slot_size;
+    int        format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     AggCtx     local;         /* per-segment private accumulator */
     V2ScanWrap wrap;          /* .cb = agg_scan_cb, .ctx = &this->local */
     int       *stop_flag;
@@ -24045,7 +24091,10 @@ static void *agg_od_seg_worker(void *raw) {
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = &arg->wrap, .stop_flag = arg->stop_flag };
-    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    if (arg->format == SLOTCASK_FORMAT_VARIABLE)
+        seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
+    else
+        seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     count_scan_cb_flush_thread();
     return NULL;
 }
@@ -24081,6 +24130,7 @@ static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
             memset(a, 0, sizeof(*a));
             snprintf(a->seg_path, PATH_MAX, "%s/%s", stream_dir, de->d_name);
             a->slot_size   = sdb->slot_size;
+            a->format      = sdb->format;
             agg_ctx_clone_shared(&a->local, main_ctx);
             a->wrap.cb     = agg_scan_cb;
             /* wrap.ctx set in fixup pass below — realloc may move args */

@@ -135,7 +135,7 @@ Two on-disk layers per object (under `<db_root>/<dir>/<object>/`):
 
 - **Keyfile shards** (`data/kf/NNN.kf`, 3 hex digits, max `MAX_SPLITS=4096`): open-addressed hash table mapping each key's xxh128 hash to its segment location. Each entry is a 24-byte slot header (16B hash, 2B key_len, 1B flag, 1B stream_id, 4B file_id) + key bytes. `flag`: 0=empty, 1=live, 2=tombstone. Shard routed by `hash[0..1] % splits`.
 - **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, padded to `slot_size`. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
-- **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = round-robin across `streams`.
+- **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = `hash[15] % num_streams` (hash-routed so a key's insert/update history stays in one stream, maximising free-pool slot reuse).
 - **Dynamic growth**: 50% kf load → double `slots_per_shard`. `MAX_SPLITS=4096` caps shard *files*, not slots.
 - **I/O**: kf writes via ucache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
