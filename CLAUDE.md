@@ -54,8 +54,6 @@ gh pr create --title "type: short description" --body "$(cat <<'EOF'
 
 ## Test plan
 - [ ] relevant test cases
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
 
