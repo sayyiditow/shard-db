@@ -175,7 +175,7 @@ static int test_schema_export_run(void) {
     free(resp); resp = NULL;
 
     /* Imported objects start empty. */
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"mig_users\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"mig_users\"}", &resp);
     ASSERT_CONTAINS(resp, "0", "mig_users empty after import");
     free(resp); resp = NULL;
 

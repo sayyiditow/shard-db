@@ -86,9 +86,9 @@ static int test_bare_shapes_run(void) {
     ASSERT_TRUE(eq_str(resp, "2"), "count with criteria");
     free(resp); resp = NULL;
 
-    /* size → bare live count */
+    /* size → bare disk bytes (positive integer) */
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"shape_t\"}", &resp);
-    ASSERT_TRUE(eq_str(resp, "3"), "size = 3 live");
+    ASSERT_TRUE(atoll(resp) > 0, "size > 0 (disk bytes)");
     free(resp); resp = NULL;
 
     /* delete + orphaned → bare deleted count */
@@ -99,7 +99,7 @@ static int test_bare_shapes_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"shape_t\"}", &resp);
-    ASSERT_TRUE(eq_str(resp, "2"), "size = 2 (live drops on delete)");
+    ASSERT_TRUE(atoll(resp) > 0, "size > 0 after delete");
     free(resp); resp = NULL;
 
     /* fetch format:dict — wraps with {"results":...,"cursor":...} */

@@ -202,8 +202,8 @@ static int test_auto_vacuum_run(void) {
         free(resp); resp = NULL;
 
         /* Live count for big unchanged (vacuum reclaims tombstones, not live). */
-        tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
-        ASSERT_EQ_INT(tu_parse_count(resp), 20, "big size=20 (50 - 30 deleted)");
+        tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
+        ASSERT_EQ_INT(tu_parse_count(resp), 20, "big count=20 (50 - 30 deleted)");
         free(resp); resp = NULL;
     }
 

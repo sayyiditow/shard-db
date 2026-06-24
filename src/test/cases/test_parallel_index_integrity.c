@@ -129,7 +129,7 @@ static int test_parallel_index_integrity_run(void) {
     ASSERT_EQ_INT(worker_failures, 0, "all bulk-insert workers succeeded");
 
     /* Total record count. */
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"idxtest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"idxtest\"}", &resp);
     ASSERT_EQ_INT(tu_parse_count(resp), TOTAL, "100000 records present");
     free(resp); resp = NULL;
 
