@@ -45,7 +45,8 @@ static int mode_is_schema(const char *m) {
            strcasecmp(m, "add-field") == 0 || strcasecmp(m, "edit-field") == 0 ||
            strcasecmp(m, "vacuum") == 0 ||
            strcasecmp(m, "truncate") == 0 ||
-           strcasecmp(m, "migrate-storage-version") == 0;
+            strcasecmp(m, "migrate-storage-version") == 0 ||
+            strcasecmp(m, "migrate") == 0;
 }
 
 /* ========== Auth: IP allowlist + token set ========== */
@@ -1636,6 +1637,34 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int new_splits = splits_s ? atoi(splits_s) : 0;
         cmd_vacuum(db_root, object, compact, new_splits);
         free(splits_s);
+    } else if (strcmp(mode, "migrate") == 0) {
+        /* Migrate one object from FIXED to VARIABLE segment format.
+           Idempotent — returns migrated:false if already VARIABLE.
+           Exclusive schema wrlock (mode_is_schema) serialises against
+           concurrent queries; the registry instance is updated in-place
+           so no registry invalidation is needed. */
+        Schema sch = load_schema(db_root, object);
+        if (sch.splits <= 0) {
+            OUT("{\"error\":\"object not found in schema\"}\n");
+        } else {
+            SlotcaskSchemaInfo info = {
+                .splits    = sch.splits,
+                .slot_size = sch.slot_size,
+                .streams   = sch.streams,
+            };
+            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+            if (!sdb) {
+                OUT("{\"error\":\"failed to open object\"}\n");
+            } else if (sdb->format == SLOTCASK_FORMAT_VARIABLE) {
+                OUT("{\"status\":\"ok\",\"migrated\":false}\n");
+            } else {
+                int mrc = slotcask_migrate_to_varlen(sdb);
+                if (mrc != 0)
+                    OUT("{\"error\":\"migration failed\"}\n");
+                else
+                    OUT("{\"status\":\"ok\",\"migrated\":true}\n");
+            }
+        }
     } else if (strcmp(mode, "rename-field") == 0) {
         char *oldn = json_obj_strdup(&req, "old");
         char *newn = json_obj_strdup(&req, "new");
@@ -1858,6 +1887,15 @@ _Atomic int active_threads = 0;
 _Atomic int in_flight_writes = 0;    /* write/schema modes; shutdown waits for these */
 
 ShardDb *g_shard_db_instance = NULL; /* set by cmd_server before threads spawn */
+
+static ShardDb g_offline_stub; /* zero-initialized stub for offline commands */
+void shard_db_offline_init(const char *db_root) {
+    memset(&g_offline_stub, 0, sizeof(g_offline_stub));
+    if (db_root)
+        snprintf(g_offline_stub.db_root, sizeof(g_offline_stub.db_root), "%s", db_root);
+    g_shard_db_instance = &g_offline_stub;
+    g_db = g_shard_db_instance;
+}
 pthread_mutex_t thread_count_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Per-worker active client fd (indexed by worker id; -1 = idle). On SIGTERM

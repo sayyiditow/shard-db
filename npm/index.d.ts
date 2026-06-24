@@ -29,6 +29,16 @@ declare class ShardDb {
    */
   setLogHandler(fn: ShardDb.LogHandler | null): void
 
+  /**
+   * Migrate one object from fixed-slot to variable-length segment format.
+   * Idempotent — safe to call on already-migrated objects (returns immediately).
+   * Resolves to `{"status":"ok","migrated":true}` on success,
+   * `{"status":"ok","migrated":false}` if already variable-length,
+   * or `{"error":"..."}` on failure.
+   * Called automatically during construction; use this for explicit per-object control.
+   */
+  migrate(dir: string, object: string): Promise<string>
+
   /** Close the database and release all resources. */
   close(): void
 }
@@ -143,6 +153,9 @@ declare namespace ShardDb {
         dir: string; object: string }
 
     | { mode: 'vacuum'
+        dir: string; object: string }
+
+    | { mode: 'migrate'
         dir: string; object: string }
 
     | { mode: 'stats' }

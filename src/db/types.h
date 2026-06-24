@@ -1318,6 +1318,7 @@ static inline uint32_t resolve_timeout_ms(void) {
 int cmd_server(const char *db_root, int daemonize);
 int cmd_stop(const char *db_root);
 int cmd_status(const char *db_root);
+void shard_db_offline_init(const char *db_root); /* minimal g_db stub for offline commands (migrate-varlen etc.) */
 int cmd_query(int port, int argc, char **argv);
 int cmd_query_json(int port, const char *json);
 int cmd_put_file_tcp(int port, const char *dir, const char *object,

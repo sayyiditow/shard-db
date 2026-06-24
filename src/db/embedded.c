@@ -140,6 +140,76 @@ void test_init_process_db(void) {
     if (!g_shard_db_instance) g_shard_db_instance = g_db;
 }
 
+/* Forward decl — defined below in the impl section. */
+static void db_mutexes_destroy(void);
+
+/* Migrate every registered object still in FIXED segment format to
+   VARIABLE format.  Called from shard_db_open before thread pools
+   start, so no registry entries are open and slotcask_close is safe.
+   Logs progress to stderr.  Returns 0 on success, -1 if any object
+   fails (shard_db_open will refuse to proceed). */
+static int run_startup_migration(const char *db_root) {
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    FILE *f = fopen(schema_path, "r");
+    if (!f) return 0; /* no schema.conf — nothing to migrate */
+
+    char line[4096];
+    int failed = 0;
+    while (!failed && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || !*p) continue;
+
+        /* Format: dir:object:splits:max_key:2:streams[...] */
+        char *c1 = strchr(p, ':');
+        if (!c1) continue;
+        *c1 = '\0';
+        char *c2 = strchr(c1 + 1, ':');
+        if (!c2) continue;
+        *c2 = '\0';
+
+        const char *dir = p;
+        const char *obj = c1 + 1;
+
+        char obj_data[PATH_MAX];
+        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, dir, obj);
+
+        /* Skip objects with no materialised data directory. */
+        char kf_probe[PATH_MAX];
+        snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
+        struct stat kf_st;
+        if (stat(kf_probe, &kf_st) != 0) continue;
+
+        char eff_root[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
+        Schema sch = load_schema(eff_root, obj);
+        if (sch.splits <= 0) continue;
+
+        SlotcaskDb sdb;
+        if (slotcask_open(&sdb, obj_data, sch.splits, sch.streams, sch.slot_size) != 0)
+            continue;
+
+        if (sdb.format == SLOTCASK_FORMAT_VARIABLE) {
+            slotcask_close(&sdb);
+            continue;
+        }
+
+        fprintf(stderr, "[shard-db] migrating %s/%s...\n", dir, obj);
+        int mrc = slotcask_migrate_to_varlen(&sdb);
+        slotcask_close(&sdb);
+        if (mrc != 0) {
+            fprintf(stderr, "[shard-db] migration failed for %s/%s\n", dir, obj);
+            failed = 1;
+        } else {
+            fprintf(stderr, "[shard-db] migrated %s/%s\n", dir, obj);
+        }
+    }
+    fclose(f);
+    return failed ? -1 : 0;
+}
+
 /* ── Public API ── */
 
 ShardDb *shard_db_open(const char *db_root) {
@@ -155,6 +225,30 @@ ShardDb *shard_db_open(const char *db_root) {
     /* Expose instance before starting pools so pool_worker / io_pool_worker
        can bind their thread-local g_db on entry. */
     g_shard_db_instance = db;
+
+    /* Auto-migrate any FIXED-format objects before thread pools start.
+       Migration is offline at this point — no registry entries open. */
+    if (run_startup_migration(db_root) != 0) {
+        fprintf(stderr, "shard_db_open: startup migration failed\n");
+        g_shard_db_instance = NULL;
+        g_db = NULL;
+        /* Thread pools not yet started — call shutdown helpers that
+           are safe on uninitialised state, skip parallel_pool_shutdown. */
+        bt_cache_shutdown();
+        bm_cache_shutdown();
+        slotcask_shutdown();
+        ucache_shutdown();
+        free(db->token_set);
+        free(db->token_scope);
+        free(db->token_scope_obj);
+        free(db->token_perm);
+        free(db->token_set_used);
+        db_mutexes_destroy();
+        if (db->slots_inited) sem_destroy(&db->query_slots);
+        free(db);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
 
     /* Start CPU and I/O thread pools (shared process-global). */
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);

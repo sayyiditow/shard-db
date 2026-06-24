@@ -102,6 +102,18 @@ typedef int (*od_leaf_cb)(const uint8_t *value, size_t vlen,
 int seg_scan_o_direct(const char *seg_path, int slot_size,
                       od_record_cb cb, void *ctx);
 
+/* Variable-length variant: walks a varlen-format segment file where records
+   are not at fixed stride.  Scans each record's 24-byte header to determine
+   the padded record size, strides by that amount, and calls `cb` for every
+   live record (flag == 1).  Max single-record carry buffer is 256 KB.
+
+   Returns:
+    0    — success
+   +1    — cb returned non-zero (early stop)
+   -errno — I/O error */
+int seg_scan_o_direct_varlen(const char *seg_path,
+                              od_record_cb cb, void *ctx);
+
 /* Same as seg_scan_o_direct, but the callback receives value bytes directly
  * (the key-and-hash extraction adapter is moved into the inner loop, saving
  * one function-call frame per record).  Use this when the caller only needs

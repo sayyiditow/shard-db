@@ -644,6 +644,196 @@ done:
 }
 
 /* ============================================================
+ * seg_scan_o_direct_varlen — variable-length O_DIRECT scan
+ * ========================================================= */
+
+/* Max carry buffer for a single variable-length record (256 KB).
+   Only used at chunk boundaries where one record straddles two chunks. */
+#define OD_VARLEN_CARRY_SIZE (256 * 1024)
+
+static inline size_t od_varlen_rec_size(uint16_t klen, uint32_t vlen) {
+    size_t raw = 24 + (size_t)klen + (size_t)vlen;
+    return (raw + 7) & ~(size_t)7;
+}
+
+int seg_scan_o_direct_varlen(const char *seg_path,
+                              od_record_cb cb, void *ctx)
+{
+    if (!seg_path || !cb) return -EINVAL;
+
+    if (odirect_buf_size == 0) odirect_init_buf_size();
+
+    struct stat st;
+    if (stat(seg_path, &st) != 0) return -errno;
+    off_t file_size = st.st_size;
+    if (file_size == 0) return 0;
+
+    int single_shot = (file_size <= (off_t)odirect_buf_size);
+
+    int fd = od_open(seg_path);
+    if (fd < 0) return -errno;
+
+    DbCtx dc;
+    int rc = dbctx_init(&dc, fd, file_size, single_shot);
+    if (rc != 0) { close(fd); return rc; }
+
+    size_t carry_cap = OD_VARLEN_CARRY_SIZE;
+    uint8_t *carry = malloc(carry_cap);
+    if (!carry) {
+        if (single_shot) free(dc.buf[0]);
+        else { free(dc.buf[0]); free(dc.buf[1]); }
+        pthread_mutex_destroy(&dc.lock);
+        pthread_cond_destroy(&dc.prefetch_needed);
+        pthread_cond_destroy(&dc.prefetch_done);
+        close(fd);
+        return -ENOMEM;
+    }
+    int carry_len = 0;
+
+    pthread_t worker_tid = (pthread_t)0;
+    if (!single_shot) {
+        int e2;
+        if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
+            e2 = errno;
+            free(carry);
+            free(dc.buf[0]); free(dc.buf[1]);
+            pthread_mutex_destroy(&dc.lock);
+            pthread_cond_destroy(&dc.prefetch_needed);
+            pthread_cond_destroy(&dc.prefetch_done);
+            close(fd);
+            return -e2;
+        }
+        dbctx_kickoff(&dc);
+    }
+
+    int ret = 0;
+
+    for (;;) {
+        ssize_t chunk_len = dc.active_len;
+        if (chunk_len <= 0) {
+            if (chunk_len < 0) ret = (int)chunk_len;
+            break;
+        }
+
+        uint8_t *chunk = dc.buf[dc.active];
+        size_t   pos   = 0;
+
+        /* Reassemble a record that straddled the previous chunk boundary. */
+        if (carry_len > 0) {
+            /* Stage 1: ensure we have the 24-byte header in carry. */
+            if (carry_len < 24) {
+                int need = 24 - carry_len;
+                if ((ssize_t)need > chunk_len) {
+                    /* Still not enough — stay in carry. */
+                    size_t need_cap = (size_t)(carry_len + chunk_len);
+                    if (need_cap > carry_cap) {
+                        uint8_t *nc = realloc(carry, need_cap);
+                        if (!nc) { ret = -ENOMEM; goto done; }
+                        carry = nc; carry_cap = need_cap;
+                    }
+                    memcpy(carry + carry_len, chunk, (size_t)chunk_len);
+                    carry_len += (int)chunk_len;
+                    goto next_chunk;
+                }
+                memcpy(carry + carry_len, chunk, (size_t)need);
+                pos += (size_t)need;
+                carry_len = 24;
+            }
+
+            /* Stage 2: carry has 24-byte header; complete the record. */
+            uint16_t klen;
+            uint32_t vlen;
+            uint8_t  flag;
+            memcpy(&klen, carry + 16, 2);
+            memcpy(&vlen, carry + 20, 4);
+            flag = carry[18];
+            size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
+
+            int need = (int)rec_size - carry_len;
+            if (need > 0) {
+                if ((ssize_t)need > chunk_len) {
+                    size_t need_cap = (size_t)(carry_len + chunk_len);
+                    if (need_cap > carry_cap) {
+                        uint8_t *nc = realloc(carry, need_cap);
+                        if (!nc) { ret = -ENOMEM; goto done; }
+                        carry = nc; carry_cap = need_cap;
+                    }
+                    memcpy(carry + carry_len, chunk, (size_t)chunk_len);
+                    carry_len += (int)chunk_len;
+                    goto next_chunk;
+                }
+                if (rec_size > carry_cap) {
+                    uint8_t *nc = realloc(carry, rec_size);
+                    if (!nc) { ret = -ENOMEM; goto done; }
+                    carry = nc; carry_cap = rec_size;
+                }
+                memcpy(carry + carry_len, chunk, (size_t)need);
+                pos   += (size_t)need;
+                carry_len = (int)rec_size;
+            }
+
+            if (flag == 1) {
+                if (cb(carry, (size_t)vlen, carry, ctx) != 0) {
+                    ret = 1; goto done;
+                }
+            }
+            carry_len = 0;
+        }
+
+        /* Stride through whole records in this chunk. */
+        while (pos + 24 <= (size_t)chunk_len) {
+            uint8_t *rec  = chunk + pos;
+            uint8_t  flag = rec[18];
+            uint16_t klen;
+            uint32_t vlen;
+            memcpy(&klen, rec + 16, 2);
+            memcpy(&vlen, rec + 20, 4);
+            size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
+
+            if (pos + rec_size > (size_t)chunk_len) {
+                /* Record straddles chunk boundary — save tail in carry. */
+                break;
+            }
+
+            if (flag == 1) {
+                if (cb(rec, (size_t)vlen, rec, ctx) != 0) {
+                    ret = 1; goto done;
+                }
+            }
+            pos += rec_size;
+        }
+
+        /* Save any partial bytes at the chunk tail. */
+        if (pos < (size_t)chunk_len) {
+            size_t tail = (size_t)chunk_len - pos;
+            if (tail > carry_cap) {
+                uint8_t *nc = realloc(carry, tail);
+                if (!nc) { ret = -ENOMEM; goto done; }
+                carry = nc; carry_cap = tail;
+            }
+            carry_len = (int)tail;
+            memcpy(carry, chunk + pos, tail);
+        }
+
+next_chunk:
+        {
+            ssize_t next = dbctx_swap(&dc);
+            if (next < 0) { ret = (int)next; goto done; }
+            if (next == 0) {
+                dc.active_len = 0;
+                break;
+            }
+        }
+    }
+
+done:
+    dbctx_destroy(&dc, worker_tid);
+    free(carry);
+    close(fd);
+    return ret;
+}
+
+/* ============================================================
  * seg_scan_o_direct_match — inline-match O_DIRECT scan
  * ========================================================= */
 
