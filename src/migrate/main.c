@@ -142,6 +142,22 @@ int main(int argc, char **argv) {
     if (n_objects == 0)
         fprintf(stdout, "migrate:   no objects in schema.conf, nothing to migrate\n");
 
+    /* Phase 2/2: compact — trim trailing zero fields from migrated records. */
+    fprintf(stdout, "migrate: phase 2/2 — compact (trim zero fields)\n");
+    for (int i = 0; i < n_objects; i++) {
+        char cmd2[PATH_MAX + 512];
+        snprintf(cmd2, sizeof(cmd2), "./shard-db compact %s %s",
+                 objects[i].dir, objects[i].obj);
+        fprintf(stdout, "migrate:   compact %s/%s\n",
+                objects[i].dir, objects[i].obj);
+        fflush(stdout);
+        int rc2 = system(cmd2);
+        if (rc2 != 0) {
+            fprintf(stderr, "migrate: compact failed for %s/%s (rc=%d) — skipping\n",
+                    objects[i].dir, objects[i].obj, rc2);
+        }
+    }
+
     fprintf(stdout, "migrate: complete\n");
     return 0;
 }

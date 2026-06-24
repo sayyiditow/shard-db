@@ -1665,6 +1665,31 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     OUT("{\"status\":\"ok\",\"migrated\":true}\n");
             }
         }
+    } else if (strcmp(mode, "compact") == 0) {
+        char *dir = json_obj_strdup(&req, "dir");
+        char *object = json_obj_strdup(&req, "object");
+        if (!dir || !object) {
+            free(dir); free(object);
+            OUT("{\"error\":\"compact requires dir and object\"}\n"); return;
+        }
+        char eff_root[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
+        Schema sc = load_schema(eff_root, object);
+        TypedSchema *ts = load_typed_schema(eff_root, object);
+        SlotcaskSchemaInfo info = { .splits = sc.splits, .slot_size = sc.slot_size,
+                                     .streams = sc.streams };
+        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        if (!sdb || sdb->format != SLOTCASK_FORMAT_VARIABLE) {
+            free(dir); free(object);
+            OUT("{\"error\":\"object not found or not in VARIABLE format\"}\n"); return;
+        }
+        objlock_wrlock(db_root, object);
+        int rc = slotcask_compact(sdb, schema_trim_fn, (void *)ts);
+        objlock_wrunlock(db_root, object);
+        free(dir); free(object);
+        if (rc != 0) { OUT("{\"error\":\"compact failed\"}\n"); return; }
+        OUT("{\"ok\":true}\n");
+        return;
     } else if (strcmp(mode, "rename-field") == 0) {
         char *oldn = json_obj_strdup(&req, "old");
         char *newn = json_obj_strdup(&req, "new");
