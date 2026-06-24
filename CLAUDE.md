@@ -197,7 +197,8 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./shard-db list-files <dir> <obj> [pattern] [offset] [limit] [--match=<prefix|suffix|contains|glob>]
 
 # Maintenance
-./shard-db size | orphaned <dir> <obj>                          # bare integers (O(1) metadata)
+./shard-db size <dir> <obj>                                     # disk bytes used by the object (all data + index files); same as du -sb
+./shard-db orphaned <dir> <obj>                                 # deleted record count (O(1) metadata)
 ./shard-db recount | truncate | vacuum | backup <dir> <obj>
 ./shard-db add-index <dir> <obj> <field> [-f]                   # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>
@@ -262,7 +263,8 @@ Cookbook: [docs/query-protocol/recipes.md](docs/query-protocol/recipes.md).
 | `get` (multi) | `{"k1":{...},"k2":{...},"missing":null}` |
 | `exists` (single) | bare `true`/`false` |
 | `exists` (multi) | `{"k1":true,"k2":false}` |
-| `count`, `size`, `orphaned` | bare integer |
+| `count`, `orphaned` | bare integer (record count) |
+| `size` | bare integer (disk bytes, same accounting as `du -sb`) |
 | `find`, `fetch` | array (default), or `format ∈ {rows, csv, dict}` |
 
 Errors always: `{"error":"..."}` — clients branch on JSON type to disambiguate.

@@ -107,7 +107,7 @@ static int test_bulk_cas_run(void) {
     ASSERT_CONTAINS(resp, "\"name\":\"eve\"", "k5 eve inserted");
     free(resp); resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
     ASSERT_CONTAINS(resp, "5", "after JSON CAS: 5 records");
     free(resp); resp = NULL;
 
@@ -150,7 +150,7 @@ static int test_bulk_cas_run(void) {
     ASSERT_CONTAINS(resp, "\"name\":\"iris\"", "k9 iris inserted");
     free(resp); resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
     ASSERT_CONTAINS(resp, "9", "after CSV CAS: 9 records total");
     free(resp); resp = NULL;
 
@@ -286,7 +286,7 @@ static int test_bulk_cas_run(void) {
     char size_before[64] = {0};
     if (resp) {
         const char *p = resp; while (*p == ' ' || *p == '\n') p++;
-        snprintf(size_before, sizeof(size_before), "%d", atoi(p));
+        snprintf(size_before, sizeof(size_before), "%lld", (long long)atoll(p));
     }
     free(resp); resp = NULL;
 
@@ -312,7 +312,7 @@ static int test_bulk_cas_run(void) {
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
     {
         const char *p = resp; while (p && (*p == ' ' || *p == '\n')) p++;
-        char after[64]; snprintf(after, sizeof(after), "%d", atoi(p));
+        char after[64]; snprintf(after, sizeof(after), "%lld", (long long)atoll(p));
         ASSERT_TRUE(strcmp(size_before, after) == 0, "size unchanged after dry runs");
     }
     free(resp); resp = NULL;

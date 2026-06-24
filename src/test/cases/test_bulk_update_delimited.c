@@ -63,7 +63,7 @@ static int test_bulk_update_delimited_run(void) {
     tc_request(tc, req, &resp); free(resp); resp = NULL;
     unlink(seed_path);
 
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"udtest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"udtest\"}", &resp);
     ASSERT_CONTAINS(resp, "5", "seeded 5 records"); free(resp); resp = NULL;
 
     /* basic CSV update — non-blank cells overwrite, blank cells leave alone */
@@ -106,7 +106,7 @@ static int test_bulk_update_delimited_run(void) {
     ASSERT_TRUE(!resp || strstr(resp, "\"name\":\"zzz\"") == NULL, "k_missing_1 NOT inserted");
     free(resp); resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"udtest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"udtest\"}", &resp);
     ASSERT_CONTAINS(resp, "5", "record count still 5");
     free(resp); resp = NULL;
 

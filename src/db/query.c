@@ -515,8 +515,32 @@ void release_record_ref(RecordRef *r) {
 
 /* ========== SIZE ========== */
 
+static void dir_du(const char *path, int64_t *acc) {
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' &&
+            (e->d_name[1] == '\0' ||
+             (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+        char sub[PATH_MAX];
+        snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(sub, &st) != 0) continue;
+        if (S_ISREG(st.st_mode))
+            *acc += (int64_t)st.st_blocks * 512;
+        else if (S_ISDIR(st.st_mode))
+            dir_du(sub, acc);
+    }
+    closedir(d);
+}
+
 int cmd_size(const char *db_root, const char *object) {
-    OUT("%d\n", get_live_count(db_root, object));
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    int64_t bytes = 0;
+    dir_du(obj_dir, &bytes);
+    OUT("%lld\n", (long long)bytes);
     return 0;
 }
 

@@ -31,7 +31,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  get <object> <key>                   Get a record\n");
         fprintf(stderr, "  delete <object> <key>                Delete a record\n");
         fprintf(stderr, "  exists <object> <key>                Check if key exists\n");
-        fprintf(stderr, "  size <object>                        Live record count (O(1) metadata)\n");
+        fprintf(stderr, "  size <object>                        Disk bytes used by object files (same as du -sb)\n");
         fprintf(stderr, "  orphaned <object>                    Tombstoned slot count (vacuum reclaims)\n");
         fprintf(stderr, "  find <object> <criteria> [off] [lim] [fields]\n");
         fprintf(stderr, "  count <dir> <obj> [criteria_json]    Count records (criteria optional)\n");
