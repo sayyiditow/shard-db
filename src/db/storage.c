@@ -1324,6 +1324,12 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         return 1;
     }
 
+    /* Wire up compact trim for VARIABLE-format typed objects. */
+    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
+        sdb->trim_fn  = schema_trim_fn;
+        sdb->trim_ctx = (void *)ts;
+    }
+
     /* Index fields + criteria (only parsed if if_json is present). */
     char fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
@@ -1585,6 +1591,12 @@ static int cmd_update_v2(const char *db_root, const char *object,
 
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
+
+    /* Wire up compact trim for VARIABLE-format typed objects. */
+    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
+        sdb->trim_fn  = schema_trim_fn;
+        sdb->trim_ctx = (void *)ts;
+    }
 
     void *old_val = NULL; size_t old_vlen = 0;
     if (slotcask_get(sdb, key, klen, &old_val, &old_vlen) != 0) {
@@ -1856,6 +1868,12 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     }
 
     TypedSchema *ts = load_typed_schema(db_root, object);
+
+    /* Wire up compact trim for VARIABLE-format typed objects. */
+    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
+        sdb->trim_fn  = schema_trim_fn;
+        sdb->trim_ctx = (void *)ts;
+    }
 
     /* dry_run: read + validate, never tombstone. */
     if (dry_run) {

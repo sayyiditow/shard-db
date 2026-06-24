@@ -218,6 +218,11 @@ typedef struct {
 
 /* ============================================================ DB handle */
 
+/* Callback for trimming record values before writing (VARIABLE format only).
+   Returns the number of bytes of val that should be stored; must be ≤ vlen.
+   Set db->trim_fn = NULL to disable. */
+typedef size_t (*SlotcaskTrimFn)(const void *val, size_t vlen, void *ctx);
+
 typedef struct SlotcaskDb {
     char    data_dir[PATH_MAX];
     int     num_shards;
@@ -240,6 +245,13 @@ typedef struct SlotcaskDb {
        seg_slot_caps[stream_id] is the allocated capacity of that array. */
     SlotRef **seg_slot_refs;
     int      *seg_slot_caps;
+
+    /* Optional value trim callback. When non-NULL and format == SLOTCASK_FORMAT_VARIABLE,
+       called in insert_with_hooks / upsert_with_hooks to shorten vlen before writing.
+       trim_ctx is passed as the third argument. Not used by compact (which passes
+       the trim function explicitly). Not thread-safe to change after first write. */
+    SlotcaskTrimFn  trim_fn;
+    void           *trim_ctx;
 } SlotcaskDb;
 
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf

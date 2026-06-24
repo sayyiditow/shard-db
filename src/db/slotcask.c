@@ -2926,6 +2926,11 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_vlen = 0;
     }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+
+    /* Trim value to field boundary for compact varlen storage. */
+    if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
+        vlen = db->trim_fn(value, vlen, db->trim_ctx);
+
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
     if (!opts) opts = &blank;
@@ -3395,6 +3400,11 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_vlen = 0;
     }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
+
+    /* Trim value to field boundary for compact varlen storage. */
+    if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
+        vlen = db->trim_fn(value, vlen, db->trim_ctx);
+
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
     if (!opts) opts = &blank;
