@@ -137,8 +137,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    free(objects);
-
     if (n_objects == 0)
         fprintf(stdout, "migrate:   no objects in schema.conf, nothing to migrate\n");
 
@@ -157,6 +155,7 @@ int main(int argc, char **argv) {
                     objects[i].dir, objects[i].obj, rc2);
         }
     }
+    free(objects);
 
     fprintf(stdout, "migrate: complete\n");
     return 0;

@@ -6371,7 +6371,7 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
    from the old fixed-format segment, writes it to a new varlen segment,
    repoints the KF entry, then removes old segment files. */
 #define MIGRATE_STREAM_BASE 60000u
-#define COMPACT_STREAM_BASE 120000u  /* dest range for slotcask_compact */
+#define COMPACT_STREAM_BASE 30000u   /* dest range for slotcask_compact; fits uint16_t, below MIGRATE_STREAM_BASE */
 
 int slotcask_migrate_to_varlen(SlotcaskDb *db) {
     if (!db) return -1;
@@ -6519,10 +6519,14 @@ int slotcask_migrate_to_varlen(SlotcaskDb *db) {
             close(dest[s].fd);
             dest[s].base = NULL;
         }
-        /* Update stream state so the daemon resumes from the right file. */
+        /* Update stream state so the daemon resumes from the right file.
+           reserve_off must reflect actual bytes written — offset 0 would
+           cause the next online insert to overwrite the start of the
+           compacted segment. Offline restarts re-derive via recover_one_stream
+           anyway, but correct it here for the server-side path too. */
         pthread_mutex_lock(&db->streams[s].rotation_lock);
         db->streams[s].active_file_id = dest_fid[s];
-        db->streams[s].reserve_off    = 0;  /* re-derived on restart */
+        db->streams[s].reserve_off    = dest_off[s];
         pthread_mutex_unlock(&db->streams[s].rotation_lock);
     }
 
@@ -6578,11 +6582,130 @@ fail:
     return -1;
 }
 
+/* Per-stream source map (read-only mmap of one source segment file). */
+typedef struct { uint8_t *base; size_t sz; } CmpSegMap;
+typedef struct { CmpSegMap *maps; uint32_t count; } CmpStreamMaps;
+
+/* Per-stream worker arg for parallel compact. */
+typedef struct {
+    SlotcaskDb     *db;
+    CmpStreamMaps  *smaps;        /* shared read-only across all workers */
+    uint32_t        src_min;
+    uint32_t        dest_base;
+    int             sid;          /* stream this worker owns */
+    SlotcaskTrimFn  trim_fn;
+    void           *trim_ctx;
+    uint32_t        dest_fid_out; /* final active file id after compaction */
+    size_t          dest_off_out; /* bytes written to final file */
+    int             rc;
+} CmpStreamArg;
+
+/* Repack one stream: scan all KF shards for entries belonging to sid,
+   trim and write each to a fresh dest segment file, repoint KF entries.
+   Workers for different streams run concurrently; they serialise briefly
+   on kfcache_acquire per shard (exclusive lock, held for one shard scan). */
+static void *compact_stream_worker(void *arg_ptr) {
+    CmpStreamArg *a = arg_ptr;
+    SlotcaskDb *db = a->db;
+    int sid = a->sid;
+
+    uint32_t dest_fid  = a->dest_base + (uint32_t)sid * 1000u;
+    size_t   dest_off  = 0;
+    uint8_t *dest_ptr  = NULL;
+    size_t   dest_alloc = 0;
+    int      dest_fd   = -1;
+
+    for (int shard = 0; shard < db->num_shards; shard++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, shard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
+            a->rc = -1;
+            goto worker_fail;
+        }
+
+        size_t cap = kh.capacity;
+        SlotcaskKfEntry *kf = kh.map;
+
+        for (size_t slot = 0; slot < cap; slot++) {
+            if (kf[slot].flag != 1) continue;
+            if ((int)kf[slot].stream_id != sid) continue;
+
+            uint32_t fid = kf[slot].file_id;
+            uint32_t off = kf[slot].offset;
+
+            if (!a->smaps[sid].maps) continue;
+            uint32_t lo = a->src_min + (uint32_t)sid * 1000u;
+            if (fid < lo || fid - lo >= a->smaps[sid].count) continue;
+            CmpSegMap *sm = &a->smaps[sid].maps[fid - lo];
+            if (!sm->base || (size_t)off + 24 > sm->sz) continue;
+
+            uint16_t klen; memcpy(&klen, sm->base + off + 16, 2);
+            uint32_t vlen; memcpy(&vlen, sm->base + off + 20, 4);
+            if ((size_t)off + 24 + klen + vlen > sm->sz) continue;
+
+            const uint8_t *key   = sm->base + off + 24;
+            const uint8_t *value = key + klen;
+
+            size_t trimmed_vlen = a->trim_fn(value, (size_t)vlen, a->trim_ctx);
+            size_t rec_size = slotcask_record_size_varlen((size_t)klen, trimmed_vlen);
+
+            if (!dest_ptr || dest_off + rec_size > SLOTCASK_SEG_MAX_BYTES) {
+                if (dest_ptr) {
+                    munmap(dest_ptr, dest_alloc);
+                    ftruncate(dest_fd, (off_t)dest_off);
+                    close(dest_fd);
+                    dest_ptr = NULL; dest_fd = -1;
+                    dest_fid++;
+                    dest_off = 0;
+                }
+                char np[PATH_MAX];
+                seg_path_for(np, db->data_dir, sid, dest_fid);
+                { char d2[PATH_MAX]; snprintf(d2, sizeof(d2), "%s", np);
+                  char *sl = strrchr(d2, '/'); if (sl) { *sl = '\0'; mkdirp_local(d2); } }
+                int fd = open(np, O_RDWR | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) { kfcache_release(&kh); a->rc = -1; goto worker_fail; }
+                if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0) {
+                    close(fd); kfcache_release(&kh); a->rc = -1; goto worker_fail;
+                }
+                void *dm = mmap(NULL, SLOTCASK_SEG_MAX_BYTES,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (dm == MAP_FAILED) {
+                    close(fd); kfcache_release(&kh); a->rc = -1; goto worker_fail;
+                }
+                dest_ptr   = (uint8_t *)dm;
+                dest_alloc = SLOTCASK_SEG_MAX_BYTES;
+                dest_fd    = fd;
+            }
+
+            uint32_t new_off = (uint32_t)dest_off;
+            dest_off += rec_size;
+
+            seg_record_emit(dest_ptr + new_off, (int)rec_size,
+                            kf[slot].hash, key, (size_t)klen, value, trimmed_vlen);
+            kf_repoint_at_slot(&kh, slot, (uint8_t)sid,
+                               (uint16_t)dest_fid, new_off);
+        }
+        kfcache_release(&kh);
+    }
+
+    if (dest_ptr) { munmap(dest_ptr, dest_alloc); close(dest_fd); }
+    a->dest_fid_out = dest_fid;
+    a->dest_off_out = dest_off;
+    a->rc = 0;
+    return NULL;
+
+worker_fail:
+    if (dest_ptr) { munmap(dest_ptr, dest_alloc); close(dest_fd); }
+    return NULL;
+}
+
 int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
     if (!db || db->format != SLOTCASK_FORMAT_VARIABLE) return -1;
     if (!trim_fn) return 0;
 
     int n_streams = db->num_streams;
+    if (n_streams <= 0 || n_streams > SLOTCASK_MAX_STREAMS) return -1;
 
     uint32_t cur_max = 0;
     for (int s = 0; s < n_streams; s++) {
@@ -6591,15 +6714,12 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
         pthread_mutex_unlock(&db->streams[s].rotation_lock);
         if (fid > cur_max) cur_max = fid;
     }
-    uint32_t dest_base = (cur_max >= COMPACT_STREAM_BASE)
-        ? MIGRATE_STREAM_BASE : COMPACT_STREAM_BASE;
-    uint32_t src_min   = (dest_base == COMPACT_STREAM_BASE)
+    uint32_t dest_base = (cur_max >= MIGRATE_STREAM_BASE)
+        ? COMPACT_STREAM_BASE : MIGRATE_STREAM_BASE;
+    uint32_t src_min = (dest_base == COMPACT_STREAM_BASE)
         ? MIGRATE_STREAM_BASE : COMPACT_STREAM_BASE;
 
-    typedef struct { uint8_t *base; size_t sz; int fd; } SegMap;
-
-    typedef struct { SegMap *maps; uint32_t count; } StreamMaps;
-    StreamMaps *smaps = calloc((size_t)n_streams, sizeof(StreamMaps));
+    CmpStreamMaps *smaps = calloc((size_t)n_streams, sizeof(CmpStreamMaps));
     if (!smaps) return -1;
 
     for (int s = 0; s < n_streams; s++) {
@@ -6618,9 +6738,9 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
         }
         closedir(dh);
         if (cnt == 0) continue;
-        smaps[s].maps  = calloc((size_t)cnt, sizeof(SegMap));
+        smaps[s].maps = calloc((size_t)cnt, sizeof(CmpSegMap));
         smaps[s].count = cnt;
-        if (!smaps[s].maps) goto fail;
+        if (!smaps[s].maps) goto fail_smaps;
         for (uint32_t i = 0; i < cnt; i++) {
             char p[PATH_MAX];
             seg_path_for(p, db->data_dir, s, lo + i);
@@ -6632,110 +6752,40 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
                 if (m != MAP_FAILED) {
                     smaps[s].maps[i].base = (uint8_t *)m;
                     smaps[s].maps[i].sz   = (size_t)st.st_size;
-                    smaps[s].maps[i].fd   = fd;
                 }
             }
             close(fd);
         }
     }
 
-    typedef struct { uint8_t *base; size_t alloc; int fd; } DestMap;
-    DestMap dest[SLOTCASK_MAX_STREAMS];
-    memset(dest, 0, sizeof(dest));
-    for (int s = 0; s < n_streams; s++) dest[s].fd = -1;
-    uint32_t dest_fid[SLOTCASK_MAX_STREAMS];
-    size_t   dest_off[SLOTCASK_MAX_STREAMS];
+    CmpStreamArg *args = calloc((size_t)n_streams, sizeof(CmpStreamArg));
+    if (!args) goto fail_smaps;
     for (int s = 0; s < n_streams; s++) {
-        dest_fid[s] = dest_base + (uint32_t)s * 1000u;
-        dest_off[s] = 0;
+        args[s].db        = db;
+        args[s].smaps     = smaps;
+        args[s].src_min   = src_min;
+        args[s].dest_base = dest_base;
+        args[s].sid       = s;
+        args[s].trim_fn   = trim_fn;
+        args[s].trim_ctx  = trim_ctx;
+        args[s].rc        = 0;
     }
 
-    for (int shard = 0; shard < db->num_shards; shard++) {
-        char kf_path[PATH_MAX];
-        kf_path_for(kf_path, db->data_dir, shard);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0)
-            goto fail;
+    parallel_for_io(compact_stream_worker, args, n_streams, sizeof(CmpStreamArg));
 
-        size_t cap = kh.capacity;
-        SlotcaskKfEntry *kf = kh.map;
+    int any_fail = 0;
+    for (int s = 0; s < n_streams; s++)
+        if (args[s].rc != 0) { any_fail = 1; break; }
 
-        for (size_t slot = 0; slot < cap; slot++) {
-            if (kf[slot].flag != 1) continue;
-
-            uint8_t  sid = kf[slot].stream_id;
-            uint32_t fid = kf[slot].file_id;
-            uint32_t off = kf[slot].offset;
-
-            if (sid >= (uint8_t)n_streams) continue;
-            if (!smaps[sid].maps) continue;
-            uint32_t lo = src_min + (uint32_t)sid * 1000u;
-            if (fid < lo || fid - lo >= smaps[sid].count) continue;
-            SegMap *sm = &smaps[sid].maps[fid - lo];
-            if (!sm->base || (size_t)off + 24 > sm->sz) continue;
-
-            uint16_t klen; memcpy(&klen, sm->base + off + 16, 2);
-            uint32_t vlen; memcpy(&vlen, sm->base + off + 20, 4);
-            if ((size_t)off + 24 + klen + vlen > sm->sz) continue;
-
-            const uint8_t *key   = sm->base + off + 24;
-            const uint8_t *value = key + klen;
-
-            size_t trimmed_vlen = trim_fn(value, (size_t)vlen, trim_ctx);
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, trimmed_vlen);
-
-            if (!dest[sid].base ||
-                dest_off[sid] + rec_size > SLOTCASK_SEG_MAX_BYTES) {
-                if (dest[sid].base) {
-                    size_t used = dest_off[sid];
-                    munmap(dest[sid].base, dest[sid].alloc);
-                    ftruncate(dest[sid].fd, (off_t)used);
-                    close(dest[sid].fd);
-                    dest[sid].base = NULL; dest[sid].fd = -1;
-                    dest_fid[sid]++;
-                    dest_off[sid] = 0;
-                }
-                char np[PATH_MAX];
-                seg_path_for(np, db->data_dir, sid, dest_fid[sid]);
-                { char d2[PATH_MAX]; snprintf(d2,sizeof(d2),"%s",np);
-                  char *sl = strrchr(d2,'/'); if(sl){*sl='\0'; mkdirp_local(d2);} }
-                int fd = open(np, O_RDWR | O_CREAT | O_TRUNC, 0644);
-                if (fd < 0) { kfcache_release(&kh); goto fail; }
-                if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0)
-                    { close(fd); kfcache_release(&kh); goto fail; }
-                void *dm = mmap(NULL, SLOTCASK_SEG_MAX_BYTES,
-                                PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-                if (dm == MAP_FAILED)
-                    { close(fd); kfcache_release(&kh); goto fail; }
-                dest[sid].base  = (uint8_t *)dm;
-                dest[sid].alloc = SLOTCASK_SEG_MAX_BYTES;
-                dest[sid].fd    = fd;
-            }
-
-            uint32_t new_off = (uint32_t)dest_off[sid];
-            dest_off[sid] += rec_size;
-
-            seg_record_emit(dest[sid].base + new_off, (int)rec_size,
-                            kf[slot].hash, key, (size_t)klen,
-                            value, trimmed_vlen);
-
-            kf_repoint_at_slot(&kh, slot, sid,
-                               (uint16_t)dest_fid[sid], new_off);
+    if (!any_fail) {
+        for (int s = 0; s < n_streams; s++) {
+            pthread_mutex_lock(&db->streams[s].rotation_lock);
+            db->streams[s].active_file_id = args[s].dest_fid_out;
+            db->streams[s].reserve_off    = args[s].dest_off_out;
+            pthread_mutex_unlock(&db->streams[s].rotation_lock);
         }
-        kfcache_release(&kh);
     }
-
-    for (int s = 0; s < n_streams; s++) {
-        if (dest[s].base) {
-            munmap(dest[s].base, dest[s].alloc);
-            close(dest[s].fd);
-            dest[s].base = NULL;
-        }
-        pthread_mutex_lock(&db->streams[s].rotation_lock);
-        db->streams[s].active_file_id = dest_fid[s];
-        db->streams[s].reserve_off    = 0;
-        pthread_mutex_unlock(&db->streams[s].rotation_lock);
-    }
+    free(args);
 
     for (int s = 0; s < n_streams; s++) {
         if (smaps[s].maps) {
@@ -6746,6 +6796,7 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
         }
     }
     free(smaps);
+    if (any_fail) return -1;
 
     for (int s = 0; s < n_streams; s++) {
         char dir[PATH_MAX];
@@ -6770,10 +6821,9 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
     }
     return 0;
 
-fail:
+fail_smaps:
     for (int s = 0; s < n_streams; s++) {
-        if (dest[s].base) { munmap(dest[s].base, dest[s].alloc); close(dest[s].fd); }
-        if (smaps && smaps[s].maps) {
+        if (smaps[s].maps) {
             for (uint32_t i = 0; i < smaps[s].count; i++)
                 if (smaps[s].maps[i].base)
                     munmap(smaps[s].maps[i].base, smaps[s].maps[i].sz);
