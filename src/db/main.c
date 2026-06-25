@@ -176,6 +176,61 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    /* compact — offline repack of migrated segments, applying trim_fn to recover
+       disk space from records stored before trim-on-write was active. */
+    if (strcmp(cmd, "compact") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: shard-db compact <dir> <object>\n");
+            return 1;
+        }
+        const char *cmp_dir = argv[2];
+        const char *cmp_obj = argv[3];
+        char db_root[PATH_MAX];
+        if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
+        char eff_root[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, cmp_dir);
+        shard_db_offline_init(db_root);
+        Schema sc = load_schema(eff_root, cmp_obj);
+        if (sc.splits <= 0) {
+            fprintf(stderr, "compact: cannot load schema for %s/%s\n", cmp_dir, cmp_obj);
+            return 1;
+        }
+        TypedSchema *ts = load_typed_schema(eff_root, cmp_obj);
+        slotcask_init(sc.splits, 256);
+        char obj_data[PATH_MAX];
+        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, cmp_dir, cmp_obj);
+        {
+            char kf_probe[PATH_MAX];
+            snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
+            struct stat _st;
+            if (stat(kf_probe, &_st) != 0) {
+                fprintf(stdout, "compact: %s/%s skipped (no data dir)\n", cmp_dir, cmp_obj);
+                return 0;
+            }
+        }
+        SlotcaskDb sdb;
+        if (slotcask_open(&sdb, obj_data, sc.splits, sc.streams, sc.slot_size) != 0) {
+            fprintf(stderr, "compact: slotcask_open failed\n");
+            return 1;
+        }
+        if (sdb.format != SLOTCASK_FORMAT_VARIABLE) {
+            fprintf(stderr, "compact: %s/%s is FIXED format — run migrate-varlen first\n",
+                    cmp_dir, cmp_obj);
+            slotcask_close(&sdb);
+            return 1;
+        }
+        fprintf(stdout, "compact: repacking %s/%s ...\n", cmp_dir, cmp_obj);
+        fflush(stdout);
+        int rc = slotcask_compact(&sdb, schema_trim_fn, (void *)ts);
+        slotcask_close(&sdb);
+        if (rc != 0) {
+            fprintf(stderr, "compact: failed for %s/%s\n", cmp_dir, cmp_obj);
+            return 1;
+        }
+        fprintf(stdout, "compact: %s/%s done\n", cmp_dir, cmp_obj);
+        return 0;
+    }
+
     /* All other commands — route through server via TCP */
     char db_root[PATH_MAX];
     if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;

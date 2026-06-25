@@ -691,7 +691,7 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
             while (tok) {
                 int idx = typed_field_index(fs->ts, tok);
                 if (idx >= 0) {
-                    char *v = typed_get_field_str(fs->ts, (const uint8_t *)raw, idx);
+                    char *v = typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
                     if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
                 }
                 tok = strtok_r(NULL, "+", &_tok_save);
@@ -700,7 +700,7 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
             return cp > 0 ? strdup(cat) : NULL;
         }
         int idx = typed_field_index(fs->ts, field);
-        return typed_get_field_str(fs->ts, (const uint8_t *)raw, idx);
+        return typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
     }
     return NULL;
 }
@@ -3374,7 +3374,7 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     if (!old) return -1;
     if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
-        !cas_check(w->ts, old->value, w->cas_crit, w->cas_ncrit)) return -1;
+        !cas_check(w->ts, old->value, (int)old->vlen, w->cas_crit, w->cas_ncrit)) return -1;
 
     uint8_t *new_buf = (uint8_t *)rec->value;
     if (old->vlen >= (size_t)w->ts->total_size) {
@@ -4794,7 +4794,7 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
     if (!old) return -1;
     if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
-        !cas_check(w->ts, old->value, w->cas_crit, w->cas_ncrit)) return -1;
+        !cas_check(w->ts, old->value, (int)old->vlen, w->cas_crit, w->cas_ncrit)) return -1;
 
     if (w->nidx > 0 && w->ts) {
         for (int fi = 0; fi < w->nidx; fi++) {
@@ -5178,7 +5178,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         /* Per-record CAS — same optimistic-concurrency check single-op
            cmd_delete uses. Failures count as skipped, not errors. */
         if (cas_crit && cas_ncrit > 0 &&
-            !cas_check(ts, value_ptr, cas_crit, cas_ncrit)) {
+            !cas_check(ts, value_ptr, (int)h->value_len, cas_crit, cas_ncrit)) {
             ucache_write_release(wh); skipped++; continue;
         }
 
@@ -7118,7 +7118,7 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
     } else if (fs && fs->ts) {
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
-            char *pv = json_escape_field(typed_get_field_str(fs->ts, (const uint8_t *)raw, i));
+            char *pv = json_escape_field(typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i));
             OUT(",\"%s\"", pv ? pv : "");
             free(pv);
         }
@@ -7229,7 +7229,7 @@ static void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
             char d[2] = { delim, '\0' }; OUT("%s", d);
-            char *v = typed_get_field_str(fs->ts, raw, i);
+            char *v = typed_get_field_str(fs->ts, raw, (int)val_len, i);
             csv_emit_cell(v, delim);
             free(v);
         }
@@ -9362,7 +9362,7 @@ static size_t build_joined_csv_row(const char *key,
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             int idx = typed_field_index(driver_fs->ts, proj_fields[i]);
             char *v = (idx >= 0)
-                ? typed_get_field_str(driver_fs->ts, driver_raw, idx)
+                ? typed_get_field_str(driver_fs->ts, driver_raw, driver_fs->ts->total_size, idx)
                 : NULL;
             (void)tmp;
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
@@ -9372,7 +9372,7 @@ static size_t build_joined_csv_row(const char *key,
         for (int i = 0; i < driver_fs->ts->nfields; i++) {
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            char *v = typed_get_field_str(driver_fs->ts, driver_raw, i);
+            char *v = typed_get_field_str(driver_fs->ts, driver_raw, driver_fs->ts->total_size, i);
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
             free(v);
         }
@@ -9559,7 +9559,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     } else if (sc->fs && sc->fs->ts) {
                         for (int i = 0; i < sc->fs->ts->nfields; i++) {
                             if (sc->fs->ts->fields[i].removed) continue;
-                            char *pv = json_escape_field(typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, i));
+                            char *pv = json_escape_field(typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i));
                             OUT(",\"%s\"", pv ? pv : "");
                             free(pv);
                         }
@@ -15863,7 +15863,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             } else if (fs && fs->ts) {
                                 for (int j = 0; j < fs->ts->nfields; j++) {
                                     if (fs->ts->fields[j].removed) continue;
-                                    char *pv = json_escape_field(typed_get_field_str(fs->ts, raw, j));
+                                    char *pv = json_escape_field(typed_get_field_str(fs->ts, raw, (int)value_len, j));
                                     OUT(",\"%s\"", pv ? pv : "");
                                     free(pv);
                                 }
@@ -17153,7 +17153,7 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     /* Extract sort key */
     char *sv = NULL;
     if (oc->fs && oc->fs->ts && oc->order_field_idx >= 0) {
-        sv = typed_get_field_str(oc->fs->ts, raw, oc->order_field_idx);
+        sv = typed_get_field_str(oc->fs->ts, raw, (int)hdr->value_len, oc->order_field_idx);
     } else {
         sv = decode_field((const char *)raw, hdr->value_len, oc->order_field_name, oc->fs);
     }
@@ -17471,7 +17471,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         } else if (c->fs && c->fs->ts) {
             for (int i = 0; i < c->fs->ts->nfields; i++) {
                 if (c->fs->ts->fields[i].removed) continue;
-                char *pv = json_escape_field(typed_get_field_str(c->fs->ts, raw, i));
+                char *pv = json_escape_field(typed_get_field_str(c->fs->ts, raw, (int)value_len, i));
                 OUT(",\"%s\"", pv ? pv : "");
                 free(pv);
             }
@@ -17525,7 +17525,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
        the defensive pattern at the OrderedCollectCtx callback (line 8000)
        and silence Coverity's flow-insensitive FORWARD_NULL on c->fs. */
     c->last_value_str = (c->order_tf && c->fs && c->fs->ts)
-        ? json_escape_field(typed_get_field_str(c->fs->ts, raw, c->order_field_idx))
+        ? json_escape_field(typed_get_field_str(c->fs->ts, raw, (int)value_len, c->order_field_idx))
         : NULL;
     c->last_key_str = strndup(key_buf, klen);
 
@@ -19685,7 +19685,7 @@ int cmd_find(const char *db_root, const char *object,
                 } else if (driver_fs.ts) {
                     for (int j = 0; j < driver_fs.ts->nfields; j++) {
                         if (driver_fs.ts->fields[j].removed) continue;
-                        char *pv = json_escape_field(typed_get_field_str(driver_fs.ts, val, j));
+                        char *pv = json_escape_field(typed_get_field_str(driver_fs.ts, val, (int)r->value_len, j));
                         OUT(",\"%s\"", pv ? pv : "");
                         free(pv);
                     }

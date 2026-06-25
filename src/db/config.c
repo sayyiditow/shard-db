@@ -2635,7 +2635,13 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;  /* tombstoned — not visible to consumers */
-        if (f->offset + f->size > data_len) break;
+
+        /* For trim-encoded records, fields past data_len are zero/default.
+           Use a static zero buffer so decode_field_to_buf always has valid input. */
+        static const uint8_t zero_field[65537]; /* BSS — always zero-initialised */
+        const uint8_t *field_src = (f->offset + f->size <= data_len)
+            ? data + f->offset
+            : zero_field;
 
         /* Stack buffer covers non-varchar fields (numbers / bool / dates
            fit comfortably). Varchar may need 6 * content_max + 2 bytes
@@ -2652,7 +2658,7 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
                 else        { vbufsz = need; }
             }
         }
-        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, vbufsz);
+        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz);
         if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first && pos + 1 < est) buf[pos++] = ',';
@@ -2673,7 +2679,11 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;
-        if (f->offset + f->size > data_len) break;
+
+        static const uint8_t zero_field[65537];
+        const uint8_t *field_src = (f->offset + f->size <= data_len)
+            ? data + f->offset
+            : zero_field;
 
         char vbuf_stack[512];
         char *vbuf = vbuf_stack;
@@ -2686,7 +2696,7 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                 else        { vbufsz = need; }
             }
         }
-        int vlen = decode_field_to_buf(f, data + f->offset, vbuf, vbufsz);
+        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz);
         if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first) fputc(',', out);
@@ -2697,17 +2707,60 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
     fputc('}', out);
 }
 
+/* Return the minimum byte length needed to represent all fields in buf[0..full_len).
+   Scans backward through non-removed fields; returns the end offset of the last
+   field that contains any non-zero byte, rounded to that field's boundary.
+   Returns 0 if every field is zero (record is empty / default). */
+size_t typed_encode_trim_len(const TypedSchema *ts, const uint8_t *buf,
+                              size_t full_len) {
+    if (!ts || !ts->typed || !buf || full_len == 0) return 0;
+    for (int i = ts->nfields - 1; i >= 0; i--) {
+        const TypedField *f = &ts->fields[i];
+        if (f->removed) continue;
+        size_t end = (size_t)f->offset + (size_t)f->size;
+        if (end > full_len) continue;  /* field outside buf — skip */
+        /* Check if this field has any non-zero byte */
+        const uint8_t *fp = buf + f->offset;
+        for (size_t b = 0; b < (size_t)f->size; b++) {
+            if (fp[b]) return end;  /* found non-zero — trim point is this field's end */
+        }
+    }
+    return 0;  /* all fields zero */
+}
+
+/* SlotcaskTrimFn-compatible wrapper around typed_encode_trim_len.
+   ctx must be a const TypedSchema *. Exported so main.c and storage.c
+   can share a single definition. */
+size_t schema_trim_fn(const void *val, size_t vlen, void *ctx) {
+    return typed_encode_trim_len((const TypedSchema *)ctx,
+                                  (const uint8_t *)val, vlen);
+}
+
 /* Extract a single field as string (for B+ tree keys, query matching) */
-char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_idx) {
+/* data_len is the number of valid bytes in data (may be < ts->total_size for
+   trim-encoded records). Fields extending past data_len return NULL. */
+char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
+                           int data_len, int field_idx) {
     if (!ts || field_idx < 0 || field_idx >= ts->nfields) return NULL;
     const TypedField *f = &ts->fields[field_idx];
     if (f->removed) return NULL;
+
+    /* For trim-encoded records: any field that ends past stored bytes → treat as zero/empty.
+       Uses the same condition as the original typed_decode break, which is
+       f->offset + f->size > data_len rather than f->offset >= data_len — this is
+       correct for both field-boundary trim and any hypothetical byte-level trim. */
+    static const uint8_t zero_field[65537];
+    const uint8_t *src = (data_len >= 0 &&
+                            (size_t)f->offset + (size_t)f->size > (size_t)data_len)
+        ? zero_field
+        : data;
+
     char buf[512];
     int len;
 
     switch (f->type) {
     case FT_VARCHAR: {
-        const uint8_t *p = data + f->offset;
+        const uint8_t *p = src + f->offset;
         int slen = ((int)p[0] << 8) | (int)p[1];
         int content_max = f->size - 2;
         if (slen > content_max) slen = content_max;
@@ -2718,9 +2771,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         return out;
     }
     case FT_BOOL:
-        return strdup(data[f->offset] ? "true" : "false");
+        return strdup(src[f->offset] ? "true" : "false");
     case FT_DATE: {
-        const uint8_t *d = data + f->offset;
+        const uint8_t *d = src + f->offset;
         int32_t v = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                     ((int32_t)d[2] << 8) | d[3];
         if (v == 0) return NULL;
@@ -2729,7 +2782,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         return out;
     }
     case FT_DATETIME: {
-        const uint8_t *d = data + f->offset;
+        const uint8_t *d = src + f->offset;
         int32_t dv = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                      ((int32_t)d[2] << 8) | d[3];
         uint16_t t = ((uint16_t)d[4] << 8) | d[5];
@@ -2740,7 +2793,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         return out;
     }
     case FT_TIME: {
-        const uint8_t *d = data + f->offset;
+        const uint8_t *d = src + f->offset;
         uint32_t secs = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
         if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0) return NULL;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
@@ -2749,14 +2802,14 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data, int field_
         return out;
     }
     case FT_UUID: {
-        const uint8_t *b = data + f->offset;
+        const uint8_t *b = src + f->offset;
         if (uuid_is_zero(b)) return NULL;
         char *out = malloc(37);
         uuid_format_canonical(out, 37, b);
         return out;
     }
     default:
-        len = decode_field_to_buf(f, data + f->offset, buf, sizeof(buf));
+        len = decode_field_to_buf(f, src + f->offset, buf, sizeof(buf));
         if (len <= 0) return NULL;
         return strdup(buf);
     }
