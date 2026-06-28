@@ -16586,27 +16586,10 @@ void cmd_explain(const char *db_root, const char *object, const char *criteria_j
     free_criteria_tree(tree);
 }
 
-int cmd_count(const char *db_root, const char *object, const char *criteria_json) {
-    /* No criteria = O(1) from metadata */
-    if (!criteria_json || criteria_json[0] == '\0') {
-        int n = get_live_count(db_root, object);
-        OUT("%d\n", n);
-        return 0;
-    }
-
-    const char *perr = NULL;
-    CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
-    if (perr) {
-        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
-        free_criteria_tree(tree);
-        return 1;
-    }
-    if (!tree) {
-        int n = get_live_count(db_root, object);
-        OUT("%d\n", n);
-        return 0;
-    }
-
+/* Tree-based variant: tree already parsed by caller (NQL path). Does NOT free
+   tree — ownership stays with the caller. */
+void cmd_explain_tree(const char *db_root, const char *object, CriteriaNode *tree,
+                      const char *order_by, int fetching) {
     Schema sch = load_schema(db_root, object);
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
@@ -16615,7 +16598,177 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         char verr[256];
         if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
             OUT("{\"error\":\"%s\"}\n", verr);
-            free_criteria_tree(tree);
+            return;
+        }
+    }
+    if (tree) compile_criteria_tree(tree, fs.ts);
+
+    int table_rows = get_live_count(db_root, object);
+    FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
+                                 table_rows, order_by, fetching, 0);
+
+    const char *plan_str = "unknown";
+    switch (fp.kind) {
+        case FP_FULL_SCAN:       plan_str = "scan"; break;
+        case FP_PRIMARY_LEAF:    plan_str = "leaf"; break;
+        case FP_BITMAP_SMALLER:  plan_str = "bitmap"; break;
+        case FP_INTERSECT:       plan_str = "intersect"; break;
+        case FP_UNION:           plan_str = "union"; break;
+    }
+    const char *order_str = "none";
+    switch (fp.order) {
+        case FP_ORDER_NONE:              order_str = "none"; break;
+        case FP_ORDER_COMPOSITE:         order_str = "composite"; break;
+        case FP_ORDER_COMPOSITE_EXACT:   order_str = "composite_exact"; break;
+        case FP_ORDER_SORT:              order_str = "sort"; break;
+        case FP_ORDER_INDEX_WALK:        order_str = "index_walk"; break;
+    }
+
+    OUT("{\"plan\":\"%s\",\"order\":\"%s\",\"total_cheap\":%s,\"table_rows\":%d,"
+        "\"source\":[", plan_str, order_str, fp.total_cheap ? "true" : "false", table_rows);
+
+    for (int i = 0; i < fp.n_source; i++) {
+        SearchCriterion *leaf = fp.source_leaves[i];
+        if (!leaf) continue;
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        const char *it_str = (it == IT_BTREE)   ? "btree"   :
+                             (it == IT_BITMAP)  ? "bitmap"  :
+                             (it == IT_TRIGRAM) ? "trigram" : "none";
+        const TypedField *leaf_tf = resolve_idx_field(fs.ts, leaf->field);
+        CardEst est = card_est_leaf(db_root, object, sch.splits, leaf,
+                                    leaf_tf, selectivity_budget((size_t)table_rows));
+        if (i > 0) OUT(",");
+        OUT("{\"field\":\"%s\",\"op\":\"%s\",\"index\":\"%s\",\"role\":\"seed\",\"estimated_rows\":%zu}",
+            leaf->field,
+            (leaf->op == OP_EQUAL) ? "eq" : (leaf->op == OP_LESS) ? "lt" :
+            (leaf->op == OP_GREATER) ? "gt" : (leaf->op == OP_LESS_EQ) ? "lte" :
+            (leaf->op == OP_GREATER_EQ) ? "gte" : (leaf->op == OP_LIKE) ? "like" :
+            (leaf->op == OP_CONTAINS) ? "contains" : (leaf->op == OP_STARTS_WITH) ? "starts" :
+            (leaf->op == OP_BETWEEN) ? "between" : (leaf->op == OP_IN) ? "in" :
+            (leaf->op == OP_EXISTS) ? "exists" : "other",
+            it_str, est.k);
+    }
+    OUT("],\"postfilter\":[");
+
+    for (int i = 0; i < fp.n_postfilter; i++) {
+        SearchCriterion *leaf = fp.postfilter_leaves[i];
+        if (!leaf) continue;
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        const char *pf_it_str = (it == IT_BTREE) ? "\"btree\"" :
+                                (it == IT_BITMAP) ? "\"bitmap\"" :
+                                (it == IT_TRIGRAM) ? "\"trigram\"" : "null";
+        if (i > 0) OUT(",");
+        OUT("{\"field\":\"%s\",\"op\":\"%s\",\"index\":%s,\"role\":\"postfilter\",\"estimated_rows\":null}",
+            leaf->field,
+            (leaf->op == OP_EQUAL) ? "eq" : (leaf->op == OP_LESS) ? "lt" :
+            (leaf->op == OP_GREATER) ? "gt" : (leaf->op == OP_LESS_EQ) ? "lte" :
+            (leaf->op == OP_GREATER_EQ) ? "gte" : (leaf->op == OP_LIKE) ? "like" :
+            (leaf->op == OP_CONTAINS) ? "contains" : (leaf->op == OP_STARTS_WITH) ? "starts" :
+            (leaf->op == OP_BETWEEN) ? "between" : (leaf->op == OP_IN) ? "in" :
+            (leaf->op == OP_EXISTS) ? "exists" : "other",
+            pf_it_str);
+    }
+    OUT("],\"hints\":[");
+
+    int hint_count = 0;
+    for (int i = 0; i < fp.n_postfilter; i++) {
+        SearchCriterion *leaf = fp.postfilter_leaves[i];
+        if (!leaf) continue;
+        int it = pick_index_for_leaf(db_root, object, leaf);
+        if (it < 0) {
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH)) {
+                /* trigram hint emitted below */
+            } else {
+                if (hint_count > 0) OUT(",");
+                OUT("{\"type\":\"add_index\",\"field\":\"%s\",\"reason\":\"unindexed field in postfilter; index avoids full record scan\"}",
+                    leaf->field);
+                hint_count++;
+            }
+        }
+    }
+
+    int trigram_checked = 0;
+    for (int j = 0; j < 2; j++) {
+        int n = (j == 0) ? fp.n_source : fp.n_postfilter;
+        SearchCriterion **leaves = (j == 0) ? fp.source_leaves : fp.postfilter_leaves;
+        for (int i = 0; i < n; i++) {
+            SearchCriterion *leaf = leaves[i];
+            if (!leaf) continue;
+            trigram_checked = 1;
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH ||
+                 leaf->op == OP_NOT_LIKE || leaf->op == OP_NOT_CONTAINS ||
+                 leaf->op == OP_INOT_LIKE || leaf->op == OP_INOT_CONTAINS ||
+                 leaf->op == OP_ENDS_WITH || leaf->op == OP_IENDS_WITH)) {
+                int it = pick_index_for_leaf(db_root, object, leaf);
+                if (it != IT_TRIGRAM) {
+                    if (hint_count > 0) OUT(",");
+                    OUT("{\"type\":\"add_trigram_index\",\"field\":\"%s\",\"reason\":\"varchar text-search op on %s field; trigram index enables substring matching without full record scan\"}",
+                        leaf->field, (it < 0) ? "unindexed" : "non-trigram-indexed");
+                    hint_count++;
+                }
+            }
+        }
+    }
+
+    if (!trigram_checked && tree) {
+        SearchCriterion *raw_ptrs[64];
+        int n_raw = collect_and_leaves(tree, raw_ptrs, 64);
+        for (int i = 0; i < n_raw; i++) {
+            SearchCriterion *leaf = raw_ptrs[i];
+            if (!leaf) continue;
+            const TypedField *tf = resolve_idx_field(fs.ts, leaf->field);
+            if (tf && tf->type == FT_VARCHAR &&
+                (leaf->op == OP_LIKE || leaf->op == OP_CONTAINS ||
+                 leaf->op == OP_ILIKE || leaf->op == OP_ICONTAINS ||
+                 leaf->op == OP_STARTS_WITH || leaf->op == OP_ISTARTS_WITH ||
+                 leaf->op == OP_NOT_LIKE || leaf->op == OP_NOT_CONTAINS ||
+                 leaf->op == OP_INOT_LIKE || leaf->op == OP_INOT_CONTAINS ||
+                 leaf->op == OP_ENDS_WITH || leaf->op == OP_IENDS_WITH)) {
+                int it = pick_index_for_leaf(db_root, object, leaf);
+                if (it != IT_TRIGRAM) {
+                    if (hint_count > 0) OUT(",");
+                    OUT("{\"type\":\"add_trigram_index\",\"field\":\"%s\",\"reason\":\"varchar text-search op on %s field; trigram index enables substring matching without full record scan\"}",
+                        leaf->field, (it < 0) ? "unindexed" : "non-trigram-indexed");
+                    hint_count++;
+                }
+            }
+        }
+    }
+
+    if (fp.order == FP_ORDER_SORT && order_by && fp.n_source > 0) {
+        SearchCriterion *seed = fp.source_leaves[0];
+        if (seed && strcmp(seed->field, order_by) != 0 &&
+            pick_index_for_leaf(db_root, object, seed) >= 0) {
+            if (hint_count > 0) OUT(",");
+            OUT("{\"type\":\"composite_index\",\"field\":\"%s+%s\","
+                "\"reason\":\"filter on %s + order_by %s; composite index avoids in-memory sort\"}",
+                seed->field, order_by, seed->field, order_by);
+            hint_count++;
+        }
+    }
+
+    OUT("]}\n");
+    /* tree owned by caller — not freed here */
+}
+
+static int cmd_count_with_tree(const char *db_root, const char *object,
+                                CriteriaNode *tree) {
+    Schema sch = load_schema(db_root, object);
+    FieldSchema fs;
+    init_field_schema(&fs, db_root, object);
+
+    {
+        char verr[256];
+        if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
+            OUT("{\"error\":\"%s\"}\n", verr);
             return 1;
         }
     }
@@ -16626,14 +16779,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
-    /* Existence shortcut on single-leaf EXISTS/NOT_EXISTS: typed binary
-       records always carry every typed field, so for non-varchar typed
-       fields EXISTS=live_count and NOT_EXISTS=0 by definition — no scan
-       needed. Saves ~15-22ms per query on a 1M table.
-
-       Both `[{...}]` (parsed as CNODE_AND-of-1) and `{...}` (CNODE_LEAF)
-       surface forms accepted — the array form was missing in the first
-       implementation and silently fell through to the full scan. */
     {
         CriteriaNode *exists_leaf = NULL;
         if (tree->kind == CNODE_LEAF) exists_leaf = tree;
@@ -16647,20 +16792,8 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             if (fi >= 0 && fs.ts->fields[fi].type != FT_VARCHAR) {
                 int total = get_live_count(db_root, object);
                 OUT("%d\n", exists_leaf->leaf.op == OP_EXISTS ? total : 0);
-                free_criteria_tree(tree);
                 return 0;
             }
-            /* Varchar NOT_EXISTS with an index: count(NOT_EXISTS) =
-               live_count − count(EXISTS). The btree only stores non-empty
-               varchars, so count(EXISTS) on the index = btree size, which
-               idx_count_cb resolves in ~5-15ms at 1M. The prior path was
-               PRIMARY_NONE (full record scan) at ~305ms — the planner
-               override at leaf_is_indexed claimed 3ms for scan_shards but
-               that estimate predates v2 segment-walk cost.
-               The EXISTS half (without the negation) already uses the
-               indexed path via the planner; only NOT_EXISTS needs this
-               local shortcut so cmd_find's NOT_EXISTS keeps the correct
-               PRIMARY_NONE record-walk semantics. */
             if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR &&
                 exists_leaf->leaf.op == OP_NOT_EXISTS &&
                 btree_idx_exists(db_root, object, exists_leaf->leaf.field,
@@ -16678,16 +16811,10 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                   ? (size_t)total - ic.count : 0;
                     OUT("%zu\n", neg);
                 }
-                free_criteria_tree(tree);
                 return 0;
             }
         }
 
-        /* IN / NOT_IN whole-domain shortcut for bool fields. If the value
-           list covers both true and false, every (or no) record matches:
-             count(field IN  {true,false}) = live_count
-             count(field NOT_IN {true,false}) = 0
-           Saves ~16ms on the bench's `active in {true,false}` row. */
         if (exists_leaf && fs.ts &&
             (exists_leaf->leaf.op == OP_IN || exists_leaf->leaf.op == OP_NOT_IN)) {
             int fi = typed_field_index(fs.ts, exists_leaf->leaf.field);
@@ -16701,36 +16828,21 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 if (saw_t && saw_f) {
                     int total = get_live_count(db_root, object);
                     OUT("%d\n", exists_leaf->leaf.op == OP_IN ? total : 0);
-                    free_criteria_tree(tree);
                     return 0;
                 }
             }
         }
     }
 
-    /* Phase 1c step 1/6: cmd_count now consumes FilterPlan; choose_primary_source
-       no longer called from this path.  fetching=0 so the planner can enable
-       index-only intersect for count (no record reads needed). */
     size_t N_live = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
-                                N_live, NULL /*order_by*/, 0 /*fetching=count*/,
-                                0 /*limit*/);
-    /* FP_ORDER_* overlays are irrelevant for count (no order_by supplied). */
+                                N_live, NULL, 0, 0);
 
     if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
-        /* FP_PRIMARY_LEAF: one selective indexed leaf seeds; remaining leaves
-           (fp.n_postfilter > 0) are post-filtered per record via full tree.
-           FP_BITMAP_SMALLER: lone/broad bitmap — routed here because
-           fp.source_leaves[0] is set and pick_index_for_leaf returns IT_BITMAP,
-           which the dispatch block below handles via bm_popcount_*. */
         SearchCriterion *pc = fp.source_leaves[0];
         enum SearchOp op = pc->op;
         int check_primary = op_needs_check_primary(op);
 
-        /* Single-leaf tree → inline btree count, no record fetch.
-           With FP_PRIMARY_LEAF and n_postfilter==0 the whole tree is covered
-           by the seed; with n_postfilter>0 we must fall to the multi-leaf
-           post-filter path even if the tree looks like a single leaf. */
         int is_single_leaf =
             (fp.n_postfilter == 0) &&
             ((tree->kind == CNODE_LEAF) ||
@@ -16740,14 +16852,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
         if (is_single_leaf && op_is_negatable(op)) {
-            /* count(neg) = count(*) - count(pos). Big win for NEQ/NOT_IN
-               where the positive match set is small; also the correct
-               answer for NOT_EXISTS (the old default-branch path visited
-               every indexed entry and returned count(exists) instead).
-               Dispatch on the picker's choice for the *inverted* form
-               — e.g. count(NOT_CONTAINS 'foobar') runs through trigram
-               if the picker would have picked trigram for CONTAINS
-               'foobar' (long-pattern win), then subtracts. */
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
             size_t pos_count = 0;
@@ -16760,10 +16864,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     CollectedHash *entries = NULL;
                     size_t n = 0;
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
-                    /* parallel_indexed_count re-verifies each candidate
-                       against the full criterion tree, but here the
-                       positive form `pos` is what we want — substitute
-                       a single-leaf tree around `pos` instead of `tree`. */
                     CriteriaNode pos_leaf = { .kind = CNODE_LEAF, .leaf = pos,
                                               .children = NULL, .n_children = 0 };
                     pos_count = parallel_indexed_count(db_root, object, &sch,
@@ -16776,12 +16876,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     pos_ok = 0;
                 }
             } else if (pos_picked == IT_BITMAP) {
-                /* Bitmap popcount fast path for the inverted positive.
-                   Eq/IN → per-value popcount sum. Anything else (the
-                   inverted form of NOT_LIKE / NOT_CONTAINS / NOT_REGEX
-                   / ...) → dict-scan popcount: iterate ≤256 dict
-                   entries, match each, sum bm_count for matching values.
-                   Either way avoids the full data-shard scan. */
                 if (pos.op == OP_EQUAL || pos.op == OP_IN) {
                     pos_count = bm_popcount_for_crit(db_root, object, sch.splits,
                                                       &pos, pc_tf);
@@ -16791,9 +16885,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                               &pos, pc_tf);
                 }
             } else {
-                /* IT_BTREE or -1 — btree_dispatch handles bitmap-keyed
-                   fields via its internal routing if the picker fell
-                   back to btree for a non-trigram-prefer op. */
                 int pos_cp = op_needs_check_primary(pos.op);
                 IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0, pc_tf };
                 btree_dispatch(db_root, object, pc->field, sch.splits,
@@ -16808,16 +16899,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            /* Dispatch on the picker's chosen index — same rulebook the
-               planner used to claim this leaf:
-                 IT_TRIGRAM → build trigram keyset, verify candidates via
-                             parallel_indexed_count (kills false positives
-                             from order-insensitive trigram match).
-                 IT_BITMAP  → popcount-style fast path (per-value sum for
-                             eq/IN, dict-scan + per-matching-value sum
-                             otherwise). Avoids the per-record fan-out the
-                             default idx_count_cb path needs.
-                 IT_BTREE   → btree_dispatch + idx_count_cb. */
             int picked = pick_index_for_leaf(db_root, object, pc);
             if (picked == IT_TRIGRAM) {
                 KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
@@ -16833,14 +16914,9 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     else OUT("%zu\n", count);
                     free(entries);
                     keyset_free(tg_ks);
-                    free_criteria_tree(tree);
                     return 0;
                 }
-                /* tg_ks NULL is unexpected here — the picker enforces
-                   plen ≥ 3 before returning IT_TRIGRAM. Treat as a
-                   transient failure and emit 0 (defensive only). */
                 OUT("0\n");
-                free_criteria_tree(tree);
                 return 0;
             }
             if (picked == IT_BITMAP) {
@@ -16863,14 +16939,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                 else OUT("%zu\n", ic.count);
             }
         } else {
-            /* Multi-leaf tree, indexed primary. Dispatch on the picker's
-               choice — btree_dispatch only handles btree/bitmap, so a
-               trigram primary needs build_keyset_from_trigram before the
-               full-tree post-filter via parallel_indexed_count. Previously
-               find_primary_leaf returned source-order, so trigram rarely
-               sat as primary in multi-leaf trees; the selectivity-scoring
-               picker now favours it (trigram=10 vs bitmap=80) and surfaced
-               this gap. */
             int picked = pick_index_for_leaf(db_root, object, pc);
             if (picked == IT_TRIGRAM) {
                 KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
@@ -16886,13 +16954,9 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                     else OUT("%zu\n", count);
                     free(entries);
                     keyset_free(tg_ks);
-                    free_criteria_tree(tree);
                     return 0;
                 }
-                /* Trigram builder transient failure (alloc, …) — defensive 0
-                   matches the single-leaf branch's behaviour. */
                 OUT("0\n");
-                free_criteria_tree(tree);
                 return 0;
             }
 
@@ -16908,7 +16972,7 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
 
             if (cc.budget_exceeded) {
                 OUT(QUERY_BUFFER_ERR);
-                collect_ctx_destroy(&cc); free_criteria_tree(tree);
+                collect_ctx_destroy(&cc);
                 return -1;
             }
             size_t count = parallel_indexed_count(db_root, object, &sch,
@@ -16919,8 +16983,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             collect_ctx_destroy(&cc);
         }
     } else if (fp.kind == FP_INTERSECT) {
-        /* Fast path: all-bitmap eq/in AND → word-level intersect popcount.
-         * Beats KeySet materialization for any selectivity. */
         if (fp.source_is_bitmap && fp.n_postfilter == 0) {
             int all_supported = 1;
             for (int i = 0; i < fp.n_source; i++) {
@@ -16937,17 +16999,9 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                                                       fs.ts, &dl);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else OUT("%zu\n", total);
-                free_criteria_tree(tree);
                 return 0;
             }
         }
-        /* Fall through to existing KeySet intersect path */
-        /* FP_INTERSECT + n_postfilter==0: all AND leaves covered by source set
-           → intersect index-only, keyset_size is the exact count (no record reads).
-           FP_INTERSECT + n_postfilter>0: at least one leaf was dropped from the
-           intersect (non-rangeable op, bitmap, excess past MAX_INTERSECT_LEAVES);
-           those live in the criteria tree as post-filters → feed through
-           parallel_indexed_count which re-applies the full tree per record. */
         int small_primary = 0;
         KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
                                                   fp.source_leaves, fp.n_source,
@@ -16956,13 +17010,11 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("0\n");
         } else if (!small_primary && fp.n_postfilter == 0) {
-            /* index-only intersect: keyset_size is exact */
             size_t n = keyset_size(result);
             keyset_free(result);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("%zu\n", n);
         } else {
-            /* small first leaf or post-filter leaves: re-verify full tree */
             CollectedHash *batch = NULL;
             size_t batch_count = 0;
             int rc = keyset_to_collected_hashes(result, sch.splits, &batch, &batch_count);
@@ -16977,8 +17029,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
             }
         }
     } else if (fp.kind == FP_UNION) {
-        /* FP_UNION: pure OR, every child indexed → union keysets, return size.
-           Pass fp.or_node (the OR sub-tree found by the planner). */
         int budget_exceeded = 0;
         size_t count = keyset_count_from_or(db_root, object, &sch, tree, fp.or_node,
                                             &fs, &dl, &budget_exceeded);
@@ -16986,12 +17036,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else OUT("%zu\n", count);
     } else {
-        /* FP_FULL_SCAN: nothing indexed, or planner demoted to scan.
-         * Use the inline-match O_DIRECT path which calls match_typed()
-         * directly in the scan loop — no callback indirection, no
-         * SlotHeader construction, no adapter bounce.
-         * Hoist a single-leaf compiled criterion for the fast path
-         * (match_typed directly) vs. criteria_match_tree fallback. */
         const CompiledCriterion *fast_cc = NULL;
         if (tree) {
             const CriteriaNode *leaf = NULL;
@@ -17000,8 +17044,6 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
                      tree->children[0]->kind == CNODE_LEAF) leaf = tree->children[0];
             if (leaf && leaf->compiled) fast_cc = leaf->compiled;
         }
-        /* When we have a single compiled criterion, pass NULL tree and
-           let the inline loop use match_typed directly. */
         SlotcaskSchemaInfo info = {
             .splits = sch.splits, .slot_size = sch.slot_size,
             .streams = sch.streams,
@@ -17022,8 +17064,42 @@ int cmd_count(const char *db_root, const char *object, const char *criteria_json
         }
     }
 
-    free_criteria_tree(tree);
     return 0;
+}
+
+int cmd_count(const char *db_root, const char *object, const char *criteria_json) {
+    /* No criteria = O(1) from metadata */
+    if (!criteria_json || criteria_json[0] == '\0') {
+        int n = get_live_count(db_root, object);
+        OUT("%d\n", n);
+        return 0;
+    }
+
+    const char *perr = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
+    if (perr) {
+        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
+        free_criteria_tree(tree);
+        return 1;
+    }
+    if (!tree) {
+        int n = get_live_count(db_root, object);
+        OUT("%d\n", n);
+        return 0;
+    }
+
+    int r = cmd_count_with_tree(db_root, object, tree);
+    free_criteria_tree(tree);
+    return r;
+}
+
+int cmd_count_tree(const char *db_root, const char *object, CriteriaNode *tree) {
+    if (!tree) {
+        int n = get_live_count(db_root, object);
+        OUT("%d\n", n);
+        return 0;
+    }
+    return cmd_count_with_tree(db_root, object, tree);
 }
 
 /* Count the matching entries for a single indexed leaf criterion without
@@ -18495,34 +18571,21 @@ static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
     }
 }
 
-int cmd_find(const char *db_root, const char *object,
-                    const char *criteria_json, int offset, int limit,
-                    const char *proj_str, const char *excluded_csv,
-                    const char *format, const char *delimiter,
-                    const char *join_json,
-                    const char *order_by, const char *order_dir,
-                    const char *cursor_json, int want_total) {
+
+static int cmd_find_do(const char *db_root, const char *object,
+                        CriteriaNode *tree,
+                        JoinSpec *joins, int njoins,
+                        int offset, int limit,
+                        const char *proj_str, const char *excluded_csv,
+                        const char *format, const char *delimiter,
+                        const char *order_by, const char *order_dir,
+                        const char *cursor_json, int want_total) {
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-
-    /* Parse joins (if any) — forces tabular output irrespective of `format`. */
-    JoinSpec *joins = NULL;
-    int njoins = 0;
-    if (join_json && join_json[0]) {
-        if (parse_joins_json(join_json, &joins, &njoins) < 0) {
-            OUT("{\"error\":\"invalid 'join' array\"}\n");
-            return -1;
-        }
-    }
     int has_joins = (njoins > 0);
 
-    if (dict_fmt && has_joins) {
-        OUT("{\"error\":\"format=dict is not supported with join\"}\n");
-        free_joins(joins, njoins);
-        return -1;
-    }
-
+    /* tree is owned by caller — no free_criteria_tree here */
     Schema sch = load_schema(db_root, object);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
@@ -18540,15 +18603,6 @@ int cmd_find(const char *db_root, const char *object,
         }
     }
 
-    /* Parse criteria into a tree (AND/OR supported). Empty/absent → no criteria. */
-    const char *perr = NULL;
-    CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
-    if (perr) {
-        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
-        free_criteria_tree(tree);
-        free_joins(joins, njoins);
-        return -1;
-    }
 
     /* Apply hard limit: 0 or -1 means use server default, else cap at hard limit */
     if (limit <= 0) limit = g_global_limit;
@@ -18560,7 +18614,6 @@ int cmd_find(const char *db_root, const char *object,
     init_field_schema(&driver_fs, db_root, object);
     if (has_joins && resolve_joins(joins, njoins, db_root, object, &driver_fs) < 0) {
         free_joins(joins, njoins);
-        free_criteria_tree(tree);
         free_excluded(&excluded);
         return -1;
     }
@@ -18574,7 +18627,6 @@ int cmd_find(const char *db_root, const char *object,
                                                        "order_by", verr, sizeof(verr)) < 0)) {
             OUT("{\"error\":\"%s\"}\n", verr);
             free_joins(joins, njoins);
-            free_criteria_tree(tree);
             free_excluded(&excluded);
             return -1;
         }
@@ -18587,7 +18639,6 @@ int cmd_find(const char *db_root, const char *object,
     if (want_total && csv_delim) {
         OUT("{\"error\":\"\\\"total\\\" with format=csv is not supported\"}\n");
         free_joins(joins, njoins);
-        free_criteria_tree(tree);
         free_excluded(&excluded);
         return -1;
     }
@@ -18601,22 +18652,22 @@ int cmd_find(const char *db_root, const char *object,
         int cr = parse_cursor_object(cursor_json, order_by, &cur, &cerr);
         if (cr < 0) {
             OUT("{\"error\":\"%s\"}\n", cerr ? cerr : "invalid cursor");
-            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            free_joins(joins, njoins); free_excluded(&excluded);
             return -1;
         }
         if (!order_by || !order_by[0]) {
             OUT("{\"error\":\"cursor requires order_by\"}\n");
-            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            free_joins(joins, njoins); free_excluded(&excluded);
             return -1;
         }
         if (has_joins) {
             OUT("{\"error\":\"cursor with join is not supported\"}\n");
-            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            free_joins(joins, njoins); free_excluded(&excluded);
             return -1;
         }
         if (csv_delim) {
             OUT("{\"error\":\"cursor with format=csv is not supported\"}\n");
-            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            free_joins(joins, njoins); free_excluded(&excluded);
             return -1;
         }
 
@@ -18624,7 +18675,7 @@ int cmd_find(const char *db_root, const char *object,
         if (!btree_idx_exists(db_root, object, order_by, sch.splits)) {
             OUT("{\"error\":\"cursor requires order_by field to be indexed\",\"field\":\"%s\"}\n",
                 order_by);
-            free_joins(joins, njoins); free_criteria_tree(tree); free_excluded(&excluded);
+            free_joins(joins, njoins); free_excluded(&excluded);
             return -1;
         }
 
@@ -18715,7 +18766,6 @@ int cmd_find(const char *db_root, const char *object,
                              : "{\"rows\":[],\"cursor\":null}\n");
             keyset_free(cursor_prefilter_ks);
             free_joins(joins, njoins);
-            free_criteria_tree(tree);
             free_excluded(&excluded);
             return 0;
         }
@@ -18978,7 +19028,6 @@ int cmd_find(const char *db_root, const char *object,
                 free(cc.last_key_str);
                 keyset_free(cursor_prefilter_ks);
                 free_joins(joins, njoins);
-                free_criteria_tree(tree);
                 free_excluded(&excluded);
                 return 0;
             }
@@ -19076,7 +19125,6 @@ int cmd_find(const char *db_root, const char *object,
         free(cc.last_value_str);
         free(cc.last_key_str);
         free_joins(joins, njoins);
-        free_criteria_tree(tree);
         free_excluded(&excluded);
         return 0;
     }
@@ -19172,7 +19220,6 @@ int cmd_find(const char *db_root, const char *object,
             else OUT("],\"total\":%zu}\n", ex_total);
         }
         free_excluded(&excluded);
-        free_criteria_tree(tree);
         free_joins(joins, njoins);
         return 0;
     }
@@ -19204,7 +19251,6 @@ int cmd_find(const char *db_root, const char *object,
             else OUT("],\"total\":%zu}\n", d1_total);
         }
         free_excluded(&excluded);
-        free_criteria_tree(tree);
         free_joins(joins, njoins);
         return 0;
     } else if (fp.order == FP_ORDER_INDEX_WALK &&
@@ -19243,7 +19289,6 @@ int cmd_find(const char *db_root, const char *object,
             else OUT("],\"total\":%zu}\n", d3_total);
         }
         free_excluded(&excluded);
-        free_criteria_tree(tree);
         free_joins(joins, njoins);
         return 0;
     } else if (fp.order == FP_ORDER_SORT &&
@@ -19287,7 +19332,6 @@ int cmd_find(const char *db_root, const char *object,
             else OUT("],\"total\":%zu}\n", d2_matched);
         }
         free_excluded(&excluded);
-        free_criteria_tree(tree);
         free_joins(joins, njoins);
         return 0;
     }
@@ -19382,7 +19426,6 @@ int cmd_find(const char *db_root, const char *object,
                     OUT(want_total ? "],\"total\":null}\n" : "]\n");
                 keyset_free(prefilter_ks);
                 free_joins(joins, njoins);
-                free_criteria_tree(tree);
                 free_excluded(&excluded);
                 return 0;
             }
@@ -19551,7 +19594,6 @@ int cmd_find(const char *db_root, const char *object,
                         else            OUT("]\n");
                     }
                     free_joins(joins, njoins);
-                    free_criteria_tree(tree);
                     free_excluded(&excluded);
                     return 0;
                 }
@@ -19606,7 +19648,6 @@ int cmd_find(const char *db_root, const char *object,
             free(cc.last_value_str);
             free(cc.last_key_str);
             free_joins(joins, njoins);
-            free_criteria_tree(tree);
             free_excluded(&excluded);
             return 0;
         }
@@ -19651,7 +19692,6 @@ int cmd_find(const char *db_root, const char *object,
             pthread_mutex_destroy(&oc.lock);
             OUT(QUERY_BUFFER_ERR);
             free_excluded(&excluded);
-            free_criteria_tree(tree);
             free_joins(joins, njoins);
             return -1;
         }
@@ -19738,7 +19778,7 @@ int cmd_find(const char *db_root, const char *object,
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
                (fp.kind == FP_INTERSECT ||
                 ((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
-                 tree && tree->kind != CNODE_LEAF)) &&
+                 tree)) &&
                /* Trigram-leaf is not streaming-friendly — idx_find_streaming
                   walks the leaf's btree (.idx) which doesn't exist for
                   trigram-only fields. Fall through to FP_PRIMARY_LEAF where
@@ -19830,7 +19870,6 @@ int cmd_find(const char *db_root, const char *object,
                 else
                     OUT(want_total ? "],\"total\":null}\n" : "]\n");
                 free_excluded(&excluded);
-                free_criteria_tree(tree);
                 free_joins(joins, njoins);
                 return 0;
             }
@@ -19894,7 +19933,7 @@ int cmd_find(const char *db_root, const char *object,
             else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
             else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
             else OUT(want_total ? "],\"total\":null}\n" : "]\n");
-            free_excluded(&excluded); free_criteria_tree(tree); free_joins(joins, njoins);
+            free_excluded(&excluded); free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
             return -1;
         }
@@ -19914,7 +19953,6 @@ int cmd_find(const char *db_root, const char *object,
             else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
             else OUT(want_total ? "],\"total\":null}\n" : "]\n");
             free_excluded(&excluded);
-            free_criteria_tree(tree);
             free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
             return -1;
@@ -19990,10 +20028,67 @@ int cmd_find(const char *db_root, const char *object,
         OUT("]\n");
     free_excluded(&excluded);
 
-    free_criteria_tree(tree);
     free_joins(joins, njoins);
 
     return 0;
+}
+
+int cmd_find(const char *db_root, const char *object,
+                    const char *criteria_json, int offset, int limit,
+                    const char *proj_str, const char *excluded_csv,
+                    const char *format, const char *delimiter,
+                    const char *join_json,
+                    const char *order_by, const char *order_dir,
+                    const char *cursor_json, int want_total) {
+    int dict_fmt = (format && strcmp(format, "dict") == 0);
+
+    /* Parse joins (if any) — forces tabular output irrespective of `format`. */
+    JoinSpec *joins = NULL;
+    int njoins = 0;
+    if (join_json && join_json[0]) {
+        if (parse_joins_json(join_json, &joins, &njoins) < 0) {
+            OUT("{\"error\":\"invalid 'join' array\"}\n");
+            return -1;
+        }
+    }
+
+    if (dict_fmt && njoins > 0) {
+        OUT("{\"error\":\"format=dict is not supported with join\"}\n");
+        free_joins(joins, njoins);
+        return -1;
+    }
+
+    /* Parse criteria into a tree (AND/OR supported). Empty/absent → no criteria. */
+    const char *perr = NULL;
+    CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
+    if (perr) {
+        OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
+        free_criteria_tree(tree);
+        free_joins(joins, njoins);
+        return -1;
+    }
+
+    int r = cmd_find_do(db_root, object, tree, joins, njoins,
+                        offset, limit, proj_str, excluded_csv,
+                        format, delimiter, order_by, order_dir,
+                        cursor_json, want_total);
+    free_criteria_tree(tree);
+    return r;
+}
+
+int cmd_find_tree(const char *db_root, const char *object, CriteriaNode *tree,
+                  int offset, int limit, const char *proj_str,
+                  const char *format, const char *delimiter,
+                  const char *order_by, const char *order_dir, int want_total,
+                  const char *cursor_json) {
+    return cmd_find_do(db_root, object, tree,
+                       NULL, 0,           /* no joins */
+                       offset, limit, proj_str,
+                       NULL,              /* no excluded_csv */
+                       format, delimiter,
+                       order_by, order_dir,
+                       cursor_json,
+                       want_total);
 }
 
 /* ========== SEQUENCES ========== */
@@ -24326,7 +24421,9 @@ static void agg_free(AggCtx *ctx) {
     ctx->ht = NULL;
     ctx->ht_cap = ctx->ht_mask = 0;
     ctx->total_buckets = 0;
-    free(ctx->specs);
+    /* specs is borrowed from the caller (cmd_aggregate / cmd_aggregate_tree) —
+       do NOT free it here to avoid double-free. */
+    ctx->specs = NULL;
 }
 
 /* Format a double, removing trailing zeros */
@@ -25084,54 +25181,30 @@ static int bm_intersect_walk_cb(uint32_t slot, void *ctx) {
     return 0;
 }
 
-int cmd_aggregate(const char *db_root, const char *object,
-                  const char *criteria_json, const char *group_by_json,
-                  const char *aggregates_json, const char *having_json,
-                  const char *order_by, int order_desc, int limit,
-                  const char *format, const char *delimiter, int want_total) {
+static int cmd_aggregate_do(const char *db_root, const char *object,
+                            CriteriaNode *tree,
+                            AggSpec *specs, int nspecs,
+                            const char *group_by_json,
+                            const char *having_json,
+                            const char *order_by, int order_desc, int limit,
+                            const char *format, const char *delimiter, int want_total) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-    if (!aggregates_json || aggregates_json[0] == '\0') {
-        OUT("{\"error\":\"Missing aggregates\"}\n");
-        return -1;
-    }
 
     Schema sch = load_schema(db_root, object);
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
 
-    /* Parse aggregates */
-    AggSpec *specs = NULL;
-    int nspecs = parse_agg_specs(aggregates_json, &specs);
-    if (nspecs == 0) {
-        OUT("{\"error\":\"No valid aggregates\"}\n");
-        free(specs);
-        return -1;
-    }
-
-    /* Parse criteria into tree (AND/OR supported). */
-    CriteriaNode *tree = NULL;
-    if (criteria_json && criteria_json[0]) {
-        const char *perr = NULL;
-        tree = parse_criteria_tree(criteria_json, &perr);
-        if (perr) {
-            OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
-            free_criteria_tree(tree);
-            free(specs);
-            return -1;
-        }
-    }
-
     {
         char verr[256];
         if (validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0) {
-            OUT("{\"error\":\"%s\"}\n", verr); free_criteria_tree(tree); free(specs); return -1;
+            OUT("{\"error\":\"%s\"}\n", verr); return -1;
         }
         for (int i = 0; i < nspecs; i++) {
             /* count(*) / count() carry no field — skip. */
             if (specs[i].fn == AGG_COUNT && specs[i].field[0] == '\0') continue;
             if (validate_field(fs.ts, specs[i].field, "aggregate",
                                verr, sizeof(verr)) < 0) {
-                OUT("{\"error\":\"%s\"}\n", verr); free_criteria_tree(tree); free(specs); return -1;
+                OUT("{\"error\":\"%s\"}\n", verr); return -1;
             }
         }
         /* order_by validated below after group_by parse — it may reference
@@ -25158,7 +25231,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                 OUT("{\"rows\":{\"%s\":%d},\"total\":1}\n", specs[0].alias, n);
             else
                 OUT("{\"%s\":%d}\n", specs[0].alias, n);
-            free(specs);
             return 0;
         }
     }
@@ -25285,7 +25357,6 @@ int cmd_aggregate(const char *db_root, const char *object,
             } else {
                 OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
             }
-            free(specs);
             return 0;
         }
     }
@@ -25430,7 +25501,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                 }
                 OUT(want_total ? "},\"total\":1}\n" : "}\n");
             }
-            free(specs);
             return 0;
         }
     }
@@ -25465,13 +25535,9 @@ int cmd_aggregate(const char *db_root, const char *object,
                                           limit, tree, &topn_dl,
                                           want_total);
             if (rc == 0) {
-                free_criteria_tree(tree);
-                free(specs);
                 return 0;
             }
             if (rc == -1) {
-                free_criteria_tree(tree);
-                free(specs);
                 OUT("{\"error\":\"query_timeout\"}\n");
                 return -1;
             }
@@ -25502,7 +25568,7 @@ int cmd_aggregate(const char *db_root, const char *object,
             if (validate_field(fs.ts, ctx.group_fields[i], "group_by",
                                verr, sizeof(verr)) < 0) {
                 OUT("{\"error\":\"%s\"}\n", verr);
-                free_criteria_tree(tree); free(specs); return -1;
+                return -1;
             }
         }
         /* order_by in aggregate may name (a) a typed field, (b) an
@@ -25518,7 +25584,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                          "unknown field '%s' in order_by (no matching field, alias, or group_by)",
                          order_by);
                 OUT("{\"error\":\"%s\"}\n", verr);
-                free_criteria_tree(tree); free(specs); return -1;
+                return -1;
             }
         }
     }
@@ -25587,8 +25653,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
                     specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
-                free_criteria_tree(tree);
-                free(specs);
                 return 0;
             }
         }
@@ -25644,7 +25708,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                 free(wargs);
                 if (dl.timed_out) {
                     OUT("{\"error\":\"query_timeout\"}\n");
-                    free_criteria_tree(tree); free(specs);
                     return -1;
                 }
                 if (!any_indefinite) {
@@ -25662,8 +25725,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     } else {
                         OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
                     }
-                    free_criteria_tree(tree);
-                    free(specs);
                     return 0;
                 }
                 /* else: fall through to keyset/intersect paths below */
@@ -25706,8 +25767,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
                     specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
-                free_criteria_tree(tree);
-                free(specs);
                 return 0;
             }
 
@@ -25734,8 +25793,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     emit_min_max_via_keyset(db_root, object, &sch,
                                             &specs[0], agg_tf, ks,
                                             format, delimiter, want_total);
-                    free_criteria_tree(tree);
-                    free(specs);
                     return 0;
                 }
                 keyset_free(ks);
@@ -25782,8 +25839,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                     emit_min_max_via_keyset(db_root, object, &sch,
                                             &specs[0], agg_tf, ks,
                                             format, delimiter, want_total);
-                    free_criteria_tree(tree);
-                    free(specs);
                     return 0;
                 }
                 if (ks) keyset_free(ks);
@@ -25850,7 +25905,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                            &pos, pos_tf, idx_count_cb, &ic);
             if (dl.timed_out) {
                 OUT("{\"error\":\"query_timeout\"}\n");
-                free_criteria_tree(tree); agg_free(&ctx); return -1;
+                agg_free(&ctx); return -1;
             }
             int total = get_live_count(db_root, object);
             size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
@@ -25874,7 +25929,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                 }
                 OUT(want_total ? "},\"total\":1}\n" : "}\n");
             }
-            free_criteria_tree(tree); agg_free(&ctx); return 0;
+            agg_free(&ctx); return 0;
         }
 
         /* Mixed COUNT/SUM/AVG: still need full-side for sum/avg.
@@ -25899,14 +25954,12 @@ int cmd_aggregate(const char *db_root, const char *object,
         if (dl.timed_out) {
             OUT("{\"error\":\"query_timeout\"}\n");
             agg_ctx_free_local(&ctx_full);
-            free_criteria_tree(tree);
             agg_free(&ctx);
             return -1;
         }
         if (ctx.budget_exceeded || ctx_full.budget_exceeded) {
             OUT(QUERY_BUFFER_ERR);
             agg_ctx_free_local(&ctx_full);
-            free_criteria_tree(tree);
             agg_free(&ctx);
             return -1;
         }
@@ -25964,7 +26017,6 @@ int cmd_aggregate(const char *db_root, const char *object,
 
         free(bs_eq); free(bs_full);
         agg_ctx_free_local(&ctx_full);
-        free_criteria_tree(tree);
         agg_free(&ctx);
         return 0;
     }
@@ -26132,7 +26184,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                         free(wargs); free(w_counts); free(w_sums);
                         free(w_mins); free(w_maxs); free(w_present);
                         keyset_free(crit_ks);
-                        free_criteria_tree(tree); free(specs);
                         OUT(QUERY_BUFFER_ERR);
                         return -1;
                     }
@@ -26226,8 +26277,6 @@ int cmd_aggregate(const char *db_root, const char *object,
                 }
 
                 keyset_free(crit_ks);
-                free_criteria_tree(tree);
-                free(specs);
                 return 0;
             }
             if (crit_ks) keyset_free(crit_ks);
@@ -27467,7 +27516,6 @@ igb_skip:
     } else if (agg_run_plan(&ctx, tree, db_root, object, &sch) != 0) {
         if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
         else if (ctx.budget_exceeded) OUT(QUERY_BUFFER_ERR);
-        free_criteria_tree(tree);
         agg_free(&ctx);
         return -1;
     }
@@ -27544,7 +27592,6 @@ igb_skip:
         }
 
         free(buckets);
-        free_criteria_tree(tree);
         free_criteria(having, nhaving);
         agg_free(&ctx);
         return 0;
@@ -27632,10 +27679,138 @@ igb_skip:
     }
 
     free(buckets);
-    free_criteria_tree(tree);
     free_criteria(having, nhaving);
     agg_free(&ctx);
     return 0;
+}
+
+int cmd_aggregate(const char *db_root, const char *object,
+                  const char *criteria_json, const char *group_by_json,
+                  const char *aggregates_json, const char *having_json,
+                  const char *order_by, int order_desc, int limit,
+                  const char *format, const char *delimiter, int want_total) {
+    if (!aggregates_json || aggregates_json[0] == '\0') {
+        OUT("{\"error\":\"Missing aggregates\"}\n");
+        return -1;
+    }
+
+    AggSpec *specs = NULL;
+    int nspecs = parse_agg_specs(aggregates_json, &specs);
+    if (nspecs == 0) {
+        OUT("{\"error\":\"No valid aggregates\"}\n");
+        free(specs);
+        return -1;
+    }
+
+    CriteriaNode *tree = NULL;
+    if (criteria_json && criteria_json[0]) {
+        const char *perr = NULL;
+        tree = parse_criteria_tree(criteria_json, &perr);
+        if (perr) {
+            OUT("{\"error\":\"bad criteria: %s\"}\n", perr);
+            free_criteria_tree(tree);
+            free(specs);
+            return -1;
+        }
+    }
+
+    int r = cmd_aggregate_do(db_root, object, tree, specs, nspecs,
+                            group_by_json, having_json,
+                            order_by, order_desc, limit,
+                            format, delimiter, want_total);
+    free_criteria_tree(tree);
+    free(specs);
+    return r;
+}
+
+int cmd_aggregate_tree(const char *db_root, const char *object,
+                       CriteriaNode *criteria_tree,
+                       const NqlAggSpec *aggs, int naggs,
+                       const char *group_by_csv,
+                       CriteriaNode *having_tree,
+                       const char *order_by, int order_desc, int limit,
+                       const char *format, const char *delimiter, int want_total) {
+    /* Convert NqlAggSpec[] to AggSpec[] */
+    AggSpec *specs = calloc(naggs, sizeof(AggSpec));
+    if (!specs) {
+        OUT("{\"error\":\"out of memory\"}\n");
+        return -1;
+    }
+    for (int i = 0; i < naggs; i++) {
+        if (strcmp(aggs[i].fn, "count") == 0) specs[i].fn = AGG_COUNT;
+        else if (strcmp(aggs[i].fn, "sum") == 0) specs[i].fn = AGG_SUM;
+        else if (strcmp(aggs[i].fn, "avg") == 0) specs[i].fn = AGG_AVG;
+        else if (strcmp(aggs[i].fn, "min") == 0) specs[i].fn = AGG_MIN;
+        else if (strcmp(aggs[i].fn, "max") == 0) specs[i].fn = AGG_MAX;
+        strncpy(specs[i].field, aggs[i].field, sizeof(specs[i].field) - 1);
+        if (aggs[i].field[0])
+            snprintf(specs[i].alias, sizeof(specs[i].alias), "%s_%s", aggs[i].fn, aggs[i].field);
+        else
+            strncpy(specs[i].alias, aggs[i].fn, sizeof(specs[i].alias) - 1);
+    }
+
+    /* Convert group_by_csv to group_by_json (JSON array) */
+    char group_by_buf[4096] = "[";
+    int gpos = 1;
+    if (group_by_csv && group_by_csv[0]) {
+        const char *p = group_by_csv;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p) break;
+            if (gpos > 1 && gpos < (int)sizeof(group_by_buf) - 1)
+                group_by_buf[gpos++] = ',';
+            group_by_buf[gpos++] = '"';
+            while (*p && *p != ',') {
+                if (gpos >= (int)sizeof(group_by_buf) - 2) break;
+                group_by_buf[gpos++] = *p++;
+            }
+            group_by_buf[gpos++] = '"';
+            if (*p == ',') p++;
+        }
+    }
+    group_by_buf[gpos] = ']';
+
+    /* Convert CriteriaNode *having_tree to having_json */
+    char having_buf[4096] = {0};
+    if (having_tree) {
+        int hpos = 0, hcount = 0;
+        having_buf[hpos++] = '[';
+        int n_nodes = (having_tree->kind == CNODE_AND) ? having_tree->n_children : 1;
+        for (int i = 0; i < n_nodes; i++) {
+            CriteriaNode *hn = (having_tree->kind == CNODE_AND) ? having_tree->children[i] : having_tree;
+            if (hn->kind != CNODE_LEAF) continue;
+            SearchCriterion *sc = &hn->leaf;
+            const char *op_str = "eq";
+            switch (sc->op) {
+                case OP_EQUAL:       op_str = "eq"; break;
+                case OP_NOT_EQUAL:   op_str = "neq"; break;
+                case OP_LESS:        op_str = "lt"; break;
+                case OP_GREATER:     op_str = "gt"; break;
+                case OP_LESS_EQ:     op_str = "lte"; break;
+                case OP_GREATER_EQ:  op_str = "gte"; break;
+                default: break;
+            }
+            int remain = (int)sizeof(having_buf) - hpos;
+            int n = snprintf(having_buf + hpos, remain,
+                            "%s{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\"}",
+                            hcount > 0 ? "," : "",
+                            sc->field, op_str, sc->value);
+            if (n > 0 && n < remain) hpos += n;
+            hcount++;
+        }
+        if (hpos + 2 <= (int)sizeof(having_buf)) {
+            having_buf[hpos++] = ']';
+            having_buf[hpos] = '\0';
+        }
+    }
+
+    int r = cmd_aggregate_do(db_root, object, criteria_tree, specs, naggs,
+                            group_by_buf,
+                            having_buf[0] ? having_buf : NULL,
+                            order_by, order_desc, limit,
+                            format, delimiter, want_total);
+    free(specs);
+    return r;
 }
 
 #ifdef TEST_BUILD
@@ -27780,4 +27955,5 @@ int composite_prefix_bound_for_test(const char *db_root, const char *object,
     return (int)len_hi;
 }
 #endif
+
 

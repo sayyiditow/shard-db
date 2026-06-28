@@ -4,6 +4,81 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.06.4
+
+Compact VARCHAR storage and Natural Query Language (NQL). **Run `./migrate`** after upgrading — it converts existing objects to VARIABLE format and compacts all segments to reclaim the space savings. New records are already written in compact form after upgrade, regardless of whether `./migrate` has run. Wire-compatible with 2026.06.3.
+
+### Storage: Compact VARCHAR (run `./migrate`)
+
+- **VARIABLE-format segments** — shard-db now stores typed records as exactly `24 + key_len + value_len` bytes in segment files, with no zero-padding to a fixed slot size. For typical varchar workloads where most field values are short, this can reduce segment file sizes by 50–90%.
+
+- **Trailing-zero trim on every write** — `typed_encode_trim_len()` walks the typed field layout from the end and computes the shortest prefix that fully encodes all non-zero fields. Zero fields at the end are omitted; the decoder fills them back as zero on read. Safe for all field types: zero = empty string (varchar), 0 (int/long/short), 0.0 (double), false (bool), epoch (date/datetime). Happens automatically on every INSERT / UPDATE / bulk-insert after upgrading.
+
+- **`compact` command** — rewrites all existing segment files for an object, applying the trim to every record. Needed to reclaim space from records written by older binary versions.
+
+  ```bash
+  # CLI (server must be stopped)
+  ./shard-db compact default stories
+
+  # JSON API (server running, requires rwx permission)
+  ./shard-db query '{"mode":"compact","dir":"default","object":"stories"}'
+  ```
+
+- **`./migrate` runs compact automatically** — Phase 2 of the migrate tool iterates all objects and calls compact on each one. Run once after upgrading:
+
+  ```bash
+  ./shard-db stop
+  ./migrate          # converts format + compacts all objects
+  ./shard-db start
+  ```
+
+  Idempotent — safe to re-run if interrupted.
+
+### Features: NQL wire protocol
+
+- **NQL wire protocol** — the server now accepts NQL on the same TCP port as JSON, detected by the first character of the request line: `{` = JSON, `f`/`c`/`a` = NQL (`find`/`count`/`aggregate`). Response framing (`\0\n` terminator, pipelining) is identical.
+
+- **NQL filter grammar** — a recursive-descent parser (`nql.c`) produces the same `CriteriaNode *` tree the JSON engine already uses. Full grammar:
+  - `and-expr` / `or-expr` with correct AND > OR precedence; parentheses for grouping.
+  - `BETWEEN value AND value` (the disambiguating `and` is consumed by `between`, not the logical combinator).
+  - `IN (v1, v2, ...)` / `NOT IN [v1, v2, ...]` with either bracket style.
+  - All 38 operators, including symbolic aliases (`=`, `!=`, `>`, `<`, `>=`, `<=`) and keyword aliases (`gt`, `lt`, `gte`, `lte`, `eq`, `neq`).
+  - Existence checks: `field exists` / `field not_exists`.
+  - String/regex ops: `contains`, `starts`, `ends`, `like`, `regex`, case-insensitive `i`-variants.
+  - Length ops: `len_eq`, `len_gt`, `len_lt`, `len_between`, `len_gte`, `len_lte`.
+  - Field-vs-field: `eq_field`, `neq_field`, `lt_field`, etc.
+  - Values: single-quoted strings, numbers, booleans, bare words.
+
+- **NQL command parser** — dispatches `find`, `count`, `aggregate` with flags:
+  - `find`: `--limit N`, `--offset N`, `--fields f1,f2`, `--order-by field[:dir]`, `--format json|rows|csv|dict`, `--auth token`
+  - `aggregate`: `--group-by f1,f2`, `--having filter`, `--order-by alias[:dir]`, `--limit N`
+  - Auth token via `--auth` for raw-TCP access from non-trusted IPs; CLI uses trusted-localhost.
+
+- **CLI `find` command** — new `./shard-db find <dir> <obj> [filter] [flags]` shortcut. Previously `find` was JSON-only via `./shard-db query '{...}'`.
+  - `./shard-db count` and `./shard-db aggregate` retain their existing positional JSON API and gain NQL auto-detection: if the criteria argument contains `(` (aggregate spec) or lacks `[`/`{`, it routes through NQL.
+
+- **NQL reference docs** — full grammar, operator table, normalization rules, TCP usage, and limitations at [`docs/query-protocol/nql.md`](../query-protocol/nql.md).
+
+### Examples
+
+```bash
+./shard-db find default users 'age > 25 and status = active' --limit 20
+./shard-db find default users 'status in (active,pending)' --fields name,email --format csv
+./shard-db count default orders 'total between 100 and 999 and paid = true'
+./shard-db aggregate default orders 'status = active' sum(amount),count() \
+  --group-by region --having 'count > 10' --order-by sum_amount:desc
+
+# TCP wire (server auto-detects)
+echo 'find default users "age > 25" --limit 5' | nc localhost 9199
+```
+
+### Internal
+
+- **Compact VARCHAR internals**: `typed_encode_trim_len(ts, buf, full_len)` walks the field table in reverse to find the last non-zero boundary; `schema_trim_fn` is the `SlotcaskTrimFn` adapter. `slotcask_compact(db, trim_fn, ctx)` replays every live record through the trim callback and rewrites segments atomically. `slotcask_compact_kf` rebuilds keyfile pointers after segments are rewritten.
+- New `src/db/nql.c` + `src/db/nql.h` — lexer, filter parser, aggregate spec parser, command tokenizer. No engine changes; NQL builds the same `CriteriaNode *` the JSON criteria path does.
+- `cmd_count_tree`, `cmd_find_tree`, `cmd_aggregate_tree` — new public wrappers that accept a pre-built `CriteriaNode *` directly, bypassing JSON criteria parsing. `cmd_count_do`, `cmd_find_do`, `cmd_aggregate_do` extracted as static helpers (callers own tree/spec memory; helpers borrow and do not free).
+- 9 new unit tests in `src/test/cases/test_nql.c` (nql-simple-filter, nql-find-command, nql-count-command, nql-aggregate-command, nql-and-or, nql-between, nql-in, nql-parse-errors, nql-flags).
+
 ## 2026.06.3
 
 Explain query mode, lock-free warm reads, and a reindex spill-file collision fix. No `./migrate` required; wire-compatible with 2026.06.2.

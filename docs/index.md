@@ -5,7 +5,7 @@ A high-performance database in C. Single static binary, single process, no exter
 ## What it is
 
 - **Typed records** — varchar, int/long/short, double/float, bool/byte, date, datetime, time, uuid, numeric (fixed-point), currency.
-- **Slotcask storage engine (v2)** — bitcask-style: per-object keyfile shards (`data/kf/NNN.kf`) hold 24-byte slot headers; values live in append-only segment files (`data/streams/NNN/NNNNNN.dat`) split across nproc-derived streams. Commits are a single atomic 8-byte store into the keyfile after the value lands on disk. Tombstoned slots feed a per-stream free pool so inline overwrites reuse holes (snake-game). Keyfile shards auto-resplit in-place at 75 % load; no global rehash, no per-shard ceiling.
+- **Slotcask storage engine (v2)** — bitcask-style: per-object keyfile shards (`data/kf/NNN.kf`) hold 24-byte slot headers; values live in append-only VARIABLE-format segment files (`data/streams/NNN/NNNNNN.dat`) split across nproc-derived streams. Records are stored as exactly `24 + key_len + value_len` bytes — trailing all-zero fields are trimmed on every write, shrinking varchar records by 50–90% on typical workloads. The `compact` command rewrites existing segments to apply the trim retroactively. Commits are a single atomic 8-byte store into the keyfile after the value lands on disk. Tombstoned slots feed a per-stream free pool so inline overwrites reuse holes (snake-game). Keyfile shards auto-resplit in-place at 75 % load; no global rehash, no per-shard ceiling.
 - **Three index types** — pick one per field:
     - **B+ tree** (default) — eq, range, prefix, all 38 operators. Single + composite (`field1+field2`). Per-shard prefix-compressed leaves at `indexes/<field>/NNN.idx`, `index_splits_for(splits)` files (non-linear curve, capped at 128 for `splits=4096`). Reads fan out across shards via the worker pool; writes route by record hash.
     - **Bitmap** (auto-default for `bool` + `enum`; opt-in via `field:bitmap` / `field:bitmap(N)` for low-cardinality varchar) — one dense bit per slot, per-distinct-value, at `indexes/<field>/NNN.bm`. Popcount fast paths for `eq`/`in`/`neq`/`not_in`; dict-scan for every other op. 1:1 shard layout with data.
@@ -44,7 +44,7 @@ A high-performance database in C. Single static binary, single process, no exter
 }'
 
 ./shard-db insert default users u1 '{"name":"Alice","email":"a@x.com","age":30}'
-./shard-db find default users '[{"field":"age","op":"gt","value":"25"}]'
+./shard-db find default users 'age > 25'   # NQL — human-readable filter
 ./shard-db stop
 ```
 
@@ -57,6 +57,7 @@ Dive deeper in the [Quick start](getting-started/quickstart.md).
 | Install and run shard-db | [Install](getting-started/install.md) · [Quick start](getting-started/quickstart.md) |
 | Understand the model | [Concepts](concepts/storage-model.md) |
 | Look up a CLI command | [CLI reference](cli/index.md) |
+| Query with human-readable filters (NQL) | [NQL reference](query-protocol/nql.md) |
 | Look up a JSON query | [Query protocol](query-protocol/overview.md) |
 | Deploy to production | [Operations → Deployment](operations/deployment.md) · [Tuning](operations/tuning.md) |
 | Find a limit or error | [Reference → Limits](reference/limits.md) · [Error codes](reference/error-codes.md) |

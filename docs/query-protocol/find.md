@@ -2,6 +2,8 @@
 
 The workhorse query mode. Filters records against a criteria array, with optional projection, sorting, pagination, and joins.
 
+> **Simpler alternative:** For interactive use, `./shard-db find <dir> <obj> 'age > 25 and status = active'` accepts [NQL filter syntax](nql.md) directly — no JSON criteria array needed.
+
 ## Shape
 
 ```json

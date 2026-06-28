@@ -1,4 +1,5 @@
 #include "types.h"
+#include "nql.h"
 #ifndef EMBED_NO_TLS
 #include "tls.h"
 #else
@@ -554,6 +555,80 @@ static int auto_key_generate(const Schema *sc, const char *db_root,
     }
     OUT("{\"error\":\"auto_key_generate called on AK_NONE object\"}\n");
     return -1;
+}
+
+/* ========== NQL DISPATCH ========== */
+
+static void dispatch_nql_query(const char *raw_db_root, const char *line,
+                                const char *client_ip) {
+    NqlCommand cmd;
+    if (nql_parse_command(line, &cmd) < 0) {
+        OUT("{\"error\":\"%s\"}\n", cmd.err);
+        return;
+    }
+
+    /* Auth — same precedence as JSON path */
+    if (!is_ip_trusted(client_ip)) {
+        if (!cmd.auth[0] || !is_authorized(cmd.auth, cmd.dir, cmd.obj, "find")) {
+            LOG_AUDIT(LOG_SUB_AUTH, "AUTH failed: ip=%s nql_mode=%d", client_ip, cmd.mode);
+            OUT("{\"error\":\"auth failed\"}\n");
+            nql_free_command(&cmd);
+            return;
+        }
+    }
+
+    /* Build db_root = g_db->db_root / dir */
+    char db_root[PATH_MAX];
+    snprintf(db_root, sizeof db_root, "%s/%s", raw_db_root, cmd.dir);
+
+    objlock_rdlock(db_root, cmd.obj);
+
+    switch (cmd.mode) {
+    case NQL_COUNT:
+        if (cmd.explain)
+            cmd_explain_tree(db_root, cmd.obj, cmd.filter,
+                             cmd.order_by[0] ? cmd.order_by : NULL, 0);
+        else
+            cmd_count_tree(db_root, cmd.obj, cmd.filter);
+        break;
+    case NQL_FIND:
+        if (cmd.explain) {
+            cmd_explain_tree(db_root, cmd.obj, cmd.filter,
+                             cmd.order_by[0] ? cmd.order_by : NULL, 1);
+        } else {
+            cmd_find_tree(db_root, cmd.obj, cmd.filter,
+                          cmd.offset, cmd.limit,
+                          cmd.fields[0]    ? cmd.fields    : NULL,
+                          cmd.format[0]    ? cmd.format    : NULL,
+                          NULL,            /* delimiter */
+                          cmd.order_by[0]  ? cmd.order_by  : NULL,
+                          cmd.order_dir[0] ? cmd.order_dir : NULL,
+                          0,
+                          cmd.cursor[0]    ? cmd.cursor    : NULL);
+        }
+        break;
+    case NQL_AGGREGATE:
+        if (cmd.explain) {
+            cmd_explain_tree(db_root, cmd.obj, cmd.filter,
+                             cmd.order_by[0] ? cmd.order_by : NULL, 0);
+            break;
+        }
+        cmd_aggregate_tree(db_root, cmd.obj,
+                           cmd.filter,
+                           cmd.aggs, cmd.naggs,
+                           cmd.group_by[0] ? cmd.group_by : NULL,
+                           cmd.having,
+                           cmd.order_by[0]  ? cmd.order_by  : NULL,
+                           cmd.order_dir[0] && strcmp(cmd.order_dir,"desc")==0,
+                           cmd.limit,
+                           cmd.format[0] ? cmd.format : NULL,
+                           NULL,  /* delimiter */
+                           0);
+        break;
+    }
+
+    objlock_rdunlock(db_root, cmd.obj);
+    nql_free_command(&cmd);
 }
 
 /* ========== JSON QUERY DISPATCH ========== */
@@ -2044,6 +2119,13 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         pthread_mutex_lock(&thread_count_lock);
         in_flight_writes++;
         pthread_mutex_unlock(&thread_count_lock);
+    }
+
+    /* NQL path: first char is f/c/a (find/count/aggregate), not '{' or '\x1F' */
+    if (!is_json && (trimmed[0]=='f' || trimmed[0]=='c' || trimmed[0]=='a') &&
+        !strchr(trimmed, '\x1F')) {
+        dispatch_nql_query(db_root, trimmed, client_ip);
+        goto timing;
     }
 
     if (is_json) {

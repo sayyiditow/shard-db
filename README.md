@@ -38,7 +38,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 | Server process (multi-client TCP) | **Yes** | Yes | Yes | No |
 | SQL | No | **Yes** | No | **Yes** |
 | Fixed typed schema | **Yes** | Yes | No | Yes |
-| JSON / TCP wire protocol | **Yes** | No | RESP / TCP | No |
+| JSON + NQL / TCP wire protocol | **Yes** | No | RESP / TCP | No |
 | Built-in TLS (single port) | **Yes** | Via libssl | Via libssl | No |
 | B+ tree range queries | **Yes** | Yes | Sorted sets | Yes |
 | Bitmap index (bool / enum) | **Yes** | No | Bitfields | No |
@@ -59,7 +59,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 | **Operators (38)** | eq / neq / range / between, like / contains / starts / ends, in / not_in, regex, exists, len_*, ilike / icontains, eq_field — all use the index when one is available. |
 | **Planner** | AND-intersection across 2+ indexed leaves without per-record fetch for `count`. Lock-free OR-union via KeySet. Rarest-first selection for trigram intersect. |
 | **Query features** | Inner + left joins, count/sum/avg/min/max aggregations with `group_by` + `having`, cursor pagination, CAS (`if` / `if_not_exists`, dry-run bulk ops). |
-| **Storage** | Per-shard btree layout (2026.05.1+) — writes route by hash, reads fan out across `splits/4` shards in parallel; k-way streaming merge for ordered queries. |
+| **Storage** | Per-shard btree layout, VARIABLE-format segments (2026.06.4+) — writes route by hash, reads fan out across `splits/4` shards in parallel; k-way streaming merge for ordered queries. Trailing-zero field trimming shrinks varchar records by 50–90% on typical workloads; `compact` command rewrites existing segments. |
 | **Multi-tenancy** | `dir` parameter + tokens scoped global / per-tenant / per-object × `r` / `rw` / `rwx` permissions. |
 | **Transport** | Native TLS 1.3 (single binary, single port, OpenSSL-backed) or reverse-proxy termination — both first-class. |
 | **Reliability** | Crash-safe (atomic flag-flip writes, msync on shutdown, recovery sweep at startup). External-merge-sort index build — bounded memory at any scale. |
@@ -70,7 +70,7 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 ## What it is not
 
 - **Not distributed.** Single-node, single-process. No built-in replication across hosts. Block-level replication (DRBD / BSR) is the recommended HA path and works transparently at the storage layer; application-level replication is on the roadmap.
-- **Not SQL.** The wire protocol is JSON-over-TCP; queries are JSON documents. This is intentional — the typed-record model gives the planner a fixed schema to optimise against rather than a general-purpose SQL parser.
+- **Not SQL.** The primary wire protocol is JSON-over-TCP; complex queries are JSON documents. For everyday reads, the [Natural Query Language (NQL)](docs/query-protocol/nql.md) lets you write `find default users 'age > 25'` directly — the server auto-detects NQL vs JSON on the same port. This is intentional — the typed-record model gives the planner a fixed schema to optimise against rather than a general-purpose SQL parser.
 - **Not Windows.** Linux x86_64 / ARM64 and macOS Apple Silicon only.
 
 ## Quick start
@@ -87,7 +87,7 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 }'
 
 ./shard-db insert default users u1 '{"name":"Alice","email":"a@x.com","age":30}'
-./shard-db find default users '[{"field":"age","op":"gt","value":"25"}]'
+./shard-db find default users 'age > 25'   # NQL — human-readable filter syntax
 ./shard-db stop
 ```
 

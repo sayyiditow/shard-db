@@ -307,14 +307,13 @@ int main(int argc, char *argv[]) {
        shard-db explain aggregate <dir> <obj> '[...]' [order_by_field] */
     if (strcmp(cmd, "explain") == 0) {
         if (argc < 6) {
-            fprintf(stderr, "Usage: shard-db explain find|count|aggregate <dir> <obj> <criteria> [order_by]\n");
+            fprintf(stderr, "Usage: shard-db explain find|count|aggregate <dir> <obj> '<filter>' [--order-by field[:dir]] [--limit N]\n");
             return 1;
         }
-        const char *subcmd  = argv[2];
-        const char *dir     = argv[3];
-        const char *object  = argv[4];
-        const char *criteria = argv[5];
-        const char *order_by = (argc > 6) ? argv[6] : NULL;
+        const char *subcmd = argv[2];
+        const char *dir    = argv[3];
+        const char *object = argv[4];
+        const char *filter = argv[5];
 
         if (strcmp(subcmd, "find") != 0 && strcmp(subcmd, "count") != 0 &&
             strcmp(subcmd, "aggregate") != 0) {
@@ -322,19 +321,26 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        char json[4096];
-        if (order_by) {
-            snprintf(json, sizeof(json),
-                "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\","
-                "\"criteria\":%s,\"order_by\":\"%s\",\"explain\":true}",
-                subcmd, dir, object, criteria, order_by);
-        } else {
-            snprintf(json, sizeof(json),
-                "{\"mode\":\"%s\",\"dir\":\"%s\",\"object\":\"%s\","
-                "\"criteria\":%s,\"explain\":true}",
-                subcmd, dir, object, criteria);
+        /* Build NQL string: "<subcmd> <dir> <obj> '<filter>' --explain [remaining flags]" */
+        char nql[8192];
+        snprintf(nql, sizeof(nql), "%s %s %s", subcmd, dir, object);
+        if (filter && filter[0]) {
+            strncat(nql, " '", sizeof(nql) - strlen(nql) - 1);
+            strncat(nql, filter, sizeof(nql) - strlen(nql) - 1);
+            strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
         }
-        return cmd_query_json(port, json);
+        strncat(nql, " --explain", sizeof(nql) - strlen(nql) - 1);
+        for (int i = 6; i < argc; i++) {
+            strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
+            if (strchr(argv[i], ' ')) {
+                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+            } else {
+                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+            }
+        }
+        return cmd_query_json(port, nql);
     }
     /* estimate-index <dir> <obj> <field>:trigram — sample 1024 records,
        project on-disk size for a hypothetical trigram index. Lets ops
@@ -374,6 +380,28 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "vacuum-check") == 0)
         return cmd_query_json(port, "{\"mode\":\"vacuum-check\"}");
 
+    /* find <dir> <obj> [filter] [--flags] — NQL query forwarded to server */
+    if (strcmp(cmd, "find") == 0) {
+        if (argc < 4) {
+            fprintf(stderr,
+                "Usage: shard-db find <dir> <obj> [filter] [--order-by f:dir] "
+                "[--limit N] [--offset N] [--fields f1,f2] [--format json|rows|csv]\n");
+            return 1;
+        }
+        char nql[8192] = {0};
+        for (int i = 1; i < argc; i++) {
+            if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
+            if (strchr(argv[i], ' ')) {
+                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+            } else {
+                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+            }
+        }
+        return cmd_query_json(port, nql);
+    }
+
     /* count <dir> <obj> [criteria_json] — debugging shortcut for the JSON query.
        criteria_json must be a JSON array like '[{"field":"age","op":"gt","value":"30"}]'.
        Empty/absent criteria returns the O(1) live count from metadata. */
@@ -381,6 +409,21 @@ int main(int argc, char *argv[]) {
         if (argc < 4) {
             fprintf(stderr, "Usage: shard-db count <dir> <obj> [criteria_json]\n");
             return 1;
+        }
+        /* NQL path: filter doesn't start with '[' or '{' */
+        if (argc >= 5 && argv[4][0] && argv[4][0] != '[' && argv[4][0] != '{') {
+            char nql[8192] = {0};
+            for (int i = 1; i < argc; i++) {
+                if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
+                if (strchr(argv[i], ' ')) {
+                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                } else {
+                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                }
+            }
+            return cmd_query_json(port, nql);
         }
         const char *crit = (argc >= 5 && argv[4][0]) ? argv[4] : NULL;
         size_t cap = strlen(argv[2]) + strlen(argv[3]) + (crit ? strlen(crit) : 0) + 128;
@@ -408,6 +451,21 @@ int main(int argc, char *argv[]) {
                 "Usage: shard-db aggregate <dir> <obj> <aggregates_json> "
                 "[group_by_csv] [criteria_json] [having_json]\n");
             return 1;
+        }
+        /* NQL path: aggregates arg contains '(' not '[' — e.g. sum(amount),count() */
+        if (argv[4][0] != '[') {
+            char nql[8192] = {0};
+            for (int i = 1; i < argc; i++) {
+                if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
+                if (strchr(argv[i], ' ')) {
+                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+                } else {
+                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                }
+            }
+            return cmd_query_json(port, nql);
         }
         const char *aggs = argv[4];
         const char *gb   = (argc >= 6 && argv[5][0]) ? argv[5] : NULL;

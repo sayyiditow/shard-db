@@ -2,6 +2,8 @@
 
 Group-by aggregations with `count`, `sum`, `avg`, `min`, `max`. Supports `having` (post-aggregation filter), `order_by`, and `limit`. Numbers are accumulated directly in typed form — no string round-trip.
 
+> **Simpler alternative:** `./shard-db aggregate default orders 'status = active' sum(amount),count() --group-by region` accepts [NQL syntax](nql.md) directly.
+
 ## Shape
 
 ```json

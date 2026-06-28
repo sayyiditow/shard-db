@@ -2,6 +2,8 @@
 
 Returns the number of records matching the criteria, without materializing any record values. Uses the same criteria shape as [`find`](find.md).
 
+> **Simpler alternative:** `./shard-db count <dir> <obj> 'age > 25'` accepts [NQL filter syntax](nql.md) directly.
+
 ## Shape
 
 ```json
