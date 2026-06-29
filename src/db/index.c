@@ -2793,6 +2793,7 @@ typedef struct {
     int                seg_start, seg_count;
     _Atomic int       *segs_done; /* progress counter (shared) */
     int                had_error;
+    uint8_t           *padded_value; /* ts->total_size bytes; zero-pads compact VARIABLE records */
 } SegScanWorker;
 
 /* Bitmap spill entry on disk: [u16 kf_shard][u16 vlen][vlen bytes][16B hash].
@@ -2813,7 +2814,14 @@ static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
     SegScanWorker *w = (SegScanWorker *)ctx;
     uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
     const uint8_t *value = rec + 24 + klen;
-    (void)vlen;
+    /* Compact VARIABLE records may be shorter than ts->total_size (trailing
+       zero fields trimmed). Pad to total_size so field access at tf->offset
+       is always safe — fields beyond vlen read back as zero. */
+    if (w->padded_value && vlen < (size_t)w->ts->total_size) {
+        memset(w->padded_value, 0, (size_t)w->ts->total_size);
+        if (vlen > 0) memcpy(w->padded_value, value, vlen);
+        value = w->padded_value;
+    }
     for (int fi = 0; fi < w->n_fields; fi++) {
         const MFFieldDesc *d = &w->descs[fi];
         if (d->type == MF_BITMAP) {
@@ -3119,6 +3127,10 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         workers[w].fields = calloc((size_t)n_fields, sizeof(MFWorkerField));
         workers[w].bm_writers = calloc((size_t)n_fields, sizeof(SpillWriter));
         if (!workers[w].fields || !workers[w].bm_writers) { alloc_ok = 0; break; }
+        if (sdb->format == SLOTCASK_FORMAT_VARIABLE && ts->total_size > 0) {
+            workers[w].padded_value = calloc(1, (size_t)ts->total_size);
+            if (!workers[w].padded_value) { alloc_ok = 0; break; }
+        }
         for (int fi = 0; fi < n_fields; fi++) workers[w].bm_writers[fi].fd = -1;
         for (int fi = 0; fi < n_fields && alloc_ok; fi++) {
             if (descs[fi].type == MF_BITMAP) continue;  /* bitmap → append file, no sort buffers */
@@ -3160,6 +3172,7 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         }
         free(workers[w].fields);
         free(workers[w].bm_writers);
+        free(workers[w].padded_value);
     }
     free(workers);
     free(segs);
