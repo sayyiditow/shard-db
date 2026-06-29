@@ -75,14 +75,24 @@ See [Concepts → Storage model](../concepts/storage-model.md) for what's actual
 ## 5. Find by indexed field
 
 ```bash
+# NQL — human-readable filter string (recommended for interactive use)
+./shard-db find default users 'age > 25'
+
+# Equivalent JSON criteria (for programmatic use or advanced options)
 ./shard-db find default users '[{"field":"age","op":"gt","value":"25"}]'
 ```
 
-Returns a JSON array of matching records. Because `age` is indexed, this is a 1–3 ms B+ tree range scan rather than a full shard scan. See [Query protocol → find](../query-protocol/find.md) for every option.
+Returns a JSON array of matching records. Because `age` is indexed, this is a 1–3 ms B+ tree range scan rather than a full shard scan.
+
+NQL supports the full filter grammar — AND/OR, BETWEEN, IN, string ops, and more. See [Query protocol → NQL](../query-protocol/nql.md) for the complete reference, or [Query protocol → find](../query-protocol/find.md) for JSON mode options.
 
 ## 6. Aggregate
 
 ```bash
+# NQL — inline aggregate spec
+./shard-db aggregate default users count(),avg(age) --group-by active
+
+# JSON mode — full control over aliases and criteria
 ./shard-db query '{
   "mode":"aggregate","dir":"default","object":"users",
   "group_by":["active"],
@@ -129,6 +139,7 @@ Files ride the same TCP socket as queries — no separate upload protocol. See [
 
 ## Where to go next
 
+- [Query protocol → NQL](../query-protocol/nql.md) — human-readable filter syntax for find / count / aggregate.
 - [Query protocol → Overview](../query-protocol/overview.md) — the full JSON API shape.
 - [Concepts → Typed records](../concepts/typed-records.md) — every field type + how defaults work.
 - [Concepts → Indexes](../concepts/indexes.md) — when a query uses an index, composite indexes, cost.

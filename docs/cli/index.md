@@ -29,11 +29,22 @@ All data-plane commands (anything besides `start`/`stop`/`status`/`server`) talk
 
 | Command | Args | Description |
 |---|---|---|
-| `find` | `<dir> <obj> '<criteria_json>' [offset] [limit] [fields]` | Search records. For `join`, `order_by`, `format`, etc. use [JSON mode](../query-protocol/find.md). |
-| `count` | `<dir> <obj> [criteria_json]` | Count matching records. Omit criteria for the O(1) metadata count. |
-| `aggregate` | `<dir> <obj> '<aggregates_json>' [group_by_csv] [criteria_json] [having_json]` | Group + aggregate. `group_by` is a comma-separated field list; leave intermediate slots empty (`''`) to skip them. |
+| `find` | `<dir> <obj> [filter] [--limit N] [--offset N] [--fields f1,f2] [--order-by f[:dir]] [--format json\|rows\|csv]` | Search records using NQL filter syntax. For `join`, cursor pagination, or dict format, use [JSON mode](../query-protocol/find.md). |
+| `count` | `<dir> <obj> [filter\|criteria_json]` | Count matching records. Omit filter for the O(1) metadata count. Accepts either NQL filter string or JSON criteria array. |
+| `aggregate` | `<dir> <obj> [filter] <agg-list> [--group-by f1,f2] [--having filter] [--order-by alias[:dir]] [--limit N]` | Group + aggregate using NQL syntax. For JSON mode with full alias control, use [JSON mode](../query-protocol/aggregate.md). |
 | `keys` | `<dir> <obj> [offset] [limit]` | List keys, paginated. |
 | `fetch` | `<dir> <obj> [offset] [limit] [fields]` | Paginated full scan with optional field projection. Use JSON mode for keyset `cursor` pagination. |
+
+### NQL filter examples
+
+```bash
+./shard-db find default users 'age > 25'
+./shard-db find default users 'status = active and age between 18 and 65' --limit 20 --fields name,email
+./shard-db count default users 'status in (active,pending)'
+./shard-db aggregate default orders 'status = active' sum(amount),count() --group-by region
+```
+
+See the [NQL reference](../query-protocol/nql.md) for the full grammar and operator list.
 
 ## Bulk
 
@@ -67,6 +78,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | Command | Args | Description |
 |---|---|---|
 | `vacuum` | `<dir> <obj>` | Fast in-place tombstone reclaim (no schema changes). For compact/reshard, use [JSON mode](../query-protocol/schema-mutations.md). |
+| `compact` | `<dir> <obj>` | Offline VARCHAR compaction — rewrites all VARIABLE-format segments, trimming trailing zero bytes from every record. Reclaims the space saved by switching from fixed-width slots to the VARIABLE format. Run once after `./migrate` on upgrade. Requires the server to be stopped. |
 | `recount` | `<dir> <obj>` | Rescans shards and rewrites the cached `counts` file. |
 | `truncate` | `<dir> <obj>` | Delete all records. Schema + indexes survive. |
 | `backup` | `<dir> <obj>` | Copy the object's data + metadata + indexes to a timestamped backup directory. |

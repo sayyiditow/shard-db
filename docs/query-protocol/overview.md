@@ -1,10 +1,24 @@
 # Query protocol overview
 
-shard-db speaks one wire protocol: **newline-delimited JSON over TCP**. Every request is a JSON object on a single line terminated by `\n`; every response is terminated by `\0\n` (NUL byte + newline).
+shard-db accepts two query formats on the same TCP port: **JSON** (full expressiveness) and **NQL** (human-readable shorthand for `find` / `count` / `aggregate`). Both are newline-delimited, both respond with `\0\n`.
+
+## Natural Query Language (NQL)
+
+For interactive use and scripting, NQL is the simpler path:
+
+```bash
+# CLI
+./shard-db find default users 'age > 25 and status = active' --limit 20
+
+# Raw TCP — server auto-detects NQL when the line starts with f/c/a (not '{')
+echo 'find default users "age > 25 and status = active" --limit 20' | nc localhost 9199
+```
+
+NQL supports AND/OR, BETWEEN, IN/NOT_IN, string ops, all 38 operators, and aggregate specs. Full reference: [Query protocol → NQL](nql.md).
 
 ## Wire format
 
-### Request
+### JSON request
 
 ```
 {"mode":"...","dir":"...",...}\n
@@ -13,6 +27,18 @@ shard-db speaks one wire protocol: **newline-delimited JSON over TCP**. Every re
 - One JSON object per line. No comments, no trailing comma.
 - Maximum per-request size = `MAX_REQUEST_SIZE` (default 32 MB). Oversized requests are rejected with `{"error":"Request too large (max N bytes)"}`.
 - You can pipeline multiple requests on the same connection — the server processes them in order.
+
+### NQL request
+
+```
+find <dir> <obj> [filter] [--flags]\n
+count <dir> <obj> [filter]\n
+aggregate <dir> <obj> [filter] <agg-list> [--flags]\n
+```
+
+- One NQL command per line, exactly as you'd type it on the CLI.
+- The server distinguishes JSON from NQL by the first character: `{` = JSON, `f`/`c`/`a` = NQL.
+- Response framing is identical to JSON (`\0\n` terminator).
 
 ### Response
 
@@ -64,6 +90,9 @@ Any query can override the global `TIMEOUT` (db.env) for itself:
 Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or absent → falls back to the global. Use it to give specific callers tighter deadlines without reconfiguring the server.
 
 ## Modes at a glance
+
+### Natural Query Language (NQL shorthand)
+- [`find` / `count` / `aggregate` via NQL](nql.md) — human-readable filter syntax; server auto-detects on the same port as JSON
 
 ### Data operations
 - [`get`](#get), `insert`, `update`, `delete`, `exists`, `not-exists`, `size` — per-record CRUD and existence checks
