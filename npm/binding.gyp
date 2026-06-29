@@ -19,6 +19,7 @@
         "../src/db/io_direct.c",
         "../src/db/bitmap.c",
         "../src/db/trigram.c",
+        "../src/db/nql.c",
         "../src/db/tls_stub.c",
         "../src/db/embedded.c"
       ],
