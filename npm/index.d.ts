@@ -158,6 +158,9 @@ declare namespace ShardDb {
     | { mode: 'migrate'
         dir: string; object: string }
 
+    | { mode: 'compact'
+        dir: string; object: string }
+
     | { mode: 'stats' }
 
     // ── Single-record update ──────────────────────────────────────────────

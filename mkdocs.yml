@@ -95,6 +95,7 @@ nav:
       - All commands: cli/index.md
   - Query protocol:
       - Overview: query-protocol/overview.md
+      - NQL: query-protocol/nql.md
       - find: query-protocol/find.md
       - count: query-protocol/count.md
       - aggregate: query-protocol/aggregate.md
