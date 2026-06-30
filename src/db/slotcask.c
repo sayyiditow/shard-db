@@ -5839,6 +5839,7 @@ typedef struct {
     size_t      free_count;
     size_t      free_idx;
     int         rc;
+    uint32_t    kf_lookup_failed; /* live records where kf lookup returned -1 */
 } CompactOdCtx;
 
 /* od_record_cb adapter: called by seg_scan_o_direct for each live donor slot.
@@ -5879,11 +5880,24 @@ static int compact_od_cb(const uint8_t *rec, size_t vlen,
     int lr = kf_lookup_with_slot(&kh, hash16, key, klen, c->db->data_dir,
                                   &cur_flag, &cur_sid, &cur_fid,
                                   &cur_off, &kf_slot_idx);
-    if (lr != 0 || (int)cur_sid != c->stream_id ||
-        (uint32_t)cur_fid != c->donor_fid) {
-        /* Orphan (lr!=0) or already repointed (cur_fid != donor_fid):
-           recipient slot was written but kf won't point to it — the slot
-           becomes a recoverable orphan, same as the original mmap path. */
+    if (lr != 0) {
+        size_t cap = kh.capacity;
+        size_t kstart = kf_slot_for(hash16, cap);
+        for (size_t ki = 0; ki < cap; ki++) {
+            size_t kslot = (kstart + ki) % cap;
+            SlotcaskKfEntry *ke = &kh.map[kslot];
+            if (ke->flag == 0) break;
+            if (memcmp(ke->hash, hash16, 16) == 0) {
+                if (ke->flag == 1) c->kf_lookup_failed++;
+                break;
+            }
+        }
+        kfcache_release(&kh);
+        c->free_idx++;
+        return 0;
+    }
+    if ((int)cur_sid != c->stream_id || (uint32_t)cur_fid != c->donor_fid) {
+        /* Already repointed elsewhere (legitimate orphan). */
         kfcache_release(&kh);
         c->free_idx++;
         return 0;
@@ -5909,6 +5923,7 @@ typedef struct {
     size_t      free_count;
     size_t      free_next;   /* next index to try (cached linear scan position) */
     int         rc;
+    uint32_t    kf_lookup_failed; /* live records where kf lookup returned -1 */
 } VarlenCompactCtx;
 
 /* Callback for varlen compaction: find a free recipient slot with capacity
@@ -5973,8 +5988,28 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
     int lr = kf_lookup_with_slot(&kh, hash16, key, klen, c->db->data_dir,
                                   &cur_flag, &cur_sid, &cur_fid,
                                   &cur_off, &kf_slot_idx);
-    if (lr != 0 || (int)cur_sid != c->stream_id ||
-        (uint32_t)cur_fid != c->donor_fid) {
+    if (lr != 0) {
+        /* Lookup failed: check whether a live kf entry exists for this hash.
+           If yes, the entry's stored segment location is inaccessible (file
+           missing or corrupt) — count this as a failed update so the donor
+           is not deleted.  If the hash has no live entry (deleted or unknown),
+           it is a legitimate orphan and we skip silently. */
+        size_t cap = kh.capacity;
+        size_t kstart = kf_slot_for(hash16, cap);
+        for (size_t ki = 0; ki < cap; ki++) {
+            size_t kslot = (kstart + ki) % cap;
+            SlotcaskKfEntry *ke = &kh.map[kslot];
+            if (ke->flag == 0) break;
+            if (memcmp(ke->hash, hash16, 16) == 0) {
+                if (ke->flag == 1) c->kf_lookup_failed++;
+                break;
+            }
+        }
+        kfcache_release(&kh);
+        return 0;
+    }
+    if ((int)cur_sid != c->stream_id || (uint32_t)cur_fid != c->donor_fid) {
+        /* Already repointed elsewhere (legitimate orphan). */
         kfcache_release(&kh);
         return 0;
     }
@@ -5991,7 +6026,8 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
    with each live record forwarded to varlen_compact_cb. */
 static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
                                            uint32_t donor_fid,
-                                           uint32_t recipient_fid) {
+                                           uint32_t recipient_fid,
+                                           uint32_t *out_kf_failed) {
     char donor_path[PATH_MAX], recipient_path[PATH_MAX];
     seg_path_for(donor_path, db->data_dir, stream_id, donor_fid);
     seg_path_for(recipient_path, db->data_dir, stream_id, recipient_fid);
@@ -6053,6 +6089,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         .rmap = rh.map, .rmap_size = rmap_size,
         .free_offs = free_offs, .free_caps = free_caps,
         .free_count = free_count, .free_next = 0, .rc = 0,
+        .kf_lookup_failed = 0,
     };
 
     /* Scan donor using the fixed O_DIRECT scanner with db->slot_size.
@@ -6099,6 +6136,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         segcache_release(&dh);
     }
 
+    if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
     free(free_offs);
     free(free_caps);
     segcache_release(&rh);
@@ -6106,7 +6144,8 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
 }
 
 static int compact_migrate_records(SlotcaskDb *db, int stream_id,
-                                    uint32_t donor_fid, uint32_t recipient_fid) {
+                                    uint32_t donor_fid, uint32_t recipient_fid,
+                                    uint32_t *out_kf_failed) {
     char donor_path[PATH_MAX], recipient_path[PATH_MAX];
     seg_path_for(donor_path, db->data_dir, stream_id, donor_fid);
     seg_path_for(recipient_path, db->data_dir, stream_id, recipient_fid);
@@ -6146,9 +6185,11 @@ static int compact_migrate_records(SlotcaskDb *db, int stream_id,
         .rmap = rh.map,
         .free_offs = free_offs, .free_count = free_count,
         .free_idx = 0, .rc = 0,
+        .kf_lookup_failed = 0,
     };
     seg_scan_o_direct(donor_path, slot_size, compact_od_cb, &ctx);
 
+    if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
     free(free_offs);
     segcache_release(&rh);
     return ctx.rc;
@@ -6247,10 +6288,14 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
         }
         uint32_t recip_free = files[j].total_slots - files[j].live_count;
         if (recip_free >= files[i].live_count) {
+            uint32_t kf_failed = 0;
             if (compact_migrate_records(db, stream_id,
-                                          files[i].file_id, files[j].file_id) == 0) {
-                if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                    dropped++;
+                                          files[i].file_id, files[j].file_id,
+                                          &kf_failed) == 0) {
+                if (kf_failed == 0) {
+                    if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
+                        dropped++;
+                }
                 files[j].live_count += files[i].live_count;
             }
             i++;
@@ -6331,11 +6376,20 @@ static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
         }
         uint32_t recip_free = files[j].total_slots - files[j].live_count;
         if (recip_free >= files[i].live_count) {
+            uint32_t kf_failed = 0;
             if (compact_migrate_records_varlen(db, stream_id,
                                                 files[i].file_id,
-                                                files[j].file_id) == 0) {
-                if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                    dropped++;
+                                                files[j].file_id,
+                                                &kf_failed) == 0) {
+                /* Only delete donor if every live kf entry that referenced it
+                   was successfully repointed.  kf_failed > 0 means at least
+                   one live kf entry exists for a record in this donor but
+                   verify_stored_key could not reach its backing file — the
+                   donor must be preserved so rebuild-kf can recover it. */
+                if (kf_failed == 0) {
+                    if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
+                        dropped++;
+                }
                 files[j].live_count += files[i].live_count;
             }
             i++;
@@ -6347,6 +6401,141 @@ static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
 
     free(files);
     return dropped;
+}
+
+/* File-id comparator for qsort (ascending). */
+static int cmp_fid_asc(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Rebuild the kf for every live segment record.
+ *
+ * Scans ALL segment files for all streams in ascending file_id order.
+ * For each flag=1 (live) record, probes the corresponding kf shard by
+ * hash alone (no segment re-read) and repoints the entry to the current
+ * (stream_id, file_id, offset).  Processing in ascending file_id order
+ * ensures the final kf entry for each key points to the highest-file_id
+ * occurrence, which is the most recent version.
+ *
+ * Invariants:
+ *   - Caller must hold the per-object write lock (objlock_wrlock).
+ *   - Skips kf entries with flag=2 (tombstone) — deleted keys stay deleted.
+ *   - Skips keys not found in kf (no ghost insertions).
+ *   - After scan, invalidates kfcache for the object so callers see new pointers.
+ *
+ * Returns the number of kf entries actually updated (changed to a different
+ * stream_id/file_id/offset).  Returns -1 on a fatal allocation error.
+ */
+int slotcask_rebuild_kf(SlotcaskDb *db) {
+    if (!db) return 0;
+    int total_repaired = 0;
+
+    for (int s = 0; s < db->num_streams; s++) {
+        char stream_dir[PATH_MAX];
+        stream_dir_for(stream_dir, db->data_dir, s);
+
+        DIR *dh = opendir(stream_dir);
+        if (!dh) continue;
+
+        uint32_t *fids = NULL;
+        size_t nfids = 0, fcap = 0;
+        struct dirent *de;
+        while ((de = readdir(dh)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            size_t nlen = strlen(de->d_name);
+            if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
+            uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
+            if (nfids == fcap) {
+                size_t nc = fcap ? fcap * 2 : 16;
+                uint32_t *t = realloc(fids, nc * sizeof(uint32_t));
+                if (!t) { free(fids); closedir(dh); return -1; }
+                fids = t; fcap = nc;
+            }
+            fids[nfids++] = fid;
+        }
+        closedir(dh);
+        if (nfids == 0) { free(fids); continue; }
+
+        qsort(fids, nfids, sizeof(uint32_t), cmp_fid_asc);
+
+        for (size_t fi = 0; fi < nfids; fi++) {
+            char seg_path[PATH_MAX];
+            seg_path_for(seg_path, db->data_dir, s, fids[fi]);
+            SlotcaskSegHandle sh;
+            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+
+            size_t off = 0;
+            size_t file_size = sh.map_size;
+
+            while (off + 24 <= file_size) {
+                const uint8_t *rec = sh.map + off;
+                uint8_t  flag = rec[18];
+                uint16_t klen;
+                uint32_t vlen;
+                memcpy(&klen, rec + 16, 2);
+                memcpy(&vlen, rec + 20, 4);
+
+                size_t rec_size;
+                if (db->format == SLOTCASK_FORMAT_VARIABLE) {
+                    rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
+                } else {
+                    rec_size = (size_t)db->slot_size;
+                }
+                if (off + rec_size > file_size) break;
+
+                if (flag == 1) {
+                    const uint8_t *hash16 = rec;
+                    int kfshard = shard_for_hash(hash16, db->num_shards);
+                    char kfp[PATH_MAX];
+                    kf_path_for(kfp, db->data_dir, kfshard);
+                    SlotcaskKfHandle kh;
+                    if (kfcache_acquire(&kh, kfp, db->slots_per_shard, 1) == 0) {
+                        /* Match kf entries by hash only — no key re-fetch from
+                           segment.  xxh128 collisions are negligible; a segment
+                           record with a corrupted hash field could theoretically
+                           repoint an unrelated live entry.  Acceptable: this is
+                           a recovery-only operation invoked explicitly by an
+                           operator. */
+                        size_t cap = kh.capacity;
+                        size_t kstart = kf_slot_for(hash16, cap);
+                        for (size_t ki = 0; ki < cap; ki++) {
+                            size_t kslot = (kstart + ki) % cap;
+                            SlotcaskKfEntry *ke = &kh.map[kslot];
+                            if (ke->flag == 0) break; /* probe chain end */
+                            if (memcmp(ke->hash, hash16, 16) != 0) continue;
+                            if (ke->flag == 1) {
+                                /* Only update if location differs. */
+                                if (ke->stream_id != (uint8_t)s ||
+                                    ke->file_id   != (uint16_t)fids[fi] ||
+                                    ke->offset    != (uint32_t)off) {
+                                    kf_repoint_at_slot(&kh, kslot,
+                                                        (uint8_t)s,
+                                                        (uint16_t)fids[fi],
+                                                        (uint32_t)off);
+                                    total_repaired++;
+                                }
+                            }
+                            /* flag=2: deleted key — leave tombstone intact. */
+                            break;
+                        }
+                        kfcache_release(&kh);
+                    }
+                }
+
+                off += rec_size;
+            }
+
+            segcache_release(&sh);
+        }
+
+        free(fids);
+    }
+
+    /* Flush kf cache so subsequent reads pick up the new pointers. */
+    kfcache_invalidate_prefix(db->data_dir);
+
+    return total_repaired;
 }
 
 /* Public entry point. Caller must hold objlock_wrlock for the object. */

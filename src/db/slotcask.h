@@ -296,6 +296,9 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
+/* Rebuild kf from segment scan.  Caller holds objlock_wrlock.
+   Returns number of entries repaired, or -1 on fatal error. */
+int  slotcask_rebuild_kf(SlotcaskDb *db);
 
 /* Migrate an object's segment files from fixed-size to variable-length format.
    Daemon must be stopped. Uses atomic rename: writes to streams.new/ + kf.new/,

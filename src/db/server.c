@@ -291,7 +291,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         if (strcmp(mode, srv[i]) == 0) return ADMIN_SERVER;
     if (strcmp(mode, "create-object") == 0) return ADMIN_TENANT;
     static const char *obj[] = {
-        "truncate", "vacuum", "backup", "recount",
+        "truncate", "vacuum", "backup", "recount", "rebuild-kf",
         "add-field", "edit-field", "remove-field", "rename-field",
         "add-index", "remove-index",
         "drop-object",
@@ -1853,6 +1853,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             else cmd_remove_fields(db_root, object, names, nnames);
             free(fields_arr);
         }
+    } else if (strcmp(mode, "rebuild-kf") == 0) {
+        cmd_rebuild_kf(db_root, object);
     } else if (strcmp(mode, "recount") == 0) {
         cmd_recount(db_root, object);
     } else if (strcmp(mode, "shard-stats") == 0) {
@@ -2240,6 +2242,8 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "vacuum") == 0) {
         /* Legacy fast path always does fast in-place vacuum; JSON mode carries the flags. */
         cmd_vacuum(eff_root, object, 0, 0);
+    } else if (strcasecmp(cmd, "rebuild-kf") == 0) {
+        cmd_rebuild_kf(eff_root, object);
     } else if (strcasecmp(cmd, "recount") == 0) {
         cmd_recount(eff_root, object);
     } else if (strcasecmp(cmd, "truncate") == 0) {

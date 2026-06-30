@@ -1198,6 +1198,7 @@ int rebuild_object(const char *db_root, const char *object,
                    char added_lines[][256], int n_added,
                    int new_streams_arg);
 int cmd_recount(const char *db_root, const char *object);
+int cmd_rebuild_kf(const char *db_root, const char *object);
 int cmd_shard_stats(const char *db_root, const char *object, int as_table);
 int cmd_truncate(const char *db_root, const char *object);
 int cmd_backup(const char *db_root, const char *object);
