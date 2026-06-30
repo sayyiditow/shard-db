@@ -113,8 +113,8 @@ int main(int argc, char **argv) {
     if (load_db_root("db.env", db_root, sizeof(db_root)) < 0) return 1;
     fprintf(stdout, "migrate: DB_ROOT=%s\n", db_root);
 
-    /* Phase 1/2: varlen segment migration (offline). */
-    fprintf(stdout, "migrate: phase 1/2 — varlen segment migration (offline)\n");
+    /* Phase 1/3: varlen segment migration (offline). */
+    fprintf(stdout, "migrate: phase 1/3 — varlen segment migration (offline)\n");
 
     SchemaEntry *objects = NULL;
     int n_objects = 0;
@@ -140,8 +140,26 @@ int main(int argc, char **argv) {
     if (n_objects == 0)
         fprintf(stdout, "migrate:   no objects in schema.conf, nothing to migrate\n");
 
-    /* Phase 2/2: compact — trim trailing zero fields from migrated records. */
-    fprintf(stdout, "migrate: phase 2/2 — compact (trim zero fields)\n");
+    /* Phase 2/3: rebuild-kf — repair any kf entries corrupted by a prior
+       buggy compact run.  Idempotent: objects with clean kf return repaired=0
+       almost immediately.  Must run before compact so we fix pointers before
+       the compact guard inspects them. */
+    fprintf(stdout, "migrate: phase 2/3 — rebuild-kf (repair corrupted kf entries)\n");
+    for (int i = 0; i < n_objects; i++) {
+        char cmd1[PATH_MAX + 512];
+        snprintf(cmd1, sizeof(cmd1), "./shard-db rebuild-kf %s %s",
+                 objects[i].dir, objects[i].obj);
+        fprintf(stdout, "migrate:   rebuild-kf %s/%s\n", objects[i].dir, objects[i].obj);
+        fflush(stdout);
+        int rc1 = system(cmd1);
+        if (rc1 != 0) {
+            fprintf(stderr, "migrate: rebuild-kf failed for %s/%s (rc=%d) — skipping\n",
+                    objects[i].dir, objects[i].obj, rc1);
+        }
+    }
+
+    /* Phase 3/3: compact — trim trailing zero fields from migrated records. */
+    fprintf(stdout, "migrate: phase 3/3 — compact (trim zero fields)\n");
     for (int i = 0; i < n_objects; i++) {
         char cmd2[PATH_MAX + 512];
         snprintf(cmd2, sizeof(cmd2), "./shard-db compact %s %s",
@@ -155,6 +173,13 @@ int main(int argc, char **argv) {
                     objects[i].dir, objects[i].obj, rc2);
         }
     }
+    /* Write sentinel so embedded startup skips rebuild-kf for this db_root
+       (it was already done here). */
+    char kf_sentinel[PATH_MAX];
+    snprintf(kf_sentinel, sizeof(kf_sentinel), "%s/.kf_rebuild_done", db_root);
+    FILE *sf = fopen(kf_sentinel, "w");
+    if (sf) fclose(sf);
+
     free(objects);
 
     fprintf(stdout, "migrate: complete\n");

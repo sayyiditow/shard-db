@@ -39,6 +39,15 @@ declare class ShardDb {
    */
   migrate(dir: string, object: string): Promise<string>
 
+  /**
+   * Repair corrupted kf (key-file) entries by rescanning all segment files.
+   * Idempotent — objects with clean kf return `{"status":"ok","repaired":0}` immediately.
+   * Resolves to `{"status":"ok","repaired":N}` where N is the number of entries fixed,
+   * or `{"error":"..."}` on failure.
+   * Call once per object after upgrading from a release prior to the compact-kf-fix.
+   */
+  rebuildKf(dir: string, object: string): Promise<string>
+
   /** Close the database and release all resources. */
   close(): void
 }
@@ -156,6 +165,9 @@ declare namespace ShardDb {
         dir: string; object: string }
 
     | { mode: 'migrate'
+        dir: string; object: string }
+
+    | { mode: 'rebuild-kf'
         dir: string; object: string }
 
     | { mode: 'compact'

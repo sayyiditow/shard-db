@@ -5404,6 +5404,7 @@ typedef struct {
     int               *new_to_old;
     int                slot_changed;
     int                live_count;
+    int                skipped;
     int                error;
     /* Per-new-field backfill state; indexed by new_ts field index.
        Entries for fields that don't need backfill have kind=DK_NONE. */
@@ -5535,7 +5536,10 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
         /* Layout unchanged (e.g., splits-only resplit). Re-insert the
            record bytes verbatim. */
         if (slotcask_insert(ctx->new_db, -1, key, klen, value, vlen) != 0) {
-            ctx->error = 1; return 1;
+            LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: insert failed for record %d (klen=%zu vlen=%zu), skipping",
+                     ctx->live_count + ctx->skipped + 1, klen, vlen);
+            ctx->skipped++;
+            return 0;
         }
         ctx->live_count++;
         return 0;
@@ -5642,7 +5646,12 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
     int rc = slotcask_insert(ctx->new_db, -1, key, klen,
                               buf, ctx->new_ts->total_size);
     free(buf);
-    if (rc != 0) { ctx->error = 1; return 1; }
+    if (rc != 0) {
+        LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: insert failed for record %d (klen=%zu), skipping",
+                 ctx->live_count + ctx->skipped + 1, klen);
+        ctx->skipped++;
+        return 0;
+    }
     ctx->live_count++;
     return 0;
 }
@@ -5772,7 +5781,10 @@ static int rebuild_object_v2(const char *db_root, const char *object,
 
     slotcask_walk_live(&legacy_db, v2_rebuild_walk_cb, &walk_ctx);
     int live_count = walk_ctx.live_count;
+    int skipped    = walk_ctx.skipped;
     int walk_err   = walk_ctx.error;
+    if (skipped > 0)
+        LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: skipped %d records due to insert failure", skipped);
     free(walk_ctx.backfill);
     walk_ctx.backfill = NULL;
 
@@ -5780,8 +5792,17 @@ static int rebuild_object_v2(const char *db_root, const char *object,
     slotcask_close(&new_db);
 
     if (walk_err) {
-        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: walk error after %d records", live_count);
-        OUT("{\"error\":\"Rebuild walk failed; %s/.rebuild_legacy_root preserved\"}\n", obj_dir);
+        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: walk error after %d records; restoring original data",
+                  live_count);
+        rmrf(data_dir);
+        if (rename(legacy_data_under_root, data_dir) != 0) {
+            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: restore failed: %s — original at %s",
+                      strerror(errno), legacy_root);
+            OUT("{\"error\":\"Rebuild walk failed; restore also failed — original at .rebuild_legacy_root\"}\n");
+        } else {
+            rmrf(legacy_root);
+            OUT("{\"error\":\"Rebuild walk failed; original data restored\"}\n");
+        }
         return 1;
     }
 
