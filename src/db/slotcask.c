@@ -2480,8 +2480,9 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         if (id < 0) continue;
         if (n_ids == cap_ids) {
             cap_ids = cap_ids ? cap_ids * 2 : 64;
-            ids = realloc(ids, cap_ids * sizeof(int));
-            if (!ids) { closedir(d); return -1; }
+            int *nids = realloc(ids, cap_ids * sizeof(int));
+            if (!nids) { free(ids); closedir(d); return -1; }
+            ids = nids;
         }
         ids[n_ids++] = id;
     }
