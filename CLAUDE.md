@@ -87,7 +87,7 @@ shard-db is a high-performance database in C. Single static binary, single proce
 ./build/bin/shard-db-test list                    # list registered cases
 ```
 
-C test cases live under `src/test/cases/test_*.c` (34 cases, ~1000 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
+C test cases live under `src/test/cases/test_*.c` (222 cases, ~4900 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
 
 Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`. **The user runs benches**; do not run them to validate perf.
 
@@ -200,6 +200,7 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./shard-db size <dir> <obj>                                     # disk bytes used by the object (all data + index files); same as du -sb
 ./shard-db orphaned <dir> <obj>                                 # deleted record count (O(1) metadata)
 ./shard-db recount | truncate | vacuum | backup <dir> <obj>
+./shard-db rebuild-kf <dir> <obj>                               # repair corrupted/dangling kf entries by rescanning segments; idempotent
 ./shard-db add-index <dir> <obj> <field> [-f]                   # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>
 ./shard-db edit-field <dir> <obj> <name:type[:param]>           # same-type only, v2 only; JSON form covers batch
@@ -249,7 +250,7 @@ All advanced queries: `./shard-db query '<json>'`. Wire format: newline-delimite
 | `bulk-insert / bulk-delete / bulk-update` | [bulk.md](docs/query-protocol/bulk.md) |
 | `insert / update / delete` with `if` / `if_not_exists` (CAS) | [cas.md](docs/query-protocol/cas.md) |
 | `put-file / get-file / delete-file / list-files / get-file-path` | [files.md](docs/query-protocol/files.md) |
-| `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
+| `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index / rebuild-kf` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
 | `add-token / remove-token / list-tokens / add-ip / remove-ip / list-ips / stats / shard-stats / vacuum-check / list-objects / describe-object` | [diagnostics.md](docs/query-protocol/diagnostics.md) |
 | `create-object / drop-object` | [overview.md](docs/query-protocol/overview.md) |
 

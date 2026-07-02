@@ -99,7 +99,8 @@ static int test_schema_export_run(void) {
     ASSERT_NOT_NULL(manifest, "manifest read");
     if (!manifest) { tc_close(tc); test_env_stop(&env); return 1; }
 
-    ASSERT_CONTAINS(manifest, "\"version\"", "manifest has version field");
+    ASSERT_TRUE(strstr(manifest, "\"version\"") == NULL,
+                "manifest has no version field (unused by import, removed 2026.07.1)");
     ASSERT_CONTAINS(manifest, "\"dirs\"", "manifest has dirs[]");
     ASSERT_CONTAINS(manifest, "\"objects\"", "manifest has objects[]");
     ASSERT_CONTAINS(manifest, "\"default\"", "default tenant present");
@@ -122,8 +123,8 @@ static int test_schema_export_run(void) {
     /* === STDOUT FORM === */
     char *stdout_man = tu_capture_cmd("cd %s && %s export-schema 2>/dev/null",
                                    base, shard_db_abs);
-    ASSERT_TRUE(stdout_man && strstr(stdout_man, "\"version\"") != NULL,
-                "stdout export contains version");
+    ASSERT_TRUE(stdout_man && strstr(stdout_man, "\"version\"") == NULL,
+                "stdout export has no version field");
     ASSERT_TRUE(stdout_man && strstr(stdout_man, "\"mig_users\"") != NULL,
                 "stdout export contains mig_users");
     free(stdout_man);

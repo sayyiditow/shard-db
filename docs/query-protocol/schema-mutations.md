@@ -368,6 +368,25 @@ Rescans every shard, counts live/tombstoned slots, and rewrites `metadata/counts
 
 Response: `{"count":N,"orphaned":M}`.
 
+## rebuild-kf
+
+New in 2026.07.1. Repairs corrupted/dangling kf (keyfile) entries by rescanning every segment file and re-deriving each live record's kf slot from scratch. Use after suspected kf corruption — e.g. a prior crash mid-compact left kf entries pointing at segment files that no longer exist, causing bulk-insert or find to intermittently report `some_records_dropped` or miss records that are actually present on disk.
+
+```json
+{"mode":"rebuild-kf","dir":"<dir>","object":"<obj>"}
+```
+
+```bash
+./shard-db rebuild-kf <dir> <obj>
+```
+
+- Idempotent — safe to re-run; a clean object reports `repaired:0`.
+- `./migrate` runs this automatically (phase 2/3, before compact) on every upgrade and writes a `.kf_rebuild_done` sentinel so it isn't repeated on every subsequent embedded startup.
+- Embedded (npm) clients auto-run this once per `db_root` on first use, gated by the same sentinel — no manual step needed for npm consumers. Exposed directly as `shardDb.rebuildKf(dir, object)` for on-demand repair.
+- Takes no `objlock` (neither rdlock nor wrlock) — safe to run against a live object, though concurrent writes during the rescan are not guaranteed to be reflected in the repair pass (re-run if you suspect a race).
+
+Response: `{"status":"ok","repaired":N}` where `N` is the count of kf entries that were corrected.
+
 ## backup
 
 Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories into a timestamped snapshot under the same root.
@@ -387,7 +406,9 @@ Snapshot is a point-in-time copy — in-flight writes after the copy starts may 
 | `add-field`, `remove-field`, `vacuum --compact`, `vacuum --splits` | `objlock_wrlock` | All other ops on this object (reads + writes). |
 | `rename-field` | `objlock_wrlock` | Same. |
 | `truncate` | `objlock_wrlock` | Same. |
+| `add-index`, `remove-index` | `objlock_wrlock` | Same — both unlink()+rebuild index files in place; needs exclusivity against concurrent on-the-fly index writes (2026.07.1). |
 | `backup`, `recount` | `objlock_rdlock` | Only schema mutations. |
+| `rebuild-kf` | none | Nothing — safe to run live, but concurrent writes during the rescan aren't guaranteed to be reflected. |
 | Normal CRUD / queries | `objlock_rdlock` | Only schema mutations. |
 
 Held only for the rebuild duration. For multi-second rebuilds, clients see temporarily-blocked queries; consider running these in a maintenance window.
