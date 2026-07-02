@@ -6,31 +6,7 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.07.1
 
-kf-corruption recovery and an `add-index`/`remove-index` locking fix. Full notes: [docs/release-notes/2026.07.1.md](../release-notes/2026.07.1.md). Wire-compatible with 2026.06.4.
-
-### Fixes
-
-- **`add-index`/`remove-index` exclusive locking** — both now take `objlock_wrlock` instead of the shared `objlock_rdlock`, closing a race where a concurrent insert's on-the-fly index update could corrupt or silently lose data during an index rebuild. Root cause of a production trigram-search undercount that scaled with rebuild duration.
-- **`rebuild-kf` recovery command** — repairs dangling kf entries left by a `vacuum`/compact guard bug (donor segment deleted even when the kf update for a record failed to confirm). `./migrate` and embedded (npm) startup both run this automatically now.
-- **`rebuild_object_v2` (`vacuum --splits`) recovery** — restores `data/` from `.rebuild_legacy_root` on walk failure instead of stranding the object half-migrated; a single corrupt record during the walk is skipped (logged) instead of aborting the whole rebuild.
-- **`reindex_seg_cb` segfault on compacted objects** — fixed an out-of-bounds read when `add-index`/`reindex` ran against records shorter than `ts->total_size` (i.e. anything written after 2026.06.4's compact trim).
-- **`compact` dispatch double-dir path bug**.
-- **`recover_one_stream` realloc leak on OOM** during crash-recovery directory scanning.
-- **npm packaging** — `nql.c` added to `binding.gyp` (was missing, breaking NQL in embedded builds); npm package version corrected `1.1.2` → `1.0.7`.
-
-### Upgrade
-
-```bash
-./shard-db stop
-./migrate
-./shard-db start
-```
-
-Required if you've run `vacuum`/compact on 2026.06.4, or rebuilt indexes under concurrent write load on any prior version. See [Upgrade notes](../release-notes/2026.07.1.md#upgrade-notes) for the force-rebuild-suspect-indexes step.
-
-## 2026.06.4
-
-Compact VARCHAR storage and Natural Query Language (NQL). **Run `./migrate`** after upgrading — it converts existing objects to VARIABLE format and compacts all segments to reclaim the space savings. New records are already written in compact form after upgrade, regardless of whether `./migrate` has run. Wire-compatible with 2026.06.3.
+Compact VARCHAR storage, Natural Query Language (NQL), kf-corruption recovery, and an `add-index`/`remove-index` locking fix. Covers everything merged since 2026.06.3. Full notes: [docs/release-notes/2026.07.1.md](../release-notes/2026.07.1.md). Wire-compatible with 2026.06.3.
 
 ### Storage: Compact VARCHAR (run `./migrate`)
 
@@ -102,6 +78,34 @@ echo 'find default users "age > 25" --limit 5' | nc localhost 9199
 - New `src/db/nql.c` + `src/db/nql.h` — lexer, filter parser, aggregate spec parser, command tokenizer. No engine changes; NQL builds the same `CriteriaNode *` the JSON criteria path does.
 - `cmd_count_tree`, `cmd_find_tree`, `cmd_aggregate_tree` — new public wrappers that accept a pre-built `CriteriaNode *` directly, bypassing JSON criteria parsing. `cmd_count_do`, `cmd_find_do`, `cmd_aggregate_do` extracted as static helpers (callers own tree/spec memory; helpers borrow and do not free).
 - 9 new unit tests in `src/test/cases/test_nql.c` (nql-simple-filter, nql-find-command, nql-count-command, nql-aggregate-command, nql-and-or, nql-between, nql-in, nql-parse-errors, nql-flags).
+
+### kf corruption recovery
+
+- **compact-kf guard** — `vacuum`/compact's segment-merge path no longer deletes a donor segment file when a record's kf update couldn't be confirmed during migration; previously this left dangling kf pointers to files that no longer existed.
+- **`rebuild-kf` command** — repairs already-corrupted kf entries by rescanning all segment files for an object and rebuilding kf slots from what's actually on disk. Idempotent. `./migrate` runs it automatically (phase 2/3, before compact); embedded (npm) clients auto-run it once per `db_root` on first use, also exposed as `shardDb.rebuildKf(dir, object)`. See [schema-mutations.md#rebuild-kf](../query-protocol/schema-mutations.md#rebuild-kf).
+- **`rebuild_object_v2` (`vacuum --splits`) recovery** — restores `data/` from `.rebuild_legacy_root` on walk failure instead of stranding the object half-migrated; a single corrupt record during the walk is skipped (logged) instead of aborting the whole rebuild.
+
+### add-index / remove-index locking fix
+
+- **Exclusive locking** — `add-index`/`remove-index` now take `objlock_wrlock` instead of the shared `objlock_rdlock`, closing a race where a concurrent insert's on-the-fly index update could land on the same index file mid-rebuild and either get silently discarded or corrupt the B-tree pages being written. Same lock class `vacuum`/`truncate` already use for the identical unlink-and-rebuild pattern. See [Concepts → Concurrency](../concepts/concurrency.md#per-object-rwlock-objlock).
+
+### Fixes
+
+- **`reindex_seg_cb` segfault on compacted objects** — fixed an out-of-bounds read when `add-index`/`reindex` ran against records shorter than `ts->total_size` (i.e. anything written after the compact trim above).
+- **`compact` dispatch double-dir path bug**.
+- **`recover_one_stream` realloc leak on OOM** during crash-recovery directory scanning.
+- **`export-schema`** — removed the unused, unvalidated `version` field from its output.
+- **npm packaging** — `nql.c` added to `binding.gyp` (was missing, breaking NQL in embedded builds); npm package version corrected `1.1.2` → `1.0.7`.
+
+### Upgrade
+
+```bash
+./shard-db stop
+./migrate          # phase 1: convert fixed→variable; phase 2: rebuild-kf + compact
+./shard-db start
+```
+
+Migration required to reclaim disk space and repair any kf corruption from earlier versions. See [Upgrade notes](../release-notes/2026.07.1.md#upgrade-notes) for the force-rebuild-suspect-indexes step.
 
 ## 2026.06.3
 
