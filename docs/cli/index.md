@@ -71,7 +71,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | Command | Args | Description |
 |---|---|---|
 | `add-index` | `<dir> <obj> <field> [-f]` | Build a B+ tree index on a single field. `-f` forces rebuild. Composite via `field1+field2`. Batch builds via [JSON mode](../query-protocol/index-management.md). |
-| `remove-index` | `<dir> <obj> <field>` | Drop the index (exact name match, including composites). Safe on non-existent index. |
+| `remove-index` | `<dir> <obj> <field>` | Drop the index. `<field>` must be the exact name stored in `index.conf` — bare for btree/composite, with the type suffix (`field:trigram`, `field:bitmap`) for typed indexes, even if it's the only index on that field. There's no bare-name fallback: a field can have both a bare btree index and a typed sibling at once, so the engine won't guess. See [Index management → remove-index](../query-protocol/index-management.md#remove-index). Safe on non-existent index. |
 
 ## Maintenance
 
