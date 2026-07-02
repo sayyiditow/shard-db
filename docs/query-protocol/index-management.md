@@ -88,22 +88,30 @@ Only `:trigram` specs are supported today (btree and bitmap sizes are derivable 
 {"mode":"remove-index","dir":"<dir>","object":"<obj>","field":"email"}
 ```
 
+**`field` must be the exact index name as stored in `index.conf`** — bare (`"email"`) for a plain btree index, or with the type suffix (`"email:trigram"`, `"status:bitmap"`) for a typed index. There is no bare-name fallback, even when it's the only index on that field: `"email"` will never match a stored `"email:trigram"` line. This is deliberate, not a bug — a field can have **both** a bare btree index and a typed sibling registered at the same time (see `add-index` above), so the engine cannot safely guess which one a bare name is asking for. If you're unsure of the exact stored name, check `index.conf` (see Inspection below) before calling `remove-index`.
+
+```json
+{"mode":"remove-index","dir":"<dir>","object":"<obj>","field":"body:trigram"}
+```
+
 ### Multiple
 
 ```json
-{"mode":"remove-index","dir":"<dir>","object":"<obj>","fields":["email","city+country"]}
+{"mode":"remove-index","dir":"<dir>","object":"<obj>","fields":["email","body:trigram","city+country"]}
 ```
+
+Same exact-name rule applies per entry in the array.
 
 ### Behavior
 
-- Looks up the matched line in `index.conf` to determine the index type, then unlinks the appropriate files:
+- Matches the `field`/`fields` value **exactly** against a line in `index.conf`, then unlinks the appropriate files by that line's type:
     - **btree** → `<NNN>.idx` files + the `<field>/` directory
     - **bitmap** → `<NNN>.bm` files + bm_cache invalidation + the `<field>/` directory
     - **trigram** → `<NNN>.tg` files + btree_cache invalidation + the `<field>/` directory
-- For fields with multiple index types, pass the explicit suffix to drop just one: `"field":"email:trigram"` drops only the trigram, leaving any btree intact.
+- No match (wrong name, wrong/missing type suffix, or already removed) → `{"status":"not_indexed","field":"..."}`, not an error.
 - Rewrites `index.conf` without the removed entry.
 - Invalidates `g_idx_cache` for the object.
-- Safe on non-existent index: returns `{"status":"not_indexed","field":"..."}` — not an error. Idempotent.
+- Idempotent: removing an already-removed (or never-existent) index is safe and returns `not_indexed`, not an error.
 
 Response (single): `{"status":"removed","field":"email"}` or `{"status":"not_indexed","field":"..."}`.
 Response (multi): `{"status":"removed","count":N,"not_indexed":M}`.

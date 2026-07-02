@@ -26,7 +26,7 @@ void  tls_close(SSL *ssl, int fd);
 extern _Atomic int active_threads;
 extern _Atomic int in_flight_writes;
 
-/* Commands that mutate data (insert/delete/update/bulk/add-index/put-file/sequence).
+/* Commands that mutate data (insert/delete/update/bulk/put-file/sequence).
    Take per-object rdlock during dispatch so rebuild (wrlock) blocks them briefly. */
 static int mode_is_write(const char *m) {
     if (!m) return 0;
@@ -34,18 +34,29 @@ static int mode_is_write(const char *m) {
            strcasecmp(m, "delete") == 0 || strcasecmp(m, "bulk-insert") == 0 ||
            strcasecmp(m, "bulk-insert-delimited") == 0 || strcasecmp(m, "bulk-delete") == 0 ||
            strcasecmp(m, "bulk-update") == 0 || strcasecmp(m, "bulk-update-delimited") == 0 ||
-           strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
            strcasecmp(m, "put-file") == 0 ||
            strcasecmp(m, "delete-file") == 0 ||
            strcasecmp(m, "sequence") == 0;
 }
-/* Schema/rebuild commands — take exclusive wrlock. */
+/* Schema/rebuild commands — take exclusive wrlock. add-index/remove-index
+   belong here, not in mode_is_write: both unlink() and rebuild index files
+   in place (bt_stream_build_open in btree.c does
+   btree_cache_invalidate(path); unlink(path); then rebuilds via raw,
+   non-locked page writes). The btree cache keys entries by path string
+   with no inode check, so a concurrent per-record insert's on-the-fly
+   index update (btree_idx_insert, same shared rdlock class as insert)
+   can land on the same path mid-rebuild and either get silently
+   discarded or corrupt the pages bt_stream_build_add is writing.
+   Exclusive wrlock here serialises against that, same as
+   vacuum/truncate/reindex already do for the identical unlink+rebuild
+   pattern. */
 static int mode_is_schema(const char *m) {
     if (!m) return 0;
     return strcasecmp(m, "rename-field") == 0 || strcasecmp(m, "remove-field") == 0 ||
            strcasecmp(m, "add-field") == 0 || strcasecmp(m, "edit-field") == 0 ||
            strcasecmp(m, "vacuum") == 0 ||
            strcasecmp(m, "truncate") == 0 ||
+           strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
             strcasecmp(m, "migrate-storage-version") == 0 ||
             strcasecmp(m, "migrate") == 0;
 }
