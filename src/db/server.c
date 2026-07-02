@@ -3890,7 +3890,7 @@ int cmd_export_schema(int port, const char *out_path) {
         close_out = 1;
     }
 
-    fprintf(out, "{\n  \"version\": \"2026.05\",\n  \"dirs\": [");
+    fprintf(out, "{\n  \"dirs\": [");
     /* Re-use the same response twice: once to emit the dirs[] list, then
        walk it again to drive list-objects + describe-object. */
     {
