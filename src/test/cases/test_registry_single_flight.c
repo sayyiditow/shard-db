@@ -36,9 +36,48 @@
    timing assertions are unreliable across CI runners). */
 #define BURST_TIMEOUT_MS 20000
 
+/* Portable stand-in for pthread_barrier_t: Apple's libc doesn't implement
+   the (optional) POSIX barrier API at all, so pthread_barrier_t/_init/
+   _wait/_destroy fail to compile on macOS. This is a plain generation-
+   counted mutex+cond barrier with identical release-all-at-once semantics. */
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    int             count;
+    int             total;
+    int             generation;
+} TestBarrier;
+
+static void test_barrier_init(TestBarrier *b, int total) {
+    pthread_mutex_init(&b->lock, NULL);
+    pthread_cond_init(&b->cond, NULL);
+    b->count = 0;
+    b->total = total;
+    b->generation = 0;
+}
+
+static void test_barrier_wait(TestBarrier *b) {
+    pthread_mutex_lock(&b->lock);
+    int gen = b->generation;
+    b->count++;
+    if (b->count == b->total) {
+        b->generation++;
+        b->count = 0;
+        pthread_cond_broadcast(&b->cond);
+    } else {
+        while (gen == b->generation) pthread_cond_wait(&b->cond, &b->lock);
+    }
+    pthread_mutex_unlock(&b->lock);
+}
+
+static void test_barrier_destroy(TestBarrier *b) {
+    pthread_mutex_destroy(&b->lock);
+    pthread_cond_destroy(&b->cond);
+}
+
 typedef struct {
     int port;
-    pthread_barrier_t *barrier;
+    TestBarrier *barrier;
     int ok;      /* 1 if request succeeded with no "error" field */
     long ms;     /* wall-clock for this worker's single request */
 } RaceWorker;
@@ -59,7 +98,7 @@ static void *race_worker_main(void *arg) {
        together — this forces genuinely concurrent arrival at the
        server's registry regardless of how fast slotcask_open itself
        happens to run in this environment. */
-    pthread_barrier_wait(w->barrier);
+    test_barrier_wait(w->barrier);
 
     long t0 = now_ms();
     char *resp = NULL;
@@ -101,8 +140,8 @@ static int test_registry_single_flight_run(void) {
        exactly matching the incident's post-restart state (objects
        exist on disk; registry is cold). */
 
-    pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, NULL, N_WORKERS);
+    TestBarrier barrier;
+    test_barrier_init(&barrier, N_WORKERS);
 
     pthread_t threads[N_WORKERS];
     RaceWorker workers[N_WORKERS];
@@ -118,7 +157,7 @@ static int test_registry_single_flight_run(void) {
     for (int i = 0; i < N_WORKERS; i++) pthread_join(threads[i], NULL);
     long burst_ms = now_ms() - burst_t0;
 
-    pthread_barrier_destroy(&barrier);
+    test_barrier_destroy(&barrier);
 
     int all_ok = 1;
     for (int i = 0; i < N_WORKERS; i++) if (!workers[i].ok) all_ok = 0;
