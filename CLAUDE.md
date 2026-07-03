@@ -155,6 +155,7 @@ Driven by fields.conf. One slot = sum of field sizes (fixed).
 | `bool / byte` | 1 byte |
 | `date` | 4 bytes BE int32 (`yyyyMMdd`) |
 | `datetime` | 6 bytes (BE int32 yyyyMMdd + BE uint16 packed HHmmss) |
+| `datetimems` | 8 bytes (BE int32 yyyyMMdd + BE uint32 ms-of-day) |
 | `numeric:P,S` | 8 bytes BE int64 × 10^S |
 
 Field defaults (in fields.conf): `:default=<literal>`, `:auto_create`, `:auto_update`, `:default=seq(<name>)`, `:default=uuid()`, `:default=random(N)`. Reference: [docs/concepts/typed-records.md](docs/concepts/typed-records.md).

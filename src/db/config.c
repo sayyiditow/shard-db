@@ -1209,6 +1209,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "datetime") == 0) {
         f->type = FT_DATETIME;
         f->size = 6;
+    } else if (strcmp(spec, "datetimems") == 0) {
+        f->type = FT_DATETIMEMS;
+        f->size = 8;
     } else if (strcmp(spec, "time") == 0) {
         f->type = FT_TIME;
         f->size = 3;
@@ -1536,6 +1539,27 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
         break;
     }
+    case FT_DATETIMEMS: {
+        /* Parse up to 17 digits: yyyyMMddHHmmssfff. Short input zero-pads
+           on the right (mirrors FT_DATETIME's convention). */
+        char clean[24]; int ci = 0;
+        for (size_t i = 0; i < vlen && ci < 17; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
+        while (ci < 17) clean[ci++] = '0';
+        clean[17] = '\0';
+        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
+        int32_t d = (int32_t)atoi(datebuf);
+        out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
+        out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
+        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
+        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
+        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
+        int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
+        uint32_t ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
+        out[4] = (ms >> 24) & 0xFF; out[5] = (ms >> 16) & 0xFF;
+        out[6] = (ms >> 8) & 0xFF;  out[7] = ms & 0xFF;
+        break;
+    }
     case FT_TIME: {
         /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian).
            Validate strictly: 8 chars, digits at 0/1/3/4/6/7, ':' at 2 and 5,
@@ -1764,6 +1788,27 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 6;
         break;
     }
+    case FT_DATETIMEMS: {
+        char clean[24]; int ci = 0;
+        for (size_t i = 0; i < vlen && ci < 17; i++)
+            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
+        while (ci < 17) clean[ci++] = '0';
+        clean[17] = '\0';
+        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
+        int32_t d = (int32_t)atoi(datebuf);
+        uint32_t du = (uint32_t)d ^ 0x80000000u;
+        out[0] = (du >> 24) & 0xFF; out[1] = (du >> 16) & 0xFF;
+        out[2] = (du >> 8) & 0xFF;  out[3] = du & 0xFF;
+        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
+        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
+        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
+        int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
+        uint32_t ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
+        out[4] = (ms >> 24) & 0xFF; out[5] = (ms >> 16) & 0xFF;
+        out[6] = (ms >> 8) & 0xFF;  out[7] = ms & 0xFF;
+        *out_len = 8;
+        break;
+    }
     case FT_TIME: {
         /* Parse "HH:MM:SS" into 3 bytes, top-bit flip for sorted index */
         int hh = 0, mm = 0, ss = 0;
@@ -1889,6 +1934,13 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         memcpy(out, src, 6);
         out[0] ^= 0x80;
         *out_len = 6;
+        break;
+    }
+    case FT_DATETIMEMS: {
+        /* int32 BE date (flip) + uint32 BE ms-of-day (already unsigned-sortable). */
+        memcpy(out, src, 8);
+        out[0] ^= 0x80;
+        *out_len = 8;
         break;
     }
     case FT_TIME: {
@@ -2060,6 +2112,21 @@ static void gen_date_now(char *buf, size_t bufsz) {
     localtime_r(&now, &tm);
     snprintf(buf, bufsz, "%04d%02d%02d",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+/* Current date+time-of-day with millisecond precision as
+   "yyyyMMddHHmmssfff" into buf (>= 18 bytes). Used by FT_DATETIMEMS's
+   auto_create / auto_update generators. */
+static void gen_datetimems_now(char *buf, size_t bufsz) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    time_t now = ts.tv_sec;
+    struct tm tm;
+    localtime_r(&now, &tm);
+    int msec = (int)(ts.tv_nsec / 1000000L);
+    snprintf(buf, bufsz, "%04d%02d%02d%02d%02d%02d%03d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
 }
 
 /* === UUID helpers ===
@@ -2276,6 +2343,8 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
     case DK_AUTO_UPDATE:
         if (tf->type == FT_TIMESTAMP)
             gen_timestamp_now(gen_buf, bufsz);
+        else if (tf->type == FT_DATETIMEMS)
+            gen_datetimems_now(gen_buf, bufsz);
         else if (tf->type == FT_DATETIME)
             gen_datetime_now(gen_buf, bufsz);
         else if (tf->type == FT_DATE)
@@ -2558,6 +2627,18 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int ss = t % 60;
         return snprintf(buf, buflen, "\"%08d%02d%02d%02d\"", d, hh, mm, ss); /* "yyyyMMddHHmmss" */
     }
+    case FT_DATETIMEMS: {
+        int32_t d = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
+                    ((int32_t)data[2] << 8) | data[3];
+        uint32_t ms = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                      ((uint32_t)data[6] << 8) | data[7];
+        if (d == 0 && ms == 0) return 0;
+        int hh = ms / 3600000;
+        int mm = (ms % 3600000) / 60000;
+        int ss = (ms % 60000) / 1000;
+        int fff = ms % 1000;
+        return snprintf(buf, buflen, "\"%08d%02d%02d%02d%03d\"", d, hh, mm, ss, fff);
+    }
     case FT_TIME: {
         uint32_t secs = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
         if (secs == 0 && data[0]==0 && data[1]==0 && data[2]==0) return 0;
@@ -2790,6 +2871,20 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
+        return out;
+    }
+    case FT_DATETIMEMS: {
+        const uint8_t *d = src + f->offset;
+        int32_t dv = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
+                     ((int32_t)d[2] << 8) | d[3];
+        uint32_t ms = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+                      ((uint32_t)d[6] << 8) | d[7];
+        if (dv == 0 && ms == 0) return NULL;
+        int hh = ms / 3600000, mm = (ms % 3600000) / 60000,
+            ss = (ms % 60000) / 1000, fff = ms % 1000;
+        char *out = malloc(18);
+        if (!out) return NULL;
+        snprintf(out, 18, "%08d%02d%02d%02d%03d", dv, hh, mm, ss, fff);
         return out;
     }
     case FT_TIME: {

@@ -1311,6 +1311,7 @@ static size_t typed_field_str_avg(const TypedField *f) {
     case FT_NUMERIC:  return 8;   /* int64 BE + total-order flip */
     case FT_DATE:     return 4;   /* int32 BE + total-order flip */
     case FT_DATETIME: return 6;   /* int32 BE date + uint16 BE time */
+    case FT_DATETIMEMS: return 8; /* int32 BE date + uint32 BE ms-of-day */
     case FT_TIME:     return 3;   /* uint24 BE + total-order flip */
     case FT_TIMESTAMP: return 8;  /* int64 BE + total-order flip */
     case FT_UUID:     return 16;  /* raw 16 bytes */
