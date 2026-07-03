@@ -3394,16 +3394,32 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     for (int fi = 0; fi < w->ts->nfields; fi++) {
         if (w->ts->fields[fi].removed) continue;
         if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-            char tbuf[20];
-            time_t now = time(NULL);
-            struct tm tm; localtime_r(&now, &tm);
-            if (w->ts->fields[fi].type == FT_DATE)
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            else
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+            char tbuf[24];
+            if (w->ts->fields[fi].type == FT_TIMESTAMP) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+                snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+            } else if (w->ts->fields[fi].type == FT_DATETIMEMS) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                time_t nowsec = tsn.tv_sec;
+                struct tm tm; localtime_r(&nowsec, &tm);
+                int msec = (int)(tsn.tv_nsec / 1000000L);
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+                          tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+            } else {
+                time_t now = time(NULL);
+                struct tm tm; localtime_r(&now, &tm);
+                if (w->ts->fields[fi].type == FT_DATE)
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                else
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                              tm.tm_hour, tm.tm_min, tm.tm_sec);
+            }
             encode_field(&w->ts->fields[fi], tbuf,
                           new_buf + w->ts->fields[fi].offset);
         }
@@ -3880,16 +3896,32 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
     for (int fi = 0; fi < w->ts->nfields; fi++) {
         if (w->ts->fields[fi].removed) continue;
         if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-            char tbuf[20];
-            time_t now = time(NULL);
-            struct tm tm; localtime_r(&now, &tm);
-            if (w->ts->fields[fi].type == FT_DATE)
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            else
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+            char tbuf[24];
+            if (w->ts->fields[fi].type == FT_TIMESTAMP) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+                snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+            } else if (w->ts->fields[fi].type == FT_DATETIMEMS) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                time_t nowsec = tsn.tv_sec;
+                struct tm tm; localtime_r(&nowsec, &tm);
+                int msec = (int)(tsn.tv_nsec / 1000000L);
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+                          tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+            } else {
+                time_t now = time(NULL);
+                struct tm tm; localtime_r(&now, &tm);
+                if (w->ts->fields[fi].type == FT_DATE)
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                else
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                              tm.tm_hour, tm.tm_min, tm.tm_sec);
+            }
             encode_field(&w->ts->fields[fi], tbuf,
                           new_buf + w->ts->fields[fi].offset);
         }
@@ -4314,16 +4346,32 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
     for (int fi = 0; fi < w->ts->nfields; fi++) {
         if (w->ts->fields[fi].removed) continue;
         if (w->ts->fields[fi].default_kind == DK_AUTO_UPDATE) {
-            char tbuf[20];
-            time_t now = time(NULL);
-            struct tm tm; localtime_r(&now, &tm);
-            if (w->ts->fields[fi].type == FT_DATE)
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            else
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+            char tbuf[24];
+            if (w->ts->fields[fi].type == FT_TIMESTAMP) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+                snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+            } else if (w->ts->fields[fi].type == FT_DATETIMEMS) {
+                struct timespec tsn;
+                clock_gettime(CLOCK_REALTIME, &tsn);
+                time_t nowsec = tsn.tv_sec;
+                struct tm tm; localtime_r(&nowsec, &tm);
+                int msec = (int)(tsn.tv_nsec / 1000000L);
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                          tm.tm_hour, tm.tm_min, tm.tm_sec);
+                          tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+            } else {
+                time_t now = time(NULL);
+                struct tm tm; localtime_r(&now, &tm);
+                if (w->ts->fields[fi].type == FT_DATE)
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+                else
+                    snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                              tm.tm_hour, tm.tm_min, tm.tm_sec);
+            }
             encode_field(&w->ts->fields[fi], tbuf,
                           new_buf + w->ts->fields[fi].offset);
         }
@@ -7910,6 +7958,11 @@ static inline uint16_t ld_be_u16(const uint8_t *p) {
     return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
 }
 
+static inline uint32_t ld_be_u32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
 /* Effective varchar length: read BE uint16 prefix. `size` is on-disk field size
    (content + 2). Content starts at p + 2. Defensively clamps if prefix is bogus. */
 static inline int varchar_eff_len(const uint8_t *p, int size) {
@@ -7945,6 +7998,23 @@ static void parse_datetime(const char *s, int32_t *out_date, uint16_t *out_time)
     int mm = (clean[10]-'0')*10 + (clean[11]-'0');
     int ss = (clean[12]-'0')*10 + (clean[13]-'0');
     *out_time = (uint16_t)(hh * 3600 + mm * 60 + ss);
+}
+
+/* Parse "yyyyMMddHHmmssfff" (digit-only, right-zero-padded if short) into
+   a calendar date (int32, yyyyMMdd) and ms-of-day (uint32, 0..86399999). */
+static void parse_datetimems(const char *s, int32_t *out_date, uint32_t *out_ms) {
+    char clean[24]; int ci = 0;
+    for (const char *c = s; *c && ci < 17; c++)
+        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
+    while (ci < 17) clean[ci++] = '0';
+    clean[17] = '\0';
+    char dbuf[9]; memcpy(dbuf, clean, 8); dbuf[8] = '\0';
+    *out_date = (int32_t)atoi(dbuf);
+    int hh = (clean[8]-'0')*10 + (clean[9]-'0');
+    int mm = (clean[10]-'0')*10 + (clean[11]-'0');
+    int ss = (clean[12]-'0')*10 + (clean[13]-'0');
+    int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
+    *out_ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
 }
 
 /* Parse decimal string → int64 scaled by 10^scale (matches encode_field FT_NUMERIC). */
@@ -8234,6 +8304,12 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         int32_t d; uint16_t t;
         parse_datetime(c->value, &d, &t); cc->i1 = d; cc->t1 = t;
         parse_datetime(c->value2, &d, &t); cc->i2 = d; cc->t2 = t;
+        break;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d; uint32_t ms;
+        parse_datetimems(c->value, &d, &ms); cc->i1 = d; cc->dm1 = (int32_t)ms;
+        parse_datetimems(c->value2, &d, &ms); cc->i2 = d; cc->dm2 = (int32_t)ms;
         break;
     }
     case FT_TIME: {
@@ -8673,6 +8749,11 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
         int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u16(b + 4);
         return va < vb ? -1 : (va > vb ? 1 : 0);
     }
+    case FT_DATETIMEMS: {
+        int64_t va = (int64_t)ld_be_i32(a) * 100000000LL + (int64_t)ld_be_u32(a + 4);
+        int64_t vb = (int64_t)ld_be_i32(b) * 100000000LL + (int64_t)ld_be_u32(b + 4);
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
     case FT_TIME: {
         uint32_t va = ((uint32_t)a[0] << 16) | ((uint32_t)a[1] << 8) | a[2];
         uint32_t vb = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
@@ -8838,6 +8919,20 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         case OP_NOT_EXISTS: return d == 0 && t == 0;
         default:
             if (d == 0 && t == 0) return 0;
+            return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
+        }
+    }
+    case FT_DATETIMEMS: {
+        int64_t d = (int64_t)ld_be_i32(p);
+        uint32_t ms = ld_be_u32(p + 4);
+        int64_t v = d * 100000000LL + (int64_t)ms;
+        int64_t q1 = cc->i1 * 100000000LL + (int64_t)(uint32_t)cc->dm1;
+        int64_t q2 = cc->i2 * 100000000LL + (int64_t)(uint32_t)cc->dm2;
+        switch (cc->op) {
+        case OP_EXISTS: return !(d == 0 && ms == 0);
+        case OP_NOT_EXISTS: return d == 0 && ms == 0;
+        default:
+            if (d == 0 && ms == 0) return 0;
             return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
         }
     }
@@ -9267,6 +9362,7 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     }
     case FT_DATE:
     case FT_DATETIME:
+    case FT_DATETIMEMS:
     case FT_ENUM:
         /* Enum's display string is a JSON string (quoted, escaped).
            DATE/DATETIME are also strings on the wire. */
@@ -17313,7 +17409,7 @@ static int cmp_row_desc(const void *a, const void *b) { return -cmp_row_asc(a, b
 static int typed_field_is_numeric(uint8_t ft) {
     return ft == FT_INT || ft == FT_LONG || ft == FT_SHORT || ft == FT_DOUBLE ||
            ft == FT_NUMERIC || ft == FT_DATE || ft == FT_DATETIME ||
-           ft == FT_BOOL || ft == FT_BYTE;
+           ft == FT_DATETIMEMS || ft == FT_BOOL || ft == FT_BYTE;
 }
 
 /* ========== Find cursor (keyset pagination) ==========
@@ -21289,6 +21385,7 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "byte") == 0)   return 1;
     if (strcmp(type, "date") == 0)   return 4;
     if (strcmp(type, "datetime") == 0) return 6;
+    if (strcmp(type, "datetimems") == 0) return 8;
     if (strcmp(type, "time") == 0)    return 3;
     if (strcmp(type, "timestamp") == 0) return 8;
     if (strcmp(type, "uuid") == 0)    return 16;
@@ -21474,7 +21571,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, time, timestamp, uuid, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
                    field_specs[nfields]);
             return 1;
         }
@@ -22114,6 +22211,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_NUMERIC:  return "numeric";
         case FT_DATE:     return "date";
         case FT_DATETIME: return "datetime";
+        case FT_DATETIMEMS: return "datetimems";
         case FT_TIME:     return "time";
         case FT_TIMESTAMP: return "timestamp";
         case FT_UUID:     return "uuid";
@@ -23031,6 +23129,14 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
     }
+    case FT_DATETIMEMS: {
+        int32_t d = ld_be_i32(p);
+        uint32_t ms = ld_be_u32(p + 4);
+        if (d == 0 && ms == 0) return 0;
+        int hh = ms / 3600000, mm = (ms % 3600000) / 60000,
+            ss = (ms % 60000) / 1000, fff = ms % 1000;
+        return snprintf(buf, bufsz, "%08d%02d%02d%02d%03d", d, hh, mm, ss, fff);
+    }
     case FT_TIME: {
         uint32_t secs = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
         if (secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
@@ -23157,6 +23263,17 @@ static int decode_index_key_to_double(const TypedField *f,
         if (d == 0 && t == 0) return 0;
         *out = (double)d * 1000000.0 + (double)t; return 1;
     }
+    case FT_DATETIMEMS: {
+        if (plen < 8) return 0;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                      ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
+        if (d == 0 && ms == 0) return 0;
+        *out = (double)d * 100000000.0 + (double)ms;
+        return 1;
+    }
     case FT_TIME: return 0;  /* not summable */
     case FT_NUMERIC: {
         if (plen < 8) return 0;
@@ -23256,6 +23373,18 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (skip_zero && d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
+    }
+    case FT_DATETIMEMS: {
+        if (plen < 8) return 0;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                      ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
+        if (skip_zero && d == 0 && ms == 0) return 0;
+        int hh = ms / 3600000, mm = (ms % 3600000) / 60000,
+            ss = (ms % 60000) / 1000, fff = ms % 1000;
+        return snprintf(buf, bufsz, "%08d%02d%02d%02d%03d", d, hh, mm, ss, fff);
     }
     case FT_TIME: {
         /* Index stores 3 bytes with top-bit flip - undo flip and format */
@@ -23737,6 +23866,13 @@ static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *
         uint16_t t = ld_be_u16(p + 4);
         if (d == 0 && t == 0) return 0;
         *out = (double)d * 1000000.0 + (double)t; return 1;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d = ld_be_i32(p);
+        uint32_t ms = ld_be_u32(p + 4);
+        if (d == 0 && ms == 0) return 0;
+        *out = (double)d * 100000000.0 + (double)ms;
+        return 1;
     }
     case FT_TIME: return 0;  /* not summable */
     case FT_UUID: return 0;  /* not summable */

@@ -1664,6 +1664,16 @@ static int cmd_update_v2(const char *db_root, const char *object,
             clock_gettime(CLOCK_REALTIME, &tsn);
             long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
             snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+        } else if (ts->fields[i].type == FT_DATETIMEMS) {
+            struct timespec tsn;
+            clock_gettime(CLOCK_REALTIME, &tsn);
+            time_t nowsec = tsn.tv_sec;
+            struct tm tmv;
+            localtime_r(&nowsec, &tmv);
+            int msec = (int)(tsn.tv_nsec / 1000000L);
+            snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
+                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msec);
         } else {
             time_t now = time(NULL);
             struct tm tmv;

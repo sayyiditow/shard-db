@@ -150,6 +150,9 @@ enum FieldType {
     FT_NUMERIC,     /* numeric:P,S — 8 bytes int64 × 10^S */
     FT_DATE,        /* date — 4 bytes int32 yyyyMMdd big-endian */
     FT_DATETIME,    /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
+    FT_DATETIMEMS,  /* datetimems — 8 bytes: int32 BE yyyyMMdd date + uint32 BE
+                       ms-of-day (0..86399999). Wire format is the 17-digit
+                       string "yyyyMMddHHmmssfff". */
     FT_TIME,        /* time — 3 bytes uint24 big-endian (seconds since midnight) */
     FT_TIMESTAMP,   /* timestamp — 8 bytes int64 big-endian (Unix epoch milliseconds);
                        semantic int64 with auto_create / auto_update generators that
@@ -348,6 +351,7 @@ typedef struct CompiledCriterion {
     uint8_t  time_val[3];
     uint8_t  time_val2[3];
     uint16_t t1, t2;
+    int32_t  dm1, dm2;  /* FT_DATETIMEMS ms-of-day bounds (0..86399999) */
     uint8_t  b1;
 
     /* Varchar + LIKE rvalues */
