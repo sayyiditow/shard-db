@@ -57,6 +57,8 @@ typedef struct {
     char        key[PATH_MAX];
     struct SlotcaskDb *db;
     int         used;
+    int         opening;   /* 1 while some thread's slotcask_open() is in
+                               flight for this key; see slotcask_registry_get. */
 } RegEntry;
 
 /* objlock.c */
@@ -234,6 +236,8 @@ struct ShardDb {
     /* slotcask object registry */
     RegEntry        reg[SLOTCASK_REG_BUCKETS];
     pthread_mutex_t reg_lock;
+    pthread_cond_t  reg_cond;   /* broadcast whenever any slot's `opening`
+                                   flag clears (success or failure) */
 
     /* object lock table */
     ObjLockEntry    objlocks[OBJLOCK_BUCKETS];
@@ -359,6 +363,7 @@ extern __thread ShardDb *g_db;
 #define g_segcache_clock            (g_db->segcache_clock)
 #define g_reg                       (g_db->reg)
 #define g_reg_lock                  (g_db->reg_lock)
+#define g_reg_cond                  (g_db->reg_cond)
 
 /* objlock.c */
 #define g_objlocks                  (g_db->objlocks)
