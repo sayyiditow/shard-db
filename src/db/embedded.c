@@ -28,6 +28,7 @@ static void db_mutexes_init(void) {
     pthread_mutex_init(&g_kfcache_lock,          NULL);
     pthread_mutex_init(&g_segcache_lock,         NULL);
     pthread_mutex_init(&g_reg_lock,              NULL);
+    pthread_cond_init(&g_reg_cond,               NULL);
     pthread_mutex_init(&g_objlock_table_lock,    NULL);
     pthread_mutex_init(&g_ip_lock,               NULL);
     pthread_mutex_init(&g_token_lock,            NULL);
@@ -357,6 +358,7 @@ static void db_mutexes_destroy(void) {
     pthread_mutex_destroy(&g_kfcache_lock);
     pthread_mutex_destroy(&g_segcache_lock);
     pthread_mutex_destroy(&g_reg_lock);
+    pthread_cond_destroy(&g_reg_cond);
     pthread_mutex_destroy(&g_objlock_table_lock);
     pthread_mutex_destroy(&g_ip_lock);
     pthread_mutex_destroy(&g_token_lock);

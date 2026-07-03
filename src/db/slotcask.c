@@ -5005,71 +5005,74 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
     char key[PATH_MAX];
     reg_key(key, effective_root, object);
 
-    /* Fast path: probe under the lock; hit returns immediately. */
+    /* Fast path: probe under the lock; hit returns immediately.  On a
+       miss, this thread either becomes the sole opener for `key` (and
+       reserves its slot before releasing the lock) or, if another
+       thread is already opening the same key, waits on g_reg_cond
+       instead of redundantly repeating slotcask_open — which itself
+       fans out up to three parallel_for_io() waves across the shared
+       IO pool.  Concurrent misses on the same key used to each pay
+       that cost independently; on a cold restart with several callers
+       missing on the same hot object at once, that duplicated,
+       wasted work is what inflated query latency to minutes (2026-07-03
+       hn-explorer incident) even though nothing was truly deadlocked. */
     pthread_mutex_lock(&g_reg_lock);
-    int slot = reg_probe(key);
-    if (slot < 0) {
+    for (;;) {
+        int slot = reg_probe(key);
+        if (slot < 0) {
+            pthread_mutex_unlock(&g_reg_lock);
+            fprintf(stderr, "slotcask_registry: table full (%d buckets)\n",
+                    SLOTCASK_REG_BUCKETS);
+            return NULL;
+        }
+        if (g_reg[slot].used) {
+            SlotcaskDb *db = g_reg[slot].db;
+            pthread_mutex_unlock(&g_reg_lock);
+            return db;
+        }
+        if (g_reg[slot].opening) {
+            /* Someone else is opening this key (or a colliding one) —
+               wait for them to finish, then re-probe from scratch. */
+            pthread_cond_wait(&g_reg_cond, &g_reg_lock);
+            continue;
+        }
+
+        /* We are the sole opener. Reserve the slot by index — do NOT
+           re-probe after opening (see plan invariant 5): a concurrent
+           slotcask_registry_invalidate() of an unrelated, earlier-in-chain
+           key could free a slot that a fresh reg_probe() would stop at
+           first, orphaning this reservation. */
+        int reserved = slot;
+        snprintf(g_reg[reserved].key, sizeof(g_reg[reserved].key), "%s", key);
+        g_reg[reserved].opening = 1;
         pthread_mutex_unlock(&g_reg_lock);
-        fprintf(stderr, "slotcask_registry: table full (%d buckets)\n",
-                SLOTCASK_REG_BUCKETS);
-        return NULL;
-    }
-    if (g_reg[slot].used) {
-        SlotcaskDb *db = g_reg[slot].db;
+
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s", effective_root, object);
+
+        SlotcaskDb *db = calloc(1, sizeof(SlotcaskDb));
+        int open_rc = db ? slotcask_open(db, data_dir, info->splits,
+                                          info->streams, info->slot_size)
+                          : -1;
+
+        pthread_mutex_lock(&g_reg_lock);
+        if (open_rc != 0 || !db) {
+            if (db) free(db);
+            g_reg[reserved].opening = 0;
+            g_reg[reserved].key[0] = '\0';
+            pthread_cond_broadcast(&g_reg_cond);
+            pthread_mutex_unlock(&g_reg_lock);
+            fprintf(stderr, "slotcask_registry: open failed for %s/%s\n",
+                    effective_root, object);
+            return NULL;
+        }
+        g_reg[reserved].db = db;
+        g_reg[reserved].used = 1;
+        g_reg[reserved].opening = 0;
+        pthread_cond_broadcast(&g_reg_cond);
         pthread_mutex_unlock(&g_reg_lock);
         return db;
     }
-    pthread_mutex_unlock(&g_reg_lock);
-
-    /* Miss — open OUTSIDE the registry lock.  slotcask_open mmaps 8 stream
-       segments × 128 MiB and can take seconds on large objects (e.g.
-       hn/comments at splits=256).  Holding g_reg_lock across that would
-       block every other registry operation (other opens via warmup's
-       parallel_for, drop-object's slotcask_registry_invalidate, any
-       slotcask_registry_get caller in a query handler).  Pre-fix this
-       caused drop-object to wait 7-12s under warmup contention.
-
-       Race: two concurrent misses for the same key both reach this
-       point.  Re-probe inside the install lock below; the loser frees
-       its own SlotcaskDb and returns the winner's. */
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s", effective_root, object);
-
-    SlotcaskDb *db = calloc(1, sizeof(SlotcaskDb));
-    if (!db) return NULL;
-    if (slotcask_open(db, data_dir, info->splits, info->streams,
-                      info->slot_size) != 0) {
-        free(db);
-        fprintf(stderr, "slotcask_registry: open failed for %s/%s\n",
-                effective_root, object);
-        return NULL;
-    }
-
-    /* Install (or lose the race + free ours). */
-    pthread_mutex_lock(&g_reg_lock);
-    slot = reg_probe(key);
-    if (slot < 0) {
-        pthread_mutex_unlock(&g_reg_lock);
-        slotcask_close(db);
-        free(db);
-        fprintf(stderr, "slotcask_registry: table full (%d buckets)\n",
-                SLOTCASK_REG_BUCKETS);
-        return NULL;
-    }
-    if (g_reg[slot].used) {
-        /* Another thread installed while we were opening.  Discard ours
-           and use theirs. */
-        SlotcaskDb *winner = g_reg[slot].db;
-        pthread_mutex_unlock(&g_reg_lock);
-        slotcask_close(db);
-        free(db);
-        return winner;
-    }
-    snprintf(g_reg[slot].key, sizeof(g_reg[slot].key), "%s", key);
-    g_reg[slot].db = db;
-    g_reg[slot].used = 1;
-    pthread_mutex_unlock(&g_reg_lock);
-    return db;
 }
 
 void slotcask_registry_invalidate(const char *effective_root,
