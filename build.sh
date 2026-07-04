@@ -173,6 +173,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_neq_shortcut.c \
     src/test/cases/test_agg_indexed_groupby.c \
     src/test/cases/test_agg_int_groupby_multi.c \
+    src/test/cases/test_agg_int_groupby_resize.c \
     src/test/cases/test_agg_leaf_only_walk.c \
     src/test/cases/test_agg_varchar_groupby_limit.c \
     src/test/cases/test_agg_varchar_groupby_sum.c \
