@@ -1642,9 +1642,25 @@ static int cmd_update_v2(const char *db_root, const char *object,
 
     for (int i = 0; i < ts->nfields; i++) {
         if (field_vals[i]) {
-            if (!ts->fields[i].removed)
+            if (!ts->fields[i].removed) {
+                if (ts->fields[i].type == FT_VARCHAR) {
+                    int content_max = ts->fields[i].size - 2;
+                    size_t vlen = strlen(field_vals[i]);
+                    if ((int)vlen > content_max) {
+                        char err[256];
+                        snprintf(err, sizeof(err),
+                            "value for field '%s' is %zu bytes; exceeds max %d for varchar",
+                            ts->fields[i].name, vlen, content_max);
+                        free(field_vals[i]);
+                        for (int j = i + 1; j < ts->nfields; j++) free(field_vals[j]);
+                        free(new_buf);
+                        OUT("{\"error\":\"%s\"}\n", err);
+                        return 1;
+                    }
+                }
                 encode_field(&ts->fields[i], field_vals[i],
                              new_buf + ts->fields[i].offset);
+            }
             free(field_vals[i]);
         }
     }

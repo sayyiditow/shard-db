@@ -2483,19 +2483,32 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         uint8_t *payload = arena_alloc(&arena, ts->total_size);
         memset(payload, 0, ts->total_size);
 
+        int row_overflow = 0;
         if (!has_tombstones) {
             for (int i = 0; i < active_count && i < nvals; i++) {
-                if (vals[i].len > 0)
-                    encode_field_len(&ts->fields[i], vals[i].ptr, vals[i].len,
-                                     payload + ts->fields[i].offset);
+                if (vals[i].len == 0) continue;
+                if (ts->fields[i].type == FT_VARCHAR &&
+                    (int)vals[i].len > ts->fields[i].size - 2) { row_overflow = 1; break; }
+                encode_field_len(&ts->fields[i], vals[i].ptr, vals[i].len,
+                                 payload + ts->fields[i].offset);
             }
         } else {
             for (int i = 0; i < active_count && i < nvals; i++) {
                 int fi = active_indices[i];
-                if (vals[i].len > 0)
-                    encode_field_len(&ts->fields[fi], vals[i].ptr, vals[i].len,
-                                     payload + ts->fields[fi].offset);
+                if (vals[i].len == 0) continue;
+                if (ts->fields[fi].type == FT_VARCHAR &&
+                    (int)vals[i].len > ts->fields[fi].size - 2) { row_overflow = 1; break; }
+                encode_field_len(&ts->fields[fi], vals[i].ptr, vals[i].len,
+                                 payload + ts->fields[fi].offset);
             }
+        }
+        if (row_overflow) {
+            /* Skip this row rather than storing a truncated value. Count it
+               like every other per-row reject in this loop so the client's
+               errors/skipped tally reflects the drop. */
+            free(wire_for_record);
+            errors++;
+            continue;
         }
 
         if (rec_count >= rec_cap) {

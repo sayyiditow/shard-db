@@ -31,7 +31,7 @@ static int test_request_timeout_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_big\","
         "\"splits\":16,\"max_key\":16,"
-        "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:32\"]}",
+        "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:40\"]}",
         &resp); free(resp); resp = NULL;
 
     /* Write 1.5M records to a tempfile and bulk-insert via "file" — payload

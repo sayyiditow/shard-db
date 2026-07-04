@@ -145,6 +145,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_auto_key.c \
     src/test/cases/test_object_name_validation.c \
     src/test/cases/test_auto_key_multi.c \
+    src/test/cases/test_varchar_overflow.c \
     src/test/cases/test_bulk_upsert.c \
     src/test/cases/test_joins.c \
     src/test/cases/test_describe.c \
