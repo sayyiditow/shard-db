@@ -1001,62 +1001,24 @@ void rmrf(const char *path) {
 }
 
 /* ========== ADD-INDEX ========== */
-/* Singular add-index uses the streaming pipeline below
-   (build_btree_streaming). Plural cmd_add_indexes still uses the
-   single-scan multi-field path (MultiIndexCtx + multi_index_scan_cb)
-   which has its own memory model — both are bounded but via different
-   strategies. */
+/* Both the singular (cmd_add_index) and plural (cmd_add_indexes) entry
+   points funnel every field type — btree, bitmap, trigram — requested in
+   ONE add-index call through the same single-scan engine reindex_object
+   uses (build_indexes_streaming_multi -> seg_seq_build_spills +
+   resolve_bitmaps). A force add-index over N fields of mixed type does
+   exactly one sequential pass over storage, not one pass per type. */
 
-/* Per-field-shard build worker — qsorts its slice and bulk-builds one shard. */
-typedef struct {
-    char  ipath[PATH_MAX];
-    BtEntry *pairs;     /* slice — does NOT own backing memory; freed by caller */
-    size_t  pair_count;
-} ShardBuildArg;
-
-static void *shard_build_worker(void *arg) {
-    ShardBuildArg *sb = (ShardBuildArg *)arg;
-    qsort(sb->pairs, sb->pair_count, sizeof(BtEntry), cmp_btentry_fn);
-    btree_bulk_build(sb->ipath, sb->pairs, sb->pair_count);
-    return NULL;
-}
-
-/* Bucket-sort `pairs` (of total `count`) into `nshards` partitions by
-   idx_shard_for_hash(pair.hash, splits). Returns a malloc'd contiguous
-   BtEntry array of length `count` (caller frees) plus per-shard offset/length
-   arrays (out_offsets[i] and out_counts[i]). The original `pairs` array is
-   consumed (no copies of the variable-length value strings — pointers are
-   moved). */
-static BtEntry *partition_by_shard(BtEntry *pairs, size_t count, int splits,
-                                   int nshards,
-                                   size_t **out_offsets, size_t **out_counts) {
-    size_t *counts = calloc((size_t)nshards, sizeof(size_t));
-    size_t *offsets = calloc((size_t)nshards, sizeof(size_t));
-    BtEntry *out = malloc(count * sizeof(BtEntry));
-    if (!counts || !offsets || !out) {
-        free(counts); free(offsets); free(out);
-        *out_offsets = NULL; *out_counts = NULL;
-        return NULL;
+/* Unlink every .tg shard for a trigram field — shared by build_trigram_pass,
+   cmd_add_indexes inline force, and unlink_index_by_line. */
+static void tg_idx_unlink_all(const char *db_root, const char *object,
+                               const char *field, int splits) {
+    int idx_n = index_splits_for(splits);
+    for (int s = 0; s < idx_n; s++) {
+        char tp[PATH_MAX];
+        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
+        btree_cache_invalidate(tp);
+        unlink(tp);
     }
-    /* First pass: tally per-shard sizes. */
-    for (size_t i = 0; i < count; i++) {
-        int s = idx_shard_for_hash(pairs[i].hash, splits);
-        counts[s]++;
-    }
-    /* Compute prefix-sum offsets. */
-    size_t acc = 0;
-    for (int s = 0; s < nshards; s++) { offsets[s] = acc; acc += counts[s]; }
-    /* Second pass: scatter into out[] using a per-shard write cursor. */
-    size_t *cursor = calloc((size_t)nshards, sizeof(size_t));
-    if (!cursor) { free(counts); free(offsets); free(out); return NULL; }
-    for (size_t i = 0; i < count; i++) {
-        int s = idx_shard_for_hash(pairs[i].hash, splits);
-        out[offsets[s] + cursor[s]++] = pairs[i];
-    }
-    free(cursor);
-    *out_offsets = offsets;
-    *out_counts = counts;
-    return out;
 }
 
 /* Forward decls — full definitions live near the multi-index builder. */
@@ -1188,189 +1150,6 @@ int cmd_add_index(const char *db_root, const char *object,
     OUT("{\"status\":\"indexed\",\"field\":\"%s\",\"records\":%d,\"duration_ms\":%llu}\n",
         field, records, (unsigned long long)duration_ms);
     return 0;
-}
-
-/* ========== Multi-index build: single shard scan, all fields at once ========== */
-
-typedef struct {
-    int nfields;
-    char fields[MAX_FIELDS][256];
-    TypedSchema *ts;
-    /* Per-field: pre-resolved indices + collectors */
-    int is_composite[MAX_FIELDS];
-    int field_indices[MAX_FIELDS][16];
-    int field_index_count[MAX_FIELDS];
-    BtEntry *pairs[MAX_FIELDS];
-    size_t pair_count[MAX_FIELDS];
-    size_t pair_cap[MAX_FIELDS];
-    /* Per-field mutex: the pairs arrays grow independently, so serializing
-       each separately lets different fields' appends happen in parallel. */
-    pthread_mutex_t lock[MAX_FIELDS];
-} MultiIndexCtx;
-
-static int multi_index_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
-    MultiIndexCtx *mc = (MultiIndexCtx *)ctx;
-    const char *raw = (const char *)(block + hdr->key_len);
-
-    for (int fi = 0; fi < mc->nfields; fi++) {
-        uint8_t *key_buf = NULL;
-        size_t key_len = 0;
-
-        /* Key encoding is thread-local. */
-        if (mc->is_composite[fi]) {
-            char cat[4096]; int cpos = 0; int ok = 1;
-            for (int si = 0; si < mc->field_index_count[fi]; si++) {
-                size_t blen = 0;
-                typed_field_to_index_key(mc->ts, (const uint8_t *)raw,
-                                          mc->field_indices[fi][si],
-                                          (uint8_t *)cat + cpos, &blen);
-                if (blen == 0) { ok = 0; break; }
-                if (cpos + (int)blen < (int)sizeof(cat)) { cpos += (int)blen; }
-                else { ok = 0; break; }
-            }
-            if (ok && cpos > 0) {
-                key_buf = malloc((size_t)cpos);
-                memcpy(key_buf, cat, (size_t)cpos);
-                key_len = (size_t)cpos;
-            }
-        } else {
-            int fidx = mc->field_indices[fi][0];
-            if (fidx >= 0) {
-                const TypedField *f = &mc->ts->fields[fidx];
-                /* Allocate exactly what the index key needs. See index_scan_cb
-                   for the rationale — varchar over-allocation dominates peak
-                   memory at scale (×nfields here). */
-                size_t cap;
-                if (f->type == FT_VARCHAR) {
-                    const uint8_t *src = (const uint8_t *)raw + f->offset;
-                    int content_max = f->size - 2;
-                    if (content_max < 0) content_max = 0;
-                    int len = ((int)src[0] << 8) | (int)src[1];
-                    if (len < 0) len = 0;
-                    if (len > content_max) len = content_max;
-                    cap = (size_t)len;
-                } else {
-                    cap = (size_t)f->size;
-                    if (cap == 0) cap = 8;
-                }
-                if (cap > 0) {
-                    key_buf = malloc(cap);
-                    typed_field_to_index_key(mc->ts, (const uint8_t *)raw, fidx, key_buf, &key_len);
-                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
-                }
-            }
-        }
-
-        if (key_buf && key_len > 0) {
-            pthread_mutex_lock(&mc->lock[fi]);
-            if (mc->pair_count[fi] >= mc->pair_cap[fi]) {
-                size_t new_cap = mc->pair_cap[fi] * 2;
-                BtEntry *t = xrealloc_or_free(mc->pairs[fi], new_cap * sizeof(BtEntry));
-                if (!t) {
-                    mc->pairs[fi] = NULL;
-                    mc->pair_count[fi] = 0;
-                    mc->pair_cap[fi] = 0;
-                    pthread_mutex_unlock(&mc->lock[fi]);
-                    free(key_buf);
-                    continue;
-                }
-                mc->pairs[fi] = t;
-                mc->pair_cap[fi] = new_cap;
-            }
-            mc->pairs[fi][mc->pair_count[fi]].value = (const char *)key_buf;
-            mc->pairs[fi][mc->pair_count[fi]].vlen = key_len;
-            memcpy(mc->pairs[fi][mc->pair_count[fi]].hash, hdr->hash, 16);
-            mc->pair_count[fi]++;
-            pthread_mutex_unlock(&mc->lock[fi]);
-        } else {
-            free(key_buf);
-        }
-    }
-    return 0;
-}
-
-/* Average index-key size per field for composite key budgeting.
-   Composites are now built by concatenating typed_field_to_index_key output
-   (binary, total-order encoded). Fixed-width types use f->size; varchars
-   use 50% fill of f->size-2, same as the single-field estimator. */
-static size_t typed_field_str_avg(const TypedField *f) {
-    switch (f->type) {
-    case FT_NONE:     return 16;  /* unassigned — conservative fallback */
-    case FT_VARCHAR: {
-        size_t content_max = (size_t)f->size > 2 ? (size_t)f->size - 2 : 0;
-        size_t avg = content_max / 2;
-        return avg < 1 ? 1 : avg;
-    }
-    case FT_BOOL:
-    case FT_BYTE:     return 1;   /* single byte */
-    case FT_SHORT:    return 2;   /* int16 BE + total-order flip */
-    case FT_INT:      return 4;   /* int32 BE + total-order flip */
-    case FT_LONG:     return 8;   /* int64 BE + total-order flip */
-    case FT_DOUBLE:   return 8;   /* IEEE-754 total-order flip */
-    case FT_FLOAT:    return 4;   /* IEEE-754 total-order flip */
-    case FT_NUMERIC:  return 8;   /* int64 BE + total-order flip */
-    case FT_DATE:     return 4;   /* int32 BE + total-order flip */
-    case FT_DATETIME: return 6;   /* int32 BE date + uint16 BE time */
-    case FT_DATETIMEMS: return 8; /* int32 BE date + uint32 BE ms-of-day */
-    case FT_TIME:     return 3;   /* uint24 BE + total-order flip */
-    case FT_TIMESTAMP: return 8;  /* int64 BE + total-order flip */
-    case FT_UUID:     return 16;  /* raw 16 bytes */
-    case FT_ENUM:     return (size_t)f->enum_width;  /* 1 or 2 bytes BE */
-    }
-    return 16;
-}
-
-/* Estimate the peak per-field memory cost of a single batch pass in bytes.
-   The build pipeline keeps three things alive per field while building:
-     - pairs[]: BtEntry array, 32 B per live record
-     - parted_per_field[]: partition copy of the BtEntry array (also 32 B/rec)
-     - key value buffers: one malloc per record sized to the encoded key
-   This estimate is conservative — better to overshoot and run more (smaller)
-   batches than to undershoot and OOM. The doubling fallback in the scan cb
-   handles concurrent inserts that push live_count over the estimate. */
-static size_t estimate_field_build_bytes(const TypedSchema *ts,
-                                         const char *field, size_t live_count) {
-    size_t key_avg = 16;
-
-    if (strchr(field, '+')) {
-        /* Composite key — sum each child field's binary index-key width.
-           Composite keys are built by concatenating typed_field_to_index_key
-           per child; the estimate is the sum of typed_field_str_avg over
-           children. status+invoiceDate ≈ 12 B (4+8), not 64. */
-        char fb[256]; strncpy(fb, field, 255); fb[255] = '\0';
-        size_t sum = 0;
-        char *save = NULL;
-        char *tok = strtok_r(fb, "+", &save);
-        while (tok) {
-            int fidx = typed_field_index(ts, tok);
-            if (fidx >= 0) sum += typed_field_str_avg(&ts->fields[fidx]);
-            else sum += 16;  /* unknown child — conservative fallback */
-            tok = strtok_r(NULL, "+", &save);
-        }
-        if (sum < 8) sum = 8;
-        key_avg = sum;
-    } else {
-        int fidx = typed_field_index(ts, field);
-        if (fidx >= 0) {
-            const TypedField *f = &ts->fields[fidx];
-            if (f->type == FT_VARCHAR) {
-                /* varchar:N stores [u16 len][content], max content = size-2.
-                   Assume 50% fill on average; floor at 8 B for glibc small-bin
-                   overhead so we don't undershoot on near-empty strings. */
-                size_t content_max = (size_t)f->size > 2 ? (size_t)f->size - 2 : 0;
-                key_avg = content_max / 2;
-                if (key_avg < 8) key_avg = 8;
-            } else {
-                /* Fixed-width types: typed_field_to_index_key writes exactly
-                   f->size bytes (binary, total-order encoded). */
-                key_avg = (size_t)f->size;
-                if (key_avg < 8) key_avg = 8;
-            }
-        }
-    }
-    /* +24 B for glibc per-allocation overhead (chunk header). */
-    size_t per_record = 32 + 32 + key_avg + 24;
-    return per_record * (live_count == 0 ? 1 : live_count);
 }
 
 /* Bitmap reindex pass — rebuilds every .bm shard for one field by
@@ -1815,6 +1594,14 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
                                 SlotcaskDb *sdb,
                                 const MFFieldDesc *descs, int n_fields);
 
+/* Forward decl — full definition lives further down, after
+   seg_seq_build_spills/resolve_bitmaps. cmd_add_indexes calls this to
+   build every requested field (btree+bitmap+trigram) in one scan, same
+   engine reindex_object uses. */
+static int build_indexes_streaming_multi(const char *db_root, const char *object,
+                                          const Schema *sch, TypedSchema *ts,
+                                          const MFFieldDesc *descs, int n_fields);
+
 int build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force);
@@ -1825,19 +1612,10 @@ int build_trigram_pass(const char *db_root, const char *object,
     int fi = typed_field_index(ts, field);
     if (fi < 0) return -1;
 
-    int idx_n = index_splits_for(sch->splits);
-
     /* Force: unlink existing .tg shards before rebuild (matches btree's
        force semantics). bt_cache is path-keyed, so cached handles on the
        orphaned inode die on next bt_acquire via inode-mismatch reopen. */
-    if (force) {
-        for (int s = 0; s < idx_n; s++) {
-            char tp[PATH_MAX];
-            tg_build_path(tp, sizeof(tp), db_root, object, field, s);
-            btree_cache_invalidate(tp);
-            unlink(tp);
-        }
-    }
+    if (force) tg_idx_unlink_all(db_root, object, field, sch->splits);
 
     SlotcaskSchemaInfo info = {
         .splits = sch->splits, .slot_size = sch->slot_size,
@@ -1988,111 +1766,6 @@ int build_bitmap_pass(const char *db_root, const char *object,
     return 0;
 }
 
-/* One batch of cmd_add_indexes: scan storage once, accumulate per-field
-   BtEntry arrays, partition by idx_shard, parallel-build the (field, shard)
-   btree files. Memory peak ≈ Σ estimate_field_build_bytes(field, live).
-   Called from cmd_add_indexes per batch so we can bound that peak. */
-static void build_indexes_pass(const char *db_root, const char *object,
-                               const Schema *sch, TypedSchema *ts,
-                               char fields[][256], int start, int n,
-                               size_t live_count) {
-    int idx_n = index_splits_for(sch->splits);
-
-    MultiIndexCtx mc;
-    memset(&mc, 0, sizeof(mc));
-    mc.nfields = n;
-    mc.ts = ts;
-
-    /* Pre-size pair arrays from live_count + small slack for concurrent
-       inserts during the scan. Eliminates exponential doubling (and its
-       2× transient peak from the old buffer hanging around during realloc).
-       If pre-size malloc fails, fall back to the original 4096 + doubling
-       path — the scan cb's xrealloc_or_free still handles growth. */
-    size_t initial = live_count + 4096;
-    if (initial < 4096) initial = 4096;
-    if (initial > (1ULL << 30)) initial = (1ULL << 30);  /* 1 Gi BtEntries hard cap */
-
-    for (int fi = 0; fi < n; fi++) {
-        memcpy(mc.fields[fi], fields[start + fi], 256);
-        mc.is_composite[fi] = (strchr(fields[start + fi], '+') != NULL);
-        mc.pair_cap[fi] = initial;
-        mc.pairs[fi] = malloc(initial * sizeof(BtEntry));
-        if (!mc.pairs[fi]) {
-            mc.pair_cap[fi] = 4096;
-            mc.pairs[fi] = malloc(mc.pair_cap[fi] * sizeof(BtEntry));
-        }
-        pthread_mutex_init(&mc.lock[fi], NULL);
-
-        if (mc.is_composite[fi]) {
-            char fb[256]; strncpy(fb, fields[start + fi], 255); fb[255] = '\0';
-            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-            while (tok && mc.field_index_count[fi] < 16) {
-                mc.field_indices[fi][mc.field_index_count[fi]++] = typed_field_index(ts, tok);
-                tok = strtok_r(NULL, "+", &_tok_save);
-            }
-        } else {
-            mc.field_indices[fi][0] = typed_field_index(ts, fields[start + fi]);
-            mc.field_index_count[fi] = 1;
-        }
-    }
-
-    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: pass on %d fields, scanning %d kf shards...",
-             db_root, object, n, sch->splits);
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    scan_dispatch(db_root, object, sch, data_dir, multi_index_scan_cb, &mc);
-    LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: scan done, partitioning...",
-             db_root, object);
-    for (int fi = 0; fi < n; fi++) pthread_mutex_destroy(&mc.lock[fi]);
-
-    ShardBuildArg *sb = malloc((size_t)n * idx_n * sizeof(ShardBuildArg));
-    int sb_count = 0;
-    if (n <= 0) return;
-    BtEntry **parted_per_field = calloc((size_t)n, sizeof(BtEntry *));
-    size_t  **offsets_per_field = calloc((size_t)n, sizeof(size_t *));
-    size_t  **counts_per_field  = calloc((size_t)n, sizeof(size_t *));
-
-    for (int fi = 0; fi < n; fi++) {
-        /* Skip empty / partition-failed fields; the cleanup loop below frees
-           mc.pairs[fi] unconditionally, so we must NOT free it here too —
-           that's a double-free that only surfaced once reindex_object ran
-           on a v2 object (where the legacy v1 scan found no records and
-           every field had pair_count = 0). */
-        if (mc.pair_count[fi] == 0) continue;
-        size_t *offsets = NULL, *counts = NULL;
-        BtEntry *parted = partition_by_shard(mc.pairs[fi], mc.pair_count[fi],
-                                             sch->splits, idx_n,
-                                             &offsets, &counts);
-        if (!parted) continue;
-        parted_per_field[fi] = parted;
-        offsets_per_field[fi] = offsets;
-        counts_per_field[fi] = counts;
-        for (int s = 0; s < idx_n; s++) {
-            if (counts[s] == 0) continue;
-            build_idx_path(sb[sb_count].ipath, sizeof(sb[sb_count].ipath),
-                           db_root, object, mc.fields[fi], s);
-            sb[sb_count].pairs = parted + offsets[s];
-            sb[sb_count].pair_count = counts[s];
-            sb_count++;
-        }
-    }
-
-    parallel_for(shard_build_worker, sb, sb_count, sizeof(ShardBuildArg));
-    free(sb);
-
-    for (int fi = 0; fi < n; fi++) {
-        for (size_t ei = 0; ei < mc.pair_count[fi]; ei++)
-            free((char *)mc.pairs[fi][ei].value);
-        free(mc.pairs[fi]);
-        free(parted_per_field[fi]);
-        free(offsets_per_field[fi]);
-        free(counts_per_field[fi]);
-    }
-    free(parted_per_field);
-    free(offsets_per_field);
-    free(counts_per_field);
-}
-
 int cmd_add_indexes(const char *db_root, const char *object,
                     const char *fields_json, int force) {
     uint64_t t_start = now_ms();
@@ -2164,18 +1837,21 @@ int cmd_add_indexes(const char *db_root, const char *object,
         }
     }
 
-    /* Forward-declared further down (definition lives near the build
-       workers). Rebuilds every shard's .bm for a single field. */
-    int build_bitmap_pass(const char *db_root, const char *object,
-                          const Schema *sch, TypedSchema *ts,
-                          const char *field, uint32_t max_values, int force);
-
     /* Bitmap- and trigram-typed fields follow the same skip-if-exists
        semantic as btree: with force, wipe + rebuild; without force,
-       no-op when any shard file already exists for the field. */
+       no-op when any shard file already exists for the field. All three
+       types are accumulated into ONE combined MFFieldDesc array below and
+       built via ONE call to build_indexes_streaming_multi — the same
+       single-scan engine reindex_object uses — instead of the old
+       build_bitmap_pass-per-field + build_trigram_pass-per-field +
+       build_indexes_pass-batch triple dispatch (up to 3 separate
+       full-object scans for one add-index call). */
     int total_fields = nfields;  /* preserved across the btree-only reduction below */
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
+    MFFieldDesc *descs = calloc((size_t)total_fields, sizeof(MFFieldDesc));
+    int n_desc = 0;
+
     for (int i = 0; i < nfields; i++) {
         if (types[i] == IT_BITMAP) {
             if (!force) {
@@ -2186,12 +1862,27 @@ int cmd_add_indexes(const char *db_root, const char *object,
                 struct stat st;
                 if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
             }
-            build_bitmap_pass(db_root, object, &sch,
-                              load_typed_schema(db_root, object),
-                              names[i], maxes[i], force);
+            if (descs && ts_for_idx) {
+                int fi_t = typed_field_index(ts_for_idx, names[i]);
+                if (fi_t >= 0) {
+                    MFFieldDesc *d = &descs[n_desc++];
+                    memset(d, 0, sizeof(*d));
+                    d->type = MF_BITMAP;
+                    strncpy(d->name, names[i], sizeof(d->name) - 1);
+                    d->field_indices[0] = fi_t;
+                    d->field_index_count = 1;
+                    d->bm_max_values = maxes[i];
+                    d->bm_bool_fastpath = (ts_for_idx->fields[fi_t].type == FT_BOOL) ? 1 : 0;
+                }
+            }
             continue;
         }
         if (types[i] == IT_TRIGRAM) {
+            /* Validate field exists in typed schema before touching any
+               on-disk state — matches build_trigram_pass's early return
+               on fi < 0. A typo'd field name must not wipe existing shards. */
+            int fi_t = ts_for_idx ? typed_field_index(ts_for_idx, names[i]) : -1;
+            if (fi_t < 0) continue;
             if (!force) {
                 /* Probe shard 0's .tg — same skip-if-exists rule the
                    btree and bitmap branches use. */
@@ -2199,10 +1890,20 @@ int cmd_add_indexes(const char *db_root, const char *object,
                 tg_build_path(probe, sizeof(probe), db_root, object, names[i], 0);
                 struct stat st;
                 if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
+            } else {
+                /* Force: unlink existing .tg shards before rebuild —
+                   mirrors build_trigram_pass's own force branch, since
+                   we no longer call build_trigram_pass from here. */
+                tg_idx_unlink_all(db_root, object, names[i], sch.splits);
             }
-            build_trigram_pass(db_root, object, &sch,
-                               load_typed_schema(db_root, object),
-                               names[i], force);
+            if (descs) {
+                MFFieldDesc *d = &descs[n_desc++];
+                memset(d, 0, sizeof(*d));
+                d->type = STREAM_TRIGRAM;
+                strncpy(d->name, names[i], sizeof(d->name) - 1);
+                d->field_indices[0] = fi_t;
+                d->field_index_count = 1;
+            }
             continue;
         }
         memcpy(btree_fields[btree_count], names[i], 256);
@@ -2214,9 +1915,9 @@ int cmd_add_indexes(const char *db_root, const char *object,
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
-    /* === Btree batched-build path (only when btree fields remain after
-       the typed-dispatch loop above). Typed builds already ran inline
-       — this block handles only IT_BTREE. */
+    /* === Btree fields: same skip-if-exists / force-unlink semantics as
+       before — just add one MFFieldDesc per field to the SAME combined
+       array built above instead of running a separate batched pass. */
     char actual_fields[MAX_FIELDS][256];
     int actual_count = 0;
     if (nfields > 0) {
@@ -2231,67 +1932,44 @@ int cmd_add_indexes(const char *db_root, const char *object,
             actual_count++;
         }
 
-        if (actual_count > 0) {
-            TypedSchema *ts = load_typed_schema(db_root, object);
-
-            /* Adaptive batching: group fields into passes whose combined estimated
-               memory fits g_index_build_budget_bytes. Each pass keeps the existing
-               parallel scan + parallel build machinery — we just bound peak memory
-               so reindex on 25 M× 12-field schemas doesn't OOM the host. A single
-               field that alone exceeds the budget is still processed alone (the
-               "always include at least one" rule below). */
-            int live_count = get_live_count(db_root, object);
-            if (live_count < 0) live_count = 0;
-            size_t budget = g_index_build_budget_bytes;
-            if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
-
-            size_t per_field_bytes[MAX_FIELDS];
-            for (int i = 0; i < actual_count; i++)
-                per_field_bytes[i] = estimate_field_build_bytes(ts, actual_fields[i],
-                                                                (size_t)live_count);
-
-            int n_batches = 0;
-            int batch_start = 0;
-            /* Pre-count total batches so per-batch log can show X/N */
-            int total_batches = 0;
-            {
-                int bs = 0;
-                while (bs < actual_count) {
-                    size_t bb = 0;
-                    int be = bs;
-                    while (be < actual_count) {
-                        size_t next = per_field_bytes[be];
-                        if (be > bs && bb + next > budget) break;
-                        bb += next;
-                        be++;
+        if (actual_count > 0 && descs && ts_for_idx) {
+            for (int i = 0; i < actual_count; i++) {
+                int fi_t = typed_field_index(ts_for_idx, actual_fields[i]);
+                if (fi_t < 0 && !strchr(actual_fields[i], '+')) continue;
+                MFFieldDesc *d = &descs[n_desc++];
+                memset(d, 0, sizeof(*d));
+                d->type = STREAM_BTREE;
+                strncpy(d->name, actual_fields[i], sizeof(d->name) - 1);
+                d->is_composite = (strchr(actual_fields[i], '+') != NULL);
+                if (d->is_composite) {
+                    char fbuf[256];
+                    strncpy(fbuf, actual_fields[i], 255); fbuf[255] = '\0';
+                    char *save = NULL;
+                    for (char *t = strtok_r(fbuf, "+", &save);
+                         t && d->field_index_count < 16;
+                         t = strtok_r(NULL, "+", &save)) {
+                        int ci = typed_field_index(ts_for_idx, t);
+                        if (ci >= 0)
+                            d->field_indices[d->field_index_count++] = ci;
                     }
-                    total_batches++;
-                    bs = be;
+                    if (d->field_index_count == 0) { n_desc--; continue; }
+                } else {
+                    d->field_indices[0] = fi_t;
+                    d->field_index_count = 1;
                 }
             }
-            while (batch_start < actual_count) {
-                size_t batch_bytes = 0;
-                int batch_end = batch_start;
-                while (batch_end < actual_count) {
-                    size_t next = per_field_bytes[batch_end];
-                    if (batch_end > batch_start && batch_bytes + next > budget) break;
-                    batch_bytes += next;
-                    batch_end++;
-                }
-                LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: batch %d/%d (fields %d..%d, budget=%zu MB)...",
-                         db_root, object, n_batches + 1, total_batches,
-                         batch_start, batch_end - 1, budget / (1024 * 1024));
-                build_indexes_pass(db_root, object, &sch, ts, actual_fields,
-                                   batch_start, batch_end - batch_start,
-                                   (size_t)live_count);
-                n_batches++;
-                batch_start = batch_end;
-            }
-            LOG_AUDIT(LOG_SUB_INDEX, "ADD-INDEXES %s: %d fields in %d batch(es), live=%d, budget=%zu MB",
-                    object, actual_count, n_batches, live_count,
-                    budget / (1024 * 1024));
         }
     }
+
+    /* Single scan: build every requested bitmap/trigram/btree field in
+       ONE call to the same engine reindex uses. This is the fix for the
+       "N separate full-object scans per add-index call" incident. */
+    if (n_desc > 0) {
+        LOG_AUDIT(LOG_SUB_INDEX, "ADD-INDEXES %s: %d field(s), single scan",
+                 object, n_desc);
+        build_indexes_streaming_multi(db_root, object, &sch, ts_for_idx, descs, n_desc);
+    }
+    free(descs);
 
     /* === Write canonical index.conf for ALL original fields (typed +
        btree). Pre-fix this only ran for btree fields, so a plural
