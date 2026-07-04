@@ -21625,6 +21625,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         OUT("{\"error\":\"object is required\"}\n");
         return 1;
     }
+    if (!is_valid_object(object)) {
+        OUT("{\"error\":\"invalid object name (no /,\\\\, leading dot, control chars; max 255 bytes)\"}\n");
+        return 1;
+    }
     if (!fields_json || !fields_json[0]) {
         OUT("{\"error\":\"fields is required — e.g. [\\\"name:varchar:30\\\",\\\"age:int\\\"]\"}\n");
         return 1;

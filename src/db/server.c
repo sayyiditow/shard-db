@@ -588,6 +588,12 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
         }
     }
 
+    if (!is_valid_object(cmd.obj)) {
+        OUT("{\"error\":\"invalid object name\"}\n");
+        nql_free_command(&cmd);
+        return;
+    }
+
     /* Build db_root = g_db->db_root / dir */
     char db_root[PATH_MAX];
     snprintf(db_root, sizeof db_root, "%s/%s", raw_db_root, cmd.dir);
@@ -704,6 +710,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             /* Validate dir if present */
             if (dir_scope && dir_scope[0] && !is_valid_dir(dir_scope)) {
                 OUT("{\"error\":\"Unknown dir: %s\"}\n", dir_scope);
+                free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                return;
+            }
+            /* Validate object name if present */
+            if (obj_scope && obj_scope[0] && !is_valid_object(obj_scope)) {
+                OUT("{\"error\":\"invalid object name\"}\n");
                 free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
                 return;
             }
@@ -1187,6 +1199,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *obj_f = json_obj_strdup(&req, "object");
         const char *df = (dir_f && dir_f[0]) ? dir_f : NULL;
         const char *of = (obj_f && obj_f[0]) ? obj_f : NULL;
+        if (of && !is_valid_object(of)) {
+            OUT("{\"error\":\"invalid object name\"}\n");
+            free(dir_f); free(obj_f); free(mode);
+            return;
+        }
         int composites_only = json_obj_is_true(&req, "composites_only");
         cmd_reindex(g_db_root, df, of, composites_only);
         free(dir_f); free(obj_f); free(mode);
@@ -1248,6 +1265,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
     if (!mode || !dir || !object) {
         OUT("{\"error\":\"Missing mode, dir, or object\"}\n");
+        free(mode); free(dir); free(object);
+        return;
+    }
+
+    /* Object names are interpolated into filesystem paths below; reject any
+       traversal ("/", "..") before create-object/drop-object/restore and every
+       data path build their $DB_ROOT/<dir>/<object> paths. Without this a
+       tenant token could pass object:"../other/obj" and escape its tenant. */
+    if (!is_valid_object(object)) {
+        OUT("{\"error\":\"invalid object name (no /,\\\\, leading dot, control chars; max 255 bytes)\"}\n");
         free(mode); free(dir); free(object);
         return;
     }
@@ -2179,6 +2206,10 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        the schema, killing the worker thread. */
     if (!object || !object[0]) {
         OUT("{\"error\":\"object is required\"}\n");
+        goto timing;
+    }
+    if (!is_valid_object(object)) {
+        OUT("{\"error\":\"invalid object name (no /,\\\\, leading dot, control chars; max 255 bytes)\"}\n");
         goto timing;
     }
     char obj_check[PATH_MAX];
