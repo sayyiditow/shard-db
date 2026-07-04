@@ -5656,7 +5656,16 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
+    /* Same lock-free warm-hit fast path slotcask_get already uses:
+       db->kf_slot_refs[sid_kf] is a per-shard SlotRef owned by the
+       SlotcaskDb instance, so it stays warm across every call against
+       this shard regardless of caller. kfcache_acquire_direct falls
+       back to the plain kfcache_acquire slow path (and refreshes the
+       ref) on a cold miss or eviction race — same correctness, fewer
+       table-mutex acquisitions on the common warm path. */
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path, db->slots_per_shard,
+                               db, sid_kf) != 0) return -1;
 
     size_t cap = kh.capacity;
     SlotcaskKfEntry *kf = kh.map;
