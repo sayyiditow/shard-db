@@ -160,12 +160,15 @@ enum FieldType {
                        (no time-source defaults) and FT_DATETIME (calendar-packed,
                        can't represent pre-1970 or post-9999 dates). */
     FT_UUID,        /* uuid — 16 bytes binary */
-    FT_ENUM         /* enum(v1,v2,...) — declared value list, encoded as
+    FT_ENUM,        /* enum(v1,v2,...) — declared value list, encoded as
                        1-byte index (≤256 values) or 2-byte BE index
                        (257-65535 values). The byte width is fixed at
                        declaration time; auto-widens 1→2 via edit-field
                        when an append pushes count past 256. Auto-defaults
                        to a bitmap index (like FT_BOOL). */
+    FT_IPV4         /* ipv4 — 4 bytes binary, network byte order (same
+                       ordering as inet_pton output). No sign-bit flip
+                       needed for index-key ordering — mirrors FT_UUID. */
 };
 
 /* Index types — declared per-field at create-object, persisted in
@@ -348,6 +351,8 @@ typedef struct CompiledCriterion {
     double   d1, d2;
     uint8_t  uuid_bytes[16];
     uint8_t  uuid_bytes2[16];
+    uint8_t  ipv4_val[4];
+    uint8_t  ipv4_val2[4];
     uint8_t  time_val[3];
     uint8_t  time_val2[3];
     uint16_t t1, t2;
@@ -368,6 +373,7 @@ typedef struct CompiledCriterion {
     double   *in_f64;
     uint8_t (*in_uuid)[16];
     uint8_t (*in_time)[3];
+    uint8_t (*in_ipv4)[4];
     size_t   *in_lens;   /* varchar only: strlen(in_values[i]), precomputed once
                              at compile time instead of per-record in the match
                              loop (in_values[] themselves stay raw strings) */
