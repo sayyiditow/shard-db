@@ -2539,7 +2539,19 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                        varchars — keeps wire and stored bytes in sync. */
                     if (ts->fields[i].type == FT_VARCHAR) {
                         char *unesc = NULL; size_t unesc_len = 0;
-                        if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
+                        int did_unesc =
+                            (json_unescape_string(ev, el, &unesc, &unesc_len) == 0);
+                        size_t stored_len = did_unesc ? unesc_len : el;
+                        int content_max = ts->fields[i].size - 2;
+                        if ((int)stored_len > content_max) {
+                            if (err_buf && err_buf_size > 0)
+                                snprintf(err_buf, err_buf_size,
+                                    "value for field '%s' is %zu bytes; exceeds max %d for varchar",
+                                    ts->fields[i].name, stored_len, content_max);
+                            if (did_unesc) free(unesc);
+                            return -2;
+                        }
+                        if (did_unesc) {
                             encode_field_len(&ts->fields[i], unesc, unesc_len,
                                               out + ts->fields[i].offset);
                             free(unesc);
