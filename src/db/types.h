@@ -368,6 +368,9 @@ typedef struct CompiledCriterion {
     double   *in_f64;
     uint8_t (*in_uuid)[16];
     uint8_t (*in_time)[3];
+    size_t   *in_lens;   /* varchar only: strlen(in_values[i]), precomputed once
+                             at compile time instead of per-record in the match
+                             loop (in_values[] themselves stay raw strings) */
     int       in_count;
 
     /* OP_REGEX / OP_NOT_REGEX */
