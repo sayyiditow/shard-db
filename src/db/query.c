@@ -24050,7 +24050,9 @@ static int agg_ht_resize(AggCtx *ctx) {
         AggBucket *b = ctx->ht[i];
         while (b) {
             AggBucket *next = b->next;
-            uint32_t h = agg_hash(b->group_key) & (uint32_t)new_mask;
+            uint32_t h = (ctx->use_int_keys && b->raw_key_len > 0)
+                ? agg_hash_int(b->raw_key, (size_t)b->raw_key_len) & (uint32_t)new_mask
+                : agg_hash(b->group_key) & (uint32_t)new_mask;
             b->next = new_ht[h];
             new_ht[h] = b;
             b = next;
