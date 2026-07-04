@@ -166,9 +166,12 @@ enum FieldType {
                        declaration time; auto-widens 1→2 via edit-field
                        when an append pushes count past 256. Auto-defaults
                        to a bitmap index (like FT_BOOL). */
-    FT_IPV4         /* ipv4 — 4 bytes binary, network byte order (same
+    FT_IPV4,        /* ipv4 — 4 bytes binary, network byte order (same
                        ordering as inet_pton output). No sign-bit flip
                        needed for index-key ordering — mirrors FT_UUID. */
+    FT_IPV6         /* ipv6 — 16 bytes binary, network byte order (same
+                       ordering as inet_pton(AF_INET6, ...) output). No
+                       sign-bit flip needed — mirrors FT_UUID/FT_IPV4. */
 };
 
 /* Index types — declared per-field at create-object, persisted in
@@ -353,6 +356,8 @@ typedef struct CompiledCriterion {
     uint8_t  uuid_bytes2[16];
     uint8_t  ipv4_val[4];
     uint8_t  ipv4_val2[4];
+    uint8_t  ipv6_val[16];
+    uint8_t  ipv6_val2[16];
     uint8_t  time_val[3];
     uint8_t  time_val2[3];
     uint16_t t1, t2;
@@ -374,6 +379,7 @@ typedef struct CompiledCriterion {
     uint8_t (*in_uuid)[16];
     uint8_t (*in_time)[3];
     uint8_t (*in_ipv4)[4];
+    uint8_t (*in_ipv6)[16];
     size_t   *in_lens;   /* varchar only: strlen(in_values[i]), precomputed once
                              at compile time instead of per-record in the match
                              loop (in_values[] themselves stay raw strings) */
