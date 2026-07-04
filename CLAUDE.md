@@ -157,6 +157,7 @@ Driven by fields.conf. One slot = sum of field sizes (fixed).
 | `datetime` | 6 bytes (BE int32 yyyyMMdd + BE uint16 packed HHmmss) |
 | `datetimems` | 8 bytes (BE int32 yyyyMMdd + BE uint32 ms-of-day) |
 | `ipv4` | 4 bytes, network byte order |
+| `ipv6` | 16 bytes, network byte order |
 | `numeric:P,S` | 8 bytes BE int64 × 10^S |
 
 Field defaults (in fields.conf): `:default=<literal>`, `:auto_create`, `:auto_update`, `:default=seq(<name>)`, `:default=uuid()`, `:default=random(N)`. Reference: [docs/concepts/typed-records.md](docs/concepts/typed-records.md).

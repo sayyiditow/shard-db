@@ -1229,6 +1229,9 @@ void parse_field_type(const char *spec, TypedField *f) {
     } else if (strcmp(spec, "ipv4") == 0) {
         f->type = FT_IPV4;
         f->size = 4;
+    } else if (strcmp(spec, "ipv6") == 0) {
+        f->type = FT_IPV6;
+        f->size = 16;
     } else if (strcmp(spec, "currency") == 0) {
         f->type = FT_NUMERIC;
         f->size = 8;
@@ -1618,6 +1621,15 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
             memset(out, 0, 4);
         break;
     }
+    case FT_IPV6: {
+        char ipbuf[46]; /* INET6_ADDRSTRLEN */
+        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
+        memcpy(ipbuf, val, n);
+        ipbuf[n] = '\0';
+        if (n == 0 || inet_pton(AF_INET6, ipbuf, out) != 1)
+            memset(out, 0, 16);
+        break;
+    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -1868,6 +1880,16 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         *out_len = 4;
         break;
     }
+    case FT_IPV6: {
+        char ipbuf[46];
+        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
+        memcpy(ipbuf, val, n);
+        ipbuf[n] = '\0';
+        if (n == 0 || inet_pton(AF_INET6, ipbuf, out) != 1)
+            memset(out, 0, 16);
+        *out_len = 16;
+        break;
+    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -1981,6 +2003,11 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
     case FT_IPV4: {
         memcpy(out, src, 4);
         *out_len = 4;
+        break;
+    }
+    case FT_IPV6: {
+        memcpy(out, src, 16);
+        *out_len = 16;
         break;
     }
     case FT_DOUBLE: {
@@ -2692,6 +2719,15 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
             return 0;
         return snprintf(buf, buflen, "\"%s\"", ipstr);
     }
+    case FT_IPV6: {
+        int allzero = 1;
+        for (int bi = 0; bi < 16; bi++) if (data[bi] != 0) { allzero = 0; break; }
+        if (allzero) return 0;
+        char ipstr[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, data, ipstr, sizeof(ipstr)))
+            return 0;
+        return snprintf(buf, buflen, "\"%s\"", ipstr);
+    }
     case FT_ENUM: {
         /* Stored bytes are the byte index (1 or 2 BE). Always emit
            (byte 0 is a legit enum index, not "unset"). Output is a
@@ -2945,6 +2981,19 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         char *out = malloc(INET_ADDRSTRLEN);
         if (!out) return NULL;
         if (!inet_ntop(AF_INET, ip, out, INET_ADDRSTRLEN)) {
+            free(out);
+            return NULL;
+        }
+        return out;
+    }
+    case FT_IPV6: {
+        const uint8_t *ip = src + f->offset;
+        int allzero = 1;
+        for (int bi = 0; bi < 16; bi++) if (ip[bi] != 0) { allzero = 0; break; }
+        if (allzero) return NULL;
+        char *out = malloc(INET6_ADDRSTRLEN);
+        if (!out) return NULL;
+        if (!inet_ntop(AF_INET6, ip, out, INET6_ADDRSTRLEN)) {
             free(out);
             return NULL;
         }

@@ -227,6 +227,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bm_intersect_count.c \
     src/test/cases/test_enum.c \
     src/test/cases/test_ipv4.c \
+    src/test/cases/test_ipv6.c \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \

@@ -8054,6 +8054,13 @@ static void parse_ipv4(const char *s, uint8_t out[4]) {
         memset(out, 0, 4);
 }
 
+/* Parse a canonical IPv6 string into 16 raw network-byte-order bytes.
+   Malformed/empty input zero-fills (mirrors parse_ipv4/parse_uuid). */
+static void parse_ipv6(const char *s, uint8_t out[16]) {
+    if (!s || !s[0] || inet_pton(AF_INET6, s, out) != 1)
+        memset(out, 0, 16);
+}
+
 /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
 static void parse_time(const char *s, uint8_t out[3]) {
     /* Parse "HH:MM:SS" query operand into 3 bytes BE. Strict validation
@@ -8347,6 +8354,11 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         if (c->value2[0]) { parse_ipv4(c->value2, cc->ipv4_val2); }
         break;
     }
+    case FT_IPV6: {
+        if (c->value[0]) { parse_ipv6(c->value, cc->ipv6_val); }
+        if (c->value2[0]) { parse_ipv6(c->value2, cc->ipv6_val2); }
+        break;
+    }
     case FT_ENUM:
         /* Resolve the criterion's display-string value to its byte index
            in the enum's value list. -1 means "no such value" — match_typed
@@ -8468,6 +8480,11 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             for (int i = 0; i < c->in_count; i++)
                 parse_ipv4(c->in_values[i], cc->in_ipv4[i]);
             break;
+        case FT_IPV6:
+            cc->in_ipv6 = malloc(sizeof(uint8_t[16]) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                parse_ipv6(c->in_values[i], cc->in_ipv6[i]);
+            break;
         case FT_ENUM:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
@@ -8507,6 +8524,7 @@ void free_compiled_criteria(CompiledCriterion *arr, int n) {
         free(arr[i].in_uuid);
         free(arr[i].in_time);
         free(arr[i].in_ipv4);
+        free(arr[i].in_ipv6);
         free(arr[i].in_lens);
         if (arr[i].re) {
             if (arr[i].re_compiled) regfree(arr[i].re);
@@ -8794,6 +8812,8 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
         return memcmp(a, b, 16);
     case FT_IPV4:
         return memcmp(a, b, 4);
+    case FT_IPV6:
+        return memcmp(a, b, 16);
     default: return 0;
     }
 }
@@ -9060,6 +9080,37 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
             int found = 0;
             for (int i = 0; i < cc->in_count; i++) {
                 if (memcmp(p, cc->in_ipv4[i], 4) == 0) { found = 1; break; }
+            }
+            return cc->op == OP_IN ? found : !found;
+        }
+        default: return 0;
+        }
+    }
+    case FT_IPV6: {
+        int exists = 0;
+        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { exists = 1; break; }
+        switch (cc->op) {
+        case OP_EXISTS: return exists;
+        case OP_NOT_EXISTS: return !exists;
+        case OP_EQUAL: return exists && memcmp(p, cc->ipv6_val, 16) == 0;
+        case OP_NOT_EQUAL: return !exists || memcmp(p, cc->ipv6_val, 16) != 0;
+        case OP_LESS: return exists && memcmp(p, cc->ipv6_val, 16) < 0;
+        case OP_GREATER: return exists && memcmp(p, cc->ipv6_val, 16) > 0;
+        case OP_LESS_EQ: return !exists || memcmp(p, cc->ipv6_val, 16) <= 0;
+        case OP_GREATER_EQ: return exists && memcmp(p, cc->ipv6_val, 16) >= 0;
+        case OP_BETWEEN: {
+            if (!exists) return 0;
+            int lo = cc->i1;
+            int hi = cc->i2;
+            if (lo && memcmp(p, cc->ipv6_val, 16) < 0) return 0;
+            if (hi && memcmp(p, cc->ipv6_val2, 16) > 0) return 0;
+            return 1;
+        }
+        case OP_IN: case OP_NOT_IN: {
+            if (!exists) return cc->op == OP_NOT_IN;
+            int found = 0;
+            for (int i = 0; i < cc->in_count; i++) {
+                if (memcmp(p, cc->in_ipv6[i], 16) == 0) { found = 1; break; }
             }
             return cc->op == OP_IN ? found : !found;
         }
@@ -9427,6 +9478,7 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     case FT_DATETIME:
     case FT_DATETIMEMS:
     case FT_IPV4:
+    case FT_IPV6:
     case FT_ENUM:
         /* Enum's display string is a JSON string (quoted, escaped).
            DATE/DATETIME are also strings on the wire. */
@@ -21454,6 +21506,7 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "timestamp") == 0) return 8;
     if (strcmp(type, "uuid") == 0)    return 16;
     if (strcmp(type, "ipv4") == 0)    return 4;
+    if (strcmp(type, "ipv6") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
     if (strncmp(type, "numeric:", 8) == 0) return 8;
     if (strncmp(type, "enum(", 5) == 0) {
@@ -21636,7 +21689,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
 
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
-            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, ipv4, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
+            OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, ipv4, ipv6, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
                    field_specs[nfields]);
             return 1;
         }
@@ -22281,6 +22334,7 @@ static const char *field_type_str(enum FieldType t) {
         case FT_TIMESTAMP: return "timestamp";
         case FT_UUID:     return "uuid";
         case FT_IPV4:     return "ipv4";
+        case FT_IPV6:     return "ipv6";
         case FT_ENUM:     return "enum";
         default:          return "unknown";
     }
@@ -23221,6 +23275,14 @@ static int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         if (!inet_ntop(AF_INET, p, ipstr, sizeof(ipstr))) return 0;
         return snprintf(buf, bufsz, "%s", ipstr);
     }
+    case FT_IPV6: {
+        int allzero = 1;
+        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break; }
+        if (allzero) return 0;
+        char ipstr[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, p, ipstr, sizeof(ipstr))) return 0;
+        return snprintf(buf, bufsz, "%s", ipstr);
+    }
     case FT_ENUM: {
         /* Stored bytes are the byte index. Look up enum_values[idx]
            and copy. Out-of-range index (data corruption) → empty string. */
@@ -23362,6 +23424,9 @@ static int decode_index_key_to_double(const TypedField *f,
     case FT_IPV4:
         /* IPv4 addresses aren't summable. */
         return 0;
+    case FT_IPV6:
+        /* IPv6 addresses aren't summable. */
+        return 0;
     default: return 0;
     }
 }
@@ -23481,6 +23546,14 @@ static int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0) return 0;
         char ipstr[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, p, ipstr, sizeof(ipstr))) return 0;
+        return snprintf(buf, bufsz, "%s", ipstr);
+    }
+    case FT_IPV6: {
+        int allzero = 1;
+        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break; }
+        if (allzero) return 0;
+        char ipstr[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, p, ipstr, sizeof(ipstr))) return 0;
         return snprintf(buf, bufsz, "%s", ipstr);
     }
     case FT_NUMERIC: {
@@ -23958,6 +24031,7 @@ static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *
     case FT_TIME: return 0;  /* not summable */
     case FT_UUID: return 0;  /* not summable */
     case FT_IPV4: return 0;  /* not summable */
+    case FT_IPV6: return 0;  /* not summable */
     case FT_VARCHAR: {
         int len = varchar_eff_len(p, f->size);
         if (len == 0) return 0;
