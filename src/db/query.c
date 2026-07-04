@@ -479,7 +479,8 @@ static int v2_record_capture_cb(const uint8_t hash[16],
                                  void *ctx) {
     (void)hash;
     RecordRef *r = (RecordRef *)ctx;
-    r->v2_buf = malloc(klen + vlen + 1);
+    size_t total = klen + vlen + 1;
+    r->v2_buf = (total <= sizeof(r->inline_buf)) ? r->inline_buf : malloc(total);
     if (!r->v2_buf) return 1;
     memcpy(r->v2_buf, key, klen);
     if (vlen) memcpy(r->v2_buf + klen, value, vlen);
@@ -508,7 +509,10 @@ int read_record_ref(const char *db_root, const char *object,
 void release_record_ref(RecordRef *r) {
     if (!r) return;
     if (r->fc.map) { fcache_release(r->fc); r->fc.map = NULL; }
-    if (r->v2_buf) { free(r->v2_buf); r->v2_buf = NULL; }
+    /* Only free the malloc'd fallback — inline_buf is part of the
+       caller's own RecordRef and needs no explicit release. */
+    if (r->v2_buf && r->v2_buf != r->inline_buf) free(r->v2_buf);
+    r->v2_buf = NULL;
     r->key = r->val = NULL;
     r->klen = r->vlen = 0;
 }

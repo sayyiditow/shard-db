@@ -1118,13 +1118,20 @@ int  scan_dispatch(const char *db_root, const char *object,
                    scan_callback cb, void *ctx);
 
 /* Indexed record fetch: layout-agnostic dispatch for hash-based lookups.
-   v1 path holds an FcacheRead handle; v2 holds a malloc'd copy of the
-   record. Either way, key + val point into a contiguous buffer with
-   layout `[key bytes][val bytes]`, matching v1 Zone B. Caller must
-   call release_record_ref to free both lifetimes. */
+   v1 path holds an FcacheRead handle; v2 holds a copy of the record in
+   inline_buf (fits) or a malloc'd fallback (too large for inline_buf).
+   Either way, key + val point into a contiguous buffer with layout
+   `[key bytes][val bytes]`, matching v1 Zone B. Caller must call
+   release_record_ref to free both lifetimes. */
 typedef struct {
     FcacheRead     fc;        /* v1: kept open to keep mmap alive; .map=NULL on v2 */
-    uint8_t       *v2_buf;    /* v2: malloc'd; NULL on v1 */
+    uint8_t       *v2_buf;    /* v2: points at inline_buf (common case) or a
+                                  malloc'd fallback (record too large for
+                                  inline_buf); NULL on v1 */
+    uint8_t        inline_buf[2048]; /* v2 fast path — avoids malloc/free for
+                                         records that fit; same size convention
+                                         as the stk[2048] pattern in query.c's
+                                         KeySet-fallback record collection */
     const uint8_t *key;
     size_t         klen;
     const uint8_t *val;
