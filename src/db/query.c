@@ -8483,6 +8483,8 @@ void free_compiled_criteria(CompiledCriterion *arr, int n) {
         free(arr[i].needle_lc);
         free(arr[i].in_i64);
         free(arr[i].in_f64);
+        free(arr[i].in_uuid);
+        free(arr[i].in_time);
         free(arr[i].in_lens);
         if (arr[i].re) {
             if (arr[i].re_compiled) regfree(arr[i].re);
