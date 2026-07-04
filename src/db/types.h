@@ -686,6 +686,7 @@ int b64_decode(const char *b64, size_t b64_len, uint8_t *out, size_t *out_len);
 
 /* Filename sanitizer — rejects /, \, .., control chars, empty, >255 bytes */
 int valid_filename(const char *name);
+int is_valid_object(const char *name);
 
 /* config.c */
 int load_db_root(char *out, size_t outlen);

@@ -272,6 +272,24 @@ int valid_filename(const char *name) {
     return 1;
 }
 
+/* Validate an object name arriving from a request. Object names are a single
+   path component under $DB_ROOT/<dir>/; they are interpolated directly into
+   filesystem paths, so they must never contain a separator or traversal.
+   Rejects: empty, > 255 bytes, "/" or "\", control chars, leading '.',
+   and the literal "." / "..". Mirrors valid_filename's contract but is named
+   for the call sites so the intent is unambiguous. */
+int is_valid_object(const char *name) {
+    if (!name || !name[0]) return 0;
+    size_t n = strlen(name);
+    if (n > 255) return 0;
+    if (name[0] == '.') return 0;  /* rejects ".", "..", and dotfiles */
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) return 0;
+    }
+    return 1;
+}
+
 /* ========== Single-pass JSON object parser ==========
    Walks `s` exactly once and records every top-level {"name": value, ...}
    field as a (name, value) span in `out`. Values include surrounding quotes
