@@ -8455,7 +8455,13 @@ static void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                                                           strlen(c->in_values[i]));
             break;
         default:
-            /* VARCHAR, DATETIME: use raw strings via c->in_values */
+            /* VARCHAR, DATETIME: values stay raw strings via c->in_values,
+               but lengths are fixed for the life of this compiled criterion —
+               precompute once here instead of strlen() per record in the
+               match loop (match_typed_varchar's OP_IN/OP_NOT_IN cases). */
+            cc->in_lens = malloc(sizeof(size_t) * c->in_count);
+            for (int i = 0; i < c->in_count; i++)
+                cc->in_lens[i] = strlen(c->in_values[i]);
             break;
         }
     }
@@ -8477,6 +8483,7 @@ void free_compiled_criteria(CompiledCriterion *arr, int n) {
         free(arr[i].needle_lc);
         free(arr[i].in_i64);
         free(arr[i].in_f64);
+        free(arr[i].in_lens);
         if (arr[i].re) {
             if (arr[i].re_compiled) regfree(arr[i].re);
             free(arr[i].re);
@@ -8610,13 +8617,13 @@ static int match_typed_varchar(const uint8_t *p, int size,
     }
     case OP_IN:
         for (int i = 0; i < c->in_count; i++) {
-            size_t vl = strlen(c->in_values[i]);
+            size_t vl = cc->in_lens[i];
             if (elen == (int)vl && memcmp(hay, c->in_values[i], vl) == 0) return 1;
         }
         return 0;
     case OP_NOT_IN:
         for (int i = 0; i < c->in_count; i++) {
-            size_t vl = strlen(c->in_values[i]);
+            size_t vl = cc->in_lens[i];
             if (elen == (int)vl && memcmp(hay, c->in_values[i], vl) == 0) return 0;
         }
         return 1;
