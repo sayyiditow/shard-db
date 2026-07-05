@@ -1273,6 +1273,36 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
     return 0;
 }
 
+/* Produce the "now" string for an auto_create / auto_update timestamp field in
+   the form its type expects. buf must be >= 24 bytes.
+     FT_TIMESTAMP  — Unix epoch ms (decimal)
+     FT_DATETIMEMS — yyyyMMddHHmmssSSS
+     FT_DATE       — yyyyMMdd
+     other (FT_DATETIME / fallback) — yyyyMMddHHmmss */
+void auto_now_str(const TypedField *f, char *buf, size_t bufsz) {
+    if (f->type == FT_TIMESTAMP) {
+        struct timespec tsn; clock_gettime(CLOCK_REALTIME, &tsn);
+        long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+        snprintf(buf, bufsz, "%lld", ms);
+    } else if (f->type == FT_DATETIMEMS) {
+        struct timespec tsn; clock_gettime(CLOCK_REALTIME, &tsn);
+        time_t nowsec = tsn.tv_sec; struct tm tm; localtime_r(&nowsec, &tm);
+        int msec = (int)(tsn.tv_nsec / 1000000L);
+        snprintf(buf, bufsz, "%04d%02d%02d%02d%02d%02d%03d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+    } else {
+        time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm);
+        if (f->type == FT_DATE)
+            snprintf(buf, bufsz, "%04d%02d%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        else
+            snprintf(buf, bufsz, "%04d%02d%02d%02d%02d%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+}
+
 static int cmd_insert_v2(const char *db_root, const char *object,
                          const char *key, size_t klen, const char *value,
                          const char *if_json, int if_not_exists,
@@ -1328,6 +1358,47 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
         sdb->trim_fn  = schema_trim_fn;
         sdb->trim_ctx = (void *)ts;
+    }
+
+    /* auto_create: stamp now() on first insert only; preserve the stored value
+       on any update / re-insert. This path is an upsert, so a re-insert of an
+       existing key would otherwise zero the create-time (typed_encode_defaults
+       leaves DK_AUTO_CREATE fields blank). We consult the prior record — but
+       only when the schema actually declares an auto_create field, so ordinary
+       objects pay nothing. */
+    {
+        int has_ac = 0;
+        for (int i = 0; i < ts->nfields; i++)
+            if (!ts->fields[i].removed &&
+                ts->fields[i].default_kind == DK_AUTO_CREATE) { has_ac = 1; break; }
+        if (has_ac) {
+            void *ac_old = NULL; size_t ac_old_vlen = 0;
+            int existed = (slotcask_get(sdb, key, klen, &ac_old, &ac_old_vlen) == 0);
+            for (int i = 0; i < ts->nfields; i++) {
+                if (ts->fields[i].removed ||
+                    ts->fields[i].default_kind != DK_AUTO_CREATE) continue;
+                size_t off = (size_t)ts->fields[i].offset;
+                size_t w   = (size_t)ts->fields[i].size;
+                if (existed && ac_old && ac_old_vlen >= off + w) {
+                    memcpy(typed_buf + off, (uint8_t *)ac_old + off, w);
+                } else if (!existed) {
+                    /* Re-stamp unconditionally, even though typed_encode_defaults
+                       already stamped now() for a client-omitted field. Do NOT
+                       "optimize" this away: if the client explicitly supplied a
+                       value for this field, typed_encode_defaults wrote THAT
+                       value (seen[i]=1 skips generate_default), and this is the
+                       only place that overwrites it — removing this branch lets
+                       a client-supplied auto_create value survive a fresh
+                       insert, which the field's contract forbids. The extra
+                       clock_gettime on fresh inserts is negligible. */
+                    char tbuf[24];
+                    auto_now_str(&ts->fields[i], tbuf, sizeof(tbuf));
+                    encode_field(&ts->fields[i], tbuf, typed_buf + off);
+                }
+                /* existed but old too short (field added post-hoc): leave blank. */
+            }
+            free(ac_old);
+        }
     }
 
     /* Index fields + criteria (only parsed if if_json is present). */

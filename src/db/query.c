@@ -1124,6 +1124,50 @@ typedef struct {
     size_t            old_arena_slot;
 } V2BulkInsCtx;
 
+/* value_compute hook: corrects :auto_create fields before the segment
+   write happens (Phase 1c of slotcask_bulk_upsert_in_kfshard — strictly
+   before the record is persisted, unlike pre_commit which fires after).
+   Only installed when the schema actually declares an auto_create field
+   (see has_ac gate in bulk_insert_shard_worker_v2), so ordinary bulk
+   inserts never pay for this.
+
+   rec->value already holds the fully-encoded payload from phase 1
+   (typed_encode_defaults for the JSON path; direct encode_field_len for
+   the delimited/CSV path) — that encode had no way to know whether this
+   key already exists, so any auto_create field in it is either a fresh
+   now() stamp (client omitted it) or whatever the client explicitly
+   supplied. This hook is the only place that corrects it:
+     - key already existed (old->value != NULL): the field must NOT change
+       on an upsert — restore the original bytes from the old record.
+     - key is a genuine fresh insert (old == NULL): re-stamp now()
+       unconditionally, even though phase 1 may already have stamped it,
+       to overwrite any client-supplied override (mirrors cmd_insert_v2's
+       Task 3 fix in storage.c — same contract, same reasoning). */
+static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
+                                         SlotcaskBulkRec *rec) {
+    V2BulkInsCtx *ctx = (V2BulkInsCtx *)rec->user_ctx;
+    const TypedSchema *ts = ctx->sw->ts;
+    uint8_t *buf = (uint8_t *)rec->value;
+
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed ||
+            ts->fields[i].default_kind != DK_AUTO_CREATE) continue;
+        size_t off = (size_t)ts->fields[i].offset;
+        size_t w   = (size_t)ts->fields[i].size;
+        if (old && old->value && old->vlen >= off + w) {
+            memcpy(buf + off, old->value + off, w);
+        } else if (!old) {
+            char tbuf[24];
+            auto_now_str(&ts->fields[i], tbuf, sizeof(tbuf));
+            encode_field(&ts->fields[i], tbuf, buf + off);
+        }
+        /* existed but old record too short (field added post-hoc): leave
+           whatever phase 1 already encoded, same as the single-insert
+           fix's equivalent case. */
+    }
+    return 0;
+}
+
 /* (slot, value) pair queued for batched bitmap flush. Inline value
    buffer covers bool (1 B) + typical varchar enum values (≤32 B);
    longer encodings fall back to the per-record bm_open path. */
@@ -1422,6 +1466,17 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         batch[pos].if_not_exists = r->if_not_exists;
     }
 
+    /* has_ac gate: only wire up the auto_create value_compute hook (and
+       the OLD-record read it implies) when the schema actually declares
+       an auto_create field. Ordinary bulk inserts pay nothing — this is
+       the same has_ac gate the single-insert fix uses in
+       storage.c's cmd_insert_v2. */
+    int has_ac = 0;
+    for (int i = 0; i < sw->ts->nfields; i++) {
+        if (!sw->ts->fields[i].removed &&
+            sw->ts->fields[i].default_kind == DK_AUTO_CREATE) { has_ac = 1; break; }
+    }
+
     SlotcaskBulkOpts opts = {
         .if_not_exists        = sw->if_not_exists,
         .pre_commit           = v2_bulk_ins_pre_commit_bulk,
@@ -1429,6 +1484,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
            the hook returns immediately. Tells the primitive to skip the
            per-record read_record_value on UPDATE. */
         .pre_commit_needs_old = sw->nidx > 0,
+        .value_compute        = has_ac ? v2_bulk_ins_ac_value_compute : NULL,
     };
     for (int s = 0; s < splits; s++) {
         if (counts[s] == 0) continue;
