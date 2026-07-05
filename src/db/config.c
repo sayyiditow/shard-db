@@ -2185,32 +2185,28 @@ static void gen_datetimems_now(char *buf, size_t bufsz) {
 
 /* === UUID helpers ===
  *
- * gen_uuid4_raw fills 16 bytes from /dev/urandom and stamps v4 + variant
- * bits. Single-shot; gen_uuid4 (the string formatter) calls it then
- * formats. gen_uuid4_batch amortises the open() over `n` UUIDs for
+ * gen_uuid4_raw fills 16 bytes via fill_random (getentropy with /dev/urandom
+ * fallback) and stamps v4 + variant bits. Single-shot; gen_uuid4 (the string
+ * formatter) calls it then formats. gen_uuid4_batch amortises the fill_random
+ * call over `n` UUIDs for
  * bulk-insert. parse_uuid_string is strict (returns -1 on malformed).
  * format_uuid_string is the inverse; both are also declared in types.h
  * for use from server.c / storage.c. */
 
-void gen_uuid4_raw(uint8_t out[16]) {
-    FILE *f = fopen("/dev/urandom", "r");
-    if (!f || fread(out, 1, 16, f) != 16) {
-        memset(out, 0, 16);
-        if (f) fclose(f);
-        return;
+int gen_uuid4_raw(uint8_t out[16]) {
+    if (fill_random(out, 16) != 0) {
+        memset(out, 0, 16);   /* defense in depth — callers must check rc */
+        return -1;
     }
-    fclose(f);
     out[6] = (out[6] & 0x0F) | 0x40;  /* version 4 */
     out[8] = (out[8] & 0x3F) | 0x80;  /* variant 1 */
+    return 0;
 }
 
 int gen_uuid4_batch(uint8_t *out, size_t n) {
     if (n == 0) return 0;
-    FILE *f = fopen("/dev/urandom", "r");
-    if (!f) return -1;
-    size_t got = fread(out, 1, n * 16, f);
-    fclose(f);
-    if (got != n * 16) return -1;
+    if (n > SIZE_MAX / 16) return -1;
+    if (fill_random(out, n * 16) != 0) return -1;
     for (size_t i = 0; i < n; i++) {
         out[i * 16 + 6] = (out[i * 16 + 6] & 0x0F) | 0x40;
         out[i * 16 + 8] = (out[i * 16 + 8] & 0x3F) | 0x80;
@@ -2257,7 +2253,7 @@ int parse_uuid_string(const char *in, uint8_t out[16]) {
 static void gen_uuid4(char *buf, size_t bufsz) {
     if (bufsz < 37) { buf[0] = '\0'; return; }
     uint8_t raw[16];
-    gen_uuid4_raw(raw);
+    if (gen_uuid4_raw(raw) != 0) { buf[0] = '\0'; return; }
     format_uuid_string(raw, buf);
 }
 
@@ -2320,9 +2316,7 @@ static void gen_random_hex(int nbytes, char *buf, size_t bufsz) {
     if (nbytes <= 0 || (size_t)(nbytes * 2 + 1) > bufsz) { buf[0] = '\0'; return; }
     uint8_t raw[256];
     if (nbytes > (int)sizeof(raw)) nbytes = (int)sizeof(raw);
-    FILE *f = fopen("/dev/urandom", "r");
-    if (!f || (int)fread(raw, 1, nbytes, f) != nbytes) { buf[0] = '\0'; if (f) fclose(f); return; }
-    fclose(f);
+    if (fill_random(raw, (size_t)nbytes) != 0) { buf[0] = '\0'; return; }
     for (int i = 0; i < nbytes; i++)
         snprintf(buf + i * 2, 3, "%02x", raw[i]);
 }
@@ -2577,7 +2571,19 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
         char gen_buf[256];
         const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
                                           db_root, object);
-        if (dv) encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
+        if (!dv) {
+            /* The loop already skipped DK_NONE, so NULL here always means the
+               generator failed (seq lock/filesystem error, random source
+               unavailable). Silently storing zeros was the old behavior —
+               refuse the write instead, using the same -2 + err_buf contract
+               as enum validation. */
+            if (err_buf && err_buf_size > 0)
+                snprintf(err_buf, err_buf_size,
+                         "default generator failed for field [%s]",
+                         ts->fields[i].name);
+            return -2;
+        }
+        encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
     }
     return ts->total_size;
 }

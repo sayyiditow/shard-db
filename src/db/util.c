@@ -1,7 +1,42 @@
 #include "types.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/random.h>
+#include <unistd.h>
+
 #define XXH_INLINE_ALL
 #include "xxhash.h"
+
+/* Fill buf with n cryptographically-secure random bytes. Primary source is
+   getentropy(2) — no fd, so it cannot fail from fd exhaustion and works in
+   chroot/sandbox; chunked at 256 bytes (the getentropy per-call cap).
+   Fallback is a /dev/urandom read loop for libcs without getentropy.
+   Returns 0 on success, -1 if no random source is available. Callers MUST
+   check the return: on -1 the buffer contents are unspecified and must not
+   be used. */
+int fill_random(void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = (n - off > 256) ? 256 : (n - off);
+        if (getentropy(p + off, chunk) != 0) break;
+        off += chunk;
+    }
+    if (off == n) return 0;
+
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, p + off, n - off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { close(fd); return -1; }
+        off += (size_t)r;
+    }
+    close(fd);
+    return 0;
+}
 
 /* ========== Hashing ==========
  * Single source of truth for the engine's primary-key hash. Used by:

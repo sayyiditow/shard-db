@@ -809,8 +809,8 @@ void parse_field_type(const char *spec, TypedField *f);
  *
  * UUID + sequence generators that back the per-object auto_key feature
  * (Schema.auto_key). Single-record helpers are fine for cmd_insert;
- * the _batch variants amortise /dev/urandom open or seq flock cost for
- * cmd_bulk_insert.
+ * the _batch variants amortise the fill_random() call or seq flock cost
+ * for cmd_bulk_insert.
  *
  * `raw` / `string` distinction: raw = the 16-byte on-disk form,
  * string = the 36-char canonical dashed render. parse + format pair
@@ -824,7 +824,8 @@ void parse_field_type(const char *spec, TypedField *f);
  * parse_seq_key / format_seq_key: strict int64 decimal parser + writer
  * for the rendered seq-key wire form. Rejects leading zeros (except
  * literal "0"), scientific notation, hex prefixes, whitespace. */
-void gen_uuid4_raw(uint8_t out[16]);
+int fill_random(void *buf, size_t n);
+int gen_uuid4_raw(uint8_t out[16]);
 int  gen_uuid4_batch(uint8_t *out, size_t n);
 int  parse_uuid_string(const char *in, uint8_t out[16]);
 void format_uuid_string(const uint8_t in[16], char out[37]);
