@@ -53,8 +53,18 @@ MARCH_CFLAGS=""
 [ -n "$BUILD_MARCH" ] && MARCH_CFLAGS="-march=$BUILD_MARCH"
 case "$BUILD_MODE" in
     release)
-        MODE_CFLAGS="-O2 -g -fno-omit-frame-pointer -flto=auto $MARCH_CFLAGS $WARN_CFLAGS"
-        MODE_LDFLAGS="-flto=auto"
+        # -ffunction-sections/-fdata-sections put each symbol in its own
+        # section so the linker can drop unreferenced ones. Linux uses
+        # --gc-sections; macOS ld64 uses -dead_strip (the section flags are
+        # harmless there). This is on top of -flto + strip.
+        GC_CFLAGS="-ffunction-sections -fdata-sections"
+        if [ "$(uname)" = "Darwin" ]; then
+            GC_LDFLAGS="-Wl,-dead_strip"
+        else
+            GC_LDFLAGS="-Wl,--gc-sections"
+        fi
+        MODE_CFLAGS="-O2 -g -fno-omit-frame-pointer -flto=auto $GC_CFLAGS $MARCH_CFLAGS $WARN_CFLAGS"
+        MODE_LDFLAGS="-flto=auto $GC_LDFLAGS"
         DO_STRIP=${DO_STRIP:-1}
         ;;
     asan)
