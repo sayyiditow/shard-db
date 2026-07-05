@@ -1901,24 +1901,40 @@ static int bulk_ins_run(const char *db_root, const char *object,
     }
 
     /* Post-parse: for auto-key omit records, batch-generate keys in one
-       shot (single /dev/urandom open for UUID, single seq flock for seq)
+       shot (single fill_random call for UUID, single seq flock for seq)
        and fill in id+klen + wire_keys per record. */
     if (auto_key_mode != AK_NONE && n_omits > 0) {
         uint8_t *uuid_pool = NULL;
         long long seq_start = 0;
+        int keygen_failed = 0;
         if (auto_key_mode == AK_UUID) {
             uuid_pool = malloc((size_t)n_omits * 16);
-            if (uuid_pool) gen_uuid4_batch(uuid_pool, n_omits);
+            if (!uuid_pool || gen_uuid4_batch(uuid_pool, n_omits) != 0)
+                keygen_failed = 1;
         } else {
             seq_start = seq_next_val_batch(db_root, object, sc.auto_key_seq_name, n_omits);
+            if (seq_start < 0) keygen_failed = 1;
+        }
+        if (keygen_failed) {
+            free(uuid_pool);
+            if (wire_keys) {
+                for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+            }
+            free(records); free(wire_keys);
+            arena_free(arena);
+            for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
+            free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+            OUT("{\"error\":\"bulk-insert key generation failed: %s\"}\n",
+                auto_key_mode == AK_UUID ? "random source unavailable"
+                                         : "sequence unavailable");
+            return 1;
         }
         int omit_idx = 0;
         for (size_t i = 0; i < rec_count; i++) {
             if (wire_keys && wire_keys[i]) continue;  /* provided key */
             BulkInsRecord *r = &records[i];
             if (auto_key_mode == AK_UUID) {
-                if (uuid_pool) memcpy(r->id, uuid_pool + omit_idx * 16, 16);
-                else gen_uuid4_raw((uint8_t *)r->id);  /* fallback per-record */
+                memcpy(r->id, uuid_pool + omit_idx * 16, 16);
                 char wbuf[37];
                 format_uuid_string((const uint8_t *)r->id, wbuf);
                 if (wire_keys) wire_keys[i] = strdup(wbuf);
@@ -2626,23 +2642,40 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     }
 
     /* Post-parse: batch-generate keys for omit records. Single
-       /dev/urandom open for UUID, single seq flock for seq. */
+       fill_random call for UUID, single seq flock for seq. */
     if (auto_key_mode != AK_NONE && n_omits > 0) {
         uint8_t *uuid_pool = NULL;
         long long seq_start = 0;
+        int keygen_failed = 0;
         if (auto_key_mode == AK_UUID) {
             uuid_pool = malloc((size_t)n_omits * 16);
-            if (uuid_pool) gen_uuid4_batch(uuid_pool, n_omits);
+            if (!uuid_pool || gen_uuid4_batch(uuid_pool, n_omits) != 0)
+                keygen_failed = 1;
         } else {
             seq_start = seq_next_val_batch(db_root, object, sc.auto_key_seq_name, n_omits);
+            if (seq_start < 0) keygen_failed = 1;
+        }
+        if (keygen_failed) {
+            free(uuid_pool);
+            if (wire_keys) {
+                for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+                free(wire_keys);
+            }
+            free(records);
+            arena_free(arena);
+            for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
+            free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
+            OUT("{\"error\":\"bulk-insert key generation failed: %s\"}\n",
+                auto_key_mode == AK_UUID ? "random source unavailable"
+                                         : "sequence unavailable");
+            return 1;
         }
         int omit_idx = 0;
         for (size_t i = 0; i < rec_count; i++) {
             if (wire_keys && wire_keys[i]) continue;  /* provided key */
             BulkInsRecord *r = &records[i];
             if (auto_key_mode == AK_UUID) {
-                if (uuid_pool) memcpy(r->id, uuid_pool + omit_idx * 16, 16);
-                else gen_uuid4_raw((uint8_t *)r->id);
+                memcpy(r->id, uuid_pool + omit_idx * 16, 16);
                 char wbuf[37];
                 format_uuid_string((const uint8_t *)r->id, wbuf);
                 if (wire_keys) wire_keys[i] = strdup(wbuf);
@@ -5457,7 +5490,7 @@ static int update_schema_conf_splits(const char *db_root, const char *object,
    project's convention is to forward-declare at the point of use rather
    than introduce a cross-cutting header for two functions. */
 extern int parse_default_modifier(char *type_spec_inout, TypedField *tf);
-extern void gen_uuid4_raw(uint8_t out[16]);
+extern int gen_uuid4_raw(uint8_t out[16]);
 extern long long seq_next_val_batch(const char *db_root, const char *object,
                                      const char *seq_name, int n);
 extern void encode_field(const TypedField *f, const char *val, uint8_t *out);
@@ -5707,7 +5740,7 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
             }
             case DK_UUID: {
                 uint8_t raw[16];
-                gen_uuid4_raw(raw);
+                if (gen_uuid4_raw(raw) != 0) { free(buf); ctx->error = 1; return 1; }
                 if (nf->type == FT_UUID && nf->size == 16) {
                     /* Native uuid type: store raw 16 bytes. */
                     memcpy(buf + nf->offset, raw, 16);
@@ -5732,13 +5765,9 @@ static int v2_rebuild_walk_cb(const uint8_t hash16[16],
                 int nbytes = bf->random_bytes;
                 if (nbytes <= 0 || nbytes > 256) break; /* defensive */
                 uint8_t raw[256];
-                FILE *rf = fopen("/dev/urandom", "r");
-                if (!rf) break;
-                if ((int)fread(raw, 1, (size_t)nbytes, rf) != nbytes) {
-                    fclose(rf);
-                    break;
+                if (fill_random(raw, (size_t)nbytes) != 0) {
+                    free(buf); ctx->error = 1; return 1;
                 }
-                fclose(rf);
                 char hexbuf[513];
                 for (int b = 0; b < nbytes; b++)
                     snprintf(hexbuf + b * 2, 3, "%02x", raw[b]);
@@ -5889,7 +5918,14 @@ static int rebuild_object_v2(const char *db_root, const char *object,
                 long long start = seq_next_val_batch(db_root, object,
                                                       nf->default_val,
                                                       (int)pf_live);
-                if (start < 0) start = 1;
+                if (start < 0) {
+                    free(walk_ctx.backfill);
+                    slotcask_close(&legacy_db);
+                    slotcask_close(&new_db);
+                    OUT("{\"error\":\"sequence unavailable for backfill of field [%s]\"}\n",
+                        nf->name);
+                    return 1;
+                }
                 walk_ctx.backfill[k].seq_start = start;
                 walk_ctx.backfill[k].seq_count = pf_live;
                 atomic_store_explicit(&walk_ctx.backfill[k].seq_next,

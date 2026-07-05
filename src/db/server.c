@@ -492,7 +492,7 @@ static void save_tokens_conf_full(const char *db_root,
  * Caller frees *out_buf.
  *
  * The auto-gen helper is the omit-key path for insert: it generates a
- * fresh binary key (UUIDv4 from /dev/urandom for AK_UUID; next value
+ * fresh binary key (UUIDv4 via fill_random for AK_UUID; next value
  * from the named sequence for AK_SEQ). Returns -1 on error (e.g. seq
  * filesystem failure).
  */
@@ -547,7 +547,11 @@ static int auto_key_generate(const Schema *sc, const char *db_root,
     if (sc->auto_key == AK_UUID) {
         char *buf = malloc(16);
         if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
-        gen_uuid4_raw((uint8_t *)buf);
+        if (gen_uuid4_raw((uint8_t *)buf) != 0) {
+            free(buf);
+            OUT("{\"error\":\"random source unavailable (uuid key generation failed)\"}\n");
+            return -1;
+        }
         *out_buf = buf; *out_len = 16;
         return 0;
     }
