@@ -759,6 +759,11 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                            int data_len, int field_idx);
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
+/* Produce the "now" string for an auto_create / auto_update timestamp field
+   in the form its type expects (buf must be >= 24 bytes). Shared between
+   storage.c's single-record insert/update paths and query.c's bulk-insert
+   value_compute hook. */
+void auto_now_str(const TypedField *f, char *buf, size_t bufsz);
 
 /* Index-key encoder: parses a textual value and emits memcmp-sortable bytes.
    Signed types get a top-bit flip (MIN→0x00..., 0→0x80..., MAX→0xFF...).
