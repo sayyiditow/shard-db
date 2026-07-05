@@ -5,6 +5,7 @@
 #include "cli.h"
 #include <unistd.h>
 #include <sys/wait.h>
+#include <spawn.h>
 
 /* ---- helpers ---- */
 
@@ -75,24 +76,44 @@ static void show_response(const char *title, const char *json) {
     tui_show_table(title, json);
 }
 
-/* Run an external command and capture output via popen. */
-static char *run_capture(const char *cmd) {
-    FILE *f = popen(cmd, "r");
-    if (!f) return strdup("(popen failed)");
+/* Run ./shard-db with an explicit argv (no shell, no injection) and capture
+   its stdout+stderr. argv[0] should be "./shard-db"; argv must be NULL-
+   terminated. Returns a heap NUL-terminated string (caller frees), or NULL. */
+static char *run_capture_argv(char *const argv[]) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return strdup("(pipe failed)");
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+    posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+
+    extern char **environ;
+    pid_t pid;
+    int rc = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pipefd[1]);
+    if (rc != 0) { close(pipefd[0]); return strdup("(spawn failed)"); }
+
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { pclose(f); return NULL; }
-    int ch;
-    while ((ch = fgetc(f)) != EOF) {
-        if (len + 1 >= cap) {
-            cap *= 2;
+    if (!buf) { close(pipefd[0]); return NULL; }
+    ssize_t n;
+    char tmp[4096];
+    while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
+        if (len + (size_t)n + 1 > cap) {
+            while (len + (size_t)n + 1 > cap) cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); pclose(f); return NULL; }
+            if (!nb) { free(buf); close(pipefd[0]); return NULL; }
             buf = nb;
         }
-        buf[len++] = (char)ch;
+        memcpy(buf + len, tmp, (size_t)n);
+        len += (size_t)n;
     }
-    pclose(f);
+    close(pipefd[0]);
+    int status; waitpid(pid, &status, 0);
     buf[len] = '\0';
     return buf;
 }
@@ -118,9 +139,9 @@ static void menu_server(void) {
         const char *cmd = NULL;
         const char *stat = NULL;
         switch (choice) {
-            case 0: cmd = "./shard-db start  2>&1"; stat = "starting daemon..."; break;
-            case 1: cmd = "./shard-db stop   2>&1"; stat = "stopping daemon (drains writes)..."; break;
-            case 2: cmd = "./shard-db status 2>&1"; stat = "checking status...";  break;
+            case 0: cmd = "start";  stat = "starting daemon..."; break;
+            case 1: cmd = "stop";   stat = "stopping daemon (drains writes)..."; break;
+            case 2: cmd = "status"; stat = "checking status...";  break;
         }
         tui_status("%s", stat);
         /* Quick repaint so the status bar shows the in-progress message
@@ -130,7 +151,9 @@ static void menu_server(void) {
         mvprintw(rows - 1, 0, " %.*s", cols - 1, stat);
         attroff(COLOR_PAIR(3));
         refresh();
-        char *out = run_capture(cmd);
+        char *sub = (char *)cmd;
+        char *argv[] = { "./shard-db", sub, NULL };
+        char *out = run_capture_argv(argv);
         tui_status("connected to %s:%d  tls=%s",
                    g_cli_host, g_cli_port, g_cli_tls_enable ? "on" : "off");
         tui_alert(items[choice].label, out ? out : "(no output)");
@@ -2570,11 +2593,8 @@ static void files_put(CliConn *c) {
     for (;;) {
         if (tui_form("put-file ← local path", fs, 1) != 0) return;
         if (!fs[0].value[0]) { tui_alert("put-file", "path required"); continue; }
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd),
-            "./shard-db put-file '%s' '%s' '%s' 2>&1",
-            oi.dir, oi.object, fs[0].value);
-        char *out = run_capture(cmd);
+        char *argv[] = { "./shard-db", "put-file", oi.dir, oi.object, fs[0].value, NULL };
+        char *out = run_capture_argv(argv);
         tui_alert("put-file", out ? out : "(no output)");
         free(out);
     }
@@ -2590,17 +2610,12 @@ static void files_get(CliConn *c) {
     for (;;) {
         if (tui_form("get-file → local path", fs, 2) != 0) return;
         if (!fs[0].value[0]) { tui_alert("get-file", "filename required"); continue; }
-        char cmd[2048];
+        char *argv[7] = { "./shard-db", "get-file", oi.dir, oi.object, fs[0].value, NULL, NULL };
         if (fs[1].value[0]) {
-            snprintf(cmd, sizeof(cmd),
-                "./shard-db get-file '%s' '%s' '%s' '%s' 2>&1",
-                oi.dir, oi.object, fs[0].value, fs[1].value);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                "./shard-db get-file '%s' '%s' '%s' 2>&1 | head -c 4096",
-                oi.dir, oi.object, fs[0].value);
+            argv[5] = fs[1].value;
         }
-        char *out = run_capture(cmd);
+        char *out = run_capture_argv(argv);
+        if (!fs[1].value[0] && out && strlen(out) > 4096) out[4096] = '\0';  /* preview cap */
         tui_alert("get-file", out ? out : "(no output)");
         free(out);
     }
