@@ -32,7 +32,9 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 # but we only need the parser. We compile a minimal subset:
 #   util.c          — JSON helpers parse_criteria_tree calls
 #   keyset.c        — KeySet definitions referenced by criteria.h
-#   query.c         — parse_criteria_tree itself
+#   query.c + query_*.c — parse_criteria_tree itself (query.c was split
+#       2026.07 into per-concern TUs; all seven query_*.c files are
+#       linked for symbol resolution alongside the remainder)
 #   storage.c, btree.c, index.c, config.c — pulled in transitively;
 #       linked but never executed because the harness only calls the
 #       parser entry point. Their globals are zero-initialised which is
@@ -60,6 +62,9 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     fuzz/fuzz_criteria.c \
     fuzz/stubs.c \
     src/db/util.c src/db/keyset.c src/db/query.c \
+    src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
+    src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
+    src/db/query_schema.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
     src/db/io_direct.c \
