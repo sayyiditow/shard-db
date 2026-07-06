@@ -6,6 +6,7 @@
         "src/binding.c",
         "../src/db/util.c",
         "../src/db/config.c",
+        "../src/db/type_desc.c",
         "../src/db/storage.c",
         "../src/db/index.c",
         "../src/db/query.c",

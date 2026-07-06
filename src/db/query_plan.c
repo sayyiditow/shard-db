@@ -903,6 +903,9 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
 
     switch (f->type) {
     case FT_NONE:
+    case FT_COUNT:      /* sentinel — never a real field type. Listed (rather
+                           than a default:) so -Wswitch keeps flagging this
+                           switch when a new FieldType is added. */
         return 0;
     case FT_VARCHAR:
         return match_typed_varchar(p, f->size, cc);

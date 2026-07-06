@@ -1,4 +1,5 @@
 #include "types.h"
+#include "type_desc.h"
 #include "slotcask.h"
 #include "simd.h"
 #include "bitmap.h"
@@ -1805,15 +1806,8 @@ static int agg_key_eq_int(const void *a, size_t alen, const void *b, size_t blen
    Mirrors the typed_field_to_raw byte counts and feeds the use_int_keys
    gate at agg setup so the total raw key width is known before scan. */
 static int typed_field_int_width(int ft) {
-    switch (ft) {
-    case FT_INT:     return 4;
-    case FT_LONG:    return 8;
-    case FT_SHORT:   return 2;
-    case FT_BYTE:    return 1;
-    case FT_NUMERIC: return 8;
-    case FT_DATE:    return 4;
-    default:         return 0;
-    }
+    const TypeDescriptor *d = type_desc(ft);
+    return d ? d->int_width : 0;
 }
 
 /* Copy the field's fixed-width on-disk bytes into buf for use as a hash key.
