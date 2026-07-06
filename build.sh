@@ -305,6 +305,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/db/query_find.c \
     src/db/server.c \
     src/db/config.c \
+    src/db/type_desc.c \
     src/db/embedded.c \
     src/db/nql.c \
     -Isrc/db -Isrc/test \
