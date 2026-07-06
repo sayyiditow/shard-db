@@ -198,7 +198,7 @@ What `splits` does **not** control:
 
 - Total data size. Seg files (`<obj>/seg/<stream>/NNNN.seg`) roll over at `SLOTCASK_SEG_MAX_BYTES` and accumulate without bound. A 100 GB object on `splits=8` is fine on disk; the only question is whether the kf shards stay snappy.
 
-The right value is driven by **per-shard kf load** (live + tombstoned slots), not records-per-shard in the v1 sense. Each kf shard auto-resplits in-place when its slot fill crosses 80 %, doubling capacity up to `SLOTCASK_MAX_SLOTS_PER_SHARD = 16M` slots. So a single kf shard tops out at ~12.8M live entries (16M × 80 %) and ~384 MB on disk — beyond that the next insert refuses and the operator must `vacuum --splits=N` to widen the keyspace.
+The right value is driven by **per-shard kf load** (live + tombstoned slots), not records-per-shard in the v1 sense. Each kf shard auto-resplits in-place when its slot fill crosses 75 %, doubling capacity up to `SLOTCASK_MAX_SLOTS_PER_SHARD = 16M` slots. So a single kf shard tops out at ~12.8M live entries (16M × 80 %) and ~384 MB on disk — beyond that the next insert refuses and the operator must `vacuum --splits=N` to widen the keyspace.
 
 ### Keyfile sizing — initial + ceiling per shard
 
@@ -255,11 +255,16 @@ Beyond the kf-fill nags above, `shard-stats` also surfaces shard-load skew:
 
 ## Benchmarks
 
-Benchmark scripts are at the repo root:
+Benchmarks run via the C bench harness:
 
-- `./bench-kv.sh`, `./bench-kv-parallel.sh` — insert / get / update throughput.
-- `./bench-queries.sh` — find / count / aggregate latency.
-- `./bench-joins.sh [count]` — join throughput.
-- `./bench-invoice.sh`, `./bench-parallel.sh` — 14-index realistic scenario.
+```bash
+./build/bin/shard-db-bench run bench-kv          # single-threaded K/V
+./build/bin/shard-db-bench run bench-kv-parallel  # multi-connection scaling
+./build/bin/shard-db-bench run bench-queries      # find / count / aggregate
+./build/bin/shard-db-bench run bench-joins        # join throughput
+./build/bin/shard-db-bench run bench-invoice      # 14-index realistic scenario
+```
+
+Override scale via env vars (`SHARD_BENCH_COUNT`, `SHARD_BENCH_TOTAL`, `SHARD_BENCH_CHUNK`, `SHARD_BENCH_USERS`, `SHARD_BENCH_ORDERS`). Full reference: [benchmarks.md](benchmarks.md).
 
 Use them to validate tuning changes empirically, not theoretically.

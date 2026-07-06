@@ -109,7 +109,7 @@ Set `TIMEOUT=<seconds>` in db.env for a global default, or pass `"timeout_ms":N`
 
 ## Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 500) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`. Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
+`QUERY_BUFFER_MB` (default 256) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`. Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
 
 ## Crash consistency
 
@@ -137,7 +137,7 @@ Cache pressure: every active connection allocates a `MAX_REQUEST_SIZE`-byte read
 
 ## Sanitizer-clean as of 2026.05.4
 
-The full 77-case suite runs cleanly under both AddressSanitizer and ThreadSanitizer (see the [2026.05.4 release notes](../release-notes/2026.05.4.md) for the bug list and per-site fixes). Notable patterns enforced:
+The full 232-case suite runs cleanly under both AddressSanitizer and ThreadSanitizer (see the [2026.05.4 release notes](../release-notes/2026.05.4.md) for the bug list and per-site fixes). Notable patterns enforced:
 
 - `_Atomic int` for every cross-thread stop flag (`g_log_running`, `server_running`, `active_threads`, `in_flight_writes`, `g_scan_stop`, `QueryDeadline.timed_out`).
 - `localtime` → `localtime_r` everywhere (libc's non-reentrant `localtime` returned a shared static buffer, racing across concurrent log calls).
