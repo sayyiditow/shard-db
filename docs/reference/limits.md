@@ -8,7 +8,7 @@ Hard caps and practical bounds. Everything here is enforced at compile time unle
 |---|---|---|
 | `MIN_SPLITS` | 8 | Minimum kf-shards per object at `create-object`. At the floor, `index_splits_for(8) = 2` per-field idx shards — preserves k-way-merge parallelism on indexed reads while giving small-server (2–4 core) deployments a tighter sizing option for sub-1M-row objects. |
 | `DEFAULT_SPLITS` | 8 | Used by `create-object` when `splits` is omitted or 0. Tuned for the common sub-1M-row case; specify `splits` explicitly for larger workloads. |
-| `MAX_SPLITS` | 4096 | Maximum shards per object. Filename is `NNN.bin` (3 hex digits), so this is structural — not a policy knob. |
+| `MAX_SPLITS` | 4096 | Maximum shards per object. Filename is `NNN.kf` (3 hex digits), so this is structural — not a policy knob. |
 | Allowed `splits` set | `{8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}` | `splits` must be a power of 2 in this set. Other values are rejected at `create-object` and `vacuum --splits`. |
 | `MAX_KEY_CEILING` | 1024 bytes | Hard upper limit on per-object `max_key`. Keys are stored raw inside each segment record (length-prefixed by `klen` in the 24B seg header). |
 | `MAX_FIELDS` | 256 | Max fields per typed schema (bumped from 64 in 2026.04.2). |
@@ -19,7 +19,7 @@ Hard caps and practical bounds. Everything here is enforced at compile time unle
 | `SLOTCASK_MAX_SLOTS_PER_SHARD` | 16 777 216 (16M) | Per-kf-shard slot ceiling. Resplits stop here; further inserts to a full shard refuse and require `vacuum --splits=N` to widen the keyspace. |
 | `SLOTCASK_MAX_STREAMS` | 16 | Maximum streams per object (segment-write lanes). Actual count picked from nproc at `create-object` time. |
 | `SLOTCASK_SEG_MAX_BYTES` | 128 MB | Segment file rotation point. |
-| kf resplit trigger | 75 % | Shard doubles in place when `header.total × 4 ≥ capacity × 3`. |
+| kf resplit trigger | 75 % (inline) / 50 % (pre-grow) | Shard doubles in place when `header.total × 4 ≥ capacity × 3` (75 %, inline path). Bulk-insert pre-grow triggers at 50 % (`count × 2 ≥ slots`). |
 | `SLOW_QUERY_RING` | 64 | Recent-slow-queries ring buffer size (memory-resident). |
 | `DIRS_BUCKETS` | 2048 | Hash bucket count for the in-memory `dirs.conf` cache. |
 

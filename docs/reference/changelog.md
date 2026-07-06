@@ -4,6 +4,68 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.07.2
+
+Three new field types (`ipv4`, `ipv6`, `datetimems`), `auto_create` preservation across upserts, security hardening (path traversal, varchar overflow, CLI injection, secure random), performance improvements (lock-free hash lookup, IN-list precompute, inline record buffer), and internal refactoring (query.c split, type descriptor table). `./migrate` retained from 2026.07.1 (idempotent); review planned for 2026.08. Wire-compatible with 2026.07.1.
+
+Full notes: [`docs/release-notes/2026.07.2.md`](../release-notes/2026.07.2.md).
+
+### New field types
+
+- **`ipv4`** — raw 4-byte IPv4 address, network byte order. Parsed from dotted-quad string (e.g. `192.168.1.1`). Byte-lexicographic order matches numeric IPv4 order. 4 bytes on disk.
+
+- **`ipv6`** — raw 16-byte IPv6 address, network byte order. Parsed from canonical IPv6 string (e.g. `2001:db8::1`). Byte-lexicographic order matches numeric IPv6 order. 16 bytes on disk.
+
+- **`datetimems`** — millisecond-precision calendar datetime. 8 bytes on disk: int32 date (`yyyyMMdd`) + uint32 ms-of-day. Wire format is the 17-digit string `"yyyyMMddHHmmssfff"`. Supports `:auto_create` and `:auto_update`.
+
+### auto_create preservation
+
+- **auto_create fields** — stamp once on genuine fresh inserts; preserved (not re-stamped) on all subsequent upserts. Previously, every upsert silently reset the create timestamp. Behavior change — existing records with overwritten timestamps retain their values; only new upserts going forward preserve the original.
+
+### Security
+
+- **Object name path traversal** — validates object names at every request entry point; rejects names containing `/`, `\`, leading dot, `..`, control characters, or exceeding 255 bytes. Closes a cross-tenant data-access vector where a tenant-scoped token could pass `object:"../other_tenant/obj"`.
+
+- **Varchar overflow rejection** — over-length varchar values (> configured size) are now rejected with an error on insert, bulk-insert, and CSV/delimited paths instead of being silently truncated.
+
+- **CLI shell injection** — replaced `popen("sh -c ...")` with `posix_spawn` in shard-cli's `run_capture`, closing a command injection vector where user input containing a single quote could break into arbitrary shell execution.
+
+- **Secure random hardening** — replaced per-call `fopen("/dev/urandom")` with `fill_random()` using `getentropy(2)` primary + `/dev/urandom` fallback. All generation sites propagate failure; `gen_uuid4_raw` returns -1 on error instead of silent all-zeros.
+
+### Performance
+
+- **Lock-free `slotcask_lookup_by_hash`** — switches from `kfcache_acquire()` (full table mutex + per-slot rwlock) to `kfcache_acquire_direct()` with per-shard ref for the warm-hit path. Transparent fallback on cold miss.
+
+- **IN-list varchar precompute** — varchar lengths in IN-list criteria are precomputed at compile time instead of re-measured per record.
+
+- **Inline record-ref buffer** — `read_record_ref` avoids malloc/free per record for records that fit in an inline buffer.
+
+### Internal
+
+- **`query.c` split** — the 28K-line monolithic `query.c` is split into 8 per-concern translation units (`query_aggregate.c`, `query_join.c`, `query_plan.c`, `query_find.c`, `query_bulk.c`, `query_maint.c`, `query_schema.c`, `query_internal.h`). Mechanical move, behavior-preserving.
+
+- **Type descriptor table** — `type_desc.c` / `type_desc.h` as single source of truth for field-type facts (name, integer width). Replaces parallel switch statements. `_Static_assert` ensures every `FieldType` enum value has a row.
+
+- **Linker GC sections** — release builds compile with `-ffunction-sections -fdata-sections` and link with `--gc-sections` (Linux) / `-dead_strip` (macOS).
+
+### Fixes
+
+- **Aggregate `group_by` hash-table resize** — `agg_ht_resize` used the wrong hash function for int-keyed buckets, causing duplicate buckets after resize and silent data corruption on large groupings.
+
+- **IN-list uuid/time memory leak** — `free_compiled_criteria` did not free `in_uuid` / `in_time` IN-list arrays.
+
+- **`slotcask_registry_get` single-flight** — prevents redundant concurrent opens of the same shard on startup with parallel requests.
+
+### Upgrade
+
+```bash
+./shard-db stop
+./migrate          # idempotent — retained from 2026.07.1; review planned for 2026.08
+./shard-db start
+```
+
+See [Upgrade notes](../release-notes/2026.07.2.md#upgrade-notes) for behavior changes (auto_create preservation, varchar overflow rejection, object name validation).
+
 ## 2026.07.1
 
 Compact VARCHAR storage, Natural Query Language (NQL), kf-corruption recovery, and an `add-index`/`remove-index` locking fix. Covers everything merged since 2026.06.3. Full notes: [docs/release-notes/2026.07.1.md](../release-notes/2026.07.1.md). Wire-compatible with 2026.06.3.

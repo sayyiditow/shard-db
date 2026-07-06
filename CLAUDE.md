@@ -87,7 +87,7 @@ shard-db is a high-performance database in C. Single static binary, single proce
 ./build/bin/shard-db-test list                    # list registered cases
 ```
 
-C test cases live under `src/test/cases/test_*.c` (222 cases, ~4900 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
+C test cases live under `src/test/cases/test_*.c` (232 cases, ~4900 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
 
 Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`. **The user runs benches**; do not run them to validate perf.
 

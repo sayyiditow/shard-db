@@ -260,7 +260,7 @@ systemctl stop shard-db
 systemctl start shard-db
 ```
 
-The `./migrate` upgrade binary was dropped in 2026.05.5 — once your objects are on the slotcask engine, point-release upgrades are a binary swap. On startup the daemon sweeps stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
+The `./migrate` binary ships with 2026.07.1+ and is required for the compact/VARIABLE-format conversion and `rebuild-kf` repair. It is idempotent — safe to re-run if interrupted. Once your objects are on the slotcask engine and compact format, point-release upgrades are a binary swap. On startup the daemon sweeps stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
 
 **Upgrading from a pre-2026.05.5 install with legacy v1 (probe-into-slot) objects.** This binary refuses v1 objects at load. Run the migration on the previous release first:
 

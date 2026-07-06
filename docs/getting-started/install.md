@@ -44,7 +44,7 @@ BUILD_MARCH=x86-64-v3 ./build.sh    # portable-but-modern (BMI2 / AVX2)
 
 ### Skipping the test suite
 
-`./build.sh` runs the full 77-case C test suite at the end. To skip it during iterative dev:
+`./build.sh` runs the full 232-case C test suite at the end. To skip it during iterative dev:
 
 ```bash
 SKIP_TESTS=1 ./build.sh
@@ -85,12 +85,15 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-The `./migrate` upgrade binary that shipped from 2026.05.1 through
-2026.05.4 was removed in 2026.05.5. Operators on a pre-2026.05.5
-install with legacy v1 (probe-into-slot) objects on disk must first
-install 2026.05.4 and run that release's `./migrate` to convert
-objects to slotcask, then upgrade to 2026.05.5+. This binary refuses
-v1 objects at load with a clear error pointing to the same step.
+The `./migrate` binary was reinstated in 2026.07.1 and ships with
+2026.07.1+. It runs compact (VARIABLE-format conversion) and
+`rebuild-kf` automatically. It is idempotent — safe to re-run if
+interrupted. A review in 2026.08 will determine which migration steps
+are no longer needed and can be removed.
+
+Operators on a pre-2026.05.5 install with legacy v1 (probe-into-slot)
+objects on disk must first install 2026.05.4 and run that release's
+`./migrate` to convert objects to slotcask, then upgrade to 2026.05.5+.
 
 See the [changelog](../reference/changelog.md) for what changed in each release.
 
