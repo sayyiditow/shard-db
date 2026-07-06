@@ -106,14 +106,14 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/server.c src/db/main.c src/db/config.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # libshard-db.a — embedded mode static library (all daemon sources except main.c)
 LIB_SRCS="src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c \
           src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c \
           src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c \
-          src/db/io_direct.c src/db/query.c src/db/server.c src/db/config.c \
+          src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c \
           src/db/nql.c src/db/embedded.c"
 LIB_OBJS=""
 mkdir -p build/bin build/obj
@@ -296,6 +296,13 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/db/objlock.c \
     src/db/io_direct.c \
     src/db/query.c \
+    src/db/query_aggregate.c \
+    src/db/query_join.c \
+    src/db/query_plan.c \
+    src/db/query_maint.c \
+    src/db/query_schema.c \
+    src/db/query_bulk.c \
+    src/db/query_find.c \
     src/db/server.c \
     src/db/config.c \
     src/db/embedded.c \
@@ -341,6 +348,13 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/simd.c \
     src/db/io_direct.c \
     src/db/query.c \
+    src/db/query_aggregate.c \
+    src/db/query_join.c \
+    src/db/query_plan.c \
+    src/db/query_maint.c \
+    src/db/query_schema.c \
+    src/db/query_bulk.c \
+    src/db/query_find.c \
     src/db/server.c \
     src/db/config.c \
     src/db/embedded.c \

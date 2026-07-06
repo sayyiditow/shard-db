@@ -100,7 +100,15 @@ Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`.
 - `config.c` — db.env, schema/index/dirs caches, typed-field encode/decode (`encode_field_len`)
 - `storage.c` — xxh128 hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache, `build_idx_path`, `compute_addr`
 - `index.c` — per-shard B+ tree wrappers (`btree_idx_*`), parallel indexing, `reindex_clean_legacy`
-- `query.c` — find, count, aggregate, joins, bulk ops, planner (`choose_primary_source`), maintenance
+- `query.c` — criteria matching, planner core, find/count orchestration
+- `query_aggregate.c` — aggregate operations, group-by, having, top-N, hash tables
+- `query_join.c` — join planning, resolution, lookup, and result emission
+- `query_plan.c` — compiled criteria, match_typed*, criteria tree parser, planner (plan_filter), cmd_explain
+- `query_maint.c` — maintenance ops (vacuum, backup, recount, rebuild-kf, reindex, etc.)
+- `query_schema.c` — schema mutations (create/drop object, edit/add/remove fields/indexes)
+- `query_bulk.c` — bulk insert/delete/update
+- `query_find.c` — scan helpers, fetch, keys, exists, CSV output, file ops
+- `query_internal.h` — shared cross-TU prototypes, types, and enums
 - `server.c` — multi-threaded TCP server (poll-based accept + thread pool), JSON dispatch, auth, stats, optional TLS
 - `tls.c / tls.h` — OpenSSL wrapper; `tls_fopen()` wraps `SSL *` as a stdio `FILE *` via fopencookie/funopen so existing OUT() / fgets() call sites stay untouched
 - `btree.c / btree.h` — B+ tree (page-based, prefix-compressed leaves, mmap'd, `BtRangeIter`, unified `bt_acquire/bt_release`)
