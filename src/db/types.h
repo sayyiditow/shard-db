@@ -169,9 +169,10 @@ enum FieldType {
     FT_IPV4,        /* ipv4 — 4 bytes binary, network byte order (same
                        ordering as inet_pton output). No sign-bit flip
                        needed for index-key ordering — mirrors FT_UUID. */
-    FT_IPV6         /* ipv6 — 16 bytes binary, network byte order (same
+    FT_IPV6,        /* ipv6 — 16 bytes binary, network byte order (same
                        ordering as inet_pton(AF_INET6, ...) output). No
                        sign-bit flip needed — mirrors FT_UUID/FT_IPV4. */
+    FT_COUNT        /* sentinel — one past last valid type; do not use as a type */
 };
 
 /* Index types — declared per-field at create-object, persisted in

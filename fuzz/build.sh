@@ -49,6 +49,8 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #       bm_* / tg_* symbols for the bitmap + trigram index types. Same
 #       rationale as above — linked for symbol resolution, never entered
 #       by the fuzzer.
+#   type_desc.c — added 2026.07: query_schema.c and query_aggregate.c
+#       call type_desc() for the field-type descriptor table.
 # server.c, tls.c are NOT linked: the parser never reaches them and
 # tls.c requires OpenSSL. Instead, fuzz/stubs.c provides zero-valued
 # stub definitions for the two globals they export (g_db,
@@ -64,7 +66,7 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/util.c src/db/keyset.c src/db/query.c \
     src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
     src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
-    src/db/query_schema.c \
+    src/db/query_schema.c src/db/type_desc.c \
     src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
     src/db/io_direct.c \

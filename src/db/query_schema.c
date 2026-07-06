@@ -1,4 +1,5 @@
 #include "types.h"
+#include "type_desc.h"
 #include "slotcask.h"
 #include "bitmap.h"
 #include "query_internal.h"
@@ -1494,27 +1495,8 @@ int cmd_list_objects(const char *db_root, const char *dir) {
 }
 
 static const char *field_type_str(enum FieldType t) {
-    switch (t) {
-        case FT_VARCHAR:  return "varchar";
-        case FT_LONG:     return "long";
-        case FT_INT:      return "int";
-        case FT_SHORT:    return "short";
-        case FT_DOUBLE:   return "double";
-        case FT_FLOAT:   return "float";
-        case FT_BOOL:     return "bool";
-        case FT_BYTE:     return "byte";
-        case FT_NUMERIC:  return "numeric";
-        case FT_DATE:     return "date";
-        case FT_DATETIME: return "datetime";
-        case FT_DATETIMEMS: return "datetimems";
-        case FT_TIME:     return "time";
-        case FT_TIMESTAMP: return "timestamp";
-        case FT_UUID:     return "uuid";
-        case FT_IPV4:     return "ipv4";
-        case FT_IPV6:     return "ipv6";
-        case FT_ENUM:     return "enum";
-        default:          return "unknown";
-    }
+    const TypeDescriptor *d = type_desc(t);
+    return d ? d->name : "unknown";
 }
 
 /* Describe an object: schema (typed fields), indexes, splits, max_key, max_value,
