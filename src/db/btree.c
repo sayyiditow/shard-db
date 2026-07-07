@@ -444,18 +444,40 @@ static int bt_cache_probe(const char *path, int *out_found) {
    the same file (coherent via the kernel page cache); the orphaned copy
    gets LRU-evicted eventually. Bounded by working-set sizing
    (BT_CACHE_MAX = FCACHE_MAX/4). */
-static void bt_cache_drop_slot(int slot) {
+/* Detach a slot's resources under bt_cache_lock without doing any syscalls.
+   The caller disposes the returned fd/map AFTER releasing bt_cache_lock via
+   bt_dispose_mapping(). Same no-rwlock-holder contract as before. */
+static void bt_cache_evict_slot(int slot, int *out_fd, uint8_t **out_map,
+                                size_t *out_sz) {
     BtCacheEntry *e = &bt_cache[slot];
+    *out_fd = -1; *out_map = NULL; *out_sz = 0;
     if (!e->used) return;
-    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
-    if (e->map) munmap(e->map, e->map_size);
-    if (e->fd >= 0) close(e->fd);
+    *out_fd = e->fd;
+    *out_map = e->map;
+    *out_sz = e->map_size;
     e->map = NULL;
     e->fd = -1;
     e->map_size = 0;
     e->used = 0;
     e->path[0] = '\0';
     bt_cache_count--;
+}
+
+/* Flush + unmap + close a detached mapping. Never call with bt_cache_lock
+   held — keeping syscalls out of that lock is the point. */
+static void bt_dispose_mapping(int fd, uint8_t *map, size_t map_size) {
+    if (map && map_size > 0) msync(map, map_size, MS_ASYNC);
+    if (map) munmap(map, map_size);
+    if (fd >= 0) close(fd);
+}
+
+/* Synchronous wrapper for callers whose teardown is not hot (invalidate).
+   NOTE: still does syscalls under bt_cache_lock at those call sites; they
+   are admin-path only (remove-index). */
+static void bt_cache_drop_slot(int slot) {
+    int fd; uint8_t *map; size_t sz;
+    bt_cache_evict_slot(slot, &fd, &map, &sz);
+    bt_dispose_mapping(fd, map, sz);
 }
 
 /* Initialise a fresh btree file at `map` of `bt_page_size * 2` bytes. */
@@ -631,10 +653,38 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     int fd;
     uint8_t *map;
     size_t sz;
-    if (bt_open_file(path, writer, &fd, &map, &sz) < 0) {
+    if (!writer) {
+        /* Readers: open+mmap OUTSIDE the table lock so parallel cold-cache
+           index fan-out doesn't serialize on syscalls. Safe for readers
+           only — they never create/init the file. Writers stay under the
+           lock: fresh-file creation (O_CREAT + ftruncate + bt_init_file)
+           relies on the table lock for serialization. */
         pthread_mutex_unlock(&bt_cache_lock);
-        return -1;
+        if (bt_open_file(path, 0, &fd, &map, &sz) < 0) return -1;
+        pthread_mutex_lock(&bt_cache_lock);
+        int refound = 0;
+        slot = bt_cache_probe(path, &refound);
+        if (refound) {
+            /* Lost the install race: another thread cached this path while
+               we were opening. Serve our fresh mapping uncached — duplicate
+               MAP_SHARED of the same file is coherent (same accepted
+               tradeoff as the cache-full fallback below); bt_release will
+               munmap+close it. */
+            pthread_mutex_unlock(&bt_cache_lock);
+            bt->slot = -1;
+            bt->fd = fd;
+            bt->map = map;
+            bt->map_size = sz;
+            return 0;
+        }
+    } else {
+        if (bt_open_file(path, 1, &fd, &map, &sz) < 0) {
+            pthread_mutex_unlock(&bt_cache_lock);
+            return -1;
+        }
     }
+
+    int vic_fd = -1; uint8_t *vic_map = NULL; size_t vic_sz = 0;
 
     /* Evict LRU when over half-full or the probe couldn't find an empty slot. */
     if (slot < 0 || bt_cache_count >= bt_cache_slots / 2) {
@@ -647,7 +697,7 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
             }
         }
         if (lru >= 0) {
-            bt_cache_drop_slot(lru);
+            bt_cache_evict_slot(lru, &vic_fd, &vic_map, &vic_sz);
             slot = lru;
         }
     }
@@ -655,6 +705,7 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     if (slot < 0) {
         /* Cache truly full — serve uncached. */
         pthread_mutex_unlock(&bt_cache_lock);
+        bt_dispose_mapping(vic_fd, vic_map, vic_sz);
         bt->slot = -1;
         bt->fd = fd;
         bt->map = map;
@@ -680,6 +731,7 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
     pthread_mutex_unlock(&bt_cache_lock);
+    bt_dispose_mapping(vic_fd, vic_map, vic_sz);
 
     bt->slot = slot;
     bt->fd = fd;
