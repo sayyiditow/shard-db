@@ -1909,7 +1909,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
         memcpy(btree_fields[btree_count], names[i], 256);
         btree_count++;
     }
-    memcpy(fields, btree_fields, sizeof(btree_fields));
+    memcpy(fields, btree_fields, (size_t)btree_count * sizeof(btree_fields[0]));
     nfields = btree_count;
 
     char conf_path[PATH_MAX];

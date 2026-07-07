@@ -3388,6 +3388,8 @@ int cmd_server(const char *db_root, int daemonize) {
         if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
+            LOG_ERROR(LOG_SUB_SERVER, "accept() failed: errno=%d (%s)",
+                      errno, strerror(errno));
             continue;
         }
 

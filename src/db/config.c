@@ -2603,6 +2603,7 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
            varchar_decode_capacity(). */
         int len = ((int)data[0] << 8) | (int)data[1];
         int content_max = f->size - 2;
+        if (content_max < 0) content_max = 0;
         if (len > content_max) len = content_max;  /* defensive */
         if (len == 0) return 0;
         if (buflen < 4) return -1;  /* "" + NUL */
