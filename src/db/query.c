@@ -5983,11 +5983,6 @@ static int cursor_fetch_cb(const uint8_t hash[16],
                              row->sort_key, &row->sort_key_len);
     pthread_mutex_unlock(&ctx->lock);
     return 0;
-    memcpy(row->hash, hash, 16);
-    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
-                             ctx->order_field_idx,
-                             row->sort_key, &row->sort_key_len);
-    return 0;
 }
 
 static void *cursor_fetch_worker(void *arg) {

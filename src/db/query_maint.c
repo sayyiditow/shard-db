@@ -158,31 +158,6 @@ int cmd_estimate_index(const char *db_root, const char *object,
         live, c.sampled, avg_distinct, est_entries, est_disk);
     return 0;
 }
-/* Per-shard vacuum worker */
-typedef struct {
-    char path[PATH_MAX];
-    int slot_size;
-    int cleaned;
-} VacuumWork;
-
-static void *vacuum_worker(void *arg) {
-    VacuumWork *vw = (VacuumWork *)arg;
-    FcacheRead wh = ucache_get_write(vw->path, 0);
-    if (!wh.map) return NULL;
-    uint32_t slots = wh.slots_per_shard;
-    if (wh.size < shard_zoneA_end(slots)) { ucache_write_release(wh); return NULL; }
-    for (uint32_t i = 0; i < slots; i++) {
-        SlotHeader *h = (SlotHeader *)(wh.map + zoneA_off(i));
-        if (h->flag == 2) {
-            memset(h, 0, HEADER_SIZE);
-            memset(wh.map + zoneB_off(i, slots, vw->slot_size), 0, vw->slot_size);
-            vw->cleaned++;
-        }
-    }
-    ucache_write_release(wh);
-    return NULL;
-}
-
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits) {
     Schema sch = load_schema(db_root, object);
@@ -227,52 +202,6 @@ int cmd_vacuum(const char *db_root, const char *object,
     }
     reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
     OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
-    return 0;
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-
-    /* Collect all shard paths */
-    VacuumWork *shards = NULL;
-    int shard_count = 0, shard_cap = 256;
-    shards = malloc(shard_cap * sizeof(VacuumWork));
-    if (!shards) { fprintf(stderr, "Error: oom\n"); return 1; }
-
-    DIR *d1 = opendir(data_dir);
-    if (!d1) { free(shards); fprintf(stderr, "Error: No data directory for [%s]\n", object); return 1; }
-    struct dirent *e1;
-    while ((e1 = readdir(d1))) {
-        if (e1->d_name[0] == '.') continue;
-        size_t nlen = strlen(e1->d_name);
-        if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
-        if (shard_count >= shard_cap) {
-            shard_cap *= 2;
-            VacuumWork *t = xrealloc_or_free(shards, shard_cap * sizeof(*t));
-            if (!t) {
-                /* xrealloc_or_free already freed shards; reset count so the
-                   parallel_for + cleaned-sum below don't dereference NULL. */
-                shards = NULL;
-                shard_count = 0;
-                break;
-            }
-            shards = t;
-        }
-        snprintf(shards[shard_count].path, PATH_MAX, "%s/%s", data_dir, e1->d_name);
-        shards[shard_count].slot_size = sch.slot_size;
-        shards[shard_count].cleaned = 0;
-        shard_count++;
-    }
-    closedir(d1);
-
-    /* Parallel vacuum across all shards */
-    parallel_for(vacuum_worker, shards, shard_count, sizeof(VacuumWork));
-
-    int cleaned = 0;
-    for (int i = 0; i < shard_count; i++)
-        cleaned += shards[i].cleaned;
-    free(shards);
-
-    reset_deleted_count(db_root, object);
-    OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", cleaned);
     return 0;
 }
 /* ========== SEQUENCES ========== */
@@ -755,48 +684,6 @@ int cmd_restore(const char *db_root, const char *object,
 
 /* ========== RECOUNT ========== */
 
-/* Recount uses its own parallel scan — historically a duplicate of
-   scan_shards that skipped the global output-serialization mutex.
-   scan_shards is now lock-free too (callbacks carry their own internal
-   sync), so this parallel variant is structurally identical. Kept as-is
-   to avoid churn; could be collapsed into scan_shards later. */
-
-typedef struct {
-    const char *path;
-    int slot_size;
-    int *counter; /* shared atomic counter */
-} RecountWorkerArg;
-
-static void *recount_worker(void *arg) {
-    RecountWorkerArg *w = (RecountWorkerArg *)arg;
-    int local = 0;
-    /* Use the persistent ucache so recount sees a consistent snapshot — a
-       concurrent insert/delete takes the per-shard wrlock and blocks
-       briefly per shard rather than racing against this MAP_PRIVATE view.
-       The MADV_DONTNEED-after-scan trick is gone with the cache: ucache
-       pins the mapping, the page-cache LRU naturally evicts cold pages
-       after the scan is over, and the OS's implicit readahead handles
-       sequential access without an explicit MADV_SEQUENTIAL hint. */
-    FcacheRead fc = fcache_get_read(w->path);
-    if (!fc.map) return NULL;
-    uint8_t *map = fc.map;
-    uint32_t shard_slots = fc.slots_per_shard;
-    if (fc.size < shard_zoneA_end(shard_slots)) { fcache_release(fc); return NULL; }
-    size_t scan_end = shard_slots;
-    while (scan_end > 0) {
-        const SlotHeader *h = (const SlotHeader *)(map + zoneA_off(scan_end - 1));
-        if (h->flag != 0 || h->key_len != 0) break;
-        scan_end--;
-    }
-    for (size_t s = 0; s < scan_end; s++) {
-        const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(s));
-        if (hdr->flag == 1) local++;
-    }
-    fcache_release(fc);
-    __sync_fetch_and_add(w->counter, local);
-    return NULL;
-}
-
 /* shard-stats: walk every shard file under data/, read each ShardHeader, report slots/records/load
    plus a hint when splits may be too low. Cheap — reads only 32B per shard.
    as_table=1 emits ASCII table; as_table=0 emits JSON. */
@@ -972,64 +859,6 @@ int cmd_recount(const char *db_root, const char *object) {
     if (sdb) slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr);
     int live = (int)(total_hdr > deleted_hdr ? total_hdr - deleted_hdr : 0);
     OUT("{\"count\":%d}\n", live);
-    return 0;
-
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-
-    /* Collect shard paths */
-    char **paths = NULL;
-    int path_count = 0, path_cap = 256;
-    paths = malloc(path_cap * sizeof(char *));
-    if (!paths) { OUT("{\"error\":\"oom\"}\n"); return 1; }
-
-    DIR *d1 = opendir(data_dir);
-    if (!d1) { free(paths); OUT("{\"count\":0}\n"); set_count(db_root, object, 0); return 0; }
-    struct dirent *e1;
-    while ((e1 = readdir(d1))) {
-        if (e1->d_name[0] == '.') continue;
-        size_t nlen = strlen(e1->d_name);
-        if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
-        if (path_count >= path_cap) {
-            path_cap *= 2;
-            /* Plain realloc + walk: paths[] holds strdup'd entries that
-               xrealloc_or_free's atomic free would orphan. */
-            char **t = realloc(paths, path_cap * sizeof(char *));
-            if (!t) {
-                for (int k = 0; k < path_count; k++) free(paths[k]);
-                free(paths);
-                paths = NULL;
-                path_count = 0;
-                break;
-            }
-            paths = t;
-        }
-        char bp[PATH_MAX];
-        snprintf(bp, sizeof(bp), "%s/%s", data_dir, e1->d_name);
-        paths[path_count++] = strdup(bp);
-    }
-    closedir(d1);
-
-    int total = 0;
-    if (path_count > 0) {
-        RecountWorkerArg *args = malloc(path_count * sizeof(RecountWorkerArg));
-        if (!args) {
-            for (int i = 0; i < path_count; i++) free(paths[i]);
-            free(paths);
-            OUT("{\"error\":\"oom\"}\n");
-            return 1;
-        }
-        for (int i = 0; i < path_count; i++)
-            args[i] = (RecountWorkerArg){ paths[i], sch.slot_size, &total };
-        parallel_for_io(recount_worker, args, path_count, sizeof(RecountWorkerArg));
-        free(args);
-    }
-
-    for (int i = 0; i < path_count; i++) free(paths[i]);
-    free(paths);
-
-    set_count(db_root, object, total);
-    OUT("{\"count\":%d}\n", total);
     return 0;
 }
 
