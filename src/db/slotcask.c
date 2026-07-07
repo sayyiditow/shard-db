@@ -6693,9 +6693,14 @@ int slotcask_migrate_to_varlen(SlotcaskDb *db) {
                 if (dest[sid].base) {
                     size_t used = dest_off[sid];
                     munmap(dest[sid].base, dest[sid].alloc);
-                    ftruncate(dest[sid].fd, (off_t)used);
-                    close(dest[sid].fd);
                     dest[sid].base = NULL;
+                    if (ftruncate(dest[sid].fd, (off_t)used) < 0) {
+                        close(dest[sid].fd);
+                        dest[sid].fd = -1;
+                        kfcache_release(&kh);
+                        goto fail;
+                    }
+                    close(dest[sid].fd);
                     dest[sid].fd   = -1;
                     dest_fid[sid]++;
                     dest_off[sid] = 0;
@@ -6873,9 +6878,16 @@ static void *compact_stream_worker(void *arg_ptr) {
             if (!dest_ptr || dest_off + rec_size > SLOTCASK_SEG_MAX_BYTES) {
                 if (dest_ptr) {
                     munmap(dest_ptr, dest_alloc);
-                    ftruncate(dest_fd, (off_t)dest_off);
+                    dest_ptr = NULL;
+                    if (ftruncate(dest_fd, (off_t)dest_off) < 0) {
+                        close(dest_fd);
+                        dest_fd = -1;
+                        kfcache_release(&kh);
+                        a->rc = -1;
+                        goto worker_fail;
+                    }
                     close(dest_fd);
-                    dest_ptr = NULL; dest_fd = -1;
+                    dest_fd = -1;
                     dest_fid++;
                     dest_off = 0;
                 }
