@@ -2846,7 +2846,7 @@ static int btree_decode_leaves_in_range(const uint8_t *range, size_t range_len,
                possibly fit after the page header before iterating, so a
                corrupted cnt can't walk bts_slot_off() past the page
                (CID 1696431). */
-            size_t max_slots = (page_sz > BT_PAGE_DATA_START)
+            size_t max_slots = ((size_t)page_sz > BT_PAGE_DATA_START)
                                     ? ((size_t)page_sz - BT_PAGE_DATA_START) / 2
                                     : 0;
             if (cnt > max_slots) cnt = (uint32_t)max_slots;

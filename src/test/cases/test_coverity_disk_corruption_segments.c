@@ -29,30 +29,6 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dirent.h>
-
-/* Find the first regular file directly under dir_path whose name ends
-   with suffix. Writes the full path into out (size out_sz). Returns 0 on
-   success, -1 if none found. */
-static int find_first_file_with_suffix(const char *dir_path,
-                                        const char *suffix,
-                                        char *out, size_t out_sz) {
-    DIR *d = opendir(dir_path);
-    if (!d) return -1;
-    struct dirent *de;
-    int found = -1;
-    size_t suf_len = strlen(suffix);
-    while ((de = readdir(d)) != NULL) {
-        size_t nlen = strlen(de->d_name);
-        if (nlen < suf_len) continue;
-        if (strcmp(de->d_name + nlen - suf_len, suffix) != 0) continue;
-        snprintf(out, out_sz, "%s/%s", dir_path, de->d_name);
-        found = 0;
-        break;
-    }
-    closedir(d);
-    return found;
-}
 
 /* --- CID 1696451: corrupt a FIXED-format segment record's on-disk klen. */
 static int test_coverity_seg_klen_corruption_run(void) {
