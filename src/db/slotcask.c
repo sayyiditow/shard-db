@@ -2546,8 +2546,15 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         last_offset = pos;
         segcache_release(&h);
     }
+    /* Same invariant as the equivalent update in slotcask_migrate_to_varlen:
+       every writer of active_file_id/reserve_off holds rotation_lock
+       (CID 1696416, CID 1696410). rotation_lock for this stream was already
+       pthread_mutex_init'd earlier in slotcask_open, so this is always safe
+       to take here. */
+    pthread_mutex_lock(&db->streams[sid].rotation_lock);
     db->streams[sid].active_file_id = (uint32_t)last_id;
     db->streams[sid].reserve_off = (uint64_t)last_offset;
+    pthread_mutex_unlock(&db->streams[sid].rotation_lock);
     free(ids);
     return 0;
 }
