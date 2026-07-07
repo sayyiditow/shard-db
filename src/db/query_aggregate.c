@@ -5781,6 +5781,48 @@ int cmd_aggregate(const char *db_root, const char *object,
     return r;
 }
 
+/* Convert a CSV field list ("a,b,c") into a JSON string array
+   ("["a","b","c"]") into out[0..out_sz). Every byte offset is
+   bounds-checked *before* the write that would produce it — the
+   original inline version instead wrote its closing quote/comma/bracket
+   unconditionally after a bounds-checked copy loop, which let a long
+   enough group_by_csv drive an unbounded write loop past the end of a
+   fixed 4096-byte stack buffer (CID 1696446). Fields beyond what fits
+   are silently dropped rather than truncated mid-name, matching the
+   sibling having_buf conversion just below this function's caller. */
+void group_by_csv_to_json(const char *csv, char *out, size_t out_sz) {
+    if (out_sz == 0) return;
+    if (out_sz < 3) { out[0] = '\0'; return; }
+    out[0] = '[';
+    int pos = 1;
+    int first = 1;
+    if (csv && csv[0]) {
+        const char *p = csv;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p) break;
+            const char *start = p;
+            while (*p && *p != ',') p++;
+            int flen = (int)(p - start);
+            int remain = (int)out_sz - pos;
+            if (remain <= 0) break;
+            int n = snprintf(out + pos, (size_t)remain, "%s\"%.*s\"",
+                             first ? "" : ",", flen, start);
+            if (n < 0 || n >= remain) break;   /* would truncate — stop here */
+            pos += n;
+            first = 0;
+            if (*p == ',') p++;
+        }
+    }
+    if ((size_t)pos + 2 <= out_sz) {
+        out[pos++] = ']';
+        out[pos] = '\0';
+    } else {
+        out[out_sz - 2] = ']';
+        out[out_sz - 1] = '\0';
+    }
+}
+
 int cmd_aggregate_tree(const char *db_root, const char *object,
                        CriteriaNode *criteria_tree,
                        const NqlAggSpec *aggs, int naggs,
@@ -5808,25 +5850,8 @@ int cmd_aggregate_tree(const char *db_root, const char *object,
     }
 
     /* Convert group_by_csv to group_by_json (JSON array) */
-    char group_by_buf[4096] = "[";
-    int gpos = 1;
-    if (group_by_csv && group_by_csv[0]) {
-        const char *p = group_by_csv;
-        while (*p) {
-            while (*p == ' ' || *p == '\t') p++;
-            if (!*p) break;
-            if (gpos > 1 && gpos < (int)sizeof(group_by_buf) - 1)
-                group_by_buf[gpos++] = ',';
-            group_by_buf[gpos++] = '"';
-            while (*p && *p != ',') {
-                if (gpos >= (int)sizeof(group_by_buf) - 2) break;
-                group_by_buf[gpos++] = *p++;
-            }
-            group_by_buf[gpos++] = '"';
-            if (*p == ',') p++;
-        }
-    }
-    group_by_buf[gpos] = ']';
+    char group_by_buf[4096];
+    group_by_csv_to_json(group_by_csv, group_by_buf, sizeof(group_by_buf));
 
     /* Convert CriteriaNode *having_tree to having_json */
     char having_buf[4096] = {0};
