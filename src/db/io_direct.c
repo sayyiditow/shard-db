@@ -782,7 +782,6 @@ int seg_scan_o_direct_varlen(const char *seg_path,
                 }
                 memcpy(carry + carry_len, chunk, (size_t)need);
                 pos   += (size_t)need;
-                carry_len = (int)rec_size;
             }
 
             if (flag == 1) {

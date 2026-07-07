@@ -2405,7 +2405,7 @@ static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
                         carry = nc;
                     }
                     memcpy(carry + carry_len, buf + pos, (size_t)need2);
-                    pos += (size_t)need2; carry_len = (int)rec_size;
+                    pos += (size_t)need2;
                 }
                 if (carry[18] == 2)
                     pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
