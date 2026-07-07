@@ -579,6 +579,7 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
     NqlCommand cmd;
     if (nql_parse_command(line, &cmd) < 0) {
         OUT("{\"error\":\"%s\"}\n", cmd.err);
+        nql_free_command(&cmd);
         return;
     }
 
@@ -2747,7 +2748,7 @@ static void *warmup_thread(void *arg) {
                 if (n_kf == kf_cap) {
                     size_t new_cap = kf_cap ? kf_cap * 2 : 64;
                     WarmupKfTask *nt = realloc(kf_tasks, new_cap * sizeof(WarmupKfTask));
-                    if (!nt) goto done_collect;
+                    if (!nt) { closedir(dd); goto done_collect; }
                     kf_tasks = nt;
                     kf_cap = new_cap;
                 }
