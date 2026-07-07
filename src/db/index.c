@@ -2314,6 +2314,12 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
         const uint8_t *vb = value + tf->offset;
         uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
         if (al == 0) return;
+        /* al is an on-disk length prefix; clamp it to the field's actual
+           declared content size before using it to read past vb + 2
+           (CID 1696428). */
+        size_t max_content = tf->size > 2 ? (size_t)tf->size - 2 : 0;
+        if ((size_t)al > max_content) al = (uint16_t)max_content;
+        if (al == 0) return;
         uint8_t tg[TG_MAX_DISTINCT][3];
         size_t n = tg_extract_distinct(vb + 2, al, tg, TG_MAX_DISTINCT);
         if (n == 0) return;
@@ -2492,6 +2498,16 @@ static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
                            const uint8_t hash16[16], void *ctx) {
     SegScanWorker *w = (SegScanWorker *)ctx;
     uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
+    /* FIXED-format records are exactly w->slot_size bytes; a corrupted
+       on-disk klen that would push the value pointer past the record's
+       actual bounds must be rejected before the pointer arithmetic below
+       (CID 1696451). VARLEN-format records already have klen validated by
+       the caller (seg_scan_o_direct_varlen) before this callback runs. */
+    if (w->format != SLOTCASK_FORMAT_VARIABLE &&
+        (size_t)24 + klen > (size_t)w->slot_size) {
+        w->had_error = 1;
+        return 0;
+    }
     const uint8_t *value = rec + 24 + klen;
     /* Compact VARIABLE records may be shorter than ts->total_size (trailing
        zero fields trimmed). Pad to total_size so field access at tf->offset
