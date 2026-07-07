@@ -282,6 +282,10 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_registry_single_flight.c \
     src/test/cases/test_add_indexes_single_scan.c \
     src/test/cases/test_secure_random_keys.c \
+    src/test/cases/test_coverity_disk_corruption_segments.c \
+    src/test/cases/test_coverity_disk_corruption_btree.c \
+    src/test/cases/test_coverity_disk_corruption_bitmap.c \
+    src/test/cases/test_coverity_seg_scan_varlen_overflow.c \
     src/test/cases/test_coverity_encode_criterion_overflow.c \
     src/test/cases/test_coverity_group_by_overflow.c \
     src/test/cases/test_coverity_join_buf_overflow.c \

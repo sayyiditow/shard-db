@@ -52,6 +52,7 @@
 #include "btree.h"    /* BtFileHeader, BtPageHeader, BT_MAGIC*, bt_page_size,
                          BT_PAGE_DATA_START, BT_LEAF_RESTART_K,
                          BT_MAX_VAL_LEN, BT_HASH_SIZE               */
+#include "slotcask.h"
 #include "simd.h"    /* simd_memmem */
 
 #include <stdlib.h>
@@ -748,6 +749,18 @@ int seg_scan_o_direct_varlen(const char *seg_path,
             memcpy(&vlen, carry + 20, 4);
             flag = carry[18];
             size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
+
+            /* rec_size is derived from an on-disk, unvalidated vlen.
+               A corrupted vlen can make rec_size enormous; narrowing
+               it into `int` below would silently wrap and produce a
+               small or negative `need`, skipping the "need more data"
+               branch and passing a huge vlen straight to cb() against
+               the small carry buffer (CID 1696466). Reject anything
+               past the largest a legitimate segment record could be. */
+            if (rec_size > SLOTCASK_SEG_MAX_BYTES) {
+                ret = -EIO;
+                goto done;
+            }
 
             int need = (int)rec_size - carry_len;
             if (need > 0) {
@@ -2828,6 +2841,15 @@ static int btree_decode_leaves_in_range(const uint8_t *range, size_t range_len,
          * Only leaves (ptype==1) carry user entries. */
         if (ptype == 1) {
             uint32_t cnt; memcpy(&cnt, &ph->count, 4);
+            /* cnt is read straight from an on-disk page header; clamp it
+               to the maximum number of 2-byte slot-table entries that can
+               possibly fit after the page header before iterating, so a
+               corrupted cnt can't walk bts_slot_off() past the page
+               (CID 1696431). */
+            size_t max_slots = (page_sz > BT_PAGE_DATA_START)
+                                    ? ((size_t)page_sz - BT_PAGE_DATA_START) / 2
+                                    : 0;
+            if (cnt > max_slots) cnt = (uint32_t)max_slots;
 
             for (uint32_t s = 0; s < cnt; s++) {
                 uint16_t eoff = bts_slot_off(pg, s);

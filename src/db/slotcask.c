@@ -2381,15 +2381,21 @@ static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
                 size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
                 int need2 = (int)rec_size - carry_len;
                 if (need2 > 0) {
-                    if ((ssize_t)need2 > nr) {
-                        if ((size_t)(carry_len + nr) > carry_cap) {
-                            carry_cap = (size_t)(carry_len + nr);
+                    /* Bytes actually remaining in this chunk starting at
+                       buf + pos — NOT the full chunk size nr, since Stage 1
+                       (header completion) may have already consumed pos
+                       bytes from the front of this same chunk
+                       (CID 1696471). */
+                    size_t remain = (size_t)nr - pos;
+                    if ((size_t)need2 > remain) {
+                        if ((size_t)(carry_len + remain) > carry_cap) {
+                            carry_cap = (size_t)(carry_len + remain);
                             uint8_t *nc = realloc(carry, carry_cap);
                             if (!nc) { free(carry); free(buf); close(fd); return -1; }
                             carry = nc;
                         }
-                        memcpy(carry + carry_len, buf, (size_t)nr);
-                        carry_len += (int)nr;
+                        memcpy(carry + carry_len, buf + pos, remain);
+                        carry_len += (int)remain;
                         file_off2 += nr; continue;
                     }
                     if (rec_size > carry_cap) {
@@ -2398,7 +2404,7 @@ static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
                         if (!nc) { free(carry); free(buf); close(fd); return -1; }
                         carry = nc;
                     }
-                    memcpy(carry + carry_len, buf, (size_t)need2);
+                    memcpy(carry + carry_len, buf + pos, (size_t)need2);
                     pos += (size_t)need2; carry_len = (int)rec_size;
                 }
                 if (carry[18] == 2)
@@ -6590,6 +6596,23 @@ int slotcask_migrate_to_varlen(SlotcaskDb *db) {
     memset(src, 0, sizeof(src));
     memset(src_cnt, 0, sizeof(src_cnt));
 
+    /* Per-stream dest segment state (one open mmap at a time per
+       stream). Declared and zeroed before the source-scanning loop
+       below so that if that loop `goto fail`s partway through (e.g.
+       a calloc failure), the fail: cleanup path finds a fully
+       zero-initialized dest[] instead of uninitialized stack memory
+       (CID 1696419). */
+    typedef struct { uint8_t *base; size_t alloc; int fd; } DestMap;
+    DestMap dest[SLOTCASK_MAX_STREAMS];
+    memset(dest, 0, sizeof(dest));
+    for (int s = 0; s < n_streams; s++) dest[s].fd = -1;
+    uint32_t dest_fid[SLOTCASK_MAX_STREAMS];
+    size_t   dest_off[SLOTCASK_MAX_STREAMS];
+    for (int s = 0; s < n_streams; s++) {
+        dest_fid[s] = MIGRATE_STREAM_BASE + (uint32_t)s * 1000u;
+        dest_off[s] = 0;
+    }
+
     for (int s = 0; s < n_streams; s++) {
         uint32_t cnt = 0;
         for (;;) {
@@ -6618,18 +6641,6 @@ int slotcask_migrate_to_varlen(SlotcaskDb *db) {
             }
             close(fd);
         }
-    }
-
-    /* Per-stream dest segment state (one open mmap at a time per stream). */
-    typedef struct { uint8_t *base; size_t alloc; int fd; } DestMap;
-    DestMap dest[SLOTCASK_MAX_STREAMS];
-    memset(dest, 0, sizeof(dest));
-    for (int s = 0; s < n_streams; s++) dest[s].fd = -1;
-    uint32_t dest_fid[SLOTCASK_MAX_STREAMS];
-    size_t   dest_off[SLOTCASK_MAX_STREAMS];
-    for (int s = 0; s < n_streams; s++) {
-        dest_fid[s] = MIGRATE_STREAM_BASE + (uint32_t)s * 1000u;
-        dest_off[s] = 0;
     }
 
     /* Phase 1: KF walk with direct-mmap reads and writes — no per-record locks. */

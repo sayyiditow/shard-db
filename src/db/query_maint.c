@@ -66,6 +66,11 @@ static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
     const TypedField *f = &c->ts->fields[c->field_index];
     const uint8_t *vbase = (const uint8_t *)value + f->offset;
     uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
+    /* actual_len is an on-disk length prefix; clamp it to the field's
+       actual declared content size before reading past vbase + 2
+       (CID 1696427), same pattern as mf_append_field in index.c. */
+    size_t max_content = f->size > 2 ? (size_t)f->size - 2 : 0;
+    if ((size_t)actual_len > max_content) actual_len = (uint16_t)max_content;
     if (actual_len > 0) {
         uint8_t trigrams[TG_MAX_DISTINCT][3];
         size_t n = tg_extract_distinct(vbase + 2, actual_len,

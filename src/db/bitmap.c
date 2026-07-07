@@ -241,9 +241,17 @@ void bm_build_path(char *out, size_t outlen,
 static uint32_t bm_dict_used_bytes(const BitmapShard *bm) {
     if (bm->hdr.flags & BM_FLAG_BOOL_FASTPATH) return 6; /* [01 00 00][01 00 01] */
     const uint8_t *p = (const uint8_t *)bm->mmap_ptr + bm->hdr.dict_off;
+    const uint8_t *end = (const uint8_t *)bm->mmap_ptr + bm->hdr.bitmaps_off;
     uint32_t off = 0;
     for (uint32_t i = 0; i < bm->hdr.n_values; i++) {
+        /* n_values is an on-disk header field with no inherent bound;
+           mirror bm_dict_lookup's bounds-checked walk instead of trusting
+           it blindly (CID 1696403). A corrupted/oversized n_values now
+           just truncates the walk at the mapped region's edge instead of
+           reading past it. */
+        if (p + off + 2 > end) break;
         uint16_t len = (uint16_t)p[off] | ((uint16_t)p[off + 1] << 8);
+        if (p + off + 2 + len > end) break;
         off += 2u + len;
     }
     return off;
@@ -549,6 +557,12 @@ static int bm_dict_add(BitmapShard *bm, const uint8_t *value, size_t vlen) {
        `field:bitmap(N)`. The wire layer translates this -1 into an
        actionable error pointing them at the override. */
     if (old_n >= bm->hdr.max_values) return -1;
+    /* Defense-in-depth: the dict's uint16 length-prefix format can't
+       represent a value longer than 65535 bytes. Today every real caller
+       already stays under this via varchar's own 65535-byte on-disk
+       ceiling, but don't rely on that coincidence holding for future
+       field types (CID 1696430). */
+    if (vlen > 0xffff) return -1;
 
     /* Actual packed bytes — NOT bitmaps_off - dict_off, which would
        include alignment padding. */

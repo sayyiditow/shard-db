@@ -777,12 +777,21 @@ static uint32_t bt_alloc_page(BtFile *bt) {
         if (bt->map == MAP_FAILED) {
             fprintf(stderr, "btree: mremap(grow %zu→%zu) failed: %s\n",
                     bt->map_size, new_size, strerror(errno));
-            bt->map = NULL; /* force SIGBUS on subsequent write */
+            bt->map = NULL;
         }
 #else
         munmap(bt->map, bt->map_size);
         bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
+        if (bt->map == MAP_FAILED) bt->map = NULL;
 #endif
+        /* No caller of bt_alloc_page (11 sites) checks an error sentinel —
+           there isn't one, it always returns a uint32_t page id. Silently
+           continuing with a NULL or stale map here would corrupt the
+           B+tree on the next access. Fail loudly instead (CID 1696467). */
+        if (!bt->map) {
+            fprintf(stderr, "btree: page allocation failed, aborting\n");
+            abort();
+        }
         if (ftruncate(bt->fd, (off_t)new_size) < 0) {
             fprintf(stderr, "btree: ftruncate(grow %zu→%zu) failed: %s\n",
                     bt->map_size, new_size, strerror(errno));
@@ -1942,7 +1951,17 @@ static int iter_init_desc_leaves(BtRangeIter *it) {
            (unless an exact match exists, in which case it's that
            entry's own child). */
         page_id = fh->root_page;
-        while (1) {
+        uint32_t desc_page_count = fh->page_count;
+        uint32_t desc_hops = 0;
+        while (page_id != 0) {
+            /* page_id comes from an on-disk child/next_leaf pointer that
+               may be corrupted; bound it against the file's actual
+               page_count and cap total hops at page_count so a corrupted
+               cycle can't spin forever (CID 1696448). */
+            if (page_id >= desc_page_count || ++desc_hops > desc_page_count) {
+                page_id = 0;
+                break;
+            }
             uint8_t *page = bt_page(&it->bt, page_id);
             BtPageHeader *ph = (BtPageHeader *)page;
             if (ph->page_type == 1) break;
@@ -1960,7 +1979,6 @@ static int iter_init_desc_leaves(BtRangeIter *it) {
             /* No exact match: descend the child immediately before pos. */
             if (pos == 0) page_id = ph->next_leaf;
             else          page_id = entry_child(page_entry(page, pos - 1));
-            if (page_id == 0) break;
         }
     }
 
@@ -2139,7 +2157,16 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
        internal pages, ph->next_leaf doubles as the leftmost-child
        pointer (matches what iter_seek_fwd uses when bsearch returns 0). */
     uint32_t page_id = fh->root_page;
+    uint32_t walk_page_count = fh->page_count;
+    uint32_t walk_hops = 0;
     while (1) {
+        /* Same corrupted-pointer / cycle guard as iter_init_desc_leaves
+           (CID 1696448 / CID 1696465): page_id descends via on-disk
+           next_leaf pointers with no inherent bound. */
+        if (page_id >= walk_page_count || ++walk_hops > walk_page_count) {
+            if (set_seq) madvise(bt.map, bt.map_size, MADV_RANDOM);
+            bt_release(&bt); return 0;
+        }
         uint8_t *page = bt_page(&bt, page_id);
         BtPageHeader *ph = (BtPageHeader *)page;
         if (ph->page_type == 1) break;
@@ -2154,7 +2181,13 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
     size_t key_len = 0;
     int rc = 0;
 
+    uint32_t chain_hops = 0;
     while (page_id != 0) {
+        /* Same corrupted-pointer / cycle guard as above: page_id advances
+           via ph->next_leaf with no inherent bound (CID 1696448). */
+        if (page_id >= walk_page_count || ++chain_hops > walk_page_count) {
+            break;
+        }
         uint8_t *page = bt_page(&bt, page_id);
         BtPageHeader *ph = (BtPageHeader *)page;
         int cnt = ph->count;
