@@ -4279,6 +4279,11 @@ static int keyset_emit_find(const char *db_root, const char *object,
         .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    if (!sdb) {
+        free(hashes);
+        free(key_to_fetch);
+        return 0;
+    }
 
     /* Batch-fetch results: parallel arrays indexed by hash position. */
     uint8_t **fkeys = calloc(n_fetch, sizeof(*fkeys));
@@ -4638,6 +4643,11 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
             .streams = sch->streams,
         };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+        if (!sdb) {
+            free(hashes);
+            keyset_free(ks);
+            return 0;
+        }
 
         OrCountCtx cb_ctx;
         memset(&cb_ctx, 0, sizeof(cb_ctx));
