@@ -2557,8 +2557,24 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
             if (*p == '"') p++;
             if (key_count >= key_cap) {
                 key_cap *= 2;
-                MultiGetEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
-                if (!t) { entries = NULL; break; }
+                /* Plain realloc (not xrealloc_or_free): on failure we still
+                   need the old `entries` array intact to free each already-
+                   parsed entry's key/wire_key before dropping the array
+                   itself (CID 1696478). Resetting key_count to 0 here also
+                   makes the `key_count == 0` early-return below fire
+                   correctly instead of falling through to a NULL entries[]
+                   dereference. */
+                MultiGetEntry *t = realloc(entries, key_cap * sizeof(*t));
+                if (!t) {
+                    for (int j = 0; j < key_count; j++) {
+                        free(entries[j].key);
+                        free(entries[j].wire_key);
+                    }
+                    free(entries);
+                    entries = NULL;
+                    key_count = 0;
+                    break;
+                }
                 entries = t;
             }
             MultiGetEntry *e = &entries[key_count++];

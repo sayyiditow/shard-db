@@ -1166,7 +1166,10 @@ static int bulk_ins_run(const char *db_root, const char *object,
     /* If parse tripped the deadline, abort before any write phase. Same
        cleanup order as the OOM bail below. */
     if (dl.timed_out) {
-        free(records);
+        if (wire_keys) {
+            for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
+        }
+        free(records); free(wire_keys);
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
