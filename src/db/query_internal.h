@@ -308,6 +308,7 @@ int op_needs_check_primary(enum SearchOp op);
 int op_prefers_trigram(enum SearchOp op);
 
 /* query.c — criterion encoding (used by query_aggregate.c) */
+void group_by_csv_to_json(const char *csv, char *out, size_t out_sz);
 void encode_criterion_value(const TypedField *tf,
                             const char *val, size_t vlen,
                             uint8_t *buf, size_t *out_len);

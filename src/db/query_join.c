@@ -7,6 +7,7 @@
 #include "query_internal.h"
 #include <math.h>
 #include <dirent.h>
+#include <stdarg.h>
 /* ========== Joins (find-side) ==========
  * Parse, resolve, lookup and emit join results. Joined queries always return
  * tabular {"columns":[...],"rows":[[...]]} with fully-namespaced column names.
@@ -292,27 +293,51 @@ int lookup_remote(const JoinSpec *j, const char *db_root,
     return 1;
 }
 
+/* snprintf() reports the length it *would* write even when the
+   destination is too small to hold it. Accumulating that raw return
+   value into a running buffer offset (`pos += snprintf(buf+pos,
+   bufsz-pos, ...)`) lets a single truncation permanently desync pos
+   from the buffer: the next call in the chain computes `buf + pos`
+   past the end of the buffer, and `bufsz - pos` (size_t - int, with
+   pos > bufsz) wraps around to a huge unsigned size — both feed an
+   out-of-bounds write to the following snprintf. This wrapper clamps
+   to what was actually written / would fit, so pos can never exceed
+   bufsz - 1 (CID 1696463, CID 1696458). */
+static int snprintf_bounded(char *buf, size_t bufsz, const char *fmt, ...) {
+    if (bufsz == 0) return 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, bufsz, fmt, ap);
+    va_end(ap);
+    if (n < 0) return 0;
+    return (n >= (int)bufsz) ? (int)bufsz - 1 : n;
+}
+
 /* Write one field value as a JSON token (number/"string"/null) into buf.
-   Returns bytes written (>= 0). Safe for worker threads. */
+   Returns bytes written; always < bufsz, so accumulating this into a
+   running offset can never overrun the caller's buffer (see
+   snprintf_bounded above). Safe for worker threads. */
 static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
                            char *buf, size_t bufsz) {
-    if (!tf) return snprintf(buf, bufsz, "null");
+    if (!tf) return snprintf_bounded(buf, bufsz, "null");
     char tmp[512];
     int n;
     switch (tf->type) {
     case FT_VARCHAR: {
         int len = varchar_eff_len(field_ptr, tf->size);
-        if (len == 0) return snprintf(buf, bufsz, "\"\"");
+        if (len == 0) return snprintf_bounded(buf, bufsz, "\"\"");
         /* Escape per RFC 8259 — varchar content is opaque bytes,
            may contain " \ or control chars. Caller sizes buf for
            up to 6 * len + 2 worst case. NUL-terminate so callers
-           that pass the buffer to printf-%s read a bounded string. */
-        if (bufsz < 4) return -1;
+           that pass the buffer to printf-%s read a bounded string.
+           Returns 0 (not -1) when it doesn't fit, so a caller doing
+           pos += buf_field_value(...) never has pos move backwards. */
+        if (bufsz < 4) return 0;
         buf[0] = '"';
         int esc = json_escape_into(buf + 1, bufsz - 3,
                                     (const char *)(field_ptr + 2),
                                     (size_t)len);
-        if (esc < 0) return -1;
+        if (esc < 0) return 0;
         buf[1 + esc] = '"';
         buf[2 + esc] = '\0';
         return 2 + esc;
@@ -326,28 +351,29 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
         /* Enum's display string is a JSON string (quoted, escaped).
            DATE/DATETIME are also strings on the wire. */
         n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
-        if (n <= 0) return snprintf(buf, bufsz, "null");
-        return snprintf(buf, bufsz, "\"%s\"", tmp);
+        if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
+        return snprintf_bounded(buf, bufsz, "\"%s\"", tmp);
     default:
         n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
-        if (n <= 0) return snprintf(buf, bufsz, "null");
-        return snprintf(buf, bufsz, "%s", tmp);
+        if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
+        return snprintf_bounded(buf, bufsz, "%s", tmp);
     }
 }
 
-/* Write one join's contribution (,val,val,...) to buf. remote_raw NULL → nulls. */
+/* Write one join's contribution (,val,val,...) to buf. remote_raw NULL → nulls.
+   Returns bytes written; always < bufsz (see snprintf_bounded above). */
 int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw,
                            char *buf, size_t bufsz) {
     int pos = 0;
     if (j->include_remote_key) {
         /* v1: emit null — local field gives the value; extend later if needed */
-        pos += snprintf(buf + pos, bufsz - pos, ",null");
+        pos += snprintf_bounded(buf + pos, bufsz - pos, ",null");
     }
     for (int k = 0; k < j->proj_count; k++) {
         if (pos >= (int)bufsz - 1) break;
-        pos += snprintf(buf + pos, bufsz - pos, ",");
+        pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
         if (!remote_raw || !j->proj_tfs[k])
-            pos += snprintf(buf + pos, bufsz - pos, "null");
+            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
         else
             pos += buf_field_value(j->proj_tfs[k],
                                    remote_raw + j->proj_tfs[k]->offset,
@@ -356,7 +382,8 @@ int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw,
     return pos;
 }
 
-/* Write driver-side row values (,val,val,...) after the key. */
+/* Write driver-side row values (,val,val,...) after the key.
+   Returns bytes written; always < bufsz (see snprintf_bounded above). */
 int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
                              const char **driver_proj, int driver_proj_count,
                              char *buf, size_t bufsz) {
@@ -364,7 +391,7 @@ int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
     if (driver_proj_count > 0) {
         for (int i = 0; i < driver_proj_count; i++) {
             if (pos >= (int)bufsz - 1) break;
-            pos += snprintf(buf + pos, bufsz - pos, ",");
+            pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
             if (driver_fs && driver_fs->ts) {
                 int idx = typed_field_index(driver_fs->ts, driver_proj[i]);
                 if (idx >= 0) {
@@ -374,13 +401,13 @@ int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
                     continue;
                 }
             }
-            pos += snprintf(buf + pos, bufsz - pos, "null");
+            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
         }
     } else if (driver_fs && driver_fs->ts) {
         for (int i = 0; i < driver_fs->ts->nfields; i++) {
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos >= (int)bufsz - 1) break;
-            pos += snprintf(buf + pos, bufsz - pos, ",");
+            pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
             pos += buf_field_value(&driver_fs->ts->fields[i],
                                    driver_raw + driver_fs->ts->fields[i].offset,
                                    buf + pos, bufsz - pos);
@@ -609,7 +636,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                 } else if (sc->njoins > 0) {
                     /* Tabular JSON row: [driver.key, driver fields..., join1 fields..., ...] */
                     char row[16384];
-                    int pos = snprintf(row, sizeof(row), "%s[\"%s\"",
+                    int pos = snprintf_bounded(row, sizeof(row), "%s[\"%s\"",
                                        sc->printed ? "," : "", key);
                     pos += buf_driver_values((const uint8_t *)raw, sc->fs,
                                              sc->proj_count > 0 ? sc->proj_fields : NULL,
@@ -618,7 +645,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     for (int i = 0; i < sc->njoins && pos < (int)sizeof(row) - 2; i++)
                         pos += buf_join_values(&sc->joins[i], join_raws[i],
                                                row + pos, sizeof(row) - pos);
-                    snprintf(row + pos, sizeof(row) - pos, "]");
+                    snprintf_bounded(row + pos, sizeof(row) - pos, "]");
                     OUT("%s", row);
                 } else if (sc->csv_delim) {
                     csv_emit_row(key, (const uint8_t *)raw, hdr->value_len,

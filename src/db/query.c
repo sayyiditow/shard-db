@@ -354,8 +354,17 @@ void encode_criterion_value(const TypedField *tf,
                                    const char *val, size_t vlen,
                                    uint8_t *buf, size_t *out_len) {
     if (!tf) {
-        memcpy(buf, val, vlen);
-        *out_len = vlen;
+        /* No typed field to bound the copy by (composite-index field name,
+           or a field absent from the typed schema) — vlen here is a raw
+           user-supplied criterion value with no upper bound from the wire
+           protocol. Every call site's buf is a fixed-size stack buffer of
+           at least 1024 bytes (verified across all call sites in query.c /
+           query_plan.c / query_aggregate.c); clamp to that so an
+           over-length value can never overflow the smallest of them
+           (CID 1696413). */
+        size_t n = vlen < 1024 ? vlen : 1024;
+        memcpy(buf, val, n);
+        *out_len = n;
         return;
     }
     encode_field_for_index(tf, val, vlen, buf, out_len);
