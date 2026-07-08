@@ -200,8 +200,8 @@ int od_open(const char *path)
     fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
 #  ifdef POSIX_FADV_SEQUENTIAL
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL); /* best-effort; ignore failures */
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   /* best-effort; ignore failures */
 #  endif
     return fd;
 
@@ -209,8 +209,8 @@ int od_open(const char *path)
     fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
 #  ifdef POSIX_FADV_SEQUENTIAL
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL); /* best-effort; ignore failures */
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   /* best-effort; ignore failures */
 #  endif
     return fd;
 #endif

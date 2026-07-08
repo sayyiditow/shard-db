@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 #include "types.h"
 #include "bitmap.h"
+#include <errno.h>
 
 #include <fcntl.h>
 #include <limits.h>
@@ -219,11 +220,12 @@ static int bm_mkdir_p(const char *path) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, 0755);
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
             *p = '/';
         }
     }
-    return mkdir(tmp, 0755);
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
 }
 
 void bm_build_path(char *out, size_t outlen,
@@ -374,7 +376,7 @@ BitmapShard *bm_open(const char *path, int slots, int create,
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
-    if (slash) { *slash = '\0'; bm_mkdir_p(dir); }
+    if (slash) { *slash = '\0'; if (bm_mkdir_p(dir) != 0) return NULL; }
     {
         struct stat st;
         if (stat(path, &st) != 0) {

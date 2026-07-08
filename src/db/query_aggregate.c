@@ -3479,6 +3479,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 if (processed[i] || specs[i].fn == AGG_COUNT) continue;
                 const char *fld = specs[i].field;
                 int fi = typed_field_index(fs.ts, fld);
+                if (fi < 0) { processed[i] = 1; continue; }
                 const TypedField *tf = &fs.ts->fields[fi];
                 /* Collect every spec sharing this field. */
                 int sibs[MAX_AGG_SPECS]; int nsibs = 0;

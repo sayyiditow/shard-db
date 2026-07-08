@@ -4882,7 +4882,7 @@ int slotcask_bulk_resolve_and_fetch(SlotcaskDb *db,
                                      SlotcaskScanCb cb) {
     size_t resolved_n = 0;
     SlotcaskResolvedRec *resolved = slotcask_bulk_resolve_hashes(db, hashes, n, &resolved_n);
-    if (!resolved || resolved_n == 0) return 0;
+    if (!resolved || resolved_n == 0) { free(resolved); return 0; }
     int rc = slotcask_bulk_fetch_resolved(db, resolved, resolved_n, ctx, cb);
     free(resolved);
     return rc;

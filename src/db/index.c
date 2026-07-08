@@ -677,7 +677,6 @@ void index_parallel(const char *db_root, const char *object, int splits,
                         pos += len;
                     }
                 }
-                if (!all_present) break;
                 tok = strtok_r(NULL, "+", &_tok_save);
             }
             if (all_present && pos > 0) {
