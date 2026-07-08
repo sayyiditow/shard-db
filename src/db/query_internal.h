@@ -6,6 +6,8 @@
    These were `static` inside the monolithic query.c; splitting the file
    forces them to external linkage. Keep this header private to src/db. */
 
+typedef struct SlotcaskDb SlotcaskDb;  /* defined in slotcask.h */
+
 #define MAX_INTERSECT_LEAVES 8
 
 /* Filter plan types — shared by query.c and query_aggregate.c */
@@ -67,7 +69,7 @@ typedef struct {
 /* ========== Joins ========== */
 enum JoinType { JOIN_INNER = 0, JOIN_LEFT = 1 };
 
-typedef struct {
+typedef struct JoinSpec {
     char object[256];
     char local_field[256];
     char remote_field[256];       /* "key" OR indexed field name */

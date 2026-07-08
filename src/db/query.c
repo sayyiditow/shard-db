@@ -8241,15 +8241,17 @@ int cmd_find_tree(const char *db_root, const char *object, CriteriaNode *tree,
                   int offset, int limit, const char *proj_str,
                   const char *format, const char *delimiter,
                   const char *order_by, const char *order_dir, int want_total,
-                  const char *cursor_json) {
-    return cmd_find_do(db_root, object, tree,
-                       NULL, 0,           /* no joins */
+                  const char *cursor_json,
+                  JoinSpec *joins, int njoins) {
+    int r = cmd_find_do(db_root, object, tree,
+                       joins, njoins,
                        offset, limit, proj_str,
                        NULL,              /* no excluded_csv */
                        format, delimiter,
                        order_by, order_dir,
                        cursor_json,
                        want_total);
+    return r;
 }
 
 #ifdef TEST_BUILD

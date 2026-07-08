@@ -626,7 +626,11 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
                           cmd.order_by[0]  ? cmd.order_by  : NULL,
                           cmd.order_dir[0] ? cmd.order_dir : NULL,
                           0,
-                          cmd.cursor[0]    ? cmd.cursor    : NULL);
+                          cmd.cursor[0]    ? cmd.cursor    : NULL,
+                          cmd.joins, cmd.njoins);
+            /* cmd_find_do() owns + frees joins internally; prevent double-free */
+            cmd.joins = NULL;
+            cmd.njoins = 0;
         }
         break;
     case NQL_AGGREGATE:

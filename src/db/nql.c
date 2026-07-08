@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "nql.h"
 #include "types.h"
+#include "query_internal.h" /* JoinSpec, free_joins, MAX_FIELDS */
 
 /* ── Lexer ────────────────────────────────────────────────────────── */
 
@@ -436,6 +437,70 @@ int nql_parse_command(const char *src, NqlCommand *out) {
         else if (!strcmp(argv[i],"--order")   && i+1<argc) { snprintf(out->order_dir,sizeof out->order_dir,"%s",argv[++i]); i++; }
         else if (!strcmp(argv[i],"--cursor")  && i+1<argc) { snprintf(out->cursor,   sizeof out->cursor,   "%s",argv[++i]); i++; }
         else if (!strcmp(argv[i],"--explain"))              { out->explain = 1; i++; }
+        else if (!strcmp(argv[i],"--join") && i+1<argc) {
+            /* --join object local=remote [as alias] [fields f1,f2] [left] */
+            i++;
+            if (i >= argc) { snprintf(out->err,sizeof out->err,"NQL: --join requires arguments"); return -1; }
+            const char *object = argv[i++];
+            if (i >= argc) { snprintf(out->err,sizeof out->err,"NQL: --join requires local=remote"); return -1; }
+            const char *local_eq_remote = argv[i++];
+            const char *eq = strchr(local_eq_remote, '=');
+            if (!eq) { snprintf(out->err,sizeof out->err,"NQL: --join expected local=remote, got '%s'",local_eq_remote); return -1; }
+            char local[256] = {0}, remote[256] = {0};
+            int llen = (int)(eq - local_eq_remote);
+            if (llen > 255) llen = 255;
+            memcpy(local, local_eq_remote, (size_t)llen);
+            strncpy(remote, eq + 1, 255);
+            char as_name[256] = {0};
+            char fields[1024] = {0};
+            int left_join = 0;
+            /* Consume optional tokens. Stop at anything that looks like a
+               flag (-), a quote ('), or end of args. */
+            while (i < argc && argv[i][0] != '-' && argv[i][0] != '\'') {
+                if (!strcmp(argv[i],"as") && i+2<=argc) {
+                    strncpy(as_name, argv[i+1], 255);
+                    i += 2;
+                } else if (!strcmp(argv[i],"fields") && i+2<=argc) {
+                    strncpy(fields, argv[i+1], 1023);
+                    i += 2;
+                } else if (!strcmp(argv[i],"left")) {
+                    left_join = 1;
+                    i++;
+                } else {
+                    break;
+                }
+            }
+            /* Grow joins array and populate the new slot */
+            int idx = out->njoins;
+            JoinSpec *tmp = realloc(out->joins, (size_t)(idx + 1) * sizeof(JoinSpec));
+            if (!tmp) { snprintf(out->err,sizeof out->err,"NQL: join alloc failed"); return -1; }
+            out->joins = tmp;
+            JoinSpec *j = &out->joins[idx];
+            memset(j, 0, sizeof(*j));
+            strncpy(j->object, object, 255);
+            strncpy(j->local_field, local, 255);
+            strncpy(j->remote_field, remote, 255);
+            if (as_name[0]) strncpy(j->as_name, as_name, 255);
+            else            strncpy(j->as_name, object, 255);
+            j->type = left_join ? JOIN_LEFT : JOIN_INNER;
+            /* Parse fields CSV into proj_fields[] */
+            if (fields[0]) {
+                const char *fp = fields;
+                while (*fp && j->proj_count < MAX_FIELDS) {
+                    while (*fp == ' ' || *fp == '\t') fp++;
+                    if (!*fp) break;
+                    const char *fstart = fp;
+                    while (*fp && *fp != ',') fp++;
+                    int flen = (int)(fp - fstart);
+                    if (flen > 255) flen = 255;
+                    memcpy(j->proj_fields[j->proj_count], fstart, (size_t)flen);
+                    j->proj_fields[j->proj_count][flen] = '\0';
+                    j->proj_count++;
+                    if (*fp == ',') fp++;
+                }
+            }
+            out->njoins++;
+        }
         else { snprintf(out->err,sizeof out->err,"NQL: unknown flag '%s'",argv[i]); return -1; }
     }
     return 0;
@@ -445,5 +510,6 @@ void nql_free_command(NqlCommand *cmd) {
     free_criteria_tree(cmd->filter);
     free_criteria_tree(cmd->having);
     free(cmd->aggs);
+    free_joins(cmd->joins, cmd->njoins);
     memset(cmd, 0, sizeof *cmd);
 }
