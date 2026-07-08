@@ -41,7 +41,7 @@ Read-only joins on [`find`](find.md). Inner and left types, chainable, by the re
 | `object` | yes | Remote object to join. Must live in the same `dir` as the driver. |
 | `local` | yes | Driver-side field whose value is looked up in the remote object. Supports composite (`"country+zip"`) when the remote has a matching composite index. |
 | `remote` | yes | Either `"key"` (primary-key lookup, O(1) hash) or any **indexed** field on the remote object (O(log n) B+ tree). Unindexed fields are rejected at parse time. |
-| `as` | yes | Column prefix in the output. Must be unique — can't collide with the driver object name or other `as` values. |
+| `as` | no (default: remote object name) | Column prefix in the output. Must be unique — can't collide with the driver object name or other `as` values. |
 | `type` | no (default `"inner"`) | `"inner"` drops driver rows without a remote match; `"left"` emits nulls instead. |
 | `fields` | no (default all) | Remote fields to include in the output. Tombstoned fields are skipped. |
 
