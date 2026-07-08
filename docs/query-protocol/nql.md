@@ -287,14 +287,8 @@ See [find → Execution paths](find.md#execution-paths) for details.
 
 ---
 
-## Limitations
+## Scope
 
-NQL covers `find`, `count`, and `aggregate`. Operations that require the full JSON protocol:
-
-- `join` — use JSON [`find`](find.md) with a `"join"` array
-- `cursor` pagination — use JSON `find` with `"cursor":null`
-- `format:"dict"` — supported via `--format dict` (no server-side limitation)
-- Bulk operations, CAS, schema mutations, file storage — JSON only
-
-`--having` in the NQL aggregate path currently handles simple leaf conditions on aggregate
-aliases. Complex AND/OR `--having` expressions are on the roadmap.
+NQL covers `find`, `count`, and `aggregate`. Joins, bulk operations, CAS,
+schema mutations, and file storage are separate commands available via the
+JSON protocol only.
