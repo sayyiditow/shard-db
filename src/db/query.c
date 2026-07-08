@@ -4343,17 +4343,23 @@ static int keyset_emit_find(const char *db_root, const char *object,
                 if (njoins > 0) {
                     jrr = calloc(njoins, sizeof(RecordRef));
                     jraws = calloc(njoins, sizeof(const uint8_t *));
-                    for (int i = 0; i < njoins; i++) {
-                        char lk[1024];
-                        int llen = extract_local_key(&joins[i], raw,
-                                                     fs ? fs->ts : NULL, lk, sizeof(lk));
-                        int jfound = 0;
-                        if (llen > 0) {
-                            jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
-                                                   &jrr[i]);
-                            if (jfound) jraws[i] = jrr[i].val;
+                    if (!jrr || !jraws) {
+                        free(jrr); free(jraws);
+                        jrr = NULL; jraws = NULL;
+                        dropped = 1;
+                    } else {
+                        for (int i = 0; i < njoins; i++) {
+                            char lk[1024];
+                            int llen = extract_local_key(&joins[i], raw,
+                                                         fs ? fs->ts : NULL, lk, sizeof(lk));
+                            int jfound = 0;
+                            if (llen > 0) {
+                                jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
+                                                       &jrr[i]);
+                                if (jfound) jraws[i] = jrr[i].val;
+                            }
+                            if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
                         }
-                        if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
                     }
                 }
 

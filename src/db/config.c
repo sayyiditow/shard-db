@@ -2368,6 +2368,11 @@ long long seq_next_val_batch(const char *db_root, const char *object,
     long long val = 0;
     FILE *f = fopen(seq_path, "r");
     if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
+    if (val < 0 || (long long)n > LLONG_MAX - val - 1) {
+        flock(lockfd, LOCK_UN);
+        close(lockfd);
+        return -1;
+    }
     long long start = val + 1;
     val += n;
     f = fopen(seq_path, "w");

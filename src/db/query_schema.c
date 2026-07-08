@@ -290,7 +290,7 @@ static void selective_reindex_dirty(const char *db_root, const char *object,
             if (*next == '+') p = next + 1;
             else break;
         }
-        if (hit) {
+        if (hit && n_aff < MAX_FIELDS) {
             strncpy(affected_specs[n_aff], line, sizeof(affected_specs[0]) - 1);
             affected_specs[n_aff][sizeof(affected_specs[0]) - 1] = '\0';
             n_aff++;
