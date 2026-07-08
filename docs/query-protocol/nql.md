@@ -44,6 +44,7 @@ For `aggregate`, the parser tells `filter` from `agg-list` by checking whether t
 | `--fields` | `f1,f2,...` | Comma-separated field projection. |
 | `--format` | `json\|rows\|csv\|dict` | Output shape (default: JSON array). |
 | `--cursor` | JSON value | Opt into keyset cursor pagination. Pass `null` for page 1, or a JSON cursor object for subsequent pages. Requires indexed `order_by`. |
+| `--join` | `object local=remote [as alias] [fields f1,f2] [left]` | Join with another object. `local` is a field on the driver; `remote` is `key` or an indexed field on the join object. Repeatable. See [joins.md](joins.md). |
 | `--auth` | token | Auth token for TCP wire use. (CLI uses trusted-localhost; not needed there.) |
 
 ### count flags
@@ -290,6 +291,6 @@ See [find → Execution paths](find.md#execution-paths) for details.
 
 ## Scope
 
-NQL covers `find`, `count`, and `aggregate`. Joins, bulk operations, CAS,
-schema mutations, and file storage are separate commands available via the
-JSON protocol only.
+NQL covers `find`, `count`, `aggregate`, and joins (via `--join` on `find`).
+Bulk operations, CAS, schema mutations, and file storage are separate commands
+available via the JSON protocol only.

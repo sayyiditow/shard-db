@@ -1173,11 +1173,12 @@ int cmd_exists(const char *db_root, const char *object,
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);
 int cmd_fetch(const char *db_root, const char *object, int offset, int limit, const char *proj_str, const char *cursor, const char *format, const char *delimiter, int want_total);
 int cmd_find(const char *db_root, const char *object, const char *criteria_json, int offset, int limit, const char *proj_str, const char *excluded_csv, const char *format, const char *delimiter, const char *join_json, const char *order_by, const char *order_dir, const char *cursor_json, int want_total);
+typedef struct JoinSpec JoinSpec;  /* defined in query_internal.h */
 int cmd_find_tree(const char *db_root, const char *object, CriteriaNode *tree,
                   int offset, int limit, const char *proj_str,
                   const char *format, const char *delimiter,
                   const char *order_by, const char *order_dir, int want_total,
-                  const char *cursor_json);
+                  const char *cursor_json, JoinSpec *joins, int njoins);
 void cmd_explain_tree(const char *db_root, const char *object, CriteriaNode *tree,
                       const char *order_by, int fetching);
 /* if_not_exists=1 makes bulk-insert idempotent — keys that already exist

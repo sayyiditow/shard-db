@@ -255,6 +255,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_tls_unit.c \
     src/test/cases/test_variable_length.c \
     src/test/cases/test_nql.c \
+    src/test/cases/test_nql_joins.c \
     src/test/cases/test_util.c \
     src/test/cases/test_agg_topn_stream.c \
     src/test/cases/test_find_orderby_selective.c \

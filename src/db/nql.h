@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include "types.h"   /* CriteriaNode, NqlAggSpec */
 
+struct JoinSpec;  /* defined in query_internal.h */
+
 /* ── Token types ────────────────────────────────────────────────── */
 typedef enum {
     TOK_IDENT,      /* field names and keywords (and/or/in/not/between…) */
@@ -60,6 +62,9 @@ typedef struct {
     int           naggs;
     char          group_by[1024];
     CriteriaNode *having;       /* owned — free with free_criteria_tree() */
+    /* find-only: join */
+    struct JoinSpec *joins;  /* heap-allocated; owned — free with free_joins() */
+    int              njoins;
     /* error */
     char          err[256];
 } NqlCommand;
@@ -75,6 +80,6 @@ CriteriaNode *nql_parse_filter(const char *src, char *err_out, size_t err_sz);
    Returns 0 on success, -1 on error (message in out->err). */
 int nql_parse_command(const char *src, NqlCommand *out);
 
-/* Free the two CriteriaNode trees and the aggs array owned by cmd.
+/* Free the two CriteriaNode trees, the aggs array, and joins owned by cmd.
    Does not free cmd itself. */
 void nql_free_command(NqlCommand *cmd);
