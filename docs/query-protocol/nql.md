@@ -43,6 +43,7 @@ For `aggregate`, the parser tells `filter` from `agg-list` by checking whether t
 | `--offset` | integer | Skip the first N matches. |
 | `--fields` | `f1,f2,...` | Comma-separated field projection. |
 | `--format` | `json\|rows\|csv\|dict` | Output shape (default: JSON array). |
+| `--cursor` | JSON value | Opt into keyset cursor pagination. Pass `null` for page 1, or a JSON cursor object for subsequent pages. Requires indexed `order_by`. |
 | `--auth` | token | Auth token for TCP wire use. (CLI uses trusted-localhost; not needed there.) |
 
 ### count flags
