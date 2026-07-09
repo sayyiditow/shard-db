@@ -4,6 +4,40 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.07.3
+
+Coverity hardening (46 true-positive fixes across two triage rounds), aggregate `HAVING` clause OR/nested-tree support (JSON + NQL), an NQL `--join` flag, and a btree-cache concurrency improvement on the cold-miss path. No on-disk format changes. Wire-compatible with 2026.07.2, no `./migrate` required.
+
+Full notes: [`docs/release-notes/2026.07.3.md`](../release-notes/2026.07.3.md).
+
+### Coverity hardening
+
+- **46 true-positive fixes across 9 PRs** — 82 findings from a fresh Coverity scan triaged by module; fixes span stack-buffer overflows, disk-corruption fail-safes (malformed/bitrot on-disk data now rejected/truncated instead of causing OOB reads or infinite loops), null derefs, resource leaks, a data race in stream recovery, dead code from the v1→v2 migration, and misc hardening (unchecked `ftruncate`, unbounded `memcpy`, unlogged accept() errno). Full CID mapping and false-positive/accepted-risk triage in [`docs/coverity-triage-2026-07.md`](../coverity-triage-2026-07.md). No functional or format changes.
+
+### Features
+
+- **Aggregate `HAVING` OR/nested trees** — `having_json` on the JSON protocol previously flattened to AND-only, silently dropping OR/nested conditions that NQL already supported. Both paths now share one tree-aware matcher. Fixes a bug where a plain `count()` aggregate with `having` and no `group_by` bypassed having filtering entirely. Malformed `having` JSON now returns an error instead of silently degrading.
+
+- **NQL `--join` flag** — `find` in NQL now accepts `--join`, built directly as `JoinSpec` C structs. `as` is optional (defaults to remote object name). Fixed two double-free bugs uncovered during implementation.
+
+### Performance
+
+- **btree-cache miss path** — cold-start syscalls (`open`/`mmap`/`munmap`/`close`) no longer serialize behind one global mutex; widens parallel fan-out for cold indexed queries across many shards.
+
+### Fixes
+
+- **npm binding** — `binding.gyp` was missing the seven `query_*.c` translation units from 2026.07.2's `query.c` split, silently building an incomplete Node.js addon (fixed, npm 1.0.9). Since the binding compiles the same sources this release patches, npm is bumped again to **1.0.10** to ship this release's fixes to Node.js consumers.
+
+### Upgrade
+
+```bash
+./shard-db stop
+# copy new build/bin/ artifacts
+./shard-db start
+```
+
+No `./migrate` step required — no storage format changes in this release.
+
 ## 2026.07.2
 
 Three new field types (`ipv4`, `ipv6`, `datetimems`), `auto_create` preservation across upserts, security hardening (path traversal, varchar overflow, CLI injection, secure random), performance improvements (lock-free hash lookup, IN-list precompute, inline record buffer), and internal refactoring (query.c split, type descriptor table). `./migrate` retained from 2026.07.1 (idempotent); review planned for 2026.08. Wire-compatible with 2026.07.1.
