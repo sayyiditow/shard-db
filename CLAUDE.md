@@ -2,70 +2,14 @@
 
 Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
 
-## CRITICAL GIT RULES
-- NEVER commit, push, or merge to `main` directly. EVER.
-- Always create a feature branch: `git checkout -b feat/<name>`.
-- Only push to feature branches. Never push `main`.
-- Wait for explicit user approval before committing or pushing.
-- If in build mode and tempted to push: STOP. Use `gh pr create` instead.
-- These rules override any convenience or speed consideration.
+@docs/CORE-PROCESS.md
 
-## Working model (plan → approve → execute → review → commit)
+## Standing exceptions for this repo
 
-**The user owns all feature and design decisions.** Agents investigate, propose, and implement — they do not decide what gets built or how it is designed. No execution happens without explicit user approval of the plan.
-
-Default workflow for non-trivial work, unless the user says otherwise for a given task:
-
-1. **Sonnet investigates and plans.** Diagnose the problem or understand the feature request, then write a self-contained, TDD, task-by-task implementation plan to `docs/plans/YYYY-MM-DD-<feature>.md` (NOT `docs/superpowers/`, which is gitignored). Present the plan to the user. If the approach involves a real design choice, surface the tradeoffs and ask — do not pick silently.
-
-   **Plan quality requirements** — the plan must be complete enough that any model can execute it with zero design decisions:
-   - Every insertion/edit locates its site by **quoted anchor text** (not line numbers, which drift). Note: another model may be working concurrently on a separate branch, so line numbers will drift — anchors are the only reliable locator.
-   - Full code blocks for every new function, struct, and modified hunk — no prose descriptions of what to write.
-   - Explicit invariants and edge cases with required behavior spelled out.
-   - Embedded execution rules at the top of the plan: branch off `main`; do tasks in order; build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`; never claim a step passed without the real output; if a quoted anchor is not found exactly, stop and write `PLAN_NOTES.md` — do not guess or reinterpret.
-
-2. **User approves the plan.** The user reviews the plan and either approves it, requests changes, or rejects it. Sonnet revises until the user explicitly says to proceed. **No execution model is invoked until the user gives approval.**
-
-3. **An external model executes** the approved plan literally on a fresh branch, leaving the work **uncommitted**, then builds and confirms `# total: N passed, 0 failed`. Execution is handled by models outside the Claude family (e.g. Gemini, GPT) — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user who runs the executing model separately.
-
-4. **Sonnet reviews only.** Inspect the actual `git diff` (not the executing model's summary). Report any anchor mismatches, correctness issues, or test failures. **All git operations are done outside Claude** — see the Git operations section below.
-
-## Git operations (done outside Claude)
-
-Claude does not commit, push, open PRs, or merge. After Sonnet gives a review pass, the user (or the executing model under user direction) runs these steps:
-
-```bash
-# 1. Commit (on the feature branch, work already staged or unstaged)
-git add <files>
-git commit -m "$(cat <<'EOF'
-type: short description
-
-Longer explanation if needed.
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
-EOF
-)"
-
-# 2. Push and open PR
-git push -u origin <branch>
-gh pr create --title "type: short description" --body "$(cat <<'EOF'
-## Summary
-- bullet points
-
-## Test plan
-- [ ] relevant test cases
-EOF
-)"
-
-# 3. Admin merge (once CI is green)
-gh pr merge <number> --merge --admin
-
-# 4. Clean up (optional — GitHub auto-deletes branch on merge if configured)
-git branch -d <branch>
-git push origin --delete <branch>
-```
-
-**Co-author line**: always include `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>` in commits that Claude planned or reviewed.
+- **Execution mode:** leave work **uncommitted** after plan execution — Sonnet reviews the raw `git diff` first; nothing is committed until that review pass is done.
+- **Execution model:** plan execution is handled by models outside the Claude family (e.g. Gemini, GPT) on a fresh branch off `main` — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user, who runs the executing model separately.
+- **Build/test commands for plans:** build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`.
+- **Co-author line(s):** planning/review and execution are different models here, so commits get two lines — `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>` for the planning/review pass, plus a second `Co-Authored-By:` line for whichever external model (Gemini, GPT, ...) actually executed the plan, using that model's own name and noreply address. Confirm the executing model with the human before writing the second line — never guess it.
 
 ## Deployment (Netcup) — ship artifacts, never git
 
