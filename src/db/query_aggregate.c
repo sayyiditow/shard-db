@@ -2182,6 +2182,33 @@ static int agg_having_match(AggBucket *bkt, AggSpec *specs, int nspecs,
     return 1;
 }
 
+/* Tree-aware having evaluation — supports OR, nested AND/OR.
+   Mirrors criteria_match_tree() but evaluates against aggregate bucket
+   values instead of raw record bytes. */
+static int agg_having_match_tree(AggBucket *bkt, AggSpec *specs, int nspecs,
+                                  const CriteriaNode *n) {
+    if (!n) return 1;
+    switch (n->kind) {
+    case CNODE_LEAF: {
+        double val = agg_bucket_value(bkt, specs, nspecs, n->leaf.field);
+        char val_str[64];
+        snprintf(val_str, sizeof(val_str), "%.6f", val);
+        return match_criterion(val_str, &n->leaf);
+    }
+    case CNODE_AND:
+        for (int i = 0; i < n->n_children; i++)
+            if (!agg_having_match_tree(bkt, specs, nspecs, n->children[i]))
+                return 0;
+        return 1;
+    case CNODE_OR:
+        for (int i = 0; i < n->n_children; i++)
+            if (agg_having_match_tree(bkt, specs, nspecs, n->children[i]))
+                return 1;
+        return 0;
+    }
+    return 0;
+}
+
 /* Collect all buckets into a flat array */
 static AggBucket **agg_collect(AggCtx *ctx, int *out_count) {
     AggBucket **arr = malloc((size_t)ctx->total_buckets * sizeof(AggBucket *));
@@ -3244,6 +3271,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                             AggSpec *specs, int nspecs,
                             const char *group_by_json,
                             const char *having_json,
+                            CriteriaNode *having_tree,   /* NEW — priority over having_json */
                             const char *order_by, int order_desc, int limit,
                             const char *format, const char *delimiter, int want_total) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
@@ -3275,8 +3303,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
        live_count can't satisfy. Other typed fields and the field-less
        form still take this O(1) path. */
     int no_group = (!group_by_json || group_by_json[0] == '\0' || strcmp(group_by_json, "[]") == 0);
-    int no_having = (!having_json || having_json[0] == '\0');
-    if (!tree && no_group && nspecs == 1 && specs[0].fn == AGG_COUNT) {
+    int no_having = !having_tree && (!having_json || having_json[0] == '\0');
+    if (!tree && no_group && no_having && nspecs == 1 && specs[0].fn == AGG_COUNT) {
         int needs_varchar_filter = 0;
         if (specs[0].field[0] && fs.ts && !strchr(specs[0].field, '+')) {
             int fi = typed_field_index(fs.ts, specs[0].field);
@@ -3586,7 +3614,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
         if (gb_csv[0] && order_by && order_by[0] &&
             eligible_for_topn_stream(db_root, object, specs, nspecs,
-                                      gb_csv, order_by, limit, having_json)) {
+                                      gb_csv, order_by, limit,
+                                      having_tree ? "1" : having_json)) {
             QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
             int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
                                           specs, nspecs, gb_csv,
@@ -3923,7 +3952,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         neq_leaf_node = tree->children[0];
 
     int neq_eligible = 0;
-    if (no_group && (!having_json || having_json[0] == '\0') &&
+    if (no_group && no_having &&
         neq_leaf_node && neq_leaf_node->leaf.op == OP_NOT_EQUAL) {
         int algebraic = 1;
         for (int i = 0; i < nspecs; i++) {
@@ -5583,19 +5612,32 @@ igb_skip:
     int nbuckets = 0;
     AggBucket **buckets = agg_collect(&ctx, &nbuckets);
 
-    /* Apply having filter */
+    /* Apply having filter — tree path takes priority (supports OR/nested);
+       flat-array JSON path kept for having_json callers. `having`/`nhaving`
+       stay declared at this scope (not narrowed into a branch) because two
+       later exit paths in this function call free_criteria(having, nhaving)
+       unconditionally — narrowing their scope would break those. */
     SearchCriterion *having = NULL;
     int nhaving = 0;
-    if (having_json && having_json[0])
-        parse_criteria_json(having_json, &having, &nhaving);
-
-    if (nhaving > 0) {
+    if (having_tree) {
         int dst = 0;
         for (int i = 0; i < nbuckets; i++) {
-            if (agg_having_match(buckets[i], specs, nspecs, having, nhaving))
+            if (agg_having_match_tree(buckets[i], specs, nspecs, having_tree))
                 buckets[dst++] = buckets[i];
         }
         nbuckets = dst;
+    } else {
+        if (having_json && having_json[0])
+            parse_criteria_json(having_json, &having, &nhaving);
+
+        if (nhaving > 0) {
+            int dst = 0;
+            for (int i = 0; i < nbuckets; i++) {
+                if (agg_having_match(buckets[i], specs, nspecs, having, nhaving))
+                    buckets[dst++] = buckets[i];
+            }
+            nbuckets = dst;
+        }
     }
 
     /* Sort */
@@ -5773,10 +5815,25 @@ int cmd_aggregate(const char *db_root, const char *object,
         }
     }
 
+    CriteriaNode *having_tree = NULL;
+    if (having_json && having_json[0]) {
+        const char *herr = NULL;
+        having_tree = parse_criteria_tree(having_json, &herr);
+        if (herr) {
+            OUT("{\"error\":\"bad having: %s\"}\n", herr);
+            free_criteria_tree(having_tree);
+            free_criteria_tree(tree);
+            free(specs);
+            return -1;
+        }
+    }
+
     int r = cmd_aggregate_do(db_root, object, tree, specs, nspecs,
-                            group_by_json, having_json,
+                            group_by_json, NULL,
+                            having_tree,
                             order_by, order_desc, limit,
                             format, delimiter, want_total);
+    free_criteria_tree(having_tree);
     free_criteria_tree(tree);
     free(specs);
     return r;
@@ -5854,43 +5911,10 @@ int cmd_aggregate_tree(const char *db_root, const char *object,
     char group_by_buf[4096];
     group_by_csv_to_json(group_by_csv, group_by_buf, sizeof(group_by_buf));
 
-    /* Convert CriteriaNode *having_tree to having_json */
-    char having_buf[4096] = {0};
-    if (having_tree) {
-        int hpos = 0, hcount = 0;
-        having_buf[hpos++] = '[';
-        int n_nodes = (having_tree->kind == CNODE_AND) ? having_tree->n_children : 1;
-        for (int i = 0; i < n_nodes; i++) {
-            CriteriaNode *hn = (having_tree->kind == CNODE_AND) ? having_tree->children[i] : having_tree;
-            if (hn->kind != CNODE_LEAF) continue;
-            SearchCriterion *sc = &hn->leaf;
-            const char *op_str = "eq";
-            switch (sc->op) {
-                case OP_EQUAL:       op_str = "eq"; break;
-                case OP_NOT_EQUAL:   op_str = "neq"; break;
-                case OP_LESS:        op_str = "lt"; break;
-                case OP_GREATER:     op_str = "gt"; break;
-                case OP_LESS_EQ:     op_str = "lte"; break;
-                case OP_GREATER_EQ:  op_str = "gte"; break;
-                default: break;
-            }
-            int remain = (int)sizeof(having_buf) - hpos;
-            int n = snprintf(having_buf + hpos, remain,
-                            "%s{\"field\":\"%s\",\"op\":\"%s\",\"value\":\"%s\"}",
-                            hcount > 0 ? "," : "",
-                            sc->field, op_str, sc->value);
-            if (n > 0 && n < remain) hpos += n;
-            hcount++;
-        }
-        if (hpos + 2 <= (int)sizeof(having_buf)) {
-            having_buf[hpos++] = ']';
-            having_buf[hpos] = '\0';
-        }
-    }
-
     int r = cmd_aggregate_do(db_root, object, criteria_tree, specs, naggs,
                             group_by_buf,
-                            having_buf[0] ? having_buf : NULL,
+                            NULL,                  /* having_json — not used */
+                            having_tree,           /* passed directly */
                             order_by, order_desc, limit,
                             format, delimiter, want_total);
     free(specs);
