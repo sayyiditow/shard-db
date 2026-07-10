@@ -746,6 +746,7 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_EQ_FIELD: case OP_NEQ_FIELD:
     case OP_LT_FIELD: case OP_GT_FIELD:
     case OP_LTE_FIELD: case OP_GTE_FIELD:
+    case OP_UNKNOWN:
         return 0;
     }
     return 0;

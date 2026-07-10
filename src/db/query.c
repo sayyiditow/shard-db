@@ -236,6 +236,8 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
         case OP_LT_FIELD: case OP_GT_FIELD:
         case OP_LTE_FIELD: case OP_GTE_FIELD:
             return 0;
+        case OP_UNKNOWN:
+            return 0;
     }
     return 0;
 }
