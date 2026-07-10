@@ -2448,7 +2448,7 @@ enum SearchOp parse_op(const char *s) {
     if (strcmp(s, "gte_field") == 0) return OP_GTE_FIELD;
     if (strcmp(s, "regex") == 0) return OP_REGEX;
     if (strcmp(s, "not_regex") == 0 || strcmp(s, "nregex") == 0) return OP_NOT_REGEX;
-    return OP_EQUAL;
+    return OP_UNKNOWN;
 }
 
 /* ========== AND index-intersection (KeySet fast path) ==========

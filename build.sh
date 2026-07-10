@@ -290,6 +290,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_coverity_encode_criterion_overflow.c \
     src/test/cases/test_coverity_group_by_overflow.c \
     src/test/cases/test_coverity_join_buf_overflow.c \
+    src/test/cases/test_criteria_operator_alias.c \
+    src/test/cases/test_criteria_op_tree_error.c \
+    src/test/cases/test_criteria_field_value_validation.c \
     src/test/cases/test_agg_having_or.c \
     src/test/cases/test_agg_having_nested.c \
     src/test/cases/test_agg_having_json_or.c \

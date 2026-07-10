@@ -1213,7 +1213,16 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
    Helper for parse_criteria_json. Called in a loop over every element of
    the criteria array; parsing the sub-object once and indexing into the
    JsonObj saves 5 walks per criterion over the previous per-field parse. */
-static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
+/* Returns 1 if the op requires a value operand, 0 for existence-only ops. */
+static int op_requires_value(enum SearchOp op) {
+    return op != OP_EXISTS && op != OP_NOT_EXISTS;
+}
+
+/* Parse one criterion leaf from a JSON object buffer.
+   Returns 0 on success, -1 on error (missing field, missing/unknown op,
+   or missing value for ops that require one).
+   On error, c is zeroed. */
+static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     memset(c, 0, sizeof(*c));
 
     JsonObj cobj;
@@ -1221,12 +1230,30 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
 
     char *f     = json_obj_strdup(&cobj, "field");
     char *o     = json_obj_strdup(&cobj, "op");
+    if (!o) o = json_obj_strdup(&cobj, "operator");   /* alias */
     char *v     = json_obj_strdup(&cobj, "value");
     char *v_raw = json_obj_strdup_raw(&cobj, "value");
     char *v2    = json_obj_strdup(&cobj, "value2");
 
-    if (f) { strncpy(c->field, f, 255); free(f); }
-    if (o) { c->op = parse_op(o); free(o); }
+    /* Validate field — every criterion must name a field */
+    if (!f || f[0] == '\0') { free(f); free(o); free(v); free(v_raw); free(v2); return -1; }
+    strncpy(c->field, f, 255); free(f);
+
+    /* Validate op — must be present and recognised */
+    if (o) {
+        c->op = parse_op(o);
+        free(o);
+        if (c->op == OP_UNKNOWN) { free(v); free(v_raw); free(v2); return -1; }
+    } else {
+        free(v); free(v_raw); free(v2);
+        return -1;   /* neither "op" nor "operator" present */
+    }
+
+    /* Validate value — required for all ops except exists/not_exists */
+    if (op_requires_value(c->op) && (!v || v[0] == '\0')) {
+        free(v); free(v_raw); free(v2);
+        return -1;
+    }
     if (v) {
         strncpy(c->value, v, sizeof(c->value) - 1);
         /* LIKE/NOT_LIKE accept '*' as an alias for '%'. Normalize once
@@ -1312,6 +1339,7 @@ static void parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         if (c->op == OP_LEN_BETWEEN)
             c->len_target2 = strtoll(c->value2, NULL, 10);
     }
+    return 0;
 }
 
 /* Parse criteria from JSON — supports two forms:
@@ -1340,7 +1368,12 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
             memcpy(obj_buf, obj_start, obj_len);
             obj_buf[obj_len] = '\0';
 
-            parse_one_criterion(obj_buf, &criteria[n]);
+            if (parse_one_criterion(obj_buf, &criteria[n]) != 0) {
+                free(criteria);
+                *out = NULL;
+                *count = 0;
+                return -1;
+            }
             n++;
             p = obj_end;
         }
@@ -1574,7 +1607,11 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
 
     CriteriaNode *n = cnode_new(CNODE_LEAF);
     if (!n) { if (err) *err = "out of memory"; return NULL; }
-    parse_one_criterion(obj_buf, &n->leaf);
+    if (parse_one_criterion(obj_buf, &n->leaf) != 0) {
+        free_criteria_tree(n);
+        if (err) *err = "invalid criterion: missing field, op or value";
+        return NULL;
+    }
     if (n->leaf.field[0] == '\0') {
         free_criteria_tree(n);
         if (err) *err = "leaf missing 'field'";
@@ -1711,7 +1748,11 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         if (json_obj_get(&pobj, "field", &field_v, &field_vl)) {
             CriteriaNode *n = cnode_new(CNODE_LEAF);
             if (!n) { if (err) *err = "out of memory"; return NULL; }
-            parse_one_criterion(p, &n->leaf);
+            if (parse_one_criterion(p, &n->leaf) != 0) {
+                free_criteria_tree(n);
+                if (err) *err = "invalid criterion: missing field, op or value";
+                return NULL;
+            }
             return n;
         }
 
