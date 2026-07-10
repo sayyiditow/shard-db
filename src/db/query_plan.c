@@ -1221,7 +1221,8 @@ static int op_requires_value(enum SearchOp op) {
 
 /* Parse one criterion leaf from a JSON object buffer.
    Returns 0 on success, -1 on error (missing field, missing/unknown op,
-   or missing value for ops that require one).
+   missing value for ops that require one, or missing value2 for
+   between/len_between).
    On error, c is zeroed. */
 static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     memset(c, 0, sizeof(*c));
@@ -1250,8 +1251,51 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         return -1;   /* neither "op" nor "operator" present */
     }
 
+    /* between/len_between accept the two bounds either as separate
+       "value"/"value2" keys, or as a single two-element array in "value"
+       (legacy array-form input, e.g. "value":["25","30"]). Split the
+       array form into value/value2 before the required-value checks
+       below, so both input shapes are validated and matched identically. */
+    if ((c->op == OP_BETWEEN || c->op == OP_LEN_BETWEEN) && !v2 && v && v[0] == '[') {
+        const char *ap = v + 1;
+        char parts[2][1024] = {{0}};
+        int pi = 0;
+        while (*ap && pi < 2) {
+            while (*ap == ' ' || *ap == ',') ap++;
+            if (*ap == ']' || !*ap) break;
+            const char *start; size_t plen;
+            if (*ap == '"') {
+                ap++;
+                start = ap;
+                while (*ap && *ap != '"') ap++;
+                plen = (size_t)(ap - start);
+                if (*ap == '"') ap++;
+            } else {
+                start = ap;
+                while (*ap && *ap != ',' && *ap != ']') ap++;
+                plen = (size_t)(ap - start);
+            }
+            if (plen >= sizeof(parts[0])) plen = sizeof(parts[0]) - 1;
+            memcpy(parts[pi], start, plen);
+            parts[pi][plen] = '\0';
+            pi++;
+        }
+        if (pi == 2 && parts[0][0] && parts[1][0]) {
+            free(v);
+            v = strdup(parts[0]);
+            v2 = strdup(parts[1]);
+        }
+    }
+
     /* Validate value — required for all ops except exists/not_exists */
     if (op_requires_value(c->op) && (!v || v[0] == '\0')) {
+        free(v); free(v_raw); free(v2);
+        return -1;
+    }
+
+    /* Validate value2 — between/len_between need both bounds; a missing
+       value2 must not silently fall back to an empty-string bound. */
+    if ((c->op == OP_BETWEEN || c->op == OP_LEN_BETWEEN) && (!v2 || v2[0] == '\0')) {
         free(v); free(v_raw); free(v2);
         return -1;
     }
@@ -1370,7 +1414,7 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
             obj_buf[obj_len] = '\0';
 
             if (parse_one_criterion(obj_buf, &criteria[n]) != 0) {
-                free(criteria);
+                free_criteria(criteria, n);
                 *out = NULL;
                 *count = 0;
                 return -1;

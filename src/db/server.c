@@ -2006,7 +2006,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             char *lim_s = json_obj_strdup(&req, "limit");
             char *fmt   = json_obj_strdup(&req, "format");
             char *delim = json_obj_strdup(&req, "delimiter");
-            int desc = (od && (strcmp(od, "desc") == 0 || strcasecmp(od, "desc") == 0));
+            int desc = (od && strcasecmp(od, "desc") == 0);
             int lim = lim_s ? atoi(lim_s) : 0;
             int want_total = json_obj_is_true(&req, "total");
             cmd_aggregate(db_root, object, crit, grp, aggs, hav, ob, desc, lim, fmt, delim, want_total);

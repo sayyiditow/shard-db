@@ -1411,7 +1411,11 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     SearchCriterion *crit = NULL;
     int ncrit = 0;
-    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+        free(typed_buf);
+        OUT("{\"error\":\"invalid if condition\"}\n");
+        return 1;
+    }
 
     V2InsertCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
@@ -1679,7 +1683,11 @@ static int cmd_update_v2(const char *db_root, const char *object,
     if (dry_run) {
         if (if_json) {
             SearchCriterion *crit = NULL; int ncrit = 0;
-            parse_criteria_json(if_json, &crit, &ncrit);
+            if (parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+                free(old_val);
+                OUT("{\"error\":\"invalid if condition\"}\n");
+                return 1;
+            }
             int pass = cas_check(ts, old_val, (int)old_vlen, crit, ncrit);
             free_criteria(crit, ncrit);
             if (!pass) {
@@ -1787,7 +1795,11 @@ static int cmd_update_v2(const char *db_root, const char *object,
        so the verify + commit are atomic against concurrent writers. */
     SearchCriterion *crit = NULL;
     int ncrit = 0;
-    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+        free(new_buf);
+        OUT("{\"error\":\"invalid if condition\"}\n");
+        return 1;
+    }
 
     V2UpdateCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
@@ -1981,7 +1993,11 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         }
         if (if_json) {
             SearchCriterion *crit = NULL; int ncrit = 0;
-            parse_criteria_json(if_json, &crit, &ncrit);
+            if (parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+                free(val);
+                OUT("{\"error\":\"invalid if condition\"}\n");
+                return 1;
+            }
             int pass = cas_check(ts, val, (int)vlen, crit, ncrit);
             if (!pass) {
                 char *cur = typed_decode(ts, val, (uint32_t)vlen);
@@ -2006,7 +2022,10 @@ static int cmd_delete_v2(const char *db_root, const char *object,
 
     SearchCriterion *crit = NULL;
     int ncrit = 0;
-    if (if_json) parse_criteria_json(if_json, &crit, &ncrit);
+    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+        OUT("{\"error\":\"invalid if condition\"}\n");
+        return 1;
+    }
 
     V2DeleteCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
