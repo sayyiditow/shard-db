@@ -30,6 +30,11 @@ string. When `filter` is absent, all records match — same as empty criteria `[
 For `aggregate`, the parser tells `filter` from `agg-list` by checking whether the token contains
 `(`. If it does, it is `agg-list`; if not, it is `filter` and the next positional is `agg-list`.
 
+If your filter text itself needs a literal `(` (e.g. `status in (paid,pending)`), that heuristic
+misreads it as `agg-list`. Use the `--filter` flag instead of the positional argument in that case
+— pass `agg-list` positionally and put the filter in `--filter`, which always wins over any
+positional filter the parser guessed.
+
 ---
 
 ## Flags
@@ -57,6 +62,7 @@ No flags (the filter is the only optional argument).
 |---|---|---|
 | `--group-by` | `f1,f2,...` | Grouping keys. |
 | `--having` | `filter` | Post-aggregation filter (same grammar as the main filter). |
+| `--filter` | `filter` | Explicit pre-aggregation filter (same grammar as the main filter). Overrides the positional `filter`, if both are given — useful when the filter text itself contains `(` and would otherwise be mis-parsed as `agg-list` (see [Command shapes](#command-shapes)). |
 | `--order-by` | `alias[:dir]` | Sort groups by an aggregate alias or group-by field. |
 | `--limit` | integer | Max groups returned. |
 | `--auth` | token | Auth token for TCP wire use. |
@@ -222,6 +228,11 @@ Output aliases are auto-generated: `sum(amount)` → alias `sum_amount`, `count(
   sum(amount),avg(amount),min(amount),max(amount) \
   --group-by status,currency \
   --order-by sum_amount:desc
+
+# --filter instead of positional filter (needed when the filter text
+# contains a literal "(", which would otherwise be misread as agg-list)
+./shard-db aggregate default orders sum(amount) \
+  --filter 'status in (paid,pending)'
 ```
 
 ---
