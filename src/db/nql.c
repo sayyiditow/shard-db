@@ -401,7 +401,7 @@ int nql_parse_command(const char *src, NqlCommand *out) {
     snprintf(out->obj, sizeof out->obj, "%s", argv[i++]);
 
     if (out->mode == NQL_AGGREGATE) {
-        if (i < argc && argv[i][0] != '-' && strchr(argv[i],'(') == NULL) {
+        if (!out->filter && i < argc && argv[i][0] != '-' && strchr(argv[i],'(') == NULL) {
             char ferr[256];
             out->filter = nql_parse_filter(argv[i], ferr, sizeof ferr);
             if (!out->filter && ferr[0]) { snprintf(out->err,sizeof out->err,"%s",ferr); return -1; }
@@ -449,6 +449,12 @@ int nql_parse_command(const char *src, NqlCommand *out) {
             }
             else         snprintf(out->order_dir,sizeof out->order_dir,"asc");
             snprintf(out->order_by, sizeof out->order_by, "%s", spec);
+        }
+        else if (!strcmp(argv[i],"--filter") && i+1<argc) {
+            char ferr[256];
+            out->filter = nql_parse_filter(argv[++i], ferr, sizeof ferr);
+            if (!out->filter && ferr[0]) { snprintf(out->err,sizeof out->err,"%s",ferr); return -1; }
+            i++;
         }
         else if (!strcmp(argv[i],"--having") && i+1<argc) {
             char ferr[256];
@@ -530,6 +536,11 @@ int nql_parse_command(const char *src, NqlCommand *out) {
                 }
             }
             out->njoins++;
+        }
+        else if (out->mode == NQL_AGGREGATE && out->naggs == 0 && argv[i][0] != '-') {
+            int n = parse_nql_aggs(argv[i], &out->aggs);
+            if (n < 0) { snprintf(out->err,sizeof out->err,"invalid agg spec '%s'",argv[i]); return -1; }
+            out->naggs = n; i++;
         }
         else { snprintf(out->err,sizeof out->err,"NQL: unknown flag '%s'",argv[i]); return -1; }
     }
