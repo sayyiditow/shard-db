@@ -1598,6 +1598,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *cur = json_obj_strdup_raw(&req, "cursor");
         int off = off_s ? atoi(off_s) : 0;
         int lim = lim_s ? atoi(lim_s) : 0;
+        if (off < 0) {
+            OUT("{\"error\":\"offset must not be negative\"}\n");
+            free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
+            free(delim); free(join); free(ob); free(od); free(cur);
+            return;
+        }
         int want_total = json_obj_is_true(&req, "total");
         if (json_obj_is_true(&req, "explain")) {
             cmd_explain(db_root, object, criteria ? criteria : "[]", ob, 1);
@@ -1615,8 +1621,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *lim_s = json_obj_strdup(&req, "limit");
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
-        cmd_keys(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fmt, delim);
-        free(off_s); free(lim_s); free(fmt); free(delim);
+        {
+            int off = off_s ? atoi(off_s) : 0;
+            if (off < 0) {
+                OUT("{\"error\":\"offset must not be negative\"}\n");
+                free(off_s); free(lim_s); free(fmt); free(delim);
+            } else {
+                cmd_keys(db_root, object, off, lim_s ? atoi(lim_s) : 0, fmt, delim);
+                free(off_s); free(lim_s); free(fmt); free(delim);
+            }
+        }
     } else if (strcmp(mode, "fetch") == 0) {
         char *off_s = json_obj_strdup(&req, "offset");
         char *lim_s = json_obj_strdup(&req, "limit");
@@ -1625,8 +1639,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
         int want_total = json_obj_is_true(&req, "total");
-        cmd_fetch(db_root, object, off_s ? atoi(off_s) : 0, lim_s ? atoi(lim_s) : 0, fields, cur, fmt, delim, want_total);
-        free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim);
+        {
+            int off = off_s ? atoi(off_s) : 0;
+            if (off < 0) {
+                OUT("{\"error\":\"offset must not be negative\"}\n");
+                free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim);
+            } else {
+                cmd_fetch(db_root, object, off, lim_s ? atoi(lim_s) : 0, fields, cur, fmt, delim, want_total);
+                free(off_s); free(lim_s); free(fields); free(cur); free(fmt); free(delim);
+            }
+        }
     } else if (strcmp(mode, "add-index") == 0) {
         char *field = json_obj_strdup(&req, "field");
         char *fields_arr = json_obj_strdup_raw(&req, "fields");
@@ -1635,6 +1657,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_add_indexes(db_root, object, fields_arr, f);
         else if (field)
             cmd_add_index(db_root, object, field, f);
+        else
+            OUT("{\"error\":\"Missing field or fields\"}\n");
         free(field); free(fields_arr);
     } else if (strcmp(mode, "remove-index") == 0) {
         char *field = json_obj_strdup(&req, "field");
@@ -1657,8 +1681,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (records) {
             cmd_bulk_insert_string(db_root, object, records, ifne);
             free(records);
-        } else {
+        } else if (file) {
             cmd_bulk_insert(db_root, object, file, ifne);
+        } else {
+            OUT("{\"error\":\"bulk-insert requires records or file\"}\n");
         }
         free(file);
     } else if (strcmp(mode, "bulk-insert-delimited") == 0) {
@@ -1701,8 +1727,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (keys) {
                 cmd_bulk_delete_string(db_root, object, keys);
                 /* keys ownership transferred — bulk_delete_run frees it. */
-            } else {
+            } else if (file) {
                 cmd_bulk_delete(db_root, object, file);
+            } else {
+                OUT("{\"error\":\"bulk-delete requires keys or file\"}\n");
             }
             free(file);
         }
@@ -1937,6 +1965,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     } else if (strcmp(mode, "get-file-path") == 0) {
         char *filename = json_obj_strdup(&req, "filename");
         if (filename) cmd_get_file_path(db_root, object, filename);
+        else OUT("{\"error\":\"filename is required\"}\n");
         free(filename);
     } else if (strcmp(mode, "delete-file") == 0) {
         char *filename = json_obj_strdup(&req, "filename");
