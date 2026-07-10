@@ -311,7 +311,8 @@ enum SearchOp {
     OP_LT_FIELD, OP_GT_FIELD, OP_LTE_FIELD, OP_GTE_FIELD,
     /* POSIX extended regex on varchar fields. regcomp at compile-criteria
        time, regexec per record. Always full-scan — no btree shortcut. */
-    OP_REGEX, OP_NOT_REGEX
+    OP_REGEX, OP_NOT_REGEX,
+    OP_UNKNOWN   /* sentinel: unrecognised operator string — parse_op() returns this */
 };
 
 typedef struct {

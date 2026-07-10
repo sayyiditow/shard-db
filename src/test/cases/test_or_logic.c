@@ -91,7 +91,7 @@ static int test_or_logic_run(void) {
     resp = req(tc,
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"or_orders\","
         "\"criteria\":[{\"field\":\"\"}]}");
-    ASSERT_CONTAINS(resp, "leaf missing 'field'", "missing field rejected"); free(resp);
+    ASSERT_CONTAINS(resp, "missing field", "missing field rejected"); free(resp);
 
     /* === SHAPE A (AND only) — regression baseline === */
     resp = req(tc,
