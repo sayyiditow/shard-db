@@ -215,6 +215,11 @@ static CriteriaNode *parse_predicate(NqlLexer *l) {
 
     /* Map string → enum via the existing parse_op() in query.c */
     node->leaf.op = parse_op(op_str);
+    if (node->leaf.op == OP_UNKNOWN) {
+        snprintf(l->err, sizeof l->err, "unknown operator '%s'", op_str);
+        free(node);
+        return NULL;
+    }
 
     /* No-value ops */
     if (node->leaf.op == OP_EXISTS || node->leaf.op == OP_NOT_EXISTS)
@@ -415,8 +420,18 @@ int nql_parse_command(const char *src, NqlCommand *out) {
     }
 
     while (i < argc) {
-        if      (!strcmp(argv[i],"--limit")    && i+1<argc) { out->limit   = atoi(argv[++i]); i++; }
-        else if (!strcmp(argv[i],"--offset")   && i+1<argc) { out->offset  = atoi(argv[++i]); i++; }
+        if      (!strcmp(argv[i],"--limit")    && i+1<argc) {
+            char *endp;
+            long v = strtol(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || v < 0) { snprintf(out->err, sizeof out->err, "--limit must be a non-negative integer, got '%s'", argv[i]); return -1; }
+            out->limit = (int)v; i++;
+        }
+        else if (!strcmp(argv[i],"--offset")   && i+1<argc) {
+            char *endp;
+            long v = strtol(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || v < 0) { snprintf(out->err, sizeof out->err, "--offset must be a non-negative integer, got '%s'", argv[i]); return -1; }
+            out->offset = (int)v; i++;
+        }
         else if (!strcmp(argv[i],"--fields")   && i+1<argc) { snprintf(out->fields,  sizeof out->fields,  "%s",argv[++i]); i++; }
         else if (!strcmp(argv[i],"--format")   && i+1<argc) { snprintf(out->format,  sizeof out->format,  "%s",argv[++i]); i++; }
         else if (!strcmp(argv[i],"--group-by") && i+1<argc) { snprintf(out->group_by,sizeof out->group_by,"%s",argv[++i]); i++; }
@@ -424,7 +439,14 @@ int nql_parse_command(const char *src, NqlCommand *out) {
         else if (!strcmp(argv[i],"--order-by") && i+1<argc) {
             char *spec = argv[++i]; i++;
             char *colon = strrchr(spec, ':');
-            if (colon) { *colon = '\0'; snprintf(out->order_dir,sizeof out->order_dir,"%s",colon+1); }
+            if (colon) {
+                *colon = '\0';
+                snprintf(out->order_dir,sizeof out->order_dir,"%s",colon+1);
+                if (spec[0] == '\0') {
+                    snprintf(out->err, sizeof out->err, "--order-by requires a field name before ':'");
+                    return -1;
+                }
+            }
             else         snprintf(out->order_dir,sizeof out->order_dir,"asc");
             snprintf(out->order_by, sizeof out->order_by, "%s", spec);
         }
@@ -434,7 +456,15 @@ int nql_parse_command(const char *src, NqlCommand *out) {
             if (!out->having && ferr[0]) { snprintf(out->err,sizeof out->err,"%s",ferr); return -1; }
             i++;
         }
-        else if (!strcmp(argv[i],"--order")   && i+1<argc) { snprintf(out->order_dir,sizeof out->order_dir,"%s",argv[++i]); i++; }
+        else if (!strcmp(argv[i],"--order")   && i+1<argc) {
+            const char *d = argv[++i];
+            if (strcmp(d,"desc")==0 || strcmp(d,"DESC")==0 || strcmp(d,"Desc")==0)
+                snprintf(out->order_dir,sizeof out->order_dir,"desc");
+            else if (strcmp(d,"asc")==0 || strcmp(d,"ASC")==0 || strcmp(d,"Asc")==0)
+                snprintf(out->order_dir,sizeof out->order_dir,"asc");
+            else { snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", d); return -1; }
+            i++;
+        }
         else if (!strcmp(argv[i],"--cursor")  && i+1<argc) { snprintf(out->cursor,   sizeof out->cursor,   "%s",argv[++i]); i++; }
         else if (!strcmp(argv[i],"--explain"))              { out->explain = 1; i++; }
         else if (!strcmp(argv[i],"--join") && i+1<argc) {
