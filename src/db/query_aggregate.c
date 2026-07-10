@@ -2118,6 +2118,7 @@ static int parse_agg_specs(const char *json, AggSpec **out) {
             else if (strcmp(fn, "avg") == 0) s->fn = AGG_AVG;
             else if (strcmp(fn, "min") == 0) s->fn = AGG_MIN;
             else if (strcmp(fn, "max") == 0) s->fn = AGG_MAX;
+            else { free(fn); free(alias); free(field); free(specs); *out = NULL; return 0; }
         }
         if (field) strncpy(s->field, field, 255);
         if (alias) strncpy(s->alias, alias, 255);
@@ -5642,6 +5643,19 @@ igb_skip:
 
     /* Sort */
     if (order_by && order_by[0]) {
+        /* Validate order_by: must be a group_by field or an aggregate alias */
+        int valid_order = 0;
+        for (int i = 0; i < ctx.ngroups; i++)
+            if (strcmp(ctx.group_fields[i], order_by) == 0) { valid_order = 1; break; }
+        if (!valid_order)
+            for (int i = 0; i < nspecs; i++)
+                if (strcmp(specs[i].alias, order_by) == 0) { valid_order = 1; break; }
+        if (!valid_order) {
+            OUT("{\"error\":\"order_by '%s' is not a group_by field or aggregate alias\"}\n",
+                order_by);
+            free(buckets);
+            return -1;
+        }
         g_sort_specs = specs;
         g_sort_nspecs = nspecs;
         strncpy(g_sort_field, order_by, 255);
@@ -5900,6 +5914,12 @@ int cmd_aggregate_tree(const char *db_root, const char *object,
         else if (strcmp(aggs[i].fn, "avg") == 0) specs[i].fn = AGG_AVG;
         else if (strcmp(aggs[i].fn, "min") == 0) specs[i].fn = AGG_MIN;
         else if (strcmp(aggs[i].fn, "max") == 0) specs[i].fn = AGG_MAX;
+        else {
+            OUT("{\"error\":\"unknown aggregate function '%s'; use count, sum, avg, min, or max\"}\n",
+                aggs[i].fn);
+            free(specs);
+            return -1;
+        }
         strncpy(specs[i].field, aggs[i].field, sizeof(specs[i].field) - 1);
         if (aggs[i].field[0])
             snprintf(specs[i].alias, sizeof(specs[i].alias), "%s_%s", aggs[i].fn, aggs[i].field);
