@@ -2908,8 +2908,11 @@ int cmd_bulk_update(const char *db_root, const char *object,
        cas_check expects. Workers share the parsed array read-only. */
     SearchCriterion *cas_crit = NULL;
     int cas_ncrit = 0;
-    if (if_json && if_json[0]) {
-        parse_criteria_json(if_json, &cas_crit, &cas_ncrit);
+    if (if_json && if_json[0] &&
+        parse_criteria_json(if_json, &cas_crit, &cas_ncrit) != 0) {
+        OUT("{\"error\":\"invalid if condition\"}\n");
+        free_criteria_tree(tree);
+        return 1;
     }
 
     /* Phase 1: Scan — collect matching keys (read-only) */
@@ -4288,8 +4291,11 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     /* Optional `if` for per-record CAS, re-verified under wrlock in phase 2. */
     SearchCriterion *cas_crit = NULL;
     int cas_ncrit = 0;
-    if (if_json && if_json[0]) {
-        parse_criteria_json(if_json, &cas_crit, &cas_ncrit);
+    if (if_json && if_json[0] &&
+        parse_criteria_json(if_json, &cas_crit, &cas_ncrit) != 0) {
+        OUT("{\"error\":\"invalid if condition\"}\n");
+        free_criteria_tree(tree);
+        return 1;
     }
 
     /* Phase 1: resolve matching keys — indexed path first, full scan fallback */

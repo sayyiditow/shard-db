@@ -302,6 +302,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_having_json_or.c \
     src/test/cases/test_agg_having_json_and.c \
     src/test/cases/test_agg_having_no_group_regression.c \
+    src/test/cases/test_criteria_in_then_invalid_leak.c \
+    src/test/cases/test_criteria_between_missing_value2.c \
+    src/test/cases/test_nql_agg_filter_override_leak.c \
+    src/test/cases/test_nql_order_by_direction.c \
+    src/test/cases/test_json_aggregate_order_case.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \

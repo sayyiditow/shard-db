@@ -378,6 +378,17 @@ static int cmd_split(const char *src, char *buf, size_t bufsz,
     return n;
 }
 
+/* Normalize an order-direction token to canonical lowercase "asc"/"desc"
+   (case-insensitive). Returns 0 and writes into out on success, -1 if d
+   is neither. Shared by --order and --order-by so both reject the same
+   set of invalid direction strings instead of silently defaulting to
+   ascending. */
+static int normalize_order_dir(const char *d, char *out, size_t out_sz) {
+    if (strcasecmp(d, "asc") == 0)  { snprintf(out, out_sz, "asc");  return 0; }
+    if (strcasecmp(d, "desc") == 0) { snprintf(out, out_sz, "desc"); return 0; }
+    return -1;
+}
+
 /* ── nql_parse_command ────────────────────────────────────────────── */
 
 int nql_parse_command(const char *src, NqlCommand *out) {
@@ -441,9 +452,12 @@ int nql_parse_command(const char *src, NqlCommand *out) {
             char *colon = strrchr(spec, ':');
             if (colon) {
                 *colon = '\0';
-                snprintf(out->order_dir,sizeof out->order_dir,"%s",colon+1);
                 if (spec[0] == '\0') {
                     snprintf(out->err, sizeof out->err, "--order-by requires a field name before ':'");
+                    return -1;
+                }
+                if (normalize_order_dir(colon + 1, out->order_dir, sizeof out->order_dir) != 0) {
+                    snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", colon + 1);
                     return -1;
                 }
             }
@@ -452,6 +466,7 @@ int nql_parse_command(const char *src, NqlCommand *out) {
         }
         else if (!strcmp(argv[i],"--filter") && i+1<argc) {
             char ferr[256];
+            free_criteria_tree(out->filter);
             out->filter = nql_parse_filter(argv[++i], ferr, sizeof ferr);
             if (!out->filter && ferr[0]) { snprintf(out->err,sizeof out->err,"%s",ferr); return -1; }
             i++;
@@ -464,11 +479,10 @@ int nql_parse_command(const char *src, NqlCommand *out) {
         }
         else if (!strcmp(argv[i],"--order")   && i+1<argc) {
             const char *d = argv[++i];
-            if (strcmp(d,"desc")==0 || strcmp(d,"DESC")==0 || strcmp(d,"Desc")==0)
-                snprintf(out->order_dir,sizeof out->order_dir,"desc");
-            else if (strcmp(d,"asc")==0 || strcmp(d,"ASC")==0 || strcmp(d,"Asc")==0)
-                snprintf(out->order_dir,sizeof out->order_dir,"asc");
-            else { snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", d); return -1; }
+            if (normalize_order_dir(d, out->order_dir, sizeof out->order_dir) != 0) {
+                snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", d);
+                return -1;
+            }
             i++;
         }
         else if (!strcmp(argv[i],"--cursor")  && i+1<argc) { snprintf(out->cursor,   sizeof out->cursor,   "%s",argv[++i]); i++; }

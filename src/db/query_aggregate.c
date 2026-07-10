@@ -5628,8 +5628,12 @@ igb_skip:
         }
         nbuckets = dst;
     } else {
-        if (having_json && having_json[0])
-            parse_criteria_json(having_json, &having, &nhaving);
+        if (having_json && having_json[0] &&
+            parse_criteria_json(having_json, &having, &nhaving) != 0) {
+            OUT("{\"error\":\"invalid having condition\"}\n");
+            free(buckets);
+            return -1;
+        }
 
         if (nhaving > 0) {
             int dst = 0;
