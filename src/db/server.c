@@ -510,7 +510,10 @@ static int auto_key_normalize(const Schema *sc, const char *key,
             return -1;
         }
         char *buf = malloc(16);
-        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        if (!buf) {
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_normalize: malloc(16) failed for AK_UUID key");
+            OUT("{\"error\":\"oom\"}\n"); return -1;
+        }
         memcpy(buf, bin, 16);
         *out_buf = buf; *out_len = 16;
         return 0;
@@ -526,7 +529,10 @@ static int auto_key_normalize(const Schema *sc, const char *key,
             return -1;
         }
         char *buf = malloc(8);
-        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        if (!buf) {
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_normalize: malloc(8) failed for AK_SEQ key");
+            OUT("{\"error\":\"oom\"}\n"); return -1;
+        }
         for (int i = 7; i >= 0; i--) {
             buf[i] = (char)(v & 0xFF);
             v >>= 8;
@@ -546,9 +552,13 @@ static int auto_key_generate(const Schema *sc, const char *db_root,
                               char **out_buf, size_t *out_len) {
     if (sc->auto_key == AK_UUID) {
         char *buf = malloc(16);
-        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        if (!buf) {
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_generate: malloc(16) failed for object [%s]", object);
+            OUT("{\"error\":\"oom\"}\n"); return -1;
+        }
         if (gen_uuid4_raw((uint8_t *)buf) != 0) {
             free(buf);
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_generate: gen_uuid4_raw failed (random source unavailable) for object [%s]", object);
             OUT("{\"error\":\"random source unavailable (uuid key generation failed)\"}\n");
             return -1;
         }
@@ -558,16 +568,21 @@ static int auto_key_generate(const Schema *sc, const char *db_root,
     if (sc->auto_key == AK_SEQ) {
         long long v = seq_next_val(db_root, object, sc->auto_key_seq_name);
         if (v < 0) {
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_generate: seq_next_val failed for object [%s] seq=[%s]", object, sc->auto_key_seq_name);
             OUT("{\"error\":\"sequence_next failed for [%s]\"}\n", sc->auto_key_seq_name);
             return -1;
         }
         char *buf = malloc(8);
-        if (!buf) { OUT("{\"error\":\"oom\"}\n"); return -1; }
+        if (!buf) {
+            LOG_ERROR(LOG_SUB_SERVER, "auto_key_generate: malloc(8) failed for object [%s]", object);
+            OUT("{\"error\":\"oom\"}\n"); return -1;
+        }
         int64_t vb = v;
         for (int i = 7; i >= 0; i--) { buf[i] = (char)(vb & 0xFF); vb >>= 8; }
         *out_buf = buf; *out_len = 8;
         return 0;
     }
+    LOG_ERROR(LOG_SUB_SERVER, "auto_key_generate: called on AK_NONE object [%s] (internal invariant violation)", object);
     OUT("{\"error\":\"auto_key_generate called on AK_NONE object\"}\n");
     return -1;
 }
@@ -2594,7 +2609,10 @@ static SlotcaskDb *warmup_object_open(const char *db_root,
 
     /* schema cache populate (load_schema is internally cached) */
     Schema sch = load_schema(eff, obj);
-    if (sch.splits <= 0) return NULL;
+    if (sch.splits <= 0) {
+        LOG_WARN(LOG_SUB_WARMUP, "warmup_object_open: load_schema returned invalid splits=%d for %s/%s; skipping warmup", sch.splits, dir, obj);
+        return NULL;
+    }
 
     /* registry + eager seg_000 mmap per stream */
     SlotcaskSchemaInfo info = {
@@ -2602,12 +2620,20 @@ static SlotcaskDb *warmup_object_open(const char *db_root,
         .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
-    return slotcask_registry_get(eff, obj, &info);
+    SlotcaskDb *sdb = slotcask_registry_get(eff, obj, &info);
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_WARMUP, "warmup_object_open: slotcask_registry_get failed for %s/%s; skipping warmup", eff, obj);
+        return NULL;
+    }
+    return sdb;
 }
 
 static int warmup_touch_file(const char *path) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        LOG_WARN(LOG_SUB_WARMUP, "warmup_touch_file: open(%s) failed: errno=%d (%s)", path, errno, strerror(errno));
+        return -1;
+    }
     /* Hint to the kernel: pre-fault this file's pages. Linux-only —
        macOS has F_RDADVISE/fcntl as an equivalent but the synchronous
        first-page read below is what actually guarantees residency
@@ -2642,7 +2668,10 @@ static void *warmup_kf_task_fn(void *arg) {
     char kf_path[PATH_MAX];
     slotcask_kf_path(kf_path, sizeof(kf_path), t->sdb->data_dir, t->shard_idx);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, t->sdb->slots_per_shard, 0) != 0) return NULL;
+    if (kfcache_acquire(&kh, kf_path, t->sdb->slots_per_shard, 0) != 0) {
+        LOG_WARN(LOG_SUB_WARMUP, "warmup_kf_task_fn: kfcache_acquire failed for kf_path=%s shard_idx=%d", kf_path, t->shard_idx);
+        return NULL;
+    }
     /* Touch the header to force the first page in. The volatile
        read prevents the compiler from optimizing away the load. */
     if (kh.hdr) {
@@ -2964,7 +2993,10 @@ static int validate_metadata(const char *db_root) {
                 schema_cap = schema_cap ? schema_cap * 2 : 32;
                 SchemaEntry *t = realloc(schema_entries,
                                          (size_t)schema_cap * sizeof(SchemaEntry));
-                if (!t) { free(schema_entries); fclose(sf); return -1; }
+                if (!t) {
+                    LOG_ERROR(LOG_SUB_SERVER, "validate_metadata: realloc failed growing schema_entries to cap=%d", schema_cap);
+                    free(schema_entries); fclose(sf); return -1;
+                }
                 schema_entries = t;
             }
             size_t dlen = (size_t)(colon1 - line);
@@ -3202,23 +3234,41 @@ int cmd_server(const char *db_root, int daemonize) {
         (void)_ignored;
     }
 
+    /* Start the log writer now, before TLS init. This is the earliest safe
+       point post-fork: fork() only carries the calling thread into the
+       child, so the writer thread must not exist before fork() runs
+       (already happened above, in the `if (daemonize)` block). TLS
+       misconfig is the most common day-1 startup failure; previously
+       log_init() ran after TLS init and after socket bind/listen, so a
+       daemonized start with a bad cert/key left zero trace anywhere —
+       stderr was already /dev/null and the log writer hadn't started. */
+    log_init(db_root);
+
     /* TLS init — if enabled, refuse to start without readable cert/key.
        Done before bind/listen so a misconfig fails fast and visibly. */
     if (g_tls_enable) {
         if (g_tls_cert[0] == '\0' || g_tls_key[0] == '\0') {
+            LOG_ERROR(LOG_SUB_TLS, "cmd_server: TLS_ENABLE=1 but TLS_CERT and/or TLS_KEY not set in db.env");
             fprintf(stderr, "Error: TLS_ENABLE=1 but TLS_CERT and/or TLS_KEY not set in db.env\n");
+            log_shutdown();
             return 1;
         }
         if (access(g_tls_cert, R_OK) != 0) {
+            LOG_ERROR(LOG_SUB_TLS, "cmd_server: TLS_CERT not readable: %s (%s)", g_tls_cert, strerror(errno));
             fprintf(stderr, "Error: TLS_CERT not readable: %s (%s)\n", g_tls_cert, strerror(errno));
+            log_shutdown();
             return 1;
         }
         if (access(g_tls_key, R_OK) != 0) {
+            LOG_ERROR(LOG_SUB_TLS, "cmd_server: TLS_KEY not readable: %s (%s)", g_tls_key, strerror(errno));
             fprintf(stderr, "Error: TLS_KEY not readable: %s (%s)\n", g_tls_key, strerror(errno));
+            log_shutdown();
             return 1;
         }
         if (tls_server_init(g_tls_cert, g_tls_key) != 0) {
+            LOG_ERROR(LOG_SUB_TLS, "cmd_server: TLS context init failed (see preceding tls_* log line)");
             fprintf(stderr, "Error: TLS context init failed (see preceding tls: ... message)\n");
+            log_shutdown();
             return 1;
         }
     }
@@ -3251,7 +3301,6 @@ int cmd_server(const char *db_root, int daemonize) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    log_init(db_root);
     write_pid_file(db_root, port);
     g_server_start_ms = now_ms();
     bt_page_size = g_index_page_size;
@@ -3554,7 +3603,10 @@ static int ensure_tls_client_ctx(void) {
 static int client_connect(int port, ClientConn *c) {
     c->fd = -1; c->ssl = NULL;
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) return -1;
+    if (sfd < 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "client_connect: socket() failed: errno=%d (%s)", errno, strerror(errno));
+        return -1;
+    }
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -3565,11 +3617,17 @@ static int client_connect(int port, ClientConn *c) {
     }
     c->fd = sfd;
     if (g_db && g_tls_enable) {
-        if (ensure_tls_client_ctx() != 0) { close(sfd); c->fd = -1; return -1; }
+        if (ensure_tls_client_ctx() != 0) {
+            LOG_ERROR(LOG_SUB_SERVER, "client_connect: ensure_tls_client_ctx failed for port=%d", port);
+            close(sfd); c->fd = -1; return -1;
+        }
         const char *server_name = getenv("TLS_SERVER_NAME");
         if (!server_name || !*server_name) server_name = "localhost";
         SSL *ssl = tls_connect(sfd, server_name);
-        if (!ssl) { close(sfd); c->fd = -1; return -1; }
+        if (!ssl) {
+            LOG_WARN(LOG_SUB_SERVER, "client_connect: tls_connect failed for port=%d server_name=%s", port, server_name);
+            close(sfd); c->fd = -1; return -1;
+        }
         c->ssl = ssl;
     }
     return 0;
@@ -3659,8 +3717,15 @@ static int write_all(int fd, const void *buf, size_t len) {
     size_t w = 0;
     while (w < len) {
         ssize_t n = write(fd, p + w, len - w);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERROR(LOG_SUB_SERVER, "write_all: write(fd=%d) failed: errno=%d (%s)", fd, errno, strerror(errno));
+            return -1;
+        }
+        if (n == 0) {
+            LOG_ERROR(LOG_SUB_SERVER, "write_all: write(fd=%d) returned 0 with %zu bytes remaining", fd, len - w);
+            return -1;
+        }
         w += (size_t)n;
     }
     return 0;
@@ -3674,12 +3739,16 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
 
     if (client_send_all(&cc, json, json_len) != 0 ||
         client_send_all(&cc, "\n", 1) != 0) {
+        LOG_WARN(LOG_SUB_SERVER, "query_collect: client_send_all failed for port=%d json_len=%zu", port, json_len);
         client_close(&cc); return -1;
     }
 
     size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { client_close(&cc); return -1; }
+    if (!buf) {
+        LOG_ERROR(LOG_SUB_SERVER, "query_collect: malloc(%zu) failed", cap);
+        client_close(&cc); return -1;
+    }
 
     char rbuf[8192];
     ssize_t n;
@@ -3689,7 +3758,10 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
                 if (len + j > cap) {
                     while (cap < len + j) cap *= 2;
                     char *nb = realloc(buf, cap);
-                    if (!nb) { free(buf); client_close(&cc); return -1; }
+                    if (!nb) {
+                        LOG_ERROR(LOG_SUB_SERVER, "query_collect: realloc(%zu) failed while framing response (len=%zu)", cap, len);
+                        free(buf); client_close(&cc); return -1;
+                    }
                     buf = nb;
                 }
                 memcpy(buf + len, rbuf, j);
@@ -3702,7 +3774,10 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
         if (len + (size_t)n > cap) {
             while (cap < len + (size_t)n) cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); client_close(&cc); return -1; }
+            if (!nb) {
+                LOG_ERROR(LOG_SUB_SERVER, "query_collect: realloc(%zu) failed while accumulating response (len=%zu)", cap, len);
+                free(buf); client_close(&cc); return -1;
+            }
             buf = nb;
         }
         memcpy(buf + len, rbuf, n);

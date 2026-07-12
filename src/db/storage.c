@@ -210,21 +210,43 @@ static int ucache_ensure(const char *path, int slot_size_for_create) {
     if (slot_size_for_create <= 0) {
         /* Read-only: open existing file */
         fd = open(path, O_RDWR);
-        if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (fd < 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: open(O_RDWR) failed: %s", path, strerror(errno));
+            pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         struct stat st;
-        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (fstat(fd, &st) < 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: fstat failed: %s", path, strerror(errno));
+            close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
+        if (st.st_size == 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: file is empty", path);
+            close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         slots_per_shard = shard_init_or_read_header(fd, 0);
-        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (slots_per_shard == 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: shard_init_or_read_header failed (corrupt/short header)", path);
+            close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         sz = st.st_size;
     } else {
         /* Write: create file if needed, write header + ftruncate */
         mkdirp(dirname_of(path));
         fd = open(path, O_RDWR | O_CREAT, 0644);
-        if (fd < 0) { pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (fd < 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: open(O_RDWR|O_CREAT) failed: %s", path, strerror(errno));
+            pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         slots_per_shard = shard_init_or_read_header(fd, slot_size_for_create);
-        if (slots_per_shard == 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (slots_per_shard == 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: shard_init_or_read_header failed during create (slot_size=%d)", path, slot_size_for_create);
+            close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         struct stat st;
-        if (fstat(fd, &st) < 0) { close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+        if (fstat(fd, &st) < 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: fstat failed: %s", path, strerror(errno));
+            close(fd); pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+        }
         sz = st.st_size;
     }
 
@@ -252,6 +274,7 @@ static int ucache_ensure(const char *path, int slot_size_for_create) {
             g_ucache_count--;
             slot = lru;
         } else {
+            LOG_WARN(LOG_SUB_SLOTCASK, "ucache_ensure %s: LRU eviction exhausted (no evictable entry found, g_ucache_count=%d)", path, g_ucache_count);
             close(fd);
             pthread_mutex_unlock(&g_ucache_table_mutex);
             return -1;
@@ -264,7 +287,10 @@ static int ucache_ensure(const char *path, int slot_size_for_create) {
     e->map_size = sz;
     e->slots_per_shard = slots_per_shard;
     e->map = mmap_with_hints(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (e->map == MAP_FAILED) { e->map = NULL; close(fd); e->fd = -1; pthread_mutex_unlock(&g_ucache_table_mutex); return -1; }
+    if (e->map == MAP_FAILED) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_ensure %s: mmap failed (size=%zu): %s", path, sz, strerror(errno));
+        e->map = NULL; close(fd); e->fd = -1; pthread_mutex_unlock(&g_ucache_table_mutex); return -1;
+    }
     e->used = 1;
     e->dirty = 0;
     e->slot_bits = NULL;
@@ -425,7 +451,10 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
                    int slot_size) {
     if (!g_ucache) return -1;
     /* target_slots must be a power of 2. */
-    if (target_slots == 0 || (target_slots & (target_slots - 1)) != 0) return -1;
+    if (target_slots == 0 || (target_slots & (target_slots - 1)) != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: target_slots %u is not a power of 2", path, target_slots);
+        return -1;
+    }
 
     int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return -1;
@@ -447,6 +476,7 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
 
     ShardHeader *old_hdr = (ShardHeader *)e->map;
     if (!old_hdr || old_hdr->magic != SHARD_MAGIC) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: bad or missing shard header (magic=0x%x, expected 0x%x)", path, old_hdr ? old_hdr->magic : 0, SHARD_MAGIC);
         pthread_rwlock_unlock(&e->rwlock);
         return -1;
     }
@@ -462,15 +492,22 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
     unlink(new_path);
 
     int nfd = open(new_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (nfd < 0) { pthread_rwlock_unlock(&e->rwlock); return -1; }
+    if (nfd < 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: open(%s, O_CREAT|O_TRUNC) failed: %s", path, new_path, strerror(errno));
+        pthread_rwlock_unlock(&e->rwlock); return -1;
+    }
 
     size_t new_size = shard_file_size(new_slots, slot_size);
     if (ftruncate(nfd, new_size) < 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: ftruncate(%s, %zu) failed: %s", path, new_path, new_size, strerror(errno));
         close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1;
     }
 
     uint8_t *nmap = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
-    if (nmap == MAP_FAILED) { close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1; }
+    if (nmap == MAP_FAILED) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: mmap(%s, %zu) failed: %s", path, new_path, new_size, strerror(errno));
+        close(nfd); unlink(new_path); pthread_rwlock_unlock(&e->rwlock); return -1;
+    }
 #ifdef MADV_HUGEPAGE
     madvise(nmap, new_size, MADV_HUGEPAGE);
 #endif
@@ -533,6 +570,7 @@ int ucache_grow_to(const char *path, uint32_t target_slots,
     fsync(nfd);
 
     if (rename(new_path, path) != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_to %s: rename(%s, %s) failed: %s", path, new_path, path, strerror(errno));
         munmap(nmap, new_size);
         close(nfd);
         unlink(new_path);
@@ -568,7 +606,10 @@ int ucache_grow_shard(const char *path, int slot_size) {
     int slot = ucache_ensure(path, slot_size);
     if (slot < 0) return -1;
     uint32_t observed = g_ucache[slot].slots_per_shard;
-    if (observed == 0) return -1;
+    if (observed == 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "ucache_grow_shard %s: cache entry has slots_per_shard=0 (corrupt state)", path);
+        return -1;
+    }
     return ucache_grow_to(path, observed * 2, slot_size);
 }
 
@@ -794,6 +835,7 @@ static CountsCacheEntry *counts_cache_get(const char *path) {
     if (idx < 0) {
         /* Cache full — fall back to direct file I/O via a NULL return.
            Callers handle this gracefully. */
+        LOG_WARN(LOG_SUB_SLOTCASK, "counts_cache_get %s: cache full (COUNTS_CACHE_BUCKETS exhausted), falling back to direct file I/O", path);
         pthread_mutex_unlock(&g_counts_lock);
         return NULL;
     }
@@ -966,7 +1008,10 @@ static int resolve_counts(const char *db_root, const char *object,
         .streams = sc.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
-    if (!sdb) { *out_live = 0; *out_deleted = 0; return -1; }
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "resolve_counts %s/%s: slotcask_registry_get failed", eff_root, bare_obj);
+        *out_live = 0; *out_deleted = 0; return -1;
+    }
     uint64_t total = 0, deleted = 0;
     slotcask_sum_kf_totals(sdb, &total, &deleted);
     *out_live    = total > deleted ? total - deleted : 0;
@@ -2134,7 +2179,10 @@ static int parse_multi_key(const char *src, size_t klen, const Schema *sc,
                             uint8_t **out_storage_key, size_t *out_storage_klen,
                             uint8_t out_hash[16], int *out_shard_id) {
     char *wire = malloc(klen + 1);
-    if (!wire) return -1;
+    if (!wire) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "parse_multi_key: malloc(%zu) failed for wire key buffer", klen + 1);
+        return -1;
+    }
     memcpy(wire, src, klen);
     wire[klen] = '\0';
     *out_wire_key = wire;
@@ -2187,10 +2235,16 @@ static void *multi_exists_shard_worker(void *arg) {
         .streams = sw->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_exists_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as not-found", sw->db_root, sw->object, sw->count);
+        return NULL;
+    }
 
     SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-    if (!batch) return NULL;
+    if (!batch) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_exists_shard_worker %s/%s: calloc(%d) failed for batch, keys reported as not-found", sw->db_root, sw->object, sw->count);
+        return NULL;
+    }
     for (int ei = 0; ei < sw->count; ei++) {
         MultiExistsEntry *e = &sw->entries[ei];
         batch[ei].key       = e->key;
@@ -2537,11 +2591,17 @@ static void *multi_get_shard_worker(void *arg) {
         .streams = sw->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_get_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as missing", sw->db_root, sw->object, sw->count);
+        return NULL;
+    }
 
     /* Extract pre-computed hashes from entries */
     uint8_t (*hashes)[16] = malloc((size_t)sw->count * sizeof(*hashes));
-    if (!hashes) return NULL;
+    if (!hashes) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_get_shard_worker %s/%s: malloc(%d * 16) failed for hashes array", sw->db_root, sw->object, sw->count);
+        return NULL;
+    }
     for (int ei = 0; ei < sw->count; ei++)
         memcpy(hashes[ei], sw->entries[ei].hash, 16);
 

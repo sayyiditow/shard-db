@@ -283,9 +283,15 @@ int cmd_sequence(const char *db_root, const char *object,
 /* Copy one regular file. Preserves mode bits. Returns 0 on success. */
 static int copy_file(const char *src, const char *dst, mode_t mode) {
     int sfd = open(src, O_RDONLY);
-    if (sfd < 0) return -1;
+    if (sfd < 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: open(%s) failed: %s", src, strerror(errno));
+        return -1;
+    }
     int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 0777);
-    if (dfd < 0) { close(sfd); return -1; }
+    if (dfd < 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: open(%s) failed: %s", dst, strerror(errno));
+        close(sfd); return -1;
+    }
     char buf[64 * 1024];
     ssize_t n;
     int rc = 0;
@@ -456,7 +462,10 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
 
     FILE *f = fopen(conf, "a+");
-    if (!f) return -1;
+    if (!f) {
+        LOG_ERROR(LOG_SUB_CONFIG, "ensure_schema_conf_line: fopen(%s) failed: %s", conf, strerror(errno));
+        return -1;
+    }
     int lockfd = fileno(f);
     flock(lockfd, LOCK_EX);
 

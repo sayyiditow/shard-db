@@ -26,12 +26,18 @@ int fill_random(void *buf, size_t n) {
     if (off == n) return 0;
 
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        fprintf(stderr, "fill_random: getentropy exhausted and open(/dev/urandom) failed: %s\n", strerror(errno));
+        return -1;
+    }
     off = 0;
     while (off < n) {
         ssize_t r = read(fd, p + off, n - off);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) { close(fd); return -1; }
+        if (r <= 0) {
+            fprintf(stderr, "fill_random: read(/dev/urandom) failed or hit EOF: %s\n", r < 0 ? strerror(errno) : "EOF");
+            close(fd); return -1;
+        }
         off += (size_t)r;
     }
     close(fd);
@@ -90,12 +96,24 @@ char *dirname_of(const char *path) {
 char *read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "read_file: fseek(SEEK_END) failed on '%s': %s\n", path, strerror(errno));
+        fclose(f); return NULL;
+    }
     long len = ftell(f);
-    if (len < 0) { fclose(f); return NULL; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    if (len < 0) {
+        fprintf(stderr, "read_file: ftell failed on '%s': %s\n", path, strerror(errno));
+        fclose(f); return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "read_file: fseek(SEEK_SET) failed on '%s': %s\n", path, strerror(errno));
+        fclose(f); return NULL;
+    }
     char *buf = malloc((size_t)len + 1);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) {
+        fprintf(stderr, "read_file: malloc(%zu) failed for '%s'\n", (size_t)len + 1, path);
+        fclose(f); return NULL;
+    }
     size_t got = fread(buf, 1, (size_t)len, f);
     buf[got] = '\0';
     fclose(f);
@@ -361,6 +379,7 @@ int json_parse_object(const char *s, size_t slen, JsonObj *out) {
             /* Too many fields for our fixed-size bucket. Abort; caller can
                still fall back to the legacy per-field walker if this ever
                fires in practice. */
+            fprintf(stderr, "json_parse_object: field count exceeds JSON_OBJ_MAX_FIELDS=%d, aborting parse\n", JSON_OBJ_MAX_FIELDS);
             return -1;
         }
         out->f[out->n].name = name_start;
@@ -410,7 +429,10 @@ int json_unescape_string(const char *in, size_t in_len,
     /* Worst case: every escape decodes to fewer bytes than its source,
        so in_len + 1 is a safe upper bound for the output buffer. */
     char *out = malloc(in_len + 1);
-    if (!out) return -1;
+    if (!out) {
+        fprintf(stderr, "json_unescape_string: malloc(%zu) failed\n", in_len + 1);
+        return -1;
+    }
     size_t op = 0;
     for (size_t i = 0; i < in_len; i++) {
         char c = in[i];
@@ -514,7 +536,10 @@ char *json_obj_strdup(const JsonObj *o, const char *key) {
     const char *v; size_t vl;
     if (!json_obj_unquoted(o, key, &v, &vl)) return NULL;
     char *s = malloc(vl + 1);
-    if (!s) return NULL;
+    if (!s) {
+        fprintf(stderr, "json_obj_strdup: malloc(%zu) failed for key '%s'\n", vl + 1, key);
+        return NULL;
+    }
     memcpy(s, v, vl); s[vl] = '\0';
     return s;
 }
@@ -523,7 +548,10 @@ char *json_obj_strdup_raw(const JsonObj *o, const char *key) {
     const char *v; size_t vl;
     if (!json_obj_get(o, key, &v, &vl)) return NULL;
     char *s = malloc(vl + 1);
-    if (!s) return NULL;
+    if (!s) {
+        fprintf(stderr, "json_obj_strdup_raw: malloc(%zu) failed for key '%s'\n", vl + 1, key);
+        return NULL;
+    }
     memcpy(s, v, vl); s[vl] = '\0';
     return s;
 }
@@ -538,14 +566,20 @@ char *json_obj_string_or_array(const JsonObj *o, const char *key) {
     /* Plain string: strip surrounding quotes if present. */
     if (vl >= 2 && v[0] == '"' && v[vl - 1] == '"') {
         char *out = malloc(vl - 1);
-        if (!out) return NULL;
+        if (!out) {
+            fprintf(stderr, "json_obj_string_or_array: malloc(%zu) failed for key '%s'\n", vl - 1, key);
+            return NULL;
+        }
         memcpy(out, v + 1, vl - 2);
         out[vl - 2] = '\0';
         return out;
     }
     if (v[0] != '[') {
         char *out = malloc(vl + 1);
-        if (!out) return NULL;
+        if (!out) {
+            fprintf(stderr, "json_obj_string_or_array: malloc(%zu) failed for key '%s'\n", vl + 1, key);
+            return NULL;
+        }
         memcpy(out, v, vl); out[vl] = '\0';
         return out;
     }

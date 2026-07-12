@@ -81,6 +81,7 @@ static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
         }
     }
     pthread_mutex_unlock(&g_objlock_table_lock);
+    LOG_ERROR(LOG_SUB_SERVER, "objlock get_lock: table full (%d buckets), object '%s' will run WITHOUT rwlock protection", OBJLOCK_BUCKETS, key);
     return NULL;
 }
 

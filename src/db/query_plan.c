@@ -1502,7 +1502,10 @@ static CriteriaNode *cnode_new(CriteriaNodeKind kind) {
 static int cnode_append(CriteriaNode *parent, CriteriaNode *child) {
     CriteriaNode **nc = realloc(parent->children,
                                 (parent->n_children + 1) * sizeof(CriteriaNode *));
-    if (!nc) return -1;
+    if (!nc) {
+        LOG_ERROR(LOG_SUB_QUERY, "cnode_append: realloc(%zu bytes) failed", (parent->n_children + 1) * sizeof(CriteriaNode *));
+        return -1;
+    }
     parent->children = nc;
     parent->children[parent->n_children++] = child;
     return 0;
@@ -1601,7 +1604,11 @@ static int parse_tree_array(const char *arr_p, CriteriaNode *parent,
         const char *obj_end = json_skip_value(p);
         size_t obj_len = obj_end - obj_start;
         char *obj_buf = malloc(obj_len + 1);
-        if (!obj_buf) { if (err) *err = "out of memory"; return -1; }
+        if (!obj_buf) {
+            LOG_ERROR(LOG_SUB_QUERY, "parse_tree_array: malloc(%zu) failed", obj_len + 1);
+            if (err) *err = "out of memory";
+            return -1;
+        }
         memcpy(obj_buf, obj_start, obj_len);
         obj_buf[obj_len] = '\0';
 
@@ -1635,7 +1642,12 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
 
     if (or_arr || and_arr) {
         CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
-        if (!n) { free(or_arr); free(and_arr); if (err) *err = "out of memory"; return NULL; }
+        if (!n) {
+            LOG_ERROR(LOG_SUB_QUERY, "parse_tree_element: calloc(sizeof(CriteriaNode)) failed for %s node", or_arr ? "OR" : "AND");
+            free(or_arr); free(and_arr);
+            if (err) *err = "out of memory";
+            return NULL;
+        }
         const char *arr = or_arr ? or_arr : and_arr;
         if (parse_tree_array(arr, n, depth, err) != 0) {
             free_criteria_tree(n); free(or_arr); free(and_arr);
@@ -1651,7 +1663,11 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
     }
 
     CriteriaNode *n = cnode_new(CNODE_LEAF);
-    if (!n) { if (err) *err = "out of memory"; return NULL; }
+    if (!n) {
+        LOG_ERROR(LOG_SUB_QUERY, "parse_tree_element: calloc(sizeof(CriteriaNode)) failed for leaf");
+        if (err) *err = "out of memory";
+        return NULL;
+    }
     if (parse_one_criterion(obj_buf, &n->leaf) != 0) {
         free_criteria_tree(n);
         if (err) *err = "invalid criterion: missing field, op or value";
@@ -1754,7 +1770,11 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
 
     if (*p == '[') {
         CriteriaNode *root = cnode_new(CNODE_AND);
-        if (!root) { if (err) *err = "out of memory"; return NULL; }
+        if (!root) {
+            LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for AND root");
+            if (err) *err = "out of memory";
+            return NULL;
+        }
         if (parse_tree_array(p, root, 0, err) != 0) {
             free_criteria_tree(root);
             return NULL;
@@ -1774,7 +1794,12 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         char *and_arr = or_arr ? NULL : json_obj_strdup_raw(&pobj, "and");
         if (or_arr || and_arr) {
             CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
-            if (!n) { free(or_arr); free(and_arr); if (err) *err = "out of memory"; return NULL; }
+            if (!n) {
+                LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for %s node", or_arr ? "OR" : "AND");
+                free(or_arr); free(and_arr);
+                if (err) *err = "out of memory";
+                return NULL;
+            }
             if (parse_tree_array(or_arr ? or_arr : and_arr, n, 0, err) != 0) {
                 free_criteria_tree(n); free(or_arr); free(and_arr);
                 return NULL;
@@ -1792,7 +1817,11 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         const char *field_v; size_t field_vl;
         if (json_obj_get(&pobj, "field", &field_v, &field_vl)) {
             CriteriaNode *n = cnode_new(CNODE_LEAF);
-            if (!n) { if (err) *err = "out of memory"; return NULL; }
+            if (!n) {
+                LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for leaf");
+                if (err) *err = "out of memory";
+                return NULL;
+            }
             if (parse_one_criterion(p, &n->leaf) != 0) {
                 free_criteria_tree(n);
                 if (err) *err = "invalid criterion: missing field, op or value";
@@ -1804,7 +1833,11 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         /* Simple-equality form `{"k1":"v1","k2":"v2"}` — backward compat.
            Parse k:v pairs as EQ leaves under an implicit AND root. */
         CriteriaNode *root = cnode_new(CNODE_AND);
-        if (!root) { if (err) *err = "out of memory"; return NULL; }
+        if (!root) {
+            LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for AND root (simple-equality form)");
+            if (err) *err = "out of memory";
+            return NULL;
+        }
         p++;
         while (*p) {
             p = json_skip(p);
@@ -1832,7 +1865,12 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             size_t vlen = vend - vstart;
 
             CriteriaNode *leaf = cnode_new(CNODE_LEAF);
-            if (!leaf) { free_criteria_tree(root); if (err) *err = "out of memory"; return NULL; }
+            if (!leaf) {
+                LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for simple-equality leaf");
+                free_criteria_tree(root);
+                if (err) *err = "out of memory";
+                return NULL;
+            }
             if (flen > 255) flen = 255;
             memcpy(leaf->leaf.field, fname, flen);
             leaf->leaf.field[flen] = '\0';

@@ -433,6 +433,7 @@ static int bt_cache_probe(const char *path, int *out_found) {
         }
     }
     *out_found = 0;
+    LOG_WARN(LOG_SUB_BTREE, "bt_cache_probe %s: table full after probing all %d slots, falling back to uncached mapping", path, bt_cache_slots);
     return -1;
 }
 
@@ -517,17 +518,29 @@ static int bt_open_file(const char *path, int writer,
     } else {
         fd = open(path, O_RDWR);
     }
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=%d): %s", path, writer, strerror(errno));
+        return -1;
+    }
 
     struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+    if (fstat(fd, &st) < 0) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: fstat failed: %s", path, strerror(errno));
+        close(fd); return -1;
+    }
 
     int fresh = 0;
     size_t sz;
     if (st.st_size == 0) {
-        if (!writer) { close(fd); return -1; }
+        if (!writer) {
+            LOG_WARN(LOG_SUB_BTREE, "bt_open_file %s: reader found zero-size file (never initialized by a writer)", path);
+            close(fd); return -1;
+        }
         size_t init_size = (size_t)bt_page_size * 2;
-        if (ftruncate(fd, init_size) < 0) { close(fd); return -1; }
+        if (ftruncate(fd, init_size) < 0) {
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: ftruncate to %zu failed: %s", path, init_size, strerror(errno));
+            close(fd); return -1;
+        }
         sz = init_size;
         fresh = 1;
     } else {
@@ -535,7 +548,10 @@ static int bt_open_file(const char *path, int writer,
     }
 
     uint8_t *map = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) { close(fd); return -1; }
+    if (map == MAP_FAILED) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: mmap(%zu) failed: %s", path, sz, strerror(errno));
+        close(fd); return -1;
+    }
     madvise(map, sz, MADV_RANDOM);
 
     if (fresh) bt_init_file(map);
@@ -557,6 +573,7 @@ static int bt_open_file(const char *path, int writer,
             fprintf(stderr,
                 "btree: rejecting %s format at %s — run ./migrate to reindex\n",
                 which, path);
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: rejecting %s format — run ./migrate to reindex", path, which);
             munmap(map, sz);
             close(fd);
             return -1;
@@ -896,7 +913,10 @@ static int leaf_rebuild(uint8_t *page, LeafRec *recs, int count) {
         data_bytes += leaf_entry_bytes(suffix_len);
     }
     size_t slots_end = sizeof(BtPageHeader) + (size_t)count * sizeof(uint16_t);
-    if (slots_end + data_bytes > (size_t)bt_page_size) return -1;
+    if (slots_end + data_bytes > (size_t)bt_page_size) {
+        LOG_ERROR(LOG_SUB_BTREE, "leaf_rebuild: %d records need %zu bytes, page holds %d (slots_end=%zu) — overflow", count, data_bytes, bt_page_size, slots_end);
+        return -1;
+    }
 
     ph->page_type = 1;
     ph->count = 0;
@@ -972,7 +992,10 @@ static int leaf_append(uint8_t *page, const char *value, size_t vlen,
 static int leaf_decode_value_at(uint8_t *page, int slot_idx,
                                 char *out_buf, size_t *out_len) {
     BtPageHeader *ph = (BtPageHeader *)page;
-    if (slot_idx < 0 || slot_idx >= (int)ph->count) return -1;
+    if (slot_idx < 0 || slot_idx >= (int)ph->count) {
+        LOG_ERROR(LOG_SUB_BTREE, "leaf_decode_value_at: slot_idx=%d out of range [0,%u)", slot_idx, ph->count);
+        return -1;
+    }
     int anchor = slot_idx & ~(BT_LEAF_RESTART_K - 1);
     char buf[BT_MAX_VAL_LEN]; size_t blen = 0;
     for (int s = anchor; s <= slot_idx; s++) {
@@ -1061,7 +1084,10 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
     const int K = BT_LEAF_RESTART_K;
     const int N = (int)ph->count;
 
-    if (pos < 0 || pos > N) return -1;
+    if (pos < 0 || pos > N) {
+        LOG_ERROR(LOG_SUB_BTREE, "page_insert_at_leaf: pos=%d out of range [0,%d]", pos, N);
+        return -1;
+    }
     if (vlen > BT_MAX_VAL_LEN) return -1;
 
     /* Append fast path. */
@@ -1132,7 +1158,10 @@ static int page_insert_at_leaf(uint8_t *page, int pos, const char *value, size_t
         first_anchor = ((pos + 1) / K + 1) * K;
     }
     for (int s = first_anchor; s <= N; s += K) {
-        if (n + 2 > LPI_MAX_PATCHES) return -1; /* shouldn't trip at K=16 */
+        if (n + 2 > LPI_MAX_PATCHES) {
+            LOG_ERROR(LOG_SUB_BTREE, "page_insert_at_leaf: patch array overflow (n=%d, cap=%d) inserting at pos=%d", n, LPI_MAX_PATCHES, pos);
+            return -1; /* shouldn't trip at K=16 */
+        }
         /* Anchor patch at slot s: value comes from old slot (s - 1). */
         LeafPatch *a = &patches[n++];
         a->new_slot = s;
@@ -2039,7 +2068,10 @@ static int iter_init_desc_leaves(BtRangeIter *it) {
        the cursor is armed; desc_li == 0 keeps the existing
        "armed" sentinel logic in iter_next_desc satisfied. */
     it->desc_leaves = malloc(sizeof(uint32_t));
-    if (!it->desc_leaves) return -1;
+    if (!it->desc_leaves) {
+        LOG_ERROR(LOG_SUB_BTREE, "iter_init_desc_leaves: malloc(%zu) failed for desc cursor", sizeof(uint32_t));
+        return -1;
+    }
     it->desc_leaves[0] = page_id;
     it->desc_leaf_count = (page_id != 0) ? 1 : 0;
     it->desc_li = (int)it->desc_leaf_count - 1;
@@ -2137,7 +2169,10 @@ BtRangeIter *btree_range_iter_open(const char *path,
                                    const char *max_val, size_t max_len, int max_exclusive,
                                    int desc) {
     BtRangeIter *it = calloc(1, sizeof(*it));
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_BTREE, "btree_range_iter_open %s: calloc(BtRangeIter) failed", path);
+        return NULL;
+    }
     if (bt_acquire(&it->bt, path, 0) != 0) { free(it); return NULL; }
     it->valid = 1;
     it->desc = desc;
@@ -2469,12 +2504,18 @@ BtStreamBuilder *bt_stream_build_open(const char *path) {
     unlink(path);
 
     BtStreamBuilder *b = calloc(1, sizeof(*b));
-    if (!b) return NULL;
+    if (!b) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_open %s: calloc(BtStreamBuilder) failed", path);
+        return NULL;
+    }
     if (bt_acquire(&b->bt, path, 1) != 0) { free(b); return NULL; }
 
     b->leaf_cap = 256;
     b->leaf_ids = malloc(b->leaf_cap * sizeof(uint32_t));
-    if (!b->leaf_ids) { bt_release(&b->bt); free(b); return NULL; }
+    if (!b->leaf_ids) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_open %s: malloc(leaf_ids, cap=%zu) failed", path, b->leaf_cap);
+        bt_release(&b->bt); free(b); return NULL;
+    }
 
     /* First leaf is page 1 (pre-allocated by bt_acquire). */
     b->cur_leaf = 1;
@@ -2511,7 +2552,10 @@ int bt_stream_build_add(BtStreamBuilder *b,
         if (b->leaf_count >= b->leaf_cap) {
             size_t new_cap = b->leaf_cap * 2;
             uint32_t *t = realloc(b->leaf_ids, new_cap * sizeof(uint32_t));
-            if (!t) { b->fatal = 1; return -1; }
+            if (!t) {
+                LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_add: realloc(leaf_ids, cap=%zu) failed — builder marked fatal", new_cap);
+                b->fatal = 1; return -1;
+            }
             b->leaf_ids = t;
             b->leaf_cap = new_cap;
         }
@@ -2557,6 +2601,7 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
         size_t parent_cap = (child_count + 1) / 2 + 1;
         uint32_t *parent_ids = malloc(parent_cap * sizeof(uint32_t));
         if (!parent_ids) {
+            LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_finish: malloc(parent_ids, cap=%zu) failed", parent_cap);
             if (child_ids != b->leaf_ids) free(child_ids);
             bt_release(&b->bt);
             free(b->leaf_ids);
@@ -2665,7 +2710,10 @@ static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
     size_t cap = (size_t)fh->entry_count + 64;
     /* CID 1693855 - header value from trusted index file, triage */
     BtEntry *entries = malloc(cap * sizeof(BtEntry));
-    if (!entries) { bt_release(&bt); return NULL; }
+    if (!entries) {
+        LOG_ERROR(LOG_SUB_BTREE, "bt_extract_all %s: malloc(entries, cap=%zu) failed", path, cap);
+        bt_release(&bt); return NULL;
+    }
     size_t count = 0;
 
     /* Walk down to leftmost leaf via next_leaf (= leftmost child for internal) */
@@ -2752,6 +2800,7 @@ static pthread_mutex_t *bt_merge_lock_for(const char *path) {
         }
     }
     pthread_mutex_unlock(&g_bt_merge_table_lock);
+    LOG_WARN(LOG_SUB_BTREE, "bt_merge_lock_for %s: all %d merge-lock buckets in use — proceeding WITHOUT per-path serialization", path, BT_MERGE_LOCK_BUCKETS);
     return NULL;
 }
 

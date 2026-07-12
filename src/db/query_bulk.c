@@ -54,6 +54,7 @@ static void *idx_build_field_worker(void *arg) {
     size_t *offsets = calloc((size_t)idx_n, sizeof(size_t));
     BtEntry *parted = malloc(fa->new_count * sizeof(BtEntry));
     if (!counts || !offsets || !parted) {
+        LOG_ERROR(LOG_SUB_QUERY, "idx_build_field_worker: alloc failed for field %s (new_count=%zu)", fa->field, fa->new_count);
         free(counts); free(offsets); free(parted);
         return NULL;
     }
@@ -62,7 +63,10 @@ static void *idx_build_field_worker(void *arg) {
     size_t acc = 0;
     for (int s = 0; s < idx_n; s++) { offsets[s] = acc; acc += counts[s]; }
     size_t *cursor = calloc((size_t)idx_n, sizeof(size_t));
-    if (!cursor) { free(counts); free(offsets); free(parted); return NULL; }
+    if (!cursor) {
+        LOG_ERROR(LOG_SUB_QUERY, "idx_build_field_worker: calloc cursor failed (idx_n=%d)", idx_n);
+        free(counts); free(offsets); free(parted); return NULL;
+    }
     for (size_t i = 0; i < fa->new_count; i++) {
         int s = idx_shard_for_hash(fa->new_entries[i].hash, fa->splits);
         parted[offsets[s] + cursor[s]++] = fa->new_entries[i];
@@ -155,9 +159,15 @@ typedef struct BulkArena {
 
 static BulkArena *arena_new(size_t cap) {
     BulkArena *a = malloc(sizeof(BulkArena));
-    if (!a) return NULL;
+    if (!a) {
+        LOG_ERROR(LOG_SUB_QUERY, "arena_new: malloc BulkArena header failed");
+        return NULL;
+    }
     a->base = malloc(cap);
-    if (!a->base) { free(a); return NULL; }
+    if (!a->base) {
+        LOG_ERROR(LOG_SUB_QUERY, "arena_new: malloc %zu bytes failed", cap);
+        free(a); return NULL;
+    }
     a->next = NULL;
     a->used = 0;
     a->cap = cap;
@@ -291,6 +301,7 @@ static int build_shard_worker_map(const int *shard_counts, int splits,
     int *worker_shards = nw > 0 ? malloc((size_t)nw * sizeof(int)) : NULL;
     int *s2w = malloc((size_t)splits * sizeof(int));
     if ((nw > 0 && !worker_shards) || !s2w) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_shard_worker_map: malloc failed (splits=%d, nw=%d)", splits, nw);
         free(worker_shards); free(s2w);
         *out_worker_shards = NULL; *out_s2w = NULL;
         return -1;
@@ -610,6 +621,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     int *offsets   = malloc(splits * sizeof(int));
     int *cursors   = calloc(splits, sizeof(int));
     if (!batch || !ctxs || !kf_shards || !counts || !offsets || !cursors) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_insert_shard_worker_v2: alloc failed, dropping %zu records for shard=%d", sw->count, sw->shard_id);
         free(batch); free(ctxs); free(kf_shards);
         free(counts); free(offsets); free(cursors);
         sw->errors += (int)sw->count;
@@ -2264,7 +2276,10 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
         .streams = sw->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "bulk_del_shard_worker_v2: slotcask_registry_get failed for %s/%s", sw->db_root, sw->object);
+        return NULL;
+    }
 
     /* All keys in this worker hash to the same kf shard (dispatcher
        aligned shard_id with compute_record_shard, see cmd_bulk_delete). */
@@ -2272,7 +2287,10 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
 
     SlotcaskBulkRec *batch = calloc(sw->key_count, sizeof(SlotcaskBulkRec));
     V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
-    if (!batch || !ctxs) { free(batch); free(ctxs); return NULL; }
+    if (!batch || !ctxs) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_del_shard_worker_v2: alloc failed, dropping %d deletes", sw->key_count);
+        free(batch); free(ctxs); return NULL;
+    }
 
     /* One arena allocation for the whole shard's batch. Replaces
        (key_count * nidx) per-field mallocs in the pre_commit hook with
@@ -2815,7 +2833,10 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
-    if (!sdb) { w->skipped += w->count; return NULL; }
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
+        w->skipped += w->count; return NULL;
+    }
 
     /* Parse value_json once for the whole worker. */
     const char *field_names[MAX_FIELDS];
@@ -2827,6 +2848,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
     uint8_t         *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
         for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
         w->skipped += w->count;
@@ -2930,6 +2952,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     int matched = ctx.count;
 
     if (dl.timed_out) {
+        LOG_WARN(LOG_SUB_QUERY, "bulk-update: query deadline exceeded while matching criteria");
         OUT("{\"error\":\"query_timeout\"}\n");
         if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
@@ -2937,6 +2960,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         return -1;
     }
     if (ctx.budget_exceeded) {
+        LOG_WARN(LOG_SUB_QUERY, "bulk-update: query buffer cap exceeded while matching criteria");
         OUT(QUERY_BUFFER_ERR);
         if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
@@ -3230,7 +3254,10 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
         .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
-    if (!sdb) { w->skipped += w->count; return NULL; }
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_delim_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
+        w->skipped += w->count; return NULL;
+    }
 
     /* Build batch + scratch slab. value_compute will write into the
        slab; rec->value points at this worker's slot up front. */
@@ -3238,6 +3265,7 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
     V2BulkUpdDelimCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdDelimCtx));
     uint8_t           *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_delim_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
         w->skipped += w->count;
         return NULL;
@@ -3692,12 +3720,16 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
         .streams = w->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
-    if (!sdb) { w->skipped += w->count; return NULL; }
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_json_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
+        w->skipped += w->count; return NULL;
+    }
 
     SlotcaskBulkRec  *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdJsonCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdJsonCtx));
     uint8_t          *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_json_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
         w->skipped += w->count;
         return NULL;
@@ -4177,6 +4209,7 @@ static void *bulk_del_crit_shard_worker(void *arg) {
     SlotcaskBulkRec  *batch = calloc((size_t)w->count, sizeof(SlotcaskBulkRec));
     V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
     if (!batch || !ctxs) {
+        LOG_ERROR(LOG_SUB_QUERY, "bulk_del_crit_shard_worker: alloc failed, skipping %d deletes", w->count);
         free(batch); free(ctxs);
         w->skipped = w->count;
         return NULL;
@@ -4316,6 +4349,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     int matched = ctx.count;
 
     if (dl.timed_out) {
+        LOG_WARN(LOG_SUB_QUERY, "bulk-delete: query deadline exceeded while matching criteria");
         OUT("{\"error\":\"query_timeout\"}\n");
         if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
@@ -4323,6 +4357,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         return -1;
     }
     if (ctx.budget_exceeded) {
+        LOG_WARN(LOG_SUB_QUERY, "bulk-delete: query buffer cap exceeded while matching criteria");
         OUT(QUERY_BUFFER_ERR);
         if (cas_crit) free_criteria(cas_crit, cas_ncrit);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
