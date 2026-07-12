@@ -1261,9 +1261,15 @@ typedef struct {
 
 static int spill_writer_open(SpillWriter *sw, const char *path) {
     sw->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (sw->fd < 0) return -1;
+    if (sw->fd < 0) {
+        LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_open: open failed for %s: %s", path, strerror(errno));
+        return -1;
+    }
     sw->wbuf = malloc(SPILL_WRITE_BUF_BYTES);
-    if (!sw->wbuf) { close(sw->fd); sw->fd = -1; return -1; }
+    if (!sw->wbuf) {
+        LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_open: malloc(%d) failed for spill write buffer (%s)", SPILL_WRITE_BUF_BYTES, path);
+        close(sw->fd); sw->fd = -1; return -1;
+    }
     sw->wbuf_used = 0;
     return 0;
 }
@@ -1274,8 +1280,15 @@ static int spill_writer_drain(SpillWriter *sw) {
     size_t left = sw->wbuf_used;
     while (left > 0) {
         ssize_t n = write(sw->fd, p, left);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_drain: write failed on fd %d: %s", sw->fd, strerror(errno));
+            return -1;
+        }
+        if (n == 0) {
+            LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_drain: write returned 0 (disk full?) on fd %d", sw->fd);
+            return -1;
+        }
         p += n; left -= (size_t)n;
     }
     sw->wbuf_used = 0;
@@ -1290,8 +1303,15 @@ static int spill_writer_put(SpillWriter *sw, const void *data, size_t len) {
             const uint8_t *p = data; size_t left = len;
             while (left > 0) {
                 ssize_t n = write(sw->fd, p, left);
-                if (n < 0) { if (errno == EINTR) continue; return -1; }
-                if (n == 0) return -1;
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_put: oversize direct write failed on fd %d (len=%zu): %s", sw->fd, len, strerror(errno));
+                    return -1;
+                }
+                if (n == 0) {
+                    LOG_ERROR(LOG_SUB_REINDEX, "spill_writer_put: oversize direct write returned 0 on fd %d (len=%zu)", sw->fd, len);
+                    return -1;
+                }
                 p += n; left -= (size_t)n;
             }
             return 0;
@@ -1312,7 +1332,10 @@ static int spill_writer_write_run(SpillWriter *sw, BtEntry *entries, uint32_t co
         body += (uint64_t)sizeof(uint16_t) + (uint64_t)entries[i].vlen +
                 (uint64_t)BT_HASH_SIZE;
     }
-    if (body > 0xFFFFFFFFULL) return -1;  /* shouldn't happen with sane buffer caps */
+    if (body > 0xFFFFFFFFULL) {
+        LOG_WARN(LOG_SUB_REINDEX, "spill_writer_write_run: run body size %llu exceeds 4GB cap (count=%u); dropping run", (unsigned long long)body, count);
+        return -1;  /* shouldn't happen with sane buffer caps */
+    }
     uint32_t body_u32 = (uint32_t)body;
 
     if (spill_writer_put(sw, &count,    sizeof(count))    != 0) return -1;
@@ -1344,7 +1367,10 @@ static int spill_run_fill(SpillRunReader *r) {
     size_t want = SPILL_READ_BUF_BYTES;
     if ((off_t)want > r->run_end - r->pos) want = (size_t)(r->run_end - r->pos);
     ssize_t n = pread(r->fd, r->buf, want, r->pos);
-    if (n <= 0) { r->eof = 1; return -1; }
+    if (n <= 0) {
+        LOG_ERROR(LOG_SUB_REINDEX, "spill_run_fill: pread failed on fd %d at offset %lld (want=%zu): %s", r->fd, (long long)r->pos, want, strerror(errno));
+        r->eof = 1; return -1;
+    }
     r->pos += n;
     r->buf_used = (size_t)n;
     r->buf_off  = 0;
@@ -1356,7 +1382,10 @@ static int spill_run_take(SpillRunReader *r, void *out, size_t len) {
     while (len > 0) {
         if (r->buf_off >= r->buf_used) {
             if (spill_run_fill(r) != 0) return -1;
-            if (r->buf_off >= r->buf_used) return -1;  /* eof mid-entry */
+            if (r->buf_off >= r->buf_used) {
+                LOG_ERROR(LOG_SUB_REINDEX, "spill_run_take: unexpected EOF mid-entry on fd %d (wanted %zu more bytes)", r->fd, len);
+                return -1;  /* eof mid-entry */
+            }
         }
         size_t avail = r->buf_used - r->buf_off;
         size_t take  = len < avail ? len : avail;
@@ -1375,7 +1404,10 @@ static int spill_run_advance(SpillRunReader *r) {
     if (r->entries_remaining == 0) { r->has_entry = 0; r->eof = 1; return 0; }
     uint16_t vlen;
     if (spill_run_take(r, &vlen, sizeof(vlen)) != 0) { r->has_entry = 0; return -1; }
-    if (vlen > sizeof(r->value)) { r->has_entry = 0; return -1; }
+    if (vlen > sizeof(r->value)) {
+        LOG_ERROR(LOG_SUB_REINDEX, "spill_run_advance: corrupt spill entry on fd %d: vlen=%u exceeds buffer size %zu", r->fd, vlen, sizeof(r->value));
+        r->has_entry = 0; return -1;
+    }
     if (spill_run_take(r, r->value, vlen)           != 0) { r->has_entry = 0; return -1; }
     if (spill_run_take(r, r->hash,  BT_HASH_SIZE)   != 0) { r->has_entry = 0; return -1; }
     r->vlen = vlen;
@@ -1464,13 +1496,19 @@ static int merge_spills_into_index(int type,
     /* Open every worker's spill file for this output shard. Files may
        not exist if a worker had no entries for this shard — skip those. */
     int *fds = calloc((size_t)n_kf, sizeof(int));
-    if (!fds) return -1;
+    if (!fds) {
+        LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: calloc failed for %d fd slots (%s/%s/%s shard %d)", n_kf, db_root, object, field, shard);
+        return -1;
+    }
     for (int w = 0; w < n_kf; w++) fds[w] = -1;
 
     /* Enumerate runs across all spill files. */
     size_t reader_cap = 256, reader_count = 0;
     SpillRunReader *readers = malloc(reader_cap * sizeof(SpillRunReader));
-    if (!readers) { free(fds); return -1; }
+    if (!readers) {
+        LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: malloc failed for %zu spill run readers (%s/%s/%s shard %d)", reader_cap, db_root, object, field, shard);
+        free(fds); return -1;
+    }
 
     for (int w = 0; w < n_kf; w++) {
         char path[PATH_MAX];
@@ -1621,7 +1659,10 @@ int build_trigram_pass(const char *db_root, const char *object,
         .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_TRIGRAM, "build_trigram_pass: slotcask_registry_get failed for %s/%s", db_root, object);
+        return -1;
+    }
 
     LOG_WARN(LOG_SUB_TRIGRAM, "BUILD-TRIGRAM %s/%s/%s: segment-sequential scan",
             db_root, object, field);
@@ -1653,7 +1694,10 @@ int build_btree_streaming(const char *db_root, const char *object,
         .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_BTREE, "build_btree_streaming: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
+        return -1;
+    }
 
     MFFieldDesc d;
     memset(&d, 0, sizeof(d));
@@ -1696,7 +1740,10 @@ static void *bm_shard_walk_worker(void *arg) {
     BmShardWalkArg *a = (BmShardWalkArg *)arg;
     BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 0, 0, 0,
                               1 /* writer: reindex bm_set's */);
-    if (!bm) return NULL;
+    if (!bm) {
+        LOG_ERROR(LOG_SUB_BITMAP, "bm_shard_walk_worker: bm_open failed for %s (kf_shard=%d); bitmap left stale for this shard", a->path, a->kf_shard);
+        return NULL;
+    }
     BmRebuildCtx c = { bm, a->fi, a->ts };
     slotcask_walk_one_shard_slots(a->sdb, a->kf_shard, bm_rebuild_cb, &c);
     bm_close(bm);
@@ -1743,7 +1790,10 @@ int build_bitmap_pass(const char *db_root, const char *object,
         .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
+        return -1;
+    }
 
     /* Parallel kf-shard walks: each worker opens its own .bm (paths are
        unique per kf shard), walks its assigned kf shard, and bm_sets
@@ -1751,7 +1801,10 @@ int build_bitmap_pass(const char *db_root, const char *object,
        accumulation (mmap is the persistent store). Matches the
        phase-1-parallel shape used by btree/trigram. */
     BmShardWalkArg *args = malloc((size_t)sch->splits * sizeof(BmShardWalkArg));
-    if (!args) return -1;
+    if (!args) {
+        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", sch->splits, db_root, object, field);
+        return -1;
+    }
     for (int s = 0; s < sch->splits; s++) {
         bm_build_path(args[s].path, sizeof(args[s].path), db_root, object, field, s);
         args[s].kf_shard       = s;
@@ -2432,10 +2485,15 @@ static int mf_worker_field_alloc(MFWorkerField *f, const MFFieldDesc *d,
     f->flush_offsets = calloc((size_t)idx_n, sizeof(size_t));
     f->flush_cursors = calloc((size_t)idx_n, sizeof(size_t));
     if (!f->pairs || !f->arena || !f->flush_out ||
-        !f->flush_counts || !f->flush_offsets || !f->flush_cursors)
+        !f->flush_counts || !f->flush_offsets || !f->flush_cursors) {
+        LOG_ERROR(LOG_SUB_REINDEX, "mf_worker_field_alloc: allocation failed for field %s (cap=%zu, idx_n=%d)", d->name, cap, idx_n);
         return -1;
+    }
     f->spill_writers = calloc((size_t)idx_n, sizeof(SpillWriter));
-    if (!f->spill_writers) return -1;
+    if (!f->spill_writers) {
+        LOG_ERROR(LOG_SUB_REINDEX, "mf_worker_field_alloc: calloc failed for %d spill_writers (field %s)", idx_n, d->name);
+        return -1;
+    }
     for (int s = 0; s < idx_n; s++) f->spill_writers[s].fd = -1;
     return 0;
 }
@@ -2598,7 +2656,10 @@ static void *seg_scan_worker(void *arg) {
 static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_n) {
     size_t cap = 256, n = 0;
     SegRef *segs = malloc(cap * sizeof(SegRef));
-    if (!segs) { *out_n = 0; return NULL; }
+    if (!segs) {
+        LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: malloc failed for %zu SegRef entries (%s)", cap, data_dir);
+        *out_n = 0; return NULL;
+    }
     for (int sid = 0; sid < n_streams; sid++) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof(dir), "%s/data/streams/%03d", data_dir, sid);
@@ -2615,7 +2676,10 @@ static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_
             if (n == cap) {
                 cap *= 2;
                 SegRef *t = realloc(segs, cap * sizeof(SegRef));
-                if (!t) { closedir(d); free(segs); *out_n = 0; return NULL; }
+                if (!t) {
+                    LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: realloc failed growing to %zu SegRef entries (%s)", cap, data_dir);
+                    closedir(d); free(segs); *out_n = 0; return NULL;
+                }
                 segs = t;
             }
             segs[n].sid = (uint8_t)sid;
@@ -2670,7 +2734,10 @@ static int resolve_bitmaps(const char *db_root, const char *object,
 
     /* mmap every kf shard once, read-only, shared across all bitmap fields. */
     KfMap *kf = calloc((size_t)splits, sizeof(KfMap));
-    if (!kf) return -1;
+    if (!kf) {
+        LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: calloc failed for %d KfMap entries (%s/%s)", splits, db_root, object);
+        return -1;
+    }
     for (int s = 0; s < splits; s++) {
         char kp[PATH_MAX];
         slotcask_kf_path(kp, sizeof(kp), sdb->data_dir, s);
@@ -2796,7 +2863,10 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
         per_field_budget / (1024 * 1024));
 
     SegScanWorker *workers = calloc((size_t)P, sizeof(SegScanWorker));
-    if (!workers) { free(segs); return -1; }
+    if (!workers) {
+        LOG_ERROR(LOG_SUB_REINDEX, "seg_seq_build_spills: calloc failed for %d SegScanWorker entries (%s/%s)", P, db_root, object);
+        free(segs); return -1;
+    }
 
     /* Contiguous segment ranges per worker so each reads its files in order. */
     int base = n_segs / P, extra = n_segs % P, cursor = 0;
@@ -2835,6 +2905,7 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
     }
 
     if (!alloc_ok) {
+        LOG_ERROR(LOG_SUB_REINDEX, "seg_seq_build_spills: per-worker buffer allocation failed (%s/%s, %d workers, %d fields)", db_root, object, P, n_fields);
         for (int w = 0; w < P; w++) {
             if (workers[w].fields) {
                 for (int fi = 0; fi < n_fields; fi++)
@@ -2922,7 +2993,10 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
         .splits = sch->splits, .slot_size = sch->slot_size, .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_REINDEX, "build_indexes_streaming_multi: slotcask_registry_get failed for %s/%s", db_root, object);
+        return -1;
+    }
 
     return seg_seq_build_spills(db_root, object, sch, ts, sdb, descs, n_fields);
 }

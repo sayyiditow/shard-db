@@ -38,13 +38,17 @@ static inline uint64_t bucket_hash(const uint8_t h[16]) {
 KeySet *keyset_new(size_t capacity_hint) {
     size_t cap = next_pow2(capacity_hint * 2);
     KeySet *ks = calloc(1, sizeof(KeySet));
-    if (!ks) return NULL;
+    if (!ks) {
+        LOG_ERROR(LOG_SUB_PLANNER, "keyset_new: calloc failed for KeySet struct (capacity_hint=%zu)", capacity_hint);
+        return NULL;
+    }
     ks->cap = cap;
     ks->mask = cap - 1;
     ks->keys  = calloc(cap, sizeof(*ks->keys));
     ks->state = calloc(cap, sizeof(*ks->state));
     atomic_init(&ks->n, 0);
     if (!ks->keys || !ks->state) {
+        LOG_ERROR(LOG_SUB_PLANNER, "keyset_new: calloc failed for keys/state arrays (cap=%zu)", cap);
         free(ks->keys); free(ks->state); free(ks);
         return NULL;
     }
@@ -92,6 +96,7 @@ int keyset_insert(KeySet *ks, const uint8_t hash[16]) {
         }
         /* Collision — linear probe. */
     }
+    LOG_WARN(LOG_SUB_PLANNER, "keyset_insert: hash table full (cap=%zu), falling back to full scan", ks->cap);
     return -1; /* full */
 }
 

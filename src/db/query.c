@@ -292,6 +292,7 @@ int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, void *c
     
     if (cc->collect_cap > 0 && idx >= (size_t)cc->collect_cap) return -1;
     if (idx >= cc->cap) {
+        LOG_WARN(LOG_SUB_QUERY, "collect_hash_cb: query buffer cap exceeded (cap=%zu)", cc->cap);
         __atomic_store_n(&cc->budget_exceeded, 1, __ATOMIC_RELAXED);
         return -1;
     }
@@ -332,6 +333,7 @@ int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16, void *
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
+        LOG_WARN(LOG_SUB_QUERY, "stream_keyset_cb: keyset capacity exhausted, aborting walk");
         atomic_store_explicit(&sk->full, 1, memory_order_relaxed);
         return -1; /* keyset full — abort walk; caller falls back. */
     }
@@ -1267,7 +1269,10 @@ static int batch_buf_init(BatchFetchBuf *b, SlotcaskDb *sdb,
         b->pending_cap = (size_t)fetch_limit;
     if (b->pending_cap < 1) b->pending_cap = 1;
     b->pending = calloc(b->pending_cap, 16);
-    if (!b->pending) return -1;
+    if (!b->pending) {
+        LOG_ERROR(LOG_SUB_QUERY, "batch_buf_init: calloc failed for pending_cap=%zu", b->pending_cap);
+        return -1;
+    }
     b->pending_n = 0;
     pthread_mutex_init(&b->lock, NULL);
     pthread_cond_init(&b->flush_done, NULL);
@@ -2479,7 +2484,10 @@ static int intersect_probe_cb(const char *val, size_t vlen,
     IntersectProbeCtx *p = (IntersectProbeCtx *)ctx;
     if (query_deadline_tick(p->deadline, &p->dl_counter)) return -1;
     if (keyset_contains(p->running, hash16)) {
-        if (keyset_insert(p->out, hash16) < 0) return -1;
+        if (keyset_insert(p->out, hash16) < 0) {
+            LOG_WARN(LOG_SUB_QUERY, "intersect_probe_cb: destination keyset capacity exhausted");
+            return -1;
+        }
     }
     return 0;
 }
@@ -2522,7 +2530,10 @@ static int intersect_collect_cb(const char *val, size_t vlen,
     (void)val; (void)vlen;
     IntersectCollectCtx *c = (IntersectCollectCtx *)ctx;
     if (query_deadline_tick(c->deadline, &c->dl_counter)) return -1;
-    if (keyset_insert(c->ks, hash16) < 0) { c->overflowed = 1; return -1; }
+    if (keyset_insert(c->ks, hash16) < 0) {
+        LOG_WARN(LOG_SUB_QUERY, "intersect_collect_cb: keyset capacity exhausted, marking overflow");
+        c->overflowed = 1; return -1;
+    }
     return 0;
 }
 
@@ -2770,14 +2781,20 @@ typedef struct {
 static void *bm_intersect_shard_worker(void *raw) {
     BmIntersectShardArg *a = (BmIntersectShardArg *)raw;
     a->count = 0;
-    if (a->n_leaves < 2 || a->n_leaves > MAX_INTERSECT_LEAVES) return NULL;
+    if (a->n_leaves < 2 || a->n_leaves > MAX_INTERSECT_LEAVES) {
+        LOG_ERROR(LOG_SUB_QUERY, "bm_intersect_shard_worker: invalid n_leaves=%d (expected 2..%d) — caller should have validated this", a->n_leaves, MAX_INTERSECT_LEAVES);
+        return NULL;
+    }
 
     /* Pre-encode all leaf values */
     uint8_t  vals[MAX_INTERSECT_LEAVES][1024];
     size_t   vlens[MAX_INTERSECT_LEAVES];
     for (int i = 0; i < a->n_leaves; i++) {
         const TypedField *tf = resolve_idx_field(a->ts, a->leaves[i]->field);
-        if (!tf) return NULL;
+        if (!tf) {
+            LOG_ERROR(LOG_SUB_QUERY, "bm_intersect_shard_worker: resolve_idx_field failed for already-validated indexed field '%s'", a->leaves[i]->field);
+            return NULL;
+        }
         encode_criterion_value(tf, a->leaves[i]->value,
                                 strlen(a->leaves[i]->value),
                                 vals[i], &vlens[i]);
@@ -3225,7 +3242,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
             .splits = sc_g.splits, .slot_size = sc_g.slot_size, .streams = sc_g.streams,
         };
         SlotcaskDb *sdb_g = slotcask_registry_get(db_root, object, &info_g);
-        if (!sdb_g) return NULL;
+        if (!sdb_g) {
+            LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
+            return NULL;
+        }
 
         size_t tot_g = bm_popcount_generic_for_crit(db_root, object,
                                                      leaf->field, splits,
@@ -3233,10 +3253,16 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
 
         size_t ks_bytes_est_g = (tot_g ? tot_g : 1024)
                                 * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-        if (ks_bytes_est_g > g_query_buffer_max_bytes) return NULL;
+        if (ks_bytes_est_g > g_query_buffer_max_bytes) {
+            LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est_g, g_query_buffer_max_bytes);
+            return NULL;
+        }
 
         KeySet *ks_g = keyset_new(tot_g > 0 ? tot_g : 1024);
-        if (!ks_g) return NULL;
+        if (!ks_g) {
+            LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", tot_g > 0 ? tot_g : 1024);
+            return NULL;
+        }
 
         BmKsEmitCtx kec = { ks_g, dl };
         for (int s = 0; s < splits; s++) {
@@ -3257,7 +3283,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     if (n_vals <= 0) return NULL;
     uint8_t (*vals)[1024] = calloc((size_t)n_vals, sizeof(*vals));
     size_t *vlens = calloc((size_t)n_vals, sizeof(*vlens));
-    if (!vals || !vlens) { free(vals); free(vlens); return NULL; }
+    if (!vals || !vlens) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: calloc failed for n_vals=%d", n_vals);
+        free(vals); free(vlens); return NULL;
+    }
     if (leaf->op == OP_EQUAL) {
         encode_criterion_value(tf, leaf->value, strlen(leaf->value),
                                vals[0], &vlens[0]);
@@ -3288,7 +3317,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) { free(vals); free(vlens); return NULL; }
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
+        free(vals); free(vlens); return NULL;
+    }
 
     /* Pass A: sum bm_count across every (shard × value). Each bm_count
        is a cache-friendly stride-byte popcount — ~ms-scale at 25M /
@@ -3317,11 +3349,15 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     size_t ks_bytes_est = (total_matches ? total_matches : 1024)
                            * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
     if (ks_bytes_est > g_query_buffer_max_bytes) {
+        LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
         free(vals); free(vlens); return NULL;
     }
 
     KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
-    if (!ks) { free(vals); free(vlens); return NULL; }
+    if (!ks) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", total_matches > 0 ? total_matches : 1024);
+        free(vals); free(vlens); return NULL;
+    }
 
     /* Pass B: walk the bitmaps and lift matching hashes via kf lookup.
        Serial across shards — the inserts themselves run lock-free
@@ -3400,17 +3436,26 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
                                               size_t comp_hint) {
     size_t ks_bytes_est = (comp_hint ? comp_hint : 1024)
                            * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) return NULL;
+    if (ks_bytes_est > g_query_buffer_max_bytes) {
+        LOG_WARN(LOG_SUB_QUERY, "build_keyset_bitmap_complement: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
+        return NULL;
+    }
 
     Schema sc = load_schema(db_root, object);
     SlotcaskSchemaInfo info = {
         .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_bitmap_complement: slotcask_registry_get failed for %s/%s", db_root, object);
+        return NULL;
+    }
 
     KeySet *ks = keyset_new(comp_hint > 0 ? comp_hint : 1024);
-    if (!ks) return NULL;
+    if (!ks) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_bitmap_complement: keyset_new(%zu) failed", comp_hint > 0 ? comp_hint : 1024);
+        return NULL;
+    }
 
     for (int s = 0; s < splits; s++) {
         if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
@@ -3457,7 +3502,10 @@ KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
 
     uint8_t (*tvals)[1024] = calloc((size_t)n_vals, sizeof(*tvals));
     size_t  *tvlens = calloc((size_t)n_vals, sizeof(*tvlens));
-    if (!tvals || !tvlens) { free(tvals); free(tvlens); return NULL; }
+    if (!tvals || !tvlens) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_smaller_bitmap_keyset: calloc failed for n_vals=%d", n_vals);
+        free(tvals); free(tvlens); return NULL;
+    }
     int nt = 0;
     for (int i = 0; i < n_vals; i++) {
         const char *v = (leaf->op == OP_EQUAL) ? leaf->value : leaf->in_values[i];
@@ -3572,7 +3620,10 @@ static KeySet *keyset_pairwise_intersect(KeySet *a, KeySet *b) {
     KeySet *small = keyset_size(a) <= keyset_size(b) ? a : b;
     KeySet *big   = (small == a) ? b : a;
     KeySet *out = keyset_new(keyset_size(small));
-    if (!out) return NULL;
+    if (!out) {
+        LOG_ERROR(LOG_SUB_QUERY, "keyset_pairwise_intersect: keyset_new(%zu) failed", keyset_size(small));
+        return NULL;
+    }
     PairwiseIntersectCtx c = { big, out };
     keyset_iter(small, pairwise_intersect_cb, &c);
     return out;
@@ -3638,7 +3689,10 @@ static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
 
     /* Result size ≤ |running|. Size to fit. */
     KeySet *next = keyset_new(keyset_size(running));
-    if (!next) { keyset_free(running); return NULL; }
+    if (!next) {
+        LOG_ERROR(LOG_SUB_QUERY, "tg_intersect_streaming: keyset_new(%zu) failed", keyset_size(running));
+        keyset_free(running); return NULL;
+    }
     TgFilterCtx c = { running, next, dl, 0 };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
@@ -3683,7 +3737,10 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
        keysets vs 1 × tiny + 9 stream walks that mostly early-out. */
     typedef struct { uint8_t tg[3]; size_t count; } TgEntry;
     TgEntry *order = malloc(n * sizeof(TgEntry));
-    if (!order) return NULL;
+    if (!order) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: malloc failed for n=%zu TgEntry", n);
+        return NULL;
+    }
     for (size_t i = 0; i < n; i++) {
         memcpy(order[i].tg, trigrams[i], 3);
         order[i].count = tg_posting_count(db_root, object, leaf->field,
@@ -3707,7 +3764,10 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
 
     /* Seed from rarest trigram — sized exactly to its posting count. */
     KeySet *acc = keyset_new(order[0].count);
-    if (!acc) { free(order); return NULL; }
+    if (!acc) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: keyset_new(%zu) failed", (size_t)order[0].count);
+        free(order); return NULL;
+    }
     int idx_n = index_splits_for(splits);
     TgCollectCtx cc = { acc, dl, 0 };
     for (int s = 0; s < idx_n; s++) {
@@ -3842,7 +3902,10 @@ KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
         /* coverity[tainted_data] CID 1693849: hint is bounded above by
            the budget_max_hint clamp during tier2 derivation. */
         KeySet *ks = keyset_new(hints[t]);
-        if (!ks) return NULL;
+        if (!ks) {
+            LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_leaf: keyset_new(%zu) failed (tier %d)", hints[t], t);
+            return NULL;
+        }
         IntersectCollectCtx c = { ks, dl, 0, 0 };
         btree_dispatch(db_root, object, leaf->field, splits,
                        leaf, tf, intersect_collect_cb, &c);
@@ -3903,7 +3966,10 @@ static int intersect_all_cb(const uint8_t hash[16], void *ctx) {
         if (i == ic->smallest_i) continue;
         if (!keyset_contains(ic->per_leaf[i], hash)) return 0;
     }
-    if (keyset_insert(ic->out, hash) < 0) return -1;
+    if (keyset_insert(ic->out, hash) < 0) {
+        LOG_WARN(LOG_SUB_QUERY, "intersect_all_cb: destination keyset capacity exhausted");
+        return -1;
+    }
     return 0;
 }
 
@@ -3946,7 +4012,10 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
            present in all others. */
         KeySet **per_leaf = calloc((size_t)n, sizeof(KeySet *));
         LeafBuildArg *args = calloc((size_t)n, sizeof(LeafBuildArg));
-        if (!per_leaf || !args) { free(per_leaf); free(args); return NULL; }
+        if (!per_leaf || !args) {
+            LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: calloc failed for n=%d leaves", n);
+            free(per_leaf); free(args); return NULL;
+        }
         for (int i = 0; i < n; i++) {
             args[i].db_root  = db_root;
             args[i].object   = object;
@@ -3988,6 +4057,7 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
 
         KeySet *result = keyset_new(keyset_size(per_leaf[smallest_i]));
         if (!result) {
+            LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed", keyset_size(per_leaf[smallest_i]));
             for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
             free(per_leaf);
             return NULL;
@@ -4019,7 +4089,10 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
         if (cur == 0) break;  /* empty intersection — short-circuit */
 
         KeySet *next = keyset_new(cur);  /* intersection cardinality ≤ |running| */
-        if (!next) { keyset_free(running); return NULL; }
+        if (!next) {
+            LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed (serial path)", cur);
+            keyset_free(running); return NULL;
+        }
 
         IntersectProbeCtx p = { running, next, dl, 0 };
         btree_dispatch(db_root, object, leaves[i]->field, splits,
@@ -4045,7 +4118,10 @@ typedef struct {
 
 static int keyset_to_batch_cb(const uint8_t hash[16], void *ctx) {
     KeysetToBatchCtx *kc = (KeysetToBatchCtx *)ctx;
-    if (kc->count >= kc->cap) return -1;  /* shouldn't happen — cap = keyset_size */
+    if (kc->count >= kc->cap) {
+        LOG_ERROR(LOG_SUB_QUERY, "keyset_to_batch_cb: count >= cap (%zu) — internal invariant violation", kc->cap);
+        return -1;  /* shouldn't happen — cap = keyset_size */
+    }
     CollectedHash *e = &kc->entries[kc->count++];
     memcpy(e->hash, hash, 16);
     e->shard_id = compute_record_shard(hash, kc->splits);
@@ -4058,7 +4134,10 @@ int keyset_to_collected_hashes(KeySet *ks, int splits,
     size_t cap = keyset_size(ks);
     if (cap == 0) { *out_entries = NULL; *out_count = 0; return 0; }
     CollectedHash *entries = malloc(cap * sizeof(CollectedHash));
-    if (!entries) return -1;
+    if (!entries) {
+        LOG_ERROR(LOG_SUB_QUERY, "keyset_to_collected_hashes: malloc failed for cap=%zu", cap);
+        return -1;
+    }
     KeysetToBatchCtx kc = { entries, 0, cap, splits };
     keyset_iter(ks, keyset_to_batch_cb, &kc);
     *out_entries = entries;
@@ -4092,7 +4171,10 @@ static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, vo
     (void)val; (void)vlen;
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
     if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
-    if (keyset_insert(w->ks, hash16) < 0) return -1;
+    if (keyset_insert(w->ks, hash16) < 0) {
+        LOG_WARN(LOG_SUB_QUERY, "or_collect_cb: destination keyset capacity exhausted");
+        return -1;
+    }
     if (w->target_count > 0 &&
         atomic_load_explicit(&w->ks->n, memory_order_relaxed) >= (size_t)w->target_count) {
         return -1;
@@ -4149,6 +4231,7 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
     size_t ks_cap_guess = est_total * 2; /* keyset_new doubles + rounds up */
     size_t ks_bytes = ks_cap_guess * (sizeof(uint8_t[16]) + sizeof(uint32_t));
     if (ks_bytes > g_query_buffer_max_bytes) {
+        LOG_WARN(LOG_SUB_QUERY, "build_or_keyset: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes, g_query_buffer_max_bytes);
         if (out_budget_exceeded) *out_budget_exceeded = 1;
         return NULL;
     }
@@ -4156,7 +4239,10 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
     /* coverity[tainted_data] CID 1693838: est_total is bounded above by
        the explicit g_query_buffer_max_bytes check immediately above. */
     KeySet *ks = keyset_new(est_total);
-    if (!ks) return NULL;
+    if (!ks) {
+        LOG_ERROR(LOG_SUB_QUERY, "build_or_keyset: keyset_new(%zu) failed", est_total);
+        return NULL;
+    }
 
     OrChildWorkerCtx *ctxs = calloc(n, sizeof(OrChildWorkerCtx));
     for (int i = 0; i < n; i++) {
@@ -5145,6 +5231,7 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
                            pc, pc_tf, collect_hash_cb, &cc);
 
             if (cc.budget_exceeded) {
+                LOG_WARN(LOG_SUB_QUERY, "cmd_count: query buffer cap exceeded");
                 OUT(QUERY_BUFFER_ERR);
                 collect_ctx_destroy(&cc);
                 return -1;
@@ -5846,7 +5933,10 @@ static int d2_hash_idx_cmp(const void *a, const void *b) {
 
 static D2HashIdxEntry *d2_build_hash_map(const SmallPrefilterRow *rows, size_t n) {
     D2HashIdxEntry *map = malloc(n * sizeof(D2HashIdxEntry));
-    if (!map) return NULL;
+    if (!map) {
+        LOG_ERROR(LOG_SUB_QUERY, "d2_build_hash_map: malloc failed for n=%zu entries", n);
+        return NULL;
+    }
     for (size_t i = 0; i < n; i++) {
         memcpy(map[i].hash, rows[i].hash, 16);
         map[i].idx = (int)i;
@@ -6003,11 +6093,17 @@ static void *cursor_fetch_worker(void *arg) {
         .streams = ctx->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(ctx->db_root, ctx->object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "cursor_fetch_worker: slotcask_registry_get failed for %s/%s", ctx->db_root, ctx->object);
+        return NULL;
+    }
 
     /* Extract hashes from entries */
     uint8_t (*hashes)[16] = malloc((size_t)ctx->entry_count * sizeof(*hashes));
-    if (!hashes) return NULL;
+    if (!hashes) {
+        LOG_ERROR(LOG_SUB_QUERY, "cursor_fetch_worker: malloc failed for entry_count=%d", ctx->entry_count);
+        return NULL;
+    }
     for (int i = 0; i < ctx->entry_count; i++)
         memcpy(hashes[i], ctx->entries[i].hash, 16);
 
@@ -7854,6 +7950,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         scan_dispatch(db_root, object, &sch, data_dir, ordered_collect_cb, &oc);
 
         if (oc.budget_exceeded) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during ordered sort/fetch (object=%s)", object);
             for (size_t i = 0; i < oc.count; i++) {
                 free(oc.rows[i].key); free(oc.rows[i].record); free(oc.rows[i].sort_str);
             }
@@ -8098,6 +8195,7 @@ static int cmd_find_do(const char *db_root, const char *object,
 
         find_emit_close:
         if (rc == -2) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: scan_shards returned rc=-2 (query buffer cap exceeded, object=%s)", object);
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
             else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
@@ -8116,6 +8214,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                             want_total ? &find_total : NULL);
         if (!budget_exceeded && want_total && !dl.timed_out) find_total_null = 0;
         if (budget_exceeded) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during OR union (object=%s)", object);
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
             if (csv_delim) { /* no envelope to close */ }
             else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");

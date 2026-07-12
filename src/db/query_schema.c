@@ -204,8 +204,12 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
     }
 
     FILE *fin = fopen(fpath, "r");
+    int fin_errno = errno;
     FILE *fout = fopen(fpath_new, "w");
+    int fout_errno = errno;
     if (!fin || !fout) {
+        if (!fin) LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: fopen %s failed: %s", fpath, strerror(fin_errno));
+        if (!fout) LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: fopen %s failed: %s", fpath_new, strerror(fout_errno));
         if (fin) fclose(fin);
         if (fout) fclose(fout);
         return -1;
@@ -250,6 +254,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
     fclose(fin);
     fclose(fout);
     if (rename(fpath_new, fpath) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: rename %s -> %s failed: %s", fpath_new, fpath, strerror(errno));
         unlink(fpath_new);
         return -1;
     }

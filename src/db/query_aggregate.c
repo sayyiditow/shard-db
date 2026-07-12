@@ -233,7 +233,10 @@ static void *agg_arena_alloc(AggArena *a, size_t bytes) {
     size_t new_cap = prev_cap * 2;
     if (new_cap < bytes) new_cap = bytes;
     AggArenaSlab *s = malloc(sizeof(AggArenaSlab) + new_cap);
-    if (!s) return NULL;
+    if (!s) {
+        LOG_ERROR(LOG_SUB_QUERY, "agg_arena_alloc: malloc %zu bytes failed", new_cap);
+        return NULL;
+    }
     s->next = a->head;
     s->used = bytes;
     s->cap = new_cap;
@@ -316,9 +319,15 @@ typedef struct {
 TOPN_VIS void *topn_heap_new(int cap, int order_desc) {
     if (cap <= 0) return NULL;
     TopNHeap *h = calloc(1, sizeof(TopNHeap));
-    if (!h) return NULL;
+    if (!h) {
+        LOG_ERROR(LOG_SUB_QUERY, "topn_heap_new: calloc TopNHeap failed (cap=%d)", cap);
+        return NULL;
+    }
     h->entries = calloc((size_t)cap + 1, sizeof(TopNHeapEntry));
-    if (!h->entries) { free(h); return NULL; }
+    if (!h->entries) {
+        LOG_ERROR(LOG_SUB_QUERY, "topn_heap_new: calloc %d entries failed", cap);
+        free(h); return NULL;
+    }
     h->cap = cap;
     h->size = 0;
     h->order_desc = order_desc;
@@ -606,7 +615,10 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
 
     if (new_group) {
         c->current_key = malloc(enc_val_len + 1);
-        if (!c->current_key) return -1;
+        if (!c->current_key) {
+            LOG_ERROR(LOG_SUB_QUERY, "topn_walk_cb: malloc %zu bytes failed", enc_val_len + 1);
+            return -1;
+        }
         memcpy(c->current_key, enc_val, enc_val_len);
         c->current_key[enc_val_len] = '\0';
         c->current_key_len = enc_val_len;
@@ -773,6 +785,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     if (prefilter) keyset_free(prefilter);
 
     if (dl->timed_out) {
+        LOG_WARN(LOG_SUB_QUERY, "top-N group-by aggregate: query deadline exceeded");
         topn_heap_destroy(heap);
         return -1;
     }
@@ -786,6 +799,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     double  *mins    = calloc((size_t)n_out + 1, sizeof(double));
     double  *maxs    = calloc((size_t)n_out + 1, sizeof(double));
     if (!metrics || !gkeys || !gklens || !counts || !sums || !mins || !maxs) {
+        LOG_ERROR(LOG_SUB_QUERY, "top-N drain: calloc failed for n_out=%d", n_out);
         free(metrics); free(gkeys); free(gklens);
         free(counts); free(sums); free(mins); free(maxs);
         topn_heap_destroy(heap);
@@ -1379,6 +1393,7 @@ static int hbk_init(HashBktMap *m, size_t cap_hint) {
     while (cap * 3 < cap_hint * 4) cap <<= 1;
     m->entries = calloc(cap, sizeof(HashBktEntry));
     if (!m->entries) {
+        LOG_ERROR(LOG_SUB_QUERY, "hbk_init: calloc cap=%zu failed", cap);
         m->cap = m->mask = 0;
         return -1;
     }
@@ -1452,6 +1467,7 @@ static int hsm_init(HashStrMap *m, size_t cap_hint, size_t arena_hint) {
     if (arena_hint < 1024) arena_hint = 1024;
     m->arena = malloc(arena_hint);
     if (!m->entries || !m->arena) {
+        LOG_ERROR(LOG_SUB_QUERY, "hsm_init: alloc failed (cap=%zu, arena_hint=%zu)", cap, arena_hint);
         free(m->entries); m->entries = NULL;
         free(m->arena); m->arena = NULL;
         m->cap = m->mask = m->arena_used = m->arena_cap = 0;
@@ -1479,7 +1495,10 @@ static int hsm_insert(HashStrMap *m, const uint8_t hash[16],
         size_t new_cap = m->arena_cap;
         while (m->arena_used + vlen > new_cap) new_cap *= 2;
         char *na = realloc(m->arena, new_cap);
-        if (!na) return -1;
+        if (!na) {
+            LOG_ERROR(LOG_SUB_QUERY, "hsm_insert: realloc arena to %zu failed", new_cap);
+            return -1;
+        }
         m->arena = na;
         m->arena_cap = new_cap;
     }
@@ -1622,7 +1641,10 @@ static void *wfc_worker(void *arg) {
                    w->db_root, w->object, w->agg_field, w->shard_id);
     BtRangeIter *it = btree_range_iter_open(
         idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, w->desc);
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_QUERY, "wfc_worker: btree_range_iter_open %s failed", idx_path);
+        return NULL;
+    }
 
     const char *val; size_t vlen; const uint8_t *hash16;
     int walks = 0;
@@ -1693,7 +1715,10 @@ static void *awc_shard_worker(void *raw) {
                    a->db_root, a->object, a->fld, a->shard_id);
     BtRangeIter *it = btree_range_iter_open(
         idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_QUERY, "awc_shard_worker: btree_range_iter_open %s failed", idx_path);
+        return NULL;
+    }
     const char *val; size_t vlen; const uint8_t *hash16;
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         if (query_deadline_tick(a->deadline, &a->dl_counter)) break;
@@ -1886,6 +1911,7 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
 
     /* Lazy-init on first insert so an empty AggCtx pays no allocation. */
     if (!ctx->ht && agg_ht_lazy_init(ctx) != 0) {
+        LOG_ERROR(LOG_SUB_QUERY, "agg_find_or_create: agg_ht_lazy_init failed (OOM), reported to client as buffer-exceeded");
         ctx->budget_exceeded = 1;
         return NULL;
     }
@@ -1920,6 +1946,7 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
         size_t prev = atomic_fetch_add_explicit(ctx->shared_buffer_bytes,
                                                 bucket_bytes, memory_order_relaxed);
         if (prev + bucket_bytes > g_query_buffer_max_bytes) {
+            LOG_WARN(LOG_SUB_QUERY, "agg_find_or_create: query buffer cap exceeded at bucket_bytes=%zu (prev=%zu, cap=%zu)", bucket_bytes, prev, g_query_buffer_max_bytes);
             atomic_fetch_sub_explicit(ctx->shared_buffer_bytes,
                                       bucket_bytes, memory_order_relaxed);
             ctx->budget_exceeded = 1;
@@ -2414,11 +2441,17 @@ static void *shard_agg_worker(void *arg) {
         .streams = sa->sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(sa->db_root, sa->object, &info);
-    if (!sdb) return NULL;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "shard_agg_worker: slotcask_registry_get failed for %s/%s", sa->db_root, sa->object);
+        return NULL;
+    }
 
     /* Extract hashes from entries */
     uint8_t (*hashes)[16] = malloc((size_t)sa->entry_count * sizeof(*hashes));
-    if (!hashes) return NULL;
+    if (!hashes) {
+        LOG_ERROR(LOG_SUB_QUERY, "shard_agg_worker: malloc %d hashes failed", sa->entry_count);
+        return NULL;
+    }
     for (int ei = 0; ei < sa->entry_count; ei++)
         memcpy(hashes[ei], sa->entries[ei].hash, 16);
 
@@ -2769,7 +2802,10 @@ static void *sec_map_build_worker(void *arg) {
                    w->gfield_s, w->shard_id);
     BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
                                              "\xff\xff\xff\xff", 4, 0, 0);
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_QUERY, "sec_map_build_worker: btree_range_iter_open %s failed", idx_path);
+        return NULL;
+    }
     const char *val; size_t vlen; const uint8_t *hash16;
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         if (query_deadline_tick(w->dl, &w->dl_counter)) {
@@ -2828,7 +2864,10 @@ static void *igb_pass1_worker(void *arg) {
                    w->gfield, w->shard_id);
     BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
                                              "\xff\xff\xff\xff", 4, 0, 0);
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_QUERY, "igb_pass1_worker: btree_range_iter_open %s failed", idx_path);
+        return NULL;
+    }
     char prev_enc[64]; size_t prev_enc_len = 0;
     struct AggBucket *prev_bkt = NULL;
     const char *val; size_t vlen; const uint8_t *hash16;
@@ -2911,7 +2950,10 @@ static int bktarr_push(BktArr *a, AggBucket *b) {
     if (a->count >= a->cap) {
         int new_cap = a->cap == 0 ? 64 : a->cap * 2;
         AggBucket **nb = realloc(a->arr, (size_t)new_cap * sizeof(AggBucket *));
-        if (!nb) return -1;
+        if (!nb) {
+            LOG_ERROR(LOG_SUB_QUERY, "bktarr_push: realloc to cap=%d failed", new_cap);
+            return -1;
+        }
         a->arr = nb;
         a->cap = new_cap;
     }
@@ -3051,7 +3093,10 @@ static void *agg_single_shard_worker(void *raw) {
        path here to reuse its DESC handling via v3 last_leaf_page. */
     BtRangeIter *it = btree_range_iter_open(
         idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, a->desc);
-    if (!it) return NULL;
+    if (!it) {
+        LOG_ERROR(LOG_SUB_QUERY, "agg_single_shard_worker: btree_range_iter_open failed");
+        return NULL;
+    }
 
     const char *val; size_t vlen; const uint8_t *hash16;
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -3796,6 +3841,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 }
                 free(wargs);
                 if (dl.timed_out) {
+                    LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (single-shard fast path)");
                     OUT("{\"error\":\"query_timeout\"}\n");
                     return -1;
                 }
@@ -3993,6 +4039,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             btree_dispatch(db_root, object, pos.field, sch.splits,
                            &pos, pos_tf, idx_count_cb, &ic);
             if (dl.timed_out) {
+                LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (NEQ split-plan position check)");
                 OUT("{\"error\":\"query_timeout\"}\n");
                 agg_free(&ctx); return -1;
             }
@@ -4041,12 +4088,14 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         if (rc_eq == 0) (void)agg_run_plan(&ctx_full, NULL, db_root, object, &sch);
 
         if (dl.timed_out) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (NEQ split-plan)");
             OUT("{\"error\":\"query_timeout\"}\n");
             agg_ctx_free_local(&ctx_full);
             agg_free(&ctx);
             return -1;
         }
         if (ctx.budget_exceeded || ctx_full.budget_exceeded) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query buffer cap exceeded (NEQ split-plan)");
             OUT(QUERY_BUFFER_ERR);
             agg_ctx_free_local(&ctx_full);
             agg_free(&ctx);
@@ -4270,6 +4319,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                         calloc((size_t)n_idx, sizeof(*w_present));
                     if (!wargs || !w_counts || !w_sums || !w_mins ||
                         !w_maxs || !w_present) {
+                        LOG_ERROR(LOG_SUB_QUERY, "cmd_aggregate_do: calloc failed for n_idx=%d shard workers", n_idx);
                         free(wargs); free(w_counts); free(w_sums);
                         free(w_mins); free(w_maxs); free(w_present);
                         keyset_free(crit_ks);
@@ -5603,8 +5653,13 @@ igb_skip:
         /* fast path populated ctx — skip agg_run_plan, fall through to
            the shared having / sort / limit / emit pipeline below. */
     } else if (agg_run_plan(&ctx, tree, db_root, object, &sch) != 0) {
-        if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else if (ctx.budget_exceeded) OUT(QUERY_BUFFER_ERR);
+        if (dl.timed_out) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded");
+            OUT("{\"error\":\"query_timeout\"}\n");
+        } else if (ctx.budget_exceeded) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query buffer cap exceeded");
+            OUT(QUERY_BUFFER_ERR);
+        }
         agg_free(&ctx);
         return -1;
     }
@@ -5909,6 +5964,7 @@ int cmd_aggregate_tree(const char *db_root, const char *object,
     /* Convert NqlAggSpec[] to AggSpec[] */
     AggSpec *specs = calloc(naggs, sizeof(AggSpec));
     if (!specs) {
+        LOG_ERROR(LOG_SUB_QUERY, "cmd_aggregate_tree: calloc %d AggSpec failed", naggs);
         OUT("{\"error\":\"out of memory\"}\n");
         return -1;
     }

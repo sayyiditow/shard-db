@@ -439,7 +439,10 @@ int scan_dispatch(const char *db_root, const char *object,
         .streams = sc->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "scan_dispatch: slotcask_registry_get failed for %s/%s", db_root, object);
+        return -1;
+    }
     scan_shards_v2_o_direct(sdb, cb, ctx);
     return 0;
 }
@@ -484,7 +487,10 @@ int read_record_ref(const char *db_root, const char *object,
         .streams = sch->streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) return -1;
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "read_record_ref: slotcask_registry_get failed for %s/%s", db_root, object);
+        return -1;
+    }
     slotcask_lookup_by_hash(sdb, hash, v2_record_capture_cb, out);
     return out->v2_buf ? 0 : -1;
 }
@@ -545,10 +551,16 @@ char *json_escape_field(char *v) {
     if (!v) return NULL;
     size_t len = strlen(v);
     char *esc = malloc(len * 6 + 1);
-    if (!esc) { free(v); return NULL; }
+    if (!esc) {
+        LOG_ERROR(LOG_SUB_QUERY, "json_escape_field: malloc %zu bytes failed", len * 6 + 1);
+        free(v); return NULL;
+    }
     int n = json_escape_into(esc, len * 6 + 1, v, len);
     free(v);
-    if (n < 0) { free(esc); return NULL; }
+    if (n < 0) {
+        LOG_ERROR(LOG_SUB_QUERY, "json_escape_field: json_escape_into overflowed a %zu-byte buffer", len * 6 + 1);
+        free(esc); return NULL;
+    }
     esc[n] = '\0';
     return esc;
 }
@@ -557,9 +569,15 @@ char *json_escape_const(const char *v) {
     if (!v) return NULL;
     size_t len = strlen(v);
     char *esc = malloc(len * 6 + 1);
-    if (!esc) return NULL;
+    if (!esc) {
+        LOG_ERROR(LOG_SUB_QUERY, "json_escape_const: malloc %zu bytes failed", len * 6 + 1);
+        return NULL;
+    }
     int n = json_escape_into(esc, len * 6 + 1, v, len);
-    if (n < 0) { free(esc); return NULL; }
+    if (n < 0) {
+        LOG_ERROR(LOG_SUB_QUERY, "json_escape_const: json_escape_into overflowed a %zu-byte buffer", len * 6 + 1);
+        free(esc); return NULL;
+    }
     esc[n] = '\0';
     return esc;
 }
@@ -614,12 +632,18 @@ int update_schema_conf_splits_streams(const char *db_root, const char *object,
     int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
 
     FILE *fin = fopen(conf, "r");
-    if (!fin) return -1;
+    if (!fin) {
+        LOG_ERROR(LOG_SUB_CONFIG, "update_schema_conf_splits_streams: fopen %s failed: %s", conf, strerror(errno));
+        return -1;
+    }
     int lockfd = fileno(fin);
     flock(lockfd, LOCK_EX);
 
     FILE *fout = fopen(tmp, "w");
-    if (!fout) { flock(lockfd, LOCK_UN); fclose(fin); return -1; }
+    if (!fout) {
+        LOG_ERROR(LOG_SUB_CONFIG, "update_schema_conf_splits_streams: fopen %s failed: %s", tmp, strerror(errno));
+        flock(lockfd, LOCK_UN); fclose(fin); return -1;
+    }
 
     char line[512];
     int replaced = 0;

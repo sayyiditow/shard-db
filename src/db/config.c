@@ -557,7 +557,10 @@ int dirs_add(const char *db_root, const char *dir) {
             return 1;  /* already exists */
         }
     }
-    if (free_slot < 0) { pthread_mutex_unlock(&g_dirs_lock); return -1; }
+    if (free_slot < 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "dirs_add: no free slot for dir [%s]; DIRS_BUCKETS (%d) exhausted", dir, DIRS_BUCKETS);
+        pthread_mutex_unlock(&g_dirs_lock); return -1;
+    }
     strncpy(g_dirs[free_slot], dir, 255);
     g_dirs[free_slot][255] = '\0';
     g_dirs_used[free_slot] = 1;
@@ -2195,6 +2198,7 @@ static void gen_datetimems_now(char *buf, size_t bufsz) {
 
 int gen_uuid4_raw(uint8_t out[16]) {
     if (fill_random(out, 16) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "gen_uuid4_raw: fill_random(16) failed: %s", strerror(errno));
         memset(out, 0, 16);   /* defense in depth — callers must check rc */
         return -1;
     }
@@ -2206,7 +2210,10 @@ int gen_uuid4_raw(uint8_t out[16]) {
 int gen_uuid4_batch(uint8_t *out, size_t n) {
     if (n == 0) return 0;
     if (n > SIZE_MAX / 16) return -1;
-    if (fill_random(out, n * 16) != 0) return -1;
+    if (fill_random(out, n * 16) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "gen_uuid4_batch: fill_random(%zu) failed: %s", n * 16, strerror(errno));
+        return -1;
+    }
     for (size_t i = 0; i < n; i++) {
         out[i * 16 + 6] = (out[i * 16 + 6] & 0x0F) | 0x40;
         out[i * 16 + 8] = (out[i * 16 + 8] & 0x3F) | 0x80;
@@ -2292,12 +2299,18 @@ void format_seq_key(int64_t v, char out[24]) {
 int format_wire_key(const Schema *sc, const char *key, size_t klen,
                     char *out, size_t outcap) {
     if (sc && sc->auto_key == AK_UUID) {
-        if (klen != 16 || outcap < 37) return -1;
+        if (klen != 16 || outcap < 37) {
+            LOG_WARN(LOG_SUB_CONFIG, "format_wire_key: AK_UUID key length mismatch (klen=%zu, outcap=%zu)", klen, outcap);
+            return -1;
+        }
         format_uuid_string((const uint8_t *)key, out);
         return 36;
     }
     if (sc && sc->auto_key == AK_SEQ) {
-        if (klen != 8 || outcap < 24) return -1;
+        if (klen != 8 || outcap < 24) {
+            LOG_WARN(LOG_SUB_CONFIG, "format_wire_key: AK_SEQ key length mismatch (klen=%zu, outcap=%zu)", klen, outcap);
+            return -1;
+        }
         int64_t v = 0;
         for (int i = 0; i < 8; i++)
             v = (v << 8) | (uint8_t)key[i];
@@ -2305,7 +2318,10 @@ int format_wire_key(const Schema *sc, const char *key, size_t klen,
         return (int)strlen(out);
     }
     /* AK_NONE: verbatim copy (key is a regular string). */
-    if (klen + 1 > outcap) return -1;
+    if (klen + 1 > outcap) {
+        LOG_WARN(LOG_SUB_CONFIG, "format_wire_key: output buffer too small for key (klen=%zu, outcap=%zu)", klen, outcap);
+        return -1;
+    }
     memcpy(out, key, klen);
     out[klen] = '\0';
     return (int)klen;
@@ -2333,7 +2349,10 @@ long long seq_next_val(const char *db_root, const char *object, const char *seq_
     snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", seq_dir, seq_name);
 
     int lockfd = open(lock_path, O_RDWR | O_CREAT, 0644);
-    if (lockfd < 0) return -1;
+    if (lockfd < 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "seq_next_val: open(%s): %s", lock_path, strerror(errno));
+        return -1;
+    }
     flock(lockfd, LOCK_EX);
 
     long long val = 0;
@@ -2362,13 +2381,17 @@ long long seq_next_val_batch(const char *db_root, const char *object,
     snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", seq_dir, seq_name);
 
     int lockfd = open(lock_path, O_RDWR | O_CREAT, 0644);
-    if (lockfd < 0) return -1;
+    if (lockfd < 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "seq_next_val_batch: open(%s): %s", lock_path, strerror(errno));
+        return -1;
+    }
     flock(lockfd, LOCK_EX);
 
     long long val = 0;
     FILE *f = fopen(seq_path, "r");
     if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
     if (val < 0 || (long long)n > LLONG_MAX - val - 1) {
+        LOG_ERROR(LOG_SUB_CONFIG, "seq_next_val_batch: sequence [%s] corrupt or exhausted (val=%lld, n=%d)", seq_name, val, n);
         flock(lockfd, LOCK_UN);
         close(lockfd);
         return -1;
@@ -2611,11 +2634,17 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         if (content_max < 0) content_max = 0;
         if (len > content_max) len = content_max;  /* defensive */
         if (len == 0) return 0;
-        if (buflen < 4) return -1;  /* "" + NUL */
+        if (buflen < 4) {
+            LOG_ERROR(LOG_SUB_CONFIG, "decode_field_to_buf: buffer too small for field [%s] (buflen=%d, need>=4)", f->name, buflen);
+            return -1;  /* "" + NUL */
+        }
         buf[0] = '"';
         int esc = json_escape_into(buf + 1, (size_t)buflen - 3,
                                    (const char *)(data + 2), (size_t)len);
-        if (esc < 0) return -1;
+        if (esc < 0) {
+            LOG_ERROR(LOG_SUB_CONFIG, "decode_field_to_buf: json_escape_into overflow for field [%s] (len=%d, buflen=%d)", f->name, len, buflen);
+            return -1;
+        }
         buf[1 + esc] = '"';
         buf[2 + esc] = '\0';   /* caller renders with %s */
         return 2 + esc;
@@ -2767,10 +2796,16 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         /* Escape per RFC 8259 — enum value strings are user-supplied
            at create-object, may carry quotes/backslashes/control chars.
            Same buffer-sizing contract as FT_VARCHAR. */
-        if (buflen < 4) return -1;
+        if (buflen < 4) {
+            LOG_ERROR(LOG_SUB_CONFIG, "decode_field_to_buf: buffer too small for enum field [%s] (buflen=%d, need>=4)", f->name, buflen);
+            return -1;
+        }
         buf[0] = '"';
         int esc = json_escape_into(buf + 1, (size_t)buflen - 3, s, strlen(s));
-        if (esc < 0) return -1;
+        if (esc < 0) {
+            LOG_ERROR(LOG_SUB_CONFIG, "decode_field_to_buf: json_escape_into overflow for enum field [%s] value [%s]", f->name, s);
+            return -1;
+        }
         buf[1 + esc] = '"';
         buf[2 + esc] = '\0';
         return 2 + esc;
@@ -2978,7 +3013,10 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         int hh = ms / 3600000, mm = (ms % 3600000) / 60000,
             ss = (ms % 60000) / 1000, fff = ms % 1000;
         char *out = malloc(18);
-        if (!out) return NULL;
+        if (!out) {
+            LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(18) failed for field [%s]", f->name);
+            return NULL;
+        }
         snprintf(out, 18, "%08d%02d%02d%02d%03d", dv, hh, mm, ss, fff);
         return out;
     }
@@ -3003,8 +3041,12 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0)
             return NULL;
         char *out = malloc(INET_ADDRSTRLEN);
-        if (!out) return NULL;
+        if (!out) {
+            LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET_ADDRSTRLEN) failed for field [%s]", f->name);
+            return NULL;
+        }
         if (!inet_ntop(AF_INET, ip, out, INET_ADDRSTRLEN)) {
+            LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: inet_ntop(AF_INET) failed for field [%s]: %s", f->name, strerror(errno));
             free(out);
             return NULL;
         }
@@ -3016,8 +3058,12 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         for (int bi = 0; bi < 16; bi++) if (ip[bi] != 0) { allzero = 0; break; }
         if (allzero) return NULL;
         char *out = malloc(INET6_ADDRSTRLEN);
-        if (!out) return NULL;
+        if (!out) {
+            LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET6_ADDRSTRLEN) failed for field [%s]", f->name);
+            return NULL;
+        }
         if (!inet_ntop(AF_INET6, ip, out, INET6_ADDRSTRLEN)) {
+            LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: inet_ntop(AF_INET6) failed for field [%s]: %s", f->name, strerror(errno));
             free(out);
             return NULL;
         }
@@ -3107,7 +3153,10 @@ static int replace_tokens(const char *in, const char *old_name, const char *new_
         } else {
             src = p; srclen = toklen;
         }
-        if (pos + srclen + 2 >= outcap) return -1; /* overflow */
+        if (pos + srclen + 2 >= outcap) {
+            LOG_WARN(LOG_SUB_CONFIG, "replace_tokens: output would overflow (in=[%s], old=[%s], new=[%s], outcap=%zu)", in, old_name, new_name, outcap);
+            return -1; /* overflow */
+        }
         memcpy(out + pos, src, srclen); pos += srclen;
         if (sep) { out[pos++] = '+'; p = sep + 1; }
         else break;
@@ -3171,7 +3220,10 @@ static int rename_indexes_for_field(const char *db_root, const char *object,
     char newconf_path[PATH_MAX];
     snprintf(newconf_path, sizeof(newconf_path), "%s.new", conf_path);
     FILE *nf = fopen(newconf_path, "w");
-    if (!nf) { fclose(f); return -1; }
+    if (!nf) {
+        LOG_ERROR(LOG_SUB_CONFIG, "rename_indexes_for_field: fopen(%s, \"w\"): %s", newconf_path, strerror(errno));
+        fclose(f); return -1;
+    }
 
     char line[512], newline[512];
     while (fgets(line, sizeof(line), f)) {
