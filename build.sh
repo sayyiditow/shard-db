@@ -214,6 +214,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_tls.c \
     src/test/cases/test_restore.c \
     src/test/cases/test_auto_vacuum.c \
+    src/test/cases/test_reshard_target.c \
+    src/test/cases/test_auto_reshard.c \
+    src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
     src/test/cases/test_index_splits_curve.c \
     src/test/cases/test_range_coalesce.c \

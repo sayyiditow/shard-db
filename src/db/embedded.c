@@ -49,6 +49,8 @@ static void db_defaults_set(ShardDb *db) {
     db->vacuum_recommend_pct      = 10;
     db->vacuum_recommend_min_deleted = 1000;
     db->auto_vacuum_interval_sec  = 3600;
+    db->auto_reshard_hour         = 3;
+    db->auto_reshard_throttle_ms  = 0;
     db->log_level                 = 3;
     db->log_retain_days           = 7;
     db->index_page_size           = 4096;

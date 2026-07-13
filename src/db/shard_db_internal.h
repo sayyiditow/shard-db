@@ -156,6 +156,9 @@ struct ShardDb {
     int vacuum_recommend_min_deleted;
     int auto_vacuum_enable;
     int auto_vacuum_interval_sec;
+    int auto_reshard_enable;
+    int auto_reshard_hour;
+    int auto_reshard_throttle_ms;
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
@@ -309,6 +312,9 @@ extern __thread ShardDb *g_db;
 #define g_vacuum_recommend_min_deleted (g_db->vacuum_recommend_min_deleted)
 #define g_auto_vacuum_enable        (g_db->auto_vacuum_enable)
 #define g_auto_vacuum_interval_sec  (g_db->auto_vacuum_interval_sec)
+#define g_auto_reshard_enable       (g_db->auto_reshard_enable)
+#define g_auto_reshard_hour         (g_db->auto_reshard_hour)
+#define g_auto_reshard_throttle_ms  (g_db->auto_reshard_throttle_ms)
 #define g_warmup_mode               (g_db->warmup_mode)
 #define g_log_level                 (g_db->log_level)
 #define g_log_retain_days           (g_db->log_retain_days)

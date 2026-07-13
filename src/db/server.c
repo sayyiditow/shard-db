@@ -2856,6 +2856,77 @@ done_collect:
     return NULL;
 }
 
+/* Shared dir/object enumeration walk used by every periodic background
+   maintenance thread that needs to visit all (dir, object) pairs
+   (auto_vacuum_thread, auto_reshard_thread): snapshot g_dirs under
+   g_dirs_lock, then for every object whose fields.conf exists invoke
+   fn(dir_name, eff, obj_name, ctx). Keeps the snapshot-under-lock +
+   readdir + fields.conf-exists-probe mechanics in exactly one place
+   instead of duplicated per thread. Returns the number of objects
+   visited (scanned), for the caller's own tick-summary log line. */
+typedef void (*SweepObjectFn)(const char *dir_name, const char *eff,
+                                const char *obj_name, void *ctx);
+
+static int sweep_all_objects(const char *db_root, SweepObjectFn fn, void *ctx) {
+    char dirs_copy[DIRS_BUCKETS][256];
+    int used_copy[DIRS_BUCKETS];
+    pthread_mutex_lock(&g_dirs_lock);
+    memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
+    memcpy(used_copy, g_dirs_used, sizeof(used_copy));
+    pthread_mutex_unlock(&g_dirs_lock);
+
+    int scanned = 0;
+    for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
+        if (!used_copy[di]) continue;
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, dirs_copy[di]);
+        DIR *dd = opendir(dir_path);
+        if (!dd) continue;
+        struct dirent *de;
+        while ((de = readdir(dd)) && server_running) {
+            if (de->d_name[0] == '.') continue;
+            char obj_check[PATH_MAX];
+            snprintf(obj_check, sizeof(obj_check),
+                     "%s/%s/fields.conf", dir_path, de->d_name);
+            struct stat ost;
+            if (stat(obj_check, &ost) != 0) continue;
+            scanned++;
+
+            char eff[PATH_MAX];
+            snprintf(eff, sizeof(eff), "%s/%s", db_root, dirs_copy[di]);
+            fn(dirs_copy[di], eff, de->d_name, ctx);
+        }
+        closedir(dd);
+    }
+    return scanned;
+}
+
+typedef struct { int vacuumed; } AutoVacuumSweepCtx;
+
+static void auto_vacuum_sweep_one(const char *dir_name, const char *eff,
+                                    const char *obj_name, void *ctx_) {
+    AutoVacuumSweepCtx *ctx = (AutoVacuumSweepCtx *)ctx_;
+    int count = get_live_count(eff, obj_name);
+    int deleted = get_deleted_count(eff, obj_name);
+    int total = count + deleted;
+    int recommend = (deleted >= g_vacuum_recommend_min_deleted
+                     && total > 0
+                     && deleted * 100 >= total * g_vacuum_recommend_pct);
+    if (!recommend) return;
+    /* recommend already implies total > 0 (see the
+       g_vacuum_recommend_min_deleted >= deleted check and total > 0
+       gate above), so the divide is safe. */
+    int pct_observed = (deleted * 100) / total;
+    LOG_INFO(LOG_SUB_VACUUM,
+        "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
+        dir_name, obj_name, count, deleted, pct_observed);
+    uint64_t obj_t0 = now_ms();
+    cmd_vacuum(eff, obj_name, 0, 0);
+    LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM done %s/%s in %lums",
+            dir_name, obj_name, (unsigned long)(now_ms() - obj_t0));
+    ctx->vacuumed++;
+}
+
 static void *auto_vacuum_thread(void *arg) {
     AutoVacuumArg *a = (AutoVacuumArg *)arg;
 
@@ -2877,62 +2948,145 @@ static void *auto_vacuum_thread(void *arg) {
             sleep(1);
         if (!server_running) break;
 
-        /* Snapshot dir table so we don't hold g_dirs_lock for the full sweep
-           (mirrors the vacuum-check handler). */
-        char dirs_copy[DIRS_BUCKETS][256];
-        int used_copy[DIRS_BUCKETS];
-        pthread_mutex_lock(&g_dirs_lock);
-        memcpy(dirs_copy, g_dirs, sizeof(dirs_copy));
-        memcpy(used_copy, g_dirs_used, sizeof(used_copy));
-        pthread_mutex_unlock(&g_dirs_lock);
+        uint64_t tick_t0 = now_ms();
+        AutoVacuumSweepCtx ctx = {0};
+        int scanned = sweep_all_objects(a->db_root, auto_vacuum_sweep_one, &ctx);
+        LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM tick: scanned=%d vacuumed=%d in %lums",
+                scanned, ctx.vacuumed, (unsigned long)(now_ms() - tick_t0));
+    }
+
+    if (g_out && g_out != stderr) fclose(g_out);
+    return NULL;
+}
+
+/* Background auto-reshard thread.
+ *
+ * Wall-clock-gated (server-local time): once per calendar day, during
+ * hour g_auto_reshard_hour, uses sweep_all_objects to walk every
+ * (dir, object) and calls auto_reshard_sweep_one per candidate, which
+ * compares its live record count against reshard_target_for_count()'s
+ * recommended `splits`. If the object has outgrown its current
+ * `splits`, runs `vacuum --splits=target` (a full reshard) on it.
+ *
+ * Unlike auto_vacuum_thread, this DOES run the heavy --splits path —
+ * that's the entire point of this feature. vacuum --splits holds the
+ * object's exclusive objlock for the full rehash (objlock_wrlock, see
+ * auto_reshard_sweep_one), so reads/writes to that object block until
+ * it completes; each reshard is logged loudly (LOG_WARN) immediately
+ * before it starts, precisely because this is a deliberate, opt-in
+ * exception to auto_vacuum_thread's own "never auto-run --splits" rule
+ * (see the comment above that function).
+ *
+ * The in-memory last_run_date guard means a restart during the trigger
+ * hour can re-run the same night's sweep — acceptable, since re-checking
+ * an object already at its target `splits` is a cheap get_live_count +
+ * table lookup, not a rebuild.
+ *
+ * A fixed 5s startup delay runs before the first wall-clock check (see
+ * below). Unlike auto_vacuum_thread's plain interval loop, this thread
+ * has a once-per-calendar-day guard (last_run_date) — if its very first
+ * tick lands during the matching hour before daemon startup has fully
+ * settled (e.g. objects the sweep should act on don't exist yet), it
+ * scans, finds nothing eligible, sets last_run_date, and won't check
+ * again until the next day. The 5s delay gives startup (and, in tests,
+ * the harness setting up fixtures against a just-started daemon) room
+ * to finish before the first tick can ever fire. Negligible in
+ * production (5s once, before an opt-in nightly maintenance thread).
+ *
+ * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0)
+ * brings shutdown latency down to <1s. Detached — no join on shutdown.
+ */
+typedef struct {
+    char db_root[PATH_MAX];
+} AutoReshardArg;
+
+typedef struct { int reshaped; } AutoReshardSweepCtx;
+
+static void auto_reshard_sweep_one(const char *dir_name, const char *eff,
+                                    const char *obj_name, void *ctx_) {
+    AutoReshardSweepCtx *ctx = (AutoReshardSweepCtx *)ctx_;
+    Schema sch = load_schema(eff, obj_name);
+    if (sch.splits <= 0) return;  /* mid-create or dropped between the stat() probe and here */
+    long long live = get_live_count_ll_for_schema(eff, obj_name, &sch);
+    int target = reshard_target_for_count(live);
+    if (target <= sch.splits) return;
+
+    LOG_WARN(LOG_SUB_VACUUM,
+        "AUTO-RESHARD %s/%s: starting %d -> %d splits (live=%lld) "
+        "— object locked for the duration",
+        dir_name, obj_name, sch.splits, target, live);
+    uint64_t obj_t0 = now_ms();
+    objlock_wrlock(eff, obj_name);
+    int rc = cmd_vacuum(eff, obj_name, 0, target);
+    objlock_wrunlock(eff, obj_name);
+    if (rc == 0) {
+        LOG_INFO(LOG_SUB_VACUUM,
+            "AUTO-RESHARD %s/%s: %d -> %d splits done (live=%lld) in %lums",
+            dir_name, obj_name, sch.splits, target, live,
+            (unsigned long)(now_ms() - obj_t0));
+        ctx->reshaped++;
+        /* Pace consecutive reshards within the same sweep tick so a spike
+           that pushes many objects past their threshold on the same
+           night doesn't run their full rebuilds back-to-back with zero
+           recovery gap (see this task's doc comment for why this doesn't
+           contradict the design doc's "no time-box" decision). Sliced
+           into 1s chunks so shutdown (server_running=0) isn't delayed by
+           a long throttle value. */
+        for (int slept_ms = 0; slept_ms < g_auto_reshard_throttle_ms && server_running; slept_ms += 1000) {
+            struct timespec ts = { 1, 0 };
+            nanosleep(&ts, NULL);
+        }
+    } else {
+        LOG_ERROR(LOG_SUB_VACUUM,
+            "AUTO-RESHARD %s/%s: vacuum --splits=%d failed",
+            dir_name, obj_name, target);
+    }
+}
+
+static void *auto_reshard_thread(void *arg) {
+    AutoReshardArg *a = (AutoReshardArg *)arg;
+
+    /* Bind thread-local g_db so all g_* macros work. */
+    g_db = g_shard_db_instance;
+
+    /* Startup grace period — see the function doc comment above for why
+       this must run before the first wall-clock check, not just before
+       the loop's steady-state ticks. */
+    sleep(5);
+
+    /* Discard cmd_vacuum's JSON output — there's no client connection.
+       /dev/null open failure shouldn't kill the thread; fall back to
+       stderr (which the daemon redirects to /dev/null after fork). */
+    g_out = fopen("/dev/null", "w");
+    if (!g_out) g_out = stderr;
+
+    LOG_INFO(LOG_SUB_VACUUM, "AUTO-RESHARD thread started: hour=%d",
+            g_auto_reshard_hour);
+
+    char last_run_date[16] = "";
+
+    while (server_running) {
+        for (int i = 0; i < 1 && server_running; i++)
+            sleep(1);
+        if (!server_running) break;
+
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        if (tmv.tm_hour != g_auto_reshard_hour) continue;
+
+        char today[16];
+        snprintf(today, sizeof(today), "%04d-%02d-%02d",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+        if (strcmp(today, last_run_date) == 0) continue;
+        strncpy(last_run_date, today, sizeof(last_run_date) - 1);
+        last_run_date[sizeof(last_run_date) - 1] = '\0';
 
         uint64_t tick_t0 = now_ms();
-        int scanned = 0, vacuumed = 0;
-        for (int di = 0; di < DIRS_BUCKETS && server_running; di++) {
-            if (!used_copy[di]) continue;
-            char dir_path[PATH_MAX];
-            snprintf(dir_path, sizeof(dir_path), "%s/%s", a->db_root, dirs_copy[di]);
-            DIR *dd = opendir(dir_path);
-            if (!dd) continue;
-            struct dirent *de;
-            while ((de = readdir(dd)) && server_running) {
-                if (de->d_name[0] == '.') continue;
-                char obj_check[PATH_MAX];
-                snprintf(obj_check, sizeof(obj_check),
-                         "%s/%s/fields.conf", dir_path, de->d_name);
-                struct stat ost;
-                if (stat(obj_check, &ost) != 0) continue;
-                scanned++;
-
-                char eff[PATH_MAX];
-                snprintf(eff, sizeof(eff), "%s/%s", a->db_root, dirs_copy[di]);
-                int count = get_live_count(eff, de->d_name);
-                int deleted = get_deleted_count(eff, de->d_name);
-                int total = count + deleted;
-                int recommend = (deleted >= g_vacuum_recommend_min_deleted
-                                 && total > 0
-                                 && deleted * 100 >= total * g_vacuum_recommend_pct);
-                if (recommend) {
-                    /* recommend already implies total > 0 (see the
-                       g_vacuum_recommend_min_deleted >= deleted check
-                       and total > 0 gate above), so the divide is safe. */
-                    int pct_observed = (deleted * 100) / total;
-                    LOG_INFO(LOG_SUB_VACUUM,
-                        "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
-                        dirs_copy[di], de->d_name, count, deleted, pct_observed);
-                    uint64_t obj_t0 = now_ms();
-                    cmd_vacuum(eff, de->d_name, 0, 0);
-                    LOG_INFO(LOG_SUB_VACUUM,
-                        "AUTO-VACUUM done %s/%s in %lums",
-                        dirs_copy[di], de->d_name,
-                        (unsigned long)(now_ms() - obj_t0));
-                    vacuumed++;
-                }
-            }
-            closedir(dd);
-        }
-        LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM tick: scanned=%d vacuumed=%d in %lums",
-                scanned, vacuumed, (unsigned long)(now_ms() - tick_t0));
+        AutoReshardSweepCtx ctx = {0};
+        int scanned = sweep_all_objects(a->db_root, auto_reshard_sweep_one, &ctx);
+        LOG_INFO(LOG_SUB_VACUUM, "AUTO-RESHARD tick: scanned=%d reshaped=%d in %lums",
+                scanned, ctx.reshaped, (unsigned long)(now_ms() - tick_t0));
     }
 
     if (g_out && g_out != stderr) fclose(g_out);
@@ -3417,6 +3571,20 @@ int cmd_server(const char *db_root, int daemonize) {
                 pthread_detach(auto_vac_tid);
             else
                 free(av);
+        }
+    }
+
+    /* Auto-reshard is opt-in. Detached thread; exits on server_running=0. */
+    if (g_auto_reshard_enable) {
+        pthread_t auto_reshard_tid;
+        AutoReshardArg *ar = malloc(sizeof(AutoReshardArg));
+        if (ar) {
+            strncpy(ar->db_root, db_root, PATH_MAX - 1);
+            ar->db_root[PATH_MAX - 1] = '\0';
+            if (db_thread_create(&auto_reshard_tid, auto_reshard_thread, ar) == 0)
+                pthread_detach(auto_reshard_tid);
+            else
+                free(ar);
         }
     }
 
