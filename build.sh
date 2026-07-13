@@ -251,6 +251,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_planner_edge_cases.c \
     src/test/cases/test_signal_handling.c \
     src/test/cases/test_simd.c \
+    src/test/cases/test_kfcache_staleness.c \
+    src/test/cases/test_segcache_staleness.c \
     src/test/cases/test_slotcask_api.c \
     src/test/cases/test_tls_unit.c \
     src/test/cases/test_variable_length.c \
