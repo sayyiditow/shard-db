@@ -38,6 +38,8 @@ typedef struct {
     int      used;
     uint64_t last_access;
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
+    dev_t    file_dev;      /* identity of the file open at install time — */
+    ino_t    file_ino;      /* detects rename-away-and-recreate at `path` */
 } KfCacheEntry;
 
 /* slotcask.c — segcache */
@@ -50,6 +52,8 @@ typedef struct {
     int      used;
     uint64_t last_access;
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
+    dev_t    file_dev;      /* identity of the file open at install time — */
+    ino_t    file_ino;      /* detects rename-away-and-recreate at `path` */
 } SegCacheEntry;
 
 #define SLOTCASK_REG_BUCKETS 1024

@@ -257,7 +257,8 @@ static void kfcache_invalidate_prefix(const char *prefix) {
    the file system call could block, so we do the heavy lifting outside the
    table mutex (matching bt_open_file's contract in btree.c). */
 static int kf_open_file(const char *path, size_t slots_capacity, int writer,
-                        int *out_fd, uint8_t **out_base, size_t *out_size) {
+                        int *out_fd, uint8_t **out_base, size_t *out_size,
+                        dev_t *out_dev, ino_t *out_ino) {
     int fd;
     int created_fresh = 0;  /* track first-time creation for header init */
     if (writer) {
@@ -323,6 +324,8 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
     *out_fd = fd;
     *out_base = (uint8_t *)m;
     *out_size = want;
+    *out_dev = st.st_dev;
+    *out_ino = st.st_ino;
     return 0;
 }
 
@@ -358,8 +361,8 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
 
     if (!g_kfcache) {
         /* Cache not initialised — direct mmap, no locking. */
-        int fd; uint8_t *base; size_t sz;
-        if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz) < 0) return -1;
+        int fd; uint8_t *base; size_t sz; dev_t dev; ino_t ino;
+        if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz, &dev, &ino) < 0) return -1;
         kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
@@ -385,11 +388,29 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
            barrier the analyzer can't see. */
         KfCacheEntry *e = &g_kfcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
-            h->slot = slot;
-            kf_handle_from_entry(h, e);
-            /* coverity[missing_unlock] intentional: returning with the
-               per-slot rwlock held; caller releases via kfcache_release. */
-            return 0;
+            struct stat pst;
+            if (stat(path, &pst) == 0 &&
+                pst.st_dev == e->file_dev && pst.st_ino == e->file_ino) {
+                h->slot = slot;
+                kf_handle_from_entry(h, e);
+                /* coverity[missing_unlock] intentional: returning with the
+                   per-slot rwlock held; caller releases via kfcache_release. */
+                return 0;
+            }
+            /* Cached entry no longer matches the file currently at
+               `path` — e.g. rebuild_object_v2 renamed data/ away and
+               recreated it after this entry was installed by a racing
+               kfcache_acquire(writer=1) (commonly warmup's
+               slotcask_open() fan-out). Evict it so the retry below (or
+               the miss path) re-opens the real current file instead of
+               aliasing stale pre-rebuild data. */
+            pthread_rwlock_unlock(lock);
+            pthread_mutex_lock(&g_kfcache_lock);
+            if (g_kfcache[slot].used && strcmp(g_kfcache[slot].path, path) == 0) {
+                kfcache_drop_slot(slot);
+            }
+            if (++retries >= 4) break;
+            continue;
         }
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
@@ -404,16 +425,13 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     /* Miss path: open + install. Drop table lock during open since it can
        block on disk. */
     pthread_mutex_unlock(&g_kfcache_lock);
-    int fd; uint8_t *base; size_t sz;
-    if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz) < 0) return -1;
+    int fd; uint8_t *base; size_t sz; dev_t dev; ino_t ino;
+    if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz, &dev, &ino) < 0) return -1;
     pthread_mutex_lock(&g_kfcache_lock);
 
     /* Re-probe — another thread may have installed it while we were opening. */
     slot = kfcache_probe(path, &found);
     if (found) {
-        /* Lost the install race. Discard our open; use the cached entry. */
-        munmap(base, sz);
-        close(fd);
         g_kfcache[slot].last_access =
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
@@ -421,18 +439,38 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
         KfCacheEntry *e = &g_kfcache[slot];
-        if (e->used && strcmp(e->path, path) == 0) {
-            h->slot = slot;
-            kf_handle_from_entry(h, e);
-            /* coverity[missing_unlock] intentional: returning with the
-               per-slot rwlock held; caller releases via kfcache_release. */
-            return 0;
+        int matched = e->used && strcmp(e->path, path) == 0;
+        if (matched) {
+            struct stat pst;
+            if (stat(path, &pst) == 0 &&
+                pst.st_dev == e->file_dev && pst.st_ino == e->file_ino) {
+                /* Genuinely valid — lost the install race. Discard our
+                   own open; use the cached entry. */
+                munmap(base, sz);
+                close(fd);
+                h->slot = slot;
+                kf_handle_from_entry(h, e);
+                /* coverity[missing_unlock] intentional: returning with the
+                   per-slot rwlock held; caller releases via kfcache_release. */
+                return 0;
+            }
         }
-        /* Slot was evicted under us; serve uncached this once. */
         pthread_rwlock_unlock(lock);
-        int fd2; uint8_t *base2; size_t sz2;
-        if (kf_open_file(path, slots_capacity, writer, &fd2, &base2, &sz2) < 0) return -1;
-        kf_handle_from_uncached(h, fd2, base2, sz2);
+        if (matched) {
+            /* The racing installer's entry is itself stale (same
+               rebuild-rename race, one level deeper). Evict it so it
+               can't alias stale data for the next caller. */
+            pthread_mutex_lock(&g_kfcache_lock);
+            if (g_kfcache[slot].used && strcmp(g_kfcache[slot].path, path) == 0) {
+                kfcache_drop_slot(slot);
+            }
+            pthread_mutex_unlock(&g_kfcache_lock);
+        }
+        /* Slot was evicted under us, or was just evicted above for
+           staleness. Our own fd/base/sz (opened moments ago) are
+           current — serve them uncached this once instead of opening
+           a third time. */
+        kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
 
@@ -465,6 +503,8 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     e->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
+    e->file_dev = dev;
+    e->file_ino = ino;
     g_kfcache_count++;
 
     /* Take rwlock before releasing table mutex (closes evict-after-install race). */
@@ -644,7 +684,8 @@ static void segcache_drop_slot(int slot) {
 
 /* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */
 static int seg_open_file(const char *path, int create,
-                         int *out_fd, uint8_t **out_map, size_t *out_size) {
+                         int *out_fd, uint8_t **out_map, size_t *out_size,
+                         dev_t *out_dev, ino_t *out_ino) {
     int fd;
     if (create) {
         char dir[PATH_MAX];
@@ -676,6 +717,8 @@ static int seg_open_file(const char *path, int create,
     *out_fd = fd;
     *out_map = (uint8_t *)m;
     *out_size = SLOTCASK_SEG_MAX_BYTES;
+    *out_dev = st.st_dev;
+    *out_ino = st.st_ino;
     return 0;
 }
 
@@ -688,7 +731,8 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     h->map_size = 0;
 
     if (!g_segcache) {
-        if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        dev_t dev; ino_t ino;
+        if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size, &dev, &ino) < 0) return -1;
         return 0;
     }
 
@@ -712,13 +756,28 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
            barrier the analyzer can't see. */
         SegCacheEntry *e = &g_segcache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
-            h->slot = slot;
-            h->fd = e->fd;
-            h->map = e->map;
-            h->map_size = e->map_size;
-            /* coverity[missing_unlock] intentional: returning with the
-               per-slot rwlock held; caller releases via segcache_release. */
-            return 0;
+            struct stat pst;
+            if (stat(path, &pst) == 0 &&
+                pst.st_dev == e->file_dev && pst.st_ino == e->file_ino) {
+                h->slot = slot;
+                h->fd = e->fd;
+                h->map = e->map;
+                h->map_size = e->map_size;
+                /* coverity[missing_unlock] intentional: returning with the
+                   per-slot rwlock held; caller releases via segcache_release. */
+                return 0;
+            }
+            /* Cached entry no longer matches the file currently at
+               `path` — same rebuild-rename staleness class as
+               kfcache_acquire. Evict it so the retry below (or the miss
+               path) re-opens the real current file. */
+            pthread_rwlock_unlock(lock);
+            pthread_mutex_lock(&g_segcache_lock);
+            if (g_segcache[slot].used && strcmp(g_segcache[slot].path, path) == 0) {
+                segcache_drop_slot(slot);
+            }
+            if (++retries >= 4) break;
+            continue;
         }
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
@@ -731,14 +790,12 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     }
 
     pthread_mutex_unlock(&g_segcache_lock);
-    int fd; uint8_t *map; size_t sz;
-    if (seg_open_file(path, create, &fd, &map, &sz) < 0) return -1;
+    int fd; uint8_t *map; size_t sz; dev_t dev; ino_t ino;
+    if (seg_open_file(path, create, &fd, &map, &sz, &dev, &ino) < 0) return -1;
     pthread_mutex_lock(&g_segcache_lock);
 
     slot = segcache_probe(path, &found);
     if (found) {
-        munmap(map, sz);
-        close(fd);
         g_segcache[slot].last_access =
             __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_segcache[slot].rwlock;
@@ -746,17 +803,34 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
         SegCacheEntry *e = &g_segcache[slot];
-        if (e->used && strcmp(e->path, path) == 0) {
-            h->slot = slot;
-            h->fd = e->fd;
-            h->map = e->map;
-            h->map_size = e->map_size;
-            /* coverity[missing_unlock] intentional: returning with the
-               per-slot rwlock held; caller releases via segcache_release. */
-            return 0;
+        int matched = e->used && strcmp(e->path, path) == 0;
+        if (matched) {
+            struct stat pst;
+            if (stat(path, &pst) == 0 &&
+                pst.st_dev == e->file_dev && pst.st_ino == e->file_ino) {
+                munmap(map, sz);
+                close(fd);
+                h->slot = slot;
+                h->fd = e->fd;
+                h->map = e->map;
+                h->map_size = e->map_size;
+                /* coverity[missing_unlock] intentional: returning with the
+                   per-slot rwlock held; caller releases via segcache_release. */
+                return 0;
+            }
         }
         pthread_rwlock_unlock(lock);
-        if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size) < 0) return -1;
+        if (matched) {
+            pthread_mutex_lock(&g_segcache_lock);
+            if (g_segcache[slot].used && strcmp(g_segcache[slot].path, path) == 0) {
+                segcache_drop_slot(slot);
+            }
+            pthread_mutex_unlock(&g_segcache_lock);
+        }
+        h->slot = -1;
+        h->fd = fd;
+        h->map = map;
+        h->map_size = sz;
         return 0;
     }
 
@@ -789,6 +863,8 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     e->map_size = sz;
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
+    e->file_dev = dev;
+    e->file_ino = ino;
     g_segcache_count++;
 
     pthread_rwlock_t *lock = &e->rwlock;
