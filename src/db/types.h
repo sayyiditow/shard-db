@@ -956,6 +956,14 @@ void update_deleted_count(const char *db_root, const char *object, int delta);
 void reset_deleted_count(const char *db_root, const char *object);
 int get_deleted_count(const char *db_root, const char *object);
 int get_live_count(const char *db_root, const char *object);
+/* Full-width counterpart to get_live_count() — returns the true 64-bit
+   live record count with no truncation. Use this (not get_live_count)
+   anywhere the count may exceed INT_MAX, e.g. auto-reshard's 1B+ bands. */
+long long get_live_count_ll(const char *db_root, const char *object);
+/* Schema-aware sibling of get_live_count_ll() — skips the internal
+   load_schema() call for callers that already have a Schema in hand. */
+long long get_live_count_ll_for_schema(const char *db_root, const char *object,
+                                        const Schema *sc);
 /* Persist any in-memory counts cache for the object back to disk. Called
    from vacuum / recount / shutdown so cmd_size on the next process boot
    reflects recent updates. */
@@ -1227,6 +1235,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                              int limit, int dry_run);
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits);
+int reshard_target_for_count(long long live);
 /* new_streams_arg: 0 = keep current streams; >0 = rebuild with that count
    (only meaningful for v2 storage). Used by vacuum's streams-mismatch path. */
 int rebuild_object(const char *db_root, const char *object,

@@ -431,6 +431,25 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "AUTO_VACUUM_INTERVAL_SEC=", 25) == 0) {
             int n = atoi(p + 25);
             if (n >= 60 && g_db) g_auto_vacuum_interval_sec = n; /* 1-min floor */
+        } else if (strncmp(p, "AUTO_RESHARD_ENABLE=", 20) == 0) {
+            if (g_db) g_auto_reshard_enable = (atoi(p + 20) != 0);
+        } else if (strncmp(p, "AUTO_RESHARD_HOUR=", 18) == 0) {
+            char *v = p + 18;
+            char *e = v + strlen(v) - 1;
+            while (e >= v && (*e == '\n' || *e == '\r' || *e == ' ')) *e-- = '\0';
+            char *endp = NULL;
+            long n = strtol(v, &endp, 10);
+            if (endp == v || *endp != '\0' || n < 0 || n > 23) {
+                fprintf(stderr,
+                    "config: AUTO_RESHARD_HOUR=\"%s\" is not a valid hour (0-23); "
+                    "keeping current value (%d)\n",
+                    v, g_db ? g_auto_reshard_hour : 3);
+            } else if (g_db) {
+                g_auto_reshard_hour = (int)n;
+            }
+        } else if (strncmp(p, "AUTO_RESHARD_THROTTLE_MS=", 26) == 0) {
+            int n = atoi(p + 26);
+            if (n >= 0 && g_db) g_auto_reshard_throttle_ms = n;
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
                 const char *v = p + 7;

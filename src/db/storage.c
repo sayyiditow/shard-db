@@ -978,16 +978,50 @@ void reset_deleted_count(const char *db_root, const char *object) {
     (void)db_root; (void)object;
 }
 
-/* Resolve (live, deleted) for an object. Sums kf headers — each is updated
-   atomically inside slotcask_put / slotcask_delete and is the single source
-   of truth for record counts (cannot go stale across daemon crashes the
-   way a separate counts file would).
+/* Resolve (live, deleted) for an object given an already-loaded Schema --
+   skips the load_schema() lookup for callers that already have one (e.g.
+   auto_reshard_thread, which needs sch.splits for its own comparison
+   regardless). Sums kf headers — each is updated atomically inside
+   slotcask_put / slotcask_delete and is the single source of truth for
+   record counts (cannot go stale across daemon crashes the way a
+   separate counts file would).
 
    Callers pass `object` in two forms historically:
      1. (db_root, "object")          — most call sites
      2. (db_root, "dir/object")      — describe-object, list-objects, list-dirs
-   load_schema and slotcask_registry_get expect (effective_root, bare_object)
-   so we split joined form here. */
+   slotcask_registry_get expects (effective_root, bare_object) so we split
+   joined form here. */
+static int resolve_counts_with_schema(const char *db_root, const char *object,
+                                       const Schema *sc,
+                                       uint64_t *out_live, uint64_t *out_deleted) {
+    char eff_root[PATH_MAX];
+    const char *bare_obj;
+    const char *slash = strchr(object, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - object);
+        snprintf(eff_root, sizeof(eff_root), "%s/%.*s",
+                 db_root, (int)dir_len, object);
+        bare_obj = slash + 1;
+    } else {
+        snprintf(eff_root, sizeof(eff_root), "%s", db_root);
+        bare_obj = object;
+    }
+    SlotcaskSchemaInfo info = {
+        .splits = sc->splits, .slot_size = sc->slot_size,
+        .streams = sc->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
+    if (!sdb) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "resolve_counts %s/%s: slotcask_registry_get failed", eff_root, bare_obj);
+        *out_live = 0; *out_deleted = 0; return -1;
+    }
+    uint64_t total = 0, deleted = 0;
+    slotcask_sum_kf_totals(sdb, &total, &deleted);
+    *out_live    = total > deleted ? total - deleted : 0;
+    *out_deleted = deleted;
+    return 0;
+}
+
 static int resolve_counts(const char *db_root, const char *object,
                           uint64_t *out_live, uint64_t *out_deleted) {
     char eff_root[PATH_MAX];
@@ -1003,20 +1037,7 @@ static int resolve_counts(const char *db_root, const char *object,
         bare_obj = object;
     }
     Schema sc = load_schema(eff_root, bare_obj);
-    SlotcaskSchemaInfo info = {
-        .splits = sc.splits, .slot_size = sc.slot_size,
-        .streams = sc.streams,
-    };
-    SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
-    if (!sdb) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "resolve_counts %s/%s: slotcask_registry_get failed", eff_root, bare_obj);
-        *out_live = 0; *out_deleted = 0; return -1;
-    }
-    uint64_t total = 0, deleted = 0;
-    slotcask_sum_kf_totals(sdb, &total, &deleted);
-    *out_live    = total > deleted ? total - deleted : 0;
-    *out_deleted = deleted;
-    return 0;
+    return resolve_counts_with_schema(db_root, object, &sc, out_live, out_deleted);
 }
 
 int get_deleted_count(const char *db_root, const char *object) {
@@ -1029,6 +1050,28 @@ int get_live_count(const char *db_root, const char *object) {
     uint64_t live = 0, del = 0;
     resolve_counts(db_root, object, &live, &del);
     return (int)live;
+}
+
+/* Full-width counterpart to get_live_count() (above) — no (int)
+   narrowing. get_live_count() itself is left untouched, since its
+   existing call sites operate on in-memory result sets already bounded
+   by QUERY_BUFFER_MB / int-sized offsets, where the narrowing is
+   harmless. Callers that compare against multi-billion-record
+   thresholds (auto-reshard) must use this one instead. */
+long long get_live_count_ll(const char *db_root, const char *object) {
+    uint64_t live = 0, del = 0;
+    resolve_counts(db_root, object, &live, &del);
+    return (long long)live;
+}
+
+/* Schema-aware sibling of get_live_count_ll() — for callers that already
+   have a freshly-loaded Schema (avoids a redundant load_schema() call on
+   hot per-object sweep paths, e.g. auto_reshard_thread). */
+long long get_live_count_ll_for_schema(const char *db_root, const char *object,
+                                        const Schema *sc) {
+    uint64_t live = 0, del = 0;
+    resolve_counts_with_schema(db_root, object, sc, &live, &del);
+    return (long long)live;
 }
 
 /* Forward declaration */

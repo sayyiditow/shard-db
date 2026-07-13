@@ -204,6 +204,15 @@ int cmd_vacuum(const char *db_root, const char *object,
     OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
     return 0;
 }
+int reshard_target_for_count(long long live) {
+    if (live >= 5000000000LL)  return 4096;  /* 5B+ (ceiling, no further auto action) */
+    if (live >= 1000000000LL)  return 2048;  /* 1B-5B */
+    if (live >= 200000000LL)   return 1024;  /* 200M-1B */
+    if (live >= 50000000LL)    return 256;   /* 50M-200M */
+    if (live >= 10000000LL)    return 64;    /* 10M-50M */
+    if (live >= 1000000LL)     return 16;    /* 1M-10M */
+    return 8;                                 /* up to 1M */
+}
 /* ========== SEQUENCES ========== */
 
 /* Atomic counter per object, stored in $DB_ROOT/<object>/metadata/sequences/<name> */
@@ -776,22 +785,28 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     int grows = 0;
     for (uint32_t s = max_slots; initial > 0 && s > initial; s >>= 1) grows++;
 
-    /* Hint: in v1, sizing is driven by records-per-shard (sweet spot 78K-200K).
-       In v2 the kf auto-resplits, so high recs/shard ≠ broken — but it does mean
-       the kf paid inline doubling cost. Same advice ("vacuum --splits=N") fits
-       both: a higher `splits` up-front avoids resplit work. */
+    /* Hint: single source of truth with auto-reshard — reuse
+       reshard_target_for_count() (src/db/query_maint.c, added for
+       auto_reshard_thread()) instead of an independent per-shard
+       average/max threshold, so shard-stats and the automatic nightly
+       sweep never disagree about whether an object needs a bigger
+       `splits`. Stack-local hint_buf (not static): cmd_shard_stats can
+       run concurrently across server workers for different objects. */
     const char *hint = NULL;
+    char hint_buf[160];
     double avg_load = 0.0;
     uint64_t rps = 0;
     if (nrows > 0) {
         avg_load = (double)total_records / ((double)max_slots * nrows);
         rps = total_records / (uint64_t)nrows;
-        if (rps > 1000000ULL) {
-            hint = (sch.splits < MAX_SPLITS)
-                ? "records-per-shard past sweet spot (>1M) — re-split with vacuum --splits=N"
-                : "at MAX_SPLITS with >1M records/shard — performance may degrade; consider partitioning across objects";
-        } else if (rps > 500000ULL && sch.splits < MAX_SPLITS) {
-            hint = "records-per-shard approaching upper band (>500K) — consider vacuum --splits=N";
+        int target = reshard_target_for_count((long long)total_records);
+        if (target > sch.splits) {
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "live records (%lu) recommend splits=%d (currently %d) — re-split with vacuum --splits=%d",
+                     (unsigned long)total_records, target, sch.splits, target);
+            hint = hint_buf;
+        } else if (sch.splits >= MAX_SPLITS && rps > 1000000ULL) {
+            hint = "at MAX_SPLITS with >1M records/shard — performance may degrade; consider partitioning across objects";
         } else if (min_records > 0 && max_records > min_records * 4) {
             hint = "shard load is skewed — check key distribution";
         }

@@ -36,6 +36,9 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `AUTO_VACUUM_INTERVAL_SEC` | `3600` | Auto-vacuum poll cadence in seconds. Floor 60. Sleep is sliced into 1-second chunks so SIGTERM brings the thread down within a second. |
 | `VACUUM_RECOMMEND_TOMBSTONE_PCT` | `10` | Tombstone ratio at which `vacuum-check` flags an object for cleanup (`deleted * 100 ≥ total * N`). Also drives auto-vacuum when enabled — same threshold for both manual and automated paths. |
 | `VACUUM_RECOMMEND_MIN_DELETED` | `1000` | Absolute floor on `deleted` count below which `vacuum-check` does **not** recommend cleanup, even if the percentage clears. Prevents tiny objects from triggering vacuum overhead that exceeds the work saved. |
+| `AUTO_RESHARD_ENABLE` | `0` | `1` = enable a background thread that, once per calendar day during `AUTO_RESHARD_HOUR`, grows an object's `splits` when its live record count outgrows the recommended sizing table (see [Tuning → Recommended splits](../operations/tuning.md)). Runs a full reshard (`vacuum --splits=N`), which holds the exclusive objlock for the duration — unlike `AUTO_VACUUM`, which never touches `--splits`. |
+| `AUTO_RESHARD_HOUR` | `3` | Server-local hour (`0`-`23`) the auto-reshard sweep is allowed to run in, once per calendar day. |
+| `AUTO_RESHARD_THROTTLE_MS` | `0` | Milliseconds to pause after each successful reshard before the same sweep tick considers its next candidate object. `0` = no pacing (reshards still run strictly one at a time either way; this only adds a gap between them). |
 | `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. See [Operations → Deployment → Native TLS](../operations/deployment.md). |
 | `TLS_CERT` / `TLS_KEY` | (empty) | Server cert + private key paths (PEM). Required when `TLS_ENABLE=1`. |
 | `TLS_CA` | (empty) | Client-side CA bundle for verifying the server (defaults to OS trust store). |
@@ -76,6 +79,11 @@ export AUTO_VACUUM=0
 export AUTO_VACUUM_INTERVAL_SEC=3600
 export VACUUM_RECOMMEND_TOMBSTONE_PCT=10
 export VACUUM_RECOMMEND_MIN_DELETED=1000
+
+# Auto-reshard — opt-in, grows splits automatically when an object outgrows
+# its sizing (off by default)
+export AUTO_RESHARD_ENABLE=0
+export AUTO_RESHARD_HOUR=3
 
 # Native TLS — leave TLS_ENABLE=0 unless terminating TLS in-process
 export TLS_ENABLE=0
