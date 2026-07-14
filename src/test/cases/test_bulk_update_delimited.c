@@ -103,7 +103,7 @@ static int test_bulk_update_delimited_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"udtest\",\"key\":\"k_missing_1\"}", &resp);
-    ASSERT_TRUE(!resp || strstr(resp, "\"name\":\"zzz\"") == NULL, "k_missing_1 NOT inserted");
+    ASSERT_TRUE(!resp || SAFE_STRSTR(resp, "\"name\":\"zzz\"") == NULL, "k_missing_1 NOT inserted");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"udtest\"}", &resp);

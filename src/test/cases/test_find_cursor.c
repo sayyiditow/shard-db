@@ -17,7 +17,7 @@
    filled. Naive parser: locates `"cursor":{` then `"key":"...". */
 static int extract_cursor_key(const char *resp, char *out, size_t out_sz) {
     if (!resp) return 0;
-    const char *c = strstr(resp, "\"cursor\":{");
+    const char *c = SAFE_STRSTR(resp, "\"cursor\":{");
     if (!c) return 0;
     const char *k = strstr(c, "\"key\":\"");
     if (!k) return 0;
@@ -99,8 +99,8 @@ static int test_find_cursor_run(void) {
        we're allowed to see k3 only inside "cursor":{...}. We need a more
        careful check — look in the rows array specifically. */
     {
-        const char *rows = strstr(resp, "\"rows\":");
-        const char *cursor_obj = strstr(resp, "\"cursor\":{");
+        const char *rows = SAFE_STRSTR(resp, "\"rows\":");
+        const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":{");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
         char window[1024]; size_t n = (size_t)(rows_end - rows);
         if (n + 1 > sizeof(window)) n = sizeof(window) - 1;
@@ -137,8 +137,8 @@ static int test_find_cursor_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"k6\"", "desc page 2 includes k6");
     /* Check k8 not in rows. */
     {
-        const char *rows = strstr(resp, "\"rows\":");
-        const char *cursor_obj = strstr(resp, "\"cursor\":");
+        const char *rows = SAFE_STRSTR(resp, "\"rows\":");
+        const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
         char window[1024]; size_t n = (size_t)(rows_end - rows);
         if (n + 1 > sizeof(window)) n = sizeof(window) - 1;
@@ -153,8 +153,8 @@ static int test_find_cursor_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"curs_int\","
         "\"criteria\":[],\"order_by\":\"n\",\"order\":\"asc\",\"limit\":3}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"rows\":") == NULL, "no cursor → no rows wrapper");
-    ASSERT_TRUE(resp && strstr(resp, "\"cursor\":") == NULL, "no cursor → no cursor field");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"rows\":") == NULL, "no cursor → no rows wrapper");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"cursor\":") == NULL, "no cursor → no cursor field");
     ASSERT_CONTAINS(resp, "\"key\":\"k1\"", "no cursor → still returns array");
     free(resp); resp = NULL;
 
@@ -223,8 +223,8 @@ static int test_find_cursor_run(void) {
         ASSERT_TRUE(count_keys_with_prefix(resp, "t") >= 3,
                     "tie-break page 2 returns 3 rows");
         /* p1 cursor key must not appear in p2 rows. */
-        const char *rows = strstr(resp, "\"rows\":");
-        const char *cursor_obj = strstr(resp, "\"cursor\":");
+        const char *rows = SAFE_STRSTR(resp, "\"rows\":");
+        const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
         char window[1024]; size_t n = (size_t)(rows_end - rows);
         if (n + 1 > sizeof(window)) n = sizeof(window) - 1;
@@ -257,9 +257,9 @@ static int test_find_cursor_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"c2\"", "cursor+filter page 1 has c2");
     ASSERT_CONTAINS(resp, "\"key\":\"c4\"", "cursor+filter page 1 has c4");
-    ASSERT_TRUE(resp && strstr(resp, "\"key\":\"c1\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"key\":\"c1\"") == NULL,
                 "cursor+filter page 1 does NOT have c1");
-    ASSERT_TRUE(resp && strstr(resp, "\"key\":\"c3\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"key\":\"c3\"") == NULL,
                 "cursor+filter page 1 does NOT have c3");
     ASSERT_CONTAINS(resp, "\"cursor\":{", "cursor+filter page 1 emits cursor");
     free(resp); resp = NULL;
@@ -273,8 +273,8 @@ static int test_find_cursor_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"c8\"", "cursor+filter page 2 has c8");
     /* c4 must not be in rows. */
     {
-        const char *rows = strstr(resp, "\"rows\":");
-        const char *cursor_obj = strstr(resp, "\"cursor\":");
+        const char *rows = SAFE_STRSTR(resp, "\"rows\":");
+        const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
         char window[1024]; size_t n = (size_t)(rows_end - rows);
         if (n + 1 > sizeof(window)) n = sizeof(window) - 1;
@@ -294,8 +294,8 @@ static int test_find_cursor_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"k6\"", "cursor past deleted k5 yields k6");
     /* k5 should not appear in rows[]. */
     {
-        const char *rows = strstr(resp, "\"rows\":");
-        const char *cursor_obj = strstr(resp, "\"cursor\":");
+        const char *rows = SAFE_STRSTR(resp, "\"rows\":");
+        const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
         char window[1024]; size_t n = (size_t)(rows_end - rows);
         if (n + 1 > sizeof(window)) n = sizeof(window) - 1;

@@ -139,8 +139,15 @@ void test_init_process_db(void) {
     if (!mkdtemp(tmpdir)) return;
     shard_db_open_internal(tmpdir);  /* sets g_db as a side effect */
     /* Expose the instance so threads spawned by test code can bind their
-       own g_db via the g_shard_db_instance fallback in storage functions. */
+       own g_db via the g_shard_db_instance fallback in storage functions.
+       Guarded: under parallel run-all, multiple worker threads call this
+       function concurrently (each with its own thread-local g_db) — an
+       unguarded check-and-set on the process-global g_shard_db_instance
+       was a genuine data race. */
+    static pthread_mutex_t instance_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&instance_lock);
     if (!g_shard_db_instance) g_shard_db_instance = g_db;
+    pthread_mutex_unlock(&instance_lock);
 }
 
 /* Forward decl — defined below in the impl section. */

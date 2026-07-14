@@ -122,7 +122,7 @@ static int test_agg_varchar_groupby_sum_run(void) {
         "\"limit\":2}", &resp);
     ASSERT_EQ_INT(count_braces(resp), 2, "case1: min/max limit=2 → 2 buckets");
     /* admin row should have mn=100, mx=100 */
-    ASSERT_TRUE(strstr(resp, "\"role\":\"admin\"") != NULL, "case1: admin in result");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"role\":\"admin\"") != NULL, "case1: admin in result");
     free(resp); resp = NULL;
 
     /* count + sum together — bench uses this shape */

@@ -198,6 +198,14 @@ static int kfcache_probe(const char *path, int *out_found) {
 static void kfcache_drop_slot(int slot) {
     KfCacheEntry *e = &g_kfcache[slot];
     if (!e->used) return;
+    /* Exclude any thread still holding this slot's rwlock from an earlier
+       kfcache_acquire() (e.g. slotcask_pool_rebuild_worker's long
+       rdlock-held walk over kh.map) before munmapping under it — the
+       caller only holds g_kfcache_lock, which guards slot-table
+       bookkeeping, not live e->base access. Without this, LRU eviction
+       or a stale-entry drop can munmap out from under a concurrent
+       reader, producing a SEGV. */
+    pthread_rwlock_wrlock(&e->rwlock);
     if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
     if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
@@ -212,6 +220,7 @@ static void kfcache_drop_slot(int slot) {
        this store, forcing the slow-path re-probe. */
     atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_kfcache_count--;
+    pthread_rwlock_unlock(&e->rwlock);
 }
 
 /* Drop every cached kf shard whose path starts with `prefix`. Used by
@@ -667,6 +676,11 @@ static void segcache_invalidate_prefix(const char *prefix) {
 static void segcache_drop_slot(int slot) {
     SegCacheEntry *e = &g_segcache[slot];
     if (!e->used) return;
+    /* See kfcache_drop_slot's comment: exclude any thread still holding
+       this slot's rwlock from an earlier segcache_acquire() before
+       munmapping under it — the caller only holds g_segcache_lock, which
+       guards slot-table bookkeeping, not live e->map access. */
+    pthread_rwlock_wrlock(&e->rwlock);
     if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
     if (e->map) munmap(e->map, e->map_size);
     if (e->fd >= 0) close(e->fd);
@@ -680,6 +694,7 @@ static void segcache_drop_slot(int slot) {
        the slow-path re-probe. */
     atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_segcache_count--;
+    pthread_rwlock_unlock(&e->rwlock);
 }
 
 /* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */

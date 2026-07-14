@@ -111,7 +111,7 @@ static int test_slotcask_v2_schema_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"sch2\",\"object\":\"users\",\"key\":\"u2\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"n2\"", "u2 name preserved");
     ASSERT_CONTAINS(resp, "\"age\":22", "u2 age preserved");
-    ASSERT_TRUE(strstr(resp, "\"score\":0") != NULL, "u2 score zero-initialized");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"score\":0") != NULL, "u2 score zero-initialized");
     free(resp); resp = NULL;
 
     ASSERT_EQ_INT(sch_count_total(tc, "users"), 4, "count still 4 post add-field");
@@ -143,7 +143,7 @@ static int test_slotcask_v2_schema_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"sch2\",\"object\":\"users\",\"key\":\"u1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"n1\"", "u1 name still readable post remove-field");
     ASSERT_CONTAINS(resp, "\"score\":99", "u1 score still readable");
-    ASSERT_TRUE(strstr(resp, "\"city\":") == NULL, "u1 city no longer in output");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"city\":") == NULL, "u1 city no longer in output");
     free(resp); resp = NULL;
 
     /* ===== rename-field (metadata-only) ===== */
@@ -155,7 +155,7 @@ static int test_slotcask_v2_schema_run(void) {
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"sch2\",\"object\":\"users\",\"key\":\"u1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"points\":99", "u1 points (renamed from score) readable");
-    ASSERT_TRUE(strstr(resp, "\"score\":") == NULL, "u1 score gone (renamed away)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"score\":") == NULL, "u1 score gone (renamed away)");
     free(resp); resp = NULL;
 
     /* ===== vacuum --compact: drop the tombstoned `city` from fields.conf ===== */

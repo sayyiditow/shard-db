@@ -64,8 +64,8 @@ static int test_agg_input_validation_run(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "DESC uppercase response not null");
     /* b (score=50) should come first, a (score=30 total) second */
-    const char *b_pos = strstr(resp, "\"tag\":\"b\"");
-    const char *a_pos = strstr(resp, "\"tag\":\"a\"");
+    const char *b_pos = SAFE_STRSTR(resp, "\"tag\":\"b\"");
+    const char *a_pos = SAFE_STRSTR(resp, "\"tag\":\"a\"");
     ASSERT_NOT_NULL(b_pos, "DESC: b present");
     ASSERT_NOT_NULL(a_pos, "DESC: a present");
     ASSERT_TRUE(b_pos < a_pos, "DESC: b appears before a (descending)");

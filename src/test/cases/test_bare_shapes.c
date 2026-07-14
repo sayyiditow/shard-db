@@ -144,7 +144,7 @@ static int test_bare_shapes_run(void) {
         "\"format\":\"dict\"}", &resp);
     ASSERT_CONTAINS(resp, "\"ki1\":", "PRIMARY_LEAF dict has ki1");
     ASSERT_CONTAINS(resp, "\"ki2\":", "PRIMARY_LEAF dict has ki2");
-    ASSERT_TRUE(strstr(resp, "\"ki3\"") == NULL, "PRIMARY_LEAF dict excludes refunded");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"ki3\"") == NULL, "PRIMARY_LEAF dict excludes refunded");
     free(resp); resp = NULL;
 
     /* PRIMARY_INTERSECT */
@@ -154,7 +154,7 @@ static int test_bare_shapes_run(void) {
                        "{\"field\":\"region\",\"op\":\"eq\",\"value\":\"us\"}],"
         "\"format\":\"dict\"}", &resp);
     ASSERT_CONTAINS(resp, "\"ki1\":", "PRIMARY_INTERSECT dict has ki1");
-    ASSERT_TRUE(strstr(resp, "\"ki2\"") == NULL, "INTERSECT dict excludes ki2");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"ki2\"") == NULL, "INTERSECT dict excludes ki2");
     free(resp); resp = NULL;
 
     /* PRIMARY_KEYSET */

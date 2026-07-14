@@ -44,7 +44,7 @@ static int test_criteria_operator_alias_run(void) {
     ASSERT_NOT_NULL(resp, "op:gt response not null");
     ASSERT_CONTAINS(resp, "\"name\":\"mid\"", "op:gt returns mid");
     ASSERT_CONTAINS(resp, "\"name\":\"expensive\"", "op:gt returns expensive");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"cheap\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"cheap\"") == NULL,
                 "op:gt excludes cheap");
     free(resp); resp = NULL;
 
@@ -56,7 +56,7 @@ static int test_criteria_operator_alias_run(void) {
     ASSERT_NOT_NULL(resp, "operator:gt response not null");
     ASSERT_CONTAINS(resp, "\"name\":\"mid\"", "operator:gt returns mid");
     ASSERT_CONTAINS(resp, "\"name\":\"expensive\"", "operator:gt returns expensive");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"cheap\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"cheap\"") == NULL,
                 "operator:gt excludes cheap");
     free(resp); resp = NULL;
 

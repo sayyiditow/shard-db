@@ -17,6 +17,13 @@ typedef struct {
    wait until it accepts connections. Returns 0 on success. */
 int test_env_start(TestEnv *env);
 
+/* Same as test_env_start, but takes the QUERY_BUFFER_MB override
+   explicitly instead of reading SHARD_TEST_QUERY_BUFFER_MB from the
+   process environment — avoids a setenv/unsetenv race when tests run
+   concurrently under parallel run-all. Pass NULL for "no override"
+   (daemon default). */
+int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override);
+
 /* Stop the daemon (SIGTERM, then SIGKILL if it doesn't exit in 5s) and
    rm -rf the db_root. */
 void test_env_stop(TestEnv *env);

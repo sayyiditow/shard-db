@@ -49,11 +49,11 @@ static int test_find_by_orderby_time_correct(void) {
         "\"order_by\":\"time\",\"order\":\"desc\",\"limit\":3}", &resp);
     ASSERT_TRUE(resp != NULL, "find response");
     /* a's three newest = 109,108,107; must NOT contain b/c (200+/300+). */
-    ASSERT_TRUE(strstr(resp, "\"time\":109") != NULL, "newest 109 present");
-    ASSERT_TRUE(strstr(resp, "\"time\":108") != NULL, "108 present");
-    ASSERT_TRUE(strstr(resp, "\"time\":107") != NULL, "107 present");
-    ASSERT_TRUE(strstr(resp, "\"by\":\"b\"") == NULL, "no author b leaked");
-    ASSERT_TRUE(strstr(resp, "\"by\":\"c\"") == NULL, "no author c leaked");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"time\":109") != NULL, "newest 109 present");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"time\":108") != NULL, "108 present");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"time\":107") != NULL, "107 present");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"by\":\"b\"") == NULL, "no author b leaked");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"by\":\"c\"") == NULL, "no author c leaked");
     free(resp); resp=NULL;
     tc_close(tc); test_env_stop(&env);
     return 0;
@@ -94,8 +94,8 @@ static int test_count_find_parity(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"par\","
         "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"},"
                       "{\"field\":\"active\",\"op\":\"eq\",\"value\":true}]}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "30") != NULL, "count [tag=x AND active=true] = 30");
-    ASSERT_TRUE(resp != NULL && strstr(resp, "50") == NULL, "not tag=x-only (50)");
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "30") != NULL, "count [tag=x AND active=true] = 30");
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "50") == NULL, "not tag=x-only (50)");
     free(resp); resp=NULL;
     tc_close(tc); test_env_stop(&env);
     return 0;

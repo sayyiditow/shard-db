@@ -35,7 +35,7 @@ static int test_idx_cache_tenants_run(void) {
         "\"fields\":[\"price:int\",\"name:varchar:32\"],"
         "\"indexes\":[\"price\"]}",
         &resp);
-    if (resp && strstr(resp, "error")) fprintf(stderr, "DEBUG: create ict_alpha/products: %s\n", resp);
+    if (resp && SAFE_STRSTR(resp, "error")) fprintf(stderr, "DEBUG: create ict_alpha/products: %s\n", resp);
     free(resp); resp = NULL;
 
     /* beta/products — index on "name" */
@@ -45,7 +45,7 @@ static int test_idx_cache_tenants_run(void) {
         "\"fields\":[\"price:int\",\"name:varchar:32\"],"
         "\"indexes\":[\"name\"]}",
         &resp);
-    if (resp && strstr(resp, "error")) fprintf(stderr, "DEBUG: create ict_beta/products: %s\n", resp);
+    if (resp && SAFE_STRSTR(resp, "error")) fprintf(stderr, "DEBUG: create ict_beta/products: %s\n", resp);
     free(resp); resp = NULL;
 
     /* Verify alpha sees "price" index, NOT "name" */
@@ -53,10 +53,10 @@ static int test_idx_cache_tenants_run(void) {
         "{\"mode\":\"describe-object\",\"dir\":\"ict_alpha\",\"object\":\"products\"}",
         &resp);
     ASSERT_CONTAINS(resp, "\"price\"", "ict_alpha/products indexes contain price");
-    ASSERT_TRUE(strstr(resp, "\"name\"") == NULL ||
-                strstr(resp, "\"indexes\"") == NULL ||
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\"") == NULL ||
+                SAFE_STRSTR(resp, "\"indexes\"") == NULL ||
                 /* name appears only in fields, not indexes section */
-                (strstr(strstr(resp, "\"indexes\""), "\"price\"") != NULL),
+                (strstr(SAFE_STRSTR(resp, "\"indexes\""), "\"price\"") != NULL),
                 "ict_alpha/products index list contains price");
     free(resp); resp = NULL;
 
@@ -80,7 +80,7 @@ static int test_idx_cache_tenants_run(void) {
         "\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"x\"}],"
         "\"limit\":1}",
         &resp);
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL,
                 "find on ict_beta/products by name (indexed) succeeds without error");
     free(resp); resp = NULL;
 
@@ -96,7 +96,7 @@ static int test_idx_cache_tenants_run(void) {
         "\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"x\"}],"
         "\"limit\":1}",
         &resp);
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL,
                 "find on ict_beta/products by name still works after ict_alpha remove-index");
     free(resp); resp = NULL;
 

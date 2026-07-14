@@ -15,7 +15,7 @@ static char *extract_field_num(const char *resp, const char *field) {
     if (!resp) return NULL;
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\":", field);
-    const char *p = strstr(resp, pat);
+    const char *p = SAFE_STRSTR(resp, pat);
     if (!p) return NULL;
     p += strlen(pat);
     const char *s = p;

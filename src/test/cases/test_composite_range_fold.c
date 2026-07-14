@@ -43,10 +43,10 @@ static int test_range_fold_window(void) {
         "\"order_by\":\"time\",\"order\":\"asc\",\"limit\":3}", &resp);
     ASSERT_NOT_NULL(resp, "asc page");
     {
-        const char *p5=strstr(resp,"a05"), *p6=strstr(resp,"a06"), *p7=strstr(resp,"a07");
+        const char *p5=SAFE_STRSTR(resp,"a05"), *p6=SAFE_STRSTR(resp,"a06"), *p7=SAFE_STRSTR(resp,"a07");
         ASSERT_TRUE(p5 && p6 && p7 && p5<p6 && p6<p7, "asc: a05,a06,a07 in order");
-        ASSERT_TRUE(!strstr(resp,"a04") && !strstr(resp,"a08"), "asc: window excludes a04/a08");
-        ASSERT_TRUE(!strstr(resp,"z1"), "asc: decoy story_root excluded");
+        ASSERT_TRUE(!SAFE_STRSTR(resp,"a04") && !SAFE_STRSTR(resp,"a08"), "asc: window excludes a04/a08");
+        ASSERT_TRUE(!SAFE_STRSTR(resp,"z1"), "asc: decoy story_root excluded");
     }
     free(resp); resp=NULL;
 
@@ -58,9 +58,9 @@ static int test_range_fold_window(void) {
         "\"order_by\":\"time\",\"order\":\"desc\",\"limit\":3}", &resp);
     ASSERT_NOT_NULL(resp, "desc page");
     {
-        const char *p5=strstr(resp,"a05"), *p4=strstr(resp,"a04"), *p3=strstr(resp,"a03");
+        const char *p5=SAFE_STRSTR(resp,"a05"), *p4=SAFE_STRSTR(resp,"a04"), *p3=SAFE_STRSTR(resp,"a03");
         ASSERT_TRUE(p5 && p4 && p3 && p5<p4 && p4<p3, "desc: a05,a04,a03 in order");
-        ASSERT_TRUE(!strstr(resp,"a06") && !strstr(resp,"a02"), "desc: window excludes a06/a02");
+        ASSERT_TRUE(!SAFE_STRSTR(resp,"a06") && !SAFE_STRSTR(resp,"a02"), "desc: window excludes a06/a02");
     }
     free(resp); resp=NULL;
 
@@ -95,7 +95,7 @@ static int test_range_fold_no_bound(void) {
         "{\"mode\":\"find\",\"dir\":\"c2\",\"object\":\"cm\","
         "\"criteria\":[{\"field\":\"story_root\",\"op\":\"eq\",\"value\":7}],"
         "\"order_by\":\"time\",\"order\":\"asc\",\"limit\":50}", &resp);
-    ASSERT_TRUE(resp && strstr(resp,"b01") && strstr(resp,"b04"), "no-bound: all rows returned");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp,"b01") && SAFE_STRSTR(resp,"b04"), "no-bound: all rows returned");
     free(resp); resp=NULL;
     tc_close(tc); test_env_stop(&env);
     return 0;

@@ -75,9 +75,9 @@ static int test_small_prefilter_orderby_run(void) {
         "\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_5\"}],"
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10}", &resp);
     ASSERT_NOT_NULL(resp, "find user_5 order_by age desc");
-    ASSERT_TRUE(resp && strstr(resp, "\"k5\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k5\"") != NULL,
                 "find user_5 returns k5");
-    ASSERT_TRUE(resp && strstr(resp, "\"k4\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k4\"") == NULL,
                 "find user_5 doesn't return k4");
     free(resp); resp = NULL;
 
@@ -87,7 +87,7 @@ static int test_small_prefilter_orderby_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"spo\","
         "\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_5\"}],"
         "\"order_by\":\"age\",\"order\":\"asc\",\"limit\":10}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"k5\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k5\"") != NULL,
                 "find user_5 asc returns k5");
     free(resp); resp = NULL;
 
@@ -113,10 +113,10 @@ static int test_small_prefilter_orderby_run(void) {
         "\"criteria\":[{\"field\":\"age\",\"op\":\"between\","
                        "\"value\":\"30\",\"value2\":\"35\"}],"
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":3}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"k17\"") != NULL, "k17 present");
-    ASSERT_TRUE(resp && strstr(resp, "\"k16\"") != NULL, "k16 present");
-    ASSERT_TRUE(resp && strstr(resp, "\"k15\"") != NULL, "k15 present");
-    ASSERT_TRUE(resp && strstr(resp, "\"k14\"") == NULL, "k14 NOT present (under limit)");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k17\"") != NULL, "k17 present");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k16\"") != NULL, "k16 present");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k15\"") != NULL, "k15 present");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k14\"") == NULL, "k14 NOT present (under limit)");
     free(resp); resp = NULL;
 
     /* ===== offset within shortcut path =====
@@ -128,10 +128,10 @@ static int test_small_prefilter_orderby_run(void) {
         "\"criteria\":[{\"field\":\"age\",\"op\":\"between\","
                        "\"value\":\"30\",\"value2\":\"35\"}],"
         "\"order_by\":\"age\",\"order\":\"desc\",\"offset\":2,\"limit\":2}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"k15\"") != NULL, "offset=2: k15 present");
-    ASSERT_TRUE(resp && strstr(resp, "\"k14\"") != NULL, "offset=2: k14 present");
-    ASSERT_TRUE(resp && strstr(resp, "\"k17\"") == NULL, "offset=2: k17 skipped");
-    ASSERT_TRUE(resp && strstr(resp, "\"k16\"") == NULL, "offset=2: k16 skipped");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k15\"") != NULL, "offset=2: k15 present");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k14\"") != NULL, "offset=2: k14 present");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k17\"") == NULL, "offset=2: k17 skipped");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k16\"") == NULL, "offset=2: k16 skipped");
     free(resp); resp = NULL;
 
     /* ===== projection through the shortcut =====
@@ -142,11 +142,11 @@ static int test_small_prefilter_orderby_run(void) {
         "\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_10\"}],"
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,"
         "\"fields\":[\"username\",\"age\"]}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"username\":\"user_10\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"username\":\"user_10\"") != NULL,
                 "projection includes username");
-    ASSERT_TRUE(resp && strstr(resp, "\"age\":\"28\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"age\":\"28\"") != NULL,
                 "projection includes age=28");
-    ASSERT_TRUE(resp && strstr(resp, "\"bio\":") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"bio\":") == NULL,
                 "projection excludes bio");
     free(resp); resp = NULL;
 
@@ -156,7 +156,7 @@ static int test_small_prefilter_orderby_run(void) {
         "\"criteria\":[{\"field\":\"username\",\"op\":\"eq\",\"value\":\"user_5\"}],"
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,"
         "\"format\":\"dict\"}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"k5\":") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"k5\":") != NULL,
                 "dict format key:value shape");
     free(resp); resp = NULL;
 

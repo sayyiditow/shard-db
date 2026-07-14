@@ -16,7 +16,7 @@
 #include <string.h>
 
 static int extract_n(const char *resp, char *out, size_t out_sz) {
-    const char *p = strstr(resp, "\"n\":");
+    const char *p = SAFE_STRSTR(resp, "\"n\":");
     if (!p) return 0;
     p += 4;
     while (*p == ' ' || *p == '"') p++;

@@ -99,7 +99,7 @@ static int test_per_tenant_auth_run(void) {
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
         "export LOG_LEVEL=2\n"
-        "export THREADS=0\n"
+        "export THREADS=2\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n"
         "export DISABLE_LOCALHOST_TRUST=1\n",
@@ -176,7 +176,7 @@ static int test_per_tenant_auth_run(void) {
         "{\"mode\":\"get\",\"dir\":\"tenant_a\",\"object\":\"users\","
         "\"key\":\"a1\",\"auth\":\"wrong\"}", &resp);
     ASSERT_CONTAINS(resp, "\"error\":\"auth failed\"", "wrong token rejected");
-    ASSERT_TRUE(resp && strstr(resp, "wrong") == NULL, "error does not leak token");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "wrong") == NULL, "error does not leak token");
     free(resp); resp = NULL;
 
     /* add-token persists to tenant-local file. */
@@ -249,7 +249,7 @@ static int test_per_tenant_auth_run(void) {
     ASSERT_CONTAINS(resp, "\"scope\":\"global\"", "list-tokens shows global scope");
     ASSERT_CONTAINS(resp, "\"scope\":\"tenant_a\"", "list-tokens shows tenant_a scope");
     ASSERT_CONTAINS(resp, "\"scope\":\"tenant_b\"", "list-tokens shows tenant_b scope");
-    ASSERT_TRUE(resp && strstr(resp, tatok) == NULL, "full token never printed");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, tatok) == NULL, "full token never printed");
     free(resp); resp = NULL;
 
     /* remove-token rewrites correct file. */

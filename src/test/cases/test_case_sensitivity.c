@@ -113,7 +113,7 @@ static int test_case_sensitivity_run(void) {
         "\"criteria\":[{\"field\":\"name\",\"op\":\"contains\",\"value\":\"bob\"}],"
         "\"fields\":[\"name\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"bob\"", "find contains 'bob' returns bob");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"BOB\"") == NULL, "find contains 'bob' rejects BOB");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"BOB\"") == NULL, "find contains 'bob' rejects BOB");
     free(resp); resp = NULL;
 
     /* find ilike (CI) */

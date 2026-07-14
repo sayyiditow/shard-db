@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "run") == 0 && argc >= 3) return test_run_one(argv[2]);
-    if (strcmp(argv[1], "run-all") == 0) return test_run_all(NULL);
+    if (strcmp(argv[1], "run-all") == 0) return test_run_all(NULL, 1);
     fprintf(stderr, "unknown subcommand: %s\n", argv[1]);
     return 1;
 }

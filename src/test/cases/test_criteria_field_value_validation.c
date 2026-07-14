@@ -69,7 +69,7 @@ static int test_criteria_field_value_validation_run(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "exists without value response not null");
     ASSERT_CONTAINS(resp, "\"name\":\"alpha\"", "exists: alpha has tag");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"beta\"") == NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"name\":\"beta\"") == NULL,
                 "exists: beta has no tag");
     free(resp); resp = NULL;
 
@@ -80,7 +80,7 @@ static int test_criteria_field_value_validation_run(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "not_exists without value response not null");
     ASSERT_CONTAINS(resp, "\"name\":\"beta\"", "not_exists: beta has no tag");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"alpha\"") == NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"name\":\"alpha\"") == NULL,
                 "not_exists: alpha has tag");
     free(resp); resp = NULL;
 

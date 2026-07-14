@@ -43,8 +43,8 @@ static int test_json_aggregate_order_case_run(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "uppercase DESC response not null");
     if (resp) {
-        const char *pa = strstr(resp, "\"grp\":\"a\"");
-        const char *pb = strstr(resp, "\"grp\":\"b\"");
+        const char *pa = SAFE_STRSTR(resp, "\"grp\":\"a\"");
+        const char *pb = SAFE_STRSTR(resp, "\"grp\":\"b\"");
         ASSERT_TRUE(pa && pb && pa < pb, "order:DESC (uppercase) sorts descending by total");
     }
     free(resp); resp = NULL;

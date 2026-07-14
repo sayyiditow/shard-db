@@ -49,7 +49,7 @@ static int test_agg_having_json_or_run(void) {
     ASSERT_TRUE(resp != NULL, "got response");
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "JSON OR keeps paid (n=5>2)");
     ASSERT_CONTAINS(resp, "\"status\":\"cancelled\"", "JSON OR keeps cancelled (s=200>100)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"pending\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"pending\"") == NULL,
                 "JSON OR drops pending (neither branch matches)");
     free(resp); resp = NULL;
 

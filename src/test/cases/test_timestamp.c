@@ -61,7 +61,7 @@ static int test_timestamp_run(void) {
 
     /* Sanity-check the auto-generated values fall in [t0..t1+1000]. */
     {
-        const char *cap = strstr(resp, "\"created_at\":");
+        const char *cap = SAFE_STRSTR(resp, "\"created_at\":");
         ASSERT_NOT_NULL(cap, "created_at substring present");
         if (cap) {
             long long got = atoll(cap + strlen("\"created_at\":"));
@@ -84,7 +84,7 @@ static int test_timestamp_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"ts\",\"object\":\"events\",\"key\":\"e1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"event_time\":1745654400000", "event_time updated");
     {
-        const char *uap = strstr(resp, "\"updated_at\":");
+        const char *uap = SAFE_STRSTR(resp, "\"updated_at\":");
         ASSERT_NOT_NULL(uap, "updated_at present after update");
         if (uap) {
             long long got = atoll(uap + strlen("\"updated_at\":"));

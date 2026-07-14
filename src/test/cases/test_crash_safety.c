@@ -154,7 +154,7 @@ static int test_crash_safety_run(void) {
         } else {
             char expected[64];
             snprintf(expected, sizeof(expected), "\"val_%d\"", i);
-            if (!strstr(resp, expected)) spot_check_failures++;
+            if (!SAFE_STRSTR(resp, expected)) spot_check_failures++;
         }
         free(resp); resp = NULL;
     }
@@ -166,7 +166,7 @@ static int test_crash_safety_run(void) {
         "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"crash\","
         "\"key\":\"k%07d\"}", BASELINE + CRASH_AT + 9999);
     tc_request(tc, req, &resp);
-    ASSERT_TRUE(resp && (strstr(resp, "Not found") || strstr(resp, "error")),
+    ASSERT_TRUE(resp && (SAFE_STRSTR(resp, "Not found") || SAFE_STRSTR(resp, "error")),
                 "never-attempted key is absent (no phantom records)");
     free(resp); resp = NULL;
 

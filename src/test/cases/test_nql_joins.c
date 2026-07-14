@@ -144,7 +144,7 @@ static int test_nql_join_inner(void) {
     ASSERT_CONTAINS(resp, "\"cust.name\"", "inner: cust.name column present");
     ASSERT_CONTAINS(resp, "\"Alice\"", "inner: Alice joined");
     ASSERT_CONTAINS(resp, "\"Bob\"", "inner: Bob joined");
-    ASSERT_TRUE(strstr(resp, "\"o4\"") == NULL, "inner: o4 filtered out");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"o4\"") == NULL, "inner: o4 filtered out");
     free(resp); resp = NULL;
 
     tc_close(tc);
@@ -212,7 +212,7 @@ static int test_nql_join_fields(void) {
         " --join nj_cust cust_id=key as cust fields name", &resp);
     ASSERT_CONTAINS(resp, "\"cust.name\"", "fields: name present");
     /* city should NOT be in output since we only requested name */
-    ASSERT_TRUE(strstr(resp, "\"cust.city\"") == NULL, "fields: city excluded");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"cust.city\"") == NULL, "fields: city excluded");
     free(resp); resp = NULL;
 
     tc_close(tc);

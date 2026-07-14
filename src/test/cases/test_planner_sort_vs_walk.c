@@ -99,7 +99,7 @@ static int test_cursor_fetch_sort(void) {
     ASSERT_EQ_INT(substr_count(resp, "\"kind\""), 3, "page1 has 3 rows");
 
     /* Extract cursor JSON for page 2. */
-    const char *curp = strstr(resp, "\"cursor\":");
+    const char *curp = SAFE_STRSTR(resp, "\"cursor\":");
     char *page2_cursor = NULL;
     if (curp) {
         const char *brace = strchr(curp, '{');

@@ -91,9 +91,9 @@ static int test_find_without_total(void) {
     /* Must be a JSON array — starts with [ */
     ASSERT_NOT_NULL(resp, "find response not null");
     ASSERT_TRUE(resp[0] == '[', "no-total find → bare array starts with [");
-    ASSERT_TRUE(strstr(resp, "\"rows\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"rows\"") == NULL,
                 "no-total find → no rows wrapper");
-    ASSERT_TRUE(strstr(resp, "\"total\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"total\"") == NULL,
                 "no-total find → no total field");
     free(resp);
 
@@ -124,7 +124,7 @@ static int test_find_with_total_shape(void) {
     ASSERT_CONTAINS(resp, "\"rows\"", "find+total → rows key present");
     ASSERT_CONTAINS(resp, "\"total\":", "find+total → total key present");
     /* The rows value must be an array starting with [ */
-    const char *rows_pos = strstr(resp, "\"rows\":");
+    const char *rows_pos = SAFE_STRSTR(resp, "\"rows\":");
     ASSERT_NOT_NULL(rows_pos, "rows key found");
     const char *after_rows = rows_pos + strlen("\"rows\":");
     while (*after_rows == ' ') after_rows++;
@@ -179,7 +179,7 @@ static int test_find_total_cursor_conflict(void) {
         "\"total\":true,\"cursor\":{}}",
         &resp);
     ASSERT_NOT_NULL(resp, "total+cursor response not null");
-    ASSERT_TRUE(strstr(resp, "mutually exclusive") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "mutually exclusive") == NULL,
                 "total+cursor → no longer an error");
     free(resp);
 
@@ -226,7 +226,7 @@ static int test_aggregate_without_total(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "agg no-total response not null");
     ASSERT_TRUE(resp[0] == '{', "agg no-total no-group → bare object");
-    ASSERT_TRUE(strstr(resp, "\"rows\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"rows\"") == NULL,
                 "agg no-total → no rows wrapper");
     free(resp); resp = NULL;
 
@@ -238,7 +238,7 @@ static int test_aggregate_without_total(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "agg no-total group resp not null");
     ASSERT_TRUE(resp[0] == '[', "agg no-total group → bare array");
-    ASSERT_TRUE(strstr(resp, "\"rows\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"rows\"") == NULL,
                 "agg no-total group → no rows wrapper");
     free(resp);
 
@@ -268,7 +268,7 @@ static int test_aggregate_with_total_group(void) {
     int total = extract_total(resp);
     ASSERT_EQ_INT(total, 5, "agg+total group → total = 5 distinct groups");
     /* rows value should be an array */
-    const char *rows_pos = strstr(resp, "\"rows\":");
+    const char *rows_pos = SAFE_STRSTR(resp, "\"rows\":");
     ASSERT_NOT_NULL(rows_pos, "rows key found in agg response");
     const char *after = rows_pos + strlen("\"rows\":");
     while (*after == ' ') after++;
@@ -324,7 +324,7 @@ static int test_fetch_with_total(void) {
     ASSERT_CONTAINS(resp, "\"rows\"", "fetch+total → rows key");
     ASSERT_CONTAINS(resp, "\"total\":null", "fetch+total → total:null");
     /* Must NOT contain "cursor" key when total mode is active */
-    ASSERT_TRUE(strstr(resp, "\"cursor\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"cursor\"") == NULL,
                 "fetch+total → no cursor in total-mode response");
     free(resp);
 
@@ -348,7 +348,7 @@ static int test_fetch_without_total(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "fetch no-total response not null");
     ASSERT_CONTAINS(resp, "\"results\"", "fetch no-total → results key (unchanged)");
-    ASSERT_TRUE(strstr(resp, "\"rows\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"rows\"") == NULL,
                 "fetch no-total → no rows wrapper");
     free(resp);
 
@@ -365,7 +365,7 @@ TEST_REGISTER("test-fetch-without-total", test_fetch_without_total)
    Returns the integer value, or -999 if "total":null, or -1 on error. */
 static int extract_total(const char *resp) {
     if (!resp) return -1;
-    const char *p = strstr(resp, "\"total\":");
+    const char *p = SAFE_STRSTR(resp, "\"total\":");
     if (!p) return -1;
     p += 8; /* skip "total": */
     while (*p == ' ') p++;
@@ -376,7 +376,7 @@ static int extract_total(const char *resp) {
 /* Count rows in the rows array — count occurrences of "key": to proxy row count. */
 static int count_rows_in_resp(const char *resp) {
     if (!resp) return 0;
-    const char *rows_start = strstr(resp, "\"rows\":");
+    const char *rows_start = SAFE_STRSTR(resp, "\"rows\":");
     if (!rows_start) {
         /* bare array */
         rows_start = resp;
@@ -836,7 +836,7 @@ TEST_REGISTER("test-real-total-d3-order-walk", test_real_total_d3_order_walk)
 static int count_agg_rows(const char *resp) {
     if (!resp) return 0;
     /* Locate the rows value: either {"rows":[...]} or bare [...] / {single} */
-    const char *start = strstr(resp, "\"rows\":");
+    const char *start = SAFE_STRSTR(resp, "\"rows\":");
     if (start) {
         start += 7; /* skip "rows": */
         while (*start == ' ' || *start == '\t') start++;

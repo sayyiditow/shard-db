@@ -47,8 +47,8 @@ static int test_nql_order_by_direction_run(void) {
     tc_request(tc, "find default nql_ord_t --order-by amount:DESC", &resp);
     ASSERT_NOT_NULL(resp, "DESC response not null");
     if (resp) {
-        const char *p30 = strstr(resp, "\"amount\":30");
-        const char *p10 = strstr(resp, "\"amount\":10");
+        const char *p30 = SAFE_STRSTR(resp, "\"amount\":30");
+        const char *p10 = SAFE_STRSTR(resp, "\"amount\":10");
         ASSERT_TRUE(p30 && p10 && p30 < p10, "amount:DESC sorts descending");
     }
     free(resp); resp = NULL;
@@ -64,8 +64,8 @@ static int test_nql_order_by_direction_run(void) {
     tc_request(tc, "find default nql_ord_t --order-by amount:asc", &resp);
     ASSERT_NOT_NULL(resp, "asc response not null");
     if (resp) {
-        const char *p30 = strstr(resp, "\"amount\":30");
-        const char *p10 = strstr(resp, "\"amount\":10");
+        const char *p30 = SAFE_STRSTR(resp, "\"amount\":30");
+        const char *p10 = SAFE_STRSTR(resp, "\"amount\":10");
         ASSERT_TRUE(p30 && p10 && p10 < p30, "amount:asc sorts ascending");
     }
     free(resp); resp = NULL;

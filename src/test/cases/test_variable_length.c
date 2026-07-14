@@ -71,7 +71,7 @@ static void test_trim_len_basics(void) {
     buf[28] = 'f'; buf[29] = 'o'; buf[30] = 'o';
     ASSERT_EQ_INT((int)typed_encode_trim_len(&ts, buf, 38), 38, "all-fields non-zero trims to full");
 
-    printf("  trim_len_basics: passed\n");
+    TAP_DIAG("  trim_len_basics: passed\n");
 }
 
 static int test_variable_length_run(void) {

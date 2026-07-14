@@ -92,8 +92,8 @@ static int test_cursor_sparse_prefetch(void) {
     ASSERT_CONTAINS(resp, "\"score\":699", "top rare score 699");
     ASSERT_CONTAINS(resp, "\"score\":698", "2nd rare score 698");
     ASSERT_EQ_INT(
-        (int)(strstr(resp, "\"score\":699") ? 1 : 0) +
-        (int)(strstr(resp, "\"score\":698") ? 1 : 0), 2,
+        (int)(SAFE_STRSTR(resp, "\"score\":699") ? 1 : 0) +
+        (int)(SAFE_STRSTR(resp, "\"score\":698") ? 1 : 0), 2,
         "top-2 rare scores present");
     free(resp); resp=NULL;
 

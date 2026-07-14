@@ -115,7 +115,7 @@ static int test_rebuild_kf_run(void) {
             "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"rebuildtest\","
             "\"key\":\"user%04d\"}", i);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"error\"")) errors++;
+        if (resp && SAFE_STRSTR(resp, "\"error\"")) errors++;
         free(resp); resp = NULL;
     }
     ASSERT_TRUE(errors > 0, "some gets fail after kf corruption");
@@ -126,7 +126,7 @@ static int test_rebuild_kf_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"ok\"", "rebuild-kf returns ok");
     /* Parse repaired count: find "repaired": and atoi the number after it. */
-    const char *rp = resp ? strstr(resp, "\"repaired\":") : NULL;
+    const char *rp = resp ? SAFE_STRSTR(resp, "\"repaired\":") : NULL;
     ASSERT_TRUE(rp && atoi(rp + 11) > 0, "repaired > 0");
     free(resp); resp = NULL;
 
@@ -138,7 +138,7 @@ static int test_rebuild_kf_run(void) {
             "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"rebuildtest\","
             "\"key\":\"user%04d\"}", i);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"karma\"")) ok++;
+        if (resp && SAFE_STRSTR(resp, "\"karma\"")) ok++;
         free(resp); resp = NULL;
     }
     ASSERT_EQ_INT(ok, 200, "all 200 records readable after rebuild-kf");

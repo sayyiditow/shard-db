@@ -76,7 +76,7 @@ static int test_bulk_upsert_run(void) {
         "\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],"
         "\"fields\":[\"status\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"k2\"", "find(paid) returns k2");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"k1\"") == NULL, "find(paid) does not return stale k1");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"k1\"") == NULL, "find(paid) does not return stale k1");
     free(resp); resp = NULL;
 
     /* No-op rewrite must not duplicate. */

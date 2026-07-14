@@ -53,9 +53,9 @@ static int test_agg_having_json_and_run(void) {
         &resp);
     ASSERT_TRUE(resp != NULL, "got response");
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "AND keeps paid (both conditions true)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"pending\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"pending\"") == NULL,
                 "AND drops pending (sum condition fails)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"cancelled\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"cancelled\"") == NULL,
                 "AND drops cancelled (count condition fails)");
     free(resp); resp = NULL;
 

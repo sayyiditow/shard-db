@@ -277,9 +277,9 @@ static int test_topn_stream_count_no_criteria(void) {
     ASSERT_TRUE(resp != NULL, "got aggregate response");
 
     /* Top 10 should be author_099 (100), author_098 (99), ..., author_090 (91). */
-    const char *p99 = strstr(resp, "\"author_099\"");
-    const char *p98 = strstr(resp, "\"author_098\"");
-    const char *p90 = strstr(resp, "\"author_090\"");
+    const char *p99 = resp ? SAFE_STRSTR(resp, "\"author_099\"") : NULL;
+    const char *p98 = resp ? SAFE_STRSTR(resp, "\"author_098\"") : NULL;
+    const char *p90 = resp ? SAFE_STRSTR(resp, "\"author_090\"") : NULL;
     ASSERT_TRUE(p99 != NULL, "author_099 present");
     ASSERT_TRUE(p98 != NULL, "author_098 present");
     ASSERT_TRUE(p90 != NULL, "author_090 present");
@@ -354,16 +354,18 @@ static int test_topn_stream_with_criteria_bitmap(void) {
     /* Every author should have count=10 under active=true. Top 5 are returned.
      * The streaming top-N path returns aggregate results in array format with
      * each row as {"name":"...", "n":10}. Check for the count value. */
-    ASSERT_TRUE(strstr(resp, "\"n\":10") != NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":10") != NULL,
                 "count = 10 per author in response");
 
     /* Count result rows: array of objects, each having a "name" field.
      * limit=5 → 5 result rows. Count "name" strings to verify. */
     int name_count = 0;
-    const char *q = resp;
-    while ((q = strstr(q, "\"name\":")) != NULL) {
-        name_count++;
-        q++;
+    if (resp) {
+        const char *q = resp;
+        while ((q = strstr(q, "\"name\":")) != NULL) {
+            name_count++;
+            q++;
+        }
     }
     ASSERT_EQ_INT(name_count, 5, "limit=5 returns 5 rows");
 
@@ -428,23 +430,24 @@ static int test_topn_stream_sum_min_max(void) {
         "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"v\",\"alias\":\"s\"}],"
         "\"order_by\":\"s\",\"order\":\"desc\",\"limit\":3}", &resp);
     ASSERT_TRUE(resp != NULL, "sum aggregate response");
+    if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
     /* Existing aggregate output emits numerics via fmt_double which produces
      * things like "990" or "990.000000" or "9.9e+02" depending on path.
      * Look for the value AND its sum in the response.
      * Match liberally — both quoted and unquoted forms are valid output shapes. */
-    ASSERT_TRUE(strstr(resp, "\"v\":\"99\"") != NULL || strstr(resp, "\"v\":99") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"v\":\"99\"") != NULL || SAFE_STRSTR(resp, "\"v\":99") != NULL,
                 "top by sum: v=99 present");
-    ASSERT_TRUE(strstr(resp, "990") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "990") != NULL,
                 "sum(99)=990 appears in response");
 
     /* Verify ordering: v=99 should appear before v=98, v=98 before v=97. */
-    const char *p99 = strstr(resp, "\"v\":\"99\"");
-    if (!p99) p99 = strstr(resp, "\"v\":99");
-    const char *p98 = strstr(resp, "\"v\":\"98\"");
-    if (!p98) p98 = strstr(resp, "\"v\":98");
-    const char *p97 = strstr(resp, "\"v\":\"97\"");
-    if (!p97) p97 = strstr(resp, "\"v\":97");
+    const char *p99 = SAFE_STRSTR(resp, "\"v\":\"99\"");
+    if (!p99) p99 = SAFE_STRSTR(resp, "\"v\":99");
+    const char *p98 = SAFE_STRSTR(resp, "\"v\":\"98\"");
+    if (!p98) p98 = SAFE_STRSTR(resp, "\"v\":98");
+    const char *p97 = SAFE_STRSTR(resp, "\"v\":\"97\"");
+    if (!p97) p97 = SAFE_STRSTR(resp, "\"v\":97");
     ASSERT_TRUE(p99 != NULL, "v=99 found");
     ASSERT_TRUE(p98 != NULL, "v=98 found");
     ASSERT_TRUE(p97 != NULL, "v=97 found");
@@ -529,18 +532,19 @@ static int test_topn_stream_with_composite(void) {
         "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"b\",\"alias\":\"sb\"}],"
         "\"order_by\":\"sb\",\"order\":\"desc\",\"limit\":3}", &resp);
     ASSERT_TRUE(resp != NULL, "composite-covered aggregate response");
+    if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
     /* Top group present. */
-    ASSERT_TRUE(strstr(resp, "\"a\":\"g_49\"") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"a\":\"g_49\"") != NULL,
                 "top group a=g_49 present");
     /* sum(b) for g_49 = 4900+...+4919 = 98190. Accept integer or scientific
      * float renderings produced by fmt_double. */
-    ASSERT_TRUE(strstr(resp, "98190") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "98190") != NULL,
                 "sum(b) for g_49 = 98190 present");
 
     /* Ordering: g_49 (98190) before g_48 (sum 4800..4819 = 96190). */
-    const char *p49 = strstr(resp, "\"a\":\"g_49\"");
-    const char *p48 = strstr(resp, "\"a\":\"g_48\"");
+    const char *p49 = SAFE_STRSTR(resp, "\"a\":\"g_49\"");
+    const char *p48 = SAFE_STRSTR(resp, "\"a\":\"g_48\"");
     ASSERT_TRUE(p49 != NULL, "g_49 found");
     ASSERT_TRUE(p48 != NULL, "g_48 found");
     ASSERT_TRUE(p49 != NULL && p48 != NULL && p49 < p48,
@@ -571,10 +575,8 @@ TEST_REGISTER("test-topn-stream-with-composite", test_topn_stream_with_composite
  * Group "g0" has 40000 active=true + 5000 active=false rows. Under
  * criteria active=true the count must be 40000, never 45000. */
 static int test_topn_stream_bitmap_postfilter_bounded(void) {
-    setenv("SHARD_TEST_QUERY_BUFFER_MB", "1", 1);
     TestEnv env = {0};
-    int started = test_env_start(&env);
-    unsetenv("SHARD_TEST_QUERY_BUFFER_MB");
+    int started = test_env_start_ex(&env, "1");
     if (started != 0) {
         ASSERT_TRUE(0, "test_env_start failed");
         return 1;
@@ -633,10 +635,11 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
         "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true}],"
         "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
     ASSERT_TRUE(resp != NULL, "bitmap-criteria aggregate response");
+    if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
-    ASSERT_TRUE(strstr(resp, "\"n\":40000") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":40000") != NULL,
                 "g0 count is the FILTERED active=true count (40000)");
-    ASSERT_TRUE(strstr(resp, "\"n\":45000") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":45000") == NULL,
                 "must NOT return the unfiltered count (45000) — criterion dropped under budget");
 
     free(resp); resp = NULL;
@@ -716,7 +719,7 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"topn_multi\","
         "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
                       "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}]}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "25") != NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "25") != NULL,
                 "plain count [active=true AND tag=x] = 25");
     free(resp); resp = NULL;
 
@@ -728,12 +731,13 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
                       "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}],"
         "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
     ASSERT_TRUE(resp != NULL, "multi-criteria aggregate response");
+    if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
-    ASSERT_TRUE(strstr(resp, "\"n\":25") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":25") != NULL,
                 "count applies BOTH leaves: active=true AND tag=x = 25");
-    ASSERT_TRUE(strstr(resp, "\"n\":35") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":35") == NULL,
                 "must not drop the bitmap leaf (tag=x only = 35)");
-    ASSERT_TRUE(strstr(resp, "\"n\":40") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":40") == NULL,
                 "must not drop the tag leaf (active=true only = 40)");
     free(resp); resp = NULL;
 
@@ -747,7 +751,7 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
         "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
                       "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}],"
         "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":20000}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":25") != NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":25") != NULL,
                 "scan-path aggregate (limit>10000) also applies both leaves = 25");
     free(resp); resp = NULL;
 
@@ -759,9 +763,9 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":true},"
                       "{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}]}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":25") != NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":25") != NULL,
                 "no-group aggregate count also applies both leaves = 25");
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":35") == NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":35") == NULL,
                 "no-group aggregate must not drop the bitmap leaf (= 35)");
     free(resp); resp = NULL;
     tc_close(tc);
@@ -824,10 +828,10 @@ static int test_topn_stream_btree_btree_intersect(void) {
         "\"criteria\":[{\"field\":\"t1\",\"op\":\"eq\",\"value\":\"x\"},"
                       "{\"field\":\"t2\",\"op\":\"eq\",\"value\":\"y\"}],"
         "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":5}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":30") != NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":30") != NULL,
                 "btree+btree intersect: [t1=x AND t2=y] = 30");
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"n\":50") == NULL &&
-                strstr(resp, "\"n\":40") == NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"n\":50") == NULL &&
+                SAFE_STRSTR(resp, "\"n\":40") == NULL,
                 "neither single-leaf result (50 / 40)");
     free(resp); resp = NULL;
     tc_close(tc);

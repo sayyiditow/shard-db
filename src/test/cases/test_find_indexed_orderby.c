@@ -72,7 +72,7 @@ static int test_find_indexed_orderby_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"age\":\"1\"", "ASC[0..5] contains age=1");
     ASSERT_CONTAINS(resp, "\"age\":\"5\"", "ASC[0..5] contains age=5");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"6\"") == NULL, "ASC[0..5] excludes age=6");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"6\"") == NULL, "ASC[0..5] excludes age=6");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "ASC[0..5] has 5 rows");
     free(resp); resp = NULL;
 
@@ -82,10 +82,10 @@ static int test_find_indexed_orderby_run(void) {
         "\"criteria\":[],\"order_by\":\"age\",\"order\":\"asc\","
         "\"offset\":50,\"limit\":5,\"fields\":[\"age\"]}",
         &resp);
-    ASSERT_TRUE(strstr(resp, "\"age\":\"50\"") == NULL, "ASC offset=50 excludes age=50");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"50\"") == NULL, "ASC offset=50 excludes age=50");
     ASSERT_CONTAINS(resp, "\"age\":\"51\"", "ASC offset=50 includes age=51");
     ASSERT_CONTAINS(resp, "\"age\":\"55\"", "ASC offset=50 includes age=55");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"56\"") == NULL, "ASC offset=50 excludes age=56");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"56\"") == NULL, "ASC offset=50 excludes age=56");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "ASC offset=50 has 5 rows");
     free(resp); resp = NULL;
 
@@ -97,7 +97,7 @@ static int test_find_indexed_orderby_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"age\":\"100\"", "DESC[0..5] includes age=100");
     ASSERT_CONTAINS(resp, "\"age\":\"96\"", "DESC[0..5] includes age=96");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"95\"") == NULL, "DESC[0..5] excludes age=95");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"95\"") == NULL, "DESC[0..5] excludes age=95");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "DESC[0..5] has 5 rows");
     free(resp); resp = NULL;
 
@@ -109,7 +109,7 @@ static int test_find_indexed_orderby_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"age\":\"50\"", "DESC offset=50 includes age=50");
     ASSERT_CONTAINS(resp, "\"age\":\"46\"", "DESC offset=50 includes age=46");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"51\"") == NULL, "DESC offset=50 excludes age=51");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"51\"") == NULL, "DESC offset=50 excludes age=51");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "DESC offset=50 has 5 rows");
     free(resp); resp = NULL;
 
@@ -122,8 +122,8 @@ static int test_find_indexed_orderby_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"age\":\"2\"", "ASC criteria includes age=2");
     ASSERT_CONTAINS(resp, "\"age\":\"10\"", "ASC criteria includes age=10");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"1\"") == NULL, "ASC criteria excludes age=1");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"3\"") == NULL, "ASC criteria excludes age=3");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"1\"") == NULL, "ASC criteria excludes age=1");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"3\"") == NULL, "ASC criteria excludes age=3");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "ASC criteria has 5 rows");
     free(resp); resp = NULL;
 
@@ -136,7 +136,7 @@ static int test_find_indexed_orderby_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"age\":\"92\"", "ASC criteria offset includes age=92");
     ASSERT_CONTAINS(resp, "\"age\":\"100\"", "ASC criteria offset includes age=100");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"90\"") == NULL, "ASC criteria offset excludes age=90");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"90\"") == NULL, "ASC criteria offset excludes age=90");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 5, "ASC criteria offset has 5 rows");
     free(resp); resp = NULL;
 
@@ -158,7 +158,7 @@ static int test_find_indexed_orderby_run(void) {
     ASSERT_CONTAINS(resp, "\"k1\"", "dict format includes k1");
     ASSERT_CONTAINS(resp, "\"k2\"", "dict format includes k2");
     ASSERT_CONTAINS(resp, "\"k3\"", "dict format includes k3");
-    ASSERT_TRUE(strstr(resp, "\"k4\"") == NULL, "dict format excludes k4");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"k4\"") == NULL, "dict format excludes k4");
     free(resp); resp = NULL;
 
     /* Non-indexed order_by (name) must still work via buffered fallback. */

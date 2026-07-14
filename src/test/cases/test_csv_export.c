@@ -86,7 +86,7 @@ static int test_csv_export_run(void) {
         "\"format\":\"csv\",\"delimiter\":\"|\"}", &resp);
     ASSERT_CONTAINS(resp, "o1|paid|100|vip", "indexed: o1 present");
     ASSERT_CONTAINS(resp, "o2|paid|50", "indexed: o2 present");
-    ASSERT_TRUE(resp && strstr(resp, "o3|") == NULL, "indexed: o3 absent");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "o3|") == NULL, "indexed: o3 absent");
     free(resp); resp = NULL;
 
     /* find: OR index-union (Shape C). */
@@ -105,7 +105,7 @@ static int test_csv_export_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"csv_orders\","
         "\"criteria\":[],\"format\":\"csv\",\"fields\":\"status,amount\"}", &resp);
     ASSERT_CONTAINS(resp, "key,status,amount", "proj header");
-    ASSERT_TRUE(resp && strstr(resp, ",note") == NULL, "proj: note column dropped");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, ",note") == NULL, "proj: note column dropped");
     free(resp); resp = NULL;
 
     /* find: error still JSON even with format=csv. */
@@ -180,7 +180,7 @@ static int test_csv_export_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"csv_orders\","
         "\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}],"
         "\"format\":\"csv\",\"delimiter\":\"|\"}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "nl1|") != NULL, "nl row exists");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "nl1|") != NULL, "nl row exists");
     ASSERT_EQ_INT(count_lines_starting_with(resp, "nl1|"), 1,
                   "nl value stays on one physical line");
     free(resp); resp = NULL;

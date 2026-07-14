@@ -119,9 +119,9 @@ static int test_auto_reshard_run(void) {
     localtime_r(&now, &tmv);
     int secs_left_in_hour = (59 - tmv.tm_min) * 60 + (60 - tmv.tm_sec);
     if (secs_left_in_hour < 90) {
-        printf("# auto-reshard: only %ds left in the hour, sleeping past the boundary...\n",
+        TAP_DIAG("# auto-reshard: only %ds left in the hour, sleeping past the boundary...\n",
                secs_left_in_hour);
-        fflush(stdout);
+        fflush(_TAP_OUT);
         struct timespec boundary_ts = { secs_left_in_hour + 2, 0 };
         nanosleep(&boundary_ts, NULL);
         now = time(NULL);
@@ -136,10 +136,10 @@ static int test_auto_reshard_run(void) {
         "export PORT=%d\n"
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
-        "export LOG_LEVEL=3\n"
-        "export THREADS=0\n"
-        "export FCACHE_MAX=4096\n"
-        "export TLS_ENABLE=0\n"
+"export LOG_LEVEL=3\n"
+            "export THREADS=2\n"
+            "export FCACHE_MAX=4096\n"
+            "export TLS_ENABLE=0\n"
         "export AUTO_RESHARD_ENABLE=1\n"
         "export AUTO_RESHARD_HOUR=%d\n",
         db_root, port, base, tmv.tm_hour);
@@ -239,13 +239,13 @@ static int test_auto_reshard_run(void) {
        specifically so this setup above always finishes first — then it
        sleeps in 1s increments and checks the wall clock each tick. 20s
        gives generous slack on top of the 5s startup delay for slow CI. */
-    printf("# auto-reshard: waiting up to 20s for the first thread tick...\n");
-    fflush(stdout);
+    TAP_DIAG("# auto-reshard: waiting up to 20s for the first thread tick...\n");
+    fflush(_TAP_OUT);
     int grown_reshaped = 0;
     for (int i = 0; i < 40; i++) {
         struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown\"}", &resp);
-        if (resp && strstr(resp, "\"splits\":16")) { grown_reshaped = 1; free(resp); resp = NULL; break; }
+        if (resp && SAFE_STRSTR(resp, "\"splits\":16")) { grown_reshaped = 1; free(resp); resp = NULL; break; }
         free(resp); resp = NULL;
     }
     ASSERT_TRUE(grown_reshaped, "grown reshaped from splits=8 to splits=16 within 20s");
@@ -296,7 +296,7 @@ static int test_auto_reshard_run(void) {
     for (int i = 0; i < 40; i++) {
         struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"huge\"}", &resp);
-        if (resp && strstr(resp, "\"splits\":2048")) { huge_reshaped = 1; free(resp); resp = NULL; break; }
+        if (resp && SAFE_STRSTR(resp, "\"splits\":2048")) { huge_reshaped = 1; free(resp); resp = NULL; break; }
         free(resp); resp = NULL;
     }
     ASSERT_TRUE(huge_reshaped,
@@ -335,10 +335,10 @@ static int test_auto_reshard_bad_hour_run(void) {
         "export PORT=%d\n"
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
-        "export LOG_LEVEL=3\n"
-        "export THREADS=0\n"
-        "export FCACHE_MAX=4096\n"
-        "export TLS_ENABLE=0\n"
+"export LOG_LEVEL=3\n"
+            "export THREADS=2\n"
+            "export FCACHE_MAX=4096\n"
+            "export TLS_ENABLE=0\n"
         "export AUTO_RESHARD_ENABLE=1\n"
         "export AUTO_RESHARD_HOUR=not-a-number\n",
         db_root, port, base);
@@ -437,10 +437,10 @@ static int test_auto_reshard_throttle_run(void) {
         "export PORT=%d\n"
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
-        "export LOG_LEVEL=3\n"
-        "export THREADS=0\n"
-        "export FCACHE_MAX=4096\n"
-        "export TLS_ENABLE=0\n"
+"export LOG_LEVEL=3\n"
+            "export THREADS=2\n"
+            "export FCACHE_MAX=4096\n"
+            "export TLS_ENABLE=0\n"
         "export AUTO_RESHARD_ENABLE=1\n"
         "export AUTO_RESHARD_HOUR=%d\n"
         "export AUTO_RESHARD_THROTTLE_MS=3000\n",
@@ -512,10 +512,10 @@ static int test_auto_reshard_throttle_run(void) {
     for (int i = 0; i < 80; i++) {
         struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown_a\"}", &resp);
-        int a_done = resp && strstr(resp, "\"splits\":16");
+        int a_done = resp && SAFE_STRSTR(resp, "\"splits\":16");
         free(resp); resp = NULL;
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown_b\"}", &resp);
-        int b_done = resp && strstr(resp, "\"splits\":16");
+        int b_done = resp && SAFE_STRSTR(resp, "\"splits\":16");
         free(resp); resp = NULL;
         if (a_done && b_done) { both_reshaped = 1; break; }
     }

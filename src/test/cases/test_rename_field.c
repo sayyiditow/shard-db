@@ -78,7 +78,7 @@ static int test_rename_field_run(void) {
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"contact\":\"a@x.com\"", "GET k1 has contact");
-    ASSERT_TRUE(strstr(resp, "\"email\"") == NULL, "GET k1 no email"); free(resp); resp = NULL;
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "GET k1 no email"); free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"leads\","
                    "\"key\":\"k3\",\"value\":{\"fullName\":\"Carol\",\"contact\":\"c@x.com\",\"age\":40}}", &resp);

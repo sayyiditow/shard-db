@@ -76,7 +76,7 @@ static int test_token_perms_run(void) {
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
         "export LOG_LEVEL=2\n"
-        "export THREADS=0\n"
+        "export THREADS=2\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n"
         "export DISABLE_LOCALHOST_TRUST=1\n",

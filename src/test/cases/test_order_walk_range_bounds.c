@@ -192,7 +192,7 @@ static int test_order_walk_cursor_windowed_paging(void) {
         "\"cursor\":{\"t\":\"22\",\"key\":\"k22\"}}", &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"k21\"", "page2 top = k21 (no gap after k22)");
     ASSERT_CONTAINS(resp, "\"key\":\"k14\"", "page2 last = k14");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"k22\"") == NULL, "page2 does not repeat k22");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"k22\"") == NULL, "page2 does not repeat k22");
     free(resp); resp=NULL;
 
     /* PAGE 3: resume from k14 (t=14) → k13..k10, then cursor:null. Must STOP at
@@ -204,8 +204,8 @@ static int test_order_walk_cursor_windowed_paging(void) {
         "\"cursor\":{\"t\":\"14\",\"key\":\"k14\"}}", &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"k13\"", "page3 top = k13 (no gap after k14)");
     ASSERT_CONTAINS(resp, "\"key\":\"k10\"", "page3 includes inclusive window-low k10");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"k14\"") == NULL, "page3 does not repeat k14");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"k09\"") == NULL, "page3 does not spill below window (no k09)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"k14\"") == NULL, "page3 does not repeat k14");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"k09\"") == NULL, "page3 does not spill below window (no k09)");
     ASSERT_CONTAINS(resp, "\"cursor\":null", "pagination terminates at window low");
     free(resp); resp=NULL;
 

@@ -131,7 +131,7 @@ static int test_field_vs_field_run(void) {
             "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"fft\","
             "\"criteria\":[{\"field\":\"name\",\"op\":\"eq_field\",\"value\":\"missing_field\"}]}",
             &resp);
-        ASSERT_TRUE(resp && strstr(resp, "unknown field") != NULL,
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, "unknown field") != NULL,
                     "name eq_field missing_field → error");
         free(resp);
     }

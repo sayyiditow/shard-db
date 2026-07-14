@@ -185,8 +185,8 @@ static int test_and_intersection_run(void) {
         "\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"},"
         "{\"field\":\"region\",\"op\":\"eq\",\"value\":\"us\"}],"
         "\"limit\":1,\"fields\":[\"amount\"]}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"amount\":") != NULL, "projection has amount");
-    ASSERT_TRUE(resp && strstr(resp, "\"status\":") == NULL, "projection excludes status");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"amount\":") != NULL, "projection has amount");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"status\":") == NULL, "projection excludes status");
     free(resp); resp = NULL;
 
     /* AGGREGATE sum + count: paid+us. sum=10100, count=50. */

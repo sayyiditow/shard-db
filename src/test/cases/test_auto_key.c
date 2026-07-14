@@ -27,7 +27,7 @@
    Returns a malloc'd copy of the value (caller frees) or NULL if not
    found. Strict: assumes the value is a JSON string, not a number. */
 static char *extract_key_field(const char *resp) {
-    const char *p = strstr(resp, "\"key\":\"");
+    const char *p = SAFE_STRSTR(resp, "\"key\":\"");
     if (!p) return NULL;
     p += 7;
     const char *end = strchr(p, '"');
@@ -360,7 +360,7 @@ static int test_auto_key_run(void) {
     ASSERT_CONTAINS(resp, "\"count\":2", "bulk-insert auto-uuid count");
     /* Both keys should be 36-char dashed uuids — substring check on "-" pattern. */
     /* Loose check: response should contain at least one dashed-uuid pattern. */
-    ASSERT_TRUE(resp && strstr(resp, "-4") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "-4") != NULL,
                 "bulk-insert response contains v4 marker (-4)");
     free(resp); resp = NULL;
 
@@ -388,7 +388,7 @@ static int test_auto_key_run(void) {
         "{\"mode\":\"not-exists\",\"dir\":\"default\",\"object\":\"orders\","
         "\"keys\":[\"1\",\"999\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"999\"", "not-exists: 999 in output");
-    ASSERT_TRUE(resp && strstr(resp, "\"1\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"1\"") == NULL,
                 "not-exists: existing key 1 omitted");
     free(resp); resp = NULL;
 
@@ -441,7 +441,7 @@ static int test_auto_key_run(void) {
         "\"data\":\",DelimP\\n,DelimQ\\n\"}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim auto-uuid status");
     ASSERT_CONTAINS(resp, "\"count\":2", "delim auto-uuid count");
-    ASSERT_TRUE(resp && strstr(resp, "-4") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "-4") != NULL,
                 "delim auto-uuid: v4 marker present");
     free(resp); resp = NULL;
 

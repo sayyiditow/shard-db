@@ -57,15 +57,15 @@ static int test_explain_run(void) {
         "\"criteria\":[{\"field\":\"score\",\"op\":\"eq\",\"value\":\"5\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":\"leaf\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":\"leaf\"") != NULL,
                 "indexed eq criterion -> plan==leaf");
-    ASSERT_TRUE(strstr(resp, "\"role\":\"seed\"") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"role\":\"seed\"") != NULL,
                 "seed leaf present in source");
     /* table_rows must match what we inserted -- use a format string to avoid
        hard-coding the number in two places. */
     char expected_rows[64];
     snprintf(expected_rows, sizeof(expected_rows), "\"table_rows\":%d", N_ROWS);
-    ASSERT_TRUE(strstr(resp, expected_rows) != NULL, "table_rows matches N_ROWS");
+    ASSERT_TRUE(SAFE_STRSTR(resp, expected_rows) != NULL, "table_rows matches N_ROWS");
     free(resp); resp = NULL;
 
     /* -- Test 2: full scan + trigram hint (threshold=0 in TEST_BUILD) -- */
@@ -74,9 +74,9 @@ static int test_explain_run(void) {
         "\"criteria\":[{\"field\":\"title\",\"op\":\"contains\",\"value\":\"title1\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":\"scan\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":\"scan\"") != NULL,
                 "unindexed contains -> plan==scan");
-    ASSERT_TRUE(strstr(resp, "add_trigram_index") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "add_trigram_index") != NULL,
                 "trigram hint emitted (TEST_BUILD threshold=0)");
     free(resp); resp = NULL;
 
@@ -87,11 +87,11 @@ static int test_explain_run(void) {
         "{\"field\":\"created_at\",\"op\":\"gt\",\"value\":\"1000050\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":") != NULL,
                 "two indexed AND leaves returns a plan");
-    ASSERT_TRUE(strstr(resp, "\"role\":\"seed\"") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"role\":\"seed\"") != NULL,
                 "seed leaf present in source");
-    ASSERT_TRUE(strstr(resp, "\"role\":\"postfilter\"") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"role\":\"postfilter\"") != NULL,
                 "postfilter leaf present");
     free(resp); resp = NULL;
 
@@ -103,9 +103,9 @@ static int test_explain_run(void) {
         "\"explain\":true}",
         &resp);
     /* order==sort because title has no index; composite_index hint expected */
-    ASSERT_TRUE(resp && strstr(resp, "\"order\":\"sort\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"order\":\"sort\"") != NULL,
                 "order_by unindexed field -> order==sort");
-    ASSERT_TRUE(strstr(resp, "composite_index") != NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "composite_index") != NULL,
                 "composite_index hint emitted for filter+order_by mismatch");
     free(resp); resp = NULL;
 
@@ -115,9 +115,9 @@ static int test_explain_run(void) {
         "\"criteria\":[{\"field\":\"score\",\"op\":\"lt\",\"value\":\"10\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":") != NULL,
                 "count+explain returns plan object");
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL,
                 "count+explain has no error");
     free(resp); resp = NULL;
 
@@ -128,9 +128,9 @@ static int test_explain_run(void) {
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":") != NULL,
                 "aggregate+explain returns plan object");
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL,
                 "aggregate+explain has no error");
     free(resp); resp = NULL;
 
@@ -140,7 +140,7 @@ static int test_explain_run(void) {
         "\"criteria\":[{\"field\":\"score\",\"op\":\"eq\",\"value\":\"5\"}],"
         "\"limit\":5}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"plan\":") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"plan\":") == NULL,
                 "normal find returns no plan field");
     free(resp); resp = NULL;
 
@@ -150,7 +150,7 @@ static int test_explain_run(void) {
         "\"criteria\":[{\"field\":\"nosuchfield\",\"op\":\"eq\",\"value\":\"x\"}],"
         "\"explain\":true}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"error\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") != NULL,
                 "explain with invalid field returns error");
     free(resp); resp = NULL;
 

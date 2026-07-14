@@ -61,7 +61,7 @@ static int test_criteria_between_missing_value2_run(void) {
         "\"criteria\":[{\"field\":\"age\",\"op\":\"between\",\"value\":\"18\",\"value2\":\"65\"}]}",
         &resp);
     ASSERT_NOT_NULL(resp, "between with value2 response not null");
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "between with both bounds not rejected");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL, "between with both bounds not rejected");
     ASSERT_CONTAINS(resp, "\"name\":\"alice\"", "between with both bounds matches alice");
     free(resp); resp = NULL;
 

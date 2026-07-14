@@ -28,7 +28,7 @@
 static int extract_field(const char *resp, const char *key, char *out, size_t out_sz) {
     if (!resp || !key) return 0;
     char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(resp, needle);
+    const char *p = SAFE_STRSTR(resp, needle);
     if (!p) return 0;
     p += strlen(needle);
     size_t i = 0;
@@ -153,7 +153,7 @@ static int test_agg_walk_fetch_check_run(void) {
         "\"criteria\":[{\"field\":\"active\",\"op\":\"eq\",\"value\":\"true\"}],"
         "\"aggregates\":[{\"fn\":\"min\",\"field\":\"name\"}]}", &resp);
     /* Just check it doesn't error; varchar min is degenerate by design. */
-    ASSERT_NOT_NULL(strstr(resp, "\"min_name\":"), "varchar fall-through emits result");
+    ASSERT_NOT_NULL(SAFE_STRSTR(resp, "\"min_name\":"), "varchar fall-through emits result");
     free(resp); resp = NULL;
 
     tc_close(tc);
