@@ -1,7 +1,7 @@
 <!--
   GENERATED FILE — do not hand-edit.
-  Source: https://github.com/sayyiditow/dev-standards/blob/b34d2c1/CORE-PROCESS.md
-  Synced: 2026-07-09
+  Source: https://github.com/sayyiditow/dev-standards/blob/37290da/CORE-PROCESS.md
+  Synced: 2026-07-14
   To update: edit CORE-PROCESS.md in dev-standards, then re-run sync.sh against this repo.
 -->
 
@@ -52,15 +52,40 @@ plan.
      block** — no prose descriptions of what to write.
    - Every task states its **test-first** step: a failing test (or a
      reproduction script for a bug) before the fix/feature code.
+   - Bug-fix tasks state the **root cause** — the specific mechanism
+     producing the wrong behavior, not just where it's observed — before
+     proposing a fix. If the root cause isn't yet known with confidence,
+     the plan's first task is a diagnostic/investigation task to establish
+     it, not a speculative fix.
    - Bug-fix tasks include a **regression test** — one that fails on the
-     base branch before the change and passes after.
+     base branch before the change and passes after. The task's steps make
+     the executor prove this directly: temporarily revert the fix, run the
+     test and confirm it fails for the expected reason, then re-apply the
+     fix and confirm it passes. Both outputs get pasted, not just the
+     final green run.
+   - New tests don't depend on process-wide mutable state (env vars,
+     global singletons, fixed ports/paths) unless that state is already
+     guarded for concurrent access, and don't assume they run alone or in
+     a specific order — unless the project's test harness only ever runs
+     tests strictly sequentially, in which case this doesn't apply.
+   - Before proposing a signature/format/protocol change, the plan lists
+     every call site / consumer of the thing being changed (via codebase
+     search, plus any known external consumers) — not left for the
+     executor to discover ad hoc while implementing.
    - Edge cases and invariants are spelled out explicitly, not left to the
      executor's judgment.
    - Embedded execution rules: branch off the default branch; do tasks in
      order; the exact build/test commands for this repo; "if a quoted
-     anchor isn't found exactly, stop and write `PLAN_NOTES.md` — do not
-     guess or reinterpret"; "if you hit a decision the plan doesn't cover,
-     stop and ask — do not improvise."
+     anchor isn't found exactly, write `PLAN_NOTES.md` describing the
+     mismatch and halt the entire execution run immediately — do not
+     guess, reinterpret, or continue to any further task, even an
+     unrelated one. Resuming requires the human (or the planning model,
+     re-engaged) to read `PLAN_NOTES.md`, decide whether it's a
+     stale-anchor problem (re-derive and patch the plan) or a
+     wrong-assumption problem (rethink the plan), and hand back either a
+     patched or a fresh plan — execution never resumes on its own
+     initiative"; "if you hit a decision the plan doesn't cover, stop and
+     ask — do not improvise."
 
 2. **Approve.** The human approves, requests changes, or rejects. No
    execution starts without an explicit go-ahead.
@@ -72,15 +97,34 @@ plan.
    claim a step passed without pasting the real command output. Never
    weaken a test — loosen an assertion, delete a case, mark it
    skip/xfail — to make a failure disappear. If a test can't be made to
-   pass honestly, stop and report why instead of hiding it.
+   pass honestly, stop and report why instead of hiding it. A test that
+   fails and then passes on rerun is not resolved — treat it as a
+   confirmed bug until root-caused, or explicitly time-boxed and escalated
+   to the human with what was checked. Never quietly rerun-until-green.
 
-4. **Review.** Inspect the actual diff, not the executor's summary. Check,
-   at minimum:
+4. **Review.** Inspect the actual diff, not the executor's summary. For any
+   diff touching concurrency, security boundaries, or an on-disk/wire
+   format, include a pass from a reviewer that hasn't seen the plan —
+   reviewing the raw diff and repo on its own terms, blind to the plan's
+   stated intent, catches both confirmation bias ("did the executor follow
+   the plan") and flaws baked into the plan itself that a plan-aware
+   reviewer would wave through. Check, at minimum:
    - Correctness against the plan's stated invariants and edge cases.
    - Security: injection, path traversal, unchecked bounds, secrets in the
      diff.
    - Resource handling: leaks, unclosed handles, unbounded allocation.
    - Concurrency: races, lock ordering, TOCTOU.
+   - Interrupt/crash safety: if this operation is killed or fails partway
+     through, is the resulting state safe (consistent, recoverable, or at
+     worst inert) rather than corrupted or stuck? If the diff introduces a
+     new multi-step mutation, does an existing recovery/cleanup path cover
+     it, or does one need to be added?
+   - Breaking changes: does this diff change any externally-observable
+     contract (wire protocol, on-disk/serialized format, public API
+     signature, CLI flags, config keys/semantics) in a way an existing
+     caller could break? If yes, is there an explicit migration path, or
+     is it flagged to the human as a breaking change requiring a version
+     bump / migration note?
    - Test quality: does the new test actually fail without the fix? Is
      coverage of the stated edge cases real, or just line coverage?
    - Scope: no unrelated changes, no drive-by refactors that weren't asked
@@ -145,6 +189,16 @@ confirms was actually run.
 
 - [ ] Full test suite passes locally, fresh — not relying on a stale
       cache or a subset run.
+- [ ] Dynamic-safety tooling gate: if the project has dynamic-analysis
+      tooling for concurrency- or resource-safety (sanitizers in
+      C/C++/Rust, `-race` in Go, strict concurrency/leak linting in
+      TS/Python/Java, valgrind, etc.), and the diff touches
+      shared/concurrent state or resource lifetimes (locks, connections,
+      file handles, goroutines/threads/async tasks), that tooling has been
+      run locally against the affected tests — not deferred to a
+      separately-scheduled CI job. Conditional on what the project already
+      has; not a mandate to add new tooling. Projects with none of this
+      have nothing to trigger here.
 - [ ] No new compiler/linter warnings.
 - [ ] No leftover `TODO`/`FIXME`/debug prints/commented-out code from the
       work itself.
@@ -152,6 +206,9 @@ confirms was actually run.
 - [ ] Dependency additions, if any, are called out explicitly to the
       human — a new dependency is a supply-chain and maintenance cost,
       never add one silently.
+- [ ] Documentation sync: if this diff changes a documented command, flag,
+      config option, API surface, or invariant, the corresponding docs are
+      updated in the same branch/PR — not deferred as a follow-up.
 - [ ] Commit messages are atomic (one logical change each) and explain
       *why*, not *what*.
 
