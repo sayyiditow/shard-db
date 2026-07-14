@@ -26,7 +26,7 @@
 static int extract_field(const char *resp, const char *key, char *out, size_t out_sz) {
     if (!resp || !key) return 0;
     char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(resp, needle);
+    const char *p = SAFE_STRSTR(resp, needle);
     if (!p) return 0;
     p += strlen(needle);
     size_t i = 0;
@@ -47,7 +47,7 @@ static int extract_bucket_field(const char *resp, const char *gb_key,
     if (!resp) return 0;
     char gb_needle[128];
     snprintf(gb_needle, sizeof(gb_needle), "\"%s\":\"%s\"", gb_key, gb_val);
-    const char *bucket = strstr(resp, gb_needle);
+    const char *bucket = SAFE_STRSTR(resp, gb_needle);
     if (!bucket) return 0;
     /* find the closing brace for this bucket */
     const char *end = strchr(bucket, '}');
@@ -191,8 +191,8 @@ static int test_agg_indexed_groupby_run(void) {
         "\"group_by\":[\"age\"],"
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"having\":[{\"field\":\"n\",\"op\":\"gt\",\"value\":\"50\"}]}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"age\":\"10\"") == NULL, "having drops age=10");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"40\"") == NULL, "having drops age=40");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"10\"") == NULL, "having drops age=10");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"40\"") == NULL, "having drops age=40");
     free(resp); resp = NULL;
 
     /* order_by + limit: top-2 by count descending → all tied at 50, but

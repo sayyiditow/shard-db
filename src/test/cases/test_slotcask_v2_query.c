@@ -91,7 +91,7 @@ static int test_slotcask_v2_query_run(void) {
     tc_request(tc, "{\"mode\":\"find\",\"dir\":\"qry\",\"object\":\"users\","
                    "\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"carol\"}]}", &resp);
     ASSERT_CONTAINS(resp, "carol", "non-indexed find returns carol");
-    ASSERT_TRUE(resp && strstr(resp, "alice") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "alice") == NULL,
                 "non-indexed find excludes alice");
     free(resp); resp = NULL;
 
@@ -103,9 +103,9 @@ static int test_slotcask_v2_query_run(void) {
     ASSERT_CONTAINS(resp, "dave",  "indexed range w/ order_by returns dave (age=40)");
     ASSERT_CONTAINS(resp, "eve",   "indexed range w/ order_by returns eve (age=45)");
     ASSERT_CONTAINS(resp, "frank", "indexed range w/ order_by returns frank (age=50)");
-    ASSERT_TRUE(resp && strstr(resp, "alice") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "alice") == NULL,
                 "indexed range excludes alice (age=25)");
-    ASSERT_TRUE(resp && strstr(resp, "bob") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "bob") == NULL,
                 "indexed range excludes bob (age=30)");
     free(resp); resp = NULL;
 
@@ -115,9 +115,9 @@ static int test_slotcask_v2_query_run(void) {
     ASSERT_CONTAINS(resp, "alice", "indexed eq w/ order_by returns alice");
     ASSERT_CONTAINS(resp, "carol", "indexed eq w/ order_by returns carol");
     ASSERT_CONTAINS(resp, "frank", "indexed eq w/ order_by returns frank");
-    ASSERT_TRUE(resp && strstr(resp, "bob") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "bob") == NULL,
                 "indexed eq excludes bob (LON)");
-    ASSERT_TRUE(resp && strstr(resp, "dave") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "dave") == NULL,
                 "indexed eq excludes dave (TYO)");
     free(resp); resp = NULL;
 
@@ -155,7 +155,7 @@ static int test_slotcask_v2_query_run(void) {
                    "\"offset\":0,\"limit\":2}", &resp);
     ASSERT_CONTAINS(resp, "alice", "limit=2 includes alice (smallest age)");
     ASSERT_CONTAINS(resp, "bob",   "limit=2 includes bob (next age)");
-    ASSERT_TRUE(resp && strstr(resp, "frank") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "frank") == NULL,
                 "limit=2 excludes frank (largest age)");
     free(resp); resp = NULL;
 
@@ -164,7 +164,7 @@ static int test_slotcask_v2_query_run(void) {
                    "\"criteria\":[{\"field\":\"age\",\"op\":\"eq\",\"value\":\"35\"}]}", &resp);
     ASSERT_CONTAINS(resp, "carol",
                     "indexed eq (no order_by) returns carol via idx_find_parallel");
-    ASSERT_TRUE(resp && strstr(resp, "alice") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "alice") == NULL,
                 "indexed eq (no order_by) excludes alice");
     free(resp); resp = NULL;
 
@@ -172,7 +172,7 @@ static int test_slotcask_v2_query_run(void) {
                    "\"criteria\":[{\"field\":\"city\",\"op\":\"eq\",\"value\":\"LON\"}]}", &resp);
     ASSERT_CONTAINS(resp, "bob", "indexed city=LON returns bob (no order_by)");
     ASSERT_CONTAINS(resp, "eve", "indexed city=LON returns eve (no order_by)");
-    ASSERT_TRUE(resp && strstr(resp, "alice") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "alice") == NULL,
                 "indexed city=LON excludes alice (NYC)");
     free(resp); resp = NULL;
 
@@ -182,9 +182,9 @@ static int test_slotcask_v2_query_run(void) {
     ASSERT_CONTAINS(resp, "bob",   "indexed between returns bob (age=30)");
     ASSERT_CONTAINS(resp, "carol", "indexed between returns carol (age=35)");
     ASSERT_CONTAINS(resp, "dave",  "indexed between returns dave (age=40)");
-    ASSERT_TRUE(resp && strstr(resp, "alice") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "alice") == NULL,
                 "indexed between excludes alice (age=25)");
-    ASSERT_TRUE(resp && strstr(resp, "frank") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "frank") == NULL,
                 "indexed between excludes frank (age=50)");
     free(resp); resp = NULL;
 

@@ -114,7 +114,7 @@ static int test_rebuild_recovery_run(void) {
     tc_request(tc,
         "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"rebuildrecov\",\"splits\":16}",
         &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""),
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
                 "vacuum/rebuild succeeds despite corrupt segment record");
     free(resp); resp = NULL;
 

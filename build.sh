@@ -312,6 +312,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_nql_agg_filter_override_leak.c \
     src/test/cases/test_nql_order_by_direction.c \
     src/test/cases/test_json_aggregate_order_case.c \
+    src/test/cases/test_runner_parallel.c \
     src/db/util.c \
     src/db/slotcask.c \
     src/db/parallel.c \

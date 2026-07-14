@@ -14,6 +14,7 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -52,7 +53,7 @@ static int test_auto_vacuum_run(void) {
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
         "export LOG_LEVEL=3\n"
-        "export THREADS=0\n"
+        "export THREADS=2\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n"
         "export AUTO_VACUUM=1\n"
@@ -72,7 +73,23 @@ static int test_auto_vacuum_run(void) {
     pid_t pid = fork();
     if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
     if (pid == 0) {
+        /* Redirect stdout/stderr to a log file before exec, same as
+           fixtures.c's spawn_daemon(). Without this, the daemon child
+           inherits whatever fd 1/2 the test binary itself had — when
+           this test runs under a popen()'d pipe (the watchdog
+           self-test), that leaves the daemon holding the pipe's
+           write end open indefinitely after the watchdog _exit(124)s
+           the immediate child, hanging the reader's fgets() on an
+           EOF that never comes. */
         chdir(base);
+        char dlog[400];
+        snprintf(dlog, sizeof(dlog), "%s/daemon.log", base);
+        int lfd = open(dlog, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
         execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
         _exit(127);
     }
@@ -151,7 +168,7 @@ static int test_auto_vacuum_run(void) {
     /* sml may not appear at all (deleted=2, the handler suppresses if deleted==0
        — here it's 2 so it appears, but with vacuum:false). */
     {
-        const char *sml = strstr(resp, "\"object\":\"sml\"");
+        const char *sml = SAFE_STRSTR(resp, "\"object\":\"sml\"");
         if (sml) {
             const char *next_obj = strstr(sml + 1, "\"object\"");
             const char *vac = strstr(sml, "\"vacuum\":");
@@ -185,10 +202,10 @@ static int test_auto_vacuum_run(void) {
        under load. The interval floor is 60s; 30s slack is enough for
        both runners to settle.) Skip if SHARD_TEST_FAST=1. */
     if (getenv("SHARD_TEST_FAST")) {
-        printf("# auto-vacuum: SHARD_TEST_FAST set, skipping the 90s wake test\n");
+        TAP_DIAG("# auto-vacuum: SHARD_TEST_FAST set, skipping the 90s wake test\n");
     } else {
-        printf("# auto-vacuum: sleeping 90s for the first thread tick…\n");
-        fflush(stdout);
+        TAP_DIAG("# auto-vacuum: sleeping 90s for the first thread tick…\n");
+        fflush(_TAP_OUT);
         sleep(90);
 
         tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"big\"}", &resp);

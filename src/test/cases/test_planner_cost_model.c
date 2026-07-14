@@ -1047,8 +1047,8 @@ static int test_a3_trigram_starts_with_executor(void) {
         while ((p = strstr(p, "Show HN")) != NULL) { count++; p++; }
         ASSERT_EQ_INT(count, 10, "A3 exec: 10 rows returned all with Show HN prefix");
         /* Should NOT contain "Ask HN" or "How to" */
-        ASSERT_TRUE(strstr(resp, "Ask HN") == NULL, "A3 exec: no Ask HN rows in result");
-        ASSERT_TRUE(strstr(resp, "How to") == NULL, "A3 exec: no How to rows in result");
+        ASSERT_TRUE(SAFE_STRSTR(resp, "Ask HN") == NULL, "A3 exec: no Ask HN rows in result");
+        ASSERT_TRUE(SAFE_STRSTR(resp, "How to") == NULL, "A3 exec: no How to rows in result");
         free(resp);
     }
 

@@ -309,7 +309,7 @@ static int run_reindex_assertions(TestEnv *env) {
     /* Reindex via wire — server-side rebuild. */
     tc_request(tc, "{\"mode\":\"reindex\",\"dir\":\"r\",\"object\":\"texts\"}", &resp);
     /* Either {"status":"ok"} or a numeric "rebuilt": N. Just ensure no error. */
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "reindex: no error response");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL, "reindex: no error response");
     free(resp); resp = NULL;
 
     /* After reindex the .tg shards should still hold content. The exact
@@ -459,7 +459,7 @@ static int run_planner_assertions(TestEnv *env) {
         "\"spec\":\"body:trigram\"}", &resp);
     ASSERT_CONTAINS(resp, "\"records\":6", "estimate: records=6");
     ASSERT_CONTAINS(resp, "\"sample_size\":6", "estimate: sample=6");
-    ASSERT_TRUE(strstr(resp, "\"avg_distinct_trigrams\":0.0") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"avg_distinct_trigrams\":0.0") == NULL,
                 "estimate: non-zero avg_distinct_trigrams");
     free(resp); resp = NULL;
 
@@ -749,7 +749,7 @@ static int run_streaming_stress_assertions(TestEnv *env) {
         snprintf(buf + pos, cap - pos, "]}");
         tc_request(tc, buf, &resp);
         free(buf);
-        ASSERT_TRUE(resp && strstr(resp, "\"inserted\"") != NULL,
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"inserted\"") != NULL,
                     "stress: bulk-insert chunk");
         free(resp); resp = NULL;
     }
@@ -792,7 +792,7 @@ static int run_streaming_stress_assertions(TestEnv *env) {
         "\"criteria\":[{\"field\":\"text\",\"op\":\"contains\",\"value\":\"jump\"}]}",
         &resp);
     /* All 5000 records contain "jump". */
-    ASSERT_TRUE(resp && strstr(resp, "5000") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "5000") != NULL,
                 "stress: contains 'jump' → 5000 matches");
     free(resp); resp = NULL;
 
@@ -869,7 +869,7 @@ static int run_reindex_completeness_assertions(TestEnv *env) {
 
     /* Reindex via wire — server-side rebuild. */
     tc_request(tc, "{\"mode\":\"reindex\",\"dir\":\"c\",\"object\":\"pages\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "completeness: reindex no error");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"error\"") == NULL, "completeness: reindex no error");
     free(resp); resp = NULL;
 
     /* Count records where title icontains "the" after reindex. */

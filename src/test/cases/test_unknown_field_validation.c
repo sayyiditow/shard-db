@@ -18,7 +18,7 @@
 #include <string.h>
 
 static int has_unknown_field_error(const char *resp) {
-    return resp && strstr(resp, "unknown field") != NULL;
+    return resp && SAFE_STRSTR(resp, "unknown field") != NULL;
 }
 
 static int test_unknown_field_validation_run(void) {
@@ -152,7 +152,7 @@ static int test_unknown_field_validation_run(void) {
         "\"criteria\":[{\"field\":\"name+city\",\"op\":\"eq\",\"value\":\"alice|london\"}]}",
         &resp);
     ASSERT_TRUE(resp && !has_unknown_field_error(resp)
-                && strstr(resp, "unknown sub-field") == NULL,
+                && SAFE_STRSTR(resp, "unknown sub-field") == NULL,
                 "count: composite 'name+city' (both subfields exist) → accepted");
     free(resp); resp = NULL;
 
@@ -163,7 +163,7 @@ static int test_unknown_field_validation_run(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ufv\","
         "\"criteria\":[{\"field\":\"name+missing\",\"op\":\"eq\",\"value\":\"alice|x\"}]}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "unknown sub-field 'missing'") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "unknown sub-field 'missing'") != NULL,
                 "count: composite 'name+missing' → error pinpointing 'missing'");
     free(resp); resp = NULL;
 

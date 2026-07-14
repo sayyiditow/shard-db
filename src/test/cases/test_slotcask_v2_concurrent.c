@@ -101,7 +101,7 @@ static void *writer_thread(void *arg) {
    not present or malformed. */
 static int parse_v_field(const char *resp) {
     if (!resp) return INT_MIN;
-    const char *p = strstr(resp, "\"v\":");
+    const char *p = SAFE_STRSTR(resp, "\"v\":");
     if (!p) return INT_MIN;
     p += 4;
     return atoi(p);
@@ -109,7 +109,7 @@ static int parse_v_field(const char *resp) {
 
 static int parse_writer_field(const char *resp) {
     if (!resp) return -1;
-    const char *p = strstr(resp, "\"writer\":");
+    const char *p = SAFE_STRSTR(resp, "\"writer\":");
     if (!p) return -1;
     p += 9;
     return atoi(p);
@@ -135,7 +135,7 @@ static void *reader_thread(void *arg) {
                writer*1000+99999] and writer in [0, NUM_WRITERS). The
                update-only path doesn't touch `writer`, so we tolerate
                its absence (treat as "from some prior insert"). */
-            if (resp && strstr(resp, "\"v\":")) {
+            if (resp && SAFE_STRSTR(resp, "\"v\":")) {
                 int v = parse_v_field(resp);
                 int wid = parse_writer_field(resp);
                 if (v != INT_MIN && wid >= 0) {
@@ -258,7 +258,7 @@ static int test_slotcask_v2_concurrent_run(void) {
             "{\"mode\":\"get\",\"dir\":\"d\",\"object\":\"o\","
             "\"key\":\"k%d\"}", k);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"v\":")) {
+        if (resp && SAFE_STRSTR(resp, "\"v\":")) {
             int v = parse_v_field(resp);
             int v_writer = v / 1000000;
             if (v_writer < 0 || v_writer >= NUM_WRITERS) read_failures++;

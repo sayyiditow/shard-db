@@ -110,7 +110,7 @@ static int test_or_logic_run(void) {
         "\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"},"
                       "{\"field\":\"amount\",\"op\":\"gte\",\"value\":\"100\"}]}");
     ASSERT_CONTAINS(resp, "\"key\":\"o1\"", "find paid+amount>=100 includes o1");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"o2\"") == NULL, "find paid+amount>=100 excludes o2");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"o2\"") == NULL, "find paid+amount>=100 excludes o2");
     free(resp);
 
     /* === SHAPE B (AND + OR, indexed AND sibling drives primary) === */
@@ -128,7 +128,7 @@ static int test_or_logic_run(void) {
                                "{\"field\":\"amount\",\"op\":\"lt\",\"value\":\"100\"}]}]}");
     ASSERT_CONTAINS(resp, "\"key\":\"o1\"", "Shape B: includes o1 (paid+us)");
     ASSERT_CONTAINS(resp, "\"key\":\"o2\"", "Shape B: includes o2 (paid+amount=50)");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"o3\"") == NULL, "Shape B: excludes o3 (pending)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"o3\"") == NULL, "Shape B: excludes o3 (pending)");
     free(resp);
 
     /* === SHAPE C (pure OR, all children indexed → KeySet path) === */
@@ -146,8 +146,8 @@ static int test_or_logic_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"o1\"", "Shape C find: o1 present");
     ASSERT_CONTAINS(resp, "\"key\":\"o2\"", "Shape C find: o2 present");
     ASSERT_CONTAINS(resp, "\"key\":\"o3\"", "Shape C find: o3 present");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"o4\"") == NULL, "Shape C find: o4 absent");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"o5\"") == NULL, "Shape C find: o5 absent");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"o4\"") == NULL, "Shape C find: o4 absent");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"o5\"") == NULL, "Shape C find: o5 absent");
     free(resp);
 
     /* Three indexed OR children: o1,o2 (paid), o3 (pending), o4 (asia) → 4 */

@@ -54,9 +54,9 @@ static int test_agg_having_nested_run(void) {
                      "nested: paid kept via (count>2 and sum>100)");
     ASSERT_CONTAINS(resp, "\"status\":\"pending\"",
                      "nested: pending kept via (avg<20)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"cancelled\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"cancelled\"") == NULL,
                 "nested: cancelled dropped (count>2 but sum not>100, avg not<20)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"refunded\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"refunded\"") == NULL,
                 "nested: refunded dropped (count not>2, avg not<20)");
     free(resp); resp = NULL;
 

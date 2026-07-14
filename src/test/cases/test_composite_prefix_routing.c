@@ -98,15 +98,15 @@ static int test_composite_prefix_results_correct(void) {
         "\"criteria\":[{\"field\":\"type\",\"op\":\"eq\",\"value\":\"job\"}],"
         "\"order_by\":\"time\",\"order\":\"desc\",\"limit\":25}", &resp);
     ASSERT_NOT_NULL(resp, "find returned");
-    ASSERT_TRUE(strstr(resp, "k09") && strstr(resp, "k06") && strstr(resp, "k03"),
+    ASSERT_TRUE(SAFE_STRSTR(resp, "k09") && SAFE_STRSTR(resp, "k06") && SAFE_STRSTR(resp, "k03"),
                 "all 3 jobs returned");
-    ASSERT_TRUE(!strstr(resp, "k01") && !strstr(resp, "k02"),
+    ASSERT_TRUE(!SAFE_STRSTR(resp, "k01") && !SAFE_STRSTR(resp, "k02"),
                 "no stories leaked into job results");
     /* DESC order: k09 must appear before k06 before k03 in the payload. */
     {
-        const char *p9 = strstr(resp, "k09");
-        const char *p6 = strstr(resp, "k06");
-        const char *p3 = strstr(resp, "k03");
+        const char *p9 = SAFE_STRSTR(resp, "k09");
+        const char *p6 = SAFE_STRSTR(resp, "k06");
+        const char *p3 = SAFE_STRSTR(resp, "k03");
         ASSERT_TRUE(p9 && p6 && p3 && p9 < p6 && p6 < p3,
                     "results are time-desc ordered");
     }
@@ -118,9 +118,9 @@ static int test_composite_prefix_results_correct(void) {
         "\"criteria\":[{\"field\":\"type\",\"op\":\"eq\",\"value\":\"job\"},"
         " {\"field\":\"time\",\"op\":\"gte\",\"value\":\"5\"}],"
         "\"order_by\":\"time\",\"order\":\"desc\",\"limit\":25}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "k09") && strstr(resp, "k06"),
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "k09") && SAFE_STRSTR(resp, "k06"),
                 "range: k09,k06 present");
-    ASSERT_TRUE(resp && !strstr(resp, "k03"),
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "k03"),
                 "range: k03 (before cutoff) excluded by post-filter");
     free(resp); resp = NULL;
 
@@ -192,8 +192,8 @@ static int test_exact_composite_results(void) {
         "\"criteria\":[{\"field\":\"by\",\"op\":\"eq\",\"value\":\"alice\"},"
         " {\"field\":\"time\",\"op\":\"eq\",\"value\":\"2\"}]}", &resp);
     ASSERT_NOT_NULL(resp, "find returned");
-    ASSERT_TRUE(strstr(resp,"k1") && strstr(resp,"k4"), "both alice@day2 rows returned");
-    ASSERT_TRUE(!strstr(resp,"k2") && !strstr(resp,"k3"), "decoys excluded");
+    ASSERT_TRUE(SAFE_STRSTR(resp,"k1") && SAFE_STRSTR(resp,"k4"), "both alice@day2 rows returned");
+    ASSERT_TRUE(!SAFE_STRSTR(resp,"k2") && !SAFE_STRSTR(resp,"k3"), "decoys excluded");
     free(resp); resp=NULL;
     tc_close(tc); test_env_stop(&env);
     return 0;

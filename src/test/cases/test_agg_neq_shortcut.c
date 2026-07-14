@@ -21,7 +21,7 @@
 static int extract_field(const char *resp, const char *key, char *out, size_t out_sz) {
     if (!resp || !key) return 0;
     char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(resp, needle);
+    const char *p = SAFE_STRSTR(resp, needle);
     if (!p) return 0;
     p += strlen(needle);
     size_t i = 0;
@@ -200,7 +200,7 @@ static int test_agg_neq_shortcut_run(void) {
         "\"having\":[{\"field\":\"n\",\"op\":\"gt\",\"value\":\"50\"}],"
         "\"criteria\":[]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"pending\"", "having keeps pending");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"paid\"") == NULL, "having drops paid");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"paid\"") == NULL, "having drops paid");
     free(resp); resp = NULL;
 
     /* Empty criteria — shortcut not engaged, returns whole-set. */
@@ -218,8 +218,8 @@ static int test_agg_neq_shortcut_run(void) {
                         "{\"fn\":\"sum\",\"field\":\"amount\",\"alias\":\"s\"}],"
         "\"criteria\":[{\"field\":\"status\",\"op\":\"neq\",\"value\":\"paid\"}],"
         "\"format\":\"csv\"}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "n,s") != NULL, "CSV header");
-    ASSERT_TRUE(resp && strstr(resp, "80,4000") != NULL, "CSV data");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "n,s") != NULL, "CSV header");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "80,4000") != NULL, "CSV data");
     free(resp); resp = NULL;
 
     /* NEQ value matches everything. */

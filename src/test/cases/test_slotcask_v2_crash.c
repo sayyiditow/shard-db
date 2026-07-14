@@ -43,7 +43,7 @@ static int crash_parse_count(const char *resp) {
     if (!resp) return -1;
     while (*resp == ' ' || *resp == '\n') resp++;
     if (*resp == '{') {
-        const char *p = strstr(resp, "\"count\":");
+        const char *p = SAFE_STRSTR(resp, "\"count\":");
         return p ? atoi(p + 8) : -1;
     }
     return atoi(resp);
@@ -161,7 +161,7 @@ static int test_slotcask_v2_crash_run(void) {
         } else {
             char expected[64];
             snprintf(expected, sizeof(expected), "\"val_%d\"", i);
-            if (!strstr(resp, expected)) spot_check_failures++;
+            if (!SAFE_STRSTR(resp, expected)) spot_check_failures++;
         }
         free(resp); resp = NULL;
     }
@@ -205,7 +205,7 @@ static int test_slotcask_v2_crash_run(void) {
         "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"crash2\","
         "\"key\":\"k%07d\"}", BASELINE + CRASH_AT + 9999);
     tc_request(tc, req, &resp);
-    ASSERT_TRUE(resp && (strstr(resp, "Not found") || strstr(resp, "error")),
+    ASSERT_TRUE(resp && (SAFE_STRSTR(resp, "Not found") || SAFE_STRSTR(resp, "error")),
                 "never-attempted key is absent (no phantom records)");
     free(resp); resp = NULL;
 

@@ -119,9 +119,9 @@ static int test_find_filter_first_orderby_run(void) {
     ASSERT_NOT_NULL(resp, "case2: response received");
     ASSERT_CONTAINS(resp, "\"age\":\"99\"", "case2: includes age=99 (highest odd)");
     ASSERT_CONTAINS(resp, "\"age\":\"81\"", "case2: includes age=81 (10th-highest odd)");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"79\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"79\"") == NULL,
         "case2: excludes age=79 (would be 11th, past limit)");
-    ASSERT_TRUE(strstr(resp, "\"age\":\"100\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"100\"") == NULL,
         "case2: excludes age=100 (even row, bio='scientist')");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 10,
         "case2: exactly 10 rows");

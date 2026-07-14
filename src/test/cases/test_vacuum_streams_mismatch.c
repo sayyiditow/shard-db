@@ -187,7 +187,7 @@ static int test_vacuum_streams_mismatch_run(void) {
             "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"vmstreams\","
             "\"key\":\"k%d\"}", i);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"name\"") != NULL) readable_pre++;
+        if (resp && SAFE_STRSTR(resp, "\"name\"") != NULL) readable_pre++;
         free(resp); resp = NULL;
     }
     ASSERT_EQ_INT(readable_pre, 50, "all 50 records readable under mismatched schema");
@@ -221,7 +221,7 @@ static int test_vacuum_streams_mismatch_run(void) {
             "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"vmstreams\","
             "\"key\":\"k%d\"}", i);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"name\"") != NULL) readable_post++;
+        if (resp && SAFE_STRSTR(resp, "\"name\"") != NULL) readable_post++;
         free(resp); resp = NULL;
     }
     ASSERT_EQ_INT(readable_post, 50, "all 50 records still readable after rebuild");

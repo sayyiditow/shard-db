@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,17 +22,73 @@
 #include <unistd.h>
 #include "test_client.h"
 
+/* test_pick_port() below binds to port 0 to get an OS-assigned free
+   port, then closes the probe socket and hands the number back to the
+   caller, who forks a daemon that binds it moments later. Under
+   run_all_parallel (many worker threads calling this concurrently),
+   the OS can hand the same just-freed ephemeral port to a second
+   caller before the first caller's daemon has bound it for real,
+   producing a `bind: Address already in use` daemon-spawn failure.
+   Close that window with a short-TTL in-process reservation table:
+   once a port is handed out it's ineligible for reuse for
+   PORT_RESERVE_TTL_MS, comfortably longer than fork+exec+daemon-bind
+   ever takes. No caller changes needed — every test_pick_port() call
+   site (via test_env_start* or direct, e.g. test_auto_vacuum.c)
+   benefits automatically. */
+#define PORT_RESERVE_TTL_MS 5000
+#define PORT_RESERVE_MAX    256
+
+typedef struct { int port; struct timespec ts; } PortReservation;
+static PortReservation g_port_reservations[PORT_RESERVE_MAX];
+static int g_port_reservation_count = 0;
+static pthread_mutex_t g_port_reservation_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static long port_reservation_age_ms(const struct timespec *t) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - t->tv_sec) * 1000L + (now.tv_nsec - t->tv_nsec) / 1000000L;
+}
+
+/* Returns 1 if `port` was free and is now claimed, 0 if another
+   still-live claim holds it (caller should probe again for a
+   different port). Opportunistically purges expired entries. */
+static int try_reserve_port(int port) {
+    pthread_mutex_lock(&g_port_reservation_lock);
+    int i = 0;
+    while (i < g_port_reservation_count) {
+        if (port_reservation_age_ms(&g_port_reservations[i].ts) > PORT_RESERVE_TTL_MS) {
+            g_port_reservations[i] = g_port_reservations[--g_port_reservation_count];
+            continue;
+        }
+        if (g_port_reservations[i].port == port) {
+            pthread_mutex_unlock(&g_port_reservation_lock);
+            return 0;
+        }
+        i++;
+    }
+    if (g_port_reservation_count < PORT_RESERVE_MAX) {
+        g_port_reservations[g_port_reservation_count].port = port;
+        clock_gettime(CLOCK_MONOTONIC, &g_port_reservations[g_port_reservation_count].ts);
+        g_port_reservation_count++;
+    }
+    pthread_mutex_unlock(&g_port_reservation_lock);
+    return 1;
+}
+
 int test_pick_port(void) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return -1;
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = 0,
-                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(s); return -1; }
-    socklen_t len = sizeof(addr);
-    if (getsockname(s, (struct sockaddr *)&addr, &len) < 0) { close(s); return -1; }
-    int port = ntohs(addr.sin_port);
-    close(s);
-    return port;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) return -1;
+        struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = 0,
+                                    .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(s); return -1; }
+        socklen_t len = sizeof(addr);
+        if (getsockname(s, (struct sockaddr *)&addr, &len) < 0) { close(s); return -1; }
+        int port = ntohs(addr.sin_port);
+        close(s);
+        if (try_reserve_port(port)) return port;
+    }
+    return -1;
 }
 
 static int sleep_ms(int ms) {
@@ -90,7 +147,7 @@ static int run_cmd(const char *fmt, ...) {
     return system(cmd);
 }
 
-int test_env_start(TestEnv *env) {
+int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     if (!env) return -1;
 
     /* Unique DB_ROOT under <dir>/shard-db-test-<pid>-<idx>/db. Default
@@ -141,18 +198,44 @@ int test_env_start(TestEnv *env) {
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
         "export LOG_LEVEL=2\n"
-        "export THREADS=0\n"
+        "export THREADS=2\n"
+        /* MAX_CONCURRENT_QUERIES auto-derives from THREADS (slot_init()
+           in config.c floors it at max(4, min(parallel_threads(),32))),
+           so shrinking THREADS to 2 above also silently floors the
+           query-admission semaphore at 4 — well below the concurrency
+           several tests exercise (e.g. test-registry-single-flight's 16
+           concurrent connections, test-parallel-index-integrity's 5).
+           Pin it explicitly so the CPU-pool shrink doesn't reject
+           legitimate concurrent test traffic with "server at capacity". */
+        "export MAX_CONCURRENT_QUERIES=32\n"
+        /* WORKERS (TCP accept/dispatch pool) and IO_THREADS (page-fault
+           I/O pool) both default to nproc-scaled values (nproc and
+           nproc*4 respectively) when unset — sized for a single
+           production daemon. Under run-all's parallel mode, up to
+           nproc test daemons now run concurrently in separate
+           processes; left at their defaults that multiplies out to
+           nproc daemons × nproc*4 IO threads each (e.g. 16 × 64 = 1024
+           threads just for I/O), which starves every daemon of CPU and
+           causes real request timeouts/connection resets under load —
+           not a logic bug, but visible as sporadic NULL responses in
+           tests run under high --jobs counts. Pin both to small fixed
+           values, independent of host core count or --jobs, so total
+           thread footprint stays bounded regardless of how many
+           daemons run side by side. 16 preserves
+           test-registry-single-flight's 16-concurrent-connection
+           requirement without queuing. */
+        "export WORKERS=16\n"
+        "export IO_THREADS=8\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n",
         env->db_root, env->port, base);
     /* Optional per-test override: a test that needs to exercise the
        per-query memory cap (e.g. forcing a bitmap KeySet past budget)
-       sets SHARD_TEST_QUERY_BUFFER_MB before test_env_start, then unsets
-       it. Absent → daemon default. Kept out of TestEnv so the many
-       uninitialised `TestEnv env;` callers are unaffected. */
-    const char *qbuf_mb = getenv("SHARD_TEST_QUERY_BUFFER_MB");
-    if (qbuf_mb && *qbuf_mb)
-        fprintf(f, "export QUERY_BUFFER_MB=%s\n", qbuf_mb);
+       passes qbuf_mb_override via test_env_start_ex. NULL → daemon
+       default. Kept out of TestEnv so the many uninitialised
+       `TestEnv env;` callers are unaffected. */
+    if (qbuf_mb_override && *qbuf_mb_override)
+        fprintf(f, "export QUERY_BUFFER_MB=%s\n", qbuf_mb_override);
     fclose(f);
     char logs_dir[400];
     snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);
@@ -217,6 +300,10 @@ int test_env_start(TestEnv *env) {
     return 0;
 }
 
+int test_env_start(TestEnv *env) {
+    return test_env_start_ex(env, getenv("SHARD_TEST_QUERY_BUFFER_MB"));
+}
+
 int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     if (!env || !db_root || port <= 0) return -1;
 
@@ -254,7 +341,10 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
             "export TIMEOUT=0\n"
             "export LOG_DIR=\"%s/logs\"\n"
             "export LOG_LEVEL=2\n"
-            "export THREADS=0\n"
+            "export THREADS=2\n"
+            /* See test_env_start_ex's comment: MAX_CONCURRENT_QUERIES
+               auto-derives from THREADS, so pin it explicitly here too. */
+            "export MAX_CONCURRENT_QUERIES=32\n"
             "export FCACHE_MAX=4096\n"
             "export TLS_ENABLE=0\n",
             env->db_root, env->port, base);

@@ -40,7 +40,7 @@ static void write_dbenv(const char *base, const char *db_root, int port,
         "export TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\n"
         "export LOG_LEVEL=2\n"
-        "export THREADS=0\n"
+        "export THREADS=2\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=%d\n"
         "export TLS_CERT=\"%s\"\n"
@@ -103,7 +103,7 @@ static int spawn_tls_daemon(const char *base, const char *shard_db_abs,
 static int test_tls_run(void) {
     /* openssl CLI required. */
     if (system("command -v openssl >/dev/null 2>&1") != 0) {
-        printf("# test-tls: openssl CLI not present, skipping\n");
+        TAP_DIAG("# test-tls: openssl CLI not present, skipping\n");
         return 0;
     }
 

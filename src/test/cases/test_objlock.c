@@ -158,7 +158,7 @@ static int test_objlock_run(void) {
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"keylim\","
         "\"splits\":16,\"max_key\":1024,\"fields\":[\"v:int\"],\"indexes\":[]}",
         &resp);
-    ASSERT_TRUE(!resp || strstr(resp, "\"error\"") == NULL, "create-object accepts max_key=1024");
+    ASSERT_TRUE(!resp || SAFE_STRSTR(resp, "\"error\"") == NULL, "create-object accepts max_key=1024");
     free(resp); resp = NULL;
 
     tc_close(tc);

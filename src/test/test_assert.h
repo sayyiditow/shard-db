@@ -18,15 +18,27 @@ typedef struct {
     int passed;
     int failed;
     const char *name;
+    FILE *out;           /* NULL = write straight to real stdout (list /
+                            run / --jobs 1); non-NULL = per-worker
+                            open_memstream buffer under parallel run-all,
+                            flushed atomically once the case completes. */
 } TestCtx;
 
 extern __thread TestCtx *t_ctx;
 
+#define _TAP_OUT (t_ctx->out ? t_ctx->out : stdout)
+
 #define _TAP_OK(desc)   do { t_ctx->test_num++; t_ctx->passed++; \
-    printf("ok %d - %s\n", t_ctx->test_num, (desc)); } while (0)
+    fprintf(_TAP_OUT, "ok %d - %s\n", t_ctx->test_num, (desc)); } while (0)
 
 #define _TAP_FAIL(desc, fmt, ...) do { t_ctx->test_num++; t_ctx->failed++; \
-    printf("not ok %d - %s\n#   " fmt "\n", t_ctx->test_num, (desc), ##__VA_ARGS__); } while (0)
+    fprintf(_TAP_OUT, "not ok %d - %s\n#   " fmt "\n", t_ctx->test_num, (desc), ##__VA_ARGS__); } while (0)
+
+/* For diagnostic/skip/progress lines emitted by test bodies outside the
+   ASSERT_* macros. Routes through the same stream as TAP output so
+   parallel run-all's per-test buffering never interleaves these with
+   another concurrently-running test's lines. */
+#define TAP_DIAG(fmt, ...) fprintf(_TAP_OUT, fmt, ##__VA_ARGS__)
 
 #define ASSERT_TRUE(cond, desc) \
     do { if (cond) _TAP_OK(desc); else _TAP_FAIL(desc, "assertion failed: %s", #cond); } while (0)
@@ -48,5 +60,14 @@ extern __thread TestCtx *t_ctx;
 
 #define ASSERT_NOT_NULL(ptr, desc) \
     do { if (ptr) _TAP_OK(desc); else _TAP_FAIL(desc, "got NULL"); } while (0)
+
+/* NULL-safe strstr for test bodies that call strstr(resp, ...) directly
+   (outside an ASSERT_* macro) after a non-fatal ASSERT_NOT_NULL/ASSERT_TRUE
+   on resp. Those asserts record a failure but never stop execution, so a
+   request that genuinely fails under load (timeout/connection reset,
+   tc_recv leaves *out_response NULL) would otherwise crash the very next
+   line instead of just leaving the already-recorded assertion failure as
+   the only symptom. */
+#define SAFE_STRSTR(h, n) ((h) ? strstr((h), (n)) : NULL)
 
 #endif

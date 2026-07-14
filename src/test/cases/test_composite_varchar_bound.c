@@ -71,7 +71,7 @@ static int test_composite_varchar_bound_verify(void) {
         "\"criteria\":[{\"field\":\"name\",\"op\":\"eq\",\"value\":\"rare\"}],"
         "\"order_by\":\"t\",\"order\":\"desc\",\"limit\":5}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"rare\"", "returns rare rows");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"rarf\"") == NULL, "no rarf rows returned");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"rarf\"") == NULL, "no rarf rows returned");
     free(resp); resp=NULL;
 
     tc_close(tc); test_env_stop(&env);

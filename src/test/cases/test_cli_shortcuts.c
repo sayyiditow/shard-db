@@ -163,7 +163,7 @@ static int test_cli_shortcuts_run(void) {
         "\"filename\":\"%s\"}", basename);
     tc_request(tc, req, &resp);
     if (resp) {
-        const char *p = strstr(resp, "\"path\":\"");
+        const char *p = SAFE_STRSTR(resp, "\"path\":\"");
         if (p) {
             p += strlen("\"path\":\"");
             const char *q = strchr(p, '"');

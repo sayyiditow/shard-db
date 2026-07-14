@@ -202,7 +202,7 @@ static int test_parallel_index_integrity_run(void) {
         tc_request(tc, req, &resp);
         char want[64]; snprintf(want, sizeof(want), "\"k%d\"", id);
         char desc[64]; snprintf(desc, sizeof(desc), "k%d findable via 3-way composite", id);
-        ASSERT_TRUE(resp && strstr(resp, want) != NULL, desc);
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, want) != NULL, desc);
         free(resp); resp = NULL;
     }
 

@@ -51,7 +51,7 @@ static int test_nql_agg_filter_flag_run(void) {
     ASSERT_NOT_NULL(resp, "--filter with IN response not null");
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "--filter IN: paid present");
     ASSERT_CONTAINS(resp, "\"status\":\"cancelled\"", "--filter IN: cancelled present");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"pending\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"pending\"") == NULL,
                 "--filter IN: pending excluded");
     free(resp); resp = NULL;
 

@@ -109,7 +109,7 @@ static int test_ipv6_run(void) {
     ASSERT_CONTAINS(resp, "\"inserted\"", "insert with malformed addr does not error");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"ip6\",\"object\":\"hosts\",\"key\":\"h4\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"addr\":\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"addr\":\"") == NULL,
         "malformed addr encodes to the unset sentinel (field omitted or null)");
     free(resp); resp = NULL;
 

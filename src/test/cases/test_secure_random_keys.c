@@ -19,7 +19,7 @@
 #include <ctype.h>
 
 static char *extract_key_field(const char *resp) {
-    const char *p = strstr(resp, "\"key\":\"");
+    const char *p = SAFE_STRSTR(resp, "\"key\":\"");
     if (!p) return NULL;
     p += 7;
     const char *end = strchr(p, '"');
@@ -102,7 +102,7 @@ static int test_secure_random_keys_run(void) {
     ASSERT_CONTAINS(resp, "\"count\":100", "bulk: count=100");
 
     /* Extract the "keys":[...] array from the response. */
-    const char *kp = strstr(resp, "\"keys\":[");
+    const char *kp = SAFE_STRSTR(resp, "\"keys\":[");
     ASSERT_NOT_NULL(kp, "bulk: keys array present");
     if (kp) {
         kp += 8; /* skip "keys":['\0' */

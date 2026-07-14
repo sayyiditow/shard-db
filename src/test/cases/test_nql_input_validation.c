@@ -89,7 +89,7 @@ static int test_nql_input_validation_run(void) {
         &resp);
     ASSERT_NOT_NULL(resp, "valid NQL response not null");
     ASSERT_CONTAINS(resp, "\"name\":\"bob\"", "valid NQL returns bob");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"alice\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"alice\"") == NULL,
                 "valid NQL excludes alice");
     free(resp); resp = NULL;
 

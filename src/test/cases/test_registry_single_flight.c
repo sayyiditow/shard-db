@@ -105,7 +105,7 @@ static void *race_worker_main(void *arg) {
     int rc = tc_request(tc,
         "{\"mode\":\"count\",\"dir\":\"racetest\",\"object\":\"hot\"}", &resp);
     w->ms = now_ms() - t0;
-    w->ok = (rc == 0 && resp && !strstr(resp, "\"error\""));
+    w->ok = (rc == 0 && resp && !SAFE_STRSTR(resp, "\"error\""));
     free(resp);
     tc_close(tc);
     return NULL;
@@ -170,7 +170,7 @@ static int test_registry_single_flight_run(void) {
        are excluded on shared CI runners). Not required for correctness;
        demonstrates the fix's actual perf property when run locally. */
     if (!getenv("CI")) {
-        printf("# registry-single-flight: burst of %d completed in %ldms\n",
+        TAP_DIAG("# registry-single-flight: burst of %d completed in %ldms\n",
                N_WORKERS, burst_ms);
     }
 

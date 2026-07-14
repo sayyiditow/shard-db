@@ -17,7 +17,7 @@
    Returns 1 if a non-null cursor was found and copied into out. */
 static int extract_cursor_json(const char *resp, char *out, size_t out_sz) {
     if (!resp) return 0;
-    const char *p = strstr(resp, "\"cursor\":{");
+    const char *p = SAFE_STRSTR(resp, "\"cursor\":{");
     if (!p) return 0;
     p += strlen("\"cursor\":");
     /* find matching closing brace */
@@ -37,7 +37,7 @@ static int extract_cursor_json(const char *resp, char *out, size_t out_sz) {
 /* Extract integer value of "total":N from response. Returns -1 if absent. */
 static int extract_total(const char *resp) {
     if (!resp) return -1;
-    const char *p = strstr(resp, "\"total\":");
+    const char *p = SAFE_STRSTR(resp, "\"total\":");
     if (!p) return -1;
     p += strlen("\"total\":");
     if (*p == 'n') return -2; /* null */
@@ -92,8 +92,8 @@ static int test_cursor_with_total_run(void) {
         "\"cursor\":null,\"total\":true}",
         &resp);
     {
-        const char *pc = strstr(resp, "\"cursor\":");
-        const char *pt = strstr(resp, "\"total\":");
+        const char *pc = SAFE_STRSTR(resp, "\"cursor\":");
+        const char *pt = SAFE_STRSTR(resp, "\"total\":");
         ASSERT_TRUE(pc && pt && pc < pt, "cursor key appears before total key");
     }
     char cursor_json[256] = {0};
@@ -145,7 +145,7 @@ static int test_cursor_with_total_run(void) {
         "\"criteria\":[],\"order_by\":\"n\",\"order\":\"asc\",\"limit\":3,"
         "\"cursor\":null,\"total\":true}",
         &resp);
-    ASSERT_TRUE(strstr(resp, "mutually exclusive") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "mutually exclusive") == NULL,
                 "no mutually exclusive error when cursor+total combined");
     free(resp); resp = NULL;
 

@@ -113,7 +113,7 @@ static int test_find_timestamp_criteria_run(void) {
     ASSERT_NOT_NULL(resp, "find time gte response");
     ASSERT_TRUE(count_substr(resp, "\"key\"") == 4,
         "time gte returns r2..r5");
-    ASSERT_TRUE(strstr(resp, "\"r1\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"r1\"") == NULL,
         "time gte excludes r1 (earlier)");
     free(resp); resp = NULL;
 
@@ -157,9 +157,9 @@ static int test_find_timestamp_criteria_run(void) {
         "intersect returns r1+r2");
     ASSERT_CONTAINS(resp, "\"r1\"", "intersect includes r1");
     ASSERT_CONTAINS(resp, "\"r2\"", "intersect includes r2");
-    ASSERT_TRUE(strstr(resp, "\"r3\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"r3\"") == NULL,
         "intersect excludes r3 (time too high)");
-    ASSERT_TRUE(strstr(resp, "\"r4\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"r4\"") == NULL,
         "intersect excludes r4 (wrong story_root)");
     free(resp); resp = NULL;
 

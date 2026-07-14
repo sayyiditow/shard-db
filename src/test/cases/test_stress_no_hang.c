@@ -150,8 +150,8 @@ static int test_stress_no_hang_run(void) {
        cleanly so far) and by local execution; CI runs of this specific
        test produce noise. Set SHARD_TEST_STRESS=1 to force-enable. */
     if (getenv("CI") && !getenv("SHARD_TEST_STRESS")) {
-        printf("ok 1 - skipped on CI (set SHARD_TEST_STRESS=1 to enable)\n");
-        return 0;
+        TAP_DIAG("ok 1 - skipped on CI (set SHARD_TEST_STRESS=1 to enable)\n");
+            return 0;
     }
 
     TestEnv env = {0};
@@ -222,7 +222,7 @@ static int test_stress_no_hang_run(void) {
 
     /* Throughput sanity: should clear at least 100 ops/sec aggregate. */
     long ops_per_sec = elapsed_ms > 0 ? (total_ops * 1000) / elapsed_ms : 0;
-    printf("# stress: %ld ops total (%ld errs), %ld ops/sec, %d probes (max %ld ms)\n",
+    TAP_DIAG("# stress: %ld ops total (%ld errs), %ld ops/sec, %d probes (max %ld ms)\n",
            total_ops, total_errs, ops_per_sec, wd.probes, wd.max_ms);
 
     test_env_stop(&env);

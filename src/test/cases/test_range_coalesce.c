@@ -109,8 +109,8 @@ static int test_range_coalesce_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"k4\"", "gt+lt finds k4");
     ASSERT_CONTAINS(resp, "\"key\":\"k5\"", "gt+lt finds k5");
     ASSERT_CONTAINS(resp, "\"key\":\"k6\"", "gt+lt finds k6");
-    ASSERT_TRUE(resp && strstr(resp, "\"key\":\"k3\"") == NULL, "gt+lt excludes k3 (boundary)");
-    ASSERT_TRUE(resp && strstr(resp, "\"key\":\"k7\"") == NULL, "gt+lt excludes k7 (boundary)");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"key\":\"k3\"") == NULL, "gt+lt excludes k3 (boundary)");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"key\":\"k7\"") == NULL, "gt+lt excludes k7 (boundary)");
     free(resp); resp = NULL;
 
     tc_close(tc);

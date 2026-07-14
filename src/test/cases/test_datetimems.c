@@ -77,7 +77,7 @@ static int test_datetimems_run(void) {
         tc_request(tc, "{\"mode\":\"get\",\"dir\":\"dtms\",\"object\":\"events\",\"key\":\"e1\"}", &resp);
         ASSERT_CONTAINS(resp, "\"event_time\":\"20260703170000456\"", "event_time updated");
 
-        const char *uap = strstr(resp, "\"updated_at\":\"");
+        const char *uap = SAFE_STRSTR(resp, "\"updated_at\":\"");
         ASSERT_NOT_NULL(uap, "updated_at present after update");
         if (uap) {
             const char *digits = uap + strlen("\"updated_at\":\"");

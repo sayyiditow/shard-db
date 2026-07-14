@@ -115,7 +115,7 @@ static int test_regex_run(void) {
         "\"fields\":[\"email\",\"phone\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"k1\"", "find regex includes k1");
     ASSERT_CONTAINS(resp, "\"key\":\"k3\"", "find regex includes k3");
-    ASSERT_TRUE(strstr(resp, "\"key\":\"k2\"") == NULL, "find regex excludes k2");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"key\":\"k2\"") == NULL, "find regex excludes k2");
     free(resp); resp = NULL;
 
     /* Aggregate */

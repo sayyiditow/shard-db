@@ -138,11 +138,11 @@ static int test_schema_export_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"list-objects\",\"dir\":\"default\"}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"mig_users\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"mig_users\"") == NULL,
                 "wipe: mig_users gone from default");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"list-objects\",\"dir\":\"migtest\"}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "\"mig_events\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"mig_events\"") == NULL,
                 "wipe: mig_events gone from migtest");
     free(resp); resp = NULL;
 

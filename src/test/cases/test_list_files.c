@@ -21,7 +21,7 @@
 /* Pull "total":N out of a list-files response. */
 static int parse_total(const char *resp) {
     if (!resp) return -1;
-    const char *p = strstr(resp, "\"total\":");
+    const char *p = SAFE_STRSTR(resp, "\"total\":");
     return p ? atoi(p + 8) : -1;
 }
 
@@ -69,7 +69,7 @@ static int test_list_files_run(void) {
     ASSERT_EQ_INT(parse_total(resp), 2, "prefix alpha → total=2");
     ASSERT_CONTAINS(resp, "alpha.pdf", "prefix alpha → alpha.pdf");
     ASSERT_CONTAINS(resp, "alpha2.pdf", "prefix alpha → alpha2.pdf");
-    ASSERT_TRUE(strstr(resp, "beta.pdf") == NULL, "prefix alpha rejects beta.pdf");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "beta.pdf") == NULL, "prefix alpha rejects beta.pdf");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"list-files\",\"dir\":\"default\",\"object\":\"lft\",\"prefix\":\"z\"}", &resp);
@@ -122,7 +122,7 @@ static int test_list_files_run(void) {
                    "\"pattern\":\".pdf\",\"match\":\"suffix\"}", &resp);
     ASSERT_EQ_INT(parse_total(resp), 4, "suffix .pdf → total=4");
     ASSERT_CONTAINS(resp, "alpha.pdf", "suffix → alpha.pdf");
-    ASSERT_TRUE(strstr(resp, "gamma.txt") == NULL, "suffix .pdf rejects gamma.txt");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "gamma.txt") == NULL, "suffix .pdf rejects gamma.txt");
     free(resp); resp = NULL;
 
     /* match=contains */
@@ -136,7 +136,7 @@ static int test_list_files_run(void) {
     ASSERT_EQ_INT(parse_total(resp), 2, "contains eta → total=2");
     ASSERT_CONTAINS(resp, "beta.pdf", "contains eta → beta.pdf");
     ASSERT_CONTAINS(resp, "zeta.png", "contains eta → zeta.png");
-    ASSERT_TRUE(strstr(resp, "delta.pdf") == NULL, "contains eta rejects delta.pdf");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "delta.pdf") == NULL, "contains eta rejects delta.pdf");
     free(resp); resp = NULL;
 
     /* match=glob */
@@ -167,7 +167,7 @@ static int test_list_files_run(void) {
                    "\"filename\":\"beta.pdf\"}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"list-files\",\"dir\":\"default\",\"object\":\"lft\"}", &resp);
     ASSERT_EQ_INT(parse_total(resp), 5, "after delete → total=5");
-    ASSERT_TRUE(strstr(resp, "beta.pdf") == NULL, "deleted beta.pdf gone from list");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "beta.pdf") == NULL, "deleted beta.pdf gone from list");
     free(resp); resp = NULL;
 
     tc_close(tc);

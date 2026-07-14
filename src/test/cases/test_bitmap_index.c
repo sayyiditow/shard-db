@@ -309,7 +309,7 @@ static int test_bitmap_index_run(void) {
        legitimately appears in the fields section, so scope the check
        to the substring after `"indexes":[`. */
     {
-        const char *idx_section = strstr(resp, "\"indexes\":[");
+        const char *idx_section = SAFE_STRSTR(resp, "\"indexes\":[");
         ASSERT_NOT_NULL((void *)idx_section, "indexes section present");
         if (idx_section) {
             const char *idx_end = strchr(idx_section, ']');
@@ -358,7 +358,7 @@ static int test_bitmap_index_run(void) {
     /* Check no `"flag",` or `"flag"]` (separate bare entry) follows the
        bitmap one. This is a regex-ish sniff. */
     {
-        const char *first = strstr(resp, "\"flag:bitmap\"");
+        const char *first = SAFE_STRSTR(resp, "\"flag:bitmap\"");
         if (first) {
             /* Look for another "flag" anywhere AFTER first that isn't part of
                our :bitmap entry's surrounding braces. */
@@ -577,7 +577,7 @@ static int test_bitmap_index_run(void) {
         "{\"mode\":\"add-index\",\"dir\":\"t\",\"object\":\"reix\","
         "\"fields\":[\"flag:bitmap\"],\"force\":\"true\"}", &resp);
     /* Either status:added or status:ok depending on the path taken. */
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "add-index force succeeded");
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""), "add-index force succeeded");
     free(resp); resp = NULL;
 
     /* Confirm bits repopulated. */
@@ -610,7 +610,7 @@ static int test_bitmap_index_run(void) {
     }
     tc_request(tc,
         "{\"mode\":\"reindex\",\"dir\":\"t\",\"object\":\"reix\"}", &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "mode:reindex succeeded");
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""), "mode:reindex succeeded");
     free(resp); resp = NULL;
 
     {
@@ -992,10 +992,10 @@ static int test_bitmap_index_run(void) {
             "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"capovf\","
             "\"key\":\"k%d\",\"value\":{\"v\":\"v%d\"}}", k, k);
         tc_request(tc, req, &resp);
-        if (resp && strstr(resp, "\"error\"")) {
+        if (resp && SAFE_STRSTR(resp, "\"error\"")) {
             saw_cap_error = 1;
-            if (strstr(resp, "bitmap index on field 'v' exceeded") &&
-                strstr(resp, "or switch to btree")) {
+            if (SAFE_STRSTR(resp, "bitmap index on field 'v' exceeded") &&
+                SAFE_STRSTR(resp, "or switch to btree")) {
                 actionable_msg = 1;
             }
             free(resp); resp = NULL;

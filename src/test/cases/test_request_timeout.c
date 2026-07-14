@@ -147,7 +147,7 @@ static int test_request_timeout_run(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"rt_big\","
         "\"criteria\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"42\"}],"
         "\"timeout_ms\":0}", &resp);
-    ASSERT_TRUE(resp && strstr(resp, "query_timeout") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "query_timeout") == NULL,
                 "timeout_ms:0 does not trip");
     ASSERT_CONTAINS(resp, "1500", "timeout_ms:0 returns result");
     free(resp); resp = NULL;
@@ -157,7 +157,7 @@ static int test_request_timeout_run(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"rt_big\","
         "\"criteria\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"42\"}]}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "query_timeout") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "query_timeout") == NULL,
                 "absent timeout_ms does not trip");
     ASSERT_CONTAINS(resp, "1500", "absent timeout_ms returns result");
     free(resp); resp = NULL;
@@ -173,7 +173,7 @@ static int test_request_timeout_run(void) {
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"rt_big\","
         "\"criteria\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"1\"}]}",
         &resp);
-    ASSERT_TRUE(resp && strstr(resp, "query_timeout") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "query_timeout") == NULL,
                 "follow-up count does not inherit timeout");
     ASSERT_CONTAINS(resp, "1500", "follow-up returns result");
     free(resp); resp = NULL;

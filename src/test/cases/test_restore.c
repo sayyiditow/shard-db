@@ -22,7 +22,7 @@
 static int extract_str(const char *resp, const char *key, char *out, size_t out_sz) {
     if (!resp) return 0;
     char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":\"", key);
-    const char *p = strstr(resp, needle);
+    const char *p = SAFE_STRSTR(resp, needle);
     if (!p) return 0;
     p += strlen(needle);
     const char *q = strchr(p, '"');
@@ -121,7 +121,7 @@ static int test_restore_run(void) {
         tc_request(tc, req, &resp);
         snprintf(want, sizeof(want), "\"name\":\"n%d\"", i);
         char desc[64]; snprintf(desc, sizeof(desc), "k%d restored to n%d", i, i);
-        ASSERT_TRUE(resp && strstr(resp, want) != NULL, desc);
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, want) != NULL, desc);
         free(resp); resp = NULL;
     }
 

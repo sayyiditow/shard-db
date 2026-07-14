@@ -43,7 +43,7 @@ static int test_object_name_validation_run(void) {
     tc_request(tc,
         "{\"mode\":\"get\",\"dir\":\"tenant_a\",\"object\":\"../tenant_b/secrets\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "invalid object name", "get rejects traversal object");
-    ASSERT_TRUE(strstr(resp, "topsecret") == NULL, "secret must not leak"); free(resp); resp = NULL;
+    ASSERT_TRUE(SAFE_STRSTR(resp, "topsecret") == NULL, "secret must not leak"); free(resp); resp = NULL;
 
     /* Sanity: a normal object name still works. */
     tc_request(tc,

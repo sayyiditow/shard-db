@@ -57,7 +57,7 @@ static int test_bulk_cas_run(void) {
         "\"file\":\"%s\"}", seed_path);
     tc_request(tc, req, &resp);
     ASSERT_CONTAINS(resp, "\"inserted\":3", "fresh insert returns inserted=3");
-    ASSERT_TRUE(resp && strstr(resp, "\"skipped\"") == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"skipped\"") == NULL,
                 "no skipped field on plain run");
     free(resp); resp = NULL;
     unlink(seed_path);

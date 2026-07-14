@@ -51,7 +51,7 @@ static int test_agg_having_or_run(void) {
     ASSERT_TRUE(resp != NULL, "got response");
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "OR keeps paid (count=5>2)");
     ASSERT_CONTAINS(resp, "\"status\":\"cancelled\"", "OR keeps cancelled (sum=200>100)");
-    ASSERT_TRUE(strstr(resp, "\"status\":\"pending\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"pending\"") == NULL,
                 "OR drops pending (neither branch matches)");
     free(resp); resp = NULL;
 

@@ -30,7 +30,7 @@
    insert response so we can use the server-rendered wire key on the
    subsequent multi-key requests. */
 static char *extract_key_field(const char *resp) {
-    const char *p = strstr(resp, "\"key\":\"");
+    const char *p = SAFE_STRSTR(resp, "\"key\":\"");
     if (!p) return NULL;
     p += 7;
     const char *end = strchr(p, '"');
@@ -160,7 +160,7 @@ static int t_not_exists_uuid(TestClient *tc) {
     ASSERT_CONTAINS(resp, want_present, "uuid not-exists: zero uuid present");
 
     /* The inserted uuid must NOT appear anywhere in the response. */
-    ASSERT_TRUE(resp && strstr(resp, inserted) == NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, inserted) == NULL,
                 "uuid not-exists: inserted uuid absent");
     free(resp); resp = NULL;
     free(inserted);

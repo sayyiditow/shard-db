@@ -147,7 +147,7 @@ static int test_vacuum_addfield_run(void) {
             sample[s]);
         tc_request(tc, req, &resp);
         char want[32]; snprintf(want, sizeof(want), "\"name\":\"n%d\"", sample[s]);
-        if (resp && strstr(resp, want)) found++;
+        if (resp && SAFE_STRSTR(resp, want)) found++;
         free(resp); resp = NULL;
     }
     ASSERT_EQ_INT(found, 4, "all sampled records survive reshard");
@@ -186,7 +186,7 @@ static int test_vacuum_addfield_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"add1\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"alice\"", "k1 name preserved");
     ASSERT_CONTAINS(resp, "\"age\":0", "k1 age defaults to 0");
-    ASSERT_TRUE(resp && strstr(resp, "\"email\"") == NULL, "k1 no email (empty varchar)");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"email\"") == NULL, "k1 no email (empty varchar)");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"add1\","
@@ -253,9 +253,9 @@ static int test_vacuum_addfield_run(void) {
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"integ\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"a\":\"aa\"", "k1 a preserved");
-    ASSERT_TRUE(resp && strstr(resp, "\"b\"") == NULL, "k1 b gone");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"b\"") == NULL, "k1 b gone");
     ASSERT_CONTAINS(resp, "\"c\":42", "k1 c preserved");
-    ASSERT_TRUE(resp && strstr(resp, "\"d\"") == NULL, "k1 d empty");
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"d\"") == NULL, "k1 d empty");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"integ\","

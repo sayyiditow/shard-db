@@ -119,7 +119,7 @@ static int test_tenant_mgmt_run(void) {
         free(resp); resp = NULL;
 
         tc_request(tc, "{\"mode\":\"list-tokens\"}", &resp);
-        ASSERT_TRUE(!resp || strstr(resp, fp) == NULL,
+        ASSERT_TRUE(!resp || SAFE_STRSTR(resp, fp) == NULL,
                     "fingerprint absent after remove");
         free(resp); resp = NULL;
         free(fp);

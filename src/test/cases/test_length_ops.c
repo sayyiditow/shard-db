@@ -71,7 +71,7 @@ static int test_length_ops_run(void) {
         "\"fields\":[\"name\"],\"order_by\":\"name\",\"order\":\"asc\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"alice\"", "find len_eq 5 has alice");
     ASSERT_CONTAINS(resp, "\"name\":\"carol\"", "find len_eq 5 has carol");
-    ASSERT_TRUE(strstr(resp, "\"name\":\"bob\"") == NULL, "find len_eq 5 didn't leak bob");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"name\":\"bob\"") == NULL, "find len_eq 5 didn't leak bob");
     free(resp); resp = NULL;
 
     /* Non-indexed bio len */
@@ -103,7 +103,7 @@ static int test_length_ops_run(void) {
             "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"lent\","
             "\"criteria\":[{\"field\":\"missing_field\",\"op\":\"len_eq\",\"value\":\"5\"}]}",
             &resp);
-        ASSERT_TRUE(resp && strstr(resp, "unknown field") != NULL,
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, "unknown field") != NULL,
                     "len_eq on unknown field → error");
         free(resp);
     }

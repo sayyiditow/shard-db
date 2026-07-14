@@ -88,7 +88,7 @@ static int run_mixed_type_single_scan_assertions(TestEnv *env) {
         "{\"mode\":\"add-index\",\"dir\":\"t\",\"object\":\"mixed\","
         "\"fields\":[\"age\",\"active:bitmap\",\"bio:trigram\"],"
         "\"force\":true}", &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""),
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
                 "mixed force add-index: no error");
     ASSERT_CONTAINS(resp, "\"status\":\"indexed\"",
                     "mixed force add-index: status indexed (age is btree)");
@@ -163,7 +163,7 @@ static int run_skip_if_exists_assertions(TestEnv *env) {
     tc_request(tc,
         "{\"mode\":\"add-index\",\"dir\":\"t\",\"object\":\"mixed\","
         "\"fields\":[\"age\",\"active:bitmap\",\"bio:trigram\"]}", &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""),
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
                 "non-force re-add-index: no error");
     ASSERT_CONTAINS(resp, "\"status\":\"all_exist\"",
                     "non-force re-add-index: all_exist (skip-if-exists honored)");

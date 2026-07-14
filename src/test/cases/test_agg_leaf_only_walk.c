@@ -31,7 +31,7 @@ static int agg_value_eq(const char *resp, const char *alias, const char *want) {
     if (!resp) return 0;
     char needle[64];
     snprintf(needle, sizeof(needle), "\"%s\":", alias);
-    const char *p = strstr(resp, needle);
+    const char *p = SAFE_STRSTR(resp, needle);
     if (!p) return 0;
     p += strlen(needle);
     while (*p == ' ') p++;
@@ -136,7 +136,7 @@ static int test_agg_leaf_only_walk_run(void) {
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"level\",\"alias\":\"s\"}]}", &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "sum level returns numeric");
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""), "sum level returns numeric");
     free(resp); resp = NULL;
 
     /* sum balance (numeric: 2dp). 1.00 + 2.00 + ... + 1000.00 = 500500.00 */

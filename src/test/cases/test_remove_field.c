@@ -69,7 +69,7 @@ static int test_remove_field_run(void) {
 
     /* Reads exclude tombstoned */
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"email\"") == NULL, "GET no email");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "GET no email");
     ASSERT_CONTAINS(resp, "\"fullName\":\"Alice\"", "GET still has fullName");
     ASSERT_CONTAINS(resp, "\"age\":30", "GET still has age");
     ASSERT_CONTAINS(resp, "\"score\":100", "GET still has score");
@@ -80,7 +80,7 @@ static int test_remove_field_run(void) {
                    "\"key\":\"k3\",\"value\":{\"fullName\":\"Carol\",\"email\":\"c@x.com\",\"age\":40,\"score\":80}}",
                    &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k3\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"email\"") == NULL, "insert: email ignored");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "insert: email ignored");
     ASSERT_CONTAINS(resp, "\"fullName\":\"Carol\"", "insert: fullName saved");
     free(resp); resp = NULL;
 
@@ -88,7 +88,7 @@ static int test_remove_field_run(void) {
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\","
                    "\"value\":{\"email\":\"ignored@x.com\",\"score\":200}}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"email\"") == NULL, "update: email still absent");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "update: email still absent");
     ASSERT_CONTAINS(resp, "\"score\":200", "update: score updated");
     free(resp); resp = NULL;
 
@@ -96,7 +96,7 @@ static int test_remove_field_run(void) {
     tc_request(tc,
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"leads\","
         "\"criteria\":[{\"field\":\"email\",\"op\":\"eq\",\"value\":\"a@x.com\"}]}", &resp);
-    ASSERT_TRUE(!resp || strstr(resp, "\"key\":\"k1\"") == NULL, "search tombstoned: no results");
+    ASSERT_TRUE(!resp || SAFE_STRSTR(resp, "\"key\":\"k1\"") == NULL, "search tombstoned: no results");
     free(resp); resp = NULL;
 
     /* Multi-remove */
@@ -112,8 +112,8 @@ static int test_remove_field_run(void) {
     ASSERT_TRUE(!tu_file_exists(path), "fullName+age/ dropped");
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
-    ASSERT_TRUE(strstr(resp, "\"age\"") == NULL, "GET no age");
-    ASSERT_TRUE(strstr(resp, "\"score\"") == NULL, "GET no score");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\"") == NULL, "GET no age");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"score\"") == NULL, "GET no score");
     ASSERT_CONTAINS(resp, "\"fullName\"", "GET still has fullName");
     free(resp); resp = NULL;
 
@@ -156,7 +156,7 @@ static int test_remove_field_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"csvtest\",\"key\":\"row1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"a\":\"aaa\"", "csv: a=aaa");
     ASSERT_CONTAINS(resp, "\"c\":\"ccc\"", "csv: c=ccc");
-    ASSERT_TRUE(strstr(resp, "\"b\"") == NULL, "csv: no b");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"b\"") == NULL, "csv: no b");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"csvtest\",\"key\":\"row2\"}", &resp);

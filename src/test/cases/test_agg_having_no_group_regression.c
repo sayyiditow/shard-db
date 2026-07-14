@@ -53,7 +53,7 @@ static int test_agg_having_no_group_regression_run(void) {
         "\"having\":[{\"field\":\"n\",\"op\":\"gt\",\"value\":\"1000\"}]}",
         &resp);
     ASSERT_TRUE(resp != NULL, "JSON: got response");
-    ASSERT_TRUE(strstr(resp, "\"n\":5") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":5") == NULL,
                 "JSON: count-only fast path must not bypass having filter");
     ASSERT_CONTAINS(resp, "[]", "JSON: impossible having drops the only bucket");
     free(resp); resp = NULL;
@@ -72,7 +72,7 @@ static int test_agg_having_no_group_regression_run(void) {
         "aggregate default having_nogroup_t count() --having 'count gt 1000'",
         &resp);
     ASSERT_TRUE(resp != NULL, "NQL: got response");
-    ASSERT_TRUE(strstr(resp, "\"count\":5") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"count\":5") == NULL,
                 "NQL: count-only fast path must not bypass having filter");
     ASSERT_CONTAINS(resp, "[]", "NQL: impossible having drops the only bucket");
     free(resp); resp = NULL;

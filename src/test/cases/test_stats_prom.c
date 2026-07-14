@@ -85,12 +85,12 @@ static int test_stats_prom_run(void) {
         char needle[160], desc[256];
         snprintf(needle, sizeof(needle), "# HELP %s", metrics[i]);
         snprintf(desc, sizeof(desc), "HELP for %s", metrics[i]);
-        if (strstr(resp, needle)) ASSERT_TRUE(1, desc);
+        if (SAFE_STRSTR(resp, needle)) ASSERT_TRUE(1, desc);
         else { char m[256]; snprintf(m, sizeof(m), "missing HELP %s", metrics[i]); ASSERT_TRUE(0, m); }
 
         snprintf(needle, sizeof(needle), "# TYPE %s", metrics[i]);
         snprintf(desc, sizeof(desc), "TYPE for %s", metrics[i]);
-        if (strstr(resp, needle)) ASSERT_TRUE(1, desc);
+        if (SAFE_STRSTR(resp, needle)) ASSERT_TRUE(1, desc);
         else { char m[256]; snprintf(m, sizeof(m), "missing TYPE %s", metrics[i]); ASSERT_TRUE(0, m); }
 
         snprintf(desc, sizeof(desc), "sample line for %s", metrics[i]);

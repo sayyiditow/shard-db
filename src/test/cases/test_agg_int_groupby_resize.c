@@ -83,7 +83,7 @@ static int test_agg_int_groupby_resize_run(void) {
         "\"group_by\":[\"grp\"],"
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"limit\":2000}", &resp);
-    ASSERT_TRUE(resp != NULL && strstr(resp, "\"error\"") == NULL,
+    ASSERT_TRUE(resp != NULL && SAFE_STRSTR(resp, "\"error\"") == NULL,
         "aggregate did not error");
 
     int n_buckets = 0;

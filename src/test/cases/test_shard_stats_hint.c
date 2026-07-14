@@ -83,7 +83,7 @@ static int test_shard_stats_hint_run(void) {
         tc_request(tc, req, &resp); free(resp); resp = NULL;
     }
     tc_request(tc, "{\"mode\":\"shard-stats\",\"dir\":\"default\",\"object\":\"sized\"}", &resp);
-    ASSERT_TRUE(!strstr(resp, "\"hint\""), "sized: no hint (target=8 <= splits=64, no skew)");
+    ASSERT_TRUE(!SAFE_STRSTR(resp, "\"hint\""), "sized: no hint (target=8 <= splits=64, no skew)");
     free(resp); resp = NULL;
 
     /* Object 3: skew hint must still fire on its own, independent of the
@@ -103,7 +103,7 @@ static int test_shard_stats_hint_run(void) {
     }
     tc_request(tc, "{\"mode\":\"shard-stats\",\"dir\":\"default\",\"object\":\"skewed\"}", &resp);
     ASSERT_CONTAINS(resp, "skewed", "skewed: skew hint fires");
-    ASSERT_TRUE(!strstr(resp, "splits="), "skewed: no reshard-target hint (target=8 <= splits=8)");
+    ASSERT_TRUE(!SAFE_STRSTR(resp, "splits="), "skewed: no reshard-target hint (target=8 <= splits=8)");
     free(resp); resp = NULL;
 
     /* Object 4: 'maxed' — already at MAX_SPLITS (4096), with average

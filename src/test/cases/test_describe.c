@@ -58,7 +58,7 @@ static int test_describe_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"list-objects\",\"dir\":\"unknown_tenant\"}", &resp);
-    ASSERT_TRUE(resp && (strstr(resp, "Unknown dir") || strstr(resp, "unknown")),
+    ASSERT_TRUE(resp && (SAFE_STRSTR(resp, "Unknown dir") || SAFE_STRSTR(resp, "unknown")),
                 "list-objects unknown tenant → error");
     free(resp); resp = NULL;
 

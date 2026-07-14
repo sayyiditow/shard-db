@@ -72,7 +72,7 @@ static int test_joins_run(void) {
     ASSERT_CONTAINS(resp, "\"Alice\"", "inner: Alice joined");
     ASSERT_CONTAINS(resp, "\"o3\"", "inner: o3 present");
     ASSERT_CONTAINS(resp, "\"Bob\"", "inner: Bob joined");
-    ASSERT_TRUE(strstr(resp, "\"o4\"") == NULL, "inner: o4 not in output (pending filtered)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"o4\"") == NULL, "inner: o4 not in output (pending filtered)");
     free(resp); resp = NULL;
 
     /* LEFT JOIN */
