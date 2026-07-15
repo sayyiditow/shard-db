@@ -59,8 +59,12 @@ jobs:
       - name: Run full C test suite
         # 40+ cases / 1000+ assertions. Each case spawns its own daemon on
         # a free port at a unique tmpdir, so cases are CWD-independent and
-        # parallel-safe within the runner.
-        run: ./build/bin/shard-db-test run-all
+        # parallel-safe within the runner. --jobs pinned explicitly:
+        # GitHub-hosted runners are 2-4 vCPU, and leaving --jobs unset
+        # defaults to sysconf(_SC_NPROCESSORS_ONLN), which over-subscribes
+        # these shared/weak runners and caused real contention-driven
+        # request timeouts (see docs/plans/2026-07-15-concurrency-and-leak-fixes.md).
+        run: ./build/bin/shard-db-test run-all --jobs 4
 
       - name: Package binary
         # Tag artifact uploads by os+arch so binaries from different

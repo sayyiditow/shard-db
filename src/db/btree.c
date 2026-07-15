@@ -21,6 +21,7 @@ int bt_page_size = 4096;
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 
 /* Defined in util.c — forward-declared here to avoid pulling all of types.h
    (types.h carries heavy server/storage deps that btree.c doesn't need). */
@@ -447,12 +448,20 @@ static int bt_cache_probe(const char *path, int *out_found) {
    (BT_CACHE_MAX = FCACHE_MAX/4). */
 /* Detach a slot's resources under bt_cache_lock without doing any syscalls.
    The caller disposes the returned fd/map AFTER releasing bt_cache_lock via
-   bt_dispose_mapping(). Same no-rwlock-holder contract as before. */
-static void bt_cache_evict_slot(int slot, int *out_fd, uint8_t **out_map,
-                                size_t *out_sz) {
+   bt_dispose_mapping(). Non-blocking: tries the slot's own rwlock with
+   pthread_rwlock_trywrlock before touching anything. A held rwlock means a
+   long-lived holder is mid-use (e.g. a BtRangeIter, which holds rdlock for
+   its entire lifetime per btree.h) — clearing the slot out from under that
+   holder and then munmap/close-ing its mapping (in bt_dispose_mapping) is a
+   use-after-unmap. Returns 0 on success (slot detached, out params filled),
+   -1 if the slot is currently held (out params left at -1/NULL/0, slot
+   untouched) — callers must treat -1 as "try a different slot". */
+static int bt_cache_evict_slot(int slot, int *out_fd, uint8_t **out_map,
+                               size_t *out_sz) {
     BtCacheEntry *e = &bt_cache[slot];
     *out_fd = -1; *out_map = NULL; *out_sz = 0;
-    if (!e->used) return;
+    if (!e->used) return 0;
+    if (pthread_rwlock_trywrlock(&e->rwlock) != 0) return -1;
     *out_fd = e->fd;
     *out_map = e->map;
     *out_sz = e->map_size;
@@ -462,6 +471,8 @@ static void bt_cache_evict_slot(int slot, int *out_fd, uint8_t **out_map,
     e->used = 0;
     e->path[0] = '\0';
     bt_cache_count--;
+    pthread_rwlock_unlock(&e->rwlock);
+    return 0;
 }
 
 /* Flush + unmap + close a detached mapping. Never call with bt_cache_lock
@@ -477,8 +488,17 @@ static void bt_dispose_mapping(int fd, uint8_t *map, size_t map_size) {
    are admin-path only (remove-index). */
 static void bt_cache_drop_slot(int slot) {
     int fd; uint8_t *map; size_t sz;
-    bt_cache_evict_slot(slot, &fd, &map, &sz);
-    bt_dispose_mapping(fd, map, sz);
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (bt_cache_evict_slot(slot, &fd, &map, &sz) == 0) {
+            bt_dispose_mapping(fd, map, sz);
+            return;
+        }
+        struct timespec ts = { 0, 1000000L }; /* 1ms */
+        nanosleep(&ts, NULL);
+    }
+    LOG_WARN(LOG_SUB_BTREE,
+        "bt_cache_drop_slot: slot %d still held after 50 retries (50ms), giving up",
+        slot);
 }
 
 /* Initialise a fresh btree file at `map` of `bt_page_size * 2` bytes. */
@@ -703,19 +723,32 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
 
     int vic_fd = -1; uint8_t *vic_map = NULL; size_t vic_sz = 0;
 
-    /* Evict LRU when over half-full or the probe couldn't find an empty slot. */
+    /* Evict LRU when over half-full or the probe couldn't find an empty
+       slot. Bounded scan: a candidate slot may be busy (a long-lived
+       holder such as a BtRangeIter has its rwlock locked) — skip it and
+       try the next-oldest candidate rather than blocking or clobbering
+       it. Gives up after 8 attempts and serves the request uncached
+       (slot stays -1) rather than looping indefinitely on a cache that's
+       entirely full of busy slots. */
     if (slot < 0 || bt_cache_count >= bt_cache_slots / 2) {
-        int lru = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < bt_cache_slots; i++) {
-            if (bt_cache[i].used && bt_cache[i].last_access < oldest) {
-                oldest = bt_cache[i].last_access;
-                lru = i;
+        uint64_t floor_ts = 0;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            int lru = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int i = 0; i < bt_cache_slots; i++) {
+                if (bt_cache[i].used && bt_cache[i].last_access >= floor_ts &&
+                    bt_cache[i].last_access < oldest) {
+                    oldest = bt_cache[i].last_access;
+                    lru = i;
+                }
             }
-        }
-        if (lru >= 0) {
-            bt_cache_evict_slot(lru, &vic_fd, &vic_map, &vic_sz);
-            slot = lru;
+            if (lru < 0) break; /* no more candidates at all */
+            if (bt_cache_evict_slot(lru, &vic_fd, &vic_map, &vic_sz) == 0) {
+                slot = lru;
+                break;
+            }
+            /* Busy — try the next-oldest candidate. */
+            floor_ts = oldest + 1;
         }
     }
 

@@ -1016,6 +1016,11 @@ static int bulk_ins_run(const char *db_root, const char *object,
                     } else {
                         if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
                         errors++;
+                        /* Parse failed: id is nulled below, so the id&&data_ptr
+                           block that would otherwise store-or-free
+                           wire_for_record is never reached — free it here. */
+                        free(wire_for_record);
+                        wire_for_record = NULL;
                         id = NULL;
                     }
                 } else { /* AK_SEQ */
@@ -1027,6 +1032,8 @@ static int bulk_ins_run(const char *db_root, const char *object,
                     } else {
                         if (validation_failed_idx < 0) validation_failed_idx = (int)rec_count;
                         errors++;
+                        free(wire_for_record);
+                        wire_for_record = NULL;
                         id = NULL;
                     }
                 }
