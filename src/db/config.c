@@ -450,6 +450,13 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "AUTO_RESHARD_THROTTLE_MS=", 26) == 0) {
             int n = atoi(p + 26);
             if (n >= 0 && g_db) g_auto_reshard_throttle_ms = n;
+        } else if (strncmp(p, "KFCACHE_TEST_HOLD_MS=", 21) == 0) {
+            /* Test-only knob (widens kfcache_invalidate_prefix's hold window
+               deterministically for the shutdown-race regression test). Not
+               a documented production setting — do not add to
+               configuration.md. */
+            int n = atoi(p + 21);
+            if (n >= 0 && g_db) g_kfcache_test_hold_ms = n;
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
                 const char *v = p + 7;

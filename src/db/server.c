@@ -2550,9 +2550,11 @@ void remove_pid_file(const char *db_root) {
  * for an extended rebuild window. Plain vacuum is in-place flag-flip,
  * cheap enough to fire on a polling cadence without surprising operators.
  *
- * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0)
- * brings shutdown latency down to <1s instead of waiting out the full
- * interval. Detached — no join on shutdown; it just exits its loop.
+ * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0) is
+ * noticed within a second between ticks. Joined (not detached) on
+ * shutdown — see cmd_server's shutdown sequence: a vacuum already in
+ * flight when SIGTERM arrives is allowed to finish before cache teardown
+ * proceeds, closing a use-after-free race against kfcache_shutdown().
  */
 typedef struct {
     char db_root[PATH_MAX];
@@ -2941,6 +2943,16 @@ static void *auto_vacuum_thread(void *arg) {
     /* Bind thread-local g_db so all g_* macros work. */
     g_db = g_shard_db_instance;
 
+    /* Block SIGTERM/SIGINT on this thread so its nanosleep/sleep calls
+       aren't interrupted by the process-wide shutdown signal. The main
+       thread's signal handler will still set server_running=0, which this
+       thread picks up via its loop check — no need to wake early. */
+    sigset_t block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGTERM);
+    sigaddset(&block_mask, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &block_mask, NULL);
+
     /* Discard cmd_vacuum's JSON output — there's no client connection.
        /dev/null open failure shouldn't kill the thread; fall back to
        stderr (which the daemon redirects to /dev/null after fork). */
@@ -3001,8 +3013,12 @@ static void *auto_vacuum_thread(void *arg) {
  * to finish before the first tick can ever fire. Negligible in
  * production (5s once, before an opt-in nightly maintenance thread).
  *
- * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0)
- * brings shutdown latency down to <1s. Detached — no join on shutdown.
+ * Sleep is sliced into 1-second chunks so SIGTERM (server_running=0) is
+ * noticed within a second between ticks. Joined (not detached) on
+ * shutdown — see cmd_server's shutdown sequence: a reshard already in
+ * flight when SIGTERM arrives runs to completion (it already holds the
+ * object's exclusive lock for the whole rebuild) before cache teardown
+ * proceeds, closing a use-after-free race against kfcache_shutdown().
  */
 typedef struct {
     char db_root[PATH_MAX];
@@ -3056,6 +3072,16 @@ static void *auto_reshard_thread(void *arg) {
 
     /* Bind thread-local g_db so all g_* macros work. */
     g_db = g_shard_db_instance;
+
+    /* Block SIGTERM/SIGINT on this thread so its nanosleep/sleep calls
+       aren't interrupted by the process-wide shutdown signal. The main
+       thread's signal handler will still set server_running=0, which this
+       thread picks up via its loop check — no need to wake early. */
+    sigset_t block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGTERM);
+    sigaddset(&block_mask, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &block_mask, NULL);
 
     /* Startup grace period — see the function doc comment above for why
        this must run before the first wall-clock check, not just before
@@ -3278,6 +3304,10 @@ int cmd_server(const char *db_root, int daemonize) {
     g_db = g_shard_db_instance;
 
     int port = g_port;
+    pthread_t auto_vac_tid = 0;
+    int auto_vac_spawned = 0;
+    pthread_t auto_reshard_tid = 0;
+    int auto_reshard_spawned = 0;
 
     /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
        fd per cached shard and briefly 2 during ucache_grow_shard (new + retired
@@ -3568,29 +3598,29 @@ int cmd_server(const char *db_root, int daemonize) {
     LOG_INFO(LOG_SUB_SERVER, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
 
-    /* Auto-vacuum is opt-in. Detached thread; exits on server_running=0. */
+    /* Auto-vacuum is opt-in. Joined (not detached) on shutdown below —
+       see the shutdown sequence's pthread_join() comment for why. */
     if (g_auto_vacuum_enable) {
-        pthread_t auto_vac_tid;
         AutoVacuumArg *av = malloc(sizeof(AutoVacuumArg));
         if (av) {
             strncpy(av->db_root, db_root, PATH_MAX - 1);
             av->db_root[PATH_MAX - 1] = '\0';
             if (db_thread_create(&auto_vac_tid, auto_vacuum_thread, av) == 0)
-                pthread_detach(auto_vac_tid);
+                auto_vac_spawned = 1;
             else
                 free(av);
         }
     }
 
-    /* Auto-reshard is opt-in. Detached thread; exits on server_running=0. */
+    /* Auto-reshard is opt-in. Joined (not detached) on shutdown below —
+       see the shutdown sequence's pthread_join() comment for why. */
     if (g_auto_reshard_enable) {
-        pthread_t auto_reshard_tid;
         AutoReshardArg *ar = malloc(sizeof(AutoReshardArg));
         if (ar) {
             strncpy(ar->db_root, db_root, PATH_MAX - 1);
             ar->db_root[PATH_MAX - 1] = '\0';
             if (db_thread_create(&auto_reshard_tid, auto_reshard_thread, ar) == 0)
-                pthread_detach(auto_reshard_tid);
+                auto_reshard_spawned = 1;
             else
                 free(ar);
         }
@@ -3674,6 +3704,26 @@ int cmd_server(const char *db_root, int daemonize) {
 
     /* Wait for any remaining in-flight writes (up to 30s) */
     for (int i = 0; i < 300 && in_flight_writes > 0; i++) usleep(100000);
+
+    /* Join the auto-vacuum/auto-reshard threads before any teardown that
+       touches slotcask/kfcache/btcache. Both are spawned joinable (not
+       detached) specifically for this: kfcache_shutdown() (invoked below
+       via slotcask_shutdown()) frees the whole kfcache array and destroys
+       every entry's rwlock while holding only g_kfcache_lock -- a mutex
+       kfcache_invalidate_prefix() (reachable from a reshard/vacuum still
+       in flight on either thread) deliberately never takes, to avoid a
+       lock-order inversion with kfcache_acquire()'s install path (see
+       slotcask.c). Without this join, a reshard/vacuum still running when
+       shutdown reached kfcache_shutdown() raced it with zero mutual
+       exclusion -- a genuine use-after-free/destroy-while-locked SIGSEGV.
+       Bounded in practice: both threads already check server_running
+       between sweep items (not mid-item), and a heavy vacuum/reshard
+       already holds the object's exclusive lock for its full duration
+       regardless -- so this join only ever waits as long as an
+       in-progress heavy op that was already blocking all other traffic
+       on that object. */
+    if (auto_vac_spawned) pthread_join(auto_vac_tid, NULL);
+    if (auto_reshard_spawned) pthread_join(auto_reshard_tid, NULL);
 
     remove_pid_file(db_root);
     parallel_io_pool_shutdown();

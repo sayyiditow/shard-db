@@ -70,6 +70,8 @@ This serializes schema rebuilds against everything else without holding a long-l
 
 Reads are not drained; they're safe to abandon mid-scan.
 
+`AUTO_VACUUM`/`AUTO_RESHARD_ENABLE`'s background threads are joined (not detached) as part of this same shutdown sequence, before any cache teardown (`slotcask_shutdown`/`kfcache_shutdown`, `bt_cache_shutdown`, `fcache_shutdown`). If either thread is mid-sweep on an object when `stop` is issued, shutdown waits for that item to finish — unbounded in theory, but no worse in practice than the exclusive objlock that operation already holds against all other traffic on that object. This closes a use-after-free race: without the join, `kfcache_shutdown()` could free/destroy the kfcache array while a reshard/vacuum thread was still using it.
+
 ## Commit semantics (v2)
 
 A v2 write is sequenced as:
