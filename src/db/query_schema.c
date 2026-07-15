@@ -375,14 +375,17 @@ int cmd_edit_fields(const char *db_root, const char *object,
         memset(&parsed[e], 0, sizeof(parsed[e]));
         if (strstr(lines[e], ":removed")) {
             OUT("{\"error\":\"Cannot edit with ':removed' marker; use remove-field\"}\n");
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (!parse_field_line(lines[e], &parsed[e])) {
             OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[e]);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (!edit_valid_name(parsed[e].name)) {
             OUT("{\"error\":\"Invalid field name: %s\"}\n", parsed[e].name);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         /* Duplicate-edit-in-request check. */
@@ -390,6 +393,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
             if (strcmp(parsed[b].name, parsed[e].name) == 0) {
                 OUT("{\"error\":\"Duplicate edit for field [%s] in request\"}\n",
                     parsed[e].name);
+                for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
                 return 1;
             }
         }
@@ -403,11 +407,13 @@ int cmd_edit_fields(const char *db_root, const char *object,
         }
         if (found < 0) {
             OUT("{\"error\":\"Field [%s] not found\"}\n", parsed[e].name);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (old_ts->fields[found].removed) {
             OUT("{\"error\":\"Field [%s] is tombstoned; cannot edit\"}\n",
                 parsed[e].name);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         /* Cross-type refusal. Allowed cross-type edits:
@@ -426,8 +432,9 @@ int cmd_edit_fields(const char *db_root, const char *object,
         int float_widen = (oldf->type == FT_FLOAT && parsed[e].type == FT_DOUBLE);
         if (!same_type && !int_family && !float_widen) {
             OUT("{\"error\":\"Cross-type edit refused for [%s]; "
-                "use add-field <new> + remove-field <old> + bulk-update\"}\n",
-                parsed[e].name);
+                 "use add-field <new> + remove-field <old> + bulk-update\"}\n",
+                 parsed[e].name);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
 
@@ -445,11 +452,13 @@ int cmd_edit_fields(const char *db_root, const char *object,
             if (newn < oldn) {
                 OUT("{\"error\":\"enum edit refused for [%s]: cannot remove or shrink the value list (records reference values by position — removing would corrupt them). Append-only edits supported.\"}\n",
                     parsed[e].name);
+                for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
                 return 1;
             }
             if (oldf->enum_width == 2 && parsed[e].enum_width == 1) {
                 OUT("{\"error\":\"enum edit refused for [%s]: cannot narrow 2-byte → 1-byte enum.\"}\n",
                     parsed[e].name);
+                for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
                 return 1;
             }
             int had_rename = 0;
@@ -459,14 +468,16 @@ int cmd_edit_fields(const char *db_root, const char *object,
                 if (!ov || !nv) {
                     OUT("{\"error\":\"enum edit for [%s]: internal value list corrupt at position %d\"}\n",
                         parsed[e].name, i);
+                    for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
                     return 1;
                 }
                 if (strcmp(ov, nv) != 0) had_rename = 1;
             }
             if (had_rename && !allow_rename) {
-                OUT("{\"error\":\"enum edit refused for [%s]: at least one value at an existing position changed — that's a rename. Re-issue with allow_rename:true to confirm (existing records keep their byte index but the displayed value changes).\"}\n",
-                    parsed[e].name);
-                return 1;
+                    OUT("{\"error\":\"enum edit refused for [%s]: at least one value at an existing position changed — that's a rename. Re-issue with allow_rename:true to confirm (existing records keep their byte index but the displayed value changes).\"}\n",
+                        parsed[e].name);
+                    for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
+                    return 1;
             }
         }
 

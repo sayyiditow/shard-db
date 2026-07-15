@@ -42,11 +42,11 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite (sequential)
-        # gcov counters aren't safe across forked processes when test
-        # cases overlap. The test runner already spawns one daemon per
-        # case sequentially, so .gcda files stay coherent without extra
-        # serialization.
-        run: ./build/bin/shard-db-test run-all
+        # gcov counters aren't safe across forked/overlapping test cases.
+        # run-all now defaults to parallel (--jobs unset = nproc) since
+        # the parallel test runner landed, so --jobs 1 must be passed
+        # explicitly here to keep this step actually sequential.
+        run: ./build/bin/shard-db-test run-all --jobs 1
 
       - name: Collect coverage
         run: |

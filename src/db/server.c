@@ -1617,6 +1617,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("{\"error\":\"offset must not be negative\"}\n");
             free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
             free(delim); free(join); free(ob); free(od); free(cur);
+            free(mode); free(dir); free(object);
             return;
         }
         int want_total = json_obj_is_true(&req, "total");
@@ -1837,13 +1838,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                                      .streams = sc.streams };
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (!sdb || sdb->format != SLOTCASK_FORMAT_VARIABLE) {
-            OUT("{\"error\":\"object not found or not in VARIABLE format\"}\n"); return;
+            OUT("{\"error\":\"object not found or not in VARIABLE format\"}\n");
+            free(mode); free(dir); free(object);
+            return;
         }
         objlock_wrlock(db_root, object);
         int rc = slotcask_compact(sdb, schema_trim_fn, (void *)ts);
         objlock_wrunlock(db_root, object);
-        if (rc != 0) { OUT("{\"error\":\"compact failed\"}\n"); return; }
+        if (rc != 0) {
+            OUT("{\"error\":\"compact failed\"}\n");
+            free(mode); free(dir); free(object);
+            return;
+        }
         OUT("{\"ok\":true}\n");
+        free(mode); free(dir); free(object);
         return;
     } else if (strcmp(mode, "rename-field") == 0) {
         char *oldn = json_obj_strdup(&req, "old");

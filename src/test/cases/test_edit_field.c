@@ -211,6 +211,27 @@ static int test_edit_field_run(void) {
     ASSERT_CONTAINS(resp, "Duplicate", "duplicate reason");
     free(resp); resp = NULL;
 
+    /* === 11b. ':removed' marker rejected on edit-field (use remove-field) === */
+    tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"users\","
+                   "\"fields\":[\"bio:removed\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "':removed' marker rejected on edit-field");
+    ASSERT_CONTAINS(resp, "use remove-field", "removed-marker reason");
+    free(resp); resp = NULL;
+
+    /* === 11c. invalid field line (no ':' spec) rejected ====================== */
+    tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"users\","
+                   "\"fields\":[\"justaname\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "invalid field line rejected");
+    ASSERT_CONTAINS(resp, "Invalid field line", "invalid field line reason");
+    free(resp); resp = NULL;
+
+    /* === 11d. invalid field name rejected ==================================== */
+    tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"users\","
+                   "\"fields\":[\"bad name:int\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"error\"", "invalid field name rejected");
+    ASSERT_CONTAINS(resp, "Invalid field name", "invalid field name reason");
+    free(resp); resp = NULL;
+
     /* === 12. batch edit success — name + age in one call ==================== */
     tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"users\","
                    "\"fields\":[\"name:varchar:128\",\"age:long\"]}", &resp);

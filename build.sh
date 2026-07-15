@@ -235,6 +235,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_v2_index_leak_on_clear.c \
     src/test/cases/test_btree.c \
     src/test/cases/test_btree_inplace_leaf.c \
+    src/test/cases/test_btcache_evict_race.c \
     src/test/cases/test_btree_value_hash_sort.c \
     src/test/cases/test_json_escape.c \
     src/test/cases/test_timestamp.c \
@@ -248,6 +249,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \
+    src/test/cases/test_dispatch_leak_paths.c \
     src/test/cases/test_keyset.c \
     src/test/cases/test_objlock_unit.c \
     src/test/cases/test_parallel.c \
