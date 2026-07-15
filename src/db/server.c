@@ -2664,21 +2664,46 @@ static int warmup_touch_file(const char *path) {
 
 /* Per-shard kfcache prime task — mmaps the kf shard via kfcache and
    forces its first page resident.  One task per kf shard so the pool
-   gets thousands-wide fan-out instead of per-object granularity. */
+   gets thousands-wide fan-out instead of per-object granularity.
+   eff/obj are copied (not pointed-to): tasks outlive the per-object
+   collection loop that creates them (kf_tasks is a realloc()-growable
+   array), and warmup_kf_task_fn dereferences them from a pool thread
+   holding no lock of its own — they are the objlock key used to
+   serialize against a concurrent vacuum/rebuild freeing `sdb` out from
+   under this task. See docs/plans/2026-07-15-auto-reshard-shutdown-race.md
+   ("the warmup thread is now in scope") for the UAF this closes. */
 typedef struct {
     SlotcaskDb *sdb;
     int shard_idx;
     _Atomic int *kf_count;
+    char eff[PATH_MAX];
+    char obj[256];
 } WarmupKfTask;
 
 static void *warmup_kf_task_fn(void *arg) {
     WarmupKfTask *t = (WarmupKfTask *)arg;
     if (!server_running) return NULL;
 
+    /* Hold the object's rdlock only long enough to copy out the fields
+       we need — this is what a concurrent vacuum's wrlock (taken before
+       slotcask_registry_invalidate frees `sdb`) blocks against. Once we
+       have kf_path + slots_per_shard by value, sdb is never touched
+       again in this function. */
     char kf_path[PATH_MAX];
+    int slots_per_shard;
+    objlock_rdlock(t->eff, t->obj);
+    if (g_db && g_warmup_test_delay_ms > 0) {
+        LOG_INFO(LOG_SUB_WARMUP, "WARMUP-TEST-DELAY: shard_idx=%d starting", t->shard_idx);
+        struct timespec delay_ts = { g_warmup_test_delay_ms / 1000,
+                                      (long)(g_warmup_test_delay_ms % 1000) * 1000000L };
+        nanosleep(&delay_ts, NULL);
+    }
     slotcask_kf_path(kf_path, sizeof(kf_path), t->sdb->data_dir, t->shard_idx);
+    slots_per_shard = t->sdb->slots_per_shard;
+    objlock_rdunlock(t->eff, t->obj);
+
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, t->sdb->slots_per_shard, 0) != 0) {
+    if (kfcache_acquire(&kh, kf_path, slots_per_shard, 0) != 0) {
         LOG_WARN(LOG_SUB_WARMUP, "warmup_kf_task_fn: kfcache_acquire failed for kf_path=%s shard_idx=%d", kf_path, t->shard_idx);
         return NULL;
     }
@@ -2815,8 +2840,15 @@ static void *warmup_thread(void *arg) {
             if (!sdb) continue;
             objects++;
 
+            /* Snapshot num_shards under the objlock — same UAF class as
+               warmup_kf_task_fn above, just narrower (phase 1 is serial
+               on this thread, so the window is only this one read). */
+            objlock_rdlock(dir_path, de->d_name);
+            int num_shards = sdb->num_shards;
+            objlock_rdunlock(dir_path, de->d_name);
+
             /* Per-shard kf tasks for this object */
-            for (int s = 0; s < sdb->num_shards; s++) {
+            for (int s = 0; s < num_shards; s++) {
                 if (n_kf == kf_cap) {
                     size_t new_cap = kf_cap ? kf_cap * 2 : 64;
                     WarmupKfTask *nt = realloc(kf_tasks, new_cap * sizeof(WarmupKfTask));
@@ -2824,11 +2856,12 @@ static void *warmup_thread(void *arg) {
                     kf_tasks = nt;
                     kf_cap = new_cap;
                 }
-                kf_tasks[n_kf++] = (WarmupKfTask){
-                    .sdb = sdb,
-                    .shard_idx = s,
-                    .kf_count = &kf_count,
-                };
+                WarmupKfTask *kt = &kf_tasks[n_kf++];
+                kt->sdb = sdb;
+                kt->shard_idx = s;
+                kt->kf_count = &kf_count;
+                snprintf(kt->eff, sizeof(kt->eff), "%s", dir_path);
+                snprintf(kt->obj, sizeof(kt->obj), "%s", de->d_name);
             }
 
             /* Recursively collect index file paths for this object */
