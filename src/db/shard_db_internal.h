@@ -159,6 +159,7 @@ struct ShardDb {
     int auto_reshard_enable;
     int auto_reshard_hour;
     int auto_reshard_throttle_ms;
+    int kfcache_test_hold_ms; /* test-only; 0 = off in production */
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
@@ -315,6 +316,7 @@ extern __thread ShardDb *g_db;
 #define g_auto_reshard_enable       (g_db->auto_reshard_enable)
 #define g_auto_reshard_hour         (g_db->auto_reshard_hour)
 #define g_auto_reshard_throttle_ms  (g_db->auto_reshard_throttle_ms)
+#define g_kfcache_test_hold_ms      (g_db->kfcache_test_hold_ms)
 #define g_warmup_mode               (g_db->warmup_mode)
 #define g_log_level                 (g_db->log_level)
 #define g_log_retain_days           (g_db->log_retain_days)

@@ -246,6 +246,17 @@ static void kfcache_invalidate_prefix(const char *prefix) {
         pthread_rwlock_wrlock(&e->rwlock);
         if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
             strncmp(e->path, prefix, pl) == 0) {
+            if (g_db && g_kfcache_test_hold_ms > 0) {
+                /* Test-only hook (KFCACHE_TEST_HOLD_MS): widens this
+                   window deterministically for the shutdown-race
+                   regression test. 0 in production. */
+                struct timespec hold_ts = { g_kfcache_test_hold_ms / 1000,
+                                             (long)(g_kfcache_test_hold_ms % 1000) * 1000000L };
+                int ret;
+                do {
+                    ret = nanosleep(&hold_ts, &hold_ts);
+                } while (ret != 0 && errno == EINTR);
+            }
             if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
             if (e->base) munmap(e->base, e->map_size);
             if (e->fd >= 0) close(e->fd);
@@ -257,6 +268,17 @@ static void kfcache_invalidate_prefix(const char *prefix) {
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
             __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
             __sync_fetch_and_sub(&g_kfcache_count, 1);
+            /* Test-only early exit: unlock this entry, then leave the
+               remaining prefix-matched entries alone.  One held entry is
+               enough for the shutdown-race regression test; iterating
+               the rest would multiply HOLD_MS and blow the test's 10s
+               waitpid timeout at high splits.  Production
+               (g_kfcache_test_hold_ms=0) never takes this path — all
+               matching entries are invalidated in one pass. */
+            if (g_db && g_kfcache_test_hold_ms > 0) {
+                pthread_rwlock_unlock(&e->rwlock);
+                break;
+            }
         }
         pthread_rwlock_unlock(&e->rwlock);
     }
