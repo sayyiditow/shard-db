@@ -34,16 +34,14 @@ const TestCaseEntry *test_first(void);
 int test_run_one(const char *name);
 
 /* Run all (optionally filtered by substring), using `jobs` worker
-   threads. jobs<=1 runs strictly sequentially (byte-identical output to
+   processes. jobs<=1 runs strictly sequentially (byte-identical output to
    the pre-parallel implementation) — this is the safety fallback.
-   jobs>1 runs a self-draining worker pool: each worker atomically pulls
-   the next case index, buffers its TAP output via open_memstream, and
-   flushes it atomically under a print mutex on completion, so
-   concurrent tests' output never interleaves. A watchdog thread
-   _exit(124)s the whole process if any single case exceeds
-   SHARD_TEST_WATCHDOG_SEC (default 180s) — a stuck pthread cannot be
-   safely cancelled mid-syscall in C, so this mirrors `timeout(1)`'s
-   hard-kill convention instead. Returns total fail count. */
+   jobs>1 uses a bounded process pool: a single-threaded parent forks one
+   isolated child per active case, captures each child's output in a private
+   file, and flushes it after reaping the child, so concurrent tests' output
+   never interleaves and their process-global test state cannot race. The
+   parent _exit(124)s after killing active children if any one exceeds
+   SHARD_TEST_WATCHDOG_SEC (default 180s). Returns total fail count. */
 int test_run_all(const char *filter, int jobs);
 
 #endif
