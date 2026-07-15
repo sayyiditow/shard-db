@@ -61,22 +61,231 @@ traffic on that object regardless) — not a new source of unbounded risk,
 but it is an observable latency change for operators and must be documented
 in `docs/concepts/concurrency.md`.
 
-## Explicitly out of scope: the warmup thread
+## Amendment (2026-07-15): the warmup thread is now in scope — confirmed UAF
 
-`cmd_server`'s startup-warmup thread (`src/db/server.c`, the
-`if (strcmp(g_warmup_mode, "off") != 0)` block, async branch) is also
-spawned via `db_thread_create()` + `pthread_detach()`, and `warmup_thread`
-does call `kfcache_acquire()` while priming the page cache. In principle
-this is the same class of race: if `stop` arrives while warmup is still
-running, `kfcache_shutdown()` could race it too. This plan does not join
-it, for a different reason than "it's safe by design" — it's a real gap,
-but a much narrower one: warmup is a single bounded pass over existing kf
-headers/index shards run once at startup (not a recurring, opt-in,
-potentially-slow nightly sweep like reshard/vacuum), so the exposure
-window is startup-to-warmup-completion, not "any time of day, indefinitely,
-if enabled." Given that narrower and different-shaped risk, it's being
-tracked separately rather than folded into this fix — flag to the human
-whether a follow-up task should be opened for it.
+The section below originally scoped the warmup thread *out*, reasoning that
+its only exposure was racing `kfcache_shutdown()` during a `stop`, and that
+the window was narrow (startup-to-warmup-completion). ASan on
+`test-rebuild-recovery` (run on the `test-runner-isolation` branch, not this
+one) subsequently caught a **broader, confirmed** heap-use-after-free that
+does not require shutdown at all — a plain concurrent `vacuum` during normal
+operation is enough:
+
+```
+==shard-db==6372==ERROR: AddressSanitizer: heap-use-after-free on address 0x521000033110
+READ of size 8 at 0x521000033110 thread T8
+    #0 warmup_kf_task_fn src/db/server.c:2681
+    #1 run_task_finish src/db/parallel.c:176
+    #2 io_pool_worker src/db/parallel.c:377
+
+freed by thread T12 here:
+    #0 free
+    #1 slotcask_registry_invalidate src/db/slotcask.c:5225
+    #2 rebuild_object_v2 src/db/query_find.c:1045
+    #3 rebuild_object src/db/query_find.c:1351
+    #4 cmd_vacuum src/db/query_maint.c:179
+    #5 dispatch_json_query src/db/server.c:1804
+
+previously allocated by thread T28 here:
+    #0 calloc
+    #1 slotcask_registry_get src/db/slotcask.c:5179
+    #2 warmup_object_open src/db/server.c:2633
+    #3 warmup_thread src/db/server.c:2813
+```
+
+### Root cause
+
+`slotcask_registry_get()` (`src/db/slotcask.c`) returns a bare,
+unrefcounted `SlotcaskDb *`. Every synchronous request-path consumer is
+safe because normal ops (rdlock) vs. rebuild/vacuum (wrlock) are already
+serialized per-object via `objlock_rdlock`/`objlock_wrlock`
+(`src/db/objlock.c`) for the duration of the call that dereferences the
+pointer. `warmup_thread`, however, gets the pointer in `warmup_object_open()`
+(phase 1, no lock held) and hands it into `WarmupKfTask` structs that are
+fanned out onto the I/O pool (`warmup_kf_task_fn`, phase 2) — these run
+later, on other threads, holding **no lock at all**. A `vacuum` with a
+splits/streams change (`cmd_vacuum` → `rebuild_object` →
+`rebuild_object_v2` → `slotcask_registry_invalidate`) frees the
+`SlotcaskDb` while a queued or in-flight warmup task still holds and
+dereferences the same pointer (`t->sdb->data_dir`, `t->sdb->num_shards`,
+`t->sdb->slots_per_shard`). This is strictly wider than the
+shutdown-vs-warmup race originally described above: it fires on any
+ordinary `vacuum --splits` while warmup is still running, shutdown not
+required.
+
+### Fix
+
+Same convention as every other registry consumer: hold
+`objlock_rdlock(eff, obj)` for the duration of every read of a warmup
+task's `SlotcaskDb *` fields, so a concurrent `vacuum`'s
+`objlock_wrlock()` (taken generically in `dispatch_json_query` before
+`cmd_vacuum` runs) blocks until the warmup side is done touching the
+pointer. Two call sites need the lock:
+
+1. `warmup_thread`'s phase-1 loop, immediately around the
+   `sdb->num_shards` read used to size the per-object task fan-out.
+2. `warmup_kf_task_fn`, immediately around `t->sdb->data_dir` /
+   `t->sdb->slots_per_shard`, which currently execute lock-free on a
+   different thread than phase 1.
+
+Because tasks in the phase-2 pool run after phase 1 has moved on to other
+objects (or finished collecting entirely), each `WarmupKfTask` must carry
+its own copy of the `(eff, obj)` objlock key — a pointer captured during
+collection cannot outlive the `realloc()`-growable `kf_tasks` array, and a
+pointer into the registry entry itself would just move the UAF one level
+down. Fixed-size string copies avoid that:
+
+```c
+/* Per-shard kfcache prime task — mmaps the kf shard via kfcache and
+   forces its first page resident.  One task per kf shard so the pool
+   gets thousands-wide fan-out instead of per-object granularity.
+   eff/obj are copied (not pointed-to) because tasks outlive the
+   per-object collection loop that creates them, and are dereferenced by
+   warmup_kf_task_fn on a pool thread with no lock of its own — they are
+   the objlock key used to serialize against a concurrent vacuum/rebuild
+   freeing `sdb` out from under this task (see UAF amendment above). */
+typedef struct {
+    SlotcaskDb *sdb;
+    int shard_idx;
+    _Atomic int *kf_count;
+    char eff[PATH_MAX];
+    char obj[256];
+} WarmupKfTask;
+
+static void *warmup_kf_task_fn(void *arg) {
+    WarmupKfTask *t = (WarmupKfTask *)arg;
+    if (!server_running) return NULL;
+
+    /* Hold the object's rdlock only long enough to copy out the fields
+       we need — this is what a concurrent vacuum's wrlock (taken before
+       slotcask_registry_invalidate frees `sdb`) blocks against. Once we
+       have kf_path + slots_per_shard by value, sdb is never touched
+       again in this function. */
+    char kf_path[PATH_MAX];
+    int slots_per_shard;
+    objlock_rdlock(t->eff, t->obj);
+    slotcask_kf_path(kf_path, sizeof(kf_path), t->sdb->data_dir, t->shard_idx);
+    slots_per_shard = t->sdb->slots_per_shard;
+    objlock_rdunlock(t->eff, t->obj);
+
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, slots_per_shard, 0) != 0) {
+        LOG_WARN(LOG_SUB_WARMUP, "warmup_kf_task_fn: kfcache_acquire failed for kf_path=%s shard_idx=%d", kf_path, t->shard_idx);
+        return NULL;
+    }
+    if (kh.hdr) {
+        volatile uint64_t v = kh.hdr->total;
+        (void)v;
+    }
+    kfcache_release(&kh);
+    atomic_fetch_add(t->kf_count, 1);
+    return NULL;
+}
+```
+
+And in `warmup_thread`'s phase-1 loop:
+
+```c
+SlotcaskDb *sdb = warmup_object_open(a->db_root,
+                                     dirs_copy[di], de->d_name);
+if (!sdb) continue;
+objects++;
+
+/* Snapshot num_shards under the objlock — same UAF class as
+   warmup_kf_task_fn above, just narrower (phase 1 is serial on this
+   thread, so the window is only this one read). */
+objlock_rdlock(dir_path, de->d_name);
+int num_shards = sdb->num_shards;
+objlock_rdunlock(dir_path, de->d_name);
+
+/* Per-shard kf tasks for this object */
+for (int s = 0; s < num_shards; s++) {
+    if (n_kf == kf_cap) {
+        size_t new_cap = kf_cap ? kf_cap * 2 : 64;
+        WarmupKfTask *nt = realloc(kf_tasks, new_cap * sizeof(WarmupKfTask));
+        if (!nt) { closedir(dd); goto done_collect; }
+        kf_tasks = nt;
+        kf_cap = new_cap;
+    }
+    WarmupKfTask *kt = &kf_tasks[n_kf++];
+    kt->sdb = sdb;
+    kt->shard_idx = s;
+    kt->kf_count = &kf_count;
+    snprintf(kt->eff, sizeof(kt->eff), "%s", dir_path);
+    snprintf(kt->obj, sizeof(kt->obj), "%s", de->d_name);
+}
+```
+
+`WarmupIdxTask`/`warmup_idx_task_fn` are unaffected — they only ever carry
+a `char path[PATH_MAX]` file path collected up front (`warmup_collect_idx`
+walks the filesystem directly, never touches `SlotcaskDb *`), so there is
+no pointer to invalidate.
+
+Not touched: `slotcask_registry_get()`'s general refcounting (a broader
+fix that would protect *any* future async consumer, not just this one) was
+considered and rejected for this task — it means auditing every existing
+call site of `slotcask_registry_get()`, a much larger and riskier diff for
+a bug with exactly one known async consumer today. Revisit if a second
+async consumer of the registry shows up.
+
+### Regression test
+
+New test-only env knob `WARMUP_TEST_DELAY_MS` (same convention as
+`KFCACHE_TEST_HOLD_MS`): when set, `warmup_kf_task_fn` sleeps for that many
+ms *inside* the `objlock_rdlock`/`objlock_rdunlock` window, right after
+acquiring the lock and before reading `t->sdb`'s fields, and logs
+`WARMUP-TEST-DELAY: shard_idx=%d starting` first so the test can poll for
+it. Add to `load_db_root()` in `config.c` next to `KFCACHE_TEST_HOLD_MS`:
+
+```c
+} else if (strncmp(p, "WARMUP_TEST_DELAY_MS=", 21) == 0) {
+    /* Test-only knob (widens warmup_kf_task_fn's objlock-held window
+       deterministically for the warmup-UAF regression test). Not a
+       documented production setting — do not add to
+       configuration.md. */
+    int n = atoi(p + 21);
+    if (n >= 0 && g_db) g_warmup_test_delay_ms = n;
+}
+```
+
+(Literal `"WARMUP_TEST_DELAY_MS="` is 21 bytes — count it directly, do not
+copy-paste a sibling constant; that exact off-by-one is what produced the
+`KFCACHE_TEST_HOLD_MS` bug this session already fixed once.)
+
+New test `src/test/cases/test_warmup_vacuum_race.c`:
+
+1. Start a daemon normally (`WARMUP` defaults to `async`), create object
+   `warmuprace` (small `splits`, e.g. 8), insert a handful of records so
+   the object has real kf shards on disk, then cleanly stop it (SIGTERM,
+   wait for exit) — this ensures the *next* start's warmup thread has a
+   real object to enumerate from a cold registry.
+2. Restart the same daemon (`db_root`/port unchanged, `test_env_start_at`
+   pattern from `test_auto_reshard_shutdown_race.c`) with
+   `WARMUP_TEST_DELAY_MS=2000` added to `db.env`.
+3. Poll `-info.log` for `WARMUP-TEST-DELAY: shard_idx=0 starting` (bounded
+   timeout, e.g. 10s) — proves a kf task for our object is now inside the
+   critical section.
+4. Immediately issue `{"mode":"vacuum","dir":"default","object":"warmupr
+   ace","splits":16}` on a fresh connection and time it.
+5. Assertions:
+   - The vacuum response has no `"error"` key (rebuild completes cleanly).
+   - Elapsed vacuum time is `>= (WARMUP_TEST_DELAY_MS - 300)` — proves
+     `cmd_vacuum`'s `objlock_wrlock()` actually blocked on the warmup
+     task's held rdlock rather than racing straight through (the same
+     "timing is the robust proof, the crash is the bonus signal" pattern
+     `test_auto_reshard_shutdown_race.c` already uses).
+   - The daemon is still alive and responsive after (`db-dirs` round-trip
+     succeeds) — the ASan-only crash signal for the pre-fix case.
+6. Root-cause proof per CORE-PROCESS: temporarily revert just the
+   `objlock_rdlock`/`objlock_rdunlock` pair in `warmup_kf_task_fn` and the
+   phase-1 `num_shards` snapshot (keep the `WARMUP_TEST_DELAY_MS` knob
+   itself — it's test scaffolding, not the fix), rebuild with ASan
+   (`sanitizers.yml`'s flags, or a local
+   `CFLAGS="-fsanitize=address,undefined" ./build.sh`), run
+   `test-warmup-vacuum-race`, confirm it fails (ASan heap-use-after-free
+   pointing at `warmup_kf_task_fn`, matching the trace above almost
+   exactly). Reapply the two lock pairs, rebuild, confirm it passes. Paste
+   both outputs in the PR.
 
 ## Global constraints
 

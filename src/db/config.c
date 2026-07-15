@@ -457,6 +457,13 @@ int load_db_root(char *out, size_t outlen) {
                configuration.md. */
             int n = atoi(p + 21);
             if (n >= 0 && g_db) g_kfcache_test_hold_ms = n;
+        } else if (strncmp(p, "WARMUP_TEST_DELAY_MS=", 21) == 0) {
+            /* Test-only knob (widens warmup_kf_task_fn's objlock-held
+               window deterministically for the warmup-vs-vacuum UAF
+               regression test). Not a documented production setting —
+               do not add to configuration.md. */
+            int n = atoi(p + 21);
+            if (n >= 0 && g_db) g_warmup_test_delay_ms = n;
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
                 const char *v = p + 7;
