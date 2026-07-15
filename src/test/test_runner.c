@@ -1,10 +1,13 @@
 /* src/test/test_runner.c */
 #include "test_runner.h"
-#include <pthread.h>
-#include <stdatomic.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,10 +36,19 @@ int test_count(void) {
 
 const TestCaseEntry *test_first(void) { return g_head; }
 
-static int run_case(const TestCaseEntry *tc) {
+typedef struct {
+    int passed;
+    int failed;
+} TestResult;
+
+/* Runs one test in this process and exposes its assertion totals to the
+   process-pool parent. The usual `run` and sequential paths use the same
+   body, so their TAP output remains unchanged. */
+static int run_case_result(const TestCaseEntry *tc, TestResult *result) {
     TestCtx ctx = { .name = tc->name };
     t_ctx = &ctx;
     printf("# %s\n", tc->name);
+    fflush(stdout);  /* preserve the case name if it crashes mid-test */
 #ifdef TEST_BUILD
     test_init_process_db();
 #endif
@@ -44,7 +56,12 @@ static int run_case(const TestCaseEntry *tc) {
     if (rc != 0 && ctx.failed == 0) ctx.failed = 1; /* fn signalled fail without assert */
     printf("# %s: %d passed, %d failed\n", tc->name, ctx.passed, ctx.failed);
     t_ctx = NULL;
+    if (result) *result = (TestResult){ .passed = ctx.passed, .failed = ctx.failed };
     return ctx.failed;
+}
+
+static int run_case(const TestCaseEntry *tc) {
+    return run_case_result(tc, NULL);
 }
 
 int test_run_one(const char *name) {
@@ -53,24 +70,6 @@ int test_run_one(const char *name) {
     }
     fprintf(stderr, "no test named '%s'\n", name);
     return 1;
-}
-
-/* Some pure in-process unit tests (no TestEnv/TCP daemon of their own)
-   are provably race-free by their own C11/POSIX happens-before design,
-   but empirically flake when a *sibling* worker thread calls fork() to
-   spawn a TestEnv daemon at the same moment: glibc's pthread_atfork
-   handling briefly stalls unrelated threads in the same process while
-   acquiring malloc arena locks around the syscall. Verified: 0/20
-   failures running test-objlock-unit alone; nonzero whenever it runs
-   concurrently with any TestEnv-based case, at every --jobs > 1 tried
-   (2, 4). Never a --jobs 1 failure. Not a bug in the test or in
-   objlock.c — this is OS-level scheduling perturbation from a sibling
-   thread's fork(), which no amount of atomic-barrier synchronization in
-   the test itself can compensate for. Fix: keep isolation-sensitive
-   cases out of the pool entirely — run them single-threaded before any
-   worker thread has a chance to fork. */
-static int test_needs_isolation(const char *name) {
-    return strcmp(name, "test-objlock-unit") == 0;
 }
 
 /* Builds a flat array of every registered case matching `filter` (NULL
@@ -99,19 +98,10 @@ static int collect_matching(const char *filter, TestCaseEntry ***out) {
 static int run_all_sequential(TestCaseEntry **cases, int n) {
     int total_fail = 0, total_passed = 0;
     for (int i = 0; i < n; i++) {
-        TestCaseEntry *p = cases[i];
-        TestCtx ctx = { .name = p->name };
-        t_ctx = &ctx;
-        printf("# %s\n", p->name);
-#ifdef TEST_BUILD
-        test_init_process_db();
-#endif
-        int rc = p->fn();
-        if (rc != 0 && ctx.failed == 0) ctx.failed = 1;
-        total_fail += ctx.failed;
-        total_passed += ctx.passed;
-        printf("# %s: %d passed, %d failed\n", p->name, ctx.passed, ctx.failed);
-        t_ctx = NULL;
+        TestResult result;
+        run_case_result(cases[i], &result);
+        total_fail += result.failed;
+        total_passed += result.passed;
 #ifdef TEST_BUILD
         test_reset_caches();
 #endif
@@ -122,32 +112,22 @@ static int run_all_sequential(TestCaseEntry **cases, int n) {
     return total_fail;
 }
 
-/* ---- Parallel path (jobs > 1) ---- */
+/* ---- Parallel path (jobs > 1) ----
+
+   Test cases are not thread-safe: many invoke fork(), popen(), or system(),
+   and several use the test-only in-process database globals. Forking from a
+   multithreaded runner leaves the child with only the calling thread and can
+   inherit libc or application locks held by siblings. On macOS this showed
+   up as SIGBUS in CI. Keep the runner parent single-threaded and execute
+   cases in independent child processes instead. */
 
 typedef struct {
-    _Atomic(const char *) name;   /* current test name; NULL = worker idle */
-    _Atomic long start_ms;
-} WorkerSlot;
-
-typedef struct {
-    TestCaseEntry **cases;
-    int n;
-    _Atomic int next;             /* self-draining index, mirrors parallel.c's
-                                     atomic fetch-add dispatch pattern */
-    _Atomic int total_passed;
-    _Atomic int total_failed;
-    pthread_mutex_t print_lock;   /* serializes each completed test's buffered
-                                     output flush to real stdout */
-    WorkerSlot *slots;
-    int nslots;
-    _Atomic int done;             /* set 1 once all workers have joined, tells
-                                     the watchdog to stop polling */
-} ParallelCtx;
-
-typedef struct {
-    ParallelCtx *pc;
-    int slot;
-} WorkerArg;
+    pid_t pid;
+    const TestCaseEntry *tc;
+    int result_fd;
+    long start_ms;
+    char output_path[PATH_MAX];
+} ProcessSlot;
 
 static long now_ms(void) {
     struct timespec ts;
@@ -155,131 +135,217 @@ static long now_ms(void) {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-/* Hard-aborts the whole process if any single test case runs longer
-   than the watchdog limit. A stuck pthread (e.g. blocked in a syscall
-   against a wedged daemon) cannot be safely cancelled mid-flight in C,
-   so this mirrors the `timeout(1)` convention: kill the process, exit
-   124, let CI/the human re-run and investigate which case hung. */
-static void *watchdog_main(void *arg) {
-    ParallelCtx *pc = arg;
-    long limit_ms = 180000;
-    const char *env = getenv("SHARD_TEST_WATCHDOG_SEC");
-    if (env && atoi(env) > 0) limit_ms = (long)atoi(env) * 1000L;
-
-    while (!atomic_load_explicit(&pc->done, memory_order_acquire)) {
-        long now = now_ms();
-        for (int i = 0; i < pc->nslots; i++) {
-            const char *name = atomic_load_explicit(&pc->slots[i].name, memory_order_acquire);
-            if (!name) continue;
-            long start = atomic_load_explicit(&pc->slots[i].start_ms, memory_order_acquire);
-            if (now - start > limit_ms) {
-                fflush(stdout);
-                fprintf(stderr,
-                    "\n# WATCHDOG: test '%s' exceeded %lds on worker %d — aborting run-all\n",
-                    name, limit_ms / 1000, i);
-                fflush(stderr);
-                _exit(124);
-            }
-        }
-        struct timespec req = { 1, 0 };
-        nanosleep(&req, NULL);
+static int write_full(int fd, const void *buf, size_t len) {
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n > 0) { p += n; len -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
     }
-    return NULL;
+    return 0;
 }
 
-static void *worker_main(void *arg_) {
-    WorkerArg *wa = arg_;
-    ParallelCtx *pc = wa->pc;
-    int slot = wa->slot;
-
-    for (;;) {
-        int idx = atomic_fetch_add_explicit(&pc->next, 1, memory_order_relaxed);
-        if (idx >= pc->n) break;
-        TestCaseEntry *tc = pc->cases[idx];
-
-        char *buf = NULL;
-        size_t bufsz = 0;
-        FILE *mem = open_memstream(&buf, &bufsz);
-        TestCtx ctx = { .name = tc->name, .out = mem };
-        t_ctx = &ctx;
-
-        long now = now_ms();
-        atomic_store_explicit(&pc->slots[slot].start_ms, now, memory_order_release);
-        atomic_store_explicit(&pc->slots[slot].name, tc->name, memory_order_release);
-
-        fprintf(mem, "# %s\n", tc->name);
-#ifdef TEST_BUILD
-        test_init_process_db();
-#endif
-        int rc = tc->fn();
-        if (rc != 0 && ctx.failed == 0) ctx.failed = 1;
-        fprintf(mem, "# %s: %d passed, %d failed\n", tc->name, ctx.passed, ctx.failed);
-        fflush(mem);
-
-        atomic_store_explicit(&pc->slots[slot].name, NULL, memory_order_release);
-        t_ctx = NULL;
-#ifdef TEST_BUILD
-        test_reset_caches();
-#endif
-        atomic_fetch_add_explicit(&pc->total_passed, ctx.passed, memory_order_relaxed);
-        atomic_fetch_add_explicit(&pc->total_failed, ctx.failed, memory_order_relaxed);
-
-        pthread_mutex_lock(&pc->print_lock);
-        fwrite(buf, 1, bufsz, stdout);
-        pthread_mutex_unlock(&pc->print_lock);
-
-        fclose(mem);
-        free(buf);
+static int read_full(int fd, void *buf, size_t len) {
+    char *p = buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n > 0) { p += n; len -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
     }
-    return NULL;
+    return 0;
+}
+
+/* Child output goes to a file rather than a pipe: some test cases produce
+   more than a macOS pipe buffer, so a parent that only reads after waitpid()
+   could otherwise deadlock the child before its result is available. */
+static void flush_case_output(ProcessSlot *slot) {
+    FILE *f = fopen(slot->output_path, "r");
+    if (f) {
+        char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+            fwrite(buf, 1, n, stdout);
+        fclose(f);
+    }
+    unlink(slot->output_path);
+    slot->output_path[0] = '\0';
+}
+
+/* Starts a single test from the single-threaded parent. Returns 0 once a
+   child occupies `slot`; returns -1 only for a runner infrastructure error. */
+static int start_case(ProcessSlot *slot, const TestCaseEntry *tc) {
+    char path[] = "/tmp/shard-db-test-output-XXXXXX";
+    int output_fd = mkstemp(path);
+    if (output_fd < 0) return -1;
+
+    int result_pipe[2];
+    if (pipe(result_pipe) != 0) {
+        close(output_fd);
+        unlink(path);
+        return -1;
+    }
+    /* Daemons exec'd by a test must not keep this control pipe open. */
+    fcntl(result_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    /* The parent flushes completed cases after reaping them. A subsequent
+       fork would otherwise copy that still-buffered TAP text into the child,
+       whose fflush() would duplicate prior cases in its private output file. */
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(output_fd);
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        unlink(path);
+        return -1;
+    }
+    if (pid == 0) {
+        close(result_pipe[0]);
+        /* A watchdog kill must include the daemon and helper processes this
+           case starts; otherwise they outlive a timed-out test as orphans. */
+        setpgid(0, 0);
+        if (dup2(output_fd, STDOUT_FILENO) < 0 ||
+            dup2(output_fd, STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        if (output_fd > STDERR_FILENO) close(output_fd);
+
+        TestResult result;
+        int failed = run_case_result(tc, &result);
+        fflush(NULL);
+        write_full(result_pipe[1], &result, sizeof(result));
+        close(result_pipe[1]);
+        _exit(failed ? 1 : 0);
+    }
+
+    close(output_fd);
+    close(result_pipe[1]);
+    /* Close the small parent/child race around setpgid() above. */
+    setpgid(pid, pid);
+    slot->pid = pid;
+    slot->tc = tc;
+    slot->result_fd = result_pipe[0];
+    slot->start_ms = now_ms();
+    snprintf(slot->output_path, sizeof(slot->output_path), "%s", path);
+    return 0;
+}
+
+static void clear_slot(ProcessSlot *slot) {
+    if (slot->result_fd >= 0) close(slot->result_fd);
+    if (slot->output_path[0]) unlink(slot->output_path);
+    *slot = (ProcessSlot){ .result_fd = -1 };
+}
+
+static void collect_case(ProcessSlot *slot, int status, int *total_passed,
+                         int *total_failed) {
+    TestResult result;
+    int got_result = read_full(slot->result_fd, &result, sizeof(result)) == 0;
+    close(slot->result_fd);
+    slot->result_fd = -1;
+
+    flush_case_output(slot);
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr, "# %s: crashed with signal %d\n", slot->tc->name,
+                WTERMSIG(status));
+        (*total_failed)++;
+    } else if (!WIFEXITED(status) || !got_result) {
+        fprintf(stderr, "# %s: exited without a test result\n", slot->tc->name);
+        (*total_failed)++;
+    } else {
+        *total_passed += result.passed;
+        *total_failed += result.failed;
+        if (WEXITSTATUS(status) != 0 && result.failed == 0) {
+            fprintf(stderr, "# %s: exited %d without reporting a failure\n",
+                    slot->tc->name, WEXITSTATUS(status));
+            (*total_failed)++;
+        }
+    }
+    clear_slot(slot);
+}
+
+static void watchdog_abort(ProcessSlot *slots, int nslots, const ProcessSlot *stuck,
+                           long limit_ms) {
+    fflush(stdout);
+    fprintf(stderr,
+            "\n# WATCHDOG: test '%s' exceeded %lds — aborting run-all\n",
+            stuck->tc->name, limit_ms / 1000L);
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].pid > 0) {
+            /* Workers lead their own process groups, so this reaps a
+               fixture daemon as well as the immediate test child. */
+            if (kill(-slots[i].pid, SIGKILL) < 0) kill(slots[i].pid, SIGKILL);
+        }
+    }
+    for (int i = 0; i < nslots; i++) {
+        if (slots[i].pid > 0) waitpid(slots[i].pid, NULL, 0);
+        clear_slot(&slots[i]);
+    }
+    fflush(stderr);
+    _exit(124);
 }
 
 static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
     if (jobs > n) jobs = n > 0 ? n : 1;
 
-    printf("# run-all: %d worker(s)\n", jobs);
+    printf("# run-all: %d worker process(es)\n", jobs);
     fflush(stdout);
 
-    ParallelCtx pc;
-    pc.cases = cases;
-    pc.n = n;
-    atomic_init(&pc.next, 0);
-    atomic_init(&pc.total_passed, 0);
-    atomic_init(&pc.total_failed, 0);
-    atomic_init(&pc.done, 0);
-    pthread_mutex_init(&pc.print_lock, NULL);
-    pc.nslots = jobs;
-    pc.slots = calloc((size_t)jobs, sizeof(*pc.slots));
-    for (int i = 0; i < jobs; i++) {
-        atomic_init(&pc.slots[i].name, (const char *)NULL);
-        atomic_init(&pc.slots[i].start_ms, 0L);
+    ProcessSlot *slots = calloc((size_t)jobs, sizeof(*slots));
+    if (!slots) return 1;
+    for (int i = 0; i < jobs; i++) slots[i].result_fd = -1;
+
+    long limit_ms = 180000;
+    const char *env = getenv("SHARD_TEST_WATCHDOG_SEC");
+    if (env && atoi(env) > 0) limit_ms = (long)atoi(env) * 1000L;
+
+    int next = 0, active = 0, total_passed = 0, total_failed = 0;
+    while (next < n || active > 0) {
+        for (int i = 0; i < jobs && next < n; i++) {
+            if (slots[i].pid != 0) continue;
+            if (start_case(&slots[i], cases[next]) == 0) {
+                active++;
+            } else {
+                fprintf(stderr, "# %s: runner failed to start worker: %s\n",
+                        cases[next]->name, strerror(errno));
+                total_failed++;
+            }
+            next++;
+        }
+
+        int progressed = 0;
+        long now = now_ms();
+        for (int i = 0; i < jobs; i++) {
+            if (slots[i].pid == 0) continue;
+            if (now - slots[i].start_ms > limit_ms)
+                watchdog_abort(slots, jobs, &slots[i], limit_ms);
+
+            int status;
+            pid_t r = waitpid(slots[i].pid, &status, WNOHANG);
+            if (r == slots[i].pid) {
+                collect_case(&slots[i], status, &total_passed, &total_failed);
+                active--;
+                progressed = 1;
+            } else if (r < 0) {
+                fprintf(stderr, "# %s: waitpid failed: %s\n",
+                        slots[i].tc->name, strerror(errno));
+                clear_slot(&slots[i]);
+                total_failed++;
+                active--;
+                progressed = 1;
+            }
+        }
+        if (active > 0 && !progressed) {
+            struct timespec req = { 0, 10000000L };
+            nanosleep(&req, NULL);
+        }
     }
 
-    pthread_t wd;
-    pthread_create(&wd, NULL, watchdog_main, &pc);
-
-    pthread_t *threads = malloc((size_t)jobs * sizeof(pthread_t));
-    WorkerArg *wargs = malloc((size_t)jobs * sizeof(WorkerArg));
-    for (int i = 0; i < jobs; i++) {
-        wargs[i].pc = &pc;
-        wargs[i].slot = i;
-        pthread_create(&threads[i], NULL, worker_main, &wargs[i]);
-    }
-    for (int i = 0; i < jobs; i++) pthread_join(threads[i], NULL);
-
-    atomic_store_explicit(&pc.done, 1, memory_order_release);
-    pthread_join(wd, NULL);
-
-    int total_passed = atomic_load_explicit(&pc.total_passed, memory_order_relaxed);
-    int total_failed = atomic_load_explicit(&pc.total_failed, memory_order_relaxed);
     printf("1..%d\n", n);
     printf("# total: %d passed, %d failed across %d cases\n",
            total_passed, total_failed, n);
-
-    free(threads);
-    free(wargs);
-    free(pc.slots);
-    pthread_mutex_destroy(&pc.print_lock);
+    free(slots);
     return total_failed;
 }
 
@@ -287,28 +353,8 @@ int test_run_all(const char *filter, int jobs) {
     TestCaseEntry **cases = NULL;
     int n = collect_matching(filter, &cases);
 
-    if (jobs <= 1) {
-        int result = run_all_sequential(cases, n);
-        free(cases);
-        return result;
-    }
-
-    /* Partition out isolation-sensitive cases (see test_needs_isolation)
-       and run them sequentially before any pool thread can fork(). */
-    TestCaseEntry **iso = malloc((size_t)(n > 0 ? n : 1) * sizeof(*iso));
-    TestCaseEntry **rest = malloc((size_t)(n > 0 ? n : 1) * sizeof(*rest));
-    int niso = 0, nrest = 0;
-    for (int i = 0; i < n; i++) {
-        if (test_needs_isolation(cases[i]->name)) iso[niso++] = cases[i];
-        else rest[nrest++] = cases[i];
-    }
-
-    int fail = 0;
-    if (niso > 0) fail += run_all_sequential(iso, niso);
-    if (nrest > 0) fail += run_all_parallel(rest, nrest, jobs);
-
-    free(iso);
-    free(rest);
+    int result = jobs <= 1 ? run_all_sequential(cases, n)
+                           : run_all_parallel(cases, n, jobs);
     free(cases);
-    return fail;
+    return result;
 }

@@ -202,9 +202,16 @@ static int test_auto_reshard_shutdown_race_run(void) {
     long t0 = now_ms();
     kill(pid, SIGTERM);
 
+    /* HOLD_MS=2000 nominally leaves ample margin, but under CI parallelism
+       (--jobs 4, contended shared runners) real shutdown latency has been
+       observed to exceed a 10s window, causing this loop's own SIGKILL
+       fallback to fire and masquerade as the crash this test exists to
+       catch (see git history for the false-positive this produced in CI).
+       300 iterations (~30s) gives headroom well beyond HOLD_MS while still
+       failing within a bounded time if shutdown truly hangs. */
     int status = 0;
     pid_t r = 0;
-    for (int i = 0; i < 100; i++) { /* up to 10s */
+    for (int i = 0; i < 300; i++) { /* up to 30s */
         r = waitpid(pid, &status, WNOHANG);
         if (r == pid) break;
         usleep(100000);
