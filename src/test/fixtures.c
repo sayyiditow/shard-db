@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -22,55 +23,64 @@
 #include <unistd.h>
 #include "test_client.h"
 
-/* test_pick_port() below binds to port 0 to get an OS-assigned free
-   port, then closes the probe socket and hands the number back to the
-   caller, who forks a daemon that binds it moments later. Under
-   run_all_parallel (many worker threads calling this concurrently),
-   the OS can hand the same just-freed ephemeral port to a second
-   caller before the first caller's daemon has bound it for real,
-   producing a `bind: Address already in use` daemon-spawn failure.
-   Close that window with a short-TTL in-process reservation table:
-   once a port is handed out it's ineligible for reuse for
-   PORT_RESERVE_TTL_MS, comfortably longer than fork+exec+daemon-bind
-   ever takes. No caller changes needed — every test_pick_port() call
-   site (via test_env_start* or direct, e.g. test_auto_vacuum.c)
-   benefits automatically. */
+/* test_pick_port() below has an unavoidable close-to-daemon-bind window.
+   Parallel tests now run in separate processes, so reservations must be
+   visible across workers. Keep an advisory per-port lock through the same
+   five-second bind window used by the old reservation table. Locks are
+   purged on subsequent allocations rather than held to process exit, which
+   keeps the sequential coverage run from accumulating one file descriptor
+   for every daemon-backed case. */
 #define PORT_RESERVE_TTL_MS 5000
-#define PORT_RESERVE_MAX    256
+#define PORT_RESERVE_MAX    64
 
-typedef struct { int port; struct timespec ts; } PortReservation;
+typedef struct { int fd; struct timespec claimed; } PortReservation;
 static PortReservation g_port_reservations[PORT_RESERVE_MAX];
 static int g_port_reservation_count = 0;
 static pthread_mutex_t g_port_reservation_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static long port_reservation_age_ms(const struct timespec *t) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - t->tv_sec) * 1000L + (now.tv_nsec - t->tv_nsec) / 1000000L;
+static long port_reservation_age_ms(const struct timespec *claimed,
+                                    const struct timespec *now) {
+    return (now->tv_sec - claimed->tv_sec) * 1000L +
+           (now->tv_nsec - claimed->tv_nsec) / 1000000L;
 }
 
-/* Returns 1 if `port` was free and is now claimed, 0 if another
-   still-live claim holds it (caller should probe again for a
-   different port). Opportunistically purges expired entries. */
 static int try_reserve_port(int port) {
     pthread_mutex_lock(&g_port_reservation_lock);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
     int i = 0;
     while (i < g_port_reservation_count) {
-        if (port_reservation_age_ms(&g_port_reservations[i].ts) > PORT_RESERVE_TTL_MS) {
-            g_port_reservations[i] = g_port_reservations[--g_port_reservation_count];
+        if (port_reservation_age_ms(&g_port_reservations[i].claimed, &now) >
+            PORT_RESERVE_TTL_MS) {
+            close(g_port_reservations[i].fd);
+            g_port_reservations[i] =
+                g_port_reservations[--g_port_reservation_count];
             continue;
-        }
-        if (g_port_reservations[i].port == port) {
-            pthread_mutex_unlock(&g_port_reservation_lock);
-            return 0;
         }
         i++;
     }
-    if (g_port_reservation_count < PORT_RESERVE_MAX) {
-        g_port_reservations[g_port_reservation_count].port = port;
-        clock_gettime(CLOCK_MONOTONIC, &g_port_reservations[g_port_reservation_count].ts);
-        g_port_reservation_count++;
+    if (g_port_reservation_count == PORT_RESERVE_MAX) {
+        pthread_mutex_unlock(&g_port_reservation_lock);
+        return 0;
     }
+
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/shard-db-test-port-%d.lock", port);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) {
+        pthread_mutex_unlock(&g_port_reservation_lock);
+        return 0;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        pthread_mutex_unlock(&g_port_reservation_lock);
+        return 0;
+    }
+    /* Exec'd daemons must not hold a stale reservation past their parent
+       test's short bind window. */
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    g_port_reservations[g_port_reservation_count++] =
+        (PortReservation){ .fd = fd, .claimed = now };
     pthread_mutex_unlock(&g_port_reservation_lock);
     return 1;
 }

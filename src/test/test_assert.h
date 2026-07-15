@@ -18,10 +18,9 @@ typedef struct {
     int passed;
     int failed;
     const char *name;
-    FILE *out;           /* NULL = write straight to real stdout (list /
-                            run / --jobs 1); non-NULL = per-worker
-                            open_memstream buffer under parallel run-all,
-                            flushed atomically once the case completes. */
+    FILE *out;           /* NULL = write to stdout (the normal path).
+                            Kept as an optional override for focused
+                            in-process test helpers. */
 } TestCtx;
 
 extern __thread TestCtx *t_ctx;
