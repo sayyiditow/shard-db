@@ -117,36 +117,31 @@ TEST_REGISTER("test-topn-heap-under-cap", test_topn_heap_under_cap)
 
 static int test_topn_eligible_truth_table(void) {
     TestEnv env = {0};
-    if (test_env_start(&env) != 0) {
-        ASSERT_TRUE(0, "daemon spawn");
-        return 1;
-    }
-
-    TestClientCfg cfg = { .port = env.port };
-    TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { test_env_stop(&env); return 1; }
+    ShardDb *tc = test_get_process_db();
+    ASSERT_NOT_NULL(tc, "process db");
+    if (!tc) return 1;
+    snprintf(env.db_root, sizeof(env.db_root), "%s", test_get_process_db_root());
 
     /* Register the "default" tenant dir at runtime. */
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
-    free(resp);
+    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    shard_db_free_result(resp);
     resp = NULL;
 
     /* Create object with fields + immediately-declared indexes. This creates
        index.conf with the index entries at object creation time, before any
        inserts trigger btree file allocation. */
-    tc_request(tc,
+    tu_pdb_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_elig\","
         "\"splits\":8,\"max_key\":12,"
         "\"fields\":[\"name:varchar:32\",\"score:int\",\"score_unindexed:int\"],"
         "\"indexes\":[\"name\",\"score\"]}", &resp);
-    free(resp);
+    shard_db_free_result(resp);
     resp = NULL;
 
     /* Insert one record to trigger btree files. */
-    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"topn_elig\",\"key\":\"k1\",\"value\":{\"name\":\"a\",\"score\":1,\"score_unindexed\":0}}", &resp);
-    free(resp); resp = NULL;
+    tu_pdb_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"topn_elig\",\"key\":\"k1\",\"value\":{\"name\":\"a\",\"score\":1,\"score_unindexed\":0}}", &resp);
+    shard_db_free_result(resp); resp = NULL;
 
     /* AGG_COUNT enum value — from query.c enum AggFn { AGG_COUNT=0, ... } */
     const int AGG_COUNT_VAL = 0;
@@ -212,8 +207,7 @@ static int test_topn_eligible_truth_table(void) {
                                   &spec_h, 1, "name", "total", 10000, NULL);
     ASSERT_EQ_INT(r, 0, "Case H: agg on non-group_by field (Phase 1 limit) → NOT ELIGIBLE");
 
-    tc_close(tc);
-    test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "topn_elig") != 0) return 1;
     return 0;
 }
 

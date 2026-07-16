@@ -150,6 +150,18 @@ void test_init_process_db(void) {
     pthread_mutex_unlock(&instance_lock);
 }
 
+/* Opening another instance would replace thread-local g_db while leaving the
+   original instance's descriptors, mappings, and caches allocated. */
+#ifdef TEST_BUILD
+ShardDb *test_get_process_db(void) {
+    return g_db;
+}
+
+const char *test_get_process_db_root(void) {
+    return g_db ? g_db->db_root : NULL;
+}
+#endif
+
 /* Forward decl — defined below in the impl section. */
 static void db_mutexes_destroy(void);
 
