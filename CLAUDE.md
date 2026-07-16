@@ -25,13 +25,13 @@ shard-db is a high-performance database in C. Single static binary, single proce
 
 ```bash
 ./build.sh                                        # builds + runs the C test suite at the end (set SKIP_TESTS=1 to skip)
-./build/bin/shard-db-test run-all                 # all tests; each spawns its own daemon on a free port
+./build/bin/shard-db-test run-all                 # all registered C tests; transport varies by case
 ./build/bin/shard-db-test run-all --filter <substr>   # narrow the run
 ./build/bin/shard-db-test run <name>              # single case (e.g. test-or-logic)
 ./build/bin/shard-db-test list                    # list registered cases
 ```
 
-C test cases live under `src/test/cases/test_*.c` (232 cases, ~4900 assertions). Each links via `TEST_REGISTER` static-init; names mirror the case file. Each fork-execs its own daemon at a unique tmpdir+port, so they're CWD-independent and parallel-safe. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
+C test cases live under `src/test/cases/test_*.c`. Each links via `TEST_REGISTER` static-init; names mirror the case file. `run-all` uses separate worker processes by default, while `--jobs 1` runs cases sequentially in one process. Cases that exercise the server or wire response start an isolated daemon on a free port and tmpdir. Setup-only and unit cases may instead reuse the process-local `ShardDb` initialized by the runner; those cases must remove any objects they create so the sequential path stays isolated. `SKIP_TESTS=1 ./build.sh` builds without running the suite.
 
 Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`. **The user runs benches**; do not run them to validate perf.
 

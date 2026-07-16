@@ -30,7 +30,29 @@ static TestClient *cm_setup(TestEnv *env, const char *obj, const char *fields,
     tc_request(tc, co, &resp); free(resp); resp=NULL;
     return tc;
 }
-static void cm_insert_tags(TestClient *tc, const char *obj) {
+
+/* Keep the setup payload byte-identical to cm_setup(). The add-dir dispatcher
+   ignores the existing "name" key, while create-object registers the directory. */
+static ShardDb *cm_pdb_setup(TestEnv *env, const char *obj, const char *fields,
+                              const char *indexes) {
+    ShardDb *db = test_get_process_db();
+    ASSERT_NOT_NULL(db, "process db");
+    if (!db) return NULL;
+    snprintf(env->db_root, sizeof(env->db_root), "%s", test_get_process_db_root());
+    char *resp=NULL;
+    tu_pdb_request(db, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    shard_db_free_result(resp); resp=NULL;
+    char co[1024];
+    snprintf(co,sizeof(co),
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"%s\","
+        "\"splits\":8,\"max_key\":12,\"fields\":[%s],\"indexes\":[%s]}",
+        obj, fields, indexes);
+    tu_pdb_request(db, co, &resp);
+    shard_db_free_result(resp); resp=NULL;
+    return db;
+}
+
+static void cm_insert_tags(ShardDb *tc, const char *obj) {
     char body[65536]; size_t p=0; int k=0; char *resp=NULL;
     SB_APPEND(body, p, sizeof(body),"{");
     for (int i=0;i<5;i++){SB_APPEND(body, p, sizeof(body),"%s\"k%d\":{\"tag\":\"rare\"}",k==0?"":",",k);k++;}
@@ -38,12 +60,12 @@ static void cm_insert_tags(TestClient *tc, const char *obj) {
     SB_APPEND(body, p, sizeof(body),"}");
     char req[66560];
     snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\",\"records\":%s}",obj,body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 }
 
 static int test_cost_selectivity_primitive(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "cm", "\"tag:varchar:8\"", "\"tag\"");
+    ShardDb *tc = cm_pdb_setup(&env, "cm", "\"tag:varchar:8\"", "\"tag\"");
     if (!tc) return 1;
     cm_insert_tags(tc, "cm");
     size_t kr=0, kc=0;
@@ -52,7 +74,7 @@ static int test_cost_selectivity_primitive(void) {
     ASSERT_EQ_INT((int)kr, 5, "rare K=5");
     ASSERT_EQ_INT(sr, 1, "rare selective (5 <= budget 25)");
     ASSERT_EQ_INT(sc, 0, "common not selective (200 > budget 25)");
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "cm") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-cost-selectivity-primitive", test_cost_selectivity_primitive)
@@ -65,7 +87,7 @@ extern const char *plan_filter_kind_for_test(const char *db_root, const char *ob
 /* A1: 1 selective btree eq → leaf, seeded on `tag`. */
 static int test_planA1_selective_leaf(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "a1", "\"tag:varchar:8\"", "\"tag\"");
+    ShardDb *tc = cm_pdb_setup(&env, "a1", "\"tag:varchar:8\"", "\"tag\"");
     if (!tc) return 1;
     cm_insert_tags(tc, "a1");
     char f[64]={0}, o[16]={0};
@@ -73,7 +95,7 @@ static int test_planA1_selective_leaf(void) {
         "{\"tag\":\"rare\"}", NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k, "leaf", "A1 selective eq → PRIMARY_LEAF");
     ASSERT_EQ_STR(f, "tag", "A1 seeds on tag");
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "a1") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-a1-selective-leaf", test_planA1_selective_leaf)
@@ -81,7 +103,7 @@ TEST_REGISTER("test-plan-a1-selective-leaf", test_planA1_selective_leaf)
 /* A2: 1 broad bitmap (active=true, 70/100) → bitmap smaller-side, never leaf. */
 static int test_planA2_broad_bitmap(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "a2", "\"active:bool\"", "\"active:bitmap\"");
+    ShardDb *tc = cm_pdb_setup(&env, "a2", "\"active:bool\"", "\"active:bitmap\"");
     if (!tc) return 1;
     char body[16384]; size_t p=0; int k=0; char *resp=NULL;
     SB_APPEND(body, p, sizeof(body),"{");
@@ -90,12 +112,12 @@ static int test_planA2_broad_bitmap(void) {
     SB_APPEND(body, p, sizeof(body),"}");
     char req[17408];
     snprintf(req,sizeof(req),"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a2\",\"records\":%s}",body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
     char f[64]={0}, o[16]={0};
     const char *kind = plan_filter_kind_for_test(env.db_root, "default/a2",
         "{\"active\":true}", NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(kind, "bitmap", "A2 broad bitmap → BITMAP_SMALLER (not leaf)");
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "a2") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-a2-broad-bitmap", test_planA2_broad_bitmap)
@@ -103,7 +125,7 @@ TEST_REGISTER("test-plan-a2-broad-bitmap", test_planA2_broad_bitmap)
 /* A5: 1 non-indexed leaf → full scan. */
 static int test_planA5_nonindexed_scan(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "a5", "\"tag:varchar:8\",\"note:varchar:16\"", "\"tag\"");
+    ShardDb *tc = cm_pdb_setup(&env, "a5", "\"tag:varchar:8\",\"note:varchar:16\"", "\"tag\"");
     if (!tc) return 1;
     cm_insert_tags(tc, "a5"); /* note absent → empty; only tag indexed */
     char f[64]={0}, o[16]={0};
@@ -112,7 +134,7 @@ static int test_planA5_nonindexed_scan(void) {
         "[{\"field\":\"note\",\"op\":\"contains\",\"value\":\"x\"}]",
         NULL, 1, f, sizeof(f), o, sizeof(o), NULL);
     ASSERT_EQ_STR(k, "scan", "A5 non-indexed → FULL_SCAN");
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "a5") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-a5-nonindexed-scan", test_planA5_nonindexed_scan)
@@ -127,7 +149,7 @@ TEST_REGISTER("test-plan-a5-nonindexed-scan", test_planA5_nonindexed_scan)
  *                                      the other on the fetched record). */
 static int test_planB1_two_selective_btree(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "b1",
+    ShardDb *tc = cm_pdb_setup(&env, "b1",
         "\"tag:varchar:8\",\"tag2:varchar:8\"",
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
@@ -145,7 +167,7 @@ static int test_planB1_two_selective_btree(void) {
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b1\",\"records\":%s}",body);
-    tc_request(tc,req,&resp); free(resp);
+    tu_pdb_request(tc,req,&resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* count path (fetching=0): two selective indexed leaves → intersect */
@@ -163,7 +185,7 @@ static int test_planB1_two_selective_btree(void) {
         NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kf, "leaf", "B1 find: two selective → leaf (fetch+check)");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "b1") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-b1-two-selective-btree", test_planB1_two_selective_btree)
@@ -173,7 +195,7 @@ TEST_REGISTER("test-plan-b1-two-selective-btree", test_planB1_two_selective_btre
  *   The bitmap leaf is NOT the seed (bitmap deprioritized). */
 static int test_planB2_selective_btree_broad_bitmap(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "b2",
+    ShardDb *tc = cm_pdb_setup(&env, "b2",
         "\"tag:varchar:8\",\"active:bool\"",
         "\"tag\",\"active:bitmap\"");
     if (!tc) return 1;
@@ -191,7 +213,7 @@ static int test_planB2_selective_btree_broad_bitmap(void) {
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b2\",\"records\":%s}",body);
-    tc_request(tc,req,&resp); free(resp);
+    tu_pdb_request(tc,req,&resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* fetching=1: selective btree seeds, bitmap post-filters */
@@ -211,7 +233,7 @@ static int test_planB2_selective_btree_broad_bitmap(void) {
     ASSERT_EQ_STR(kc, "leaf", "B2 count: selective btree still seeds (not intersect: bitmap broad)");
     ASSERT_EQ_STR(f, "tag", "B2 count: seed is tag");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "b2") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-b2-selective-btree-broad-bitmap", test_planB2_selective_btree_broad_bitmap)
@@ -220,7 +242,7 @@ TEST_REGISTER("test-plan-b2-selective-btree-broad-bitmap", test_planB2_selective
  *   (pure-bitmap AND → popcount intersect), both fetching values. */
 static int test_planB3_two_broad_bitmaps(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "b3",
+    ShardDb *tc = cm_pdb_setup(&env, "b3",
         "\"active:bool\",\"flagged:bool\"",
         "\"active:bitmap\",\"flagged:bitmap\"");
     if (!tc) return 1;
@@ -238,7 +260,7 @@ static int test_planB3_two_broad_bitmaps(void) {
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b3\",\"records\":%s}",body);
-    tc_request(tc,req,&resp); free(resp);
+    tu_pdb_request(tc,req,&resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     const char *kf = plan_filter_kind_for_test(env.db_root,"default/b3",
@@ -254,7 +276,7 @@ static int test_planB3_two_broad_bitmaps(void) {
         NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(kc, "intersect", "B3 count: pure-bitmap AND → intersect");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "b3") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-b3-two-broad-bitmaps", test_planB3_two_broad_bitmaps)
@@ -263,7 +285,7 @@ TEST_REGISTER("test-plan-b3-two-broad-bitmaps", test_planB3_two_broad_bitmaps)
  *   → "leaf" seeded on `tag` (fetch the 5 matching tag=rare, check note on record). */
 static int test_planB4_selective_btree_nonindexed(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "b4",
+    ShardDb *tc = cm_pdb_setup(&env, "b4",
         "\"tag:varchar:8\",\"note:varchar:16\"",
         "\"tag\"");   /* note is NOT indexed */
     if (!tc) return 1;
@@ -287,7 +309,7 @@ static int test_planB4_selective_btree_nonindexed(void) {
     ASSERT_EQ_STR(kc, "leaf", "B4 count: selective btree + non-indexed → leaf");
     ASSERT_EQ_STR(f, "tag", "B4 count: seed is tag");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "b4") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-b4-selective-btree-nonindexed", test_planB4_selective_btree_nonindexed)
@@ -297,17 +319,17 @@ TEST_REGISTER("test-plan-b4-selective-btree-nonindexed", test_planB4_selective_b
 static int test_planB7_all_nonindexed(void) {
     TestEnv env={0};
     /* bio and about: NO indexes at all (empty index list) */
-    TestClient *tc = cm_setup(&env, "b7",
+    ShardDb *tc = cm_pdb_setup(&env, "b7",
         "\"bio:varchar:16\",\"about:varchar:16\"",
         "");   /* intentionally no indexes */
     if (!tc) return 1;
     /* Insert a few rows so N>0 */
     char *resp=NULL;
-    tc_request(tc,
+    tu_pdb_request(tc,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"b7\","
         "\"records\":{\"k0\":{\"bio\":\"hello\",\"about\":\"world\"},"
                       "\"k1\":{\"bio\":\"foo\",\"about\":\"bar\"}}}",
-        &resp); free(resp);
+        &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     const char *k = plan_filter_kind_for_test(env.db_root,"default/b7",
@@ -316,7 +338,7 @@ static int test_planB7_all_nonindexed(void) {
         NULL, 1, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k, "scan", "B7: both non-indexed → full scan");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "b7") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-b7-all-nonindexed", test_planB7_all_nonindexed)
@@ -333,7 +355,7 @@ TEST_REGISTER("test-plan-b7-all-nonindexed", test_planB7_all_nonindexed)
 static int test_planA4_saturated_trigram_stays_leaf(void) {
     TestEnv env={0};
     /* trigram index on title field */
-    TestClient *tc = cm_setup(&env, "a4tg",
+    ShardDb *tc = cm_pdb_setup(&env, "a4tg",
         "\"title:varchar:32\"",
         "\"title:trigram\"");
     if (!tc) return 1;
@@ -356,7 +378,7 @@ static int test_planA4_saturated_trigram_stays_leaf(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"a4tg\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* Pattern "abc" → IT_TRIGRAM, saturated. Must be "leaf", never "scan". */
@@ -374,7 +396,7 @@ static int test_planA4_saturated_trigram_stays_leaf(void) {
     ASSERT_EQ_STR(k_count, "leaf",
         "A4 count: saturated trigram-contains stays leaf");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "a4tg") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-a4-saturated-trigram-stays-leaf",
@@ -389,7 +411,7 @@ TEST_REGISTER("test-plan-a4-saturated-trigram-stays-leaf",
  *   falls to single-seed block → prim_sel=true → FP_PRIMARY_LEAF. */
 static int test_planBCS_count_one_selective_leaf(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "bcs",
+    ShardDb *tc = cm_pdb_setup(&env, "bcs",
         "\"tag:varchar:8\",\"tag2:varchar:8\"",
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
@@ -413,7 +435,7 @@ static int test_planBCS_count_one_selective_leaf(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bcs\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* fetching=0, n_indexed=2, n_selective=1 → must fall through to leaf. */
@@ -426,7 +448,7 @@ static int test_planBCS_count_one_selective_leaf(void) {
     ASSERT_EQ_STR(f, "tag",
         "BCS count: seed is the selective field `tag`");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "bcs") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-bcs-count-one-selective-leaf",
@@ -447,7 +469,7 @@ TEST_REGISTER("test-plan-bcs-count-one-selective-leaf",
  * node → FP_UNION. */
 static int test_planC1_pure_or_all_indexed(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "c1",
+    ShardDb *tc = cm_pdb_setup(&env, "c1",
         "\"tag:varchar:8\",\"tag2:varchar:8\"",
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
@@ -466,7 +488,7 @@ static int test_planC1_pure_or_all_indexed(void) {
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c1\",\"records\":%s}",body);
-    tc_request(tc,req,&resp); free(resp);
+    tu_pdb_request(tc,req,&resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* Pure OR array form: [{"or":[{tag=rare},{tag2=rare}]}] */
@@ -484,7 +506,7 @@ static int test_planC1_pure_or_all_indexed(void) {
         NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "union", "C1 count: pure OR all-indexed → FP_UNION");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "c1") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-c1-pure-or-all-indexed", test_planC1_pure_or_all_indexed)
@@ -493,7 +515,7 @@ TEST_REGISTER("test-plan-c1-pure-or-all-indexed", test_planC1_pure_or_all_indexe
  * note is not indexed → find_fully_indexed_or returns NULL → FP_FULL_SCAN. */
 static int test_planC2_or_with_nonindexed_child(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "c2",
+    ShardDb *tc = cm_pdb_setup(&env, "c2",
         "\"tag:varchar:8\",\"note:varchar:16\"",
         "\"tag\"");   /* note is NOT indexed */
     if (!tc) return 1;
@@ -515,7 +537,7 @@ static int test_planC2_or_with_nonindexed_child(void) {
         NULL, 0, f,sizeof(f), o,sizeof(o), NULL);
     ASSERT_EQ_STR(k_count, "scan", "C2 count: OR with non-indexed child → FULL_SCAN");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "c2") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-c2-or-with-nonindexed-child", test_planC2_or_with_nonindexed_child)
@@ -526,7 +548,7 @@ TEST_REGISTER("test-plan-c2-or-with-nonindexed-child", test_planC2_or_with_nonin
  * The OR sub-tree becomes a per-record post-filter (has_subtree=1 internally). */
 static int test_planC3_and_leaf_plus_or_subtree(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "c3",
+    ShardDb *tc = cm_pdb_setup(&env, "c3",
         "\"tag:varchar:8\",\"tag2:varchar:8\"",
         "\"tag\",\"tag2\"");
     if (!tc) return 1;
@@ -544,7 +566,7 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
     char req[66560];
     snprintf(req,sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"c3\",\"records\":%s}",body);
-    tc_request(tc,req,&resp); free(resp);
+    tu_pdb_request(tc,req,&resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[16]={0};
     /* AND + OR sub-tree: [{tag=rare}, {"or":[{tag2=a},{tag2=b}]}]
@@ -568,7 +590,7 @@ static int test_planC3_and_leaf_plus_or_subtree(void) {
     ASSERT_EQ_STR(k_count, "leaf", "C3 count: AND+OR sub-tree → PRIMARY_LEAF");
     ASSERT_EQ_STR(f, "tag", "C3 count: seed is tag");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "c3") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-c3-and-leaf-plus-or-subtree", test_planC3_and_leaf_plus_or_subtree)
@@ -587,7 +609,7 @@ TEST_REGISTER("test-plan-c3-and-leaf-plus-or-subtree", test_planC3_and_leaf_plus
 static int test_planD1_composite_order(void) {
     TestEnv env={0};
     /* Two fields; composite index "by+time" stays btree. */
-    TestClient *tc = cm_setup(&env, "d1",
+    ShardDb *tc = cm_pdb_setup(&env, "d1",
         "\"by:varchar:16\",\"time:long\"",
         "\"by\",\"by+time\"");
     if (!tc) return 1;
@@ -610,7 +632,7 @@ static int test_planD1_composite_order(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d1\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[32]={0};
     int tc_val = -1;
@@ -621,7 +643,7 @@ static int test_planD1_composite_order(void) {
     ASSERT_EQ_STR(o, "composite", "D1: by+time composite → FP_ORDER_COMPOSITE");
     ASSERT_EQ_INT(tc_val, 1, "D1: total_cheap=1 (KeySet materialized)");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "d1") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-d1-composite-order", test_planD1_composite_order)
@@ -631,7 +653,7 @@ TEST_REGISTER("test-plan-d1-composite-order", test_planD1_composite_order)
 static int test_planD2_sort_order(void) {
     TestEnv env={0};
     /* Only "by" indexed; no composite; time is not indexed. */
-    TestClient *tc = cm_setup(&env, "d2",
+    ShardDb *tc = cm_pdb_setup(&env, "d2",
         "\"by:varchar:16\",\"time:long\"",
         "\"by\"");
     if (!tc) return 1;
@@ -653,7 +675,7 @@ static int test_planD2_sort_order(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d2\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[32]={0};
     int tc_val = -1;
@@ -664,7 +686,7 @@ static int test_planD2_sort_order(void) {
     ASSERT_EQ_STR(o, "sort", "D2: bounded K=5, no composite → FP_ORDER_SORT");
     ASSERT_EQ_INT(tc_val, 1, "D2: total_cheap=1 (KeySet materialized)");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "d2") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-d2-sort-order", test_planD2_sort_order)
@@ -675,7 +697,7 @@ TEST_REGISTER("test-plan-d2-sort-order", test_planD2_sort_order)
 static int test_planD3_walk_order(void) {
     TestEnv env={0};
     /* Only "by" indexed; no composite. */
-    TestClient *tc = cm_setup(&env, "d3",
+    ShardDb *tc = cm_pdb_setup(&env, "d3",
         "\"by:varchar:16\",\"time:long\"",
         "\"by\"");
     if (!tc) return 1;
@@ -698,7 +720,7 @@ static int test_planD3_walk_order(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp);
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp);
 
     char f[64]={0}, o[32]={0};
     int tc_val = -1;
@@ -729,12 +751,12 @@ static int test_planD3_walk_order(void) {
 
     /* Re-insert into a fresh object d3b with two indexed fields, both broad. */
     char *resp2=NULL;
-    tc_request(tc,
+    tu_pdb_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"d3b\","
         "\"splits\":8,\"max_key\":12,"
         "\"fields\":[\"by:varchar:16\",\"cat:varchar:8\"],"
         "\"indexes\":[\"by\",\"cat\"]}",
-        &resp2); free(resp2); resp2=NULL;
+        &resp2); shard_db_free_result(resp2); resp2=NULL;
 
     /* 200 rows by="bob"/cat="x" → both broad (200 > budget 25). N=200. */
     char body2[65536]; size_t p2=0; int k2=0;
@@ -750,7 +772,7 @@ static int test_planD3_walk_order(void) {
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3b\","
         "\"records\":%s}", body2);
     char *resp3=NULL;
-    tc_request(tc, req2, &resp3); free(resp3);
+    tu_pdb_request(tc, req2, &resp3); shard_db_free_result(resp3);
 
     /* fetching=1 (find), both broad indexed → FP_INTERSECT (n_selective=0 path).
      * source_leaves[0] = "by"="bob" → broad → saturated → FP_ORDER_INDEX_WALK.
@@ -779,7 +801,8 @@ static int test_planD3_walk_order(void) {
     ASSERT_EQ_STR(f, "by",
         "D3 count: seed is most-selective indexed leaf");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "d3") != 0) return 1;
+    if (tu_pdb_drop_object(tc, "default", "d3b") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-d3-walk-order", test_planD3_walk_order)
@@ -787,7 +810,7 @@ TEST_REGISTER("test-plan-d3-walk-order", test_planD3_walk_order)
 /* total_cheap: A1 (selective leaf, no order_by) → 1; A5 (scan) → 0. */
 static int test_plan_total_cheap(void) {
     TestEnv env={0};
-    TestClient *tc = cm_setup(&env, "tc_obj",
+    ShardDb *tc = cm_pdb_setup(&env, "tc_obj",
         "\"tag:varchar:8\",\"note:varchar:16\"",
         "\"tag\"");
     if (!tc) return 1;
@@ -812,7 +835,7 @@ static int test_plan_total_cheap(void) {
     ASSERT_EQ_STR(k5, "scan", "total_cheap A5: kind=scan");
     ASSERT_EQ_INT(cheap, 0, "total_cheap A5: total_cheap=0 (no KeySet)");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "tc_obj") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-total-cheap", test_plan_total_cheap)
@@ -838,23 +861,22 @@ TEST_REGISTER("test-plan-total-cheap", test_plan_total_cheap)
  */
 static int test_planD3_single_leaf_indexed_order(void) {
     TestEnv env={0};
-    if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
-    TestClientCfg cfg = { .port = env.port };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) { test_env_stop(&env); return 1; }
+    ShardDb *tc = test_get_process_db();
+    if (!tc) { ASSERT_TRUE(0, "process db"); return 1; }
+    snprintf(env.db_root, sizeof(env.db_root), "%s", test_get_process_db_root());
 
     char *resp = NULL;
     /* add-dir */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
-    free(resp); resp = NULL;
+    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    shard_db_free_result(resp); resp = NULL;
 
     /* create object: score + time indexed, note NOT indexed */
-    tc_request(tc,
+    tu_pdb_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"d3sl\","
         "\"splits\":8,\"max_key\":12,"
         "\"fields\":[\"score:int\",\"time:long\",\"note:varchar:32\"],"
         "\"indexes\":[\"score\",\"time\"]}",
-        &resp); free(resp); resp = NULL;
+        &resp); shard_db_free_result(resp); resp = NULL;
 
     /* insert 250 rows: score=100, time=i, note="x" */
     char body[65536]; size_t bp = 0; int ki = 0;
@@ -870,7 +892,7 @@ static int test_planD3_single_leaf_indexed_order(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"d3sl\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp); resp = NULL;
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp); resp = NULL;
 
     char f[64]={0}, o[32]={0};
     int cheap = -1;
@@ -897,7 +919,7 @@ static int test_planD3_single_leaf_indexed_order(void) {
     ASSERT_EQ_STR(k_b, "scan",
         "D3 single-leaf dual: unindexed order_by → B5 demotion still fires → FULL_SCAN");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "d3sl") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-d3-single-leaf-indexed-order", test_planD3_single_leaf_indexed_order)
@@ -915,7 +937,7 @@ TEST_REGISTER("test-plan-d3-single-leaf-indexed-order", test_planD3_single_leaf_
 static int test_planA3_trigram_starts_with(void) {
     TestEnv env = {0};
     /* trigram-only index on title: no btree */
-    TestClient *tc = cm_setup(&env, "cm_a3",
+    ShardDb *tc = cm_pdb_setup(&env, "cm_a3",
         "\"title:varchar:64\"",
         "\"title:trigram\"");
     if (!tc) return 1;
@@ -939,7 +961,7 @@ static int test_planA3_trigram_starts_with(void) {
     snprintf(req, sizeof(req),
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"cm_a3\","
         "\"records\":%s}", body);
-    tc_request(tc, req, &resp); free(resp); resp = NULL;
+    tu_pdb_request(tc, req, &resp); shard_db_free_result(resp); resp = NULL;
 
     char f[64] = {0}, o[16] = {0};
     /* Prefix "Show HN" is 7 chars >= 3 → trigram eligible.
@@ -968,7 +990,7 @@ static int test_planA3_trigram_starts_with(void) {
     ASSERT_EQ_STR(kind_short, "scan",
         "A3 short: prefix <3 chars → no usable trigram → FULL_SCAN");
 
-    tc_close(tc); test_env_stop(&env);
+    if (tu_pdb_drop_object(tc, "default", "cm_a3") != 0) return 1;
     return 0;
 }
 TEST_REGISTER("test-plan-a3-trigram-starts-with", test_planA3_trigram_starts_with)

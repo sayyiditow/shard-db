@@ -545,3 +545,24 @@ int tu_parse_count(const char *resp) {
     }
     return atoi(resp);
 }
+
+int tu_pdb_request(ShardDb *db, const char *json, char **out_response) {
+    size_t out_len = 0;
+    return shard_db_query(db, json, out_response, &out_len);
+}
+
+/* A process-local database outlives individual sequential runner invocations,
+   so object state needs explicit teardown. Dispatch failures are reported in
+   the JSON body even when shard_db_query() itself returns success. */
+int tu_pdb_drop_object(ShardDb *db, const char *dir, const char *object) {
+    char req[512];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"drop-object\",\"dir\":\"%s\",\"object\":\"%s\","
+        "\"if_exists\":true}", dir, object);
+    char *resp = NULL;
+    size_t out_len = 0;
+    int rc = shard_db_query(db, req, &resp, &out_len);
+    int failed = (rc != 0) || !resp || strstr(resp, "\"error\"") != NULL;
+    shard_db_free_result(resp);
+    return failed ? 1 : 0;
+}

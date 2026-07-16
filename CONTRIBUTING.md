@@ -154,7 +154,7 @@ These won't be accepted as PRs (we've thought about them and they're not on the 
 - **Windows native build.** The `epoll` + `mmap` model is deliberate. Containers cover the cross-platform case.
 - **SQL parser / surface.** The JSON wire protocol is the language. SQL bolted on top would double the surface area without adding capability.
 - **Multi-master / strongly-consistent replication.** Beyond scope. Use a database that targets that workload if you need it.
-- **In-process / embedded mode.** Always a server, always TCP. Simpler mental model, simpler auth story.
+- **Multiple embedded instances per process.** [Embedded mode](docs/getting-started/embedded-mode.md) supports one `ShardDb` instance per process. Lifting that V1 constraint would require isolating the engine's remaining process-global state.
 - **New `MAX_*` ceilings.** `MAX_SPLITS=4096`, `MAX_FIELDS=256`, `MAX_KEY_CEILING=1024` are deliberate. If you have a workload that needs more, open an issue describing it before sending a PR.
 
 ## Security issues

@@ -1,11 +1,12 @@
 /* src/test/fixtures.h
  *
- * Per-test daemon lifecycle. Each test gets its own DB_ROOT and PORT,
- * forks the daemon as a child process, and reaps it on cleanup.
+ * Shared lifecycle and query helpers for daemon-backed and process-local
+ * test cases.
  */
 #ifndef TEST_FIXTURES_H
 #define TEST_FIXTURES_H
 #include <sys/types.h>
+#include "../db/shard_db.h"
 
 typedef struct {
     char db_root[256];      /* /tmp/shard-db-test-<pid>-<n>/db */
@@ -58,5 +59,9 @@ char *tu_capture_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
 char *tu_read_file(const char *path);
 int   tu_file_exists(const char *path);
 int   tu_parse_count(const char *resp);
+ShardDb *test_get_process_db(void);
+const char *test_get_process_db_root(void);
+int   tu_pdb_request(ShardDb *db, const char *json, char **out_response);
+int   tu_pdb_drop_object(ShardDb *db, const char *dir, const char *object);
 
 #endif
