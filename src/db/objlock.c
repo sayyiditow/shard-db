@@ -4,8 +4,10 @@
    Coordinates normal writes (shared) vs. rebuild (exclusive).
    - Writers (insert/delete/update/bulk/add-index/truncate): rdlock
    - Rebuild (vacuum/add-field): wrlock — blocks all writers for the duration
-   - Reads (get/find/search/range): do NOT take this lock (MAP_PRIVATE
-     gives snapshot isolation)
+   - Reads (get/find/search/range): do NOT take this lock (MAP_SHARED
+     gives a live view; the read-side retry loop validates hash+key after
+     the fact and retries on a concurrent move, so no lock is needed for
+     correctness)
 
    Entries live for process lifetime — no eviction needed. Objects are
    created rarely and the pthread_rwlock_t memory is tiny. Safe to reuse
