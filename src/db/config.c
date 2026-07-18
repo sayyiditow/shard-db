@@ -464,6 +464,14 @@ int load_db_root(char *out, size_t outlen) {
                do not add to configuration.md. */
             int n = atoi(p + 21);
             if (n >= 0 && g_db) g_warmup_test_delay_ms = n;
+        } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
+            /* Test-only knob (widens dispatch_json_query's schema-mode
+               objlock_wrlock-held window and publishes a synchronous marker
+               for the NQL-vs-JSON lock-contention regression test). Not a
+               documented production setting — do not add to
+               configuration.md. */
+            int n = atoi(p + 28);
+            if (n >= 0 && g_db) g_schema_wrlock_test_delay_ms = n;
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
                 const char *v = p + 7;

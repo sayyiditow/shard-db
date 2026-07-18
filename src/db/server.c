@@ -618,8 +618,12 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
     char db_root[PATH_MAX];
     snprintf(db_root, sizeof db_root, "%s/%s", raw_db_root, cmd.dir);
 
-    objlock_rdlock(db_root, cmd.obj);
-
+    /* No objlock here: every NqlMode (NQL_FIND/NQL_COUNT/NQL_AGGREGATE) is a
+       read, and reads take no per-object lock — matches dispatch_json_query's
+       mode_is_write/mode_is_schema gating. The JSON and NQL forms converge on
+       the same cmd_count_with_tree/cmd_find_do/cmd_aggregate_do read cores.
+       If NQL ever grows a write mode, that mode's case must take and release
+       the appropriate lock — see mode_is_write/mode_is_schema for JSON. */
     switch (cmd.mode) {
     case NQL_COUNT:
         if (cmd.explain)
@@ -668,7 +672,6 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
         break;
     }
 
-    objlock_rdunlock(db_root, cmd.obj);
     nql_free_command(&cmd);
 }
 
@@ -1396,6 +1399,24 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     int took_rdlock = !took_wrlock && mode_is_write(mode);
     if (took_wrlock) objlock_wrlock(db_root, object);
     else if (took_rdlock) objlock_rdlock(db_root, object);
+    if (took_wrlock && g_db && g_schema_wrlock_test_delay_ms > 0) {
+        /* Synchronous marker: unlike LOG_INFO (written by the async log
+           thread), its presence proves the test delay has started and has
+           not yet ended. The test also checks it remains present after the
+           concurrent NQL response, eliminating a late-observation false pass. */
+        char marker_path[PATH_MAX];
+        snprintf(marker_path, sizeof marker_path,
+                 "%s/.schema-wrlock-test-delay-%s.active", db_root, object);
+        FILE *marker = fopen(marker_path, "w");
+        if (marker) {
+            fprintf(marker, "mode=%s object=%s\n", mode, object);
+            fclose(marker);
+        }
+        struct timespec delay_ts = { g_schema_wrlock_test_delay_ms / 1000,
+                                      (long)(g_schema_wrlock_test_delay_ms % 1000) * 1000000L };
+        nanosleep(&delay_ts, NULL);
+        unlink(marker_path);
+    }
 
     if (strcmp(mode, "get") == 0) {
         char *key = json_obj_strdup(&req, "key");
