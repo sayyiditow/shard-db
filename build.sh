@@ -218,6 +218,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_auto_reshard.c \
     src/test/cases/test_auto_reshard_shutdown_race.c \
     src/test/cases/test_warmup_vacuum_race.c \
+    src/test/cases/test_nql_no_objlock_contention.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
     src/test/cases/test_index_splits_curve.c \
