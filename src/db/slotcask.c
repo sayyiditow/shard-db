@@ -2917,7 +2917,7 @@ void slotcask_close(SlotcaskDb *db) {
    (off by an in-flight insert) which is fine for sizing decisions.
 
    Cost at splits=4096: 4096 × pread(24B) ≈ 1-3ms cold, sub-ms warm.
-   Returns 0 on success. */
+   Returns 0 on success, -1 if any shard header cannot be read or validated. */
 int slotcask_sum_kf_totals(SlotcaskDb *db,
                            uint64_t *out_total, uint64_t *out_deleted) {
     if (out_total) *out_total = 0;
@@ -2941,12 +2941,12 @@ int slotcask_sum_kf_totals(SlotcaskDb *db,
            warmup_object_via_caches in server.c.  Warm-cache cost here
            is ~50 µs per shard. */
         int fd = open(kf_path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) return -1;
         SlotcaskKfHeader hdr;
         ssize_t n = pread(fd, &hdr, sizeof(hdr), 0);
         close(fd);
-        if (n != (ssize_t)sizeof(hdr)) continue;
-        if (hdr.magic != SLOTCASK_KF_MAGIC) continue;
+        if (n != (ssize_t)sizeof(hdr)) return -1;
+        if (hdr.magic != SLOTCASK_KF_MAGIC) return -1;
         total   += hdr.total;
         deleted += hdr.deleted;
     }

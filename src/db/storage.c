@@ -306,7 +306,14 @@ static int resolve_counts_with_schema(const char *db_root, const char *object,
         *out_live = 0; *out_deleted = 0; return -1;
     }
     uint64_t total = 0, deleted = 0;
-    slotcask_sum_kf_totals(sdb, &total, &deleted);
+    if (slotcask_sum_kf_totals(sdb, &total, &deleted) != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+            "resolve_counts %s/%s: failed to read kf totals",
+            eff_root, bare_obj);
+        *out_live = 0;
+        *out_deleted = 0;
+        return -1;
+    }
     *out_live    = total > deleted ? total - deleted : 0;
     *out_deleted = deleted;
     return 0;
