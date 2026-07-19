@@ -219,10 +219,10 @@ static int remove_non_authoritative_dir(const char *path) {
 
 static int copy_regular_file_atomic(const char *src, const char *dst,
                                     const char *tmp) {
-    struct stat st;
-    if (lstat(src, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
-    int in = open(src, O_RDONLY);
+    int in = open(src, O_RDONLY | O_NOFOLLOW);
     if (in < 0) return -1;
+    struct stat st;
+    if (fstat(in, &st) != 0 || !S_ISREG(st.st_mode)) { close(in); return -1; }
     int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
     if (out < 0) { close(in); return -1; }
     char buf[16384];
@@ -276,11 +276,19 @@ static int valid_old_splits(int n) {
 static int parse_meta(RebuildTxn *txn) {
     char path[PATH_MAX];
     if (path_join2(path, sizeof(path), txn->active, "meta") != 0) return -1;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
     struct stat st;
-    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        st.st_size > 1024) return -1;
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > 1024) {
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return -1;
+    }
     int seen_version = 0, seen_splits = 0, seen_streams = 0, seen_indexes = 0;
     int version = 0, splits = 0, streams = 0, indexes = -1;
     int bad = 0;

@@ -308,7 +308,7 @@ static int test_txn_crash_phase(const char *phase, const char *object) {
     }
     ASSERT_EQ_INT(marker_rc, 0,
                   "rebuild reaches deterministic pause");
-    if (access(marker, F_OK) == 0) {
+    if (marker_rc == 0) {
         test_env_kill(&env);
         unlink(marker);
     }
@@ -408,9 +408,10 @@ static int test_edit_crash_after_metadata(void) {
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
              "%s/default/txnedit/.rebuild-test-after-metadata.active", root);
-    ASSERT_EQ_INT(wait_for_path(marker, 5000), 0,
+    int marker_rc = wait_for_path(marker, 5000);
+    ASSERT_EQ_INT(marker_rc, 0,
                   "edit rebuild reaches metadata pause");
-    if (access(marker, F_OK) == 0) {
+    if (marker_rc == 0) {
         test_env_kill(&env);
         unlink(marker);
     }

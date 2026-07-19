@@ -14,6 +14,7 @@
 #include "fixtures.h"
 #include "types.h"
 
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,10 +208,18 @@ static int test_vacuum_recount_object_not_open_run(void) {
     snprintf(kf_path, sizeof(kf_path),
              "%s/default/maint_not_open/data/kf/000.kf", saved_db_root);
 
+    int kf_fd = open(kf_path, O_RDONLY);
+    ASSERT_TRUE(kf_fd >= 0, "open kf shard fd before open-failure injection");
+    if (kf_fd < 0) {
+        tc_close(tc);
+        test_env_stop(&env);
+        return 1;
+    }
     struct stat kf_st;
-    int stat_rc = stat(kf_path, &kf_st);
-    ASSERT_EQ_INT(stat_rc, 0, "stat kf shard before open-failure injection");
-    if (stat_rc != 0) {
+    int fstat_rc = fstat(kf_fd, &kf_st);
+    ASSERT_EQ_INT(fstat_rc, 0, "fstat kf shard fd before open-failure injection");
+    if (fstat_rc != 0) {
+        close(kf_fd);
         tc_close(tc);
         test_env_stop(&env);
         return 1;
@@ -224,7 +233,7 @@ static int test_vacuum_recount_object_not_open_run(void) {
     int chmod_changed = 0;
     int restarted = 0;
     TestClient *tc2 = NULL;
-    int chmod_rc = chmod(kf_path, 0);
+    int chmod_rc = fchmod(kf_fd, 0);
     ASSERT_EQ_INT(chmod_rc, 0, "revoke kf shard permissions");
     if (chmod_rc != 0) goto cleanup;
     chmod_changed = 1;
@@ -265,9 +274,10 @@ cleanup:
     free(resp);
     if (tc2) tc_close(tc2);
     if (chmod_changed) {
-        ASSERT_EQ_INT(chmod(kf_path, original_mode), 0,
+        ASSERT_EQ_INT(fchmod(kf_fd, original_mode), 0,
                       "restore kf shard permissions");
     }
+    close(kf_fd);
     if (restarted) {
         test_env_stop(&env);
     } else if (test_env_start_at(&env, saved_db_root, saved_port) == 0) {
@@ -337,17 +347,25 @@ static int test_recount_kf_header_read_failure_run(void) {
     char kf_path[PATH_MAX];
     snprintf(kf_path, sizeof(kf_path),
              "%s/default/recount_read_fail/data/kf/000.kf", env.db_root);
+    int kf_fd = open(kf_path, O_RDONLY);
+    ASSERT_TRUE(kf_fd >= 0, "open kf shard fd before recount read failure");
+    if (kf_fd < 0) {
+        tc_close(tc);
+        test_env_stop(&env);
+        return 1;
+    }
     struct stat kf_st;
-    int stat_rc = stat(kf_path, &kf_st);
-    ASSERT_EQ_INT(stat_rc, 0, "stat kf shard before recount read failure");
-    if (stat_rc != 0) {
+    int fstat_rc = fstat(kf_fd, &kf_st);
+    ASSERT_EQ_INT(fstat_rc, 0, "fstat kf shard before recount read failure");
+    if (fstat_rc != 0) {
+        close(kf_fd);
         tc_close(tc);
         test_env_stop(&env);
         return 1;
     }
     mode_t original_mode = kf_st.st_mode & 07777;
 
-    int chmod_rc = chmod(kf_path, 0);
+    int chmod_rc = fchmod(kf_fd, 0);
     ASSERT_EQ_INT(chmod_rc, 0, "revoke kf shard permissions while cached");
     if (chmod_rc == 0) {
         if (request_response(tc,
@@ -360,10 +378,11 @@ static int test_recount_kf_header_read_failure_run(void) {
                         "failed recount does not publish a partial count");
         }
         free(resp); resp = NULL;
-        ASSERT_EQ_INT(chmod(kf_path, original_mode), 0,
+        ASSERT_EQ_INT(fchmod(kf_fd, original_mode), 0,
                       "restore cached object's kf shard permissions");
     }
 
+    close(kf_fd);
     free(resp);
     tc_close(tc);
     test_env_stop(&env);
