@@ -2,14 +2,12 @@
 
 Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
 
-@docs/CORE-PROCESS.md
+@CORE-PROCESS.md
 
 ## Standing exceptions for this repo
 
 - **Execution mode:** leave work **uncommitted** after plan execution — Sonnet reviews the raw `git diff` first; nothing is committed until that review pass is done.
-- **Execution model:** plan execution is handled by models outside the Claude family (e.g. Gemini, GPT) on a fresh branch off `main` — do NOT spawn a Haiku subagent for this step. The plan file is handed to the user, who runs the executing model separately.
 - **Build/test commands for plans:** build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`.
-- **Co-author line(s):** follow CORE-PROCESS.md's generic convention — one `Co-Authored-By:` line per model that materially contributed, using that model's actual current name/version (never a hardcoded or stale one). The common case here is a Claude model planning/reviewing while an external model (Gemini, GPT, ...) executes on its own branch, giving two lines. When the same Claude model both plans and executes a fix directly (no external model involved — e.g. a small, agent-driven bug fix rather than a handed-off plan), that commit gets a single line for that model. Confirm the executing model's identity with the human before writing its line — never guess it.
 
 ## Deployment (Netcup) — ship artifacts, never git
 

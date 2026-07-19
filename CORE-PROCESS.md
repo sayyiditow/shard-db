@@ -1,19 +1,20 @@
 <!--
   GENERATED FILE — do not hand-edit.
-  Source: https://github.com/sayyiditow/dev-standards/blob/37290da/CORE-PROCESS.md
-  Synced: 2026-07-14
+  Source: https://github.com/sayyiditow/dev-standards/blob/6901018/CORE-PROCESS.md
+  Synced: 2026-07-19
   To update: edit CORE-PROCESS.md in dev-standards, then re-run sync.sh against this repo.
 -->
 
 # Core Development Process
 
 Reusable process rules for all projects. This file is synced verbatim into
-each project as `docs/CORE-PROCESS.md` by `sync.sh` in this repo — do not
-hand-edit the copy in a project repo; edit this file and re-run the sync.
+each project as `CORE-PROCESS.md` at the project root by `sync.sh` in this
+repo — do not hand-edit the copy in a project repo; edit this file and
+re-run the sync.
 
 Project-specific content (build commands, architecture, domain docs, and
 this repo's chosen execution mode) lives in that project's own `CLAUDE.md`,
-below the `@docs/CORE-PROCESS.md` import line.
+below the `@CORE-PROCESS.md` import line.
 
 ## Git safety
 
@@ -90,7 +91,15 @@ plan.
 2. **Approve.** The human approves, requests changes, or rejects. No
    execution starts without an explicit go-ahead.
 
-3. **Execute.** The plan is carried out literally, task by task, on a
+3. **Execute.** Planner and executor are whichever model the human
+   designates for that task, per task — not fixed to a particular model
+   or family, and not inherited from precedent set by an earlier task in
+   the same session. If the human asks the current agent to execute a
+   plan directly, it executes it; if the human instead hands the plan to
+   a separately-run model, the current agent does not execute it. Don't
+   assume a default — if it's unclear who is executing a given plan, ask.
+
+   The plan is carried out literally, task by task, on a
    fresh branch, per this repo's execution mode (declared in the
    project's own `CLAUDE.md` — see "Standing exceptions" below: either
    left uncommitted for review, or committed locally per task). Never
@@ -183,7 +192,10 @@ one `Co-Authored-By:` line each:
 
 Only one line when the same model both planned and executed. Never guess
 the executing model's identity or version — use whatever the human
-confirms was actually run.
+confirms was actually run. Don't infer who planned, executed, or is
+authoring the commit message from habit or precedent set by an earlier
+task in the same session — the human tells you who filled each role for
+*this* task, and the line(s) reflect that, not a carried-over default.
 
 ## Definition of done (before handing back for review)
 
