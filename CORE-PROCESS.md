@@ -1,6 +1,6 @@
 <!--
   GENERATED FILE — do not hand-edit.
-  Source: https://github.com/sayyiditow/dev-standards/blob/6901018/CORE-PROCESS.md
+  Source: https://github.com/sayyiditow/dev-standards/blob/95827fc/CORE-PROCESS.md
   Synced: 2026-07-19
   To update: edit CORE-PROCESS.md in dev-standards, then re-run sync.sh against this repo.
 -->
@@ -13,7 +13,7 @@ repo — do not hand-edit the copy in a project repo; edit this file and
 re-run the sync.
 
 Project-specific content (build commands, architecture, domain docs, and
-this repo's chosen execution mode) lives in that project's own `CLAUDE.md`,
+this repo's chosen execution mode) lives in that project's own `AGENTS.md`,
 below the `@CORE-PROCESS.md` import line.
 
 ## Git safety
@@ -101,7 +101,7 @@ plan.
 
    The plan is carried out literally, task by task, on a
    fresh branch, per this repo's execution mode (declared in the
-   project's own `CLAUDE.md` — see "Standing exceptions" below: either
+   project's own `AGENTS.md` — see "Standing exceptions" below: either
    left uncommitted for review, or committed locally per task). Never
    claim a step passed without pasting the real command output. Never
    weaken a test — loosen an assertion, delete a case, mark it
@@ -227,7 +227,7 @@ task in the same session — the human tells you who filled each role for
 ## Standing exceptions
 
 None by default beyond declaring this repo's execution mode (see step 3
-above). Project-specific `CLAUDE.md` content may add further exceptions
+above). Project-specific `AGENTS.md` content may add further exceptions
 (e.g. "deploys via artifact copy, never `git pull` on the server") below
 the import — those are additive, not overrides of the git-safety rules
 above.
