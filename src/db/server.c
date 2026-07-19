@@ -1024,10 +1024,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
         int uc_used = 0, uc_total = 0; size_t uc_bytes = 0;
         int bc_used = 0, bc_total = 0; size_t bc_bytes = 0;
-        ucache_stats(&uc_used, &uc_total, &uc_bytes);
         bt_cache_stats(&bc_used, &bc_total, &bc_bytes);
-        uint64_t u_hits   = __atomic_load_n(&g_ucache_hits,    __ATOMIC_RELAXED);
-        uint64_t u_miss   = __atomic_load_n(&g_ucache_misses,  __ATOMIC_RELAXED);
+        uint64_t u_hits   = 0;
+        uint64_t u_miss   = 0;
         uint64_t b_hits   = __atomic_load_n(&g_bt_cache_hits,  __ATOMIC_RELAXED);
         uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
         uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
@@ -1097,10 +1096,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     if (mode && strcmp(mode, "stats-prom") == 0) {
         int uc_used = 0, uc_total = 0; size_t uc_bytes = 0;
         int bc_used = 0, bc_total = 0; size_t bc_bytes = 0;
-        ucache_stats(&uc_used, &uc_total, &uc_bytes);
         bt_cache_stats(&bc_used, &bc_total, &bc_bytes);
-        uint64_t u_hits   = __atomic_load_n(&g_ucache_hits,    __ATOMIC_RELAXED);
-        uint64_t u_miss   = __atomic_load_n(&g_ucache_misses,  __ATOMIC_RELAXED);
+        uint64_t u_hits   = 0;
+        uint64_t u_miss   = 0;
         uint64_t b_hits   = __atomic_load_n(&g_bt_cache_hits,  __ATOMIC_RELAXED);
         uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
         uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
@@ -1428,65 +1426,25 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             cmd_get_multi(db_root, object, keys, fmt, delim);
             free(keys); free(fmt); free(delim);
         } else if (key) {
-            if (fields && fields[0]) {
-                /* Get with projection — uses ucache */
-                Schema sc = load_schema(db_root, object);
-                uint8_t hash[16]; int shard_id, start_slot;
-                size_t klen = strlen(key);
-                compute_hash_raw(key, klen, hash);
-                shard_id = compute_record_shard(hash, sc.splits);
-                start_slot = 0;
-                char shard[PATH_MAX];
-                build_shard_path(shard, sizeof(shard), db_root, object, shard_id);
-                FcacheRead fc = fcache_get_read(shard);
-                if (fc.map) {
-                    uint32_t slots = fc.slots_per_shard;
-                    uint32_t mask = slots - 1;
-                    int found = 0;
-                    for (uint32_t i = 0; i < slots; i++) {
-                        uint32_t s = ((uint32_t)start_slot + i) & mask;
-                        SlotHeader *h = (SlotHeader *)(fc.map + zoneA_off(s));
-                        if (h->flag == 0 && h->key_len == 0) break;
-                        if (h->flag == 2) continue;
-                        if (h->flag == 1 && memcmp(h->hash, hash, 16) == 0 &&
-                            h->key_len == klen &&
-                            memcmp(fc.map + zoneB_off(s, slots, sc.slot_size), key, klen) == 0) {
-                            const char *raw = (const char *)(fc.map + zoneB_off(s, slots, sc.slot_size) + h->key_len);
-                            FieldSchema pfs; init_field_schema(&pfs, db_root, object);
-                            char proj_buf[MAX_LINE];
-                            strncpy(proj_buf, fields, MAX_LINE - 1);
-                            const char *flds[MAX_FIELDS];
-                            int nf = 0;
-                            char *_tok_save = NULL; char *tok = strtok_r(proj_buf, ",", &_tok_save);
-                            while (tok && nf < MAX_FIELDS) { flds[nf++] = tok; tok = strtok_r(NULL, ",", &_tok_save); }
-                            OUT("{\"key\":\"%s\",\"value\":{", key);
-                            int first = 1;
-                            for (int fi = 0; fi < nf; fi++) {
-                                char *pv = json_escape_field(decode_field(raw, h->value_len, flds[fi],
-                                    (pfs.ts || pfs.nfields > 0) ? &pfs : NULL));
-                                if (!pv) continue;
-                                OUT("%s\"%s\":\"%s\"", first ? "" : ",", flds[fi], pv);
-                                first = 0; free(pv);
-                            }
-                            OUT("}}\n");
-                            found = 1; break;
-                        }
-                    }
-                    if (!found) OUT("{\"error\":\"Not found\"}\n");
-                    fcache_release(fc);
-                } else OUT("{\"error\":\"Not found\"}\n");
-            } else {
-                Schema sc_chk = load_schema(db_root, object);
-                if (sc_chk.auto_key != AK_NONE) {
-                    char *bin = NULL; size_t blen = 0;
-                    if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
-                        cmd_get(db_root, object, bin, blen);
-                        free(bin);
-                    }
+            Schema sc_chk = load_schema(db_root, object);
+            char *bin = NULL; size_t blen = 0;
+            const char *use_key = key;
+            size_t use_klen = strlen(key);
+            if (sc_chk.auto_key != AK_NONE) {
+                if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
+                    use_key = bin; use_klen = blen;
                 } else {
-                    cmd_get(db_root, object, key, strlen(key));
+                    use_key = NULL;
                 }
             }
+            if (use_key) {
+                if (fields && fields[0]) {
+                    cmd_get_fields(db_root, object, use_key, use_klen, fields);
+                } else {
+                    cmd_get(db_root, object, use_key, use_klen);
+                }
+            }
+            free(bin);
         } else {
             OUT("{\"error\":\"Missing key or keys\"}\n");
         }
@@ -3363,13 +3321,14 @@ int cmd_server(const char *db_root, int daemonize) {
     pthread_t auto_reshard_tid = 0;
     int auto_reshard_spawned = 0;
 
-    /* Raise the file-descriptor soft limit to the hard limit. ucache holds 1
-       fd per cached shard and briefly 2 during ucache_grow_shard (new + retired
-       for grace-period). At FCACHE_MAX=4096 defaults, peak need is ~8k fds —
-       well above the 1024 default on many distros. Shell-default limits cause
-       EMFILE inside ucache_grow_shard at high split counts. Soft → hard needs
-       no privilege. If the hard limit itself is below a practical floor, warn
-       with actionable guidance. */
+    /* Raise the file-descriptor soft limit to the hard limit. Each populated
+       kfcache, segcache, bt_cache, and bm_cache entry holds 1 fd; a kf
+       resplit temporarily opens an additional fd while rebuilding/remapping
+       that shard. With FCACHE_MAX=4096, the configured cache capacities alone
+       can approach 10k fds — well above the 1024 default on many distros.
+       Shell-default limits can therefore cause EMFILE under cache pressure or
+       during resplit. Soft → hard needs no privilege. If the hard limit itself
+       is below a practical floor, warn with actionable guidance. */
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
@@ -3586,14 +3545,12 @@ int cmd_server(const char *db_root, int daemonize) {
                 g_max_concurrent_queries,
                 (g_query_buffer_max_bytes * (size_t)g_max_concurrent_queries) / (1024 * 1024));
     }
-    fcache_init(g_fcache_cap);
     bt_cache_init(g_btcache_cap);
     /* Bitmap shard cache — same sizing as bt_cache. Per-entry rwlock
        lets concurrent readers share the mmap; writers serialise. */
     bm_cache_init(g_btcache_cap);
-    /* Slotcask kfcache + segcache both sized from FCACHE_MAX. v2 (slotcask)
-       objects route reads/writes through these; v1 (legacy) objects continue
-       to use ucache. Both engines coexist until migration. */
+    /* Slotcask kfcache + segcache both sized from FCACHE_MAX; all live
+       objects are v2 and route reads/writes through these. */
     slotcask_init(g_fcache_cap, g_fcache_cap);
     /* CPU pool size: explicit THREADS wins; otherwise nproc - 2 (leaves
        2 cores for the OS / interactive shell so long full-scan queries
@@ -3624,7 +3581,6 @@ int cmd_server(const char *db_root, int daemonize) {
     load_allowed_ips_conf(db_root);
     objlock_init();
     rebuild_recovery(db_root);
-    grow_recovery(db_root);
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
@@ -3783,7 +3739,6 @@ int cmd_server(const char *db_root, int daemonize) {
     parallel_io_pool_shutdown();
     parallel_pool_shutdown();
     counts_flush_all();        /* persist in-memory atomic counts → disk */
-    fcache_shutdown();
     bt_cache_shutdown();
     slotcask_shutdown();
     tls_shutdown();
@@ -4566,4 +4521,3 @@ int cmd_get_file_tcp(int port, const char *dir, const char *object,
                           filename, raw_len, out_path);
     return 0;
 }
-

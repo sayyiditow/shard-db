@@ -357,11 +357,10 @@ static int page_bsearch(uint8_t *page, const char *target, size_t target_len) {
 }
 
 /* ========== File management ==========
-   Unified ucache-style btree cache: one MAP_SHARED mapping per file,
-   per-entry pthread_rwlock_t (readers share, writers exclusive). One open
-   path for both modes — no MAP_PRIVATE snapshot, no separate writer flock,
-   no refcount-based invalidation dance. Mirrors storage.c's UCacheEntry
-   model for shard files. */
+   Unified btree cache: one MAP_SHARED mapping per file, per-entry
+   pthread_rwlock_t (readers share, writers exclusive). One open path for
+   both modes — no MAP_PRIVATE snapshot, no separate writer flock, no
+   refcount-based invalidation dance. */
 
 typedef struct {
     int      slot;       /* cache slot index, or -1 if uncached fallback */
@@ -610,7 +609,7 @@ static int bt_open_file(const char *path, int writer,
    creates the file (with a fresh header) if missing. On cache pressure we
    evict the least-recently-used slot; if the cache isn't initialised or
    eviction can't free a slot, we fall back to an uncached mapping (slot=-1,
-   no rwlock) — same hazard tradeoff as storage.c's ucache. */
+   no rwlock) — MAP_SHARED keeps duplicate mappings byte-coherent, but concurrent uncached writers do not get the cache's rwlock serialization; that accepted cache-pressure hazard is unchanged here. */
 static int bt_acquire(BtFile *bt, const char *path, int writer) {
     bt->slot = -1;
     bt->writer = writer;
@@ -2863,7 +2862,7 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
        at 100:1 and noted point-insert was 10x slower than rebuild at 90:1
        because every btree_insert call did its own
        cache-invalidate + open + lock cycle. Per-call overhead is now ~1µs
-       (single bt_acquire wrlock; ucache keeps the file mapped) so the
+       (single bt_acquire wrlock; the cache keeps the file mapped) so the
        crossover moved much closer to the algorithmic prediction:
        insert wins when K * log(N) < N + K  →  K < N / log(N).
        For N=62K (per-shard tree size in the invoice bench),

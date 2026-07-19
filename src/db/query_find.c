@@ -12,120 +12,6 @@
    0 = empty slot (can write here)
   -1 = tombstone (deleted, can write here on insert, skip on get)
   -2 = occupied by different key (continue probing) */
-/* g_scan_stop moved to ShardDb struct */
-
-void scan_one_shard(const char *binpath, int slot_size,
-                           scan_callback cb, void *ctx) {
-    /* Use the persistent shard mmap cache. Earlier versions opened the file
-       fresh with MADV_SEQUENTIAL on the theory that ucache's MADV_RANDOM
-       hint would hurt linear scans, but in practice repeated bench runs
-       (and the bench harness in particular) hit the same shards back-to-
-       back — ucache keeps the pages hot across queries, which dwarfs the
-       readahead benefit on a one-shot scan. */
-    FcacheRead fc = fcache_get_read(binpath);
-    if (!fc.map) return;
-    uint8_t *map = fc.map;
-    size_t file_size = fc.size;
-    uint32_t shard_slots = fc.slots_per_shard;
-    if (shard_slots == 0 || file_size < shard_zoneA_end(shard_slots)) {
-        fcache_release(fc);
-        return;
-    }
-
-    /* Find last used Zone A slot (metadata-only tail trim — tiny region). */
-    size_t scan_end = shard_slots;
-    while (scan_end > 0) {
-        const SlotHeader *h = (const SlotHeader *)(map + zoneA_off(scan_end - 1));
-        if (h->flag != 0 || h->key_len != 0) break;
-        scan_end--;
-    }
-
-    /* Lock-free read loop: the callback is responsible for whatever
-       synchronization it needs (most read-only counters use atomics; the
-       few that emit output or mutate shared arrays take their own internal
-       mutex in their ctx struct). Scanning itself is pure read of mmap'd
-       data and must never serialize on a shared mutex — that eats all the
-       per-shard parallelism. */
-    for (size_t i = 0; i < scan_end; i++) {
-        if (g_scan_stop) break;
-        const SlotHeader *hdr = (const SlotHeader *)(map + zoneA_off(i));
-        if (hdr->flag == 1) {
-            const uint8_t *block = map + zoneB_off(i, shard_slots, slot_size);
-            int stop = cb(hdr, block, ctx);
-            if (stop) { g_scan_stop = 1; break; }
-        }
-    }
-    fcache_release(fc);
-}
-
-typedef struct {
-    const char *path;
-    int slot_size;
-    scan_callback cb;
-    void *ctx;
-    FILE *parent_out;  /* inherit g_out from parent thread */
-} ScanWorkerArg;
-
-void *scan_worker(void *arg) {
-    ScanWorkerArg *w = (ScanWorkerArg *)arg;
-    if (g_scan_stop) return NULL;
-    g_out = w->parent_out ? w->parent_out : stdout;
-    scan_one_shard(w->path, w->slot_size, w->cb, w->ctx);
-    count_scan_cb_flush_thread();  /* flush TLS pending count before thread exits */
-    return NULL;
-}
-
-void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx) {
-    g_scan_stop = 0; /* reset stop flag */
-    /* Collect all shard file paths */
-    char **paths = NULL;
-    int path_count = 0, path_cap = 256;
-    paths = malloc(path_cap * sizeof(char *));
-    if (!paths) return;
-
-    DIR *d1 = opendir(data_dir);
-    if (!d1) { free(paths); return; }
-    struct dirent *e1;
-    while ((e1 = readdir(d1))) {
-        if (e1->d_name[0] == '.') continue;
-        size_t nlen = strlen(e1->d_name);
-        if (nlen < 5 || strcmp(e1->d_name + nlen - 4, ".bin") != 0) continue;
-        if (path_count >= path_cap) {
-            path_cap *= 2;
-            char **t = realloc(paths, path_cap * sizeof(char *));
-            if (!t) {
-                for (int k = 0; k < path_count; k++) free(paths[k]);
-                free(paths);
-                paths = NULL;
-                path_count = 0;
-                break;
-            }
-            paths = t;
-        }
-        char binpath[PATH_MAX];
-        snprintf(binpath, sizeof(binpath), "%s/%s", data_dir, e1->d_name);
-        paths[path_count++] = strdup(binpath);
-    }
-    closedir(d1);
-
-    if (!paths || path_count == 0) { free(paths); return; }
-
-    ScanWorkerArg *args = malloc(path_count * sizeof(ScanWorkerArg));
-    if (!args) {
-        for (int i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        return;
-    }
-    for (int i = 0; i < path_count; i++) {
-        args[i] = (ScanWorkerArg){ paths[i], slot_size, cb, ctx, g_out };
-    }
-    parallel_for_io(scan_worker, args, path_count, sizeof(ScanWorkerArg));
-    free(args);
-
-    for (int i = 0; i < path_count; i++) free(paths[i]);
-    free(paths);
-}
-
 /* ========== v2 (slotcask) scan bridge ========== */
 
 /* The engine's scan_callback signature predates slotcask. To keep all
@@ -163,10 +49,6 @@ static int v2_scan_wrap_cb(const uint8_t hash[16],
    callback writes to stdout instead of the connection's stream), then
     calls the storage primitive for one kf shard. The shared stop_flag
     lets one shard's "abort" return halt the rest. */
-
-/* Forward decl — definition lives alongside count_scan_cb in cmd_count.
-   Drains the per-thread TLS count accumulator into the bound CountCtx;
-   no-op for scan workers whose callback doesn't use TLS counting. */
 
 /* Forward declarations — defined below after the O_DIRECT helper block. */
 void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx);
@@ -251,10 +133,6 @@ static void *od_seg_file_worker(void *raw) {
         seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
     else
         seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
-    /* Drain per-thread count accumulator (count_scan_cb) so the
-       orchestrator sees this worker's contribution after parallel_for
-       joins.  No-op for callbacks that don't use the TLS counter. */
-    count_scan_cb_flush_thread();
     return NULL;
 }
 
@@ -497,7 +375,6 @@ int read_record_ref(const char *db_root, const char *object,
 
 void release_record_ref(RecordRef *r) {
     if (!r) return;
-    if (r->fc.map) { fcache_release(r->fc); r->fc.map = NULL; }
     /* Only free the malloc'd fallback — inline_buf is part of the
        caller's own RecordRef and needs no explicit release. */
     if (r->v2_buf && r->v2_buf != r->inline_buf) free(r->v2_buf);
@@ -528,18 +405,40 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
         /* Typed binary: handle composite fields */
         if (strchr(field, '+')) {
             char fb[256]; strncpy(fb, field, 255); fb[255] = '\0';
-            char cat[4096]; int cp = 0;
+            /* Grows (doubling) to fit the full concatenation -- never
+               truncates. decode_field's composite path also feeds
+               criteria matching (query_plan.c), ordering (query.c), and
+               aggregate grouping (query_aggregate.c); truncating here
+               would silently collapse distinct values sharing a common
+               prefix into the same match/sort-key/group-bucket. */
+            size_t cap = 256;
+            char *cat = malloc(cap);
+            if (!cat) return NULL;
+            int cp = 0;
             char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
             while (tok) {
                 int idx = typed_field_index(fs->ts, tok);
                 if (idx >= 0) {
                     char *v = typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
-                    if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
+                    if (v) {
+                        int sl = strlen(v);
+                        if ((size_t)cp + (size_t)sl + 1 > cap) {
+                            size_t need = (size_t)cp + (size_t)sl + 1;
+                            size_t new_cap = cap;
+                            while (new_cap < need) new_cap *= 2;
+                            char *ncat = realloc(cat, new_cap);
+                            if (!ncat) { free(cat); free(v); return NULL; }
+                            cat = ncat; cap = new_cap;
+                        }
+                        memcpy(cat + cp, v, sl); cp += sl;
+                        free(v);
+                    }
                 }
                 tok = strtok_r(NULL, "+", &_tok_save);
             }
             cat[cp] = '\0';
-            return cp > 0 ? strdup(cat) : NULL;
+            if (cp == 0) { free(cat); return NULL; }
+            return cat;
         }
         int idx = typed_field_index(fs->ts, field);
         return typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
@@ -2215,4 +2114,3 @@ int cmd_list_files(const char *db_root, const char *object,
 }
 
 /* ========== CREATE OBJECT ========== */
-

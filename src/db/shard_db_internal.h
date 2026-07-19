@@ -142,8 +142,6 @@ struct ShardDb {
     char tls_ca[PATH_MAX];
 
     /* stats counters */
-    uint64_t ucache_hits;
-    uint64_t ucache_misses;
     uint64_t bt_cache_hits;
     uint64_t bt_cache_misses;
     uint64_t server_start_ms;
@@ -202,13 +200,6 @@ struct ShardDb {
     /* concurrency semaphore */
     sem_t query_slots;
     int   slots_inited;
-
-    /* ucache (storage.c) */
-    UCacheEntry         *ucache;
-    int                  ucache_slots;
-    int                  ucache_count;
-    pthread_mutex_t      ucache_table_mutex;
-    volatile uint64_t    ucache_clock;
 
     /* counts cache (storage.c) */
     CountsCacheEntry counts_cache[COUNTS_CACHE_BUCKETS];
@@ -303,8 +294,6 @@ extern __thread ShardDb *g_db;
 #define g_tls_cert                  (g_db->tls_cert)
 #define g_tls_key                   (g_db->tls_key)
 #define g_tls_ca                    (g_db->tls_ca)
-#define g_ucache_hits               (g_db->ucache_hits)
-#define g_ucache_misses             (g_db->ucache_misses)
 #define g_bt_cache_hits             (g_db->bt_cache_hits)
 #define g_bt_cache_misses           (g_db->bt_cache_misses)
 #define g_server_start_ms           (g_db->server_start_ms)
@@ -342,12 +331,6 @@ extern __thread ShardDb *g_db;
 #define g_query_slots               (g_db->query_slots)
 #define g_slots_inited              (g_db->slots_inited)
 
-/* storage.c */
-#define g_ucache                    (g_db->ucache)
-#define g_ucache_slots              (g_db->ucache_slots)
-#define g_ucache_count              (g_db->ucache_count)
-#define g_ucache_table_mutex        (g_db->ucache_table_mutex)
-#define g_ucache_clock              (g_db->ucache_clock)
 #define g_counts_cache              (g_db->counts_cache)
 #define g_counts_lock               (g_db->counts_lock)
 

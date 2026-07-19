@@ -18,7 +18,7 @@ Global server snapshot.
   "uptime_ms": 3612450,
   "connections": {"active": 4, "total": 18231},
   "in_flight_writes": 0,
-  "ucache":    {"used": 128, "total": 4096, "bytes": 1073741824, "hits": 1820391, "misses": 4102},
+  "ucache":    {"used": 0, "total": 0, "bytes": 0, "hits": 0, "misses": 0},
   "bt_cache":  {"used": 48,  "total": 1024, "bytes": 2097152,    "hits": 923104,  "misses": 847},
   "slow_queries": [
     {"mode":"find","object":"orders","duration_ms":1347,"at":"20260418153012"}
@@ -67,11 +67,11 @@ shard_db_active_threads 3
 # HELP shard_db_in_flight_writes Write/schema requests currently executing.
 # TYPE shard_db_in_flight_writes gauge
 shard_db_in_flight_writes 0
-shard_db_ucache_used 128
-shard_db_ucache_capacity 4096
-shard_db_ucache_bytes 1073741824
-shard_db_ucache_hits_total 1820391
-shard_db_ucache_misses_total 4102
+shard_db_ucache_used 0
+shard_db_ucache_capacity 0
+shard_db_ucache_bytes 0
+shard_db_ucache_hits_total 0
+shard_db_ucache_misses_total 0
 shard_db_bt_cache_used 48
 shard_db_bt_cache_capacity 1024
 shard_db_bt_cache_bytes 2097152

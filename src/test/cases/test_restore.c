@@ -1,7 +1,7 @@
 /* src/test/cases/test_restore.c
  * Backup → mutate → restore round-trip. Verifies the live data tree
- * is replaced by the backup snapshot, that ucache invalidation lets
- * subsequent reads see the restored state, and that the safety guards
+ * is replaced by the backup snapshot, that slotcask registry invalidation
+ * lets subsequent reads see the restored state, and that the safety guards
  * (missing backup, non-empty live tree without --force) fire.
  */
 #ifndef _GNU_SOURCE

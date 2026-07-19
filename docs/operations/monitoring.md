@@ -19,7 +19,7 @@ Returns (JSON):
   "uptime_ms": 3612450,
   "connections": {"active": 4, "total": 18231},
   "in_flight_writes": 0,
-  "ucache":    {"used": 128, "total": 4096, "hits": 1820391, "misses": 4102},
+  "ucache":    {"used": 0, "total": 0, "hits": 0, "misses": 0},
   "bt_cache":  {"used": 48,  "total": 256,  "hits": 923104,  "misses": 847},
   "slow_queries": [
     {"mode":"find","object":"orders","duration_ms":1347,"at":"20260418153012"}
@@ -120,7 +120,6 @@ Adapt to your stack; these are the ones worth setting up first.
 |---|---|---|
 | Server down | No `stats` response for 60 s | Critical |
 | High write backlog | `in_flight_writes > 50` for 5 min | High |
-| ucache miss rate | `ucache_miss_rate > 15%` for 10 min | Medium |
 | btcache miss rate | `bt_cache_miss_rate > 15%` for 10 min | Medium |
 | Slow query rate | More than 10 slow queries per minute | Medium |
 | Disk full | `$DB_ROOT` filesystem > 85% | High |

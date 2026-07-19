@@ -114,13 +114,23 @@ static int test_stats_prom_run(void) {
     /* Not JSON. */
     ASSERT_TRUE(resp[0] != '{', "output does not start with '{'");
 
-    long hits_before = sample_value(resp, "shard_db_ucache_hits_total");
-    long miss_before = sample_value(resp, "shard_db_ucache_misses_total");
+    long used_before = sample_value(resp, "shard_db_ucache_used");
+    long cap_before   = sample_value(resp, "shard_db_ucache_capacity");
+    long bytes_before = sample_value(resp, "shard_db_ucache_bytes");
+    long hits_before  = sample_value(resp, "shard_db_ucache_hits_total");
+    long miss_before  = sample_value(resp, "shard_db_ucache_misses_total");
     free(resp); resp = NULL;
 
-    /* Generate traffic — slotcask uses kfcache/segcache; the same prom
-       sample harness covers both. ucache_hits/misses now report zero on
-       a fresh DB but the metric still appears in the export. */
+    ASSERT_TRUE(used_before == 0, "ucache_used is exactly 0 (pre-traffic)");
+    ASSERT_TRUE(cap_before == 0, "ucache_capacity is exactly 0 (pre-traffic)");
+    ASSERT_TRUE(bytes_before == 0, "ucache_bytes is exactly 0 (pre-traffic)");
+    ASSERT_TRUE(hits_before == 0, "ucache_hits_total is exactly 0 (pre-traffic)");
+    ASSERT_TRUE(miss_before == 0, "ucache_misses_total is exactly 0 (pre-traffic)");
+
+    /* Generate traffic — slotcask uses kfcache/segcache, not ucache. ucache
+       is dead on v2 (Task 3, this plan); every one of its stats fields is
+       now a hardcoded literal 0, retained only so existing dashboards
+       parsing these field/counter names don't break. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"prom_test\","
         "\"fields\":[\"name:varchar:32\"],\"splits\":16}", &resp); free(resp); resp = NULL;
@@ -134,15 +144,18 @@ static int test_stats_prom_run(void) {
 
     tc_request(tc, "{\"mode\":\"stats-prom\"}", &resp);
     ASSERT_NOT_NULL(resp, "stats-prom (post-traffic) returned output");
-    long hits_after = sample_value(resp, "shard_db_ucache_hits_total");
-    long miss_after = sample_value(resp, "shard_db_ucache_misses_total");
+    long used_after  = sample_value(resp, "shard_db_ucache_used");
+    long cap_after   = sample_value(resp, "shard_db_ucache_capacity");
+    long bytes_after = sample_value(resp, "shard_db_ucache_bytes");
+    long hits_after  = sample_value(resp, "shard_db_ucache_hits_total");
+    long miss_after  = sample_value(resp, "shard_db_ucache_misses_total");
     long up_before = sample_value(resp, "shard_db_uptime_seconds");
 
-    /* ucache is unused on v2 (slotcask uses kfcache/segcache), so the
-       counter stays at its initial value — assert non-decreasing rather
-       than strictly increasing. */
-    ASSERT_TRUE(hits_after >= hits_before, "ucache_hits_total non-decreasing");
-    ASSERT_TRUE(miss_after >= miss_before, "ucache_misses_total non-decreasing");
+    ASSERT_TRUE(used_after == 0, "ucache_used is exactly 0 (post-traffic)");
+    ASSERT_TRUE(cap_after == 0, "ucache_capacity is exactly 0 (post-traffic)");
+    ASSERT_TRUE(bytes_after == 0, "ucache_bytes is exactly 0 (post-traffic)");
+    ASSERT_TRUE(hits_after == 0, "ucache_hits_total is exactly 0 (post-traffic)");
+    ASSERT_TRUE(miss_after == 0, "ucache_misses_total is exactly 0 (post-traffic)");
 
     /* Counter samples are integer — no decimal point on hits_total sample
        line (start-of-line, not the HELP/TYPE comment lines that contain the

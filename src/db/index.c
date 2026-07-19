@@ -3045,8 +3045,8 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
         if (S_ISDIR(st.st_mode)) {
             /* Per-shard layout: indexes/<field>/<NNN>.{idx,bm,tg}.
                Drop every cached btree mapping under this directory
-               before rmrf so ucache doesn't keep stale fds alive.
-               Bitmap (.bm) and trigram (.tg) files don't use ucache
+               before rmrf so bt_cache doesn't keep stale fds alive.
+               Bitmap (.bm) and trigram (.tg) files don't use bt_cache
                but the rmrf cleans them too — they get rebuilt below
                in the type-aware cmd_add_indexes path. */
             DIR *sub = opendir(path);

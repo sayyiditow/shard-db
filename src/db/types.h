@@ -34,9 +34,6 @@
 #include "btree.h"
 
 #define SLOT_SIZE   8192
-#define HEADER_SIZE 24               /* Zone A entry size */
-#define SHARD_HDR_SIZE   32          /* ShardHeader at file offset 0 */
-#define INITIAL_SLOTS    256         /* starting slots_per_shard for new shards */
 /* As of 2026.05.1 the valid splits set is restricted to powers of 2 from
    8 to 4096. The restriction supports the per-shard index layout — each
    indexed field shards into `index_splits_for(splits)` btree files.
@@ -119,22 +116,8 @@ static inline int idx_shard_for_hash(const uint8_t hash16[16], int splits) {
                                         size bloat slot_size; 1024 is plenty —
                                         UUIDs are 36B, composite keys rarely
                                         exceed 256B) */
-#define GROW_LOAD_NUM    1           /* grow when count*DEN >= slots*NUM (50%) */
-#define GROW_LOAD_DEN    2
-#define SHARD_MAGIC      0x564B4853u /* 'SHKV' little-endian */
-#define SHARD_VERSION    1u
 #define MAX_FIELDS  256
 
-/* Per-shard header at byte 0 of each shard file. Records slots_per_shard
-   so a restart picks up the current grown size directly from the header
-   instead of trying to derive it from file size. */
-typedef struct __attribute__((packed)) {
-    uint32_t magic;                  /* SHARD_MAGIC */
-    uint32_t version;                /* SHARD_VERSION */
-    uint32_t slots_per_shard;        /* current power-of-two slot count */
-    uint32_t record_count;           /* active (non-tombstoned) records */
-    uint8_t  reserved[16];
-} ShardHeader;
 
 /* Typed field system */
 enum FieldType {
@@ -226,9 +209,6 @@ typedef struct {
     int typed;
 } TypedSchema;
 #define MAX_LINE    65536
-/* Probe bound is dynamic per-shard: callers use the shard's current
-   slots_per_shard (via FcacheRead.slots_per_shard or ShardHeader). Growth at 50%
-   load keeps clusters short, so typical probes stop in 1-5 iterations. */
 
 /* Zone A entry: 24 bytes. Payload (key+value) lives in Zone B at a fixed offset. */
 typedef struct __attribute__((packed)) {
@@ -261,24 +241,6 @@ typedef struct {
     char auto_key_seq_name[128];   /* meaningful only when auto_key == AK_SEQ */
 } Schema;
 
-/* Shard file layout:
-     [ShardHeader: 32B]
-     [Zone A: slots_per_shard * 24B headers]
-     [Zone B: slots_per_shard * slot_size payloads]
-   Payload holds key+value packed (key_len from header determines value offset).
-   slots_per_shard is a per-shard value recorded in ShardHeader. */
-static inline size_t zoneA_off(uint32_t slot) {
-    return SHARD_HDR_SIZE + (size_t)slot * HEADER_SIZE;
-}
-static inline size_t zoneB_off(uint32_t slot, uint32_t slots_per_shard, uint32_t slot_size) {
-    return SHARD_HDR_SIZE + (size_t)slots_per_shard * HEADER_SIZE + (size_t)slot * slot_size;
-}
-static inline size_t shard_zoneA_end(uint32_t slots_per_shard) {
-    return SHARD_HDR_SIZE + (size_t)slots_per_shard * HEADER_SIZE;
-}
-static inline size_t shard_file_size(uint32_t slots_per_shard, uint32_t slot_size) {
-    return SHARD_HDR_SIZE + (size_t)slots_per_shard * (HEADER_SIZE + slot_size);
-}
 
 enum SearchOp {
     OP_EQUAL, OP_NOT_EQUAL,
@@ -576,7 +538,6 @@ int  parallel_io_pool_size(void);
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object,
                     const char *query, uint32_t duration_ms);
-int ucache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 
 /* ========== Function declarations ========== */
@@ -858,23 +819,9 @@ static inline int compute_record_shard(const uint8_t hash[16], int splits) {
     uint16_t v = (uint16_t)hash[0] | ((uint16_t)hash[1] << 8);
     return (int)(v % (uint16_t)splits);
 }
-void build_shard_path(char *buf, size_t buflen, const char *db_root, const char *object, int shard_id);
-void build_shard_filename(char *buf, size_t buflen, const char *data_dir, int shard_id);
 void build_idx_path(char *buf, size_t buflen,
                     const char *db_root, const char *object,
                     const char *field, int idx_shard_id);
-uint8_t *mmap_with_hints(void *addr, size_t len, int prot, int flags, int fd, off_t off);
-
-/* Unified shard cache (ucache) — persistent MAP_SHARED mmap per shard.
-   Per-entry rwlock: shared for reads, exclusive for writes.
-   FcacheRead handle used for both read and write operations. */
-typedef struct {
-    uint8_t *map;   /* NULL on failure */
-    size_t   size;
-    uint32_t slots_per_shard;  /* captured at open time */
-    int      slot;  /* cache slot index, -1 = invalid */
-} FcacheRead;
-
 /* A lightweight cache reference: cache-slot index + generation counter.
    Validated with a single atomic load — no table lock needed on warm hits.
    slot == -1 means "not yet populated" (safe initial value after calloc/memset). */
@@ -883,73 +830,6 @@ typedef struct SlotRef {
     uint64_t gen;
 } SlotRef;
 
-typedef struct UCacheEntry {
-    char     path[PATH_MAX];
-    int      fd;
-    uint8_t *map;
-    size_t   map_size;
-    /* Lock-free readers (fcache_get_read at storage.c:304, observed_slots
-       at :437) snapshot this field without taking e->rwlock — the retired_map
-       mechanism keeps old mappings valid across grows. _Atomic gives those
-       readers a torn-read-free view against the writers at :275, :553, :653. */
-    _Atomic uint32_t slots_per_shard;
-    pthread_rwlock_t rwlock;
-    /* `used` straddles two locking layers: written under g_ucache_table_mutex
-       (allocation/eviction at storage.c:260,278) AND under e->rwlock
-       (fcache_invalidate at storage.c:656). Lock-free reads (lines 121, 249,
-       643) check it as a fast skip. _Atomic gives the readers correct
-       cross-thread visibility regardless of which writer-lock was held. */
-    _Atomic int used;
-    uint8_t *slot_bits;
-    int      max_dirty_slot;
-    int      dirty;
-    uint64_t last_access;   /* monotonic counter for LRU eviction */
-    _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
-    /* Old mapping retained after a grow so concurrent readers holding
-       fc.map pointers stay valid; freed on next grow or shutdown. */
-    uint8_t *retired_map;
-    size_t   retired_size;
-    int      retired_fd;
-} UCacheEntry;
-
-void       fcache_init(int cap);
-void       fcache_shutdown(void);
-void       ucache_shutdown(void);
-FcacheRead fcache_get_read(const char *path);
-void       fcache_release(FcacheRead h);
-/* Open (or create) a shard for writing. slot_size > 0 creates the file with
-   INITIAL_SLOTS slots if missing; slot_size == 0 opens-only (fails if absent). */
-FcacheRead ucache_get_write(const char *path, int slot_size);
-void       ucache_write_release(FcacheRead h);
-/* Non-blocking hint to the kernel to start flushing this shard's dirty pages
-   to disk. No-op on non-Linux. Intended for bulk-insert paths that would
-   otherwise accumulate dirty pages faster than the kernel's writeback
-   daemons can drain them (which pushes dirty_ratio over its threshold and
-   causes every subsequent write to stall in D-state). */
-void       ucache_nudge_writeback(int ucache_slot);
-/* Grow `path` to exactly `target_slots` (must be a power of 2 strictly greater
-   than current slots_per_shard). Returns 0 on success, 0 if another writer
-   already grew at/past target (no-op), -1 on error. Caller must NOT hold the
-   entry wrlock. */
-int        ucache_grow_to(const char *path, uint32_t target_slots,
-                          int slot_size);
-/* Double slots_per_shard for this shard: re-bucket live records into a new file,
-   atomic rename, swap mapping. Thin wrapper over ucache_grow_to. Caller must
-   NOT hold the entry wrlock. */
-int        ucache_grow_shard(const char *path, int slot_size);
-/* Post-insert threshold check — calls ucache_grow_shard if load >= 50%. */
-void       ucache_maybe_grow(int ucache_slot, int slot_size);
-/* Returns current slots_per_shard for the shard at `path`, opening it into
-   the ucache if not already present. Returns 0 on error. Used by callers
-   that want to make a sizing decision before kicking off worker writes. */
-uint32_t   ucache_peek_slots(const char *path, int slot_size);
-/* Sweep stale shard.new files after a crash during grow. Called at startup. */
-void       grow_recovery(const char *db_root);
-UCacheEntry *ucache_entry(int slot);
-int        ucache_slot_count(void);
-void       fcache_invalidate(const char *path_prefix);
-/* Adjust a shard's record_count in the ShardHeader (caller holds wrlock). */
-void       ucache_bump_record_count(int ucache_slot, int delta);
 void update_count(const char *db_root, const char *object, int delta);
 void set_count(const char *db_root, const char *object, int count);
 void update_deleted_count(const char *db_root, const char *object, int delta);
@@ -979,6 +859,8 @@ void counts_invalidate(const char *db_root, const char *object);
    BE) work end-to-end. String-key callers pass strlen(key) for klen. */
 int cmd_get(const char *db_root, const char *object,
             const char *key, size_t klen);
+int cmd_get_fields(const char *db_root, const char *object,
+                    const char *key, size_t klen, const char *fields_csv);
 int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *value,
@@ -1134,30 +1016,26 @@ int  match_criterion(const char *val_str, const SearchCriterion *c);
 
 /* query.c */
 typedef int (*scan_callback)(const SlotHeader *hdr, const uint8_t *block, void *ctx); /* return 0=continue, 1=stop */
-void scan_shards(const char *data_dir, int slot_size, scan_callback cb, void *ctx);
 /* v2 scan bridge — adapts slotcask_walk_live to the SlotHeader-shaped
    scan_callback so existing callbacks work unchanged. */
 struct SlotcaskDb;
 void scan_shards_v2(struct SlotcaskDb *db, scan_callback cb, void *ctx);
-/* Storage-version-aware scan dispatch. v2 objects route through the
-   slotcask registry; v1 fall through to scan_shards. Returns -1 only
-   when v2 dispatch fails (open-time error). */
+/* Scan dispatch: routes through the slotcask registry. Returns -1 only
+   when dispatch fails (open-time error); no caller currently inspects the
+   return value. */
 int  scan_dispatch(const char *db_root, const char *object,
                    const Schema *sc, const char *data_dir,
                    scan_callback cb, void *ctx);
 
-/* Indexed record fetch: layout-agnostic dispatch for hash-based lookups.
-   v1 path holds an FcacheRead handle; v2 holds a copy of the record in
-   inline_buf (fits) or a malloc'd fallback (too large for inline_buf).
-   Either way, key + val point into a contiguous buffer with layout
-   `[key bytes][val bytes]`, matching v1 Zone B. Caller must call
-   release_record_ref to free both lifetimes. */
+/* Indexed record fetch: holds a copy of the record in inline_buf (fits) or
+   a malloc'd fallback (too large for inline_buf). key + val point into a
+   contiguous buffer with layout `[key bytes][val bytes]`. Caller must call
+   release_record_ref to free the fallback allocation, if any. */
 typedef struct {
-    FcacheRead     fc;        /* v1: kept open to keep mmap alive; .map=NULL on v2 */
-    uint8_t       *v2_buf;    /* v2: points at inline_buf (common case) or a
+    uint8_t       *v2_buf;    /* points at inline_buf (common case) or a
                                   malloc'd fallback (record too large for
-                                  inline_buf); NULL on v1 */
-    uint8_t        inline_buf[2048]; /* v2 fast path — avoids malloc/free for
+                                  inline_buf) */
+    uint8_t        inline_buf[2048]; /* fast path — avoids malloc/free for
                                          records that fit; same size convention
                                          as the stk[2048] pattern in query.c's
                                          KeySet-fallback record collection */

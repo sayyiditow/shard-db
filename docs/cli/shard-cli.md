@@ -127,7 +127,8 @@ The fastest way to get oriented. Assumes the daemon is running (`./shard-db star
 3. **Browse → default → users** — describe-object now shows the schema you just built.
 4. **Query → insert** — pick `users`, type key `u1`, fill the `value` form (pulls field names from describe-object).
 5. **Query → find** — pick `users`, open the criteria builder, add `age gt 18`, run. Results render as a table; press `e` to export to CSV.
-6. **Stats** — open and watch `ucache.hits` tick up as you re-query.
+6. **Stats** — open and watch `bt_cache.hits` tick up as you re-query
+   (`ucache.hits` stays at 0 on v2 — see [monitoring.md](../operations/monitoring.md)).
 7. **Auth → add-token** — issue a tenant-scoped read-only token (`dir=default`, `perm=r`) for a downstream service.
 8. **Maintenance → backup** — snapshot the object before further work.
 
