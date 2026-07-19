@@ -126,11 +126,18 @@ static int test_rebuild_recovery_run(void) {
     ASSERT_TRUE(after >= 99, ">=99 records survive rebuild");
     free(resp); resp = NULL;
 
-    /* Bug 1 fix: no .rebuild_legacy_root left behind after successful walk. */
-    char legacy_path[PATH_MAX];
-    snprintf(legacy_path, sizeof(legacy_path),
-             "%s/default/rebuildrecov/.rebuild_legacy_root", env.db_root);
-    ASSERT_TRUE(access(legacy_path, F_OK) != 0, "no .rebuild_legacy_root left behind");
+    /* No rebuild-transaction artifacts left behind after successful walk
+       (replaces the old data.legacy/.rebuild_legacy_root staging scheme). */
+    char txn_active[PATH_MAX], txn_done[PATH_MAX], txn_preparing[PATH_MAX];
+    snprintf(txn_active, sizeof(txn_active),
+             "%s/default/rebuildrecov/.rebuild_txn.active", env.db_root);
+    snprintf(txn_done, sizeof(txn_done),
+             "%s/default/rebuildrecov/.rebuild_txn.done", env.db_root);
+    snprintf(txn_preparing, sizeof(txn_preparing),
+             "%s/default/rebuildrecov/.rebuild_txn.preparing", env.db_root);
+    ASSERT_TRUE(access(txn_active, F_OK) != 0, "no .rebuild_txn.active left behind");
+    ASSERT_TRUE(access(txn_done, F_OK) != 0, "no .rebuild_txn.done left behind");
+    ASSERT_TRUE(access(txn_preparing, F_OK) != 0, "no .rebuild_txn.preparing left behind");
 
     tc_close(tc);
     test_env_stop(&env);

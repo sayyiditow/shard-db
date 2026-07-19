@@ -124,6 +124,10 @@ for f in $LIB_SRCS; do
 done
 ar rcs build/bin/libshard-db.a $LIB_OBJS
 cp src/db/shard_db.h build/bin/shard_db.h
+gcc $MODE_CFLAGS -o build/bin/embedded_lock_harness \
+    src/test/embedded_lock_harness.c build/bin/libshard-db.a \
+    -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
+    -lpthread -lssl -lcrypto
 echo "  -> build/bin/libshard-db.a + build/bin/shard_db.h"
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -208,6 +212,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_vacuum_streams_mismatch.c \
     src/test/cases/test_rebuild_kf.c \
     src/test/cases/test_rebuild_recovery.c \
+    src/test/cases/test_rebuild_txn_recovery.c \
     src/test/cases/test_slotcask_resplit.c \
     src/test/cases/test_per_tenant_auth.c \
     src/test/cases/test_stress_no_hang.c \

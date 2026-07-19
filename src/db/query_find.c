@@ -922,79 +922,62 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
     return 0;
 }
 
+static void rebuild_test_pause(const char *obj_dir, const char *phase) {
+    if (!g_db || g_rebuild_test_pause_ms <= 0 ||
+        strcmp(g_rebuild_test_pause_phase, phase) != 0) return;
+    char marker[PATH_MAX];
+    int n = snprintf(marker, sizeof(marker), "%s/.rebuild-test-%s.active",
+                     obj_dir, phase);
+    if (n < 0 || n >= (int)sizeof(marker)) return;
+    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+    int remaining = g_rebuild_test_pause_ms;
+    while (remaining > 0) {
+        int slice = remaining > 100 ? 100 : remaining;
+        struct timespec ts = { slice / 1000, (long)(slice % 1000) * 1000000L };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        remaining -= slice;
+    }
+    unlink(marker);
+}
+
 int rebuild_object_v2(const char *db_root, const char *object,
-                              const Schema *old_sch, const TypedSchema *old_ts,
-                              const Schema *new_sch, TypedSchema *new_ts,
-                              int *new_to_old, int slot_changed,
-                              int splits_changed, int drop_tombstoned,
-                              char added_lines[][256], int n_added) {
+                      const Schema *old_sch, const TypedSchema *old_ts,
+                      const Schema *new_sch, TypedSchema *new_ts,
+                      int *new_to_old, int slot_changed,
+                      int splits_changed, int drop_tombstoned,
+                      char added_lines[][256], int n_added,
+                      const RebuildFinalizeOps *finalize) {
     char obj_dir[PATH_MAX];
-    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/data", obj_dir);
-    char legacy_dir[PATH_MAX];
-    snprintf(legacy_dir, sizeof(legacy_dir), "%s/data.legacy", obj_dir);
-
-    /* Clean any stale data.legacy from a prior crashed rebuild. */
-    rmrf(legacy_dir);
-
-    /* Drop the cached slotcask handle so the rename below doesn't tug
-       on live mmap regions. The next slotcask_registry_get will
-       re-open fresh against the new data/ that we'll create. */
-    slotcask_registry_invalidate(db_root, object);
-
-    /* Atomic rename: data/ → data.legacy/. The new slotcask_open below
-       will re-create data/ from scratch with the new schema. */
-    if (rename(data_dir, legacy_dir) != 0) {
-        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed: %s",
-                data_dir, legacy_dir, strerror(errno));
-        OUT("{\"error\":\"Failed to stage legacy data\"}\n");
+    if (snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object) >=
+        (int)sizeof(obj_dir)) {
+        OUT("{\"error\":\"Object path too long\"}\n");
         return 1;
     }
 
-    /* Open standalone handles — bypass the registry (it would re-open
-       the live obj_dir under the new schema and we want both handles
-       coexisting for the walk). slotcask_open's data_dir parameter is
-       <obj>/, not <obj>/data/, so legacy_db needs the parent of
-       data.legacy/ — but the layout helpers prepend /data/ to the
-       passed dir, so we point legacy_db at a dir whose /data/ resolves
-       to data.legacy/. Symlink would be cleaner; instead we move
-       data.legacy → ./data inside a throwaway dir. Simpler: pass the
-       parent of data.legacy and have the helpers find data/ — but
-       the parent IS obj_dir. Solution: temporarily rename
-       data.legacy → data inside a sibling dir. */
-    char legacy_root[PATH_MAX];
-    snprintf(legacy_root, sizeof(legacy_root), "%s/.rebuild_legacy_root", obj_dir);
-    rmrf(legacy_root);
-    mkdirp(legacy_root);
-    char legacy_data_under_root[PATH_MAX];
-    snprintf(legacy_data_under_root, sizeof(legacy_data_under_root),
-             "%s/data", legacy_root);
-    if (rename(legacy_dir, legacy_data_under_root) != 0) {
-        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s): %s",
-                legacy_dir, legacy_data_under_root, strerror(errno));
-        rmrf(legacy_root);
-        OUT("{\"error\":\"Failed to stage legacy data root\"}\n");
+    RebuildTxn *txn = rebuild_txn_begin(
+        db_root, object, old_sch->splits, old_sch->streams,
+        splits_changed || (finalize && finalize->indexes_may_change));
+    if (!txn) {
+        OUT("{\"error\":\"Failed to begin rebuild transaction\"}\n");
         return 1;
     }
+    rebuild_test_pause(obj_dir, "after-stage");
 
     SlotcaskDb legacy_db, new_db;
-    int legacy_open = (slotcask_open(&legacy_db, legacy_root,
-                                       old_sch->splits, old_sch->streams,
-                                       old_sch->slot_size) == 0);
-    int new_open = (slotcask_open(&new_db, obj_dir,
-                                    new_sch->splits, new_sch->streams,
-                                    new_sch->slot_size) == 0);
+    V2RebuildCtx walk_ctx = {0};
+    int legacy_open = 0, new_open = 0;
+    const char *failure = "Rebuild transaction failed";
+    legacy_open = slotcask_open(&legacy_db, rebuild_txn_legacy_root(txn),
+                                old_sch->splits, old_sch->streams,
+                                old_sch->slot_size) == 0;
+    new_open = slotcask_open(&new_db, obj_dir, new_sch->splits,
+                             new_sch->streams, new_sch->slot_size) == 0;
     if (!legacy_open || !new_open) {
-        if (legacy_open) slotcask_close(&legacy_db);
-        if (new_open)    slotcask_close(&new_db);
-        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: open failed (legacy=%d new=%d)",
-                legacy_open, new_open);
-        OUT("{\"error\":\"Failed to open slotcask handles for rebuild\"}\n");
-        return 1;
+        failure = "Failed to open slotcask handles for rebuild";
+        goto txn_fail;
     }
 
-    V2RebuildCtx walk_ctx = {0};
     walk_ctx.new_db        = &new_db;
     walk_ctx.old_ts        = old_ts;
     walk_ctx.new_ts        = new_ts;
@@ -1021,10 +1004,8 @@ int rebuild_object_v2(const char *db_root, const char *object,
         walk_ctx.backfill = (BackfillSpec *)calloc((size_t)new_ts->nfields,
                                                     sizeof(BackfillSpec));
         if (!walk_ctx.backfill) {
-            slotcask_close(&legacy_db);
-            slotcask_close(&new_db);
-            OUT("{\"error\":\"Failed to allocate backfill state\"}\n");
-            return 1;
+            failure = "Failed to allocate backfill state";
+            goto txn_fail;
         }
         for (int k = 0; k < new_ts->nfields; k++) {
             if (new_to_old[k] != -1) continue;  /* not a new field */
@@ -1035,12 +1016,8 @@ int rebuild_object_v2(const char *db_root, const char *object,
                                                       nf->default_val,
                                                       (int)pf_live);
                 if (start < 0) {
-                    free(walk_ctx.backfill);
-                    slotcask_close(&legacy_db);
-                    slotcask_close(&new_db);
-                    OUT("{\"error\":\"sequence unavailable for backfill of field [%s]\"}\n",
-                        nf->name);
-                    return 1;
+                    failure = "Sequence unavailable for field backfill";
+                    goto txn_fail;
                 }
                 walk_ctx.backfill[k].seq_start = start;
                 walk_ctx.backfill[k].seq_count = pf_live;
@@ -1062,39 +1039,31 @@ int rebuild_object_v2(const char *db_root, const char *object,
     walk_ctx.backfill = NULL;
 
     slotcask_close(&legacy_db);
+    legacy_open = 0;
     slotcask_close(&new_db);
+    new_open = 0;
+    rebuild_test_pause(obj_dir, "after-walk");
 
     if (walk_err) {
-        LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: walk error after %d records; restoring original data",
-                  live_count);
-        rmrf(data_dir);
-        if (rename(legacy_data_under_root, data_dir) != 0) {
-            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: restore failed: %s — original at %s",
-                      strerror(errno), legacy_root);
-            OUT("{\"error\":\"Rebuild walk failed; restore also failed — original at .rebuild_legacy_root\"}\n");
-        } else {
-            rmrf(legacy_root);
-            OUT("{\"error\":\"Rebuild walk failed; original data restored\"}\n");
-        }
-        return 1;
+        failure = "Rebuild walk failed";
+        goto txn_fail;
     }
 
     /* Stage fields.conf rewrite (drop :removed lines if compact, append
        n_added at the end) — mirrors the v1 fields_changed branch. */
     int fields_changed = drop_tombstoned || n_added > 0;
     if (fields_changed) {
-        char fpath[PATH_MAX], fpath_new[PATH_MAX], fpath_old[PATH_MAX];
+        char fpath[PATH_MAX], fpath_new[PATH_MAX];
         snprintf(fpath,     sizeof(fpath),     "%s/fields.conf", obj_dir);
         snprintf(fpath_new, sizeof(fpath_new), "%s/fields.conf.new", obj_dir);
-        snprintf(fpath_old, sizeof(fpath_old), "%s/fields.conf.old", obj_dir);
 
         FILE *fin = fopen(fpath, "r");
         FILE *fout = fopen(fpath_new, "w");
         if (!fin || !fout) {
             if (fin) fclose(fin);
             if (fout) fclose(fout);
-            OUT("{\"error\":\"Failed to stage fields.conf.new\"}\n");
-            return 1;
+            failure = "Failed to stage fields.conf.new";
+            goto txn_fail;
         }
         char line[512];
         while (fgets(line, sizeof(line), fin)) {
@@ -1109,35 +1078,58 @@ int rebuild_object_v2(const char *db_root, const char *object,
         for (int a = 0; a < n_added; a++) fprintf(fout, "%s\n", added_lines[a]);
         fclose(fin);
         fclose(fout);
-        if (rename(fpath, fpath_old) != 0)
-            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed", fpath, fpath_old);
         if (rename(fpath_new, fpath) != 0) {
-            LOG_ERROR(LOG_SUB_CONFIG, "rebuild_v2: rename(%s → %s) failed — restoring", fpath_new, fpath);
-            (void)rename(fpath_old, fpath);
-            OUT("{\"error\":\"Failed to swap fields.conf\"}\n");
-            return 1;
+            failure = "Failed to swap fields.conf";
+            goto txn_fail;
         }
-        unlink(fpath_old);
     }
 
     int streams_changed = (new_sch->streams != old_sch->streams);
-    if (splits_changed || streams_changed)
-        update_schema_conf_splits_streams(db_root, object,
-                                           splits_changed  ? new_sch->splits  : 0,
-                                           streams_changed ? new_sch->streams : 0);
+    if ((splits_changed || streams_changed) &&
+        update_schema_conf_splits_streams(
+            db_root, object, splits_changed ? new_sch->splits : 0,
+            streams_changed ? new_sch->streams : 0) != 0) {
+        failure = "Failed to update schema.conf";
+        goto txn_fail;
+    }
+    if (finalize && finalize->apply_metadata &&
+        finalize->apply_metadata(finalize->ctx) != 0) {
+        failure = "Failed to apply rebuild metadata";
+        goto txn_fail;
+    }
+    rebuild_test_pause(obj_dir, "after-metadata");
 
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(db_root, object);
-    reset_deleted_count(db_root, object);
-    set_count(db_root, object, live_count);
-
-    /* Drop the legacy data root + force the registry to re-open against
-       the new on-disk state on the next request. */
-    rmrf(legacy_root);
     slotcask_registry_invalidate(db_root, object);
 
     int idx_rebuilt = 0;
-    if (splits_changed) idx_rebuilt = reindex_object(db_root, object, 0);
+    if (splits_changed &&
+        reindex_object_checked(db_root, object, 0, &idx_rebuilt) != 0) {
+        failure = "Failed to rebuild indexes";
+        goto txn_fail;
+    }
+    if (finalize && finalize->rebuild_indexes) {
+        int finalized_count = 0;
+        if (finalize->rebuild_indexes(finalize->ctx, &finalized_count) != 0) {
+            failure = "Failed to rebuild affected indexes";
+            goto txn_fail;
+        }
+        idx_rebuilt += finalized_count;
+    }
+    invalidate_schema_caches(db_root, object);
+    invalidate_idx_cache(db_root, object);
+    slotcask_registry_invalidate(db_root, object);
+    if (rebuild_txn_commit(txn) != 0) {
+        failure = "Failed to commit rebuild transaction";
+        goto txn_fail;
+    }
+    rebuild_test_pause(obj_dir, "after-commit");
+    rebuild_txn_cleanup_committed(txn);
+    rebuild_txn_free(txn);
+    txn = NULL;
+    reset_deleted_count(db_root, object);
+    set_count(db_root, object, live_count);
 
     LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
             db_root, object, live_count, old_sch->splits, new_sch->splits,
@@ -1147,6 +1139,22 @@ int rebuild_object_v2(const char *db_root, const char *object,
         live_count, new_sch->splits, new_sch->streams, new_sch->slot_size,
         drop_tombstoned ? "true" : "false", idx_rebuilt);
     return 0;
+
+txn_fail:
+    if (legacy_open) slotcask_close(&legacy_db);
+    if (new_open) slotcask_close(&new_db);
+    free(walk_ctx.backfill);
+    slotcask_registry_invalidate(db_root, object);
+    int abort_rc = rebuild_txn_abort(txn);
+    rebuild_txn_free(txn);
+    if (abort_rc != 0)
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "rebuild_v2: abort failed for %s/%s; startup recovery required",
+                  db_root, object);
+    OUT("{\"error\":\"%s%s\"}\n", failure,
+        abort_rc == 0 ? "; original data restored" :
+                        "; rollback incomplete, restart required");
+    return 1;
 }
 
 int rebuild_object(const char *db_root, const char *object,
@@ -1250,7 +1258,7 @@ int rebuild_object(const char *db_root, const char *object,
     return rebuild_object_v2(db_root, object, &old_sch, old_ts,
                               &new_sch, &new_ts, new_to_old,
                               slot_changed, splits_changed,
-                              drop_tombstoned, added_lines, n_added);
+                              drop_tombstoned, added_lines, n_added, NULL);
 }
 
 int is_number(const char *s) {

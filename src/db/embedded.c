@@ -34,6 +34,7 @@ static void db_mutexes_init(void) {
 }
 
 static void db_defaults_set(ShardDb *db) {
+    db->db_root_lock_fd            = -1;
     db->timeout                   = 30;
     db->port                      = 9199;
     db->global_limit              = 100000;
@@ -53,6 +54,8 @@ static void db_defaults_set(ShardDb *db) {
     db->log_level                 = 3;
     db->log_retain_days           = 7;
     db->index_page_size           = 4096;
+    db->rebuild_test_pause_phase[0] = '\0';
+    db->rebuild_test_pause_ms       = 0;
     memcpy(db->warmup_mode, "async", 6);
 }
 
@@ -119,7 +122,6 @@ ShardDb *shard_db_open_internal(const char *db_root) {
     load_tokens_conf(db->db_root);
     load_allowed_ips_conf(db->db_root);
     objlock_init();
-    rebuild_recovery(db->db_root);
 
     return db;
 }
@@ -161,6 +163,24 @@ const char *test_get_process_db_root(void) {
 
 /* Forward decl — defined below in the impl section. */
 static void db_mutexes_destroy(void);
+
+static void db_cleanup_before_pools(ShardDb *db) {
+    if (!db) return;
+    g_db = db;
+    bt_cache_shutdown();
+    bm_cache_shutdown();
+    slotcask_shutdown();
+    free(db->token_set);
+    free(db->token_scope);
+    free(db->token_scope_obj);
+    free(db->token_perm);
+    free(db->token_set_used);
+    db_root_lock_release(&db->db_root_lock_fd);
+    db_mutexes_destroy();
+    if (db->slots_inited) sem_destroy(&db->query_slots);
+    free(db);
+    g_db = NULL;
+}
 
 /* Run startup migrations for every registered object:
  *   1. varlen conversion  — fixed-slot → variable-length segment format.
@@ -268,12 +288,34 @@ ShardDb *shard_db_open(const char *db_root) {
         return NULL;
     }
 
+    mkdirp(db_root);
+    int lock_fd = -1;
+    if (db_root_lock_acquire(db_root, &lock_fd) != 0) {
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
+
     ShardDb *db = shard_db_open_internal(db_root);
-    if (!db) { atomic_store(&g_instance_open, 0); return NULL; }
+    if (!db) {
+        db_root_lock_release(&lock_fd);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
+    db->db_root_lock_fd = lock_fd;
 
     /* Expose instance before starting pools so pool_worker / io_pool_worker
        can bind their thread-local g_db on entry. */
     g_shard_db_instance = db;
+
+    if (rebuild_recovery(db_root) != 0) {
+        fprintf(stderr,
+                "shard_db_open: refusing to open: rebuild recovery requires manual intervention\n");
+        g_shard_db_instance = NULL;
+        g_db = NULL;
+        db_cleanup_before_pools(db);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
 
     /* Auto-migrate any FIXED-format objects before thread pools start.
        Migration is offline at this point — no registry entries open. */
@@ -281,19 +323,8 @@ ShardDb *shard_db_open(const char *db_root) {
         fprintf(stderr, "shard_db_open: startup migration failed\n");
         g_shard_db_instance = NULL;
         g_db = NULL;
-        /* Thread pools not yet started — call shutdown helpers that
-           are safe on uninitialised state, skip parallel_pool_shutdown. */
-        bt_cache_shutdown();
-        bm_cache_shutdown();
-        slotcask_shutdown();
-        free(db->token_set);
-        free(db->token_scope);
-        free(db->token_scope_obj);
-        free(db->token_perm);
-        free(db->token_set_used);
-        db_mutexes_destroy();
-        if (db->slots_inited) sem_destroy(&db->query_slots);
-        free(db);
+        /* Thread pools have not started yet. */
+        db_cleanup_before_pools(db);
         atomic_store(&g_instance_open, 0);
         return NULL;
     }
@@ -409,6 +440,7 @@ void shard_db_close(ShardDb *db) {
 
     if (db->slots_inited) sem_destroy(&db->query_slots);
 
+    db_root_lock_release(&db->db_root_lock_fd);
     free(db);
     g_db = NULL;
     atomic_store(&g_instance_open, 0);

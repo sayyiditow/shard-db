@@ -2943,10 +2943,13 @@ static void auto_vacuum_sweep_one(const char *dir_name, const char *eff,
         "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
         dir_name, obj_name, count, deleted, pct_observed);
     uint64_t obj_t0 = now_ms();
-    cmd_vacuum(eff, obj_name, 0, 0);
-    LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM done %s/%s in %lums",
-            dir_name, obj_name, (unsigned long)(now_ms() - obj_t0));
-    ctx->vacuumed++;
+    objlock_wrlock(eff, obj_name);
+    int vacuum_rc = cmd_vacuum(eff, obj_name, 0, 0);
+    objlock_wrunlock(eff, obj_name);
+    LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM done %s/%s rc=%d in %lums",
+            dir_name, obj_name, vacuum_rc,
+            (unsigned long)(now_ms() - obj_t0));
+    if (vacuum_rc == 0) ctx->vacuumed++;
 }
 
 static void *auto_vacuum_thread(void *arg) {
@@ -3304,6 +3307,12 @@ static int validate_metadata(const char *db_root) {
 }
 
 int cmd_server(const char *db_root, int daemonize) {
+    /* Recovery mutates object directories, so DB-root ownership must be
+       established before any instance initialization or recovery work. */
+    mkdirp(db_root);
+    int lock_fd = -1;
+    if (db_root_lock_acquire(db_root, &lock_fd) != 0) return 1;
+
     /* Allocate and initialise the ShardDb instance. Must happen before
        any code that uses g_* macros (which are now field accesses via
        the thread-local g_db pointer). */
@@ -3311,6 +3320,7 @@ int cmd_server(const char *db_root, int daemonize) {
     if (!g_shard_db_instance) {
         fprintf(stderr, "shard-db: shard_db_open_internal failed for DB_ROOT=%s\n",
                 db_root);
+        db_root_lock_release(&lock_fd);
         return 1;
     }
     g_db = g_shard_db_instance;
@@ -3364,32 +3374,10 @@ int cmd_server(const char *db_root, int daemonize) {
         }
     }
 
-    /* Bootstrap DB_ROOT on first start. The release tarball ships only the
-       binary; the data directory comes from the user's db.env setting and
-       is created here on demand so a fresh deploy doesn't require a manual
-       mkdir. Idempotent — existing dirs are left untouched. */
-    mkdirp(db_root);
-
-    /* Single-instance guard. flock on a per-DB_ROOT lock file prevents a
-       second shard-db process from attaching to the same data directory
-       (which would corrupt shared mmap state — the per-object rwlocks in
-       objlock.c are in-process only). The lock is held by the kernel for
-       the server process lifetime and released automatically on exit or
-       crash; fork() carries the open-file-description across so the
-       daemon child inherits the held lock after the parent returns. */
-    char lockpath[PATH_MAX];
-    snprintf(lockpath, sizeof(lockpath), "%s/.shard-db.lock", db_root);
-    int lock_fd = open(lockpath, O_CREAT | O_RDWR, 0644);
-    if (lock_fd < 0) {
-        fprintf(stderr, "Error: cannot open lock file %s: %s\n", lockpath, strerror(errno));
-        return 1;
-    }
-    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+    if (rebuild_recovery(db_root) != 0) {
         fprintf(stderr,
-                "Error: another shard-db instance is already running on DB_ROOT=%s "
-                "(lock held on %s). Stop it first with './shard-db stop'.\n",
-                db_root, lockpath);
-        close(lock_fd);
+                "shard-db: refusing to start: rebuild recovery requires manual intervention\n");
+        db_root_lock_release(&lock_fd);
         return 1;
     }
 
@@ -3409,14 +3397,14 @@ int cmd_server(const char *db_root, int daemonize) {
                 "  Or restore from a backup: ./shard-db restore <object> <timestamp>\n"
                 "  See full error log at %s/error-*.log.\n\n",
                 validate_errors, validate_errors == 1 ? "" : "s", g_log_dir);
-            close(lock_fd);
+            db_root_lock_release(&lock_fd);
             return 1;
         }
     }
 
     if (daemonize) {
         pid_t pid = fork();
-        if (pid < 0) { perror("fork"); close(lock_fd); return 1; }
+        if (pid < 0) { perror("fork"); db_root_lock_release(&lock_fd); return 1; }
         if (pid > 0) {
             usleep(200000);
             OUT("shard-db started (pid %d, port %d)\n", pid, port);
@@ -3576,11 +3564,6 @@ int cmd_server(const char *db_root, int daemonize) {
     if (io_pool_sz < 4) io_pool_sz = 4;                   /* absolute floor on single/dual-core */
     if (io_pool_sz > (int)nproc * 8) io_pool_sz = (int)nproc * 8; /* cap: beyond 8× scheduler thrash dominates */
     parallel_io_pool_init(io_pool_sz);
-    /* load_dirs() already called pre-fork (see validate_metadata block). */
-    load_tokens_conf(db_root);
-    load_allowed_ips_conf(db_root);
-    objlock_init();
-    rebuild_recovery(db_root);
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
