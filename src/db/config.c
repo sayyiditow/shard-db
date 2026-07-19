@@ -472,6 +472,33 @@ int load_db_root(char *out, size_t outlen) {
                configuration.md. */
             int n = atoi(p + 28);
             if (n >= 0 && g_db) g_schema_wrlock_test_delay_ms = n;
+        } else if (strncmp(p, "REBUILD_TEST_PAUSE_PHASE=", 25) == 0) {
+            char *v = p + 25;
+            v[strcspn(v, "\r\n")] = '\0';
+            if (strcmp(v, "after-stage") == 0 ||
+                strcmp(v, "after-walk") == 0 ||
+                strcmp(v, "after-metadata") == 0 ||
+                strcmp(v, "after-commit") == 0) {
+                if (g_db) snprintf(g_rebuild_test_pause_phase,
+                                   sizeof(g_rebuild_test_pause_phase), "%s", v);
+            } else {
+                fprintf(stderr,
+                        "config: invalid REBUILD_TEST_PAUSE_PHASE=%s; hook disabled\n",
+                        v);
+                if (g_db) g_rebuild_test_pause_phase[0] = '\0';
+            }
+        } else if (strncmp(p, "REBUILD_TEST_PAUSE_MS=", 22) == 0) {
+            char *end = NULL;
+            long n = strtol(p + 22, &end, 10);
+            while (end && (*end == ' ' || *end == '\r' || *end == '\n')) end++;
+            if (!end || end == p + 22 || *end != '\0' || n < 0 ||
+                n > INT_MAX) {
+                fprintf(stderr,
+                        "config: invalid REBUILD_TEST_PAUSE_MS; hook disabled\n");
+                if (g_db) g_rebuild_test_pause_ms = 0;
+            } else if (g_db) {
+                g_rebuild_test_pause_ms = (int)n;
+            }
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
                 const char *v = p + 7;
@@ -3770,4 +3797,3 @@ void test_reset_caches(void) {
     pthread_mutex_unlock(&g_idx_lock);
 }
 #endif
-

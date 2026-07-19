@@ -107,12 +107,20 @@ typedef struct {
 } OdSegAdapterCtx;
 
 /* query.c — rebuild engine (used by query_schema.c::cmd_edit_fields) */
+typedef struct {
+    int (*apply_metadata)(void *ctx);
+    int (*rebuild_indexes)(void *ctx, int *out_rebuilt);
+    void *ctx;
+    int indexes_may_change;
+} RebuildFinalizeOps;
+
 int rebuild_object_v2(const char *db_root, const char *object,
                       const Schema *old_sch, const TypedSchema *old_ts,
                       const Schema *new_sch, TypedSchema *new_ts,
                       int *new_to_old, int slot_changed,
                       int splits_changed, int drop_tombstoned,
-                      char added_lines[][256], int n_added);
+                      char added_lines[][256], int n_added,
+                      const RebuildFinalizeOps *finalize);
 int v2_rebuild_walk_cb(const uint8_t hash16[16],
                        const void *key, size_t klen,
                        const void *value, size_t vlen,

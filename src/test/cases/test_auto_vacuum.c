@@ -29,6 +29,50 @@
 
 
 
+static pid_t spawn_concurrent_insert(int port) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    TestClientCfg cfg = { .port = port, .io_timeout_ms = 15000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) _exit(2);
+    char *resp = NULL;
+    int rc = tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"big\","
+        "\"key\":\"concurrent\",\"value\":{\"v\":999}}", &resp);
+    int ok = rc == 0 && resp && SAFE_STRSTR(resp, "\"status\":\"inserted\"");
+    free(resp);
+    tc_close(tc);
+    _exit(ok ? 0 : 3);
+}
+
+static int force_big_stream_mismatch(const char *schema_path) {
+    FILE *in = fopen(schema_path, "r");
+    if (!in) return -1;
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", schema_path);
+    FILE *out = fopen(tmp, "w");
+    if (!out) { fclose(in); return -1; }
+    int changed = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), in)) {
+        int splits = 0, max_key = 0, version = 0, streams = 0;
+        if (sscanf(line, "default:big:%d:%d:%d:%d", &splits, &max_key,
+                   &version, &streams) == 4) {
+            int wrong = streams == 16 ? 15 : streams + 1;
+            fprintf(out, "default:big:%d:%d:%d:%d\n",
+                    splits, max_key, version, wrong);
+            changed = 1;
+        } else {
+            fputs(line, out);
+        }
+    }
+    int rc = 0;
+    if (fclose(in) != 0 || fclose(out) != 0 || !changed ||
+        rename(tmp, schema_path) != 0) rc = -1;
+    if (rc != 0) unlink(tmp);
+    return rc;
+}
+
 
 static int test_auto_vacuum_run(void) {
     char base[256], db_root[256];
@@ -59,7 +103,9 @@ static int test_auto_vacuum_run(void) {
         "export AUTO_VACUUM=1\n"
         "export AUTO_VACUUM_INTERVAL_SEC=60\n"
         "export VACUUM_RECOMMEND_TOMBSTONE_PCT=10\n"
-        "export VACUUM_RECOMMEND_MIN_DELETED=10\n",
+        "export VACUUM_RECOMMEND_MIN_DELETED=10\n"
+        "export REBUILD_TEST_PAUSE_PHASE=after-stage\n"
+        "export REBUILD_TEST_PAUSE_MS=3000\n",
         db_root, port, base);
     fclose(f);
 
@@ -188,6 +234,22 @@ static int test_auto_vacuum_run(void) {
     ASSERT_EQ_INT(tu_parse_count(resp), 30, "big orphaned=30 pre-vacuum");
     free(resp); resp = NULL;
 
+    /* Restart with a deliberately mismatched stored stream count so the
+       background vacuum upgrades from its light path to rebuild_object_v2. */
+    tc_close(tc);
+    tc = NULL;
+    test_env_kill(&env);
+    char schema_path[PATH_MAX];
+    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
+    ASSERT_EQ_INT(force_big_stream_mismatch(schema_path), 0,
+                  "force stream-count mismatch for auto-vacuum rebuild");
+    ASSERT_EQ_INT(test_env_start_at(&env, db_root, port), 0,
+                  "restart auto-vacuum fixture with stream mismatch");
+    cfg.port = env.port;
+    tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "reconnect after stream mismatch");
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
+
     /* Force the auto-vacuum cycle. We can't shrink AUTO_VACUUM_INTERVAL_SEC
        below 60s (config floor), and waiting 60s+ is too slow for a unit
        test. Instead, restart the daemon — the auto-vacuum thread runs ONCE
@@ -204,9 +266,41 @@ static int test_auto_vacuum_run(void) {
     if (getenv("SHARD_TEST_FAST")) {
         TAP_DIAG("# auto-vacuum: SHARD_TEST_FAST set, skipping the 90s wake test\n");
     } else {
-        TAP_DIAG("# auto-vacuum: sleeping 90s for the first thread tick…\n");
+        TAP_DIAG("# auto-vacuum: waiting for the first thread tick…\n");
         fflush(_TAP_OUT);
-        sleep(90);
+        char marker[PATH_MAX];
+        snprintf(marker, sizeof(marker),
+                 "%s/default/big/.rebuild-test-after-stage.active", db_root);
+        int reached = 0;
+        for (int i = 0; i < 900; i++) {
+            if (access(marker, F_OK) == 0) { reached = 1; break; }
+            struct timespec poll = { 0, 100 * 1000000L };
+            nanosleep(&poll, NULL);
+        }
+        ASSERT_TRUE(reached,
+                    "auto-vacuum reaches streams-mismatch rebuild pause");
+
+        pid_t insert_pid = reached ? spawn_concurrent_insert(port) : -1;
+        ASSERT_TRUE(insert_pid > 0, "spawn concurrent insert");
+        if (insert_pid > 0) {
+            struct timespec blocked_wait = { 0, 300 * 1000000L };
+            nanosleep(&blocked_wait, NULL);
+            int early_status = 0;
+            ASSERT_EQ_INT(waitpid(insert_pid, &early_status, WNOHANG), 0,
+                          "insert remains blocked while auto-vacuum holds write lock");
+            int status = 0, reaped = 0;
+            for (int i = 0; i < 100; i++) {
+                if (waitpid(insert_pid, &status, WNOHANG) == insert_pid) {
+                    reaped = 1;
+                    break;
+                }
+                struct timespec poll = { 0, 100 * 1000000L };
+                nanosleep(&poll, NULL);
+            }
+            ASSERT_TRUE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                        "insert completes after auto-vacuum releases write lock");
+            if (!reaped) { kill(insert_pid, SIGKILL); waitpid(insert_pid, NULL, 0); }
+        }
 
         tc_request(tc, "{\"mode\":\"orphaned\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
         int orphaned_after = tu_parse_count(resp);
@@ -220,7 +314,15 @@ static int test_auto_vacuum_run(void) {
 
         /* Live count for big unchanged (vacuum reclaims tombstones, not live). */
         tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"big\"}", &resp);
-        ASSERT_EQ_INT(tu_parse_count(resp), 20, "big count=20 (50 - 30 deleted)");
+        ASSERT_EQ_INT(tu_parse_count(resp), 21,
+                      "big count includes concurrent insert after rebuild");
+        free(resp); resp = NULL;
+
+        tc_request(tc,
+            "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"big\","
+            "\"key\":\"concurrent\"}", &resp);
+        ASSERT_CONTAINS(resp, "\"v\":999",
+                        "concurrent insert remains readable after auto-vacuum");
         free(resp); resp = NULL;
     }
 

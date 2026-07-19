@@ -1901,7 +1901,9 @@ int cmd_add_indexes(const char *db_root, const char *object,
     int total_fields = nfields;  /* preserved across the btree-only reduction below */
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
-    MFFieldDesc *descs = calloc((size_t)total_fields, sizeof(MFFieldDesc));
+    MFFieldDesc *descs = total_fields > 0
+                       ? calloc((size_t)total_fields, sizeof(MFFieldDesc))
+                       : NULL;
     int n_desc = 0;
 
     for (int i = 0; i < nfields; i++) {
@@ -3075,16 +3077,20 @@ static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
    kf-scan via build_indexes_streaming_multi (one pass, all fields).
    Caller must hold objlock_wrlock(eff_root, object) — cmd_reindex takes it
    per-object; rebuild_object_v2 (vacuum) inherits it from the server dispatch.
-   Returns the number of indexes rebuilt; 0 if index.conf is absent or empty. */
-int reindex_object(const char *eff_root, const char *object, int composites_only) {
+   Checked form returns 0 on success and writes the rebuilt count; the
+   compatibility wrapper below retains the historic count-or-zero result. */
+int reindex_object_checked(const char *eff_root, const char *object,
+                           int composites_only, int *out_count) {
+    if (!out_count) return -1;
+    *out_count = 0;
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
              eff_root, object);
     FILE *ic = fopen(ic_path, "r");
-    if (!ic) return 0;
+    if (!ic) return errno == ENOENT ? 0 : -1;
 
     char (*field_specs)[512] = malloc((size_t)MAX_FIELDS * 512);
-    if (!field_specs) { fclose(ic); return 0; }
+    if (!field_specs) { fclose(ic); return -1; }
     int nf = 0;
     char fline[512];
     while (fgets(fline, sizeof(fline), ic) && nf < MAX_FIELDS) {
@@ -3130,15 +3136,21 @@ int reindex_object(const char *eff_root, const char *object, int composites_only
     /* Build MFFieldDesc array: parse each index.conf line, resolve type
        (with the same auto-promotion logic as cmd_add_index), fill indices. */
     Schema sch = load_schema(eff_root, object);
+    if (sch.splits <= 0 || sch.streams <= 0) {
+        free(field_specs);
+        LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: cannot load schema",
+                  eff_root, object);
+        return -1;
+    }
     TypedSchema *ts = load_typed_schema(eff_root, object);
     if (!ts) {
         free(field_specs);
         LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: cannot load typed schema", eff_root, object);
-        return 0;
+        return -1;
     }
 
     MFFieldDesc *descs = calloc((size_t)nf, sizeof(MFFieldDesc));
-    if (!descs) { free(field_specs); return 0; }
+    if (!descs) { free(field_specs); return -1; }
     int n_desc = 0;
 
     for (int i = 0; i < nf; i++) {
@@ -3197,13 +3209,28 @@ int reindex_object(const char *eff_root, const char *object, int composites_only
         n_desc++;
     }
 
+    int build_rc = 0;
     if (n_desc > 0)
-        build_indexes_streaming_multi(eff_root, object, &sch, ts, descs, n_desc);
+        build_rc = build_indexes_streaming_multi(eff_root, object, &sch, ts,
+                                                  descs, n_desc);
 
     free(descs);
     free(field_specs);
+    if (build_rc != 0) {
+        LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: index build failed",
+                  eff_root, object);
+        return -1;
+    }
+    *out_count = nf;
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
-    return nf;
+    return 0;
+}
+
+int reindex_object(const char *eff_root, const char *object,
+                   int composites_only) {
+    int count = 0;
+    return reindex_object_checked(eff_root, object, composites_only, &count) == 0
+               ? count : 0;
 }
 
 /* Legacy single-file sweep — kept for cmd_reindex's per-object loop where

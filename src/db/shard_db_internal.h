@@ -119,6 +119,7 @@ struct IdxCache {
 struct ShardDb {
     /* config scalars */
     char     db_root[PATH_MAX];
+    int      db_root_lock_fd;
     uint32_t timeout;
     int      port;
     int      workers;
@@ -160,6 +161,8 @@ struct ShardDb {
     int kfcache_test_hold_ms; /* test-only; 0 = off in production */
     int warmup_test_delay_ms; /* test-only; 0 = off in production */
     int schema_wrlock_test_delay_ms; /* test-only; 0 = off in production */
+    char rebuild_test_pause_phase[32]; /* test-only; empty = disabled */
+    int rebuild_test_pause_ms;         /* test-only; 0 = disabled */
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
@@ -310,6 +313,8 @@ extern __thread ShardDb *g_db;
 #define g_kfcache_test_hold_ms      (g_db->kfcache_test_hold_ms)
 #define g_warmup_test_delay_ms      (g_db->warmup_test_delay_ms)
 #define g_schema_wrlock_test_delay_ms (g_db->schema_wrlock_test_delay_ms)
+#define g_rebuild_test_pause_phase  (g_db->rebuild_test_pause_phase)
+#define g_rebuild_test_pause_ms     (g_db->rebuild_test_pause_ms)
 #define g_warmup_mode               (g_db->warmup_mode)
 #define g_log_level                 (g_db->log_level)
 #define g_log_retain_days           (g_db->log_retain_days)

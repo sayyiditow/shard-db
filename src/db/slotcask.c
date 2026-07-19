@@ -195,9 +195,15 @@ static int kfcache_probe(const char *path, int *out_found) {
     return -1;
 }
 
-static void kfcache_drop_slot(int slot) {
+/* Caller holds g_kfcache_lock. Returns with it held. Lock entries before
+   re-taking the table mutex so every cache path follows entry -> table and
+   nested kf/segment walks cannot form a table -> entry -> table cycle. */
+static int kfcache_drop_slot(int slot) {
     KfCacheEntry *e = &g_kfcache[slot];
-    if (!e->used) return;
+    if (!e->used) return 1;
+    uint64_t expected_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+    char expected_path[PATH_MAX];
+    snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     /* Exclude any thread still holding this slot's rwlock from an earlier
        kfcache_acquire() (e.g. slotcask_pool_rebuild_worker's long
        rdlock-held walk over kh.map) before munmapping under it — the
@@ -205,7 +211,15 @@ static void kfcache_drop_slot(int slot) {
        bookkeeping, not live e->base access. Without this, LRU eviction
        or a stale-entry drop can munmap out from under a concurrent
        reader, producing a SEGV. */
+    pthread_mutex_unlock(&g_kfcache_lock);
     pthread_rwlock_wrlock(&e->rwlock);
+    pthread_mutex_lock(&g_kfcache_lock);
+    if (!e->used ||
+        atomic_load_explicit(&e->gen, memory_order_acquire) != expected_gen ||
+        strcmp(e->path, expected_path) != 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 0;
+    }
     if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
     if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
@@ -221,21 +235,19 @@ static void kfcache_drop_slot(int slot) {
     atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_kfcache_count--;
     pthread_rwlock_unlock(&e->rwlock);
+    return 1;
 }
 
 /* Drop every cached kf shard whose path starts with `prefix`. Used by
    slotcask_registry_invalidate to flush stale mmap regions before the
    on-disk files move (rebuild_object_v2) or vanish (drop-object).
 
-   Lock-ordering: kfcache_acquire's install path holds g_kfcache_lock
-   while taking the per-entry rwlock. To avoid deadlock we must NOT
-   hold the rwlock while reaching for the table mutex. Pattern: read
-   (path, used) without mutex (slots array is fixed-size, fields are
-   pointer/byte-sized so torn reads aren't a concern; install only
-   writes them under mutex), take rwlock for matching slots, do the
-   munmap/close/clear under rwlock alone, decrement g_kfcache_count
-   atomically. The caller (per-object wrlock) guarantees no concurrent
-   ops on THIS object so the rwlock contention is bounded. */
+   Lock-ordering: cache eviction and installation never hold the table mutex
+   while waiting for an entry rwlock. Prefix invalidation likewise takes only
+   the entry rwlock. The slots array is fixed-size; `used` is published
+   atomically, and identity is rechecked after taking the entry lock. The
+   caller (per-object wrlock) guarantees no concurrent ops on THIS object, so
+   rwlock contention is bounded. */
 static void kfcache_invalidate_prefix(const char *prefix) {
     if (!g_kfcache || !prefix || !prefix[0]) return;
     size_t pl = strlen(prefix);
@@ -515,7 +527,9 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                 lru = i;
             }
         }
-        if (lru >= 0) { kfcache_drop_slot(lru); slot = lru; }
+        if (lru >= 0) {
+            slot = kfcache_drop_slot(lru) ? lru : -1;
+        }
     }
 
     if (slot < 0) {
@@ -538,11 +552,19 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     e->file_ino = ino;
     g_kfcache_count++;
 
-    /* Take rwlock before releasing table mutex (closes evict-after-install race). */
+    /* Publish under the table mutex, then take the entry lock without holding
+       the table mutex. An evictor that wins this race closes the just-opened
+       mapping; identity verification detects that and retries safely. */
     pthread_rwlock_t *lock = &e->rwlock;
+    pthread_mutex_unlock(&g_kfcache_lock);
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
-    pthread_mutex_unlock(&g_kfcache_lock);
+
+    if (!e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
+        e->file_ino != ino) {
+        pthread_rwlock_unlock(lock);
+        return kfcache_acquire(h, path, slots_capacity, writer);
+    }
 
     h->slot = slot;
     kf_handle_from_entry(h, e);
@@ -666,10 +688,8 @@ static int segcache_probe(const char *path, int *out_found) {
     return -1;
 }
 
-/* Mirrors kfcache_invalidate_prefix — drop every cached segment under a
-   given path prefix. Same lock-ordering rules: never hold the entry
-   rwlock while reaching for g_segcache_lock; that would deadlock against
-   segcache_acquire's install path. */
+/* Mirrors kfcache_invalidate_prefix -- drop every cached segment under a
+   given path prefix while holding only the matching entry rwlock. */
 static void segcache_invalidate_prefix(const char *prefix) {
     if (!g_segcache || !prefix || !prefix[0]) return;
     size_t pl = strlen(prefix);
@@ -695,14 +715,27 @@ static void segcache_invalidate_prefix(const char *prefix) {
     }
 }
 
-static void segcache_drop_slot(int slot) {
+/* Caller holds g_segcache_lock. Returns with it held. See the kf-cache
+   equivalent for the entry -> table lock-order invariant. */
+static int segcache_drop_slot(int slot) {
     SegCacheEntry *e = &g_segcache[slot];
-    if (!e->used) return;
+    if (!e->used) return 1;
+    uint64_t expected_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+    char expected_path[PATH_MAX];
+    snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     /* See kfcache_drop_slot's comment: exclude any thread still holding
        this slot's rwlock from an earlier segcache_acquire() before
        munmapping under it — the caller only holds g_segcache_lock, which
        guards slot-table bookkeeping, not live e->map access. */
+    pthread_mutex_unlock(&g_segcache_lock);
     pthread_rwlock_wrlock(&e->rwlock);
+    pthread_mutex_lock(&g_segcache_lock);
+    if (!e->used ||
+        atomic_load_explicit(&e->gen, memory_order_acquire) != expected_gen ||
+        strcmp(e->path, expected_path) != 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 0;
+    }
     if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
     if (e->map) munmap(e->map, e->map_size);
     if (e->fd >= 0) close(e->fd);
@@ -717,6 +750,7 @@ static void segcache_drop_slot(int slot) {
     atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
     g_segcache_count--;
     pthread_rwlock_unlock(&e->rwlock);
+    return 1;
 }
 
 /* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */
@@ -880,7 +914,9 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
                 lru = i;
             }
         }
-        if (lru >= 0) { segcache_drop_slot(lru); slot = lru; }
+        if (lru >= 0) {
+            slot = segcache_drop_slot(lru) ? lru : -1;
+        }
     }
 
     if (slot < 0) {
@@ -905,9 +941,15 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     g_segcache_count++;
 
     pthread_rwlock_t *lock = &e->rwlock;
+    pthread_mutex_unlock(&g_segcache_lock);
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
-    pthread_mutex_unlock(&g_segcache_lock);
+
+    if (!e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
+        e->file_ino != ino) {
+        pthread_rwlock_unlock(lock);
+        return segcache_acquire(h, path, create, writer);
+    }
 
     h->slot = slot;
     h->fd = fd;
@@ -1416,8 +1458,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
             t->stream_id = stream_id;
             t->file_id = file_id;
             t->offset = offset;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            t->flag = 1;
+            __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
             if (hdr) {
                 if (reused_tomb) hdr->deleted--;   /* tombstone reclaimed */
                 else             hdr->total++;    /* fresh slot occupied */
@@ -1437,8 +1478,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
             e->stream_id = stream_id;
             e->file_id = file_id;
             e->offset = offset;
-            __atomic_thread_fence(__ATOMIC_RELEASE);
-            e->flag = 1;
+            __atomic_store_n(&e->flag, 1, __ATOMIC_RELEASE);
             if (hdr) hdr->deleted--;  /* tombstone reclaimed; total unchanged */
             (*used_delta)++;
             if (out_slot) *out_slot = slot;
@@ -1456,8 +1496,7 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
         t->stream_id = stream_id;
         t->file_id = file_id;
         t->offset = offset;
-        __atomic_thread_fence(__ATOMIC_RELEASE);
-        t->flag = 1;
+        __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
         if (hdr) hdr->deleted--;  /* tombstone reclaimed */
         (*used_delta)++;
         if (out_slot) *out_slot = first_tomb;
@@ -6548,6 +6587,58 @@ static int cmp_fid_asc(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+typedef struct {
+    uint8_t hash[16];
+    uint32_t offset;
+} RebuildKfCandidate;
+
+/* Apply candidates only after releasing the segment-cache entry lock.
+   Normal reads hold a kf entry while verifying its segment record, so rebuild
+   must never acquire a kf entry while it still owns a segment entry. */
+static int rebuild_kf_apply_candidates(SlotcaskDb *db,
+                                       const RebuildKfCandidate *candidates,
+                                       size_t count, uint8_t stream_id,
+                                       uint16_t file_id) {
+    int repaired = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *hash16 = candidates[i].hash;
+        int kfshard = shard_for_hash(hash16, db->num_shards);
+        char kfp[PATH_MAX];
+        kf_path_for(kfp, db->data_dir, kfshard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kfp, db->slots_per_shard, 1) != 0)
+            continue;
+
+        /* Match kf entries by hash only -- no key re-fetch from the segment.
+           xxh128 collisions are negligible; a segment record with a corrupted
+           hash field could theoretically repoint an unrelated live entry.
+           Acceptable: this is a recovery-only operation invoked explicitly by
+           an operator. */
+        size_t cap = kh.capacity;
+        size_t kstart = kf_slot_for(hash16, cap);
+        for (size_t ki = 0; ki < cap; ki++) {
+            size_t kslot = (kstart + ki) % cap;
+            SlotcaskKfEntry *ke = &kh.map[kslot];
+            if (ke->flag == 0) break; /* probe chain end */
+            if (memcmp(ke->hash, hash16, 16) != 0) continue;
+            if (ke->flag == 1 &&
+                (ke->stream_id != stream_id ||
+                 ke->file_id != file_id ||
+                 ke->offset != candidates[i].offset)) {
+                kf_repoint_at_slot(&kh, kslot, stream_id, file_id,
+                                   candidates[i].offset);
+                repaired++;
+            }
+            /* flag=2: deleted key -- leave tombstone intact. */
+            break;
+        }
+        kfcache_release(&kh);
+    }
+
+    return repaired;
+}
+
 /* Rebuild the kf for every live segment record.
  *
  * Scans ALL segment files for all streams in ascending file_id order.
@@ -6601,71 +6692,53 @@ int slotcask_rebuild_kf(SlotcaskDb *db) {
         for (size_t fi = 0; fi < nfids; fi++) {
             char seg_path[PATH_MAX];
             seg_path_for(seg_path, db->data_dir, s, fids[fi]);
-            SlotcaskSegHandle sh;
-            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
-
             size_t off = 0;
-            size_t file_size = sh.map_size;
+            int scan_done = 0;
 
-            while (off + 24 <= file_size) {
-                const uint8_t *rec = sh.map + off;
-                uint8_t  flag = rec[18];
-                uint16_t klen;
-                uint32_t vlen;
-                memcpy(&klen, rec + 16, 2);
-                memcpy(&vlen, rec + 20, 4);
+            while (!scan_done) {
+                SlotcaskSegHandle sh;
+                if (segcache_acquire(&sh, seg_path, 0, 0) != 0) break;
 
-                size_t rec_size;
-                if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-                    rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-                } else {
-                    rec_size = (size_t)db->slot_size;
-                }
-                if (off + rec_size > file_size) break;
+                RebuildKfCandidate candidates[256];
+                size_t candidate_count = 0;
+                size_t file_size = sh.map_size;
 
-                if (flag == 1) {
-                    const uint8_t *hash16 = rec;
-                    int kfshard = shard_for_hash(hash16, db->num_shards);
-                    char kfp[PATH_MAX];
-                    kf_path_for(kfp, db->data_dir, kfshard);
-                    SlotcaskKfHandle kh;
-                    if (kfcache_acquire(&kh, kfp, db->slots_per_shard, 1) == 0) {
-                        /* Match kf entries by hash only — no key re-fetch from
-                           segment.  xxh128 collisions are negligible; a segment
-                           record with a corrupted hash field could theoretically
-                           repoint an unrelated live entry.  Acceptable: this is
-                           a recovery-only operation invoked explicitly by an
-                           operator. */
-                        size_t cap = kh.capacity;
-                        size_t kstart = kf_slot_for(hash16, cap);
-                        for (size_t ki = 0; ki < cap; ki++) {
-                            size_t kslot = (kstart + ki) % cap;
-                            SlotcaskKfEntry *ke = &kh.map[kslot];
-                            if (ke->flag == 0) break; /* probe chain end */
-                            if (memcmp(ke->hash, hash16, 16) != 0) continue;
-                            if (ke->flag == 1) {
-                                /* Only update if location differs. */
-                                if (ke->stream_id != (uint8_t)s ||
-                                    ke->file_id   != (uint16_t)fids[fi] ||
-                                    ke->offset    != (uint32_t)off) {
-                                    kf_repoint_at_slot(&kh, kslot,
-                                                        (uint8_t)s,
-                                                        (uint16_t)fids[fi],
-                                                        (uint32_t)off);
-                                    total_repaired++;
-                                }
-                            }
-                            /* flag=2: deleted key — leave tombstone intact. */
-                            break;
-                        }
-                        kfcache_release(&kh);
+                while (off + 24 <= file_size &&
+                       candidate_count < sizeof(candidates) / sizeof(candidates[0])) {
+                    const uint8_t *rec = sh.map + off;
+                    uint8_t flag = rec[18];
+                    uint16_t klen;
+                    uint32_t vlen;
+                    memcpy(&klen, rec + 16, 2);
+                    memcpy(&vlen, rec + 20, 4);
+
+                    size_t rec_size;
+                    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
+                        rec_size = slotcask_record_size_varlen((size_t)klen,
+                                                               (size_t)vlen);
+                    } else {
+                        rec_size = (size_t)db->slot_size;
                     }
+                    if (off + rec_size > file_size) {
+                        scan_done = 1;
+                        break;
+                    }
+
+                    if (flag == 1) {
+                        memcpy(candidates[candidate_count].hash, rec, 16);
+                        candidates[candidate_count].offset = (uint32_t)off;
+                        candidate_count++;
+                    }
+                    off += rec_size;
                 }
 
-                off += rec_size;
-            }
+                if (off + 24 > file_size) scan_done = 1;
+                segcache_release(&sh);
 
-            segcache_release(&sh);
+                total_repaired += rebuild_kf_apply_candidates(
+                    db, candidates, candidate_count, (uint8_t)s,
+                    (uint16_t)fids[fi]);
+            }
         }
 
         free(fids);

@@ -986,6 +986,8 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
    When composites_only is non-zero, only fields containing '+' (composite
    indexes) are rebuilt. */
 int reindex_object(const char *eff_root, const char *object, int composites_only);
+int reindex_object_checked(const char *eff_root, const char *object,
+                           int composites_only, int *out_count);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 
@@ -1222,7 +1224,20 @@ void objlock_rdlock(const char *db_root, const char *object);
 void objlock_rdunlock(const char *db_root, const char *object);
 void objlock_wrlock(const char *db_root, const char *object);
 void objlock_wrunlock(const char *db_root, const char *object);
-void rebuild_recovery(const char *db_root);
+int rebuild_recovery(const char *db_root);
+int db_root_lock_acquire(const char *db_root, int *out_fd);
+void db_root_lock_release(int *fd);
+
+typedef struct RebuildTxn RebuildTxn;
+
+RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
+                              int old_splits, int old_streams,
+                              int indexes_may_change);
+const char *rebuild_txn_legacy_root(const RebuildTxn *txn);
+int rebuild_txn_commit(RebuildTxn *txn);
+int rebuild_txn_abort(RebuildTxn *txn);
+void rebuild_txn_cleanup_committed(RebuildTxn *txn);
+void rebuild_txn_free(RebuildTxn *txn);
 
 /* logging — see src/db/log.h for the macros + subsystem registry. */
 #include "log.h"

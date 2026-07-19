@@ -264,15 +264,15 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
 /* Selective reindex driver — walks index.conf and only rebuilds indexes
    whose referenced fields appear in dirty_names[]. Returns (rebuilt,
    skipped) via out params. */
-static void selective_reindex_dirty(const char *db_root, const char *object,
-                                    char dirty_names[][128], int n_dirty,
-                                    int *out_rebuilt, int *out_skipped) {
+static int selective_reindex_dirty(const char *db_root, const char *object,
+                                   char dirty_names[][128], int n_dirty,
+                                   int *out_rebuilt, int *out_skipped) {
     *out_rebuilt = 0; *out_skipped = 0;
-    if (n_dirty <= 0) return;
+    if (n_dirty <= 0) return 0;
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf", db_root, object);
     FILE *ic = fopen(ic_path, "r");
-    if (!ic) return;
+    if (!ic) return errno == ENOENT ? 0 : -1;
 
     char affected_specs[MAX_FIELDS][256];
     int n_aff = 0;
@@ -303,7 +303,7 @@ static void selective_reindex_dirty(const char *db_root, const char *object,
     }
     fclose(ic);
 
-    if (n_aff == 0) return;
+    if (n_aff == 0) return 0;
 
     Schema sch = load_schema(db_root, object);
     for (int i = 0; i < n_aff; i++) {
@@ -338,10 +338,38 @@ static void selective_reindex_dirty(const char *db_root, const char *object,
     FILE *saved_out = g_out;
     FILE *devnull = fopen("/dev/null", "w");
     g_out = devnull ? devnull : saved_out;
-    cmd_add_indexes(db_root, object, fields_json, 1);
+    int rc = cmd_add_indexes(db_root, object, fields_json, 1);
     g_out = saved_out;
     if (devnull) fclose(devnull);
-    *out_rebuilt = n_aff;
+    if (rc == 0) *out_rebuilt = n_aff;
+    return rc;
+}
+
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const char *obj_dir;
+    char (*edit_lines)[256];
+    int n_edits;
+    char (*dirty_names)[128];
+    int n_dirty;
+    int idx_rebuilt;
+    int idx_skipped;
+} EditFinalizeCtx;
+
+static int edit_finalize_metadata(void *ctx_) {
+    EditFinalizeCtx *ctx = (EditFinalizeCtx *)ctx_;
+    return rewrite_fields_conf_for_edit(ctx->obj_dir, ctx->edit_lines,
+                                        ctx->n_edits);
+}
+
+static int edit_finalize_indexes(void *ctx_, int *out_rebuilt) {
+    EditFinalizeCtx *ctx = (EditFinalizeCtx *)ctx_;
+    int rc = selective_reindex_dirty(ctx->db_root, ctx->object,
+                                     ctx->dirty_names, ctx->n_dirty,
+                                     &ctx->idx_rebuilt, &ctx->idx_skipped);
+    *out_rebuilt = ctx->idx_rebuilt;
+    return rc;
 }
 
 int cmd_edit_fields(const char *db_root, const char *object,
@@ -613,42 +641,37 @@ int cmd_edit_fields(const char *db_root, const char *object,
        numeric-scale-only edits where slot_size happens to be unchanged.
        For edit-field we always need the recompose path when any field's
        encoding changed (needs_rebuild==1 here). */
+    EditFinalizeCtx finalize_ctx = {
+        .db_root = db_root, .object = object, .obj_dir = obj_dir,
+        .edit_lines = lines, .n_edits = n_edits,
+        .dirty_names = dirty_names, .n_dirty = n_dirty,
+    };
+    RebuildFinalizeOps finalize = {
+        .apply_metadata = edit_finalize_metadata,
+        .rebuild_indexes = edit_finalize_indexes,
+        .ctx = &finalize_ctx,
+        .indexes_may_change = n_dirty > 0,
+    };
     int rc = rebuild_object_v2(db_root, object, &old_sch, old_ts,
                                 &new_sch, &new_ts, new_to_old,
                                 1 /* slot_changed → force recompose */,
                                 0 /* splits_changed */,
                                 0 /* drop_tombstoned */,
-                                NULL /* added_lines */, 0 /* n_added */);
+                                NULL /* added_lines */, 0 /* n_added */,
+                                &finalize);
     if (rc != 0) {
         /* rebuild_object_v2 already emitted an {"error":..} response. */
         return rc;
     }
 
-    /* Rebuild succeeded — rewrite fields.conf to lock in the new spec. */
-    if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
-        /* Data is already in new shape but fields.conf still reflects old.
-           This is the unrecoverable corner. Log loudly so the operator can
-           fix manually. */
-        LOG_ERROR(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: data rebuilt but fields.conf rewrite "
-                   "failed — manual repair required", db_root, object);
-        OUT("{\"error\":\"Data rebuilt but fields.conf rewrite failed; manual repair required\"}\n");
-        return 1;
-    }
-    invalidate_schema_caches(db_root, object);
-
-    /* Wipe + rebuild only indexes whose referenced fields actually had
-       their encoding change. Skipped indexes remain intact and functional. */
-    int idx_rebuilt = 0, idx_skipped = 0;
-    selective_reindex_dirty(db_root, object, dirty_names, n_dirty,
-                            &idx_rebuilt, &idx_skipped);
-
     LOG_AUDIT(LOG_SUB_CONFIG, "EDIT-FIELD %s/%s: %d fields edited, slot_size=%d→%d, "
                "idx_rebuilt=%d, idx_skipped=%d",
             db_root, object, n_edits, old_sch.slot_size, new_sch.slot_size,
-            idx_rebuilt, idx_skipped);
+            finalize_ctx.idx_rebuilt, finalize_ctx.idx_skipped);
     OUT("{\"status\":\"edited\",\"fields\":%d,\"rebuilt\":true,"
         "\"slot_size\":%d,\"indexes_rebuilt\":%d,\"indexes_skipped\":%d}\n",
-        n_edits, new_sch.slot_size, idx_rebuilt, idx_skipped);
+        n_edits, new_sch.slot_size, finalize_ctx.idx_rebuilt,
+        finalize_ctx.idx_skipped);
     for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
     return 0;
 }
