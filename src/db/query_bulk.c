@@ -10,7 +10,7 @@
 
 /* ========== BULK INSERT ========== */
 
-/* Bulk ops use ucache (unified shard cache in storage.c) */
+/* Bulk ops use the v2 slotcask storage backend (registry-cached SlotcaskDb handles). */
 
 /* ---- Shared worker types for parallel index builds ---- */
 typedef struct { char ipath[PATH_MAX]; BtEntry *pairs; size_t pair_count; } IdxBuildArg;
@@ -228,7 +228,7 @@ typedef struct {
 } BulkInsRecord;
 
 /* Per-shard bucket + worker arguments. Each bucket targets exactly one
-   shard so the worker can take the ucache wrlock **once**, write every
+   shard so the worker can take the kf-shard wrlock **once**, write every
    record in the bucket, and release **once** — avoiding per-record
    acquire/release churn. Idx entries are collected into per-worker arrays
    and merged into the caller's global arrays after the worker returns
@@ -266,7 +266,7 @@ typedef struct {
     int             if_not_exists;
     int             skipped;
     /* Phase-2 profiling: total worker wall time and time spent inside
-       ucache_grow_shard. Aggregated post-join to show "of this much
+       time spent growing a shard. Aggregated post-join to show "of this much
        Phase 2 time, X ms was grow." Helps isolate rehash cost. */
     uint64_t        wall_ms;
     uint64_t        grow_ms;
@@ -786,13 +786,13 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     return NULL;
 }
 
-/* Probe + write every record in one shard's bucket under a single ucache
-   wrlock held from start to finish. On shard-full, release the lock, grow
-   the shard, reacquire, and retry the **same** record index — avoids
-   per-record churn. Collects index entries into sw->idx_pairs for later
-   merge/bulk-build. pthread-compatible signature: workers in different
-   shard buckets never touch each other's shards, so the wrlocks are
-   disjoint and no cross-worker coordination is needed. */
+/* Probe + write every record in one shard's bucket under a single
+   kf-shard wrlock held from start to finish. On shard-full, release the
+   lock, grow the shard, reacquire, and retry the **same** record index —
+   avoids per-record churn. Collects index entries into sw->idx_pairs for
+   later merge/bulk-build. pthread-compatible signature: workers in
+   different shard buckets never touch each other's shards, so the
+   wrlocks are disjoint and no cross-worker coordination is needed. */
 static void *bulk_insert_shard_worker(void *arg) {
     BulkInsShardWork *sw = (BulkInsShardWork *)arg;
     if (sw->count == 0) return NULL;
@@ -829,7 +829,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
         return 1;
     }
 
-    /* ucache handles shard caching */
+    /* The v2 kfcache/segcache (registry-cached) handle shard caching automatically -- no manual fd/mmap management needed here. */
 
     /* Pre-allocate BtEntry collectors for bulk B+ tree build at end.
        Clamp nfields explicitly so GCC's LTO range analysis can see the
@@ -1197,7 +1197,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
     }
 
     /* ===== Phase 1.5: bucket records by shard_id so each worker owns one shard's
-       writes and can hold the ucache wrlock once for the entire bucket.
+       writes and can hold the kf-shard wrlock once for the entire bucket.
        OOM at any of the allocs below frees every prior allocation
        (records, arena, idx_pairs[], idx_pair_*, json buffer) in reverse
        order before bailing — same cleanup the success path runs at the
@@ -1297,7 +1297,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
     uint64_t t1 = now_ms_coarse();  /* end of Phase 1 (parse + bucket) */
 
     /* ===== Phase 2: run shard workers in parallel. Each worker owns one shard's
-       writes so ucache wrlocks are disjoint across workers — no cross-worker
+       writes so kf-shard wrlocks are disjoint across workers — no cross-worker
        coordination needed. Batched pthread_create/join pattern matches
        bulk_del_shard_worker. Serial fallback when thread count ≤ 1 or workload
        is small enough that spawn/join overhead would dominate. */
@@ -1365,7 +1365,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
        so there's no batched .new→active activation step to run here. */
     uint64_t t3 = now_ms_coarse();  /* end of Phase 3 (activate) */
 
-    /* ucache keeps mmaps open — OS flushes dirty pages */
+    /* The v2 kfcache/segcache keep mmaps open -- OS flushes dirty pages. */
     /* (caller owns the json buffer — no free/munmap here) */
 
     /* Bulk write indexes — one worker per field; the worker streams the per-
@@ -2907,7 +2907,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     return NULL;
 }
 
-/* Bulk-update phase 2 worker — one per shard, holds the ucache wrlock once
+/* Bulk-update phase 2 worker — one per shard, holds the kf-shard wrlock once
    for the whole bucket. Index updates (btree_insert/btree_delete) are
    serialised by bt_cache_lock inside the btree layer, so concurrent workers
    hitting the same index file are safe. */
@@ -2984,7 +2984,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     }
 
     /* Phase 2: Write — bucket matched keys by shard and fan out one worker
-       per shard. Each worker takes the ucache wrlock **once** per shard,
+       per shard. Each worker takes the kf-shard wrlock **once** per shard,
        walks its bucket end-to-end, and releases **once** — matching the
        bulk-insert pattern. Index updates (btree_insert/btree_delete) are
        serialised internally by bt_cache_lock, so concurrent workers are
@@ -3575,18 +3575,17 @@ typedef struct {
 
 /* === v2 bulk-update-json worker ===
  *
- * v1 patches fields in place under a single ucache wrlock (cheap because the
- * Zone B record lives at a fixed offset). v2 (slotcask) follows the engine's
- * locked design: every update allocates a new slot (snake-game pool reuse),
- * tombstones the old. So per record we:
+ * slotcask's locked design means every update allocates a new slot
+ * (snake-game pool reuse), tombstoning the old rather than patching in
+ * place. So per record we:
  *   1. read the old typed payload via slotcask_get
  *   2. memcpy into a heap buffer; encode_field for every touched field
  *      + auto_update fields
  *   3. slotcask_upsert_with_hooks(require_existing=1) with a pre_commit hook
  *      that performs the per-field index drop/insert diff
  *
- * Index entries are written synchronously inside the hook (mirror v1: every
- * indexed field that moved gets `delete_index_entry` + `write_index_entry`).
+ * Index entries are written synchronously inside the hook (every indexed
+ * field that moved gets `delete_index_entry` + `write_index_entry`).
  * No bulk btree merge phase — the merge phase belongs to bulk-INSERT where
  * entries point at fresh records. */
 typedef struct {
@@ -3709,14 +3708,12 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
     return 0;
 }
 
-/* Concurrency caveat (v2 bulk-update-json + delim, partial-field):
-   the read-old → patch → upsert sequence is NOT atomic. v1 holds the
-   ucache wrlock across the whole shard worker, so partial updates see
-   a consistent snapshot. v2 acquires the kf-shard wrlock per record,
-   which gives finer parallelism but means a concurrent writer between
-   the slotcask_get and the upsert can lose the racing writer's changes
-   to fields THIS bulk doesn't touch. Bulk-update has no CAS semantics
-   in either version (`if_json` is not a per-record knob in the bulk
+/* Concurrency caveat (bulk-update-json + delim, partial-field):
+   the read-old → patch → upsert sequence is NOT atomic. The kf-shard
+   wrlock is acquired per record, not held for the whole worker, so a
+   concurrent writer between the slotcask_get and the upsert can lose the
+   racing writer's changes to fields THIS bulk doesn't touch. Bulk-update
+   has no CAS semantics (`if_json` is not a per-record knob in the bulk
    protocol), so the loss is silent. Use single-record cmd_update with
    `if_json` for strict CAS; bulk-update is documented as
    "last-writer-wins on the touched fields, snapshot-of-read on the

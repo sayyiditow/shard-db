@@ -111,7 +111,7 @@ Useful knobs for embedded mode:
 # db.env  (place in your app's working directory)
 SLOW_QUERY_MS=200       # default 500 — log queries slower than this
 GLOBAL_LIMIT=10000      # default 100000 — max records returned per query
-FCACHE_MAX=4096         # default 4096 — open file-handle cache size
+FCACHE_MAX=4096         # default 4096 — entries each for kfcache/segcache; derives bt_cache/bm_cache at /4
 TOKEN_CAP=1024          # default 1024 — token table buckets
 LOG_LEVEL=3             # default 3 — 1=ERROR 2=WARN 3=INFO 4=DEBUG
 ```

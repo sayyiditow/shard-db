@@ -68,7 +68,7 @@ Changing these requires recompiling. Most don't need to change.
 | `THREADS` (parallel-pool workers) | 0 → `4 × nproc`, min 4 | Drives every parallel hot path: shard scans, parallel index builds, indexed find/count/aggregate fan-out, bulk-insert phase 2. |
 | `WORKERS` (server thread pool) | 0 → `nproc`, min 4 | Accepts connections + dispatches request handlers. |
 | `POOL_CHUNK` (parallel_for chunk) | 0 → `nproc` | Submission chunk size; rarely needs tuning. |
-| `FCACHE_MAX` (shard mmap cache) | 4096 | Strict allow-list `{4096, 8192, 12288, 16384}`. |
+| `FCACHE_MAX` (`kfcache` and `segcache`, entries per cache) | 4096 | Strict allow-list `{4096, 8192, 12288, 16384}`. |
 | `BT_CACHE_MAX` (btree mmap cache) | derived | `FCACHE_MAX / 4` since 2026.05.1; not separately configurable. |
 | In-flight writes drain timeout | 30 s | `./shard-db stop` gives writes this long to finish. |
 | Per-connection read buffer | `MAX_REQUEST_SIZE` | Allocated on first request, persists for connection lifetime. |
@@ -84,7 +84,7 @@ Changing these requires recompiling. Most don't need to change.
 | Segment files per stream | filesystem-limited | Rotate at 128 MB. Direction-C vacuum pair-merges sparse non-active segs to reclaim space. |
 | Objects per tenant (`<dir>`) | filesystem-limited | No internal cap. |
 | Tenants (`dirs.conf`) | filesystem-limited | Validated via O(1) hash. |
-| Indexes per object | no hard cap | Each is a directory of `index_splits_for(splits)` B+ tree files. Both caches (`kfcache` + `bt_cache`; `segcache` shares the kfcache budget) cap *hot* mappings, not on-disk count. |
+| Indexes per object | no hard cap | Each is a directory of `index_splits_for(splits)` B+ tree files. The caches cap *hot* mappings independently, not on-disk count: `kfcache` and `segcache` each use `FCACHE_MAX`; `bt_cache` and `bm_cache` each use `FCACHE_MAX / 4`. |
 | Tenant name length | 64 bytes | Validated by `add-dir` (rejects `/`, `\`, `..`, control chars). |
 | `edit-field` scope | same-type only | Allowed transforms: varchar grow/shrink, integer family widen/narrow (`short ↔ int ↔ long`), `numeric` scale change, `float → double` widen. Pre-flight refuses any record that wouldn't fit the new shape. Cross-type changes refused with a hint to use `add-field + remove-field + bulk-update`. Holds `objlock_wrlock` for the rebuild duration. See [schema-mutations → edit-field](../query-protocol/schema-mutations.md#edit-field). |
 | `auto_key` mode | `uuid` requires `max_key>=16`; `seq(<name>)` requires `max_key>=8` | Per-object opt-in at create-object; immutable thereafter. UUID stored as 16-byte binary, seq as 8-byte int64 BE. Rendered as dashed UUID / decimal on every read. See [schema-mutations → Auto-generated keys](../query-protocol/schema-mutations.md#auto-generated-keys). |

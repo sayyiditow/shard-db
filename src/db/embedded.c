@@ -20,7 +20,6 @@ static void db_mutexes_init(void) {
     pthread_mutex_init(&g_fields_lock,           NULL);
     pthread_mutex_init(&g_typed_lock,            NULL);
     pthread_mutex_init(&g_idx_lock,              NULL);
-    pthread_mutex_init(&g_ucache_table_mutex,    NULL);
     pthread_mutex_init(&g_counts_lock,           NULL);
     pthread_mutex_init(&bt_cache_lock,         NULL);
     pthread_mutex_init(&g_bt_merge_table_lock,   NULL);
@@ -112,7 +111,6 @@ ShardDb *shard_db_open_internal(const char *db_root) {
         }
     }
 
-    fcache_init(db->fcache_cap);
     bt_cache_init(db->btcache_cap);
     bm_cache_init(db->btcache_cap);
     slotcask_init(db->fcache_cap, db->fcache_cap);
@@ -122,7 +120,6 @@ ShardDb *shard_db_open_internal(const char *db_root) {
     load_allowed_ips_conf(db->db_root);
     objlock_init();
     rebuild_recovery(db->db_root);
-    grow_recovery(db->db_root);
 
     return db;
 }
@@ -289,7 +286,6 @@ ShardDb *shard_db_open(const char *db_root) {
         bt_cache_shutdown();
         bm_cache_shutdown();
         slotcask_shutdown();
-        ucache_shutdown();
         free(db->token_set);
         free(db->token_scope);
         free(db->token_scope_obj);
@@ -371,7 +367,6 @@ static void db_mutexes_destroy(void) {
     pthread_mutex_destroy(&g_fields_lock);
     pthread_mutex_destroy(&g_typed_lock);
     pthread_mutex_destroy(&g_idx_lock);
-    pthread_mutex_destroy(&g_ucache_table_mutex);
     pthread_mutex_destroy(&g_counts_lock);
     pthread_mutex_destroy(&bt_cache_lock);
     pthread_mutex_destroy(&g_bt_merge_table_lock);
@@ -402,7 +397,6 @@ void shard_db_close(ShardDb *db) {
     bt_cache_shutdown();
     bm_cache_shutdown();
     slotcask_shutdown();
-    ucache_shutdown();
 
     /* Free token store heap arrays. */
     free(db->token_set);

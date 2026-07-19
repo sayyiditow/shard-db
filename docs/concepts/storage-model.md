@@ -148,7 +148,7 @@ On startup, the daemon's `validate_metadata` pass sweeps `.shard-db.lock` (refus
 Two LRU caches sit between the engine and disk:
 
 - **kfcache** — path-keyed cache of mmap'd keyfile shards. Capacity from `FCACHE_MAX` (default 4096 entries). Each entry holds `(fd, mmap, header, slot_array, capacity, rwlock)`. Readers take rdlock; writers (inserts, updates, deletes, resplit) take wrlock. Per-entry locks mean a write to one shard blocks only that one shard — every other shard remains fully concurrent.
-- **segcache** — path-keyed cache of mmap'd segment files. Same model; capacity `FCACHE_MAX/4`. Routine record writes take rdlock (each writer owns a unique reserved offset, so they don't conflict on bytes); eviction and recovery take wrlock.
+- **segcache** — path-keyed cache of mmap'd segment files. Same model; capacity `FCACHE_MAX`. Routine record writes take rdlock (each writer owns a unique reserved offset, so they don't conflict on bytes); eviction and recovery take wrlock.
 
 Both caches LRU-evict once half-full. mmap regions are `MAP_SHARED` so writes hit the page cache directly and become visible to other readers as soon as the atomic store lands.
 

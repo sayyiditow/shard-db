@@ -4768,86 +4768,6 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
 
 /* ========== COUNT with criteria ========== */
 
-typedef struct {
-    CriteriaNode *tree;
-    FieldSchema *fs;
-    int count;
-    QueryDeadline *deadline;
-    int dl_counter;
-    /* Hot-path single-leaf pre-resolved criterion — set once before the
-     * scan starts when tree is a CNODE_LEAF with a compiled typed
-     * criterion.  Skips criteria_match_tree's dispatch (CNODE_AND/OR
-     * recursion + indirect function-pointer chain that LTO can't
-     * devirtualize through the seg-scan callback pointer cascade).
-     * NULL => fall back to the general criteria_match_tree path. */
-    const CompiledCriterion *single_leaf_cc;
-} CountCtx;
-
-/* Per-thread accumulator for count_scan_cb. Mirrors the idx_count_cb
-   pattern: each worker increments a TLS counter on every match, and
-   flushes the batched delta to the shared CountCtx with one atomic-add
-   per shard (instead of per-match).  Without this, a full-scan count
-   like `count exists bio` at 25M hits 25M shared atomic increments
-   across 16 worker threads — the cache line ping-pongs and serialises
-   the per-record critical path, taking ~4.8s warm (perf shows >50%
-   in count_scan_cb itself).  With per-thread batching the atomic-add
-   count drops to ≤ (num_workers × num_shard_files) = a few hundred
-   per query. */
-static __thread struct {
-    CountCtx *bound_cc;
-    int pending;
-} count_local = { NULL, 0 };
-
-static int count_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
-    CountCtx *cc = (CountCtx *)ctx;
-    /* Defensive rebind: if a worker is reused across queries without an
-       intervening flush, drain the pending count to the previously-bound
-       ctx before binding to the new one.  od_seg_file_worker calls
-       count_scan_cb_flush_thread() at the tail of every file, so this
-       branch should never fire in practice. */
-    if (count_local.bound_cc != cc) {
-        if (count_local.bound_cc) {
-            __atomic_add_fetch(&count_local.bound_cc->count,
-                               count_local.pending, __ATOMIC_RELAXED);
-        }
-        count_local.bound_cc = cc;
-        count_local.pending = 0;
-    }
-    if (query_deadline_tick(cc->deadline, &cc->dl_counter)) return 1;
-    const uint8_t *raw = block + hdr->key_len;
-    /* Fast path: single CNODE_LEAF tree with a compiled criterion bypasses
-       criteria_match_tree() altogether — straight match_typed() call. */
-    int matched;
-    if (cc->single_leaf_cc) {
-        matched = match_typed(raw, cc->single_leaf_cc, cc->fs);
-    } else {
-        matched = criteria_match_tree(raw, cc->tree, cc->fs);
-    }
-    if (!matched) return 0;
-    count_local.pending++;
-    /* Cap residency so a freak query doesn't sit on a huge unflushed
-       local before the per-file flush — mirrors idx_count_cb. */
-    if (count_local.pending >= 4096) {
-        __atomic_add_fetch(&cc->count, count_local.pending, __ATOMIC_RELAXED);
-        count_local.pending = 0;
-    }
-    return 0;
-}
-
-/* Drain this thread's pending count to the bound ctx and detach.
-   Called by the per-file scan worker (od_seg_file_worker) after each
-   seg_scan_o_direct returns so the orchestrator's read of cc->count
-   after parallel_for sees every worker's contribution.  Safe to call
-   when nothing is bound (no-op). */
-void count_scan_cb_flush_thread(void) {
-    if (count_local.bound_cc) {
-        __atomic_add_fetch(&count_local.bound_cc->count,
-                           count_local.pending, __ATOMIC_RELAXED);
-        count_local.bound_cc = NULL;
-        count_local.pending = 0;
-    }
-}
-
 void cmd_explain_tree(const char *db_root, const char *object, CriteriaNode *tree,
                       const char *order_by, int fetching) {
     Schema sch = load_schema(db_root, object);
@@ -5318,10 +5238,7 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("%lld\n", (long long)match_count);
         } else {
-            CountCtx ctx = { tree, &fs, 0, &dl, 0, fast_cc };
-            scan_shards(data_dir, sch.slot_size, count_scan_cb, &ctx);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%d\n", ctx.count);
+            OUT("{\"error\":\"object not open\"}\n");
         }
     }
 
@@ -7604,7 +7521,7 @@ static int cmd_find_do(const char *db_root, const char *object,
     /* ===== ORDERED FIND — indexed-walk fast path =====
        When order_by is indexed and there are no excluded keys, walk the
        btree in sort order, skip the first `offset` matching entries,
-       emit the next `limit`. Bypasses scan_shards + qsort entirely.
+       emit the next `limit`. Bypasses the full-table scan + qsort entirely.
 
        For empty criteria the skip phase is a pure btree walk (no record
        fetches), so offset=50000 limit=100 drops from ~580ms (collect 1M
@@ -8195,7 +8112,7 @@ static int cmd_find_do(const char *db_root, const char *object,
 
         find_emit_close:
         if (rc == -2) {
-            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: scan_shards returned rc=-2 (query buffer cap exceeded, object=%s)", object);
+            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: scan dispatch returned rc=-2 (query buffer cap exceeded, object=%s)", object);
             if (csv_delim) { /* nothing to close */ }
             else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
             else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
@@ -8503,5 +8420,3 @@ int composite_prefix_bound_for_test(const char *db_root, const char *object,
     return (int)len_hi;
 }
 #endif
-
-

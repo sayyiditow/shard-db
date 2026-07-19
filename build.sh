@@ -224,6 +224,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_index_splits_curve.c \
     src/test/cases/test_range_coalesce.c \
     src/test/cases/test_count_varchar_field.c \
+    src/test/cases/test_get_fields.c \
     src/test/cases/test_slotcask_basic.c \
     src/test/cases/test_slotcask_v2_object.c \
     src/test/cases/test_slotcask_cas.c \

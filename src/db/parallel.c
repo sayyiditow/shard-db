@@ -1,7 +1,8 @@
 /* Global compute-parallelism thread pool.
  *
- * Problem it solves: hot paths (bulk-insert Phase 2, parallel index build,
- * shard activation, scan_shards, ...) each used to spawn their own
+ * Problem it solves: hot CPU paths (parallel index build, index-update
+ * fan-out, OR-leaf planning, aggregate shard workers, ...) each used to
+ * spawn their own
  * pthread_create/join batch. Under N concurrent TCP callers, each spawning
  * P threads, the server ran N*P OS threads on 16 cores — 10x overcommit for
  * N=10,P=16 — and most of the wall time was OS scheduling delay, not work.

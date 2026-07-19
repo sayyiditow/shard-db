@@ -309,7 +309,7 @@ Realistic wide-object schema (~1.9 KB/record). Composite indexes include `irbmSt
 
 The earlier-published indexed-range figure (3 ms) was borrowed from §3's narrow `between (age 25-35)` query on the user schema; the C bench's invoice range queries cover wider date spans (one-month and two-week windows on `invoiceDate`/`createdAt`) so the 65–79 ms numbers are honest cost for matching tens of thousands of records and returning the first 10 ordered by index leaf order.
 
-The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths now going through the unified shard cache (`ucache_get_write` per shard). Pre-2026.05.1 they did per-call `open + flock + mmap MAP_SHARED + munmap`, paying full page-fault tax per request.
+The delete speedups come from `bulk_del_shard_worker` and `single_delete` paths now going through the v2 slotcask storage backend (registry-cached `SlotcaskDb` handles, one open mmap per kf shard) instead of the pre-2026.05.1 per-call `open + flock + mmap MAP_SHARED + munmap`, which paid full page-fault tax per request.
 
 ## 5. Invoice multi-threaded — 1M records, 64 fields, 14 indexes
 

@@ -1160,7 +1160,6 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     invalidate_idx_cache(db_root, object);
     char inv_path[PATH_MAX];
     snprintf(inv_path, sizeof(inv_path), "%s/%s/%s", db_root, dir, object);
-    fcache_invalidate(inv_path);
 
     /* Now create on disk */
     char eff_root[PATH_MAX];
@@ -1435,7 +1434,6 @@ int cmd_drop_object(const char *db_root, const char *dir, const char *object,
     char eff_root[PATH_MAX];
     snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
-    fcache_invalidate(obj_dir);
     slotcask_registry_invalidate(eff_root, object);
     invalidate_idx_cache(db_root, object);
     invalidate_schema_caches(db_root, object);

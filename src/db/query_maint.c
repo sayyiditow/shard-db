@@ -502,9 +502,9 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
    from `<obj>/backup/<from>` over the live tree, and ensures the
    schema.conf line is in place from object.json.
    Refuses if any live state would conflict, unless force=1. Holds the
-   object's write lock for the whole operation; invalidates ucache + bt
-   cache + idx cache + schema caches before the swap so the next reader
-   sees the new mappings. */
+   object's write lock for the whole operation; invalidates the slotcask
+   registry + bt cache + idx cache + schema caches before the swap so the
+   next reader sees the new mappings. */
 int cmd_restore(const char *db_root, const char *object,
                 const char *from, int force) {
     if (!from || !*from) { OUT("{\"error\":\"from is required\"}\n"); return 1; }
@@ -634,10 +634,9 @@ int cmd_restore(const char *db_root, const char *object,
     }
 
     /* Drop caches first so readers can't pin the old mappings while we swap.
-       fcache_invalidate handles data shards; the btree page cache holds open
-       fd+mmap per <field>/<NNN>.idx, so walk indexes/ explicitly (same
-       pattern as index.c::reindex_clean_legacy). */
-    fcache_invalidate(obj_dir);
+       slotcask_registry_invalidate (below) handles data shards; the btree
+       page cache holds open fd+mmap per <field>/<NNN>.idx, so walk
+       indexes/ explicitly (same pattern as index.c::reindex_clean_legacy). */
     invalidate_idx_cache(db_root, object);
     invalidate_schema_caches(db_root, object);
     {
@@ -702,8 +701,9 @@ int cmd_restore(const char *db_root, const char *object,
 
 /* ========== RECOUNT ========== */
 
-/* shard-stats: walk every shard file under data/, read each ShardHeader, report slots/records/load
-   plus a hint when splits may be too low. Cheap — reads only 32B per shard.
+/* shard-stats: walk every keyfile shard under data/kf/, read its
+   SlotcaskKfHeader, and report slots/records/load plus a hint when splits
+   may be too low. Cheap — reads only the 24-byte header per shard.
    as_table=1 emits ASCII table; as_table=0 emits JSON. */
 int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
     Schema sch = load_schema(db_root, object);
@@ -779,8 +779,8 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
         if (rows[i].records < min_records) min_records = rows[i].records;
     }
 
-    /* `grows` = log2(max_slots / initial). v1 uses INITIAL_SLOTS=256; v2 uses
-       the splits-tier initial from slotcask_default_slots_for_splits(). */
+    /* `grows` = log2(max_slots / initial), initial from
+       slotcask_default_slots_for_splits(). */
     uint32_t initial = (uint32_t)slotcask_default_slots_for_splits(sch.splits);
     int grows = 0;
     for (uint32_t s = max_slots; initial > 0 && s > initial; s >>= 1) grows++;
@@ -896,7 +896,6 @@ int cmd_truncate(const char *db_root, const char *object) {
         fprintf(stderr, "Error: Object [%s] not found\n", object);
         return 1;
     }
-    fcache_invalidate(obj_dir);
     invalidate_idx_cache(db_root, object);
     counts_invalidate(db_root, object);
 

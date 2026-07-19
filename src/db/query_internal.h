@@ -134,8 +134,6 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
                                QueryDeadline *dl,
                                BulkCriteriaCtx *out_ctx);
 
-/* query.c — count scan (used by query_find.c::scan_worker) */
-void count_scan_cb_flush_thread(void);
 
 /* query_find.c — CSV output (used by query.c find/count paths) */
 void csv_emit_header(const char **proj_fields, int proj_count,

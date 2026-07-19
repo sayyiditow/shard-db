@@ -2327,7 +2327,6 @@ static void *agg_od_seg_worker(void *raw) {
         seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
     else
         seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
-    count_scan_cb_flush_thread();
     return NULL;
 }
 
@@ -4017,7 +4016,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
 
     if (neq_eligible) {
         /* COUNT-only fast path: agg(count where neq=X) = live_count - count(eq=X).
-           Skip the full-side scan_shards entirely (which decodes every record
+           Skip the full-side record scan entirely (which decodes every record
            just to increment count) and use the metadata live_count instead.
            Saves ~150ms on a 1M table. */
         int count_only = 1;

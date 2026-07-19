@@ -42,7 +42,7 @@ Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`.
 - `types.h` — shared types, externs, function declarations
 - `util.c` — JSON helpers, `b64_encode/decode`, `valid_filename`
 - `config.c` — db.env, schema/index/dirs caches, typed-field encode/decode (`encode_field_len`)
-- `storage.c` — xxh128 hashing, mmap, GET/INSERT/DELETE, CAS helpers, ucache, `build_idx_path`, `compute_addr`
+- `storage.c` — xxh128 hashing, GET/INSERT/DELETE, CAS helpers, slotcask registry access, `build_idx_path`, `compute_addr`
 - `index.c` — per-shard B+ tree wrappers (`btree_idx_*`), parallel indexing, `reindex_clean_legacy`
 - `query.c` — criteria matching, planner core, find/count orchestration
 - `query_aggregate.c` — aggregate operations, group-by, having, top-N, hash tables
@@ -87,9 +87,9 @@ Two on-disk layers per object (under `<db_root>/<dir>/<object>/`):
 - **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, padded to `slot_size`. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
 - **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = `hash[15] % num_streams` (hash-routed so a key's insert/update history stays in one stream, maximising free-pool slot reuse).
 - **Dynamic growth**: 50% kf load → double `slots_per_shard`. `MAX_SPLITS=4096` caps shard *files*, not slots.
-- **I/O**: kf writes via ucache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
+- **I/O**: kf writes use slotcask's kfcache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup.
-- **Concurrency**: per-ucache-entry rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
+- **Concurrency**: per-kf-shard rwlock; per-object rwlock for schema mutations; per-btree-file rwlock (`BT_CACHE_MAX`).
 - **Index layout**: each indexed field shards into `index_splits_for(splits)` btree files at `<obj>/indexes/<field>/<NNN>.idx`. Writes route by hash16 to one shard; reads fan out across all shards in parallel; cursor pagination uses k-way streaming merge across `BtRangeIter`s. Routing: `idx_shard_for_hash(hash16, splits)`. The `index_splits_for` curve caps idx fan-out at high split counts: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128` (see `src/db/types.h` for the rationale).
 - **Record counts (v2)**: per-shard kf header (24 B at byte 0 of every kf shard) carries `total` (live + tombstoned) and `deleted`. `live = total − deleted`. Updated atomically inside `slotcask_put` / `slotcask_delete` under the kf wrlock — single source of truth, durable to mmap writeback (and so survives SIGKILL/OOM/crash without a flush window). `get_live_count` / `get_deleted_count` sum the kf headers via `slotcask_sum_kf_totals` (`pread` per shard, ~1ms cold even at splits=4096). The legacy `metadata/counts` text file is no longer written for v2; `recount` is unnecessary post-crash. v1 falls back to the text file.
 

@@ -17,7 +17,7 @@
  *       0  : magic       u32  'BM01' ASCII LE
  *       4  : version     u16  1
  *       6  : flags       u16  bit 0 = bool fast-path
- *       8  : slots       u32  data shard's slots_per_shard (matches ShardHeader)
+ *       8  : slots       u32  data shard's slots_per_shard matches the data shard's slots_per_shard
  *       12 : n_values    u32  number of distinct values in dictionary
  *       16 : dict_off    u32  byte offset of dictionary
  *       20 : bitmaps_off u32  byte offset of bitmap area

@@ -4,6 +4,48 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased
+
+### Fixes
+
+- **`get` + `fields` returned "Not found" on v2 objects** — the `get`
+  dispatch branch for single-key requests with a `fields` projection still
+  read through the v1 ucache shard-file layout (`build_shard_path`,
+  `fcache_get_read`, `zoneA_off`/`zoneB_off`), which no v2 (slotcask)
+  object has ever populated, so every such request failed even when the
+  key existed. Auto-key objects hit the same bug through a second path
+  (missing key normalization). Fixed with a new `cmd_get_fields` that reads
+  through the v2 slotcask registry, shared by both the JSON and NQL
+  dispatch paths.
+- **`decode_field` stack-buffer overflow on long composite fields** — the
+  `field1+field2`-style composite-field decoder concatenated into a fixed
+  4096-byte stack buffer with no bounds check; a composite of two `varchar`
+  fields whose combined content exceeded 4096 bytes overflowed the stack.
+  Also affected criteria matching, `order_by`, and aggregate `group_by` on
+  composite/unrecognized fields (not just `get`+`fields` display), since
+  `decode_field` backs all of these. Fixed by switching to a
+  dynamically-growing heap buffer that never truncates.
+- **`count` on a non-indexed criterion silently returned a count instead of
+  erroring when the object couldn't be opened** — `cmd_count`'s fallback
+  path for the non-indexed case called the legacy v1 `scan_shards`/
+  `count_scan_cb` path on `slotcask_registry_get` failure, returning a bare
+  (likely 0) integer rather than surfacing the open failure. Now returns
+  `{"error":"object not open"}`, matching `cmd_rebuild_kf`'s existing
+  behavior for the same failure.
+
+### Removed
+
+- **Dead v1 ucache/shard-file storage engine** — this binary has only ever
+  created v2 (slotcask) objects since 2026.05.5's v1→v2 migration
+  requirement; the entire v1 probe-into-slot code path (`ucache_*`,
+  `fcache_*`, `ShardHeader`, `zoneA_off`/`zoneB_off` and related shard-file
+  layout helpers) was unreachable and has been removed. The `stats`/
+  `stats-prom` `ucache` JSON fields and Prometheus metric names are
+  retained, permanently reporting zero, so existing dashboards parsing
+  those names don't break — see
+  [monitoring.md](../operations/monitoring.md) and
+  [diagnostics.md](../query-protocol/diagnostics.md).
+
 ## 2026.07.3
 
 Coverity hardening (46 true-positive fixes across two triage rounds), aggregate `HAVING` clause OR/nested-tree support (JSON + NQL), an NQL `--join` flag, and a btree-cache concurrency improvement on the cold-miss path. No on-disk format changes. Wire-compatible with 2026.07.2, no `./migrate` required.
