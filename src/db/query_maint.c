@@ -161,6 +161,10 @@ int cmd_estimate_index(const char *db_root, const char *object,
 int cmd_vacuum(const char *db_root, const char *object,
                int compact, int new_splits) {
     Schema sch = load_schema(db_root, object);
+    if (!sch.splits) {
+        OUT("{\"error\":\"object not found\"}\n");
+        return 1;
+    }
 
     /* v2 streams-mismatch detection: if the host's CPU count has changed
        since create-object (e.g. machine upgraded, container resized, or
@@ -192,14 +196,16 @@ int cmd_vacuum(const char *db_root, const char *object,
         .streams = sch.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    int dropped = 0;
-    if (sdb) {
-        (void)slotcask_compact_segs(sdb, &dropped);
-        /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
-           returns to 0 (kf-derived counts model — there's no separate
-           counts file to lie via anymore). */
-        (void)slotcask_compact_kf(sdb);
+    if (!sdb) {
+        OUT("{\"error\":\"object not open\"}\n");
+        return 1;
     }
+    int dropped = 0;
+    (void)slotcask_compact_segs(sdb, &dropped);
+    /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
+       returns to 0 (kf-derived counts model — there's no separate
+       counts file to lie via anymore). */
+    (void)slotcask_compact_kf(sdb);
     reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
     OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
     return 0;
@@ -873,14 +879,25 @@ int cmd_rebuild_kf(const char *db_root, const char *object) {
 
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
+    if (!sch.splits) {
+        OUT("{\"error\":\"object not found\"}\n");
+        return 1;
+    }
 
     SlotcaskSchemaInfo info = {
         .splits = sch.splits, .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        OUT("{\"error\":\"object not open\"}\n");
+        return 1;
+    }
     uint64_t total_hdr = 0, deleted_hdr = 0;
-    if (sdb) slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr);
+    if (slotcask_sum_kf_totals(sdb, &total_hdr, &deleted_hdr) != 0) {
+        OUT("{\"error\":\"recount failed\"}\n");
+        return 1;
+    }
     int live = (int)(total_hdr > deleted_hdr ? total_hdr - deleted_hdr : 0);
     OUT("{\"count\":%d}\n", live);
     return 0;
