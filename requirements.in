@@ -2,7 +2,7 @@
 # The previous `>=9.5` range left the docs build susceptible to a compromised
 # upstream release silently shipping into our build. Bump this when you mean
 # to bump it; Dependabot can also be wired up for python/pip later.
-mkdocs-material==9.7.6
+mkdocs-material==9.7.7
 
 # Pin urllib3 to fix CodeQL vulnerabilities:
 # - Decompression-bomb safeguards bypassed in streaming API
