@@ -12,7 +12,9 @@ typedef struct {
     uint8_t *map;
     size_t   map_size;
     pthread_rwlock_t rwlock;
-    int      used;
+    _Atomic int used;
+    _Atomic int dirty;
+    _Atomic uint64_t dirty_since_ms;
     uint64_t last_access;
 } BtCacheEntry;
 
@@ -23,7 +25,9 @@ typedef struct {
     uint8_t *map;
     size_t   map_size;
     pthread_rwlock_t rwlock;
-    int      used;
+    _Atomic int used;
+    _Atomic int dirty;
+    _Atomic uint64_t dirty_since_ms;
     uint64_t last_access;
 } BmCacheEntry;
 
@@ -35,7 +39,9 @@ typedef struct {
     size_t   map_size;
     size_t   capacity;
     pthread_rwlock_t rwlock;
-    int      used;
+    _Atomic int used;
+    _Atomic int dirty;
+    _Atomic uint64_t dirty_since_ms;
     uint64_t last_access;
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
     dev_t    file_dev;      /* identity of the file open at install time — */
@@ -49,7 +55,9 @@ typedef struct {
     uint8_t *map;
     size_t   map_size;
     pthread_rwlock_t rwlock;
-    int      used;
+    _Atomic int used;
+    _Atomic int dirty;
+    _Atomic uint64_t dirty_since_ms;
     uint64_t last_access;
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
     dev_t    file_dev;      /* identity of the file open at install time — */
@@ -158,8 +166,11 @@ struct ShardDb {
     int auto_reshard_enable;
     int auto_reshard_hour;
     int auto_reshard_throttle_ms;
+    int durability_sync_ms;
+    int warmup_explicit;          /* a valid WARMUP= was present in db.env */
     int kfcache_test_hold_ms; /* test-only; 0 = off in production */
     int warmup_test_delay_ms; /* test-only; 0 = off in production */
+    int warmup_test_prelock_delay_ms; /* test-only; 0 = off in production */
     int schema_wrlock_test_delay_ms; /* test-only; 0 = off in production */
     char rebuild_test_pause_phase[32]; /* test-only; empty = disabled */
     int rebuild_test_pause_ms;         /* test-only; 0 = disabled */
@@ -169,9 +180,23 @@ struct ShardDb {
     /* embedded-mode log handler (set via shard_db_set_log_handler).
        Called synchronously on the same thread as log emission when
        g_log_running == 0 (no drain thread).  Must be thread-safe.
-       type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT 6=SLOW */
-    void (*log_handler)(int type, const char *msg, void *ud);
-    void *log_handler_ud;
+       type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT 6=SLOW
+       _Atomic: background threads (e.g. durability_sync_thread) can start
+       logging as soon as shard_db_open() returns, before an embedded
+       caller's shard_db_set_log_handler() call lands -- plain reads/writes
+       here raced under TSan. */
+    _Atomic(void (*)(int type, const char *msg, void *ud)) log_handler;
+    void *_Atomic log_handler_ud;
+
+    /* Joinable background-thread lifecycle. */
+    pthread_t bg_auto_vac_tid;
+    int       bg_auto_vac_spawned;
+    pthread_t bg_auto_reshard_tid;
+    int       bg_auto_reshard_spawned;
+    pthread_t bg_warmup_tid;
+    int       bg_warmup_spawned;
+    pthread_t bg_durability_tid;
+    int       bg_durability_spawned;
 
     /* slow query ring */
     SlowQueryEntry slow_queries[SLOW_QUERY_RING];
@@ -272,6 +297,8 @@ typedef struct ShardDb ShardDb;
    Set by shard_db_open (main thread init) and by every worker thread
    before calling dispatch_json_query. */
 extern __thread ShardDb *g_db;
+extern _Atomic int server_running;
+extern ShardDb *g_shard_db_instance;
 
 /* ── Macro aliases — defined AFTER the struct so struct field
       declarations above are not expanded. ── */
@@ -310,8 +337,10 @@ extern __thread ShardDb *g_db;
 #define g_auto_reshard_enable       (g_db->auto_reshard_enable)
 #define g_auto_reshard_hour         (g_db->auto_reshard_hour)
 #define g_auto_reshard_throttle_ms  (g_db->auto_reshard_throttle_ms)
+#define g_durability_sync_ms        (g_db->durability_sync_ms)
 #define g_kfcache_test_hold_ms      (g_db->kfcache_test_hold_ms)
 #define g_warmup_test_delay_ms      (g_db->warmup_test_delay_ms)
+#define g_warmup_test_prelock_delay_ms (g_db->warmup_test_prelock_delay_ms)
 #define g_schema_wrlock_test_delay_ms (g_db->schema_wrlock_test_delay_ms)
 #define g_rebuild_test_pause_phase  (g_db->rebuild_test_pause_phase)
 #define g_rebuild_test_pause_ms     (g_db->rebuild_test_pause_ms)
@@ -391,6 +420,7 @@ extern __thread ShardDb *g_db;
 
 /* Internal open — used by cmd_server and shard_db_open. */
 ShardDb *shard_db_open_internal(const char *db_root);
+void shard_db_destroy_after_storage(ShardDb *db);
 
 /* Server-wide instance set by cmd_server before any threads spawn.
    Pool workers and the log thread bind their thread-local g_db to this. */

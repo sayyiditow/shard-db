@@ -227,19 +227,23 @@ static int test_btree_inplace_leaf_run(void) {
     unlink(path);
     if (run_random_fill_test(path, 800) != 0) goto fail;
     bt_cache_shutdown();
+    bt_cache_init(1024); /* writer acquires now require an initialized cache */
     unlink(path);
 
     if (run_tombstone_preservation_test(path, 400) != 0) goto fail;
     bt_cache_shutdown();
+    bt_cache_init(1024);
     unlink(path);
 
     if (run_long_prefix_test(path) != 0) goto fail;
     bt_cache_shutdown();
+    bt_cache_init(1024);
     unlink(path);
 
     return t_ctx->failed > 0 ? 1 : 0;
 fail:
     bt_cache_shutdown();
+    bt_cache_init(1024);
     unlink(path);
     return 1;
 }

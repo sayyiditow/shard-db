@@ -1,16 +1,22 @@
 name: TSan (ThreadSanitizer)
 
-# ThreadSanitizer build of the daemon, run against tests that exercise
-# the per-shard rwlock and parallel-for worker pool. Catches data races
-# (one thread reading, another writing, no synchronization) and lock-
-# ordering deadlocks.
+# ThreadSanitizer build of the daemon, run against the full C test suite.
+# Catches data races (one thread reading, another writing, no
+# synchronization) and lock-ordering deadlocks.
 #
-# We run only a curated subset of cases here (--filter): TSan's
-# shadow-memory bookkeeping slows the daemon ~10–15×, so a stress test
-# like test-stress-no-hang would saturate watchdogs faster than it can
-# probe. Race-detection happens via TSan instrumentation regardless of
-# throughput — the parallel-index-integrity case fires concurrent bulk
-# inserts that exercise the same lock paths under manageable load.
+# Runs at --jobs 1 (not the ASan workflow's 2): TSan's shadow-memory
+# bookkeeping slows the daemon ~10-15x and roughly doubles memory
+# overhead versus ASan, and this shared/weak runner doesn't have room
+# for both that overhead and cross-test parallelism. --jobs 1 also
+# sidesteps two known full-suite-parallel-load-only flakes (a resource-
+# contention flake in test-binary-index and a test-harness port-picker
+# TOCTOU) that aren't sanitizer findings but would otherwise
+# intermittently redden this job for unrelated reasons.
+#
+# Known, already-tracked findings are suppressed via .tsan.supp — see
+# that file for the full rationale on each. Suppressions are named and
+# documented, never blanket; anything not explicitly suppressed there
+# fails this job.
 
 on:
   push:
@@ -29,7 +35,7 @@ jobs:
   tsan:
     name: TSan (Linux x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 150
     env:
       BUILD_MODE: tsan
       TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
@@ -39,16 +45,8 @@ jobs:
       - name: Build (BUILD_MODE=tsan)
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
-      # Subset chosen because these exercise multi-thread paths inside the
-      # daemon (parallel-for fan-out, per-shard rwlock acquisition, btree
-      # cache concurrency) without saturating the daemon under TSan
-      # instrumentation.
-      - name: TSan subset (intersect / OR / parallel-index-integrity / cursor)
-        run: |
-          ./build/bin/shard-db-test run test-and-intersection
-          ./build/bin/shard-db-test run test-or-logic
-          ./build/bin/shard-db-test run test-parallel-index-integrity
-          ./build/bin/shard-db-test run test-find-cursor
+      - name: Run full C test suite under TSan
+        run: ./build/bin/shard-db-test run-all --jobs 1
 
       - name: Fail if any TSan findings escaped
         run: |

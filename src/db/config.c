@@ -1,4 +1,6 @@
 #include "types.h"
+#include "slotcask.h"
+#include "bitmap.h"
 
 /* ========== Config ========== */
 
@@ -186,7 +188,9 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
 void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     if (level > g_log_level) return;
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    if (!_running && !(g_db && g_db->log_handler)) return;
+    void (*handler)(int, const char *, void *) = g_db ?
+        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
+    if (!_running && !handler) return;
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
     if (level < 1 || level > 4) level = LOG_LVL_INFO;
     const char *sub = subsystem ? subsystem : "unknown";
@@ -211,8 +215,9 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
         entry.msg[pos+1] = '\0';
     }
 
-    if (!_running && g_db && g_db->log_handler) {
-        g_db->log_handler(level, entry.msg, g_db->log_handler_ud);
+    if (!_running && handler) {
+        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+        handler(level, entry.msg, ud);
         return;
     }
 
@@ -229,7 +234,9 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
 
 void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    if (!_running && !(g_db && g_db->log_handler)) return;
+    void (*handler)(int, const char *, void *) = g_db ?
+        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
+    if (!_running && !handler) return;
     const char *sub = subsystem ? subsystem : "unknown";
 
     time_t now = time(NULL);
@@ -251,8 +258,9 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...) {
         entry.msg[pos+1] = '\0';
     }
 
-    if (!_running && g_db && g_db->log_handler) {
-        g_db->log_handler(5 /* SHARD_DB_LOG_AUDIT */, entry.msg, g_db->log_handler_ud);
+    if (!_running && handler) {
+        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+        handler(5 /* SHARD_DB_LOG_AUDIT */, entry.msg, ud);
         return;
     }
 
@@ -290,7 +298,9 @@ void log_slow_query(const char *mode, const char *dir,
        the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
        threshold is the filter. */
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    if (!_running && !(g_db && g_db->log_handler)) return;
+    void (*handler)(int, const char *, void *) = g_db ?
+        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
+    if (!_running && !handler) return;
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
@@ -308,8 +318,9 @@ void log_slow_query(const char *mode, const char *dir,
              object ? object : "",
              query  ? query  : "");
 
-    if (!_running && g_db && g_db->log_handler) {
-        g_db->log_handler(6 /* SHARD_DB_LOG_SLOW */, entry.msg, g_db->log_handler_ud);
+    if (!_running && handler) {
+        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+        handler(6 /* SHARD_DB_LOG_SLOW */, entry.msg, ud);
         return;
     }
 
@@ -353,6 +364,26 @@ int load_db_root(char *out, size_t outlen) {
             if (g_db) g_log_level = atoi(p + 10);
         } else if (strncmp(p, "LOG_RETAIN_DAYS=", 16) == 0) {
             if (g_db) g_log_retain_days = atoi(p + 16);
+        } else if (strncmp(p, "DURABILITY_SYNC_MS=", 19) == 0) {
+            char *v = p + 19;
+            char *end = NULL;
+            errno = 0;
+            long n = strtol(v, &end, 10);
+            int no_digits = (end == v);
+            while (end && (*end == ' ' || *end == '\t' ||
+                           *end == '\r' || *end == '\n')) {
+                end++;
+            }
+            if (errno == ERANGE || !end || no_digits || *end != '\0' ||
+                n < 0 || n > INT_MAX || (n > 0 && n < 50)) {
+                fprintf(stderr,
+                        "config: DURABILITY_SYNC_MS=\"%.*s\" must be 0 or >=50; "
+                        "keeping current value (%d)\n",
+                        (int)strcspn(v, "\r\n"), v,
+                        g_db ? g_durability_sync_ms : 1000);
+            } else if (g_db) {
+                g_durability_sync_ms = (int)n;
+            }
         } else if (strncmp(p, "INDEX_PAGE_SIZE=", 16) == 0) {
             int ps = atoi(p + 16);
             if (ps >= 1024 && ps <= 65536) {
@@ -464,6 +495,17 @@ int load_db_root(char *out, size_t outlen) {
                do not add to configuration.md. */
             int n = atoi(p + 21);
             if (n >= 0 && g_db) g_warmup_test_delay_ms = n;
+        } else if (strncmp(p, "WARMUP_TEST_PRELOCK_DELAY_MS=", 29) == 0) {
+            /* Test-only knob (widens the gap between a WarmupKfTask being
+               dispatched and warmup_kf_task_fn taking its objlock_rdlock,
+               with NO lock held during the wait) deterministically for the
+               no-overlap warmup-vs-vacuum regression test: proves the fix
+               is safe even when a rebuild acquires+releases its wrlock
+               entirely before this task ever attempts to lock anything.
+               Not a documented production setting — do not add to
+               configuration.md. */
+            int n = atoi(p + 29);
+            if (n >= 0 && g_db) g_warmup_test_prelock_delay_ms = n;
         } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
             /* Test-only knob (widens dispatch_json_query's schema-mode
                objlock_wrlock-held window and publishes a synchronous marker
@@ -501,11 +543,13 @@ int load_db_root(char *out, size_t outlen) {
             }
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {
-                const char *v = p + 7;
+                char *v = p + 7;
+                v[strcspn(v, "\r\n")] = '\0';
                 if (strcmp(v, "async") == 0 || strcmp(v, "sync") == 0 ||
                     strcmp(v, "off") == 0) {
                     strncpy(g_warmup_mode, v, sizeof(g_warmup_mode) - 1);
                     g_warmup_mode[sizeof(g_warmup_mode) - 1] = '\0';
+                    g_db->warmup_explicit = 1;
                 }
             }
         } else if (strncmp(p, "TLS_ENABLE=", 11) == 0) {
@@ -3745,13 +3789,15 @@ void slot_cleanup(int *held) {
     if (held && *held) slot_release();
 }
 
-#ifdef TEST_BUILD
-/* Reset all process-global caches between test cases in run-all mode.
-   Each test case fork-execs its own daemon, but the parent process
-   holds stale cache entries that can pollute subsequent in-process
-   test hooks (plan introspection, cardinality estimates, etc.). */
-void test_reset_caches(void) {
-    if (!g_db) return;  /* daemon-spawn tests: g_db only lives in the child process */
+/* Free every entry in the process-global schema/fields/typed/index caches,
+   including the typed cache's heap-allocated enum_values state. Must run
+   before the owning ShardDb is freed — server.c and embedded.c's shutdown
+   sequences call this alongside bt_cache_shutdown/bm_cache_shutdown/
+   slotcask_shutdown; skipping it left the typed cache's last-loaded-per-slot
+   entries unfreed at process exit (LSan-visible leak, since nothing else
+   ever reaches those allocations again). */
+void schema_caches_shutdown(void) {
+    if (!g_db) return;
     /* schema cache */
     pthread_mutex_lock(&g_schema_lock);
     for (int i = 0; i < SCHEMA_BUCKETS; i++) {
@@ -3795,5 +3841,29 @@ void test_reset_caches(void) {
         }
     }
     pthread_mutex_unlock(&g_idx_lock);
+}
+
+#ifdef TEST_BUILD
+/* Reset all process-global caches between test cases in run-all mode.
+   Each test case fork-execs its own daemon, but the parent process
+   holds stale cache entries that can pollute subsequent in-process
+   test hooks (plan introspection, cardinality estimates, etc.).
+
+   Also unconditionally reinitializes bt_cache/bm_cache/slotcask: several
+   tests deliberately call *_shutdown() to exercise the "writer requires
+   an initialized cache" ENODEV contract (or to force a clean cache for
+   their own setup) and never restore it afterward. Under --jobs 1 (one
+   shared process for the whole suite) that leaves the cache disabled for
+   every later test, corrupting otherwise-unrelated cases. bt_cache_init/
+   bm_cache_init/slotcask_init are all no-ops when already initialized,
+   so this is a safe unconditional call regardless of what the prior test
+   left behind. */
+void test_reset_caches(void) {
+    schema_caches_shutdown();
+    if (g_db) {
+        bt_cache_init(g_db->btcache_cap);
+        bm_cache_init(g_db->btcache_cap);
+        slotcask_init(g_db->fcache_cap, g_db->fcache_cap);
+    }
 }
 #endif

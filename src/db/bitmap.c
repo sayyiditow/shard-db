@@ -117,19 +117,44 @@ static int bm_cache_probe(const char *path, int *out_found) {
     return -1;
 }
 
-/* Caller holds g_bm_cache_lock and has ensured no rwlock holder. */
-static void bm_cache_drop_slot(int slot) {
+/* Caller holds g_bm_cache_lock. The entry lock is acquired without holding
+   the table mutex, then identity is rechecked after the mutex is restored. */
+static int bm_cache_drop_slot(int slot, CacheDropReason reason, int wait) {
     BmCacheEntry *e = &g_bm_cache[slot];
-    if (!e->used) return;
-    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+    if (!e->used) return 1;
+    char expected_path[PATH_MAX];
+    snprintf(expected_path, sizeof(expected_path), "%s", e->path);
+    pthread_mutex_unlock(&g_bm_cache_lock);
+    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
+                       : pthread_rwlock_trywrlock(&e->rwlock);
+    pthread_mutex_lock(&g_bm_cache_lock);
+    if (lock_rc != 0) return 0;
+    if (!e->used) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 1;
+    }
+    if (strcmp(e->path, expected_path) != 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 0;
+    }
+    if (reason == CACHE_DROP_EVICT && e->map && e->map_size > 0 &&
+        durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
+                               e->map, e->map_size) < 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return -1;
+    }
     if (e->map) munmap(e->map, e->map_size);
     if (e->fd >= 0) close(e->fd);
     e->map = NULL;
     e->fd = -1;
     e->map_size = 0;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 0;
     e->path[0] = '\0';
     g_bm_cache_count--;
+    pthread_rwlock_unlock(&e->rwlock);
+    return 1;
 }
 
 void bm_cache_invalidate(const char *path) {
@@ -138,9 +163,9 @@ void bm_cache_invalidate(const char *path) {
     int found = 0;
     int slot = bm_cache_probe(path, &found);
     if (found && slot >= 0) {
-        /* Caller must ensure no rwlock holder — used by bm_grow's
-           rewrite-and-publish path. */
-        bm_cache_drop_slot(slot);
+        /* Structural discard after the path has been unlinked/recreated;
+           identity is rechecked after taking the entry wrlock. */
+        bm_cache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
     }
     pthread_mutex_unlock(&g_bm_cache_lock);
 }
@@ -372,6 +397,11 @@ static int bm_file_open_mmap(const char *path,
 
 BitmapShard *bm_open(const char *path, int slots, int create,
                      int bool_fastpath, uint32_t max_values, int writer) {
+    if (writer && !g_bm_cache) {
+        errno = ENODEV;
+        return NULL;
+    }
+
     /* Ensure parent dir + the on-disk file exists if creation was asked. */
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", path);
@@ -407,6 +437,7 @@ BitmapShard *bm_open(const char *path, int slots, int create,
     }
 
     /* Cached path — mirror bt_acquire's verify-and-retry pattern. */
+retry_bm_acquire:;
     int retries = 0;
     int found = 0;
     int slot = -1;
@@ -460,18 +491,52 @@ BitmapShard *bm_open(const char *path, int slots, int create,
     }
 
     if (slot < 0 || g_bm_cache_count >= g_bm_cache_slots / 2) {
-        int lru = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < g_bm_cache_slots; i++) {
-            if (g_bm_cache[i].used && g_bm_cache[i].last_access < oldest) {
-                oldest = g_bm_cache[i].last_access;
-                lru = i;
+        slot = -1;
+        int first_error = 0;
+        int wait_candidate = -1;
+        uint64_t floor_ts = 0;
+        for (int attempt = 0; attempt < g_bm_cache_slots; attempt++) {
+            int lru = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int i = 0; i < g_bm_cache_slots; i++) {
+                if (g_bm_cache[i].used &&
+                    g_bm_cache[i].last_access >= floor_ts &&
+                    g_bm_cache[i].last_access < oldest) {
+                    oldest = g_bm_cache[i].last_access;
+                    lru = i;
+                }
             }
+            if (lru < 0) break;
+            int drop_rc = bm_cache_drop_slot(lru, CACHE_DROP_EVICT, 0);
+            if (drop_rc > 0) {
+                slot = lru;
+                break;
+            }
+            if (drop_rc < 0 && first_error == 0) first_error = errno;
+            if (drop_rc == 0 && wait_candidate < 0) wait_candidate = lru;
+            floor_ts = oldest + 1;
         }
-        if (lru >= 0) {
-            bm_cache_drop_slot(lru);
-            slot = lru;
+        if (slot < 0 && writer && wait_candidate >= 0) {
+            int drop_rc = bm_cache_drop_slot(wait_candidate,
+                                             CACHE_DROP_EVICT, 1);
+            if (drop_rc > 0) slot = wait_candidate;
+            else if (drop_rc < 0 && first_error == 0) first_error = errno;
+            else if (drop_rc == 0) first_error = 0;
         }
+        if (slot < 0 && writer && first_error != 0) {
+            pthread_mutex_unlock(&g_bm_cache_lock);
+            munmap(map, sz);
+            close(fd);
+            errno = first_error;
+            return NULL;
+        }
+    }
+
+    if (slot < 0 && writer) {
+        pthread_mutex_unlock(&g_bm_cache_lock);
+        munmap(map, sz);
+        close(fd);
+        goto retry_bm_acquire;
     }
 
     BitmapShard *bm = calloc(1, sizeof(*bm));
@@ -500,14 +565,31 @@ BitmapShard *bm_open(const char *path, int slots, int create,
     e->fd = fd;
     e->map = map;
     e->map_size = sz;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_bm_cache_clock, 1, __ATOMIC_RELAXED);
     g_bm_cache_count++;
-
     pthread_rwlock_t *lock = &e->rwlock;
+    pthread_mutex_unlock(&g_bm_cache_lock);
+
+    /* Take the per-entry rwlock AFTER releasing the table mutex — same
+       M0-then-M1 ordering as the cache-hit path above, so a per-entry
+       rwlock never nests inside g_bm_cache_lock. A caller can park a rwlock
+       across a long-lived handle and separately need g_bm_cache_lock for an
+       unrelated slot; nesting the other way risks a lock-order inversion
+       against that. Verify-and-retry exactly like the hit path handles the
+       resulting window where a concurrent evictor can steal this slot
+       before we lock it. */
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
-    pthread_mutex_unlock(&g_bm_cache_lock);
+    if (!e->used || strcmp(e->path, path) != 0) {
+        /* Stolen by a concurrent evictor; they now own disposing our
+           fd/map. Retry from scratch. */
+        pthread_rwlock_unlock(lock);
+        free(bm);
+        goto retry_bm_acquire;
+    }
 
     bm->slot = slot;
     bm->writer = writer;
@@ -532,6 +614,10 @@ void bm_close(BitmapShard *bm) {
     if (bm->slot >= 0 && g_bm_cache) {
         /* Cached: release the rwlock — the cache keeps the mmap + fd
            alive across releases (LRU evicts later under memory pressure). */
+        if (bm->writer) {
+            BmCacheEntry *e = &g_bm_cache[bm->slot];
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+        }
         pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
     } else {
         /* Uncached fallback: tear the mapping down per call. */

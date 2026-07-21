@@ -35,6 +35,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -71,7 +72,7 @@ static int fabricate_kf_total(const char *kf_path, uint64_t total) {
    number of inserts this thread got a success response for. */
 typedef struct {
     TestClientCfg cfg;
-    volatile int stop;
+    _Atomic int stop;
     int sent, ok;
 } WriterCtx;
 
@@ -80,7 +81,7 @@ static void *writer_thread_fn(void *arg) {
     TestClient *wtc = tc_connect(&w->cfg);
     if (!wtc) return NULL;
     int i = 0;
-    while (!w->stop) {
+    while (!atomic_load_explicit(&w->stop, memory_order_acquire)) {
         char req[256], *r = NULL;
         snprintf(req, sizeof(req),
             "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"grown\","
@@ -265,7 +266,7 @@ static int test_auto_reshard_run(void) {
                   "start post-reshard writer thread");
     struct timespec writer_ts = { 1, 0 };
     nanosleep(&writer_ts, NULL);
-    wctx.stop = 1;
+    atomic_store_explicit(&wctx.stop, 1, memory_order_release);
     pthread_join(writer_tid, NULL);
     ASSERT_TRUE(wctx.sent > 0, "writer thread issued at least one insert");
     ASSERT_EQ_INT(wctx.sent, wctx.ok, "no insert on 'grown' errored after reshard");
@@ -480,6 +481,12 @@ static int test_auto_reshard_throttle_run(void) {
     ASSERT_TRUE(ready, "daemon ready with AUTO_RESHARD_THROTTLE_MS=3000");
     if (!ready) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
+    /* Captured before the (up to ~40s) reshard-wait section below so the
+       log-file date lookup is right even if that wait straddles midnight
+       (the log file is named by the date the line was WRITTEN, not the
+       date the test happens to check it). */
+    time_t reshard_start_ts = time(NULL);
+
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
@@ -529,26 +536,41 @@ static int test_auto_reshard_throttle_run(void) {
        auto_reshard_sweep_one is sufficient to verify the throttle code
        ran; the log check here just confirms log lines exist. */
     {
-        /* Log files are <date>-info.log and <date>-error.log
-           (see open_log_for_level in config.c). Build the info-log path. */
+        /* Log files are <date>-info.log and <date>-error.log (see
+           open_log_for_level in config.c), named by the date the line was
+           WRITTEN. The reshard+throttle wait above can take up to ~40s, so
+           if that window straddles midnight, "done" lines for the two
+           objects can land in two different dated files. Check both the
+           date at the start of the wait and the date now (usually the same
+           file, opened twice harmlessly) and sum matches across both. */
         time_t now2 = time(NULL);
-        struct tm tbuf2; struct tm *t2 = localtime_r(&now2, &tbuf2);
-        char date_str[16]; strftime(date_str, sizeof(date_str), "%Y-%m-%d", t2);
-        char log_path[400];
-        snprintf(log_path, sizeof(log_path), "%s/logs/%s-info.log", base, date_str);
-        FILE *lf = fopen(log_path, "r");
-        ASSERT_NOT_NULL(lf, "opened info.log for done-line check");
-        if (lf) {
+        struct tm tbuf_start, tbuf_now;
+        struct tm *t_start = localtime_r(&reshard_start_ts, &tbuf_start);
+        struct tm *t_now   = localtime_r(&now2, &tbuf_now);
+        char date_start[16], date_now[16];
+        strftime(date_start, sizeof(date_start), "%Y-%m-%d", t_start);
+        strftime(date_now,   sizeof(date_now),   "%Y-%m-%d", t_now);
+
+        int done_count = 0;
+        int opened_any = 0;
+        const char *dates[2] = { date_start, date_now };
+        for (int di = 0; di < 2; di++) {
+            if (di == 1 && strcmp(dates[0], dates[1]) == 0) break;
+            char log_path[400];
+            snprintf(log_path, sizeof(log_path), "%s/logs/%s-info.log", base, dates[di]);
+            FILE *lf = fopen(log_path, "r");
+            if (!lf) continue;
+            opened_any = 1;
             char lbuf[1024];
-            int done_count = 0;
             while (fgets(lbuf, sizeof(lbuf), lf)) {
                 if (strstr(lbuf, "AUTO-RESHARD") && strstr(lbuf, "splits done"))
                     done_count++;
             }
             fclose(lf);
-            ASSERT_TRUE(done_count >= 2,
-                "found at least 2 AUTO-RESHARD done log lines");
         }
+        ASSERT_TRUE(opened_any, "opened info.log for done-line check");
+        ASSERT_TRUE(done_count >= 2,
+            "found at least 2 AUTO-RESHARD done log lines");
     }
 
     tc_close(tc);

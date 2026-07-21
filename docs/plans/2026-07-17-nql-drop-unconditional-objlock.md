@@ -1,3 +1,15 @@
+> **SUPERSEDED 2026-07-21**: the fix below was reverted. TSan proved reads on
+> *both* wire protocols (JSON and NQL) need `objlock_rdlock` — the registry
+> struct returned by `slotcask_registry_get` has zero refcounting, and an
+> unlocked reader can race a concurrent rebuild/vacuum's
+> `slotcask_registry_invalidate` (free). "JSON reads take zero lock" (this
+> doc's premise) was itself the bug, not a safe baseline to match. See
+> `docs/plans/2026-07-21-read-path-missing-objlock-uaf.md`. The regression
+> test this doc introduced, `test_nql_no_objlock_contention.c`, was renamed
+> twice (through `test_nql_objlock_contention.c` to
+> `test_read_objlock_contention.c`) with its assertions inverted — it now
+> proves both NQL find *and* JSON get *block* behind a held schema wrlock.
+
 # Finding 4 — stop NQL dispatch from taking an objlock its JSON twin never needs
 
 Source: Finding 4 in `docs/plans/2026-07-16-storage-durability-and-recovery-findings.md`.

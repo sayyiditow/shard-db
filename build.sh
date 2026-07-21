@@ -106,11 +106,11 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/durability.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # libshard-db.a — embedded mode static library (all daemon sources except main.c)
-LIB_SRCS="src/db/util.c src/db/parallel.c src/db/storage.c src/db/index.c \
+LIB_SRCS="src/db/util.c src/db/durability.c src/db/parallel.c src/db/storage.c src/db/index.c \
           src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c \
           src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c \
           src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c src/db/type_desc.c \
@@ -126,6 +126,10 @@ ar rcs build/bin/libshard-db.a $LIB_OBJS
 cp src/db/shard_db.h build/bin/shard_db.h
 gcc $MODE_CFLAGS -o build/bin/embedded_lock_harness \
     src/test/embedded_lock_harness.c build/bin/libshard-db.a \
+    -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
+    -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o build/bin/embedded_bg_harness \
+    src/test/embedded_bg_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
     -lpthread -lssl -lcrypto
 echo "  -> build/bin/libshard-db.a + build/bin/shard_db.h"
@@ -223,7 +227,12 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_auto_reshard.c \
     src/test/cases/test_auto_reshard_shutdown_race.c \
     src/test/cases/test_warmup_vacuum_race.c \
-    src/test/cases/test_nql_no_objlock_contention.c \
+    src/test/cases/test_warmup_vacuum_norace.c \
+    src/test/cases/test_durability_sync.c \
+    src/test/cases/test_durability_sync_failures.c \
+    src/test/cases/test_durability_sync_cache_paths.c \
+    src/test/cases/test_embedded_bg_threads.c \
+    src/test/cases/test_read_objlock_contention.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
     src/test/cases/test_index_splits_curve.c \
@@ -326,6 +335,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_json_aggregate_order_case.c \
     src/test/cases/test_runner_parallel.c \
     src/db/util.c \
+    src/db/durability.c \
     src/db/slotcask.c \
     src/db/parallel.c \
     src/db/storage.c \
@@ -379,6 +389,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/test/test_runner.c \
     src/test/fixtures.c \
     src/db/util.c \
+    src/db/durability.c \
     src/db/parallel.c \
     src/db/storage.c \
     src/db/index.c \
@@ -480,6 +491,11 @@ export FCACHE_MAX=4096
 # pass (faster) or down on small VPS to cap peak.
 export INDEX_BUILD_BUDGET_MB=1024
 
+# Periodic blocking sync for dirty mmap-backed cache entries. This is a
+# target dirty-age/attempt interval, not a transactional durability bound.
+# Set 0 to disable; nonzero values must be at least 50 milliseconds.
+export DURABILITY_SYNC_MS=1000
+
 # Full-scan O_DIRECT chunk size (MB). Each parallel worker reads shard data
 # in chunks of this size using O_DIRECT (cache-bypassing pread). Larger chunks
 # reduce syscall overhead on fast NVMe; smaller chunks reduce peak RAM.
@@ -493,7 +509,7 @@ export DISABLE_LOCALHOST_TRUST=0
 # Startup warmup — primes userspace caches (schema, slotcask registry,
 # kfcache) and the OS page cache for kf + index shards so the first
 # user query is O(1).
-#   async (default)  detached thread races first queries
+#   async (default)  joinable background thread races first queries
 #   sync             block startup until warmup completes
 #   off              skip entirely (rely on lazy cache populate)
 # Warmup itself fans out per-shard / per-file through the global pool

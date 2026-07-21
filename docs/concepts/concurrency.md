@@ -72,6 +72,51 @@ Reads are not drained; they're safe to abandon mid-scan.
 
 `AUTO_VACUUM`/`AUTO_RESHARD_ENABLE`'s background threads are joined (not detached) as part of this same shutdown sequence, before the live cache teardown (`slotcask_shutdown`/`kfcache_shutdown` and `bt_cache_shutdown`). If either thread is mid-sweep on an object when `stop` is issued, shutdown waits for that item to finish — unbounded in theory, but no worse in practice than the exclusive objlock that operation already holds against all other traffic on that object. This closes a use-after-free race: without the join, `kfcache_shutdown()` could free/destroy the kfcache array while a reshard/vacuum thread was still using it.
 
+## Warmup thread vs. concurrent vacuum/rebuild
+
+`warmup_thread` (`src/db/server.c`) walks the whole `db_root` tree at
+startup and fans out one I/O-pool task per kf shard (`WarmupKfTask` /
+`warmup_kf_task_fn`) to pre-fault pages into cache. Phase 1 (the tree walk
+that collects tasks) and phase 2 (the pool actually running them) are not
+atomic with each other — a task collected early in the walk can sit queued,
+holding no lock at all, for as long as the rest of the walk takes, which is
+easily long enough for a concurrent `vacuum --splits`/`--compact` to run to
+full completion on that same object: take `objlock_wrlock()`, rewrite
+`schema.conf`, call `slotcask_registry_invalidate` (which frees the old
+`SlotcaskDb`), release the wrlock.
+
+Because of that gap, `warmup_kf_task_fn` must never carry a `SlotcaskDb*`
+(or the `SlotcaskSchemaInfo` used to obtain one) captured during phase 1
+across into phase 2 — either can go stale mid-gap, and reusing stale info
+on a subsequent registry miss would silently reopen the object at the
+*wrong* shape (`rebuild_object_v2` invalidates the registry but never
+repopulates it, so the first `registry_get` after a rebuild is the one that
+determines the reopened shape). Instead, each task reloads the schema and
+re-resolves the registry entry fresh, under its own `objlock_rdlock()`,
+taken only at the point the task actually runs — not back in phase 1. That
+lock is mutually exclusive with the vacuum's wrlock, so the reload always
+observes either the fully-pre-rebuild or fully-post-rebuild schema, never a
+torn one. This closed a real UAF (`docs/plans/2026-07-20-warmup-kftask-stale-sdb-uaf.md`):
+the first-pass fix re-resolved the `SlotcaskDb*` but still reused a
+phase-1-captured `SlotcaskSchemaInfo`, which is exactly as stale-able as the
+pointer it replaced.
+
+Two test-only delay knobs (`WARMUP_TEST_DELAY_MS`, inside the rdlock;
+`WARMUP_TEST_PRELOCK_DELAY_MS`, before it's even taken) exist to
+deterministically exercise both shapes of the race:
+`test_warmup_vacuum_race.c` proves mutual exclusion while both are
+in-flight (delay fires *inside* the rdlock, so the vacuum's wrlock request
+necessarily overlaps in time); `test_warmup_vacuum_norace.c` proves the
+no-overlap case — vacuum completes *entirely* before the delayed task ever
+attempts the rdlock — still leaves the daemon crash-free and the object
+correctly re-resolved to its new post-vacuum shape.
+
+## Durability-sync background thread
+
+A mandatory background thread (`durability_sync_thread`, `src/db/durability.c`) wakes every `DURABILITY_SYNC_MS` (default configurable via db.env) and walks the kf/seg/bt/bm mmap caches, `msync()`-ing any entry whose `dirty` flag is set and whose `dirty_since_ms` has aged past the interval — bounding how long a dirty mmap page can sit unflushed before a crash could lose it, independent of the OS's own writeback cadence.
+
+Each cache entry's `base`/`map` pointer is walked **live**, not snapshotted: `durability_sync_one_pass` iterates `db->kfcache[i]` etc. and passes `&e->base`/`&e->map` (a pointer *into* the struct) down to `durability_sync_entry`, which only dereferences it after taking `e->rwlock`. This is required, not incidental — the entry's mapping can be replaced (growth/remap on `kfcache_acquire`) or torn down (`kfcache_invalidate_prefix`/`segcache_invalidate_prefix` under a concurrent vacuum/rebuild) at any point before the lock is taken. An earlier version of this code read `*map_ptr` before acquiring the lock and passed that stale/local copy to `durability_msync()` while still clearing the *live* entry's dirty flag — syncing the wrong (possibly already-unmapped) memory while marking the real dirty data as clean. Fixed by keeping the indirection through the lock instead of snapshotting.
+
 ## Commit semantics (v2)
 
 A v2 write is sequenced as:

@@ -8,6 +8,11 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
 
 - **Execution mode:** leave work **uncommitted** after plan execution — Sonnet reviews the raw `git diff` first; nothing is committed until that review pass is done.
 - **Build/test commands for plans:** build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`.
+- **Dynamic-safety tooling for this repo (CORE-PROCESS.md's "Definition of done" gate):** ASan+UBSan and TSan, via `BUILD_MODE`. Any diff touching locks, shared/cached state (kfcache, segcache, bitmap cache, btree cache), object lifetimes, or background threads must be run locally under both before being called done — not deferred to CI:
+  - `BUILD_MODE=asan SKIP_TESTS=1 ./build.sh` then `ASAN_OPTIONS="halt_on_error=0:detect_leaks=1:abort_on_error=0:print_stacktrace=1" ./build/bin/shard-db-test run-all --jobs 2` (or `run <name>` for the affected case(s) at minimum).
+  - `BUILD_MODE=tsan SKIP_TESTS=1 ./build.sh` then `TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:suppressions=$(pwd)/.tsan.supp" ./build/bin/shard-db-test run-all --jobs 1` (or `run <name>` for the affected case(s) at minimum).
+  - New findings get root-caused and either fixed now (if simple — see CORE-PROCESS.md's "never paper over issues") or written up as a `docs/plans/<date>-<slug>.md` and, only if deliberately deferred, added to `.tsan.supp` with a named-function suppression and a full rationale paragraph — never a blanket suppression, never "not a real bug" without justification.
+  - CI (`.github/workflows/sanitizers.yml`, `.github/workflows/tsan.yml`) runs both against the full suite as a backstop, not a substitute for the local run above.
 
 ## Deployment (Netcup) — ship artifacts, never git
 

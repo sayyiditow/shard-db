@@ -58,7 +58,8 @@ static int mode_is_schema(const char *m) {
            strcasecmp(m, "truncate") == 0 ||
            strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
             strcasecmp(m, "migrate-storage-version") == 0 ||
-            strcasecmp(m, "migrate") == 0;
+            strcasecmp(m, "migrate") == 0 ||
+            strcasecmp(m, "compact") == 0;
 }
 
 /* ========== Auth: IP allowlist + token set ========== */
@@ -618,12 +619,20 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
     char db_root[PATH_MAX];
     snprintf(db_root, sizeof db_root, "%s/%s", raw_db_root, cmd.dir);
 
-    /* No objlock here: every NqlMode (NQL_FIND/NQL_COUNT/NQL_AGGREGATE) is a
-       read, and reads take no per-object lock — matches dispatch_json_query's
-       mode_is_write/mode_is_schema gating. The JSON and NQL forms converge on
-       the same cmd_count_with_tree/cmd_find_do/cmd_aggregate_do read cores.
-       If NQL ever grows a write mode, that mode's case must take and release
-       the appropriate lock — see mode_is_write/mode_is_schema for JSON. */
+    /* objlock_rdlock: every NqlMode (NQL_FIND/NQL_COUNT/NQL_AGGREGATE) reads
+       through cmd_count_tree/cmd_find_tree/cmd_aggregate_tree, which reach
+       slotcask_registry_get() the same way the JSON find/count/aggregate
+       modes do. slotcask_registry_get() hands out a raw SlotcaskDb* with no
+       refcounting; a concurrent rebuild/vacuum holding objlock_wrlock can
+       free that struct via slotcask_registry_invalidate() at any point. This
+       used to be unlocked ("matches dispatch_json_query's mode_is_write/
+       mode_is_schema gating" — true at the time, but that gating had the
+       same gap, since fixed: see dispatch_json_query's took_rdlock). Taking
+       no lock here was a use-after-free, not a documented performance
+       trade-off; NQL reads now pay the same (small, shared-lock) cost JSON
+       reads do. If NQL ever grows a write mode, that mode's case still needs
+       nothing extra here — this now covers all of them uniformly. */
+    objlock_rdlock(db_root, cmd.obj);
     switch (cmd.mode) {
     case NQL_COUNT:
         if (cmd.explain)
@@ -671,6 +680,7 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
                            0);
         break;
     }
+    objlock_rdunlock(db_root, cmd.obj);
 
     nql_free_command(&cmd);
 }
@@ -1384,17 +1394,30 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         return;
     }
 
-    /* describe-object — read-only schema/index/count snapshot. No object lock
-       needed since we're just reading static metadata + an atomic counter. */
+    /* describe-object — reads live schema/index/count state via get_live_count,
+       which opens the object's SlotcaskDb through the registry. That struct can
+       be freed concurrently by a rebuild/vacuum holding objlock_wrlock, so this
+       needs the same rdlock as every other read; it bypasses the generic block
+       below (it returns before create/drop-object style commands would want a
+       lock at all), so it takes its own. */
     if (strcmp(mode, "describe-object") == 0) {
+        objlock_rdlock(db_root, object);
         cmd_describe_object(g_db_root, dir, object);
+        objlock_rdunlock(db_root, object);
         free(mode); free(dir); free(object);
         return;
     }
 
-    /* Per-object locking: wrlock for schema/rebuild, rdlock for writes, none for reads. */
+    /* Per-object locking: wrlock for schema/rebuild, rdlock for everything else
+       (writes and reads alike). slotcask_registry_get() hands out a raw
+       SlotcaskDb* with no refcounting; slotcask_registry_invalidate() (called
+       by rebuild/vacuum under objlock_wrlock) frees that struct outright. Any
+       code path that can reach the registry — not just writes — needs rdlock
+       to keep that free from racing a concurrent dereference. Default to
+       locked (fail-safe) rather than enumerating "modes that read": a mode
+       added here later without a lock is a use-after-free, not a data race. */
     int took_wrlock = mode_is_schema(mode);
-    int took_rdlock = !took_wrlock && mode_is_write(mode);
+    int took_rdlock = !took_wrlock;
     if (took_wrlock) objlock_wrlock(db_root, object);
     else if (took_rdlock) objlock_rdlock(db_root, object);
     if (took_wrlock && g_db && g_schema_wrlock_test_delay_ms > 0) {
@@ -1594,6 +1617,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int lim = lim_s ? atoi(lim_s) : 0;
         if (off < 0) {
             OUT("{\"error\":\"offset must not be negative\"}\n");
+            if (took_wrlock) objlock_wrunlock(db_root, object);
+            else if (took_rdlock) objlock_rdunlock(db_root, object);
             free(criteria); free(off_s); free(lim_s); free(fields); free(excl); free(fmt);
             free(delim); free(join); free(ob); free(od); free(cur);
             free(mode); free(dir); free(object);
@@ -1811,6 +1836,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
         }
     } else if (strcmp(mode, "compact") == 0) {
+        /* "compact" is in mode_is_schema, so took_wrlock is already held for
+           the whole branch (taken above, before this if/else chain) — do not
+           take objlock_wrlock again here, pthread_rwlock wrlock is not
+           recursive and a same-thread re-lock deadlocks. */
         Schema sc = load_schema(db_root, object);
         TypedSchema *ts = load_typed_schema(db_root, object);
         SlotcaskSchemaInfo info = { .splits = sc.splits, .slot_size = sc.slot_size,
@@ -1818,18 +1847,22 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
         if (!sdb || sdb->format != SLOTCASK_FORMAT_VARIABLE) {
             OUT("{\"error\":\"object not found or not in VARIABLE format\"}\n");
+            if (took_wrlock) objlock_wrunlock(db_root, object);
+            else if (took_rdlock) objlock_rdunlock(db_root, object);
             free(mode); free(dir); free(object);
             return;
         }
-        objlock_wrlock(db_root, object);
         int rc = slotcask_compact(sdb, schema_trim_fn, (void *)ts);
-        objlock_wrunlock(db_root, object);
         if (rc != 0) {
             OUT("{\"error\":\"compact failed\"}\n");
+            if (took_wrlock) objlock_wrunlock(db_root, object);
+            else if (took_rdlock) objlock_rdunlock(db_root, object);
             free(mode); free(dir); free(object);
             return;
         }
         OUT("{\"ok\":true}\n");
+        if (took_wrlock) objlock_wrunlock(db_root, object);
+        else if (took_rdlock) objlock_rdunlock(db_root, object);
         free(mode); free(dir); free(object);
         return;
     } else if (strcmp(mode, "rename-field") == 0) {
@@ -2279,7 +2312,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     */
     /* Per-object locking for this dispatch — same policy as JSON mode. */
     int fast_wr = mode_is_schema(cmd);
-    int fast_rd = !fast_wr && mode_is_write(cmd);
+    int fast_rd = !fast_wr;
     if (fast_wr) objlock_wrlock(eff_root, object);
     else if (fast_rd) objlock_rdlock(eff_root, object);
 
@@ -2576,13 +2609,21 @@ typedef struct {
    page-faults that the disk's NCQ can pipeline). */
 typedef struct {
     char db_root[PATH_MAX];
+    int callback_grace_ms;
 } WarmupArg;
 
 /* Phase-1 setup for one (dir, object) — schema load + slotcask
    registry populate.  Returns the per-object SlotcaskDb* on success
    (caller fans out per-shard kfcache work over sdb->num_shards) or
    NULL if the object is missing/invalid.  The returned pointer is
-   owned by the slotcask registry and lives until shutdown. */
+   owned by the slotcask registry and lives until shutdown — callers
+   that stash work for later (phase 2/3) must not carry this pointer
+   (or the SlotcaskSchemaInfo used to obtain it) across that gap: both
+   can go stale if a wrlock-held rebuild runs entirely within the gap,
+   and reusing stale info on a registry miss would reopen the object
+   with the wrong shape. Phase 2/3 must reload the schema fresh under
+   its own lock and re-resolve via the registry instead (see
+   WarmupKfTask / warmup_kf_task_fn). */
 static SlotcaskDb *warmup_object_open(const char *db_root,
                                       const char *dir, const char *obj) {
     char eff[PATH_MAX];
@@ -2647,12 +2688,28 @@ static int warmup_touch_file(const char *path) {
    eff/obj are copied (not pointed-to): tasks outlive the per-object
    collection loop that creates them (kf_tasks is a realloc()-growable
    array), and warmup_kf_task_fn dereferences them from a pool thread
-   holding no lock of its own — they are the objlock key used to
-   serialize against a concurrent vacuum/rebuild freeing `sdb` out from
-   under this task. See docs/plans/2026-07-15-auto-reshard-shutdown-race.md
-   ("the warmup thread is now in scope") for the UAF this closes. */
+   holding no lock of its own.
+
+   Nothing about the object's shape (schema/registry pointer) is carried
+   across that gap: phase 1 walks the *entire* db_root tree before phase
+   2 dispatches a single task, so an object collected early can sit
+   queued for the whole rest of that walk — easily long enough for a
+   concurrent vacuum/rebuild to invalidate+free that object's SlotcaskDb,
+   and even change its splits/streams/slot_size, in between. A captured
+   pointer can't detect that, and reusing phase-1-captured schema info on
+   a registry miss would silently reopen the object with the WRONG shape
+   (rebuild_object_v2 invalidates the registry but never repopulates it —
+   see query_find.c, the wrlock-held invalidate calls around commit — so
+   the first registry_get to run after a rebuild is always the one whose
+   info determines the reopened shape). So warmup_kf_task_fn reloads the
+   schema itself, fresh, under its own objlock_rdlock: that lock is
+   mutually exclusive with the rebuild's wrlock (held across both the
+   schema.conf rewrite and the registry invalidate), so the reload always
+   sees either the pre-rebuild or fully-post-rebuild schema, never a
+   stale/torn one. See docs/plans/2026-07-15-auto-reshard-shutdown-race.md
+   ("the warmup thread is now in scope") and
+   docs/plans/2026-07-20-warmup-kftask-stale-sdb-uaf.md for the UAF this closes. */
 typedef struct {
-    SlotcaskDb *sdb;
     int shard_idx;
     _Atomic int *kf_count;
     char eff[PATH_MAX];
@@ -2663,11 +2720,28 @@ static void *warmup_kf_task_fn(void *arg) {
     WarmupKfTask *t = (WarmupKfTask *)arg;
     if (!server_running) return NULL;
 
-    /* Hold the object's rdlock only long enough to copy out the fields
-       we need — this is what a concurrent vacuum's wrlock (taken before
-       slotcask_registry_invalidate frees `sdb`) blocks against. Once we
-       have kf_path + slots_per_shard by value, sdb is never touched
-       again in this function. */
+    /* Test-only: widen the queued-but-not-yet-locking window with NO lock
+       held, so a regression test can let a rebuild/vacuum fully acquire
+       and release its wrlock before this task ever attempts objlock_rdlock
+       -- the no-overlap case test_warmup_vacuum_race.c doesn't cover
+       (that test's delay is held *inside* the rdlock, which itself blocks
+       the vacuum rather than letting it run to completion first). */
+    if (g_db && g_warmup_test_prelock_delay_ms > 0) {
+        LOG_INFO(LOG_SUB_WARMUP, "WARMUP-PRELOCK-TEST-DELAY: shard_idx=%d starting", t->shard_idx);
+        struct timespec prelock_ts = { g_warmup_test_prelock_delay_ms / 1000,
+                                        (long)(g_warmup_test_prelock_delay_ms % 1000) * 1000000L };
+        nanosleep(&prelock_ts, NULL);
+    }
+
+    /* Hold the object's rdlock across the schema reload, the registry
+       re-resolve, and the field copy — this is what a concurrent
+       vacuum's wrlock (taken before the schema.conf rewrite and before
+       slotcask_registry_invalidate frees the old SlotcaskDb) blocks
+       against. Reloading and re-resolving here (instead of trusting
+       anything captured back in phase 1) means a vacuum that fully
+       completed before this task even started still yields a live,
+       correctly-shaped, freshly-opened sdb rather than a dangling or
+       wrongly-shaped one. */
     char kf_path[PATH_MAX];
     int slots_per_shard;
     objlock_rdlock(t->eff, t->obj);
@@ -2677,8 +2751,21 @@ static void *warmup_kf_task_fn(void *arg) {
                                       (long)(g_warmup_test_delay_ms % 1000) * 1000000L };
         nanosleep(&delay_ts, NULL);
     }
-    slotcask_kf_path(kf_path, sizeof(kf_path), t->sdb->data_dir, t->shard_idx);
-    slots_per_shard = t->sdb->slots_per_shard;
+    Schema sch = load_schema(t->eff, t->obj);
+    if (sch.splits <= 0) {
+        objlock_rdunlock(t->eff, t->obj);
+        return NULL;
+    }
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size, .streams = sch.streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(t->eff, t->obj, &info);
+    if (!sdb) {
+        objlock_rdunlock(t->eff, t->obj);
+        return NULL;
+    }
+    slotcask_kf_path(kf_path, sizeof(kf_path), sdb->data_dir, t->shard_idx);
+    slots_per_shard = sdb->slots_per_shard;
     objlock_rdunlock(t->eff, t->obj);
 
     SlotcaskKfHandle kh;
@@ -2765,6 +2852,17 @@ static void *warmup_thread(void *arg) {
     /* Bind thread-local g_db so all g_* macros work. */
     g_db = g_shard_db_instance;
 
+    /* Embedded callers can only install their public log callback after
+       shard_db_open returns. Give that immediate call a small deterministic
+       window before async warmup emits opt-in progress markers. */
+    if (a->callback_grace_ms > 0) {
+        struct timespec grace = {
+            .tv_sec = a->callback_grace_ms / 1000,
+            .tv_nsec = (long)(a->callback_grace_ms % 1000) * 1000000L
+        };
+        nanosleep(&grace, NULL);
+    }
+
     /* g_out only matters if the warmup ever emitted via OUT(); it doesn't.
        But pool worker threads (which this one is NOT) carry __thread g_out
        state, so we set it defensively in case any helper we call adopts
@@ -2814,15 +2912,19 @@ static void *warmup_thread(void *arg) {
         while ((de = readdir(dd)) && server_running) {
             if (de->d_name[0] == '.') continue;
 
+            /* The objlock must wrap slotcask_registry_get itself, not just
+               the num_shards read after it: a concurrent vacuum's wrlock
+               (held across its whole rebuild, including the invalidate that
+               frees the old SlotcaskDb) can free sdb in the gap between
+               warmup_object_open() returning it and a lock taken afterward.
+               Taking the lock first forces us to wait out any in-flight
+               vacuum, then re-resolve sdb fresh from the registry — which
+               is guaranteed live for as long as we hold the rdlock. */
+            objlock_rdlock(dir_path, de->d_name);
             SlotcaskDb *sdb = warmup_object_open(a->db_root,
                                                  dirs_copy[di], de->d_name);
-            if (!sdb) continue;
+            if (!sdb) { objlock_rdunlock(dir_path, de->d_name); continue; }
             objects++;
-
-            /* Snapshot num_shards under the objlock — same UAF class as
-               warmup_kf_task_fn above, just narrower (phase 1 is serial
-               on this thread, so the window is only this one read). */
-            objlock_rdlock(dir_path, de->d_name);
             int num_shards = sdb->num_shards;
             objlock_rdunlock(dir_path, de->d_name);
 
@@ -2836,7 +2938,6 @@ static void *warmup_thread(void *arg) {
                     kf_cap = new_cap;
                 }
                 WarmupKfTask *kt = &kf_tasks[n_kf++];
-                kt->sdb = sdb;
                 kt->shard_idx = s;
                 kt->kf_count = &kf_count;
                 snprintf(kt->eff, sizeof(kt->eff), "%s", dir_path);
@@ -2991,6 +3092,7 @@ static void *auto_vacuum_thread(void *arg) {
     }
 
     if (g_out && g_out != stderr) fclose(g_out);
+    free(a);
     return NULL;
 }
 
@@ -3101,7 +3203,7 @@ static void *auto_reshard_thread(void *arg) {
     /* Startup grace period — see the function doc comment above for why
        this must run before the first wall-clock check, not just before
        the loop's steady-state ticks. */
-    sleep(5);
+    for (int i = 0; i < 5 && server_running; i++) sleep(1);
 
     /* Discard cmd_vacuum's JSON output — there's no client connection.
        /dev/null open failure shouldn't kill the thread; fall back to
@@ -3139,7 +3241,137 @@ static void *auto_reshard_thread(void *arg) {
     }
 
     if (g_out && g_out != stderr) fclose(g_out);
+    free(a);
     return NULL;
+}
+
+static void bg_thread_warning(BgRuntimeMode mode, const char *name,
+                              const char *detail) {
+    LOG_WARN(LOG_SUB_SERVER, "background thread %s not started: %s",
+             name, detail);
+    if (mode == BG_RUNTIME_EMBEDDED)
+        fprintf(stderr, "shard_db_open: background thread %s not started: %s\n",
+                name, detail);
+}
+
+int bg_threads_start(ShardDb *db, BgRuntimeMode mode) {
+    if (!db) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    atomic_store_explicit(&server_running, 1, memory_order_release);
+    db->bg_auto_vac_spawned = 0;
+    db->bg_auto_reshard_spawned = 0;
+    db->bg_warmup_spawned = 0;
+    db->bg_durability_spawned = 0;
+    memset(&db->bg_auto_vac_tid, 0, sizeof(db->bg_auto_vac_tid));
+    memset(&db->bg_auto_reshard_tid, 0, sizeof(db->bg_auto_reshard_tid));
+    memset(&db->bg_warmup_tid, 0, sizeof(db->bg_warmup_tid));
+    memset(&db->bg_durability_tid, 0, sizeof(db->bg_durability_tid));
+
+    if (db->durability_sync_ms > 0) {
+        int rc = db_thread_create(&db->bg_durability_tid,
+                                  durability_sync_thread, db);
+        if (rc != 0) {
+            LOG_ERROR(LOG_SUB_DURABILITY,
+                      "required durability thread not started: %s",
+                      strerror(rc));
+            fprintf(stderr,
+                    "shard-db: required durability thread not started: %s\n",
+                    strerror(rc));
+            atomic_store_explicit(&server_running, 0, memory_order_release);
+            return -1;
+        }
+        db->bg_durability_spawned = 1;
+    }
+
+    if (db->auto_vacuum_enable) {
+        AutoVacuumArg *av = malloc(sizeof(*av));
+        if (!av) {
+            bg_thread_warning(mode, "auto-vacuum", "out of memory");
+        } else {
+            snprintf(av->db_root, sizeof(av->db_root), "%s", db->db_root);
+            int rc = db_thread_create(&db->bg_auto_vac_tid,
+                                      auto_vacuum_thread, av);
+            if (rc == 0) {
+                db->bg_auto_vac_spawned = 1;
+            } else {
+                free(av);
+                bg_thread_warning(mode, "auto-vacuum", strerror(rc));
+            }
+        }
+    }
+
+    if (db->auto_reshard_enable) {
+        AutoReshardArg *ar = malloc(sizeof(*ar));
+        if (!ar) {
+            bg_thread_warning(mode, "auto-reshard", "out of memory");
+        } else {
+            snprintf(ar->db_root, sizeof(ar->db_root), "%s", db->db_root);
+            int rc = db_thread_create(&db->bg_auto_reshard_tid,
+                                      auto_reshard_thread, ar);
+            if (rc == 0) {
+                db->bg_auto_reshard_spawned = 1;
+            } else {
+                free(ar);
+                bg_thread_warning(mode, "auto-reshard", strerror(rc));
+            }
+        }
+    }
+
+    const char *warmup_mode = db->warmup_mode;
+    if (mode == BG_RUNTIME_EMBEDDED && !db->warmup_explicit)
+        warmup_mode = "off";
+    if (strcmp(warmup_mode, "off") != 0) {
+        WarmupArg *wa = malloc(sizeof(*wa));
+        if (!wa) {
+            bg_thread_warning(mode, "warmup", "out of memory");
+        } else {
+            snprintf(wa->db_root, sizeof(wa->db_root), "%s", db->db_root);
+            wa->callback_grace_ms =
+                mode == BG_RUNTIME_EMBEDDED && strcmp(warmup_mode, "async") == 0
+                    ? 50 : 0;
+            if (strcmp(warmup_mode, "sync") == 0) {
+                warmup_thread(wa); /* frees wa */
+                g_db = db;
+            } else {
+                int rc = db_thread_create(&db->bg_warmup_tid,
+                                          warmup_thread, wa);
+                if (rc == 0) {
+                    db->bg_warmup_spawned = 1;
+                } else {
+                    free(wa);
+                    bg_thread_warning(mode, "warmup", strerror(rc));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+void bg_threads_stop(ShardDb *db) {
+    if (!db) return;
+    g_db = db;
+    atomic_store_explicit(&server_running, 0, memory_order_release);
+
+    if (db->bg_durability_spawned)
+        pthread_join(db->bg_durability_tid, NULL);
+    if (db->bg_auto_vac_spawned)
+        pthread_join(db->bg_auto_vac_tid, NULL);
+    if (db->bg_auto_reshard_spawned)
+        pthread_join(db->bg_auto_reshard_tid, NULL);
+    if (db->bg_warmup_spawned)
+        pthread_join(db->bg_warmup_tid, NULL);
+
+    db->bg_durability_spawned = 0;
+    db->bg_auto_vac_spawned = 0;
+    db->bg_auto_reshard_spawned = 0;
+    db->bg_warmup_spawned = 0;
+    memset(&db->bg_durability_tid, 0, sizeof(db->bg_durability_tid));
+    memset(&db->bg_auto_vac_tid, 0, sizeof(db->bg_auto_vac_tid));
+    memset(&db->bg_auto_reshard_tid, 0, sizeof(db->bg_auto_reshard_tid));
+    memset(&db->bg_warmup_tid, 0, sizeof(db->bg_warmup_tid));
 }
 
 /* Startup metadata validator.
@@ -3326,10 +3558,6 @@ int cmd_server(const char *db_root, int daemonize) {
     g_db = g_shard_db_instance;
 
     int port = g_port;
-    pthread_t auto_vac_tid = 0;
-    int auto_vac_spawned = 0;
-    pthread_t auto_reshard_tid = 0;
-    int auto_reshard_spawned = 0;
 
     /* Raise the file-descriptor soft limit to the hard limit. Each populated
        kfcache, segcache, bt_cache, and bm_cache entry holds 1 fd; a kf
@@ -3565,6 +3793,29 @@ int cmd_server(const char *db_root, int daemonize) {
     if (io_pool_sz > (int)nproc * 8) io_pool_sz = (int)nproc * 8; /* cap: beyond 8× scheduler thrash dominates */
     parallel_io_pool_init(io_pool_sz);
 
+    /* Transfer DB-root lock ownership to the instance now that every
+       pre-background startup check has succeeded. */
+    g_shard_db_instance->db_root_lock_fd = lock_fd;
+    lock_fd = -1;
+    if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
+        LOG_ERROR(LOG_SUB_DURABILITY,
+                  "SERVER START aborted: required durability thread unavailable");
+        remove_pid_file(db_root);
+        close(sfd);
+        bg_threads_stop(g_shard_db_instance);
+        parallel_io_pool_shutdown();
+        parallel_pool_shutdown();
+        counts_flush_all();
+        bt_cache_shutdown();
+        bm_cache_shutdown();
+        slotcask_shutdown();
+        schema_caches_shutdown();
+        tls_shutdown();
+        log_shutdown();
+        shard_db_destroy_after_storage(g_shard_db_instance);
+        return 1;
+    }
+
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 4) nthreads = 4;       /* minimum pool size */
     if (nthreads > 1024) nthreads = 1024; /* sanity cap — no real CPU count exceeds this; protects nthreads*64 from int overflow on a typo'd WORKERS in db.env */
@@ -3590,60 +3841,6 @@ int cmd_server(const char *db_root, int daemonize) {
     fflush(stdout);
     LOG_INFO(LOG_SUB_SERVER, "SERVER START port=%d pid=%d workers=%d tls=%d",
             port, getpid(), nthreads, g_tls_enable);
-
-    /* Auto-vacuum is opt-in. Joined (not detached) on shutdown below —
-       see the shutdown sequence's pthread_join() comment for why. */
-    if (g_auto_vacuum_enable) {
-        AutoVacuumArg *av = malloc(sizeof(AutoVacuumArg));
-        if (av) {
-            strncpy(av->db_root, db_root, PATH_MAX - 1);
-            av->db_root[PATH_MAX - 1] = '\0';
-            if (db_thread_create(&auto_vac_tid, auto_vacuum_thread, av) == 0)
-                auto_vac_spawned = 1;
-            else
-                free(av);
-        }
-    }
-
-    /* Auto-reshard is opt-in. Joined (not detached) on shutdown below —
-       see the shutdown sequence's pthread_join() comment for why. */
-    if (g_auto_reshard_enable) {
-        AutoReshardArg *ar = malloc(sizeof(AutoReshardArg));
-        if (ar) {
-            strncpy(ar->db_root, db_root, PATH_MAX - 1);
-            ar->db_root[PATH_MAX - 1] = '\0';
-            if (db_thread_create(&auto_reshard_tid, auto_reshard_thread, ar) == 0)
-                auto_reshard_spawned = 1;
-            else
-                free(ar);
-        }
-    }
-
-    /* Startup warmup. async (default) spawns a detached thread that primes
-       the OS page cache for every kf header + index shard. sync runs the
-       same work inline before we return from cmd_server (caller blocks until
-       done). off skips it. The async path is what makes restart-while-
-       explorer-running fast: the daemon accepts connections immediately,
-       and the warmup thread races the first user queries to populate the
-       cache. See config.c (g_warmup_mode) for the env knob WARMUP=. */
-    if (strcmp(g_warmup_mode, "off") != 0) {
-        WarmupArg *wa = malloc(sizeof(WarmupArg));
-        if (wa) {
-            strncpy(wa->db_root, db_root, PATH_MAX - 1);
-            wa->db_root[PATH_MAX - 1] = '\0';
-            if (strcmp(g_warmup_mode, "sync") == 0) {
-                /* Synchronous mode — block here until warmup completes.
-                   Frees wa internally. */
-                warmup_thread(wa);
-            } else {
-                pthread_t warmup_tid;
-                if (db_thread_create(&warmup_tid, warmup_thread, wa) == 0)
-                    pthread_detach(warmup_tid);
-                else
-                    free(wa);
-            }
-        }
-    }
 
     /* poll-based accept loop. Single fd (the listen socket), so poll()
        is as cheap as epoll here — no edge-triggered / EPOLLET advantage
@@ -3698,35 +3895,24 @@ int cmd_server(const char *db_root, int daemonize) {
     /* Wait for any remaining in-flight writes (up to 30s) */
     for (int i = 0; i < 300 && in_flight_writes > 0; i++) usleep(100000);
 
-    /* Join the auto-vacuum/auto-reshard threads before any teardown that
-       touches slotcask/kfcache/btcache. Both are spawned joinable (not
-       detached) specifically for this: kfcache_shutdown() (invoked below
-       via slotcask_shutdown()) frees the whole kfcache array and destroys
-       every entry's rwlock while holding only g_kfcache_lock -- a mutex
-       kfcache_invalidate_prefix() (reachable from a reshard/vacuum still
-       in flight on either thread) deliberately never takes, to avoid a
-       lock-order inversion with kfcache_acquire()'s install path (see
-       slotcask.c). Without this join, a reshard/vacuum still running when
-       shutdown reached kfcache_shutdown() raced it with zero mutual
-       exclusion -- a genuine use-after-free/destroy-while-locked SIGSEGV.
-       Bounded in practice: both threads already check server_running
-       between sweep items (not mid-item), and a heavy vacuum/reshard
-       already holds the object's exclusive lock for its full duration
-       regardless -- so this join only ever waits as long as an
-       in-progress heavy op that was already blocking all other traffic
-       on that object. */
-    if (auto_vac_spawned) pthread_join(auto_vac_tid, NULL);
-    if (auto_reshard_spawned) pthread_join(auto_reshard_tid, NULL);
+    /* Stop and join durability, auto-vacuum, auto-reshard, and warmup before
+       tearing down either parallel pool or any cache. Maintenance threads
+       may be inside pool work or hold object/cache locks, so joining later
+       would race cache rwlock destruction and mapped-entry teardown. */
+    bg_threads_stop(g_shard_db_instance);
 
     remove_pid_file(db_root);
     parallel_io_pool_shutdown();
     parallel_pool_shutdown();
     counts_flush_all();        /* persist in-memory atomic counts → disk */
     bt_cache_shutdown();
+    bm_cache_shutdown();
     slotcask_shutdown();
+    schema_caches_shutdown();
     tls_shutdown();
     LOG_INFO(LOG_SUB_SERVER, "SERVER STOP pid=%d", getpid());
     log_shutdown();
+    shard_db_destroy_after_storage(g_shard_db_instance);
     fprintf(stdout, "shard-db stopped (pid=%d)\n", getpid());
     fflush(stdout);
     return 0;

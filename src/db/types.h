@@ -493,6 +493,19 @@ typedef struct {
 uint64_t now_ms(void);
 uint64_t now_ms_coarse(void);
 
+static inline void durability_mark_dirty(_Atomic int *dirty,
+                                         _Atomic uint64_t *dirty_since_ms) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(dirty, &expected, 1,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        uint64_t first_dirty_ms = now_ms();
+        if (first_dirty_ms == 0) first_dirty_ms = 1;
+        atomic_store_explicit(dirty_since_ms, first_dirty_ms,
+                              memory_order_release);
+    }
+}
+
 /* Per-query statement-timeout deadline. Shared across worker threads of a
    single query (pass as pointer). Check inside hot loops via the tick macro
    below. `timeout_ms == 0` disables the check. */
@@ -539,6 +552,43 @@ void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride);
 void log_slow_query(const char *mode, const char *dir, const char *object,
                     const char *query, uint32_t duration_ms);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
+
+typedef struct {
+    int kf_synced;
+    int seg_synced;
+    int bt_synced;
+    int bm_synced;
+    int failed;
+    int skipped;
+    int escalated;
+} DurabilitySyncStats;
+
+typedef enum {
+    CACHE_DROP_EVICT,
+    CACHE_DROP_DISCARD
+} CacheDropReason;
+
+struct ShardDb;
+typedef enum {
+    BG_RUNTIME_DAEMON,
+    BG_RUNTIME_EMBEDDED
+} BgRuntimeMode;
+
+int durability_msync(void *addr, size_t len);
+int durability_flush_dirty(_Atomic int *dirty,
+                           _Atomic uint64_t *dirty_since_ms,
+                           void *addr, size_t len);
+void *durability_sync_thread(void *arg);
+int bg_threads_start(struct ShardDb *db, BgRuntimeMode mode);
+void bg_threads_stop(struct ShardDb *db);
+
+#ifdef TEST_BUILD
+void durability_test_msync_reset(void);
+void durability_test_msync_fail_next(int count, int err);
+void durability_test_msync_counts(int *succeeded, int *failed);
+void durability_test_sync_one_pass(struct ShardDb *db, int interval_ms,
+                                   DurabilitySyncStats *stats);
+#endif
 
 /* ========== Function declarations ========== */
 
@@ -887,20 +937,20 @@ int cmd_not_exists(const char *db_root, const char *object, const char *keys_jso
    typed_field_to_index_key). Composite indexes pass the typed binary
    concatenated sub-field index keys; single-field indexes pass encoded
    bytes + their true length. vlen may be 0 (empty key sorts before all others). */
-void write_index_entry(const char *db_root, const char *object, const char *field,
+int write_index_entry(const char *db_root, const char *object, const char *field,
+                      int splits,
+                      const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
+int delete_index_entry(const char *db_root, const char *object, const char *field,
                        int splits,
                        const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
-void delete_index_entry(const char *db_root, const char *object, const char *field,
-                        int splits,
-                        const uint8_t *val, size_t vlen, const uint8_t hash16[16]);
 /* `types` is optional — when non-NULL, fields whose type isn't IT_BTREE
    are skipped (their index updates land via update_idx_fn in a separate
    parallel pass). When NULL, every field gets a btree write — matches
    legacy callers + the reindex builder path. */
-void index_parallel(const char *db_root, const char *object, int splits,
-                    const char *value, const uint8_t hash16[16],
-                    char fields[][256], int nfields,
-                    const enum IndexType *types);
+int index_parallel(const char *db_root, const char *object, int splits,
+                   const char *value, const uint8_t hash16[16],
+                   char fields[][256], int nfields,
+                   const enum IndexType *types);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
 
@@ -916,15 +966,15 @@ int cmd_add_indexes(const char *db_root, const char *object, const char *fields_
    where global ordering matters. */
 #include "btree.h"  /* bt_result_cb, BT_HASH_SIZE */
 
-void btree_idx_insert(const char *db_root, const char *object,
-                      const char *field, int splits,
-                      const char *value, size_t vlen,
-                      const uint8_t hash[BT_HASH_SIZE]);
+int btree_idx_insert(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *value, size_t vlen,
+                     const uint8_t hash[BT_HASH_SIZE]);
 
-void btree_idx_delete(const char *db_root, const char *object,
-                      const char *field, int splits,
-                      const char *value, size_t vlen,
-                      const uint8_t hash[BT_HASH_SIZE]);
+int btree_idx_delete(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *value, size_t vlen,
+                     const uint8_t hash[BT_HASH_SIZE]);
 
 void btree_idx_search(const char *db_root, const char *object,
                       const char *field, int splits,
@@ -1217,6 +1267,10 @@ int cmd_edit_fields(const char *db_root, const char *object,
                     char lines[][256], int nlines,
                     int allow_rename, int dry_run);
 void invalidate_schema_caches(const char *db_root, const char *object);
+/* Frees every entry in the process-global schema/fields/typed/index caches
+   (including typed cache enum_values). Call before the owning ShardDb is
+   freed — see server.c and embedded.c shutdown sequences. */
+void schema_caches_shutdown(void);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */
 void objlock_init(void);
@@ -1352,6 +1406,7 @@ typedef struct {
     int            out_error;     /* written by update_idx_fn: 0 ok, non-zero = abort.
                                      -1 = bitmap dict cap exceeded; pre_commit walks
                                      args[] after parallel_for and aborts the write. */
+    int            out_errno;     /* errno captured on cache/I/O failure */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
 /* Release this thread's cached bitmap shard handle, if any. Called at

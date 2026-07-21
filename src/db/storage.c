@@ -526,6 +526,25 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
    so query.c can dispatch the same per-field worker for its bulk
    update/delete pre_commits. */
 
+static int capture_index_update_error(char *err_buf, size_t err_cap,
+                                      const UpdateIdxArg *arg,
+                                      const char *operation) {
+    if (!arg || arg->out_error == 0) return 0;
+    if (err_buf[0]) return 1;
+    if (arg->out_error == -1 && arg->type == IT_BITMAP) {
+        snprintf(err_buf, err_cap,
+                 "bitmap index on field '%s' exceeded its distinct-value cap "
+                 "during %s; raise field:bitmap(N) or switch to btree",
+                 arg->field, operation);
+    } else {
+        int err = arg->out_errno ? arg->out_errno : EIO;
+        snprintf(err_buf, err_cap,
+                 "%s index update failed on field '%s': %s",
+                 operation, arg->field, strerror(err));
+    }
+    return 1;
+}
+
 static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
                                 int is_update, void *ctx_ptr) {
@@ -590,35 +609,35 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 free(new_key); free(old_key);
             }
         }
-        int bm_overflow = 0;
+        int idx_failed = 0;
         if (n_args > 0) {
             parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
             for (int i = 0; i < n_args; i++) {
-                if (args[i].out_error == -1 && !c->err_buf[0]) {
-                    bm_overflow = 1;
-                    snprintf(c->err_buf, sizeof(c->err_buf),
-                        "bitmap index on field '%s' exceeded distinct-value cap "
-                        "(this insert/update would push the dict past the per-file limit). "
-                        "Either declare a higher cap with field:bitmap(N), or switch to btree: "
-                        "remove-index then add-index without :bitmap.",
-                        args[i].field);
-                }
+                if (capture_index_update_error(c->err_buf,
+                                               sizeof(c->err_buf), &args[i],
+                                               "insert/update"))
+                    idx_failed = 1;
                 free(args[i].new_key);
                 free(args[i].old_key);
             }
         }
         free(old_json);
         bm_flush_thread_bitmap_cache();
-        if (bm_overflow) return -1;
+        if (idx_failed) return -1;
     } else {
         /* Fresh insert: parallel write of all index entries. Btree entries
            still go through the original index_parallel path (which knows
            about composites and shares unique-key extraction); bitmap
            entries dispatch through update_idx_fn so the type-aware code
            in index.c maintains them. */
-        index_parallel(c->db_root, c->object, c->splits,
-                       c->value_json, c->hash, c->fields, c->nfields,
-                       c->idx_types);
+        if (index_parallel(c->db_root, c->object, c->splits,
+                           c->value_json, c->hash, c->fields, c->nfields,
+                           c->idx_types) != 0) {
+            snprintf(c->err_buf, sizeof(c->err_buf),
+                     "btree index update failed during insert: %s",
+                     strerror(errno));
+            return -1;
+        }
 
         if (c->idx_types) {
             UpdateIdxArg bm_args[MAX_FIELDS];
@@ -647,23 +666,19 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 bm_args[n_bm].bm_max_values = 0;
                 n_bm++;
             }
-            int bm_overflow = 0;
+            int idx_failed = 0;
             if (n_bm > 0) {
                 parallel_for(update_idx_fn, bm_args, n_bm, sizeof(UpdateIdxArg));
                 for (int i = 0; i < n_bm; i++) {
-                    if (bm_args[i].out_error == -1 && !c->err_buf[0]) {
-                        bm_overflow = 1;
-                        snprintf(c->err_buf, sizeof(c->err_buf),
-                            "bitmap index on field '%s' exceeded distinct-value cap "
-                            "(this insert would push the dict past the per-file limit). "
-                            "Either declare a higher cap with field:bitmap(N), or switch to btree.",
-                            bm_args[i].field);
-                    }
+                    if (capture_index_update_error(c->err_buf,
+                                                   sizeof(c->err_buf),
+                                                   &bm_args[i], "insert"))
+                        idx_failed = 1;
                     free(bm_args[i].new_key);
                 }
             }
             bm_flush_thread_bitmap_cache();
-            if (bm_overflow) return -1;
+            if (idx_failed) return -1;
 
             /* Trigram indexes — same dispatch shape as bitmap above, but
                no overflow path (no per-file cap). update_idx_fn's
@@ -696,8 +711,15 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             }
             if (n_tg > 0) {
                 parallel_for(update_idx_fn, tg_args, n_tg, sizeof(UpdateIdxArg));
-                for (int i = 0; i < n_tg; i++) free(tg_args[i].new_key);
+                for (int i = 0; i < n_tg; i++) {
+                    if (capture_index_update_error(c->err_buf,
+                                                   sizeof(c->err_buf),
+                                                   &tg_args[i], "insert"))
+                        idx_failed = 1;
+                    free(tg_args[i].new_key);
+                }
             }
+            if (idx_failed) return -1;
         }
     }
     return 0;
@@ -1063,24 +1085,19 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
         }
     }
 
-    int bm_overflow = 0;
+    int idx_failed = 0;
     if (n_args > 0) {
         parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
         for (int i = 0; i < n_args; i++) {
-            if (args[i].out_error == -1 && !c->err_buf[0]) {
-                bm_overflow = 1;
-                snprintf(c->err_buf, sizeof(c->err_buf),
-                    "bitmap index on field '%s' exceeded distinct-value cap "
-                    "(this update would push the dict past the per-file limit). "
-                    "Either declare a higher cap with field:bitmap(N), or switch to btree.",
-                    args[i].field);
-            }
+            if (capture_index_update_error(c->err_buf, sizeof(c->err_buf),
+                                           &args[i], "update"))
+                idx_failed = 1;
         }
     }
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
     bm_flush_thread_bitmap_cache();
-    return bm_overflow ? -1 : 0;
+    return idx_failed ? -1 : 0;
 }
 
 static int cmd_update_v2(const char *db_root, const char *object,
@@ -1318,6 +1335,7 @@ typedef struct {
     int               ncrit;
     int               kf_shard;     /* populated by slotcask before pre_commit */
     uint32_t          kf_slot;
+    char              err_buf[256];
 } V2DeleteCtx;
 
 static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
@@ -1382,11 +1400,19 @@ static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
         n_args++;
     }
 
-    if (n_args > 0) parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+    int idx_failed = 0;
+    if (n_args > 0) {
+        parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+        for (int i = 0; i < n_args; i++) {
+            if (capture_index_update_error(c->err_buf, sizeof(c->err_buf),
+                                           &args[i], "delete"))
+                idx_failed = 1;
+        }
+    }
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
     bm_flush_thread_bitmap_cache();
-    return 0;
+    return idx_failed ? -1 : 0;
 }
 
 static int cmd_delete_v2(const char *db_root, const char *object,
@@ -1506,7 +1532,10 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     if (rc != 0) {
         free(result.current_value);
         free_criteria(crit, ncrit);
-        OUT("{\"error\":\"delete failed\"}\n");
+        if (ctx.err_buf[0])
+            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+        else
+            OUT("{\"error\":\"delete failed\"}\n");
         return 1;
     }
 
