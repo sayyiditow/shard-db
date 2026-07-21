@@ -89,7 +89,7 @@ static int wait_child_bounded(pid_t pid, int *status, int timeout_ms) {
 
 static int find_kf_slot(const char *path) {
     for (int i = 0; i < g_kfcache_slots; i++) {
-        if (__atomic_load_n(&g_kfcache[i].used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&g_kfcache[i].used, memory_order_acquire) &&
             strcmp(g_kfcache[i].path, path) == 0) {
             return i;
         }
@@ -172,7 +172,7 @@ static int test_durability_cache_paths_run(void) {
 
     int expected_failures = 0;
     for (int i = 0; i < g_kfcache_slots; i++) {
-        if (__atomic_load_n(&g_kfcache[i].used, __ATOMIC_ACQUIRE)) {
+        if (atomic_load_explicit(&g_kfcache[i].used, memory_order_acquire)) {
             durability_mark_dirty(&g_kfcache[i].dirty,
                                   &g_kfcache[i].dirty_since_ms);
             expected_failures++;
@@ -200,7 +200,7 @@ static int test_durability_cache_paths_run(void) {
     int held_slots[64];
     int held_count = 0;
     for (int i = 0; i < g_kfcache_slots; i++) {
-        if (__atomic_load_n(&g_kfcache[i].used, __ATOMIC_ACQUIRE)) {
+        if (atomic_load_explicit(&g_kfcache[i].used, memory_order_acquire)) {
             pthread_rwlock_rdlock(&g_kfcache[i].rwlock);
             held_slots[held_count++] = i;
         }

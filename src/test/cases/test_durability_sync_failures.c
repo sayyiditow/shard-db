@@ -177,7 +177,7 @@ static int test_durability_msync_injection_run(void) {
                   "insert mutates cached segment and keyfile mappings");
     int dirty_segments = 0;
     for (int i = 0; i < g_segcache_slots; i++) {
-        if (__atomic_load_n(&g_segcache[i].used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&g_segcache[i].used, memory_order_acquire) &&
             atomic_load(&g_segcache[i].dirty)) {
             dirty_segments++;
         }
@@ -196,7 +196,7 @@ static int test_durability_msync_injection_run(void) {
     btree_insert(bt_path, "value", 5, hash);
     int dirty_btrees = 0;
     for (int i = 0; i < bt_cache_slots; i++) {
-        if (__atomic_load_n(&bt_cache[i].used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&bt_cache[i].used, memory_order_acquire) &&
             atomic_load(&bt_cache[i].dirty)) {
             dirty_btrees++;
         }
@@ -214,7 +214,7 @@ static int test_durability_msync_injection_run(void) {
     }
     int dirty_bitmaps = 0;
     for (int i = 0; i < g_bm_cache_slots; i++) {
-        if (__atomic_load_n(&g_bm_cache[i].used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&g_bm_cache[i].used, memory_order_acquire) &&
             atomic_load(&g_bm_cache[i].dirty)) {
             dirty_bitmaps++;
         }
