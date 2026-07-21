@@ -264,7 +264,11 @@ static int test_durability_cache_paths_run(void) {
     if (bitmap_pid == 0) run_bitmap_holder_child(dir);
     if (bitmap_pid > 0) {
         int bitmap_status = 0;
-        int bitmap_finished = wait_child_bounded(bitmap_pid, &bitmap_status, 3000);
+        /* 30s budget matches the convention used elsewhere for fork-based
+           cache races (e.g. test_btcache_evict_race.c) — GitHub-hosted
+           runners are 2-4 vCPU and --jobs 4 test-runner contention can
+           stretch this well past a couple seconds of headroom. */
+        int bitmap_finished = wait_child_bounded(bitmap_pid, &bitmap_status, 30000);
         ASSERT_EQ_INT(bitmap_finished, 1,
                       "bitmap LRU chooses another victim instead of blocking on holder");
         ASSERT_TRUE(WIFEXITED(bitmap_status) && WEXITSTATUS(bitmap_status) == 0,

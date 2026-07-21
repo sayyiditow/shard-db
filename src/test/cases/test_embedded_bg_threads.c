@@ -49,7 +49,11 @@ static int run_harness(const char *env_dir, const char *db_root,
         _exit(127);
     }
 
-    for (int waited = 0; waited < 5000; waited += 50) {
+    /* 30s budget matches the convention used elsewhere for daemon/fork
+       tests (e.g. test_btcache_evict_race.c) — GitHub-hosted runners are
+       2-4 vCPU and --jobs 4 test-runner contention can stretch a real
+       open/insert/close cycle well past a couple hundred ms of headroom. */
+    for (int waited = 0; waited < 30000; waited += 50) {
         int status = 0;
         pid_t got = waitpid(pid, &status, WNOHANG);
         if (got == pid)
