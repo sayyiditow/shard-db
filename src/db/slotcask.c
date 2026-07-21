@@ -262,10 +262,10 @@ static void kfcache_invalidate_prefix(const char *prefix) {
     size_t pl = strlen(prefix);
     for (int i = 0; i < g_kfcache_slots; i++) {
         KfCacheEntry *e = &g_kfcache[i];
-        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
         if (strncmp(e->path, prefix, pl) != 0) continue;
         pthread_rwlock_wrlock(&e->rwlock);
-        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
             strncmp(e->path, prefix, pl) == 0) {
             if (g_db && g_kfcache_test_hold_ms > 0) {
                 /* Test-only hook (KFCACHE_TEST_HOLD_MS): widens this
@@ -290,7 +290,7 @@ static void kfcache_invalidate_prefix(const char *prefix) {
             atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
             atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&e->used, 0, memory_order_release);
             __sync_fetch_and_sub(&g_kfcache_count, 1);
             /* Test-only early exit: unlock this entry, then leave the
                remaining prefix-matched entries alone.  One held entry is
@@ -678,7 +678,7 @@ int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
             /* Gen matches — slot should still hold our entry.
                Take rdlock and verify identity before returning. */
             pthread_rwlock_rdlock(&e->rwlock);
-            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            if (atomic_load_explicit(&e->used, memory_order_acquire) &&
                 strcmp(e->path, path) == 0) {
                 /* Warm hit confirmed. */
                 h->slot = s;
@@ -785,10 +785,10 @@ static void segcache_invalidate_prefix(const char *prefix) {
     size_t pl = strlen(prefix);
     for (int i = 0; i < g_segcache_slots; i++) {
         SegCacheEntry *e = &g_segcache[i];
-        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
         if (strncmp(e->path, prefix, pl) != 0) continue;
         pthread_rwlock_wrlock(&e->rwlock);
-        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
             strncmp(e->path, prefix, pl) == 0) {
             /* Structural discard: the caller is deleting or has already
                durably published a replacement under the object wrlock. */
@@ -801,7 +801,7 @@ static void segcache_invalidate_prefix(const char *prefix) {
             atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
             atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&e->used, 0, memory_order_release);
             __sync_fetch_and_sub(&g_segcache_count, 1);
         }
         pthread_rwlock_unlock(&e->rwlock);
@@ -1185,7 +1185,7 @@ int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
         uint64_t cur_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
         if (cur_gen == ref->gen) {
             pthread_rwlock_rdlock(&e->rwlock);
-            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            if (atomic_load_explicit(&e->used, memory_order_acquire) &&
                 strcmp(e->path, path) == 0) {
                 /* Warm hit confirmed. */
                 h->slot = s;
