@@ -71,6 +71,7 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
     src/db/io_direct.c \
     src/db/bitmap.c src/db/trigram.c \
+    src/db/durability.c \
     -lpthread -latomic
 
 echo
