@@ -1267,7 +1267,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
             if (*ap == '"') {
                 ap++;
                 start = ap;
-                while (*ap && *ap != '"') ap++;
+                ap = json_raw_string_end(ap);
                 plen = (size_t)(ap - start);
                 if (*ap == '"') ap++;
             } else {
@@ -1299,6 +1299,35 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         free(v); free(v_raw); free(v2);
         return -1;
     }
+
+    /* v/v2 are still raw JSON-escaped text here, regardless of whether
+       they came from a plain scalar "value" or from the array-form
+       BETWEEN split above. Decode now, in the one place both origins
+       funnel through, right before they're committed to the criterion —
+       except for OP_IN/OP_NOT_IN, whose elements are decoded independently
+       below from v_raw, and OP_REGEX/OP_NOT_REGEX, whose value is raw
+       POSIX-regex source fed to regcomp()/regexec() rather than JSON
+       string content: callers write regex metachars (\., \+, \d, ...)
+       with a single literal backslash, which is not a valid JSON escape
+       and must not be decoded (or rejected) as one. */
+    if (v && c->op != OP_IN && c->op != OP_NOT_IN &&
+        c->op != OP_REGEX && c->op != OP_NOT_REGEX) {
+        char *unesc = NULL; size_t ulen = 0;
+        if (json_unescape_cstring(v, strlen(v), &unesc, &ulen) != 0) {
+            free(v); free(v_raw); free(v2);
+            return -1;
+        }
+        free(v); v = unesc;
+    }
+    if (v2) {
+        char *unesc2 = NULL; size_t ulen2 = 0;
+        if (json_unescape_cstring(v2, strlen(v2), &unesc2, &ulen2) != 0) {
+            free(v); free(v_raw); free(v2);
+            return -1;
+        }
+        free(v2); v2 = unesc2;
+    }
+
     if (v) {
         strncpy(c->value, v, sizeof(c->value) - 1);
         /* LIKE/NOT_LIKE accept '*' as an alias for '%'. Normalize once
@@ -1327,17 +1356,41 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                     if (*ap == '"') {
                         ap++;
                         const char *start = ap;
-                        while (*ap && *ap != '"') ap++;
+                        ap = json_raw_string_end(ap);
                         size_t len = ap - start;
+                        char *raw = malloc(len + 1);
+                        if (!raw) {
+                            for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                            free(c->in_values); c->in_values = NULL;
+                            c->in_count = 0; c->in_cap = 0;
+                            free(v); free(v_raw); free(v2);
+                            return -1;
+                        }
+                        memcpy(raw, start, len); raw[len] = '\0';
+                        char *val = NULL; size_t ulen = 0;
+                        if (json_unescape_cstring(raw, len, &val, &ulen) != 0) {
+                            free(raw);
+                            for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                            free(c->in_values); c->in_values = NULL;
+                            c->in_count = 0; c->in_cap = 0;
+                            free(v); free(v_raw); free(v2);
+                            return -1;
+                        }
+                        free(raw);
                         if (c->in_count >= c->in_cap) {
                             int new_cap = c->in_cap * 2;
                             char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
-                            if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+                            if (!t) {
+                                free(val);
+                                for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                                free(c->in_values); c->in_values = NULL;
+                                c->in_count = 0; c->in_cap = 0;
+                                free(v); free(v_raw); free(v2);
+                                return -1;
+                            }
                             c->in_values = t;
                             c->in_cap = new_cap;
                         }
-                        char *val = malloc(len + 1);
-                        memcpy(val, start, len); val[len] = '\0';
                         c->in_values[c->in_count++] = val;
                         if (*ap == '"') ap++;
                     } else {
@@ -1362,6 +1415,15 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                 char *iv = strdup(v);
                 char *_tok_save = NULL; char *tok = strtok_r(iv, ",", &_tok_save);
                 while (tok) {
+                    char *val = NULL; size_t ulen = 0;
+                    if (json_unescape_cstring(tok, strlen(tok), &val, &ulen) != 0) {
+                        free(iv);
+                        for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                        free(c->in_values); c->in_values = NULL;
+                        c->in_count = 0; c->in_cap = 0;
+                        free(v); free(v_raw); free(v2);
+                        return -1;
+                    }
                     if (c->in_count >= c->in_cap) {
                         int new_cap = c->in_cap * 2;
                         char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
@@ -1369,7 +1431,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         c->in_values = t;
                         c->in_cap = new_cap;
                     }
-                    c->in_values[c->in_count++] = strdup(tok);
+                    c->in_values[c->in_count++] = val;
                     tok = strtok_r(NULL, ",", &_tok_save);
                 }
                 free(iv);
@@ -1459,13 +1521,26 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
             c->field[flen] = '\0';
             c->op = OP_EQUAL;
 
-            /* Strip quotes from value */
-            if (vlen >= 2 && *vstart == '"' && *(vend - 1) == '"') {
-                vlen -= 2; vstart++;
+            int quoted = (vlen >= 2 && *vstart == '"' && *(vend - 1) == '"');
+            if (quoted) { vlen -= 2; vstart++; }
+            if (quoted) {
+                char *decoded = NULL; size_t decoded_len = 0;
+                if (json_unescape_cstring(vstart, vlen, &decoded, &decoded_len) != 0) {
+                    free_criteria(criteria, n);
+                    *out = NULL;
+                    *count = 0;
+                    return -1;
+                }
+                size_t copy_len = decoded_len < sizeof(c->value) - 1
+                    ? decoded_len : sizeof(c->value) - 1;
+                memcpy(c->value, decoded, copy_len);
+                c->value[copy_len] = '\0';
+                free(decoded);
+            } else {
+                if (vlen > sizeof(c->value) - 1) vlen = sizeof(c->value) - 1;
+                memcpy(c->value, vstart, vlen);
+                c->value[vlen] = '\0';
             }
-            if (vlen > sizeof(c->value) - 1) vlen = sizeof(c->value) - 1;
-            memcpy(c->value, vstart, vlen);
-            c->value[vlen] = '\0';
 
             n++;
             p = vend;
@@ -1875,10 +1950,26 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             memcpy(leaf->leaf.field, fname, flen);
             leaf->leaf.field[flen] = '\0';
             leaf->leaf.op = OP_EQUAL;
-            if (vlen >= 2 && *vstart == '"' && *(vend - 1) == '"') { vlen -= 2; vstart++; }
-            if (vlen > sizeof(leaf->leaf.value) - 1) vlen = sizeof(leaf->leaf.value) - 1;
-            memcpy(leaf->leaf.value, vstart, vlen);
-            leaf->leaf.value[vlen] = '\0';
+            int quoted = (vlen >= 2 && *vstart == '"' && *(vend - 1) == '"');
+            if (quoted) { vlen -= 2; vstart++; }
+            if (quoted) {
+                char *decoded = NULL; size_t decoded_len = 0;
+                if (json_unescape_cstring(vstart, vlen, &decoded, &decoded_len) != 0) {
+                    free_criteria_tree(leaf);
+                    free_criteria_tree(root);
+                    if (err) *err = "invalid JSON escape in simple criterion value";
+                    return NULL;
+                }
+                size_t copy_len = decoded_len < sizeof(leaf->leaf.value) - 1
+                    ? decoded_len : sizeof(leaf->leaf.value) - 1;
+                memcpy(leaf->leaf.value, decoded, copy_len);
+                leaf->leaf.value[copy_len] = '\0';
+                free(decoded);
+            } else {
+                if (vlen > sizeof(leaf->leaf.value) - 1) vlen = sizeof(leaf->leaf.value) - 1;
+                memcpy(leaf->leaf.value, vstart, vlen);
+                leaf->leaf.value[vlen] = '\0';
+            }
 
             if (cnode_append(root, leaf) != 0) {
                 free_criteria_tree(leaf); free_criteria_tree(root);
@@ -3558,4 +3649,3 @@ extern size_t g_ordered_find_keyset_max;
 void set_ordered_find_keyset_max_for_test(size_t v) { g_ordered_find_keyset_max = v; }
 size_t get_ordered_find_keyset_max_for_test(void)   { return g_ordered_find_keyset_max; }
 #endif
-

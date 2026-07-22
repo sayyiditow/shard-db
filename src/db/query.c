@@ -6877,6 +6877,21 @@ static int cmd_find_do(const char *db_root, const char *object,
             }
         }
 
+        /* parse_cursor_object has no schema access, so its order_by value is
+           still JSON-escaped text. Decode it before using it as the index
+           seek bound. */
+        if (cur.present && order_tf && order_tf->type == FT_VARCHAR) {
+            char *unesc = NULL; size_t ulen = 0;
+            if (json_unescape_cstring(cur.value, cur.vlen, &unesc, &ulen) != 0) {
+                OUT("{\"error\":\"cursor order_by value has a malformed JSON escape\"}\n");
+                free_joins(joins, njoins); free_excluded(&excluded);
+                return -1;
+            }
+            memcpy(cur.value, unesc, ulen + 1);
+            cur.vlen = ulen;
+            free(unesc);
+        }
+
         /* Encode cursor value bytes for walk bounds. If cursor absent (page 1),
            walk from start (ASC) or end (DESC); else walk from cursor position,
            with tiebreak happening inside the callback. */

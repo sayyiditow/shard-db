@@ -606,6 +606,7 @@ void sort_dedup_file(const char *path);
 /* JSON helpers */
 const char *json_skip(const char *p);
 const char *json_skip_value(const char *p);
+const char *json_raw_string_end(const char *p);
 
 /* ========== Single-pass JSON object parser ==========
    shard-db's request / criterion / join / aggregate spec shapes are all
@@ -656,6 +657,8 @@ int  json_obj_unquoted(const JsonObj *o, const char *key, const char **val, size
    *out_buf. */
 int  json_unescape_string(const char *in, size_t in_len,
                           char **out_buf, size_t *out_len);
+int json_unescape_cstring(const char *in, size_t in_len,
+                          char **out_buf, size_t *out_len);
 /* Convenience wrapper for the common dispatcher pattern:
    - looks up `key` on the JsonObj
    - strips surrounding quotes (json_obj_unquoted)
@@ -689,6 +692,8 @@ char *json_obj_strdup_raw(const JsonObj *o, const char *key);
 /* String-or-array field → comma-separated malloc'd string, or NULL on miss. */
 char *json_obj_string_or_array(const JsonObj *o, const char *key);
 int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values);
+int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
+                              const enum FieldType *field_types, char **out);
 char *extract_field_value(const char *json, const char *field_name);
 
 /* Base64 (util.c, RFC 4648 standard alphabet) */
@@ -811,7 +816,9 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
       composite    → typed binary concatenation.
    Returns 1 on success with malloc'd *out_val and *out_len set; caller
    frees. ts may be NULL (untyped object) — in that case every field is
-   treated as raw varchar text. Returns 0 on missing/empty values. */
+   treated as raw varchar text. Returns 0 only for a genuinely missing or
+   empty value. Returns -1 on decode/allocation failure with errno set; a
+   pre-commit caller must abort rather than treating that as field absence. */
 int build_index_key_from_json(const TypedSchema *ts, const char *json,
                               const char *spec,
                               uint8_t **out_val, size_t *out_len);

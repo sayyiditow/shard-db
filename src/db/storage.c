@@ -571,6 +571,18 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 ? build_index_key_from_json(c->idx_ts, old_json,
                                             c->fields[i], &old_key, &old_len)
                 : 0;
+            if (have_new < 0 || have_old < 0) {
+                free(new_key); free(old_key);
+                for (int j = 0; j < n_args; j++) {
+                    free(args[j].new_key);
+                    free(args[j].old_key);
+                }
+                free(old_json);
+                snprintf(c->err_buf, sizeof(c->err_buf),
+                         "index-key decode failed during insert/update: %s",
+                         strerror(errno ? errno : EIO));
+                return -1;
+            }
             int changed = 0;
             if (have_new && !have_old) changed = 1;
             else if (have_new && have_old) {
@@ -648,9 +660,16 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 if (strchr(c->fields[i], '+')) continue;
                 uint8_t *nk = NULL;
                 size_t nl = 0;
-                if (!build_index_key_from_json(c->idx_ts, c->value_json,
-                                                c->fields[i], &nk, &nl))
-                    continue;
+                int key_rc = build_index_key_from_json(c->idx_ts, c->value_json,
+                                                       c->fields[i], &nk, &nl);
+                if (key_rc < 0) {
+                    for (int j = 0; j < n_bm; j++) free(bm_args[j].new_key);
+                    snprintf(c->err_buf, sizeof(c->err_buf),
+                             "bitmap index-key decode failed during insert: %s",
+                             strerror(errno ? errno : EIO));
+                    return -1;
+                }
+                if (key_rc == 0) continue;
                 bm_args[n_bm].db_root = c->db_root;
                 bm_args[n_bm].object  = c->object;
                 bm_args[n_bm].field   = c->fields[i];
@@ -691,9 +710,16 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 if (strchr(c->fields[i], '+')) continue;  /* composite + trigram = rejected upstream */
                 uint8_t *nk = NULL;
                 size_t nl = 0;
-                if (!build_index_key_from_json(c->idx_ts, c->value_json,
-                                                c->fields[i], &nk, &nl))
-                    continue;
+                int key_rc = build_index_key_from_json(c->idx_ts, c->value_json,
+                                                       c->fields[i], &nk, &nl);
+                if (key_rc < 0) {
+                    for (int j = 0; j < n_tg; j++) free(tg_args[j].new_key);
+                    snprintf(c->err_buf, sizeof(c->err_buf),
+                             "trigram index-key decode failed during insert: %s",
+                             strerror(errno ? errno : EIO));
+                    return -1;
+                }
+                if (key_rc == 0) continue;
                 tg_args[n_tg].db_root  = c->db_root;
                 tg_args[n_tg].object   = c->object;
                 tg_args[n_tg].field    = c->fields[i];
@@ -1163,8 +1189,21 @@ static int cmd_update_v2(const char *db_root, const char *object,
 
     const char *field_names[MAX_FIELDS];
     char *field_vals[MAX_FIELDS] = {0};
-    for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
-    json_get_fields(partial_json, field_names, ts->nfields, field_vals);
+    enum FieldType field_types[MAX_FIELDS];
+    for (int i = 0; i < ts->nfields; i++) {
+        field_names[i] = ts->fields[i].name;
+        field_types[i] = ts->fields[i].type;
+    }
+    if (json_get_fields_unescaped(partial_json, field_names, ts->nfields, field_types, field_vals) != 0) {
+        /* At least one field the client explicitly named had a malformed
+           JSON escape. Reject the whole update rather than silently
+           applying every other field and dropping this one — a partial
+           write here would look like success to the caller. */
+        for (int i = 0; i < ts->nfields; i++) free(field_vals[i]);
+        free(new_buf);
+        OUT("{\"error\":\"malformed JSON escape in one or more field values\"}\n");
+        return 1;
+    }
 
     for (int i = 0; i < ts->nfields; i++) {
         if (field_vals[i]) {
@@ -2150,7 +2189,10 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
                 for (int fi = 0; fi < fs.ts->nfields; fi++) {
                     if (fs.ts->fields[fi].removed) continue;
                     char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                    char *pv = have_value ? json_obj_strdup(&value_obj, fs.ts->fields[fi].name) : NULL;
+                    char *pv = !have_value ? NULL :
+                        (fs.ts->fields[fi].type == FT_VARCHAR
+                         ? json_obj_strdup_unescaped(&value_obj, fs.ts->fields[fi].name, NULL)
+                         : json_obj_strdup(&value_obj, fs.ts->fields[fi].name));
                     csv_emit_cell(pv, csv_delim);
                     free(pv);
                 }

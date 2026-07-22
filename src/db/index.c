@@ -646,6 +646,30 @@ int index_parallel(const char *db_root, const char *object, int splits,
 
     char *extracted[MAX_FIELDS * 4];
     json_get_fields(value, unique_keys, unique_count, extracted);
+    for (int j = 0; j < unique_count; j++) {
+        if (!extracted[j]) continue;
+        int fidx = ts ? typed_field_index(ts, unique_keys[j]) : -1;
+        if (fidx < 0 || ts->fields[fidx].type != FT_VARCHAR) continue;
+        char *unesc = NULL; size_t ulen = 0;
+        errno = 0;
+        if (json_unescape_cstring(extracted[j], strlen(extracted[j]), &unesc, &ulen) != 0) {
+            /* The record encoder already validated this exact JSON before
+               pre_commit. A later failure can still be OOM; it must abort
+               the pre_commit, never silently omit this index key. */
+            int decode_errno = (errno == ENOMEM) ? ENOMEM : EINVAL;
+            for (int k = 0; k < unique_count; k++) free(extracted[k]);
+            for (int k = 0; k < unique_count; k++) {
+                int is_field = 0;
+                for (int m = 0; m < nfields; m++)
+                    if (unique_keys[k] == fields[m]) { is_field = 1; break; }
+                if (!is_field) free((char *)unique_keys[k]);
+            }
+            errno = decode_errno;
+            return -1;
+        }
+        free(extracted[j]);
+        extracted[j] = unesc;
+    }
 
     IndexThreadArg args[MAX_FIELDS];
     int tcount = 0;
@@ -887,7 +911,23 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
         while (tok && nsub < 16) { subs[nsub++] = tok; tok = strtok_r(NULL, "+", &_tok_save); }
         char *vals[16];
-        json_get_fields(json, subs, nsub, vals);
+        enum FieldType sub_types[16] = {0};
+        for (int i = 0; i < nsub; i++) {
+            int fi = ts ? typed_field_index(ts, subs[i]) : -1;
+            /* FT_COUNT is a sentinel that can never equal FT_VARCHAR;
+               unknown/legacy fields therefore retain json_get_fields'
+               original raw-text behavior. */
+            sub_types[i] = (fi >= 0) ? ts->fields[fi].type : FT_COUNT;
+        }
+        errno = 0;
+        if (json_get_fields_unescaped(json, subs, nsub, sub_types, vals) != 0) {
+            /* Upstream content validation cannot guarantee this second
+               allocation succeeds. Preserve the index/record invariant by
+               returning the tri-state error, not "field absent". */
+            for (int i = 0; i < nsub; i++) free(vals[i]);
+            if (errno != ENOMEM) errno = EINVAL;
+            return -1;
+        }
         char cat[4096]; int cp = 0; int ok = 1;
         for (int i = 0; i < nsub; i++) {
             if (!vals[i] || vals[i][0] == '\0') { ok = 0; break; }
@@ -918,10 +958,22 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
     /* Single field — extract text, encode to index bytes. */
     JsonObj jo;
     json_parse_object(json, strlen(json), &jo);
-    char *txt = json_obj_strdup(&jo, spec);
+    int fi = ts ? typed_field_index(ts, spec) : -1;
+    char *txt;
+    if (fi >= 0 && ts->fields[fi].type == FT_VARCHAR) {
+        const char *v; size_t vl;
+        if (!json_obj_unquoted(&jo, spec, &v, &vl)) return 0;
+        size_t ulen = 0;
+        errno = 0;
+        if (json_unescape_cstring(v, vl, &txt, &ulen) != 0) {
+            if (errno != ENOMEM) errno = EINVAL;
+            return -1;
+        }
+    } else {
+        txt = json_obj_strdup(&jo, spec);
+    }
     if (!txt || !txt[0]) { free(txt); return 0; }
 
-    int fi = ts ? typed_field_index(ts, spec) : -1;
     if (fi >= 0) {
         const TypedField *f = &ts->fields[fi];
         size_t cap = (size_t)(f->size > 8 ? f->size : 8);

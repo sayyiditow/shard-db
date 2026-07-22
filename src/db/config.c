@@ -2673,26 +2673,28 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                        varchars — keeps wire and stored bytes in sync. */
                     if (ts->fields[i].type == FT_VARCHAR) {
                         char *unesc = NULL; size_t unesc_len = 0;
-                        int did_unesc =
-                            (json_unescape_string(ev, el, &unesc, &unesc_len) == 0);
-                        size_t stored_len = did_unesc ? unesc_len : el;
+                        if (json_unescape_cstring(ev, el, &unesc, &unesc_len) != 0) {
+                            /* Malformed escape (including an embedded NUL)
+                               — reject rather than silently falling back
+                               to raw, still-escaped bytes. */
+                            if (err_buf && err_buf_size > 0)
+                                snprintf(err_buf, err_buf_size,
+                                    "malformed JSON escape in value for field '%s'",
+                                    ts->fields[i].name);
+                            return -2;
+                        }
                         int content_max = ts->fields[i].size - 2;
-                        if ((int)stored_len > content_max) {
+                        if ((int)unesc_len > content_max) {
                             if (err_buf && err_buf_size > 0)
                                 snprintf(err_buf, err_buf_size,
                                     "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                                    ts->fields[i].name, stored_len, content_max);
-                            if (did_unesc) free(unesc);
+                                    ts->fields[i].name, unesc_len, content_max);
+                            free(unesc);
                             return -2;
                         }
-                        if (did_unesc) {
-                            encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                              out + ts->fields[i].offset);
-                            free(unesc);
-                        } else {
-                            encode_field_len(&ts->fields[i], ev, el,
-                                              out + ts->fields[i].offset);
-                        }
+                        encode_field_len(&ts->fields[i], unesc, unesc_len,
+                                          out + ts->fields[i].offset);
+                        free(unesc);
                     } else {
                         encode_field_len(&ts->fields[i], ev, el,
                                           out + ts->fields[i].offset);
