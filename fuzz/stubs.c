@@ -10,3 +10,7 @@ struct ShardDb; /* opaque forward declaration — no struct body needed */
 
 __thread struct ShardDb *g_db             = (struct ShardDb *)0;
 struct ShardDb          *g_shard_db_instance = (struct ShardDb *)0;
+
+/* durability.c's sync thread checks server_running; set to 0 so the
+   thread function exits immediately if the linker ever pulls it in. */
+_Atomic int server_running = 0;

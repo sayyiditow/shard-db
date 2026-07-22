@@ -166,7 +166,7 @@ void segcache_shutdown(void);
    because each caller owns a unique reserved offset, and rdlock still
    serialises against eviction (which takes wrlock). */
 int  segcache_acquire(SlotcaskSegHandle *h, const char *path,
-                      int create, int writer);
+                      int create, int writer, int must_cache);
 void segcache_release(SlotcaskSegHandle *h);
 
 /* Fast-path acquire for read-only callers that hold a SlotRef.
@@ -175,6 +175,11 @@ void segcache_release(SlotcaskSegHandle *h);
    create must be 0 (read paths only). writer must be 0. */
 int  segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
                               const char *path);
+
+#ifdef TEST_BUILD
+void segcache_test_force_identity_mismatches(int count);
+int  segcache_test_identity_mismatches_remaining(void);
+#endif
 
 /* ============================================================ Per-stream pool */
 

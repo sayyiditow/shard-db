@@ -40,24 +40,24 @@
    for splits=4096). Writes route by hash16 to a single shard
    (idx_shard_for_hash); reads fan out across all shards. */
 
-void btree_idx_insert(const char *db_root, const char *object,
-                      const char *field, int splits,
-                      const char *value, size_t vlen,
-                      const uint8_t hash[BT_HASH_SIZE]) {
+int btree_idx_insert(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *value, size_t vlen,
+                     const uint8_t hash[BT_HASH_SIZE]) {
     int idx_shard = idx_shard_for_hash(hash, splits);
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
-    btree_insert(idx_path, value, vlen, hash);
+    return btree_insert(idx_path, value, vlen, hash);
 }
 
-void btree_idx_delete(const char *db_root, const char *object,
-                      const char *field, int splits,
-                      const char *value, size_t vlen,
-                      const uint8_t hash[BT_HASH_SIZE]) {
+int btree_idx_delete(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *value, size_t vlen,
+                     const uint8_t hash[BT_HASH_SIZE]) {
     int idx_shard = idx_shard_for_hash(hash, splits);
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
-    btree_delete(idx_path, value, vlen, hash);
+    return btree_delete(idx_path, value, vlen, hash);
 }
 
 /* Trigram index entry insert/delete. Mirror of btree_idx_* but routes
@@ -65,24 +65,24 @@ void btree_idx_delete(const char *db_root, const char *object,
    format, so the underlying primitives (btree_insert/btree_delete) are
    reused unchanged. A field may carry BOTH .idx and .tg simultaneously;
    bt_cache treats them as independent path-keyed cache entries. */
-void tg_idx_insert(const char *db_root, const char *object,
-                   const char *field, int splits,
-                   const uint8_t trigram[3],
-                   const uint8_t hash[BT_HASH_SIZE]) {
+static int tg_idx_insert(const char *db_root, const char *object,
+                         const char *field, int splits,
+                         const uint8_t trigram[3],
+                         const uint8_t hash[BT_HASH_SIZE]) {
     int idx_shard = idx_shard_for_hash(hash, splits);
     char tg_path[PATH_MAX];
     tg_build_path(tg_path, sizeof(tg_path), db_root, object, field, idx_shard);
-    btree_insert(tg_path, (const char *)trigram, 3, hash);
+    return btree_insert(tg_path, (const char *)trigram, 3, hash);
 }
 
-void tg_idx_delete(const char *db_root, const char *object,
-                   const char *field, int splits,
-                   const uint8_t trigram[3],
-                   const uint8_t hash[BT_HASH_SIZE]) {
+static int tg_idx_delete(const char *db_root, const char *object,
+                         const char *field, int splits,
+                         const uint8_t trigram[3],
+                         const uint8_t hash[BT_HASH_SIZE]) {
     int idx_shard = idx_shard_for_hash(hash, splits);
     char tg_path[PATH_MAX];
     tg_build_path(tg_path, sizeof(tg_path), db_root, object, field, idx_shard);
-    btree_delete(tg_path, (const char *)trigram, 3, hash);
+    return btree_delete(tg_path, (const char *)trigram, 3, hash);
 }
 
 /* Per-shard parallel-walk machinery. parallel_for spawns one task per shard,
@@ -332,12 +332,12 @@ int btree_idx_exists(const char *db_root, const char *object,
 }
 
 /* Wrapper for insert-time indexing — uses B+ tree */
-void write_index_entry(const char *db_root, const char *object,
-                              const char *field, int splits,
-                              const uint8_t *val, size_t vlen,
-                              const uint8_t hash16[16]) {
-    btree_idx_insert(db_root, object, field, splits,
-                     (const char *)val, vlen, hash16);
+int write_index_entry(const char *db_root, const char *object,
+                      const char *field, int splits,
+                      const uint8_t *val, size_t vlen,
+                      const uint8_t hash16[16]) {
+    return btree_idx_insert(db_root, object, field, splits,
+                            (const char *)val, vlen, hash16);
 }
 
 /* Build the bitmap shard file path for a (object, field, NNN) tuple,
@@ -385,7 +385,7 @@ static int bitmap_update(const char *db_root, const char *object,
        bm_open / bm_close just acquire + release the per-entry rwlock. */
     BitmapShard *bm = bm_open(path, slots, 1, bool_fastpath, max_values,
                               1 /* writer */);
-    if (!bm) return 0;
+    if (!bm) return -2;
 
     /* Auto-grow on slot overflow. Slotcask doubles a kf shard's
        slots_per_shard on auto-resplit (80% load trigger); the bitmap
@@ -425,15 +425,24 @@ static int bitmap_update(const char *db_root, const char *object,
    are always btree per the 2026.05.7 contract. */
 void *update_idx_fn(void *arg) {
     UpdateIdxArg *a = (UpdateIdxArg *)arg;
+    a->out_error = 0;
+    a->out_errno = 0;
 
     switch (a->type) {
         case IT_BTREE:
-            if (a->old_key)
+            if (a->old_key &&
                 delete_index_entry(a->db_root, a->object, a->field, a->splits,
-                                   a->old_key, a->old_len, a->hash);
-            if (a->new_key)
+                                   a->old_key, a->old_len, a->hash) != 0) {
+                a->out_error = -2;
+                a->out_errno = errno;
+                break;
+            }
+            if (a->new_key &&
                 write_index_entry(a->db_root, a->object, a->field, a->splits,
-                                  a->new_key, a->new_len, a->hash);
+                                  a->new_key, a->new_len, a->hash) != 0) {
+                a->out_error = -2;
+                a->out_errno = errno;
+            }
             break;
 
         case IT_TRIGRAM: {
@@ -461,10 +470,16 @@ void *update_idx_fn(void *arg) {
                     if (memcmp(old_tg[i], new_tg[j], 3) == 0) { in_new = 1; break; }
                 }
                 if (!in_new) {
-                    tg_idx_delete(a->db_root, a->object, a->field, a->splits,
-                                  old_tg[i], a->hash);
+                    if (tg_idx_delete(a->db_root, a->object, a->field, a->splits,
+                                      old_tg[i], a->hash) != 0) {
+                        a->out_error = -2;
+                        a->out_errno = errno;
+                        break;
+                    }
                 }
             }
+
+            if (a->out_error) break;
 
             /* Insert new-only trigrams. */
             for (size_t i = 0; i < n_new; i++) {
@@ -473,8 +488,12 @@ void *update_idx_fn(void *arg) {
                     if (memcmp(new_tg[i], old_tg[j], 3) == 0) { in_old = 1; break; }
                 }
                 if (!in_old) {
-                    tg_idx_insert(a->db_root, a->object, a->field, a->splits,
-                                  new_tg[i], a->hash);
+                    if (tg_idx_insert(a->db_root, a->object, a->field, a->splits,
+                                      new_tg[i], a->hash) != 0) {
+                        a->out_error = -2;
+                        a->out_errno = errno;
+                        break;
+                    }
                 }
             }
             break;
@@ -501,12 +520,12 @@ void *update_idx_fn(void *arg) {
 }
 
 /* Delete from index — uses B+ tree */
-void delete_index_entry(const char *db_root, const char *object,
-                               const char *field, int splits,
-                               const uint8_t *val, size_t vlen,
-                               const uint8_t hash16[16]) {
-    btree_idx_delete(db_root, object, field, splits,
-                     (const char *)val, vlen, hash16);
+int delete_index_entry(const char *db_root, const char *object,
+                       const char *field, int splits,
+                       const uint8_t *val, size_t vlen,
+                       const uint8_t hash16[16]) {
+    return btree_idx_delete(db_root, object, field, splits,
+                            (const char *)val, vlen, hash16);
 }
 
 /* ========== Parallel indexing ========== */
@@ -519,12 +538,15 @@ typedef struct {
     uint8_t *val;               /* heap-owned bytes (index-key encoding); freed by caller */
     size_t vlen;
     const uint8_t *hash16;
+    int out_error;
+    int out_errno;
 } IndexThreadArg;
 
 void *index_thread_fn(void *arg) {
     IndexThreadArg *a = (IndexThreadArg *)arg;
-    write_index_entry(a->db_root, a->object, a->field, a->splits,
-                      a->val, a->vlen, a->hash16);
+    a->out_error = write_index_entry(a->db_root, a->object, a->field,
+                                     a->splits, a->val, a->vlen, a->hash16);
+    a->out_errno = a->out_error ? errno : 0;
     return NULL;
 }
 
@@ -589,11 +611,11 @@ char *build_composite_value(const char *field_name, const char *json_value) {
     return all_present ? strdup(result) : NULL;
 }
 
-void index_parallel(const char *db_root, const char *object, int splits,
-                           const char *value, const uint8_t hash16[16],
-                           char fields[][256], int nfields,
-                           const enum IndexType *types) {
-    if (nfields <= 0) return;
+int index_parallel(const char *db_root, const char *object, int splits,
+                   const char *value, const uint8_t hash16[16],
+                   char fields[][256], int nfields,
+                   const enum IndexType *types) {
+    if (nfields <= 0) return 0;
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
@@ -722,12 +744,22 @@ void index_parallel(const char *db_root, const char *object, int splits,
         args[tcount].val = key_buf;
         args[tcount].vlen = key_len;
         args[tcount].hash16 = hash16;
+        args[tcount].out_error = 0;
+        args[tcount].out_errno = 0;
         tcount++;
     }
 
     parallel_for(index_thread_fn, args, tcount, sizeof(IndexThreadArg));
 
-    for (int i = 0; i < tcount; i++) free(idx_keys[i]);
+    int rc = 0;
+    int saved_errno = 0;
+    for (int i = 0; i < tcount; i++) {
+        if (args[i].out_error && rc == 0) {
+            rc = -1;
+            saved_errno = args[i].out_errno;
+        }
+        free(idx_keys[i]);
+    }
     for (int i = 0; i < unique_count; i++) free(extracted[i]);
     for (int i = 0; i < unique_count; i++) {
         int is_field = 0;
@@ -735,6 +767,8 @@ void index_parallel(const char *db_root, const char *object, int splits,
             if (unique_keys[i] == fields[j]) { is_field = 1; break; }
         if (!is_field) free((char *)unique_keys[i]);
     }
+    if (rc != 0) errno = saved_errno ? saved_errno : EIO;
+    return rc;
 }
 
 /* ========== In-process sort+dedup for index files ========== */

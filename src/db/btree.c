@@ -455,29 +455,51 @@ static int bt_cache_probe(const char *path, int *out_found) {
    use-after-unmap. Returns 0 on success (slot detached, out params filled),
    -1 if the slot is currently held (out params left at -1/NULL/0, slot
    untouched) — callers must treat -1 as "try a different slot". */
-static int bt_cache_evict_slot(int slot, int *out_fd, uint8_t **out_map,
+static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
+                               int *out_fd, uint8_t **out_map,
                                size_t *out_sz) {
     BtCacheEntry *e = &bt_cache[slot];
     *out_fd = -1; *out_map = NULL; *out_sz = 0;
-    if (!e->used) return 0;
-    if (pthread_rwlock_trywrlock(&e->rwlock) != 0) return -1;
+    if (!e->used) return 1;
+    char expected_path[PATH_MAX];
+    snprintf(expected_path, sizeof(expected_path), "%s", e->path);
+    pthread_mutex_unlock(&bt_cache_lock);
+    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
+                       : pthread_rwlock_trywrlock(&e->rwlock);
+    pthread_mutex_lock(&bt_cache_lock);
+    if (lock_rc != 0) return 0;
+    if (!e->used) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 1;
+    }
+    if (strcmp(e->path, expected_path) != 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return 0;
+    }
+    if (reason == CACHE_DROP_EVICT && e->map && e->map_size > 0 &&
+        durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
+                               e->map, e->map_size) < 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return -1;
+    }
     *out_fd = e->fd;
     *out_map = e->map;
     *out_sz = e->map_size;
     e->map = NULL;
     e->fd = -1;
     e->map_size = 0;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 0;
     e->path[0] = '\0';
     bt_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
-    return 0;
+    return 1;
 }
 
 /* Flush + unmap + close a detached mapping. Never call with bt_cache_lock
    held — keeping syscalls out of that lock is the point. */
 static void bt_dispose_mapping(int fd, uint8_t *map, size_t map_size) {
-    if (map && map_size > 0) msync(map, map_size, MS_ASYNC);
     if (map) munmap(map, map_size);
     if (fd >= 0) close(fd);
 }
@@ -485,19 +507,16 @@ static void bt_dispose_mapping(int fd, uint8_t *map, size_t map_size) {
 /* Synchronous wrapper for callers whose teardown is not hot (invalidate).
    NOTE: still does syscalls under bt_cache_lock at those call sites; they
    are admin-path only (remove-index). */
-static void bt_cache_drop_slot(int slot) {
+static void bt_cache_drop_slot(int slot, CacheDropReason reason) {
     int fd; uint8_t *map; size_t sz;
-    for (int attempt = 0; attempt < 50; attempt++) {
-        if (bt_cache_evict_slot(slot, &fd, &map, &sz) == 0) {
-            bt_dispose_mapping(fd, map, sz);
-            return;
-        }
-        struct timespec ts = { 0, 1000000L }; /* 1ms */
-        nanosleep(&ts, NULL);
+    int rc = bt_cache_evict_slot(slot, reason, 1, &fd, &map, &sz);
+    if (rc > 0) {
+        bt_dispose_mapping(fd, map, sz);
+    } else if (rc < 0) {
+        LOG_ERROR(LOG_SUB_BTREE,
+                  "bt_cache_drop_slot: required sync failed for slot %d: %s",
+                  slot, strerror(errno));
     }
-    LOG_WARN(LOG_SUB_BTREE,
-        "bt_cache_drop_slot: slot %d still held after 50 retries (50ms), giving up",
-        slot);
 }
 
 /* Initialise a fresh btree file at `map` of `bt_page_size * 2` bytes. */
@@ -617,8 +636,13 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     bt->map = NULL;
     bt->map_size = 0;
 
+retry_bt_acquire:
     if (!bt_cache) {
-        /* Cache not initialised — direct mmap, no locking. */
+        if (writer) {
+            errno = ENODEV;
+            return -1;
+        }
+        /* Read-only cache-disabled fallback: direct mmap, no locking. */
         return bt_open_file(path, writer, &bt->fd, &bt->map, &bt->map_size);
     }
 
@@ -723,15 +747,14 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     int vic_fd = -1; uint8_t *vic_map = NULL; size_t vic_sz = 0;
 
     /* Evict LRU when over half-full or the probe couldn't find an empty
-       slot. Bounded scan: a candidate slot may be busy (a long-lived
-       holder such as a BtRangeIter has its rwlock locked) — skip it and
-       try the next-oldest candidate rather than blocking or clobbering
-       it. Gives up after 8 attempts and serves the request uncached
-       (slot stays -1) rather than looping indefinitely on a cache that's
-       entirely full of busy slots. */
+       slot. Failed dirty syncs retain their entry and drive selection of a
+       different candidate. */
     if (slot < 0 || bt_cache_count >= bt_cache_slots / 2) {
+        slot = -1;
+        int first_error = 0;
+        int wait_candidate = -1;
         uint64_t floor_ts = 0;
-        for (int attempt = 0; attempt < 8; attempt++) {
+        for (int attempt = 0; attempt < bt_cache_slots; attempt++) {
             int lru = -1;
             uint64_t oldest = UINT64_MAX;
             for (int i = 0; i < bt_cache_slots; i++) {
@@ -742,19 +765,41 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
                 }
             }
             if (lru < 0) break; /* no more candidates at all */
-            if (bt_cache_evict_slot(lru, &vic_fd, &vic_map, &vic_sz) == 0) {
+            int drop_rc = bt_cache_evict_slot(lru, CACHE_DROP_EVICT, 0,
+                                              &vic_fd, &vic_map, &vic_sz);
+            if (drop_rc > 0) {
                 slot = lru;
                 break;
             }
-            /* Busy — try the next-oldest candidate. */
+            if (drop_rc < 0 && first_error == 0) first_error = errno;
+            if (drop_rc == 0 && wait_candidate < 0) wait_candidate = lru;
             floor_ts = oldest + 1;
+        }
+        if (slot < 0 && writer && wait_candidate >= 0) {
+            int drop_rc = bt_cache_evict_slot(wait_candidate,
+                                              CACHE_DROP_EVICT, 1,
+                                              &vic_fd, &vic_map, &vic_sz);
+            if (drop_rc > 0) slot = wait_candidate;
+            else if (drop_rc < 0 && first_error == 0) first_error = errno;
+            else if (drop_rc == 0) first_error = 0;
+        }
+        if (slot < 0 && writer && first_error != 0) {
+            pthread_mutex_unlock(&bt_cache_lock);
+            bt_dispose_mapping(vic_fd, vic_map, vic_sz);
+            bt_dispose_mapping(fd, map, sz);
+            errno = first_error;
+            return -1;
         }
     }
 
     if (slot < 0) {
-        /* Cache truly full — serve uncached. */
         pthread_mutex_unlock(&bt_cache_lock);
         bt_dispose_mapping(vic_fd, vic_map, vic_sz);
+        if (writer) {
+            bt_dispose_mapping(fd, map, sz);
+            goto retry_bt_acquire;
+        }
+        /* Cache truly full — read-only callers may serve uncached. */
         bt->slot = -1;
         bt->fd = fd;
         bt->map = map;
@@ -768,19 +813,31 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
     e->fd = fd;
     e->map = map;
     e->map_size = sz;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
-
-    /* Take the per-entry rwlock before releasing the table mutex — closes
-       the same evict-after-install race the hit path's verify-retry handles.
-       This is the freshly-installed slot, no one else holds the rwlock yet,
-       so neither rdlock nor wrlock can block. */
     pthread_rwlock_t *lock = &e->rwlock;
-    if (writer) pthread_rwlock_wrlock(lock);
-    else        pthread_rwlock_rdlock(lock);
     pthread_mutex_unlock(&bt_cache_lock);
     bt_dispose_mapping(vic_fd, vic_map, vic_sz);
+
+    /* Take the per-entry rwlock AFTER releasing the table mutex — same
+       M0-then-M1 ordering as the cache-hit path above, so a per-entry
+       rwlock never nests inside bt_cache_lock. A caller can park a rwlock
+       across a long-lived handle (e.g. BtRangeIter) and separately need
+       bt_cache_lock for an unrelated slot; nesting the other way risks a
+       lock-order inversion against that. Verify-and-retry exactly like the
+       hit path handles the resulting window where a concurrent evictor can
+       steal this slot before we lock it. */
+    if (writer) pthread_rwlock_wrlock(lock);
+    else        pthread_rwlock_rdlock(lock);
+    if (!e->used || strcmp(e->path, path) != 0) {
+        /* Stolen by a concurrent evictor; they now own disposing our fd/map
+           (captured as their own victim to dispose). Retry from scratch. */
+        pthread_rwlock_unlock(lock);
+        goto retry_bt_acquire;
+    }
 
     bt->slot = slot;
     bt->fd = fd;
@@ -800,6 +857,7 @@ static void bt_release(BtFile *bt) {
             BtCacheEntry *e = &bt_cache[bt->slot];
             e->map = bt->map;
             e->map_size = bt->map_size;
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
         pthread_rwlock_unlock(&bt_cache[bt->slot].rwlock);
     } else {
@@ -844,7 +902,7 @@ void btree_cache_invalidate(const char *path) {
     if (bt_cache) {
         int found = 0;
         int slot = bt_cache_probe(path, &found);
-        if (found) bt_cache_drop_slot(slot);
+        if (found) bt_cache_drop_slot(slot, CACHE_DROP_DISCARD);
     }
     pthread_mutex_unlock(&bt_cache_lock);
 }
@@ -1592,12 +1650,15 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
 
 /* ========== Public API ========== */
 
-void btree_insert(const char *path, const char *value, size_t vlen,
-                  const uint8_t hash[BT_HASH_SIZE]) {
-    if (vlen > BT_MAX_VAL_LEN) return;
+int btree_insert(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]) {
+    if (vlen > BT_MAX_VAL_LEN) {
+        errno = EINVAL;
+        return -1;
+    }
 
     BtFile bt;
-    if (bt_acquire(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return -1;
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
     char    promote_val[BT_MAX_VAL_LEN];
@@ -1636,15 +1697,16 @@ void btree_insert(const char *path, const char *value, size_t vlen,
     fh->entry_count++;
     fh->insert_count++;
     bt_release(&bt);
+    return 0;
 }
 
 /* Batch insert — opens file once, inserts all entries, closes once.
    Much faster and safer than calling btree_insert N times. */
-void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
-    if (count == 0) return;
+int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
+    if (count == 0) return 0;
 
     BtFile bt;
-    if (bt_acquire(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return -1;
 
     for (size_t i = 0; i < count; i++) {
         if (entries[i].vlen > BT_MAX_VAL_LEN) continue;
@@ -1679,12 +1741,13 @@ void btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
     }
 
     bt_release(&bt);
+    return 0;
 }
 
-void btree_delete(const char *path, const char *value, size_t vlen,
-                  const uint8_t hash[BT_HASH_SIZE]) {
+int btree_delete(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]) {
     BtFile bt;
-    if (bt_acquire(&bt, path, 1) != 0) return; /* write mode — needs to modify pages */
+    if (bt_acquire(&bt, path, 1) != 0) return -1; /* write mode — needs to modify pages */
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
@@ -1720,6 +1783,7 @@ void btree_delete(const char *path, const char *value, size_t vlen,
     }
 
     bt_release(&bt);
+    return 0;
 }
 
 void btree_search(const char *path, const char *value, size_t vlen,
@@ -2343,21 +2407,26 @@ done:
     return rc;
 }
 
-void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
+int btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     /* Drop the cached fd/mapping before unlink — otherwise the cache holds
        the orphaned inode alive and the next acquire opens the new file via
        a fresh fd while old writers still see the deleted one. */
     btree_cache_invalidate(path);
     unlink(path);
-    if (count == 0) return;
+    if (count == 0) return 0;
 
     BtFile bt;
-    if (bt_acquire(&bt, path, 1) != 0) return;
+    if (bt_acquire(&bt, path, 1) != 0) return -1;
 
     /* Fill leaf pages left to right */
     uint32_t *leaf_ids = NULL;
     size_t leaf_count = 0, leaf_cap = 256;
     leaf_ids = malloc(leaf_cap * sizeof(uint32_t));
+    if (!leaf_ids) {
+        bt_release(&bt);
+        errno = ENOMEM;
+        return -1;
+    }
 
     /* First leaf is page 1 (already allocated) */
     uint32_t cur_leaf = 1;
@@ -2499,13 +2568,15 @@ void btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
     if (child_ids != leaf_ids) free(child_ids);
     free(leaf_ids);
     bt_release(&bt);
-    return;
+    return 0;
 
 leaf_oom:
     /* Out of memory while growing leaf_ids — release the file lock and
        bail out. The on-disk tree is partial but consistent up to the
        last successfully written leaf; readers won't crash. */
     bt_release(&bt);
+    errno = ENOMEM;
+    return -1;
 }
 
 /* ========== Streaming bulk build =========================================
@@ -2836,8 +2907,8 @@ static pthread_mutex_t *bt_merge_lock_for(const char *path) {
     return NULL;
 }
 
-void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
-    if (new_count == 0) return;
+int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
+    if (new_count == 0) return 0;
 
     pthread_mutex_t *m = bt_merge_lock_for(path);
     if (m) pthread_mutex_lock(m);
@@ -2879,9 +2950,9 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
            wrlock cycle. The per-path mutex above serialises bulk_merge
            callers; btree_insert_batch's own bt_acquire serialises against
            any concurrent btree_insert / btree_delete on the same path. */
-        btree_insert_batch(path, new_entries, new_count);
+        int rc = btree_insert_batch(path, new_entries, new_count);
         if (m) pthread_mutex_unlock(m);
-        return;
+        return rc;
     }
 
     /* Large batch (or empty tree) — use the rebuild path. */
@@ -2892,9 +2963,9 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
 
     if (exist_count == 0) {
         if (existing) free(existing);
-        btree_bulk_build(path, new_entries, new_count);
+        int rc = btree_bulk_build(path, new_entries, new_count);
         if (m) pthread_mutex_unlock(m);
-        return;
+        return rc;
     }
 
     /* Merge two sorted arrays */
@@ -2904,7 +2975,8 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
         for (size_t xi = 0; xi < exist_count; xi++) free((char *)existing[xi].value);
         free(existing);
         if (m) pthread_mutex_unlock(m);
-        return;
+        errno = ENOMEM;
+        return -1;
     }
 
     size_t ei = 0, ni = 0, ci = 0;
@@ -2918,11 +2990,14 @@ void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) 
     while (ei < exist_count) combined[ci++] = existing[ei++];
     while (ni < new_count)   combined[ci++] = new_entries[ni++];
 
-    btree_bulk_build(path, combined, ci);
+    int build_rc = btree_bulk_build(path, combined, ci);
+    int build_errno = errno;
 
     free(combined);
     for (size_t xi = 0; xi < exist_count; xi++) free((char *)existing[xi].value);
     free(existing);
 
     if (m) pthread_mutex_unlock(m);
+    if (build_rc != 0) errno = build_errno;
+    return build_rc;
 }

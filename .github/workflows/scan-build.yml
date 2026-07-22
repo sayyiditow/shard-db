@@ -65,6 +65,7 @@ jobs:
               src/db/type_desc.c src/db/nql.c src/db/embedded.c \
               src/db/keyset.c src/db/parallel.c src/db/tls.c \
               src/db/slotcask.c src/db/simd.c \
+              src/db/durability.c \
               -Isrc/db -lpthread -lssl -lcrypto
 
       - name: scan-build the CLI (shard-cli)

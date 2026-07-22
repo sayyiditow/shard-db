@@ -110,12 +110,12 @@ typedef int (*bt_result_cb)(const char *value, size_t vlen,
 /* --- Public API --- */
 
 /* Insert a value + 16-byte hash into the index. Creates file if needed. */
-void btree_insert(const char *path, const char *value, size_t vlen,
-                  const uint8_t hash[BT_HASH_SIZE]);
+int btree_insert(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]);
 
 /* Delete entry matching value + hash. */
-void btree_delete(const char *path, const char *value, size_t vlen,
-                  const uint8_t hash[BT_HASH_SIZE]);
+int btree_delete(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]);
 
 /* Search for all entries matching value exactly. Calls cb for each. */
 void btree_search(const char *path, const char *value, size_t vlen,
@@ -149,11 +149,11 @@ typedef struct {
     uint8_t hash[BT_HASH_SIZE];
 } BtEntry;
 
-void btree_bulk_build(const char *path, BtEntry *entries, size_t count);
-void btree_insert_batch(const char *path, BtEntry *entries, size_t count);
+int btree_bulk_build(const char *path, BtEntry *entries, size_t count);
+int btree_insert_batch(const char *path, BtEntry *entries, size_t count);
 /* Sort new_entries, merge with existing tree contents, rebuild — O(N log N) sequential.
    Use for bulk insert operations instead of btree_insert_batch. */
-void btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count);
+int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count);
 
 /* Streaming bulk build — same output as btree_bulk_build but accepts entries
    one-at-a-time so the caller never materialises the full sorted input array

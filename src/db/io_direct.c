@@ -90,22 +90,28 @@ static inline void od_prefetch(const void *addr)
 #  define POSIX_FADV_DONTNEED   4
 #endif
 /* Configurable buffer size — reads DB_ODIRECT_BUF_MB env var.
-   Defaults to 4 MB. Lazily initialised, safe for concurrent reads. */
-size_t odirect_buf_size = 0;
+   Defaults to 4 MB. Lazily initialised from multiple io_pool_worker
+   threads; _Atomic since concurrent initializers race on the plain read
+   and write (they always compute the same value, but the C11 memory
+   model still calls that a data race, and TSan agrees). */
+_Atomic size_t odirect_buf_size = 0;
 
 void odirect_init_buf_size(void)
 {
-    if (odirect_buf_size > 0) return;
+    if (atomic_load_explicit(&odirect_buf_size, memory_order_relaxed) > 0)
+        return;
     const char *env = getenv("DB_ODIRECT_BUF_MB");
     if (env && env[0]) {
         char *end = NULL;
         long mb = strtol(env, &end, 10);
         if (end != env && mb > 0 && mb <= 1048576) {
-            odirect_buf_size = (size_t)mb * 1024 * 1024;
+            atomic_store_explicit(&odirect_buf_size, (size_t)mb * 1024 * 1024,
+                                  memory_order_relaxed);
             return;
         }
     }
-    odirect_buf_size = ODIRECT_BUF_SIZE_DEFAULT;
+    atomic_store_explicit(&odirect_buf_size, ODIRECT_BUF_SIZE_DEFAULT,
+                          memory_order_relaxed);
 }
 
 

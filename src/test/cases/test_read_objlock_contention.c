@@ -1,25 +1,35 @@
-/* src/test/cases/test_nql_no_objlock_contention.c
- * Finding 4 regression: dispatch_nql_query used to take an unconditional
- * objlock_rdlock before its find/count/aggregate switch, even though every
- * NqlMode is a read and dispatch_json_query's own mode_is_write/
- * mode_is_schema gating already takes zero lock for the JSON equivalents
- * (find/count/aggregate are in neither list). That meant an NQL read could
- * block behind another connection's held schema wrlock on the same object
- * while the JSON-wire-protocol version of the identical read would not.
+/* src/test/cases/test_read_objlock_contention.c
+ * Formerly "Finding 4": dispatch_nql_query's original unconditional
+ * objlock_rdlock was removed on the theory that every NqlMode is a read and
+ * dispatch_json_query's own mode_is_write/mode_is_schema gating already took
+ * zero lock for the JSON equivalents (find/count/aggregate were in neither
+ * list) -- so NQL should match. That "fix" was itself the bug: unlocked
+ * reads on both wire protocols could race slotcask_registry_get() against a
+ * concurrent rebuild/vacuum's slotcask_registry_invalidate() (which frees
+ * the SlotcaskDb struct under objlock_wrlock, with zero refcounting) --
+ * a genuine use-after-free, not a documented perf trade-off. See
+ * docs/plans/2026-07-21-read-path-missing-objlock-uaf.md. Both
+ * dispatch_json_query and dispatch_nql_query now take objlock_rdlock for
+ * every read mode; this file was renamed twice (from
+ * test_nql_no_objlock_contention.c through test_nql_objlock_contention.c to
+ * here) and its assertions inverted, because the original name asserted the
+ * exact opposite of correct behavior and covered only half the bug: it now
+ * proves that BOTH a JSON `get` and an NQL `find`, fired concurrently,
+ * correctly BLOCK behind a held schema wrlock (mutual exclusion, matching
+ * the pre-"Finding 4" behavior this file used to guard against), rather
+ * than proving either one doesn't.
  *
  * SCHEMA_WRLOCK_TEST_DELAY_MS (test-only, 0/off in production) widens
  * dispatch_json_query's wrlock-held window deterministically: a `vacuum`
  * request sleeps for the configured duration immediately after acquiring
  * the object's wrlock, before doing any real work. A synchronous marker file
  * exists only while that delay is active. After observing the marker, the
- * test fires a concurrent NQL `find` on the same object and requires the
- * marker to still exist when the NQL response arrives.
- *
- *   - Pre-fix: dispatch_nql_query's own objlock_rdlock blocks until the
- *     held wrlock releases. The delay marker has necessarily been removed
- *     before the NQL response can arrive.
- *   - Post-fix: dispatch_nql_query takes no lock at all -- the NQL find
- *     returns well under DELAY_MS/2 while the marker is still present.
+ * test sends a JSON `get` and an NQL `find` on the same object concurrently
+ * (both requests in flight before either response is awaited, so both race
+ * the held wrlock on separate worker threads) and requires both responses
+ * to arrive only AFTER the marker (and thus the wrlock) is gone -- proving
+ * both dispatchers' objlock_rdlock blocked until the writer released it,
+ * instead of racing the concurrent free.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -122,7 +132,7 @@ static int wait_ready(int port, int tries) {
     return 0;
 }
 
-static int test_nql_no_objlock_contention_run(void) {
+static int test_read_objlock_contention_run(void) {
     char base[] = "/tmp/shard-db-nql-lock-race-XXXXXX";
     if (!mkdtemp(base)) { ASSERT_TRUE(0, "mkdtemp"); return 1; }
 
@@ -237,28 +247,82 @@ static int test_nql_no_objlock_contention_run(void) {
     }
 
     /* While the wrlock is held (vacuum is sleeping inside it), fire a
-       concurrent NQL find on the SAME object over a second connection. */
+       concurrent NQL find AND a concurrent JSON get on the SAME object,
+       each over its own connection. Both requests are sent (tc_send) back
+       to back, before either response is awaited, so both are genuinely
+       in flight against the held wrlock at the same time -- sequential
+       tc_request calls would let the first response drain the delay
+       window before the second request is even sent, which would prove
+       nothing about concurrent blocking. objlock_rdlock inside both
+       dispatch_nql_query and dispatch_json_query must block until
+       vacuum's objlock_wrlock releases -- proving neither read path can
+       race the SlotcaskDb free that a real (non-test-delayed) rebuild
+       would do at roughly this point. */
     TestClient *nc = tc_connect(&cfg);
     ASSERT_NOT_NULL(nc, "connect for NQL find");
+    TestClient *gc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(gc, "connect for JSON get");
+
+    long nql_t0 = 0, get_t0 = 0;
+    int nql_sent = 0, get_sent = 0;
     if (nc) {
-        long t0 = now_ms();
+        nql_t0 = now_ms();
+        nql_sent = tc_send(nc, "find default lockrace") == 0;
+        ASSERT_TRUE(nql_sent, "NQL find request sent");
+    }
+    if (gc) {
+        get_t0 = now_ms();
+        get_sent = tc_send(gc,
+            "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"lockrace\","
+            "\"key\":\"k1\"}") == 0;
+        ASSERT_TRUE(get_sent, "JSON get request sent");
+    }
+
+    if (nc && nql_sent) {
         char *nresp = NULL;
-        int nql_rc = tc_request(nc, "find default lockrace", &nresp);
-        long elapsed = now_ms() - t0;
-        int marker_still_active = access(marker_path, F_OK) == 0;
+        int nql_rc = tc_recv(nc, &nresp);
+        long elapsed = now_ms() - nql_t0;
+        int marker_gone_by_response = access(marker_path, F_OK) != 0;
         tc_close(nc);
 
         ASSERT_TRUE(nql_rc == 0, "NQL find round-trip succeeds");
         ASSERT_TRUE(nresp != NULL && !SAFE_STRSTR(nresp, "\"error\""),
-            "NQL find succeeds while a schema wrlock is held on the same object");
+            "NQL find succeeds after the schema wrlock releases");
         if (nresp) TAP_DIAG("# NQL find response: %s\n", nresp);
         free(nresp);
 
-        ASSERT_TRUE(marker_still_active,
-            "NQL response arrives before the held-wrlock delay ends");
-        ASSERT_TRUE(elapsed < (DELAY_MS / 2),
-            "NQL find does not block behind the held schema wrlock (no objlock taken)");
+        ASSERT_TRUE(marker_gone_by_response,
+            "NQL response arrives only after the held-wrlock delay ends");
+        ASSERT_TRUE(elapsed >= (DELAY_MS / 2),
+            "NQL find blocks behind the held schema wrlock (objlock_rdlock taken)");
         TAP_DIAG("# NQL find elapsed: %ldms (wrlock hold=%dms)\n", elapsed, DELAY_MS);
+    } else if (nc) {
+        tc_close(nc);
+    }
+
+    if (gc && get_sent) {
+        char *gresp = NULL;
+        int get_rc = tc_recv(gc, &gresp);
+        long elapsed = now_ms() - get_t0;
+        int marker_gone_by_response = access(marker_path, F_OK) != 0;
+        tc_close(gc);
+
+        ASSERT_TRUE(get_rc == 0, "JSON get round-trip succeeds");
+        ASSERT_TRUE(gresp != NULL && !SAFE_STRSTR(gresp, "\"error\""),
+            "JSON get succeeds after the schema wrlock releases");
+        ASSERT_TRUE(gresp != NULL && SAFE_STRSTR(gresp, "\"alice\"") &&
+            SAFE_STRSTR(gresp, "30"),
+            "JSON get returns the seeded row (name=alice, age=30)");
+        if (gresp) TAP_DIAG("# JSON get response: %s\n", gresp);
+        free(gresp);
+
+        ASSERT_TRUE(marker_gone_by_response,
+            "JSON get response arrives only after the held-wrlock delay ends");
+        ASSERT_TRUE(elapsed >= (DELAY_MS / 2),
+            "JSON get blocks behind the held schema wrlock (objlock_rdlock taken)");
+        TAP_DIAG("# JSON get elapsed: %ldms (wrlock hold=%dms)\n", elapsed, DELAY_MS);
+    } else if (gc) {
+        tc_close(gc);
     }
 
     /* Drain the vacuum response so the connection doesn't leak past the
@@ -274,4 +338,4 @@ static int test_nql_no_objlock_contention_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER("test-nql-no-objlock-contention", test_nql_no_objlock_contention_run)
+TEST_REGISTER("test-read-objlock-contention", test_read_objlock_contention_run)

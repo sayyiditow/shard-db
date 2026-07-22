@@ -27,7 +27,7 @@ static int test_segcache_staleness_run(void) {
     snprintf(legacy, sizeof(legacy), "%s/000000.dat.legacy", tmpdir);
 
     SlotcaskSegHandle s1;
-    int ret = segcache_acquire(&s1, path, 1, 1);
+    int ret = segcache_acquire(&s1, path, 1, 1, 0);
     ASSERT_EQ_INT(ret, 0, "first acquire creates+caches segment file");
     s1.map[0] = 0xAB;
     segcache_release(&s1);
@@ -37,7 +37,7 @@ static int test_segcache_staleness_run(void) {
     ASSERT_EQ_INT(ret, 0, "rename segment file away, simulating rebuild's rename");
 
     SlotcaskSegHandle s2;
-    ret = segcache_acquire(&s2, path, 1, 1);
+    ret = segcache_acquire(&s2, path, 1, 1, 0);
     ASSERT_EQ_INT(ret, 0, "second acquire after rename succeeds");
     ASSERT_EQ_INT((int)s2.map[0], 0,
         "second acquire must see a fresh segment (byte0=0), not alias the renamed-away file's byte0=0xAB");

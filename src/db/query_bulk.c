@@ -13,14 +13,21 @@
 /* Bulk ops use the v2 slotcask storage backend (registry-cached SlotcaskDb handles). */
 
 /* ---- Shared worker types for parallel index builds ---- */
-typedef struct { char ipath[PATH_MAX]; BtEntry *pairs; size_t pair_count; } IdxBuildArg;
+typedef struct {
+    char ipath[PATH_MAX];
+    BtEntry *pairs;
+    size_t pair_count;
+    int out_error;
+    int out_errno;
+} IdxBuildArg;
 static void *idx_build_worker(void *arg) __attribute__((unused));
 static void *idx_build_worker(void *arg) {
     IdxBuildArg *ib = (IdxBuildArg *)arg;
     /* Merge-rebuild: sort new entries, merge with existing tree, rebuild from scratch.
        Much faster than btree_insert_batch for large datasets because it uses sequential
        I/O (leaf scan + bulk_build) instead of random B+ tree insertions. */
-    btree_bulk_merge(ib->ipath, ib->pairs, ib->pair_count);
+    ib->out_error = btree_bulk_merge(ib->ipath, ib->pairs, ib->pair_count);
+    ib->out_errno = ib->out_error ? errno : 0;
     return NULL;
 }
 
@@ -42,10 +49,14 @@ typedef struct {
     int splits;
     BtEntry *new_entries;     /* not owned; values freed by caller */
     size_t   new_count;
+    int      out_error;
+    int      out_errno;
 } IdxFieldArg;
 
 static void *idx_build_field_worker(void *arg) {
     IdxFieldArg *fa = (IdxFieldArg *)arg;
+    fa->out_error = 0;
+    fa->out_errno = 0;
     if (fa->new_count == 0) return NULL;
     int idx_n = index_splits_for(fa->splits);
 
@@ -56,6 +67,8 @@ static void *idx_build_field_worker(void *arg) {
     if (!counts || !offsets || !parted) {
         LOG_ERROR(LOG_SUB_QUERY, "idx_build_field_worker: alloc failed for field %s (new_count=%zu)", fa->field, fa->new_count);
         free(counts); free(offsets); free(parted);
+        fa->out_error = -1;
+        fa->out_errno = ENOMEM;
         return NULL;
     }
     for (size_t i = 0; i < fa->new_count; i++)
@@ -65,7 +78,10 @@ static void *idx_build_field_worker(void *arg) {
     size_t *cursor = calloc((size_t)idx_n, sizeof(size_t));
     if (!cursor) {
         LOG_ERROR(LOG_SUB_QUERY, "idx_build_field_worker: calloc cursor failed (idx_n=%d)", idx_n);
-        free(counts); free(offsets); free(parted); return NULL;
+        free(counts); free(offsets); free(parted);
+        fa->out_error = -1;
+        fa->out_errno = ENOMEM;
+        return NULL;
     }
     for (size_t i = 0; i < fa->new_count; i++) {
         int s = idx_shard_for_hash(fa->new_entries[i].hash, fa->splits);
@@ -78,7 +94,11 @@ static void *idx_build_field_worker(void *arg) {
         if (counts[s] == 0) continue;
         char path[PATH_MAX];
         build_idx_path(path, sizeof(path), fa->db_root, fa->object, fa->field, s);
-        btree_bulk_merge(path, parted + offsets[s], counts[s]);
+        if (btree_bulk_merge(path, parted + offsets[s], counts[s]) != 0) {
+            fa->out_error = -1;
+            fa->out_errno = errno;
+            break;
+        }
     }
 
     free(parted);
@@ -1375,15 +1395,28 @@ static int bulk_ins_run(const char *db_root, const char *object,
     if (nfields > 0) {
         IdxFieldArg *fa = malloc((size_t)nfields * sizeof(IdxFieldArg));
         int fa_count = 0;
-        for (int fi = 0; fi < nfields; fi++) {
-            if (idx_pair_counts[fi] == 0) continue;
-            fa[fa_count++] = (IdxFieldArg){
-                .db_root = db_root, .object = object, .field = idx_fields[fi],
-                .splits = sc.splits,
-                .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
-            };
+        if (!fa) {
+            errors++;
+        } else {
+            for (int fi = 0; fi < nfields; fi++) {
+                if (idx_pair_counts[fi] == 0) continue;
+                fa[fa_count++] = (IdxFieldArg){
+                    .db_root = db_root, .object = object, .field = idx_fields[fi],
+                    .splits = sc.splits,
+                    .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
+                };
+            }
+            parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
+            for (int i = 0; i < fa_count; i++) {
+                if (fa[i].out_error) {
+                    errors++;
+                    LOG_ERROR(LOG_SUB_QUERY,
+                              "bulk index merge failed field=%s errno=%d (%s)",
+                              fa[i].field, fa[i].out_errno,
+                              strerror(fa[i].out_errno));
+                }
+            }
         }
-        parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
         free(fa);
         /* Free the value strings — owned by idx_pairs[fi]. */
         for (int fi = 0; fi < nfields; fi++) {
@@ -2087,15 +2120,28 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     if (nidx > 0) {
         IdxFieldArg *fa = malloc((size_t)nidx * sizeof(IdxFieldArg));
         int fa_count = 0;
-        for (int fi = 0; fi < nidx; fi++) {
-            if (idx_pair_counts[fi] == 0) continue;
-            fa[fa_count++] = (IdxFieldArg){
-                .db_root = db_root, .object = object, .field = idx_fields[fi],
-                .splits = sc.splits,
-                .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
-            };
+        if (!fa) {
+            errors++;
+        } else {
+            for (int fi = 0; fi < nidx; fi++) {
+                if (idx_pair_counts[fi] == 0) continue;
+                fa[fa_count++] = (IdxFieldArg){
+                    .db_root = db_root, .object = object, .field = idx_fields[fi],
+                    .splits = sc.splits,
+                    .new_entries = idx_pairs[fi], .new_count = idx_pair_counts[fi],
+                };
+            }
+            parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
+            for (int i = 0; i < fa_count; i++) {
+                if (fa[i].out_error) {
+                    errors++;
+                    LOG_ERROR(LOG_SUB_QUERY,
+                              "bulk index merge failed field=%s errno=%d (%s)",
+                              fa[i].field, fa[i].out_errno,
+                              strerror(fa[i].out_errno));
+                }
+            }
         }
-        parallel_for(idx_build_field_worker, fa, fa_count, sizeof(IdxFieldArg));
         free(fa);
         for (int fi = 0; fi < nidx; fi++) {
             for (size_t ei = 0; ei < idx_pair_counts[fi]; ei++)

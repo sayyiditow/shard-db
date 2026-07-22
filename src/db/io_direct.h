@@ -26,8 +26,10 @@
 #define ODIRECT_ALIGN            4096                 /* O_DIRECT alignment unit */
 
 /* Configurable chunk size. Override via env var DB_ODIRECT_BUF_MB=N (integer MB).
- * Initialized before first allocation; safe to read without locking after that. */
-extern size_t odirect_buf_size;
+ * _Atomic: lazily initialised from multiple io_pool_worker threads
+ * concurrently in odirect_init_buf_size(); plain read/write raced under
+ * TSan even though racing initializers always compute the same value. */
+extern _Atomic size_t odirect_buf_size;
 
 /* ---------------------------------------------------------------------------
  * Low-level helpers

@@ -3,13 +3,26 @@
 #include "query_internal.h"
 
 /* ========== Per-object rwlock ==========
-   Coordinates normal writes (shared) vs. rebuild (exclusive).
-   - Writers (insert/delete/update/bulk/add-index/truncate): rdlock
-   - Rebuild (vacuum/add-field): wrlock — blocks all writers for the duration
-   - Reads (get/find/search/range): do NOT take this lock (MAP_SHARED
-     gives a live view; the read-side retry loop validates hash+key after
-     the fact and retries on a concurrent move, so no lock is needed for
-     correctness)
+   Coordinates normal access (shared) vs. rebuild (exclusive).
+   - Writers AND readers (insert/delete/update/bulk/get/find/exists/count/...):
+     rdlock. Every mode that can reach slotcask_registry_get() needs this,
+     not just writes: the registry hands out a raw SlotcaskDb* with no
+     reference counting, and slotcask_registry_invalidate() (called by
+     rebuild/vacuum below, under wrlock) frees that struct outright. Without
+     rdlock here, a concurrent reader's registry_get() can race the free and
+     dereference a dangling pointer — this is a genuine use-after-free, not
+     just a data race on inert bytes.
+   - Rebuild (vacuum/add-field/compact/...): wrlock — blocks all readers and
+     writers for the duration, so it's safe to invalidate + free the
+     registry entry once it holds the lock.
+
+   This is orthogonal to slotcask's own read-side retry loop, which
+   validates hash+key after a slot read and retries on a concurrent move
+   (MAP_SHARED gives a live view of slot *contents* within a still-open
+   SlotcaskDb). That mechanism handles in-object data races and needs no
+   lock. It does nothing for, and was never meant to cover, the
+   SlotcaskDb struct itself being freed out from under a reader — that's
+   what this lock is for.
 
    Entries live for process lifetime — no eviction needed. Objects are
    created rarely and the pthread_rwlock_t memory is tiny. Safe to reuse

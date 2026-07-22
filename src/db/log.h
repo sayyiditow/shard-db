@@ -43,6 +43,7 @@ typedef enum {
 #define LOG_SUB_CONFIG    "config"
 #define LOG_SUB_REINDEX   "reindex"
 #define LOG_SUB_SLOW      "slow"
+#define LOG_SUB_DURABILITY "durability"
 
 /* Call-site macros. Compiler enforces level + subsystem at every site. */
 #define LOG_ERROR(sub, fmt, ...) log_msg_sub(LOG_LVL_ERROR, (sub), (fmt), ##__VA_ARGS__)

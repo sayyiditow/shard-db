@@ -198,7 +198,7 @@ static int kfcache_probe(const char *path, int *out_found) {
 /* Caller holds g_kfcache_lock. Returns with it held. Lock entries before
    re-taking the table mutex so every cache path follows entry -> table and
    nested kf/segment walks cannot form a table -> entry -> table cycle. */
-static int kfcache_drop_slot(int slot) {
+static int kfcache_drop_slot(int slot, CacheDropReason reason, int wait) {
     KfCacheEntry *e = &g_kfcache[slot];
     if (!e->used) return 1;
     uint64_t expected_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
@@ -212,28 +212,37 @@ static int kfcache_drop_slot(int slot) {
        or a stale-entry drop can munmap out from under a concurrent
        reader, producing a SEGV. */
     pthread_mutex_unlock(&g_kfcache_lock);
-    pthread_rwlock_wrlock(&e->rwlock);
+    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
+                       : pthread_rwlock_trywrlock(&e->rwlock);
     pthread_mutex_lock(&g_kfcache_lock);
+    if (lock_rc != 0) return 0;
     if (!e->used ||
         atomic_load_explicit(&e->gen, memory_order_acquire) != expected_gen ||
         strcmp(e->path, expected_path) != 0) {
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
-    if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+    if (reason == CACHE_DROP_EVICT && e->base && e->map_size > 0 &&
+        durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
+                               e->base, e->map_size) < 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return -1;
+    }
     if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
     e->base = NULL;
     e->fd = -1;
     e->map_size = 0;
     e->capacity = 0;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 0;
     e->path[0] = '\0';
     /* Increment gen under g_kfcache_lock (caller always holds it).
        Any SlotRef pointing at this slot will fail its gen check after
        this store, forcing the slow-path re-probe. */
     atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-    g_kfcache_count--;
+    __atomic_fetch_sub(&g_kfcache_count, 1, __ATOMIC_RELAXED);
     pthread_rwlock_unlock(&e->rwlock);
     return 1;
 }
@@ -253,10 +262,10 @@ static void kfcache_invalidate_prefix(const char *prefix) {
     size_t pl = strlen(prefix);
     for (int i = 0; i < g_kfcache_slots; i++) {
         KfCacheEntry *e = &g_kfcache[i];
-        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
         if (strncmp(e->path, prefix, pl) != 0) continue;
         pthread_rwlock_wrlock(&e->rwlock);
-        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
             strncmp(e->path, prefix, pl) == 0) {
             if (g_db && g_kfcache_test_hold_ms > 0) {
                 /* Test-only hook (KFCACHE_TEST_HOLD_MS): widens this
@@ -269,7 +278,8 @@ static void kfcache_invalidate_prefix(const char *prefix) {
                     ret = nanosleep(&hold_ts, &hold_ts);
                 } while (ret != 0 && errno == EINTR);
             }
-            if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+            /* Structural discard under the object wrlock: the caller is
+               deleting this file or has durably published its replacement. */
             if (e->base) munmap(e->base, e->map_size);
             if (e->fd >= 0) close(e->fd);
             e->base = NULL;
@@ -277,8 +287,10 @@ static void kfcache_invalidate_prefix(const char *prefix) {
             e->map_size = 0;
             e->capacity = 0;
             e->path[0] = '\0';
+            atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+            atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&e->used, 0, memory_order_release);
             __sync_fetch_and_sub(&g_kfcache_count, 1);
             /* Test-only early exit: unlock this entry, then leave the
                remaining prefix-matched entries alone.  One held entry is
@@ -402,8 +414,13 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     h->map_size = 0;
     h->capacity = 0;
 
+retry_kfcache_acquire:
     if (!g_kfcache) {
-        /* Cache not initialised — direct mmap, no locking. */
+        if (writer) {
+            errno = ENODEV;
+            return -1;
+        }
+        /* Read-only cache-disabled fallback: direct mmap, no locking. */
         int fd; uint8_t *base; size_t sz; dev_t dev; ino_t ino;
         if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz, &dev, &ino) < 0) return -1;
         kf_handle_from_uncached(h, fd, base, sz);
@@ -450,7 +467,7 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
             pthread_rwlock_unlock(lock);
             pthread_mutex_lock(&g_kfcache_lock);
             if (g_kfcache[slot].used && strcmp(g_kfcache[slot].path, path) == 0) {
-                kfcache_drop_slot(slot);
+                kfcache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
             }
             if (++retries >= 4) break;
             continue;
@@ -505,7 +522,7 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                can't alias stale data for the next caller. */
             pthread_mutex_lock(&g_kfcache_lock);
             if (g_kfcache[slot].used && strcmp(g_kfcache[slot].path, path) == 0) {
-                kfcache_drop_slot(slot);
+                kfcache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
             }
             pthread_mutex_unlock(&g_kfcache_lock);
         }
@@ -513,28 +530,66 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
            staleness. Our own fd/base/sz (opened moments ago) are
            current — serve them uncached this once instead of opening
            a third time. */
+        if (writer) {
+            munmap(base, sz);
+            close(fd);
+            goto retry_kfcache_acquire;
+        }
         kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
 
-    /* Evict LRU if half-full or no empty slot. */
-    if (slot < 0 || g_kfcache_count >= g_kfcache_slots / 2) {
-        int lru = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < g_kfcache_slots; i++) {
-            if (g_kfcache[i].used && g_kfcache[i].last_access < oldest) {
-                oldest = g_kfcache[i].last_access;
-                lru = i;
+    /* Evict LRU if half-full or no empty slot. A failed dirty sync leaves
+       that candidate installed; continue to another distinct victim. */
+    if (slot < 0 || __atomic_load_n(&g_kfcache_count, __ATOMIC_RELAXED) >= g_kfcache_slots / 2) {
+        slot = -1;
+        int first_error = 0;
+        int wait_candidate = -1;
+        uint64_t floor_ts = 0;
+        for (int attempt = 0; attempt < g_kfcache_slots; attempt++) {
+            int lru = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int i = 0; i < g_kfcache_slots; i++) {
+                if (g_kfcache[i].used &&
+                    g_kfcache[i].last_access >= floor_ts &&
+                    g_kfcache[i].last_access < oldest) {
+                    oldest = g_kfcache[i].last_access;
+                    lru = i;
+                }
             }
+            if (lru < 0) break;
+            int drop_rc = kfcache_drop_slot(lru, CACHE_DROP_EVICT, 0);
+            if (drop_rc > 0) {
+                slot = lru;
+                break;
+            }
+            if (drop_rc < 0 && first_error == 0) first_error = errno;
+            if (drop_rc == 0 && wait_candidate < 0) wait_candidate = lru;
+            floor_ts = oldest + 1;
         }
-        if (lru >= 0) {
-            slot = kfcache_drop_slot(lru) ? lru : -1;
+        if (slot < 0 && writer && wait_candidate >= 0) {
+            int drop_rc = kfcache_drop_slot(wait_candidate, CACHE_DROP_EVICT, 1);
+            if (drop_rc > 0) slot = wait_candidate;
+            else if (drop_rc < 0 && first_error == 0) first_error = errno;
+            else if (drop_rc == 0) first_error = 0;
+        }
+        if (slot < 0 && writer && first_error != 0) {
+            pthread_mutex_unlock(&g_kfcache_lock);
+            munmap(base, sz);
+            close(fd);
+            errno = first_error;
+            return -1;
         }
     }
 
     if (slot < 0) {
-        /* Cache truly full — serve uncached. */
         pthread_mutex_unlock(&g_kfcache_lock);
+        if (writer) {
+            munmap(base, sz);
+            close(fd);
+            goto retry_kfcache_acquire;
+        }
+        /* Cache truly full — read-only callers may serve uncached. */
         kf_handle_from_uncached(h, fd, base, sz);
         return 0;
     }
@@ -546,11 +601,13 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
     e->base = base;
     e->map_size = sz;
     e->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
     e->file_ino = ino;
-    g_kfcache_count++;
+    __atomic_fetch_add(&g_kfcache_count, 1, __ATOMIC_RELAXED);
 
     /* Publish under the table mutex, then take the entry lock without holding
        the table mutex. An evictor that wins this race closes the just-opened
@@ -573,6 +630,10 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
 
 void kfcache_release(SlotcaskKfHandle *h) {
     if (h->slot >= 0) {
+        if (h->writer) {
+            KfCacheEntry *e = &g_kfcache[h->slot];
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+        }
         pthread_rwlock_unlock(&g_kfcache[h->slot].rwlock);
     } else if (h->hdr) {
         /* Uncached fallback. */
@@ -617,7 +678,7 @@ int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
             /* Gen matches — slot should still hold our entry.
                Take rdlock and verify identity before returning. */
             pthread_rwlock_rdlock(&e->rwlock);
-            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            if (atomic_load_explicit(&e->used, memory_order_acquire) &&
                 strcmp(e->path, path) == 0) {
                 /* Warm hit confirmed. */
                 h->slot = s;
@@ -643,6 +704,35 @@ int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
 
 /* ============================================================ segcache */
 /* SegCacheEntry moved to shard_db_internal.h; g_segcache* moved to ShardDb struct */
+
+#ifdef TEST_BUILD
+static _Atomic int g_segcache_test_identity_mismatches;
+
+void segcache_test_force_identity_mismatches(int count) {
+    atomic_store_explicit(&g_segcache_test_identity_mismatches,
+                          count > 0 ? count : 0, memory_order_release);
+}
+
+int segcache_test_identity_mismatches_remaining(void) {
+    return atomic_load_explicit(&g_segcache_test_identity_mismatches,
+                                memory_order_acquire);
+}
+
+static int segcache_test_consume_identity_mismatch(void) {
+    int remaining = atomic_load_explicit(&g_segcache_test_identity_mismatches,
+                                         memory_order_acquire);
+    while (remaining > 0) {
+        if (atomic_compare_exchange_weak_explicit(
+                &g_segcache_test_identity_mismatches, &remaining,
+                remaining - 1, memory_order_acq_rel, memory_order_acquire)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+#else
+static int segcache_test_consume_identity_mismatch(void) { return 0; }
+#endif
 
 void segcache_init(int cap) {
     if (g_segcache) return;
@@ -695,20 +785,23 @@ static void segcache_invalidate_prefix(const char *prefix) {
     size_t pl = strlen(prefix);
     for (int i = 0; i < g_segcache_slots; i++) {
         SegCacheEntry *e = &g_segcache[i];
-        if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+        if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
         if (strncmp(e->path, prefix, pl) != 0) continue;
         pthread_rwlock_wrlock(&e->rwlock);
-        if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
             strncmp(e->path, prefix, pl) == 0) {
-            if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+            /* Structural discard: the caller is deleting or has already
+               durably published a replacement under the object wrlock. */
             if (e->map) munmap(e->map, e->map_size);
             if (e->fd >= 0) close(e->fd);
             e->map = NULL;
             e->fd = -1;
             e->map_size = 0;
             e->path[0] = '\0';
+            atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+            atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+            atomic_store_explicit(&e->used, 0, memory_order_release);
             __sync_fetch_and_sub(&g_segcache_count, 1);
         }
         pthread_rwlock_unlock(&e->rwlock);
@@ -717,7 +810,7 @@ static void segcache_invalidate_prefix(const char *prefix) {
 
 /* Caller holds g_segcache_lock. Returns with it held. See the kf-cache
    equivalent for the entry -> table lock-order invariant. */
-static int segcache_drop_slot(int slot) {
+static int segcache_drop_slot(int slot, CacheDropReason reason, int wait) {
     SegCacheEntry *e = &g_segcache[slot];
     if (!e->used) return 1;
     uint64_t expected_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
@@ -728,20 +821,29 @@ static int segcache_drop_slot(int slot) {
        munmapping under it — the caller only holds g_segcache_lock, which
        guards slot-table bookkeeping, not live e->map access. */
     pthread_mutex_unlock(&g_segcache_lock);
-    pthread_rwlock_wrlock(&e->rwlock);
+    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
+                       : pthread_rwlock_trywrlock(&e->rwlock);
     pthread_mutex_lock(&g_segcache_lock);
+    if (lock_rc != 0) return 0;
     if (!e->used ||
         atomic_load_explicit(&e->gen, memory_order_acquire) != expected_gen ||
         strcmp(e->path, expected_path) != 0) {
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
-    if (e->map && e->map_size > 0) msync(e->map, e->map_size, MS_ASYNC);
+    if (reason == CACHE_DROP_EVICT && e->map && e->map_size > 0 &&
+        durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
+                               e->map, e->map_size) < 0) {
+        pthread_rwlock_unlock(&e->rwlock);
+        return -1;
+    }
     if (e->map) munmap(e->map, e->map_size);
     if (e->fd >= 0) close(e->fd);
     e->map = NULL;
     e->fd = -1;
     e->map_size = 0;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 0;
     e->path[0] = '\0';
     /* Increment gen under g_segcache_lock (caller always holds it).
@@ -794,14 +896,19 @@ static int seg_open_file(const char *path, int create,
 }
 
 int segcache_acquire(SlotcaskSegHandle *h, const char *path,
-                     int create, int writer) {
+                     int create, int writer, int must_cache) {
     h->slot = -1;
     h->writer = writer;
     h->fd = -1;
     h->map = NULL;
     h->map_size = 0;
 
+retry_segcache_acquire:
     if (!g_segcache) {
+        if (must_cache) {
+            errno = ENODEV;
+            return -1;
+        }
         dev_t dev; ino_t ino;
         if (seg_open_file(path, create, &h->fd, &h->map, &h->map_size, &dev, &ino) < 0) return -1;
         return 0;
@@ -826,6 +933,15 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
            drop the rwlock and retry — the verify is the consistency
            barrier the analyzer can't see. */
         SegCacheEntry *e = &g_segcache[slot];
+        if (segcache_test_consume_identity_mismatch()) {
+            pthread_rwlock_unlock(lock);
+            if (++retries >= 4) {
+                pthread_mutex_lock(&g_segcache_lock);
+                break;
+            }
+            pthread_mutex_lock(&g_segcache_lock);
+            continue;
+        }
         if (e->used && strcmp(e->path, path) == 0) {
             struct stat pst;
             if (stat(path, &pst) == 0 &&
@@ -845,7 +961,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
             pthread_rwlock_unlock(lock);
             pthread_mutex_lock(&g_segcache_lock);
             if (g_segcache[slot].used && strcmp(g_segcache[slot].path, path) == 0) {
-                segcache_drop_slot(slot);
+                segcache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
             }
             if (++retries >= 4) break;
             continue;
@@ -874,7 +990,8 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
         SegCacheEntry *e = &g_segcache[slot];
-        int matched = e->used && strcmp(e->path, path) == 0;
+        int matched = !segcache_test_consume_identity_mismatch() &&
+                      e->used && strcmp(e->path, path) == 0;
         if (matched) {
             struct stat pst;
             if (stat(path, &pst) == 0 &&
@@ -894,7 +1011,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
         if (matched) {
             pthread_mutex_lock(&g_segcache_lock);
             if (g_segcache[slot].used && strcmp(g_segcache[slot].path, path) == 0) {
-                segcache_drop_slot(slot);
+                segcache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
             }
             pthread_mutex_unlock(&g_segcache_lock);
         }
@@ -902,25 +1019,66 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
         h->fd = fd;
         h->map = map;
         h->map_size = sz;
+        if (must_cache) {
+            munmap(map, sz);
+            close(fd);
+            h->fd = -1;
+            h->map = NULL;
+            h->map_size = 0;
+            goto retry_segcache_acquire;
+        }
         return 0;
     }
 
     if (slot < 0 || g_segcache_count >= g_segcache_slots / 2) {
-        int lru = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < g_segcache_slots; i++) {
-            if (g_segcache[i].used && g_segcache[i].last_access < oldest) {
-                oldest = g_segcache[i].last_access;
-                lru = i;
+        slot = -1;
+        int first_error = 0;
+        int wait_candidate = -1;
+        uint64_t floor_ts = 0;
+        for (int attempt = 0; attempt < g_segcache_slots; attempt++) {
+            int lru = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int i = 0; i < g_segcache_slots; i++) {
+                if (g_segcache[i].used &&
+                    g_segcache[i].last_access >= floor_ts &&
+                    g_segcache[i].last_access < oldest) {
+                    oldest = g_segcache[i].last_access;
+                    lru = i;
+                }
             }
+            if (lru < 0) break;
+            int drop_rc = segcache_drop_slot(lru, CACHE_DROP_EVICT, 0);
+            if (drop_rc > 0) {
+                slot = lru;
+                break;
+            }
+            if (drop_rc < 0 && first_error == 0) first_error = errno;
+            if (drop_rc == 0 && wait_candidate < 0) wait_candidate = lru;
+            floor_ts = oldest + 1;
         }
-        if (lru >= 0) {
-            slot = segcache_drop_slot(lru) ? lru : -1;
+        if (slot < 0 && must_cache && wait_candidate >= 0) {
+            int drop_rc = segcache_drop_slot(wait_candidate,
+                                             CACHE_DROP_EVICT, 1);
+            if (drop_rc > 0) slot = wait_candidate;
+            else if (drop_rc < 0 && first_error == 0) first_error = errno;
+            else if (drop_rc == 0) first_error = 0;
+        }
+        if (slot < 0 && must_cache && first_error != 0) {
+            pthread_mutex_unlock(&g_segcache_lock);
+            munmap(map, sz);
+            close(fd);
+            errno = first_error;
+            return -1;
         }
     }
 
     if (slot < 0) {
         pthread_mutex_unlock(&g_segcache_lock);
+        if (must_cache) {
+            munmap(map, sz);
+            close(fd);
+            goto retry_segcache_acquire;
+        }
         h->slot = -1;
         h->fd = fd;
         h->map = map;
@@ -934,6 +1092,8 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     e->fd = fd;
     e->map = map;
     e->map_size = sz;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_segcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
@@ -945,10 +1105,11 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
 
-    if (!e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
+    if (segcache_test_consume_identity_mismatch() ||
+        !e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
         e->file_ino != ino) {
         pthread_rwlock_unlock(lock);
-        return segcache_acquire(h, path, create, writer);
+        return segcache_acquire(h, path, create, writer, must_cache);
     }
 
     h->slot = slot;
@@ -1024,7 +1185,7 @@ int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
         uint64_t cur_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
         if (cur_gen == ref->gen) {
             pthread_rwlock_rdlock(&e->rwlock);
-            if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) &&
+            if (atomic_load_explicit(&e->used, memory_order_acquire) &&
                 strcmp(e->path, path) == 0) {
                 /* Warm hit confirmed. */
                 h->slot = s;
@@ -1039,7 +1200,7 @@ int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
     }
 
     /* Slow path. */
-    int rc = segcache_acquire(h, path, 0, 0);
+    int rc = segcache_acquire(h, path, 0, 0, 0);
     if (rc == 0 && ref && h->slot >= 0) {
         ref->slot = h->slot;
         ref->gen  = atomic_load_explicit(&g_segcache[h->slot].gen,
@@ -1122,7 +1283,7 @@ static int verify_stored_key(const char *data_dir, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
     uint16_t k_stored = seg_rec_klen(rec);
     if (k_stored != klen) { segcache_release(&h); return 0; }
@@ -1256,7 +1417,8 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
     SHARD_MADV_HUGEPAGE(fresh, new_size);  /* THP hint for resplit remap */
 
-    if (e->base && e->map_size > 0) msync(e->base, e->map_size, MS_ASYNC);
+    /* The replacement was MS_SYNC'd and renamed before this old-inode
+       mapping is discarded, so no flush of the superseded inode is needed. */
     if (e->base) munmap(e->base, e->map_size);
     if (e->fd >= 0) close(e->fd);
 
@@ -1264,6 +1426,8 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     e->base = (uint8_t *)fresh;
     e->map_size = new_size;
     e->capacity = new_cap;
+    atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
 
     kh->fd = reopen_fd;
     kh->hdr = (SlotcaskKfHeader *)e->base;
@@ -1899,8 +2063,12 @@ static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
        eviction, which takes wrlock and waits for all rdlock holders.
        create=1: first writer to a freshly-rotated segment file
        materialises it (open O_CREAT + ftruncate to max). */
-    if (segcache_acquire(&h, path, 1, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 1, 0, 1) != 0) return -1;
     seg_record_emit(h.map + offset, db->slot_size, hash, key, klen, value, vlen);
+    if (h.slot >= 0) {
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+    }
     segcache_release(&h);
     return 0;
 }
@@ -1916,8 +2084,12 @@ static int seg_write_record_varlen(const SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 1, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 1, 0, 1) != 0) return -1;
     seg_record_emit(h.map + offset, (int)rec_size, hash, key, klen, value, vlen);
+    if (h.slot >= 0) {
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+    }
     segcache_release(&h);
     return 0;
 }
@@ -1932,16 +2104,20 @@ static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
    segment header to determine the slot's capacity. For fixed format,
    uses db->slot_size. Must be called with a non-const db because it
    modifies the stream's free pool. */
-static inline void slotcask_tombstone_and_push_back(SlotcaskDb *db,
-                                                     uint8_t stream_id,
-                                                     uint16_t file_id,
-                                                     uint32_t offset) {
+static inline int slotcask_tombstone_and_push_back(SlotcaskDb *db,
+                                                    uint8_t stream_id,
+                                                    uint16_t file_id,
+                                                    uint32_t offset) {
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, stream_id, file_id);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0) != 0) return;
+        if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
         __atomic_store_n(&h.map[offset + 18], 2, __ATOMIC_RELEASE);
+        if (h.slot >= 0) {
+            SegCacheEntry *e = &g_segcache[h.slot];
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+        }
         uint16_t klen = seg_rec_klen(h.map + offset);
         uint32_t vlen = seg_rec_vlen(h.map + offset);
         uint32_t cap = (uint32_t)slotcask_record_size_varlen(klen, vlen);
@@ -1949,9 +2125,10 @@ static inline void slotcask_tombstone_and_push_back(SlotcaskDb *db,
         pool_push_free_cap(&db->streams[stream_id], file_id, offset,
                            cap, db->slot_size);
     } else {
-        seg_write_flag(db, stream_id, file_id, offset, 2);
+        if (seg_write_flag(db, stream_id, file_id, offset, 2) != 0) return -1;
         pool_push_free(&db->streams[stream_id], file_id, offset, db->slot_size);
     }
+    return 0;
 }
 
 /* Set the flag byte at slot (file_id, offset) to `flag`. Used for tombstones. */
@@ -1964,11 +2141,15 @@ static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
        a unique offset, only need to keep eviction at bay. The target
        file always exists (we're tombstoning a previously-written
        record), so create=0. */
-    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
     /* Release-store: tombstones flip flag 1→2 (deleted). Concurrent
        readers doing acquire-load on the flag byte either still see 1
        (and proceed with the live record) or see 2 (and skip). */
     __atomic_store_n(&h.map[offset + 18], flag, __ATOMIC_RELEASE);
+    if (h.slot >= 0) {
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+    }
     segcache_release(&h);
     return 0;
 }
@@ -2178,8 +2359,7 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
 
     /* Tombstone old slot + return it to its stream pool — unlocked.
        For varlen, reads the old record's header to determine capacity. */
-    slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
-    return 0;
+    return slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
 }
 
 int slotcask_delete(SlotcaskDb *db,
@@ -2211,8 +2391,7 @@ int slotcask_delete(SlotcaskDb *db,
     kf_tombstone_at_slot(&kh, kf_slot);
     kfcache_release(&kh);
 
-    slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
-    return 0;
+    return slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
 }
 
 #define SLOTCASK_GET_MAX_RETRIES 4
@@ -2394,8 +2573,12 @@ int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n) {
                    infos[i].target.file_id, infos[i].target.offset,
                    recs[i].key, recs[i].klen, db->data_dir);
         kfcache_release(&kh);
-        slotcask_tombstone_and_push_back(db, infos[i].old_sid,
-                                          infos[i].old_fid, infos[i].old_off);
+        if (slotcask_tombstone_and_push_back(db, infos[i].old_sid,
+                                             infos[i].old_fid,
+                                             infos[i].old_off) != 0) {
+            free(infos);
+            return -1;
+        }
     }
 
     free(infos);
@@ -2668,7 +2851,7 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
            insert doesn't take a cold segcache miss. Also scans tombstones
            and locates the reserve frontier. */
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0) != 0) { free(ids); return -1; }
+        if (segcache_acquire(&h, path, 0, 0, 0) != 0) { free(ids); return -1; }
         off_t pos = 0;
         off_t lim = (off_t)h.map_size;
         if (db->format == SLOTCASK_FORMAT_VARIABLE) {
@@ -2798,7 +2981,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         char path[PATH_MAX];
         seg_path_for(path, data_dir, i, 0);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 1, 1) != 0) goto fail;
+        if (segcache_acquire(&h, path, 1, 1, 0) != 0) goto fail;
         /* Prime the seg slot ref for file_id 0 so point reads hit the
            fast path immediately after open. */
         if (db->seg_slot_refs && h.slot >= 0) {
@@ -3031,7 +3214,7 @@ static int read_record_value(const SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
     const uint8_t *rec = h.map + offset;
     if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { segcache_release(&h); return -1; }
     uint16_t k_stored = seg_rec_klen(rec);
@@ -3340,7 +3523,11 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         kfcache_release(&kh);
         /* Tombstone the OLD seg (after dropping kf wrlock so segcache wrlock
            doesn't compete with concurrent reads on the kf shard). */
-        slotcask_tombstone_and_push_back(db, ex_sid, ex_fid, ex_off);
+        if (slotcask_tombstone_and_push_back(db, ex_sid, ex_fid, ex_off) != 0) {
+            if (result) result->was_update = 1;
+            free(old_buf);
+            return -1;
+        }
         if (result) result->was_update = 1;
         free(old_buf);
         return 0;
@@ -3539,7 +3726,11 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     kfcache_release(&kh);
 
     if (found) {
-        slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
+        if (slotcask_tombstone_and_push_back(db, old_sid, old_fid,
+                                             old_off) != 0) {
+            free(old_buf);
+            return -1;
+        }
     }
 
     if (result) {
@@ -3871,7 +4062,7 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                 char path[PATH_MAX];
                 seg_path_for(path, db->data_dir, (uint8_t)s, st[i].target_fid);
                 SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 1, 0) != 0) {
+                if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
                     if (st[i].got_pool)
                         pool_push_free_cap(pool, st[i].target_fid,
                                             st[i].target_off,
@@ -3882,6 +4073,8 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                 seg_record_emit(h.map + st[i].target_off, (int)rec_size,
                                  st[i].hash, r->key, r->klen,
                                  r->value, r->vlen);
+                SegCacheEntry *e = &g_segcache[h.slot];
+                durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
                 segcache_release(&h);
             }
             continue;
@@ -3931,7 +4124,7 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                 char path[PATH_MAX];
                 seg_path_for(path, db->data_dir, (uint8_t)s, items[k].fid);
                 SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                if (segcache_acquire(&h, path, 0, 0, 1) != 0) {
                     for (int j = k; j < run_end; j++) {
                         int i = items[j].rec_idx;
                         pool_push_free(pool, items[j].fid, items[j].off, db->slot_size);
@@ -3950,6 +4143,8 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                                      st[i].hash, r->key, r->klen,
                                      r->value, r->vlen);
                 }
+                SegCacheEntry *e = &g_segcache[h.slot];
+                durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
                 segcache_release(&h);
                 k = run_end;
             }
@@ -3972,7 +4167,7 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, (uint8_t)s, base_fid);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 1, 0) != 0) {
+        if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
             free(offsets);
             for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
             continue;
@@ -3987,6 +4182,8 @@ static void bulk_phase3_seg_writes(SlotcaskDb *db,
                              st[i].hash, r->key, r->klen,
                              r->value, r->vlen);
         }
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         segcache_release(&h);
         free(offsets);
     }
@@ -4008,8 +4205,10 @@ static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
         for (size_t i = 0; i < n; i++) {
             if (recs[i].status != 0) continue;
             if (!st[i].old_found) continue;
-            slotcask_tombstone_and_push_back(db, st[i].old_sid,
-                                              st[i].old_fid, st[i].old_off);
+            if (slotcask_tombstone_and_push_back(db, st[i].old_sid,
+                                                 st[i].old_fid,
+                                                 st[i].old_off) != 0)
+                recs[i].status = -1;
         }
         return;
     }
@@ -4036,16 +4235,11 @@ static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, sid, fid);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0) != 0) {
-            /* Acquire failed: flag stays at 1; vacuum recovers via kf reverse-lookup.
-               Skip pool push for varlen — can't read capacity without the map. */
-            if (db->format != SLOTCASK_FORMAT_VARIABLE) {
-                for (int j = k; j < run_end; j++) {
-                    int i = tomb_idx[j];
-                    pool_push_free(&db->streams[sid], st[i].old_fid,
-                                   st[i].old_off, db->slot_size);
-                }
-            }
+        if (segcache_acquire(&h, path, 0, 0, 1) != 0) {
+            /* The kf repoint already committed. Surface the cleanup failure,
+               but never recycle an old slot whose live flag was not cleared. */
+            for (int j = k; j < run_end; j++)
+                recs[tomb_idx[j]].status = -1;
             k = run_end;
             continue;
         }
@@ -4064,6 +4258,8 @@ static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
                                st[i].old_off, db->slot_size);
             }
         }
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         segcache_release(&h);
         k = run_end;
     }
@@ -4196,7 +4392,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 char path[PATH_MAX];
                 seg_path_for(path, db->data_dir, sid, fid);
                 SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                if (segcache_acquire(&h, path, 0, 0, 0) != 0) {
                     for (int j = k; j < run_end; j++) recs[read_idx[j]].status = -1;
                     k = run_end;
                     continue;
@@ -4608,7 +4804,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 char path[PATH_MAX];
                 seg_path_for(path, db->data_dir, sid, fid);
                 SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 0, 0) != 0) {
+                if (segcache_acquire(&h, path, 0, 0, 0) != 0) {
                     for (int j = k; j < run_end; j++) recs[read_idx[j]].status = -1;
                     k = run_end;
                     continue;
@@ -4685,12 +4881,19 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             char path[PATH_MAX];
             seg_path_for(path, db->data_dir, sid, fid);
             SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 0, 0) != 0) { k = run_end; continue; }
+            if (segcache_acquire(&h, path, 0, 0, 1) != 0) {
+                for (int j = k; j < run_end; j++)
+                    recs[tomb_idx[j]].status = -1;
+                k = run_end;
+                continue;
+            }
             for (int j = k; j < run_end; j++) {
                 int i = tomb_idx[j];
                 __atomic_store_n(&h.map[st[i].old_off + 18], 2, __ATOMIC_RELEASE);
                 pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off, db->slot_size);
             }
+            SegCacheEntry *e = &g_segcache[h.slot];
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
             segcache_release(&h);
             k = run_end;
         }
@@ -4699,9 +4902,13 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         /* OOM: fall back to per-record tombstone via the existing helper. */
         for (size_t i = 0; i < n; i++) {
             if (!st[i].committed) continue;
-            seg_write_flag(db, st[i].old_sid, st[i].old_fid, st[i].old_off, 2);
-            pool_push_free(&db->streams[st[i].old_sid],
-                            st[i].old_fid, st[i].old_off, db->slot_size);
+            if (seg_write_flag(db, st[i].old_sid, st[i].old_fid,
+                               st[i].old_off, 2) != 0) {
+                recs[i].status = -1;
+            } else {
+                pool_push_free(&db->streams[st[i].old_sid],
+                               st[i].old_fid, st[i].old_off, db->slot_size);
+            }
         }
     }
 
@@ -4846,7 +5053,7 @@ typedef struct {
 static void *seg_fetch_worker(void *arg) {
     SegFetchArg *fa = (SegFetchArg *)arg;
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, fa->path, 0, 0) != 0) return NULL;
+    if (segcache_acquire(&h, fa->path, 0, 0, 0) != 0) return NULL;
     for (size_t i = 0; i < fa->count; i++) {
         const uint8_t *rec = h.map + fa->recs[i].off;
         if (!seg_rec_live_with_hash(rec, fa->recs[i].hash)) continue;
@@ -5133,7 +5340,11 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     kf_tombstone_at_slot(&kh, kf_slot);
     kfcache_release(&kh);
 
-    slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off);
+    if (slotcask_tombstone_and_push_back(db, old_sid, old_fid,
+                                         old_off) != 0) {
+        free(old_buf);
+        return -1;
+    }
     free(old_buf);
     return 0;
 }
@@ -5372,7 +5583,7 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
             char seg_path[PATH_MAX];
             seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
             SlotcaskSegHandle sh;
-            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+            if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) continue;
             const uint8_t *rec = sh.map + e->offset;
             if (seg_rec_live_with_hash(rec, e->hash)) {
                 uint16_t klen = seg_rec_klen(rec);
@@ -5475,7 +5686,7 @@ done_collect:
             sh.slot = -1; sh.fd = -1;
             char seg_path[PATH_MAX];
             seg_path_for(seg_path, db->data_dir, r->sid, r->fid);
-            if (segcache_acquire(&sh, seg_path, 0, 0) != 0) {
+            if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) {
                 held_sid = held_fid = -1;
                 continue;
             }
@@ -5604,7 +5815,7 @@ int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, e->stream_id, e->file_id);
         SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0) != 0) continue;
+        if (segcache_acquire(&h, path, 0, 0, 0) != 0) continue;
         const uint8_t *base = (const uint8_t *)h.map + (size_t)e->offset;
         if ((size_t)e->offset + 24 > h.map_size) { segcache_release(&h); continue; }
         uint16_t klen_be = (uint16_t)base[16] | ((uint16_t)base[17] << 8);
@@ -5672,7 +5883,7 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
         char seg_path[PATH_MAX];
         seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+        if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) continue;
         const uint8_t *rec = sh.map + e->offset;
         if (seg_rec_live_with_hash(rec, e->hash)) {
             uint16_t klen = seg_rec_klen(rec);
@@ -5781,7 +5992,7 @@ static int kf_od_skip_emit_cb(const SlotcaskKfEntry *e, void *raw) {
     char seg_path[PATH_MAX];
     seg_path_for(seg_path, c->db->data_dir, e->stream_id, e->file_id);
     SlotcaskSegHandle sh;
-    if (segcache_acquire(&sh, seg_path, 0, 0) != 0) return 0;
+    if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) return 0;
     const uint8_t *rec = sh.map + e->offset;
     if (!seg_rec_live_with_hash(rec, e->hash)) {
         segcache_release(&sh);
@@ -5847,7 +6058,7 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
         char seg_path[PATH_MAX];
         seg_path_for(seg_path, db->data_dir, e->stream_id, e->file_id);
         SlotcaskSegHandle sh;
-        if (segcache_acquire(&sh, seg_path, 0, 0) != 0) continue;
+        if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) continue;
         const uint8_t *rec = sh.map + e->offset;
         if (!seg_rec_live_with_hash(rec, hash16)) {
             segcache_release(&sh);
@@ -5940,7 +6151,7 @@ static int seg_stat_one(SlotcaskDb *db, int stream_id, uint32_t file_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
     size_t total = h.map_size / (size_t)db->slot_size;
     uint32_t live = 0;
     for (size_t s = 0; s < total; s++) {
@@ -5959,7 +6170,7 @@ static int seg_stat_one_varlen(SlotcaskDb *db, int stream_id, uint32_t file_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
 
     size_t file_size = h.map_size;
     uint32_t live = 0, total = 0;
@@ -6212,7 +6423,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
 
     /* Recipient: mmap for writes and for building the free-slot list. */
     SlotcaskSegHandle rh;
-    if (segcache_acquire(&rh, recipient_path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&rh, recipient_path, 0, 0, 0) != 0) return -1;
 
     size_t rmap_size = rh.map_size;
 
@@ -6287,7 +6498,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
        cache pollution is short-lived. */
     {
         SlotcaskSegHandle dh;
-        if (segcache_acquire(&dh, donor_path, 0, 0) != 0) {
+        if (segcache_acquire(&dh, donor_path, 0, 0, 0) != 0) {
             free(free_offs);
             free(free_caps);
             segcache_release(&rh);
@@ -6330,7 +6541,7 @@ static int compact_migrate_records(SlotcaskDb *db, int stream_id,
 
     /* Recipient: mmap for writes and for building the free-slot list. */
     SlotcaskSegHandle rh;
-    if (segcache_acquire(&rh, recipient_path, 0, 0) != 0) return -1;
+    if (segcache_acquire(&rh, recipient_path, 0, 0, 0) != 0) return -1;
 
     int slot_size = db->slot_size;
     size_t total = rh.map_size / (size_t)slot_size;
@@ -6697,7 +6908,7 @@ int slotcask_rebuild_kf(SlotcaskDb *db) {
 
             while (!scan_done) {
                 SlotcaskSegHandle sh;
-                if (segcache_acquire(&sh, seg_path, 0, 0) != 0) break;
+                if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) break;
 
                 RebuildKfCandidate candidates[256];
                 size_t candidate_count = 0;

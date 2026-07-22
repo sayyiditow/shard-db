@@ -51,6 +51,8 @@ static void db_defaults_set(ShardDb *db) {
     db->auto_vacuum_interval_sec  = 3600;
     db->auto_reshard_hour         = 3;
     db->auto_reshard_throttle_ms  = 0;
+    db->durability_sync_ms        = 1000;
+    db->warmup_explicit           = 0;
     db->log_level                 = 3;
     db->log_retain_days           = 7;
     db->index_page_size           = 4096;
@@ -167,6 +169,7 @@ static void db_mutexes_destroy(void);
 static void db_cleanup_before_pools(ShardDb *db) {
     if (!db) return;
     g_db = db;
+    schema_caches_shutdown();
     bt_cache_shutdown();
     bm_cache_shutdown();
     slotcask_shutdown();
@@ -343,6 +346,18 @@ ShardDb *shard_db_open(const char *db_root) {
     if (io_pool_sz > (int)nproc * 8) io_pool_sz = (int)nproc * 8;
     parallel_io_pool_init(io_pool_sz);
 
+    if (bg_threads_start(db, BG_RUNTIME_EMBEDDED) != 0) {
+        /* Required background infrastructure did not start. Stop is safe
+           after partial startup; pools must stop before mapped caches. */
+        bg_threads_stop(db);
+        parallel_io_pool_shutdown();
+        parallel_pool_shutdown();
+        g_shard_db_instance = NULL;
+        db_cleanup_before_pools(db);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
+
     return db;
 }
 
@@ -415,21 +430,20 @@ void shard_db_set_log_handler(ShardDb *db,
     void (*fn)(int type, const char *msg, void *userdata),
     void *userdata) {
     if (!db) return;
-    db->log_handler    = fn;
-    db->log_handler_ud = userdata;
+    /* release: pairs with the acquire loads in log_msg_sub/log_audit_sub/
+       log_slow_query so a background thread that observes the new
+       log_handler also observes the log_handler_ud write below it. */
+    atomic_store_explicit(&db->log_handler_ud, userdata, memory_order_relaxed);
+    atomic_store_explicit(&db->log_handler, fn, memory_order_release);
 }
 
-void shard_db_close(ShardDb *db) {
+/* Final instance teardown after callers have stopped background threads,
+   pools, and mmap caches. Kept separate so daemon startup-failure and normal
+   shutdown can stop logging before freeing the instance used by its writer. */
+void shard_db_destroy_after_storage(ShardDb *db) {
     if (!db) return;
     g_db = db;
 
-    parallel_pool_shutdown();
-    parallel_io_pool_shutdown();
-    bt_cache_shutdown();
-    bm_cache_shutdown();
-    slotcask_shutdown();
-
-    /* Free token store heap arrays. */
     free(db->token_set);
     free(db->token_scope);
     free(db->token_scope_obj);
@@ -437,11 +451,25 @@ void shard_db_close(ShardDb *db) {
     free(db->token_set_used);
 
     db_mutexes_destroy();
-
     if (db->slots_inited) sem_destroy(&db->query_slots);
-
     db_root_lock_release(&db->db_root_lock_fd);
+    g_shard_db_instance = NULL;
     free(db);
     g_db = NULL;
     atomic_store(&g_instance_open, 0);
+}
+
+void shard_db_close(ShardDb *db) {
+    if (!db) return;
+    g_db = db;
+
+    bg_threads_stop(db);
+    parallel_io_pool_shutdown();
+    parallel_pool_shutdown();
+    counts_flush_all();
+    bt_cache_shutdown();
+    bm_cache_shutdown();
+    slotcask_shutdown();
+    schema_caches_shutdown();
+    shard_db_destroy_after_storage(db);
 }

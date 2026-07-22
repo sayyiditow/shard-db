@@ -11,7 +11,9 @@ typedef struct ShardDb ShardDb;
 
 /* Open a shard-db data directory for in-process use.
    db_root must be an existing, writable directory path.
-   Returns NULL on error. Only one instance per process is allowed (V1). */
+   Returns NULL on error, including failure to start required background
+   infrastructure. Only one instance may be open at a time (V1); sequential
+   open-close-open use in the same process is supported. */
 ShardDb *shard_db_open(const char *db_root);
 
 /* Execute a JSON query string and return the JSON response in *out.
@@ -23,7 +25,8 @@ int shard_db_query(ShardDb *db, const char *json, char **out, size_t *out_len);
 /* Free a result buffer returned by shard_db_query. */
 void shard_db_free_result(char *out);
 
-/* Close the instance and free all resources. */
+/* Stop and join internal maintenance threads, flush/shut down caches and
+   pools, then free the instance. */
 void shard_db_close(ShardDb *db);
 
 /* Log event type constants passed to the shard_db_set_log_handler callback. */
