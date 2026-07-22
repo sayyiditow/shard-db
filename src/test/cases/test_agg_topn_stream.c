@@ -38,7 +38,8 @@ extern int eligible_for_topn_stream(
     const char *group_by_csv,
     const char *order_by_alias,
     int limit,
-    const char *having);
+    const char *having,
+    const char *format);
 
 static int test_topn_heap_basic_desc(void) {
     void *h = topn_heap_new(3, 1 /* desc */);
@@ -161,27 +162,27 @@ static int test_topn_eligible_truth_table(void) {
     spec_a.field[0] = '\0';
     strcpy(spec_a.alias, "n");
     int r = eligible_for_topn_stream(env.db_root, obj_path,
-                                      &spec_a, 1, "name", "n", 20, NULL);
+                                      &spec_a, 1, "name", "n", 20, NULL, NULL);
     ASSERT_EQ_INT(r, 1, "Case A: count + indexed group_by + order_by agg alias + limit → ELIGIBLE");
 
     /* Case B: no limit → NOT ELIGIBLE */
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_a, 1, "name", "n", 0, NULL);
+                                  &spec_a, 1, "name", "n", 0, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case B: no limit (0) → NOT ELIGIBLE");
 
     /* Case C: order_by on group_by field instead of agg alias → NOT ELIGIBLE */
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_a, 1, "name", "name", 20, NULL);
+                                  &spec_a, 1, "name", "name", 20, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case C: order_by on group_by field → NOT ELIGIBLE");
 
     /* Case D: group_by on un-indexed field → NOT ELIGIBLE */
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_a, 1, "score_unindexed", "n", 20, NULL);
+                                  &spec_a, 1, "score_unindexed", "n", 20, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case D: un-indexed group_by → NOT ELIGIBLE");
 
     /* Case E: multi-field group_by → NOT ELIGIBLE in Phase 1 */
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_a, 1, "name,score", "n", 20, NULL);
+                                  &spec_a, 1, "name,score", "n", 20, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case E: multi-field group_by (Phase 1 limit) → NOT ELIGIBLE");
 
     /* Case F: sum on group_by field itself + order_by on sum alias → ELIGIBLE */
@@ -190,12 +191,12 @@ static int test_topn_eligible_truth_table(void) {
     strcpy(spec_f.field, "score");  /* sum on the group_by field itself */
     strcpy(spec_f.alias, "total");
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_f, 1, "score", "total", 10000, NULL);
+                                  &spec_f, 1, "score", "total", 10000, NULL, NULL);
     ASSERT_EQ_INT(r, 1, "Case F: sum on group_by field + limit=max → ELIGIBLE");
 
     /* Case G: limit > 10000 → NOT ELIGIBLE */
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_a, 1, "name", "n", 10001, NULL);
+                                  &spec_a, 1, "name", "n", 10001, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case G: limit > 10000 → NOT ELIGIBLE");
 
     /* Case H: sum on different field → NOT ELIGIBLE in Phase 1 */
@@ -204,8 +205,14 @@ static int test_topn_eligible_truth_table(void) {
     strcpy(spec_h.field, "score_unindexed");  /* NOT the group_by field */
     strcpy(spec_h.alias, "total");
     r = eligible_for_topn_stream(env.db_root, obj_path,
-                                  &spec_h, 1, "name", "total", 10000, NULL);
+                                  &spec_h, 1, "name", "total", 10000, NULL, NULL);
     ASSERT_EQ_INT(r, 0, "Case H: agg on non-group_by field (Phase 1 limit) → NOT ELIGIBLE");
+
+    /* Case I: CSV must take the general aggregate path because the streaming
+       top-N executor only emits JSON. */
+    r = eligible_for_topn_stream(env.db_root, obj_path,
+                                  &spec_a, 1, "name", "n", 20, NULL, "csv");
+    ASSERT_EQ_INT(r, 0, "Case I: format=csv on otherwise-eligible shape → NOT ELIGIBLE");
 
     if (tu_pdb_drop_object(tc, "default", "topn_elig") != 0) return 1;
     return 0;
