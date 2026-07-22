@@ -64,7 +64,12 @@ jobs:
         # defaults to sysconf(_SC_NPROCESSORS_ONLN), which over-subscribes
         # these shared/weak runners and caused real contention-driven
         # request timeouts (see docs/plans/2026-07-15-concurrency-and-leak-fixes.md).
-        run: ./build/bin/shard-db-test run-all --jobs 4
+        # Dropped from 4 to 2: --jobs 4 still over-subscribes a 2-4 vCPU
+        # runner once each worker's own daemon spins up its nproc-sized
+        # thread pools, and produced a contention-driven SIGSEGV in an
+        # unrelated pre-existing test (trigram executor) that would not
+        # reproduce locally even pinned to 2 vCPUs.
+        run: ./build/bin/shard-db-test run-all --jobs 2
 
       - name: Package binary
         # Tag artifact uploads by os+arch so binaries from different
