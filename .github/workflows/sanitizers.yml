@@ -41,7 +41,7 @@ jobs:
       ASAN_OPTIONS: "halt_on_error=0:detect_leaks=1:abort_on_error=0:print_stacktrace=1:log_exe_name=1"
       UBSAN_OPTIONS: "halt_on_error=0:print_stacktrace=1"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build (BUILD_MODE=asan)
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
