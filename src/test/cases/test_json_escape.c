@@ -223,6 +223,39 @@ static int test_json_escape_agg_file_run(void) {
     ASSERT_CONTAINS(resp, "\\\"hi\\\"", "agg top-N: quote escaped");
     free(resp); resp = NULL;
 
+    /* Finding 10 regression: an indexed group_by + order_by + limit CSV
+       request must bypass the JSON-only streaming executor. Use a comma
+       rather than a quote in the fixture value so this test stays scoped to
+       CSV routing, independent of indexed-varchar JSON unescaping. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"agg\",\"object\":\"tcsv\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"category:varchar:64\"],"
+        "\"indexes\":[\"category\"]}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"agg\",\"object\":\"tcsv\","
+        "\"key\":\"k1\",\"value\":{\"category\":\"Widgets, Inc.\"}}",
+        &resp); free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"agg\",\"object\":\"tcsv\","
+        "\"key\":\"k2\",\"value\":{\"category\":\"Plain\"}}",
+        &resp); free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"agg\",\"object\":\"tcsv\","
+        "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
+        "\"group_by\":[\"category\"],\"order_by\":\"n\",\"limit\":10,"
+        "\"format\":\"csv\"}", &resp);
+    ASSERT_TRUE(resp[0] != '[' && resp[0] != '{',
+                "agg top-N + format=csv: response is not JSON");
+    ASSERT_CONTAINS(resp, "category,n", "agg top-N + format=csv: CSV header row present");
+    ASSERT_CONTAINS(resp, "\"Widgets, Inc.\",",
+                    "agg top-N + format=csv: comma value quoted per RFC4180");
+    ASSERT_CONTAINS(resp, "Plain,", "agg top-N + format=csv: plain value present");
+    free(resp); resp = NULL;
+
     /* ── valid_filename rejects embedded quotes ── */
     tc_request(tc,
         "{\"mode\":\"put-file\",\"dir\":\"agg\",\"object\":\"t\","

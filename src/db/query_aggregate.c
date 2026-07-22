@@ -481,13 +481,15 @@ TOPN_ELIG_VIS int eligible_for_topn_stream(
     const char *group_by_csv,
     const char *order_by_alias,
     int limit,
-    const char *having)
+    const char *having,
+    const char *format)
 {
     if (!specs || nspecs <= 0) return 0;
     if (!group_by_csv || !*group_by_csv) return 0;
     if (!order_by_alias || !*order_by_alias) return 0;
     if (limit <= 0 || limit > 10000) return 0;
     if (having && *having) return 0;
+    if (format && strcmp(format, "csv") == 0) return 0;
 
     /* Single group_by field only (Phase 1). */
     if (strchr(group_by_csv, ',')) return 0;
@@ -3660,7 +3662,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         if (gb_csv[0] && order_by && order_by[0] &&
             eligible_for_topn_stream(db_root, object, specs, nspecs,
                                       gb_csv, order_by, limit,
-                                      having_tree ? "1" : having_json)) {
+                                      having_tree ? "1" : having_json,
+                                      format)) {
             QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
             int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
                                           specs, nspecs, gb_csv,
