@@ -120,7 +120,12 @@ static int test_durability_sync_run(void) {
 
     TickTotals totals = {0};
     int all_synced = 0;
-    for (int waited = 0; waited < 2000; waited += 50) {
+    /* 30s budget matches the convention used elsewhere for background-thread
+       tick assertions under CI (see test_auto_vacuum.c) — GitHub-hosted
+       runners are 2-4 vCPU and --jobs 4 contention can delay both the
+       100ms-interval sync tick itself and the log writer thread's flush
+       well past a couple seconds. */
+    for (int waited = 0; waited < 30000; waited += 50) {
         scan_info_logs(logs_dir, &totals);
         if (totals.kf > 0 && totals.seg > 0 && totals.bt > 0 &&
             totals.bm > 0) {
@@ -144,7 +149,7 @@ static int test_durability_sync_run(void) {
                 "bulk mmap mutation completes without index/cache error");
     free(resp); resp = NULL;
     int bulk_synced = 0;
-    for (int waited = 0; waited < 2000; waited += 50) {
+    for (int waited = 0; waited < 30000; waited += 50) {
         scan_info_logs(logs_dir, &totals);
         if (totals.seg > before_bulk.seg && totals.bt > before_bulk.bt) {
             bulk_synced = 1;
