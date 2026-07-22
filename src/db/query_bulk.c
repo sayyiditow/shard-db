@@ -2677,6 +2677,7 @@ typedef struct {
     CriteriaNode  *tree;
     FieldSchema   *fs;
     const char    *value_json;
+    char         **field_vals;  /* shared read-only decoded patch; cmd owns */
     const char   (*idx_fields)[256];
     const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM (NULL = all btree, legacy) */
     int            nidx;
@@ -2891,11 +2892,9 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         w->skipped += w->count; return NULL;
     }
 
-    /* Parse value_json once for the whole worker. */
-    const char *field_names[MAX_FIELDS];
-    char       *field_vals[MAX_FIELDS];
-    for (int fi = 0; fi < w->ts->nfields; fi++) field_names[fi] = w->ts->fields[fi].name;
-    json_get_fields(w->value_json, field_names, w->ts->nfields, field_vals);
+    /* cmd_bulk_update decoded this shared patch exactly once before any
+       worker was dispatched. Workers only read it. */
+    char **field_vals = w->field_vals;
 
     SlotcaskBulkRec *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
     V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
@@ -2903,7 +2902,6 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     if (!batch || !ctxs || !scratch) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
-        for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
         w->skipped += w->count;
         return NULL;
     }
@@ -2949,7 +2947,6 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
 
     free(batch); free(ctxs); free(scratch);
     free(old_arena); free(new_arena);
-    for (int fi = 0; fi < w->ts->nfields; fi++) free(field_vals[fi]);
     return NULL;
 }
 
@@ -3035,7 +3032,24 @@ int cmd_bulk_update(const char *db_root, const char *object,
        bulk-insert pattern. Index updates (btree_insert/btree_delete) are
        serialised internally by bt_cache_lock, so concurrent workers are
        safe. */
-    TypedSchema *ts = load_typed_schema(db_root, object);
+    TypedSchema *ts = fs.ts;
+    const char *value_field_names[MAX_FIELDS];
+    enum FieldType value_field_types[MAX_FIELDS];
+    char *shared_field_vals[MAX_FIELDS] = {0};
+    for (int i = 0; i < ts->nfields; i++) {
+        value_field_names[i] = ts->fields[i].name;
+        value_field_types[i] = ts->fields[i].type;
+    }
+    if (json_get_fields_unescaped(value_json, value_field_names, ts->nfields,
+                                  value_field_types, shared_field_vals) != 0) {
+        for (int i = 0; i < ts->nfields; i++) free(shared_field_vals[i]);
+        OUT("{\"error\":\"malformed JSON escape in one or more field values\"}\n");
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        for (int i = 0; i < matched; i++) free(ctx.keys[i]);
+        free(ctx.keys);
+        free_criteria_tree(tree);
+        return 1;
+    }
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
@@ -3086,6 +3100,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].tree = tree;
         workers[wi].fs = &fs;
         workers[wi].value_json = value_json;
+        workers[wi].field_vals = shared_field_vals;
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
         workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
@@ -3103,6 +3118,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         free(workers[wi].recs);
     }
     free(workers);
+    for (int i = 0; i < ts->nfields; i++) free(shared_field_vals[i]);
 
     LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
@@ -3893,7 +3909,11 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     /* Pre-name the typed fields once so we can reuse the names array per
        record without rebuilding it. */
     const char *field_names[MAX_FIELDS];
-    for (int i = 0; i < ts->nfields; i++) field_names[i] = ts->fields[i].name;
+    enum FieldType field_types[MAX_FIELDS];
+    for (int i = 0; i < ts->nfields; i++) {
+        field_names[i] = ts->fields[i].name;
+        field_types[i] = ts->fields[i].type;
+    }
 
     while (*p) {
         p = json_skip(p);
@@ -3975,10 +3995,24 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             continue;
         }
 
+        /* The key/data pair matched the input shape; malformed field text is
+           reported as skipped below while remaining part of the matched
+           input count. */
+        matched++;
+
         /* Pull out every typed-field name from `data`. Fields not present in
            `data` come back NULL → not touched. */
         char *vals_buf[MAX_FIELDS];
-        json_get_fields(data_str, field_names, ts->nfields, vals_buf);
+        if (json_get_fields_unescaped(data_str, field_names, ts->nfields, field_types, vals_buf) != 0) {
+            /* Each record carries its own patch, so a malformed escape skips
+               only this record rather than aborting otherwise-valid peers. */
+            for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
+            skipped++;
+            free(key);
+            if (obj_heap) free(obj_str);
+            p = obj_end;
+            continue;
+        }
 
         int n_touched = 0;
         for (int i = 0; i < ts->nfields; i++) if (vals_buf[i]) n_touched++;
@@ -4007,6 +4041,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 free(records);
                 records = NULL;
                 rec_count = 0;
+                matched--;
                 free(key);
                 for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
                 if (obj_heap) free(obj_str);
@@ -4039,8 +4074,6 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             r->field_indices = NULL;
             r->field_values = NULL;
         }
-        matched++;
-
         if (obj_heap) free(obj_str);
         p = obj_end;
     }

@@ -257,6 +257,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_btcache_evict_race.c \
     src/test/cases/test_btree_value_hash_sort.c \
     src/test/cases/test_json_escape.c \
+    src/test/cases/test_index_varchar_unescape.c \
     src/test/cases/test_timestamp.c \
     src/test/cases/test_datetimems.c \
     src/test/cases/test_bitmap_index.c \

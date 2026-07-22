@@ -8,6 +8,25 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ### Fixes
 
+- **JSON-escaped varchar values are decoded consistently before storage, indexing,
+  and criteria comparison** — partial update and bulk-update paths no longer store
+  literal escape bytes or build mismatched index keys. Valid values ending in a
+  backslash are parsed correctly. Malformed JSON escapes and decoded `\u0000` are
+  now rejected for varchar inserts/updates instead of being accepted as ambiguous
+  C-string data; per-record bulk-update JSON skips only the malformed record and
+  reports it in `skipped`.
+- **Cursor pagination and multi-get CSV export now decode JSON-escaped varchar
+  values too** — resuming a cursor whose `order_by` value contained an escaped
+  character (e.g. a quote) no longer risks skipping the next record; `get` with
+  `"keys"` and `"format":"csv"` no longer leaks raw JSON escape bytes into a
+  CSV cell for a varchar value containing a quote.
+- **Fixed a regression from the above: `regex`/`not_regex` criteria values
+  were being run through the new JSON-unescape step**, but that value is raw
+  POSIX-regex source passed to `regcomp`/`regexec`, not JSON string content —
+  callers write regex metachars (`\.`, `\+`, ...) with a single literal
+  backslash, which isn't a valid JSON escape. This either corrupted the
+  pattern or rejected the whole criterion as malformed. `regex`/`not_regex`
+  values are now excluded from unescaping, same as `in`/`not_in`.
 - **`get` + `fields` returned "Not found" on v2 objects** — the `get`
   dispatch branch for single-key requests with a `fields` projection still
   read through the v1 ucache shard-file layout (`build_shard_path`,

@@ -128,11 +128,19 @@ const char *json_skip(const char *p) {
     return p;
 }
 
+const char *json_raw_string_end(const char *p) {
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p += 2;
+        else p++;
+    }
+    return p;
+}
+
 const char *json_skip_value(const char *p) {
     p = json_skip(p);
     if (*p == '"') {
         p++;
-        while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+        p = json_raw_string_end(p);
         if (*p == '"') p++;
         return p;
     }
@@ -146,7 +154,7 @@ const char *json_skip_value(const char *p) {
         while (*p && depth > 0) {
             if (*p == '{') depth++;
             else if (*p == '}') depth--;
-            else if (*p == '"') { p++; while (*p && !(*p == '"' && *(p-1) != '\\')) p++; }
+            else if (*p == '"') { p++; p = json_raw_string_end(p); }
             if (!*p) break;
             p++;
         }
@@ -157,7 +165,7 @@ const char *json_skip_value(const char *p) {
         while (*p && depth > 0) {
             if (*p == '[') depth++;
             else if (*p == ']') depth--;
-            else if (*p == '"') { p++; while (*p && !(*p == '"' && *(p-1) != '\\')) p++; }
+            else if (*p == '"') { p++; p = json_raw_string_end(p); }
             if (!*p) break;
             p++;
         }
@@ -217,6 +225,26 @@ int json_get_fields(const char *json, const char **keys, int nkeys, char **out_v
         p = json_skip_value(p);
     }
     return found;
+}
+
+int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
+                              const enum FieldType *field_types, char **out) {
+    json_get_fields(json, keys, nkeys, out);
+    int rc = 0;
+    for (int i = 0; i < nkeys; i++) {
+        if (!out[i]) continue;
+        if (field_types[i] != FT_VARCHAR) continue;
+        char *unesc = NULL; size_t ulen = 0;
+        if (json_unescape_cstring(out[i], strlen(out[i]), &unesc, &ulen) != 0) {
+            free(out[i]);
+            out[i] = NULL;
+            rc = -1;
+            continue;
+        }
+        free(out[i]);
+        out[i] = unesc;
+    }
+    return rc;
 }
 
 /* ========== Base64 (RFC 4648) ========== */
@@ -485,6 +513,18 @@ int json_unescape_string(const char *in, size_t in_len,
     out[op] = '\0';
     *out_buf = out;
     *out_len = op;
+    return 0;
+}
+
+int json_unescape_cstring(const char *in, size_t in_len,
+                          char **out_buf, size_t *out_len) {
+    if (json_unescape_string(in, in_len, out_buf, out_len) != 0) return -1;
+    if (strlen(*out_buf) != *out_len) {
+        free(*out_buf);
+        *out_buf = NULL;
+        *out_len = 0;
+        return -1;
+    }
     return 0;
 }
 
