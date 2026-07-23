@@ -9,6 +9,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,7 +113,7 @@ static void *lock_order_race_writer(void *arg) {
     TestClientCfg cfg = { .port = race->port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) {
-        __atomic_fetch_add(&race->failures, 1, __ATOMIC_RELAXED);
+        atomic_fetch_add_explicit(&race->failures, 1, memory_order_relaxed);
         return NULL;
     }
 
@@ -129,7 +130,7 @@ static void *lock_order_race_writer(void *arg) {
             kind);
         if (tc_request(tc, request, &resp) != 0 ||
             !resp || SAFE_STRSTR(resp, "\"error\"") != NULL) {
-            __atomic_fetch_add(&race->failures, 1, __ATOMIC_RELAXED);
+            atomic_fetch_add_explicit(&race->failures, 1, memory_order_relaxed);
         }
         free(resp);
     }
@@ -142,7 +143,7 @@ static void *lock_order_race_reader(void *arg) {
     TestClientCfg cfg = { .port = race->port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) {
-        __atomic_fetch_add(&race->failures, 1, __ATOMIC_RELAXED);
+        atomic_fetch_add_explicit(&race->failures, 1, memory_order_relaxed);
         return NULL;
     }
 
@@ -150,7 +151,7 @@ static void *lock_order_race_reader(void *arg) {
         char *resp = NULL;
         int rc = tc_request(tc, race->read_request, &resp);
         if (rc != 0 || !resp || SAFE_STRSTR(resp, "\"error\"") != NULL) {
-            __atomic_fetch_add(&race->failures, 1, __ATOMIC_RELAXED);
+            atomic_fetch_add_explicit(&race->failures, 1, memory_order_relaxed);
         }
         free(resp);
     }
@@ -179,9 +180,9 @@ static int lock_order_fixture_race(LockOrderFixture *f,
     }
     pthread_join(writer, NULL);
     pthread_join(reader, NULL);
-    ASSERT_EQ_INT(__atomic_load_n(&race.failures, __ATOMIC_RELAXED), 0,
+    ASSERT_EQ_INT(atomic_load_explicit(&race.failures, memory_order_relaxed), 0,
                   "concurrent bitmap writer and reader requests succeed");
-    return __atomic_load_n(&race.failures, __ATOMIC_RELAXED) == 0 ? 0 : -1;
+    return atomic_load_explicit(&race.failures, memory_order_relaxed) == 0 ? 0 : -1;
 }
 
 static int test_bitmap_kfcache_lock_order_eq(void) {
