@@ -167,7 +167,7 @@ static int test_slotcask_v2_concurrent_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"o\","

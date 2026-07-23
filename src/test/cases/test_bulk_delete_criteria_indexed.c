@@ -48,7 +48,7 @@ static int test_bulk_delete_criteria_indexed_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"bdc_idx_dir\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"bdc_idx_dir\"}", &resp);
     free(resp); resp = NULL;
 
     /* Create object with splits=8, fields status:varchar:16, score:int */

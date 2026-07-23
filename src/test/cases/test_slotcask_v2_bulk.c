@@ -55,7 +55,7 @@ static int test_slotcask_v2_bulk_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"bulk2\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"bulk2\"}", &resp);
     free(resp); resp = NULL;
 
     /* v2 object */

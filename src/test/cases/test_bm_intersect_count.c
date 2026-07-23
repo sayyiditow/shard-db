@@ -28,7 +28,7 @@ static TestClient *cm_setup(TestEnv *env, const char *obj,
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(env); return NULL; }
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}",
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}",
                &resp); free(resp); resp = NULL;
     char co[1024];
     snprintf(co, sizeof(co),

@@ -50,7 +50,7 @@ static int test_shard_stats_hint_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Object 1: under-split. splits=8, fabricate shard 0's live count to
        2,000,000 (falls in the 1M-10M band -> target=16 > 8). Hint must

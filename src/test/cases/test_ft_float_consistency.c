@@ -128,7 +128,7 @@ static int test_ft_float_consistency_run(void)
     char *resp = NULL;
 
     /* Setup ---------------------------------------------------------------- */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     /* Two float fields: price (indexed btree), price2 (NOT indexed = scan). */

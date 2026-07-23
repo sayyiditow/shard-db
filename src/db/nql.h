@@ -7,7 +7,9 @@ struct JoinSpec;  /* defined in query_internal.h */
 /* ── Token types ────────────────────────────────────────────────── */
 typedef enum {
     TOK_IDENT,      /* field names and keywords (and/or/in/not/between…) */
-    TOK_STRING,     /* 'value' — content stored without surrounding quotes */
+    TOK_STRING,     /* 'value' — content stored without surrounding quotes;
+                        '' inside a literal decodes to one literal '; an
+                        unterminated literal is a hard parse error (TOK_ERR) */
     TOK_NUMBER,     /* 123, -45, 3.14                                      */
     TOK_BOOL,       /* true / false                                        */
     TOK_SYM_EQ,    /* =                                                   */
@@ -75,6 +77,13 @@ typedef struct {
    Returns NULL on error and writes into err_out (may be NULL).
    On success the caller owns the tree; free with free_criteria_tree(). */
 CriteriaNode *nql_parse_filter(const char *src, char *err_out, size_t err_sz);
+
+/* Appends one argv element to an NQL wire command. Returns 0 on success.
+   Returns -1 without modifying dst if the complete encoded argument plus
+   separator and terminating NUL will not fit, if dst is not NUL-terminated
+   within dst_sz, or if arg contains CR/LF (which cannot occur inside the
+   newline-delimited wire protocol). Empty args are encoded as "". */
+int nql_append_arg(char *dst, size_t dst_sz, const char *arg);
 
 /* Parse a full NQL command line — "find dir obj [filter] [--flags…]".
    Returns 0 on success, -1 on error (message in out->err). */

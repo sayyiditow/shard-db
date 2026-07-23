@@ -24,7 +24,7 @@ static int test_composite_prefix_selected(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
 
     /* type: varchar bitmap (low cardinality); time: long btree;
@@ -72,7 +72,7 @@ static int test_composite_prefix_results_correct(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d2\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d2\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d2\",\"object\":\"st\","
@@ -136,7 +136,7 @@ static int test_exact_composite_selected(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d3\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d3\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d3\",\"object\":\"pexact\","
         "\"splits\":8,\"max_key\":16,"
@@ -167,7 +167,7 @@ static int test_exact_composite_results(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d4\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d4\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d4\",\"object\":\"pexactr\","
         "\"splits\":8,\"max_key\":16,"
@@ -207,7 +207,7 @@ static int test_exact_composite_no_composite(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d5\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d5\"}", &resp); free(resp); resp=NULL;
     /* Only single-field indexes — no by+time composite. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d5\",\"object\":\"pnc\","

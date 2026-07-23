@@ -61,7 +61,7 @@ static int test_coverity_bitmap_nvalues_corruption_run(void) {
     if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"bmobj\","

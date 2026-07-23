@@ -133,7 +133,7 @@ static int test_slotcask_v2_parity_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"" DIR "\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"" DIR "\"}", &resp);
     free(resp); resp = NULL;
 
     create_obj(tc, V1, 0);

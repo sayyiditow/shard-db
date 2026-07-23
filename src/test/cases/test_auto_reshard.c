@@ -186,7 +186,7 @@ static int test_auto_reshard_run(void) {
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Object 1: under-split. splits=8, fabricate shard 0's live count to
        2,000,000 (falls in the 1M-10M band -> target=16 > 8). */
@@ -493,7 +493,7 @@ static int test_auto_reshard_throttle_run(void) {
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Two objects, both under-split (splits=8, fabricated to 2,000,000 ->
        target=16). readdir order across two objects in the same dir isn't

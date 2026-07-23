@@ -33,7 +33,7 @@ static int test_selectivity_guard(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"g\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"g\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"g\",\"object\":\"sg\","
         "\"splits\":8,\"max_key\":16,"

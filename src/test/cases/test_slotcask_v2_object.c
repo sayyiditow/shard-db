@@ -57,7 +57,7 @@ static int test_slotcask_v2_object_run(void) {
 
     char *resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"v2tenant\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"v2tenant\"}", &resp);
     free(resp); resp = NULL;
 
     /* --- v2 create --- */

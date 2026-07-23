@@ -58,7 +58,7 @@ static int test_slotcask_v2_schema_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"sch2\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"sch2\"}", &resp);
     free(resp); resp = NULL;
 
     /* ===== no-arg vacuum on v2 → no-op ===== */

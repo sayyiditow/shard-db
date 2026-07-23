@@ -39,7 +39,7 @@ static int test_or_keyset_cap_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     /* Mix of typed indexed fields:
        - age (int, ~10 distinct) — eq estimate live/50 hits
        - flag (bool, 2 distinct)  — eq estimate live/2 hits

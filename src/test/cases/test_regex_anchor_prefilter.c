@@ -37,7 +37,7 @@ static int test_regex_anchor_prefilter_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     /* email indexed (regex on indexed varchar exercises btree-leaf path),
        bio non-indexed (regex on full record scan path). */
     tc_request(tc,

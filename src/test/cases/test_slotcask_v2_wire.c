@@ -25,7 +25,7 @@ static int test_slotcask_v2_wire_run(void) {
     char *resp = NULL;
 
     /* ===== Setup ===== */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"sctest\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"sctest\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,

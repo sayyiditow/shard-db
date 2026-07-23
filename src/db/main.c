@@ -1,5 +1,6 @@
 #include "types.h"
 #include "slotcask.h"
+#include "nql.h"
 
 /* ========== MAIN ========== */
 
@@ -367,23 +368,20 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* Build NQL string: "<subcmd> <dir> <obj> '<filter>' --explain [remaining flags]" */
-        char nql[8192];
-        snprintf(nql, sizeof(nql), "%s %s %s", subcmd, dir, object);
-        if (filter && filter[0]) {
-            strncat(nql, " '", sizeof(nql) - strlen(nql) - 1);
-            strncat(nql, filter, sizeof(nql) - strlen(nql) - 1);
-            strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
+        /* Build NQL from already-split argv without allowing a partial argument. */
+        char nql[8192] = {0};
+        if (nql_append_arg(nql, sizeof nql, subcmd) != 0 ||
+            nql_append_arg(nql, sizeof nql, dir) != 0 ||
+            nql_append_arg(nql, sizeof nql, object) != 0 ||
+            (filter && filter[0] && nql_append_arg(nql, sizeof nql, filter) != 0) ||
+            nql_append_arg(nql, sizeof nql, "--explain") != 0) {
+            fprintf(stderr, "Error: NQL command is too long or contains a line break\n");
+            return 1;
         }
-        strncat(nql, " --explain", sizeof(nql) - strlen(nql) - 1);
         for (int i = 6; i < argc; i++) {
-            strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
-            if (strchr(argv[i], ' ')) {
-                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
-                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-            } else {
-                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+            if (nql_append_arg(nql, sizeof nql, argv[i]) != 0) {
+                fprintf(stderr, "Error: NQL command is too long or contains a line break\n");
+                return 1;
             }
         }
         return cmd_query_json(port, nql);
@@ -436,13 +434,9 @@ int main(int argc, char *argv[]) {
         }
         char nql[8192] = {0};
         for (int i = 1; i < argc; i++) {
-            if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
-            if (strchr(argv[i], ' ')) {
-                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
-                strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-            } else {
-                strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+            if (nql_append_arg(nql, sizeof nql, argv[i]) != 0) {
+                fprintf(stderr, "Error: NQL command is too long or contains a line break\n");
+                return 1;
             }
         }
         return cmd_query_json(port, nql);
@@ -460,13 +454,9 @@ int main(int argc, char *argv[]) {
         if (argc >= 5 && argv[4][0] && argv[4][0] != '[' && argv[4][0] != '{') {
             char nql[8192] = {0};
             for (int i = 1; i < argc; i++) {
-                if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
-                if (strchr(argv[i], ' ')) {
-                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
-                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                } else {
-                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                if (nql_append_arg(nql, sizeof nql, argv[i]) != 0) {
+                    fprintf(stderr, "Error: NQL command is too long or contains a line break\n");
+                    return 1;
                 }
             }
             return cmd_query_json(port, nql);
@@ -502,13 +492,9 @@ int main(int argc, char *argv[]) {
         if (argv[4][0] != '[') {
             char nql[8192] = {0};
             for (int i = 1; i < argc; i++) {
-                if (i > 1) strncat(nql, " ", sizeof(nql) - strlen(nql) - 1);
-                if (strchr(argv[i], ' ')) {
-                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
-                    strncat(nql, "'", sizeof(nql) - strlen(nql) - 1);
-                } else {
-                    strncat(nql, argv[i], sizeof(nql) - strlen(nql) - 1);
+                if (nql_append_arg(nql, sizeof nql, argv[i]) != 0) {
+                    fprintf(stderr, "Error: NQL command is too long or contains a line break\n");
+                    return 1;
                 }
             }
             return cmd_query_json(port, nql);

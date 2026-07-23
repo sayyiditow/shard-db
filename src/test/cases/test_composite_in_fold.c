@@ -51,7 +51,7 @@ static TestClient *in_fold_setup(TestEnv *env) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(env); return NULL; }
 
-    char *r = do_req(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}"); free(r);
+    char *r = do_req(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}"); free(r);
     r = do_req(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"cm_infold\","
         "\"splits\":8,\"max_key\":12,"

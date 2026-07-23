@@ -123,7 +123,7 @@ static int test_startup_validator_run(void) {
     if (!tc) { kill(pid, SIGKILL); waitpid(pid, NULL, 0);
                tu_run_cmd("rm -rf %s", base); return 1; }
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"v\","
         "\"splits\":16,\"max_key\":16,\"fields\":[\"n:int\"]}", &resp); free(resp); resp = NULL;
