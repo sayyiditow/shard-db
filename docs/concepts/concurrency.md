@@ -7,12 +7,29 @@ shard-db is multi-threaded: a worker thread pool services TCP connections, scan 
 | Scope | Lock type | Purpose |
 |---|---|---|
 | Per kfcache entry (one kf shard mmap) | rwlock | Readers share; a writer takes exclusive. Commits go through here. |
+| Per bitmap-cache entry (one bitmap shard mmap) | rwlock | Readers share; bitmap mutation and rebuild take exclusive. When both kfcache and bitmap are needed, kfcache is acquired first. |
 | Per segcache entry (one seg file mmap) | rwlock | Routine record writes take rdlock (each owns a unique offset); eviction/recovery takes wrlock. |
 | Per bt_cache entry (one btree mmap) | rwlock | Same model, separate cache. One entry per per-shard idx file. |
 | Per stream (one append lane) | mutex + try-lock pool | Tail reservation serialised per stream; free-pool consumers use try-lock. |
 | Per object (logical) | rwlock ("objlock") | Normal ops take read; schema mutations take write. |
 | Global maps (schemas, indexes, dirs, slotcask registry) | mutex | Short-held, protects cache-lookup structures. |
 | Process wide | atomic counters | `in_flight_writes`, `active_threads`, `server_running` — no locks, just atomics. |
+
+### Cross-cache rule: kfcache before bitmap cache
+
+Bitmap bit positions are kf slot numbers, so any operation that resolves
+bitmap bits through the corresponding kf shard may need both cache entries at
+once. Those paths always acquire the kfcache entry first and the bitmap-cache
+entry second. That acquisition order is mandatory; release operations do not
+block and therefore do not add lock-order edges. CRUD already has this shape:
+the kfcache write lock is the commit lock and bitmap maintenance runs from the
+pre-commit hook while it is held. Query emission, KeySet construction, and
+bitmap rebuild use the same acquisition order.
+
+Opening the bitmap first is forbidden even for read/read nesting. A concurrent
+CRUD writer can hold the kfcache wrlock while waiting for the bitmap wrlock; a
+reader holding the bitmap rdlock while waiting for the kfcache rdlock would
+complete an AB-BA deadlock.
 
 ## Per-kfcache-entry rwlock — the commit lock
 

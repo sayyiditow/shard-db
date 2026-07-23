@@ -5787,18 +5787,16 @@ int slotcask_walk_one_shard(SlotcaskDb *db, int kf_shard_id,
    live entry with the slot index alongside the usual (hash, key, value).
    Used by the bitmap-index reindex path. Single-threaded — no fan-out;
    reindex callers typically already parallel_for over shards externally. */
-int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
-                                   SlotcaskScanSlotCb cb, void *ctx) {
-    if (!db || !cb || kf_shard_id < 0 || kf_shard_id >= db->num_shards)
+int slotcask_walk_one_shard_slots_locked(SlotcaskDb *db, int kf_shard_id,
+                                          const SlotcaskKfHandle *kh,
+                                          SlotcaskScanSlotCb cb, void *ctx) {
+    if (!db || !kh || !kh->map || !cb ||
+        kf_shard_id < 0 || kf_shard_id >= db->num_shards)
         return -1;
-    char kf_path[PATH_MAX];
-    kf_path_for(kf_path, db->data_dir, kf_shard_id);
-    SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0) return -1;
 
     int rc = 0;
-    for (size_t s = 0; s < kh.capacity; s++) {
-        SlotcaskKfEntry *e = &kh.map[s];
+    for (size_t s = 0; s < kh->capacity; s++) {
+        SlotcaskKfEntry *e = &kh->map[s];
         if (e->flag != 1) continue;
         /* read_record_value verifies the key matches; for reindex we
            trust the kf entry's pointer (kf is authoritative), so pass
@@ -5832,7 +5830,6 @@ int slotcask_walk_one_shard_slots(SlotcaskDb *db, int kf_shard_id,
         if (crc != 0) { rc = crc; break; }
     }
 
-    kfcache_release(&kh);
     return rc;
 }
 

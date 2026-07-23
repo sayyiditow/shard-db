@@ -1238,9 +1238,10 @@ int cmd_add_index(const char *db_root, const char *object,
 }
 
 /* Bitmap reindex pass — rebuilds every .bm shard for one field by
-   walking live records in their kf shards via slotcask_walk_one_shard_slots,
-   encoding the field value (matching the encoding bitmap_update uses on
-   the CRUD path), and bm_set'ing the bit at the record's kf slot. */
+   walking live records in its already-locked kf shard via
+   slotcask_walk_one_shard_slots_locked, encoding the field value
+   (matching the encoding bitmap_update uses on the CRUD path), and
+   bm_set'ing the bit at the record's kf slot. */
 typedef struct {
     BitmapShard *bm;
     int          field_index;     /* typed schema field index */
@@ -1810,9 +1811,9 @@ int build_btree_streaming(const char *db_root, const char *object,
 }
 
 /* Per-kf-shard worker for parallel bitmap rebuild. Each worker handles
-   one (kf_shard, .bm) pair — opens its own .bm writer, walks the
-   matching kf shard, and bm_sets per record. Files don't overlap, so
-   no locking; mmap absorbs the writes directly. */
+   one (kf_shard, .bm) pair: acquire the kf reader first, then open its
+   .bm writer and walk the already-locked kf shard. Distinct workers use
+   distinct files; the cache-entry locks protect mapping lifetime. */
 typedef struct {
     char         path[PATH_MAX];
     int          kf_shard;
@@ -1824,15 +1825,31 @@ typedef struct {
 
 static void *bm_shard_walk_worker(void *arg) {
     BmShardWalkArg *a = (BmShardWalkArg *)arg;
+
+    char kf_path[PATH_MAX];
+    slotcask_kf_path(kf_path, sizeof(kf_path),
+                     a->sdb->data_dir, a->kf_shard);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path,
+                        a->sdb->slots_per_shard, 0) != 0) {
+        LOG_ERROR(LOG_SUB_BITMAP,
+                  "bm_shard_walk_worker: kfcache_acquire failed for %s",
+                  kf_path);
+        return NULL;
+    }
+
     BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 0, 0, 0,
                               1 /* writer: reindex bm_set's */);
     if (!bm) {
         LOG_ERROR(LOG_SUB_BITMAP, "bm_shard_walk_worker: bm_open failed for %s (kf_shard=%d); bitmap left stale for this shard", a->path, a->kf_shard);
+        kfcache_release(&kh);
         return NULL;
     }
     BmRebuildCtx c = { bm, a->fi, a->ts };
-    slotcask_walk_one_shard_slots(a->sdb, a->kf_shard, bm_rebuild_cb, &c);
+    slotcask_walk_one_shard_slots_locked(
+        a->sdb, a->kf_shard, &kh, bm_rebuild_cb, &c);
     bm_close(bm);
+    kfcache_release(&kh);
     return NULL;
 }
 

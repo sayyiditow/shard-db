@@ -261,6 +261,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_timestamp.c \
     src/test/cases/test_datetimems.c \
     src/test/cases/test_bitmap_index.c \
+    src/test/cases/test_bitmap_kfcache_lock_order.c \
     src/test/cases/test_bm_intersect_count.c \
     src/test/cases/test_enum.c \
     src/test/cases/test_ipv4.c \
