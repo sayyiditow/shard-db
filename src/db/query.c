@@ -2628,20 +2628,25 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
                                           const TypedField *tf,
                                           bt_result_cb cb, void *ctx,
                                           SlotcaskDb *sdb) {
-    char bp[1024];
-    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) return 0;
-
-    BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
-    bm_iter_values(bm, bm_dict_match_cb, &m);
-    if (m.n_match == 0) { bm_close(bm); return 0; }
-
     char kfp[PATH_MAX];
     slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
+        return 0;
+
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) {
+        kfcache_release(&kh);
+        return 0;
+    }
+
+    BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+    bm_iter_values(bm, bm_dict_match_cb, &m);
+    if (m.n_match == 0) {
         bm_close(bm);
+        kfcache_release(&kh);
         return 0;
     }
 
@@ -2654,8 +2659,8 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
     }
     idx_count_cb_flush_thread();
 
-    kfcache_release(&kh);
     bm_close(bm);
+    kfcache_release(&kh);
     return stop;
 }
 
@@ -2921,16 +2926,17 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
                                  bt_result_cb cb, void *ctx, SlotcaskDb *sdb) {
-    char bp[1024];
-    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) return 0;
-
     char kfp[PATH_MAX];
     slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
-        bm_close(bm);
+    if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
+        return 0;
+
+    char bp[1024];
+    bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
+    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+    if (!bm) {
+        kfcache_release(&kh);
         return 0;
     }
 
@@ -2939,8 +2945,8 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
 
     idx_count_cb_flush_thread();
 
-    kfcache_release(&kh);
     bm_close(bm);
+    kfcache_release(&kh);
     return ec.stop;
 }
 
@@ -3372,16 +3378,17 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
             keyset_free(ks); free(vals); free(vlens); return NULL;
         }
 
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
-            bm_close(bm);
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
+            continue;
+
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) {
+            kfcache_release(&kh);
             continue;
         }
 
@@ -3390,8 +3397,8 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
             bm_walk(bm, vals[i], vlens[i], bm_collect_to_keyset_cb, &c);
         }
 
-        kfcache_release(&kh);
         bm_close(bm);
+        kfcache_release(&kh);
     }
     free(vals); free(vlens);
     if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
@@ -3459,16 +3466,17 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
 
     for (int s = 0; s < splits; s++) {
         if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
-        char bp[1024];
-        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
-
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
-            bm_close(bm);
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
+            continue;
+
+        char bp[1024];
+        bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
+        if (!bm) {
+            kfcache_release(&kh);
             continue;
         }
 
@@ -3476,8 +3484,8 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
         BmComplementCtx cc = { bm, tvals, tvlens, nt, &c };
         bm_iter_values(bm, bm_complement_value_cb, &cc);
 
-        kfcache_release(&kh);
         bm_close(bm);
+        kfcache_release(&kh);
     }
     if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
     return ks;

@@ -137,13 +137,22 @@ int cmd_estimate_index(const char *db_root, const char *object,
     }
 
     /* Walk shards in order, accumulating up to TG_ESTIMATE_SAMPLE
-       records. Stops early once the cap is hit. */
+       records. Stops early once the cap is hit. Each shard's kf handle is
+       acquired locally: this sampler never touches a bitmap, so there is
+       no cross-cache order to establish, only the walker's now-required
+       pre-acquired handle. */
     TgEstimateCtx c = {
         .field_index = fi, .ts = ts,
         .sampled = 0, .distinct_sum = 0, .max_sample = TG_ESTIMATE_SAMPLE,
     };
     for (int s = 0; s < sch.splits && c.sampled < c.max_sample; s++) {
-        slotcask_walk_one_shard_slots(sdb, s, tg_estimate_cb, &c);
+        char kf_path[PATH_MAX];
+        slotcask_kf_path(kf_path, sizeof(kf_path), sdb->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, sdb->slots_per_shard, 0) != 0)
+            continue;
+        slotcask_walk_one_shard_slots_locked(sdb, s, &kh, tg_estimate_cb, &c);
+        kfcache_release(&kh);
     }
 
     double avg_distinct = c.sampled > 0
