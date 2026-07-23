@@ -117,7 +117,7 @@ static int t_auto_update_carryover(TestClient *tc) {
 static int t_smart_reindex(TestClient *tc) {
     char *resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"polish\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"polish\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -235,7 +235,7 @@ static int test_edit_field_polish_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     t_default_carryover(tc);

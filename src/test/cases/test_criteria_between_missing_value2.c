@@ -26,7 +26,7 @@ static int test_criteria_between_missing_value2_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"btw_val_t\","
         "\"fields\":[\"age:int\",\"name:varchar:32\"],\"indexes\":[],\"splits\":8}",

@@ -19,6 +19,37 @@ static void skip_ws(NqlLexer *l) {
         l->pos++;
 }
 
+/* Reads a quoted literal delimited by `delim` (either '\'' or '"'),
+   starting just after the opening delimiter at *pp, decoding the
+   SQL-style doubled-delimiter escape (delim,delim -> one literal delim).
+   Writes the decoded content into out, always NUL-terminating whatever was
+   decoded so far, and advances *pp past the closing delimiter or to the
+   terminating NUL. Returns 0 for a genuine closing delimiter, -1 for an
+   unterminated literal or insufficient output capacity. */
+static int nql_read_quoted(const char **pp, char *out, size_t out_sz, char delim) {
+    const char *p = *pp;
+    size_t o = 0;
+    int ok = 0;
+    while (*p) {
+        if (*p == delim) {
+            if (p[1] == delim) {
+                if (o + 1 >= out_sz) break;
+                out[o++] = delim;
+                p += 2;
+                continue;
+            }
+            p++;
+            ok = 1;
+            break;
+        }
+        if (o + 1 >= out_sz) break;
+        out[o++] = *p++;
+    }
+    out[o] = '\0';
+    *pp = p;
+    return ok ? 0 : -1;
+}
+
 static void lex_scan(NqlLexer *l) {
     skip_ws(l);
     NqlToken *t = &l->cur;
@@ -27,14 +58,19 @@ static void lex_scan(NqlLexer *l) {
 
     if (c == '\0') { t->type = TOK_EOF; return; }
 
-    /* Single-quoted string: content stored without quotes */
+    /* Single-quoted string: content stored without quotes. A doubled quote
+       ('') decodes to one literal ' -- see nql_read_quoted. An unterminated
+       literal is a hard parse error (TOK_ERR). */
     if (c == '\'') {
         l->pos++;
-        int i = 0;
-        while (l->src[l->pos] && l->src[l->pos] != '\'' && i < (int)sizeof(t->text)-1)
-            t->text[i++] = l->src[l->pos++];
-        if (l->src[l->pos] == '\'') l->pos++;
-        t->text[i] = '\0';
+        const char *p = &l->src[l->pos];
+        if (nql_read_quoted(&p, t->text, sizeof t->text, '\'') != 0) {
+            snprintf(l->err, sizeof l->err, "unterminated string literal");
+            t->type = TOK_ERR;
+            l->pos = (int)(p - l->src);
+            return;
+        }
+        l->pos = (int)(p - l->src);
         t->type = TOK_STRING;
         return;
     }
@@ -356,7 +392,7 @@ static int parse_nql_aggs(const char *src, NqlAggSpec **out) {
     return n;
 }
 
-/* ── Command tokeniser (whitespace-split, respects single quotes) ── */
+/* ── Command tokeniser (whitespace-split, respects quoted arguments) ── */
 
 static int cmd_split(const char *src, char *buf, size_t bufsz,
                      char **argv, int maxargs) {
@@ -365,10 +401,14 @@ static int cmd_split(const char *src, char *buf, size_t bufsz,
     while (*p && n < maxargs) {
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
-        if (*p == '\'') {
-            p++; argv[n++] = p;
-            while (*p && *p != '\'') p++;
-            if (*p) *p++ = '\0';
+        if (*p == '\'' || *p == '"') {
+            char delim = *p;
+            p++;
+            char *start = p;
+            const char *cursor = p;
+            nql_read_quoted(&cursor, start, (size_t)(buf + bufsz - start), delim);
+            p = (char *)cursor;
+            argv[n++] = start;
         } else {
             argv[n++] = p;
             while (*p && !isspace((unsigned char)*p)) p++;
@@ -376,6 +416,42 @@ static int cmd_split(const char *src, char *buf, size_t bufsz,
         }
     }
     return n;
+}
+
+int nql_append_arg(char *dst, size_t dst_sz, const char *arg) {
+    if (!dst || !arg || dst_sz == 0) return -1;
+    const char *dst_end = memchr(dst, '\0', dst_sz);
+    if (!dst_end) return -1;
+    size_t len = (size_t)(dst_end - dst);
+
+    int quoted = (*arg == '\0');
+    for (const unsigned char *s = (const unsigned char *)arg; *s; s++) {
+        if (*s == '\r' || *s == '\n') return -1;
+        if (isspace(*s) || *s == '"') quoted = 1;
+    }
+
+    size_t remaining = dst_sz - len - 1; /* excludes the existing NUL */
+    size_t needed = len > 0 ? 1 : 0;     /* separator */
+    if (quoted) {
+        if (needed > remaining || 2 > remaining - needed) return -1;
+        needed += 2;                     /* opening + closing wrapper */
+    }
+    for (const char *s = arg; *s; s++) {
+        size_t add = (quoted && *s == '"') ? 2 : 1;
+        if (needed > remaining || add > remaining - needed) return -1;
+        needed += add;
+    }
+
+    char *w = dst + len;
+    if (len > 0) *w++ = ' ';
+    if (quoted) *w++ = '"';
+    for (const char *s = arg; *s; s++) {
+        if (quoted && *s == '"') *w++ = '"';
+        *w++ = *s;
+    }
+    if (quoted) *w++ = '"';
+    *w = '\0';
+    return 0;
 }
 
 /* Normalize an order-direction token to canonical lowercase "asc"/"desc"

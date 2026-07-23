@@ -36,7 +36,7 @@ static int test_bulk_update_json_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"budj_t\","
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:32\"],"

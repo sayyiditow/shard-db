@@ -103,7 +103,7 @@ static int test_nql_join_parse_bad_syntax(void) {
 
 static void setup_join_fixture(TestClient *tc) {
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"nj_cust\","
         "\"splits\":16,\"max_key\":16,"

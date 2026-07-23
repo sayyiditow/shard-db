@@ -39,7 +39,7 @@ static int test_regex_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rxt\","
         "\"fields\":[\"email:varchar:64\",\"phone:varchar:32\"]}", &resp);

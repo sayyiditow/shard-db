@@ -109,7 +109,7 @@ static int test_op_caps_planner_integration(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"o\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"o\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"o\",\"object\":\"ob\","
         "\"splits\":8,\"max_key\":16,"

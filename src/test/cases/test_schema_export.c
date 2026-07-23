@@ -46,8 +46,8 @@ static int test_schema_export_run(void) {
 
     char *resp = NULL;
     /* Two tenants. */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"migtest\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"migtest\"}", &resp); free(resp); resp = NULL;
 
     /* Three objects across two tenants, mixing types. */
     tc_request(tc,

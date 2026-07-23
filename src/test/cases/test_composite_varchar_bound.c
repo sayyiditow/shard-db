@@ -26,7 +26,7 @@ static int test_composite_varchar_bound_verify(void) {
     if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg); ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"v\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"v\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"v\",\"object\":\"ob\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"name:varchar:16\",\"t:long\"],"

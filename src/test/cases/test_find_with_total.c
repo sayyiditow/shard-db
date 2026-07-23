@@ -44,7 +44,7 @@ static TestClient *setup_obj(TestEnv *env, const char *obj,
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(env); return NULL; }
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     char co[1024];
     snprintf(co, sizeof(co),
@@ -726,7 +726,7 @@ static int test_real_total_d1_composite(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_d1\","
@@ -785,7 +785,7 @@ static int test_real_total_d3_order_walk(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_d3\","

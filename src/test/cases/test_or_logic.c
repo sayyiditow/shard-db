@@ -43,7 +43,7 @@ static int test_or_logic_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     /* Register the "default" tenant dir at runtime. */
-    char *resp = req(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}");
+    char *resp = req(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}");
     free(resp);
 
     /* === Schema + dataset setup (mirrors shell test exactly) ===

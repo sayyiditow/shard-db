@@ -19,7 +19,7 @@ static int test_reindex_spill_collision_run(void) {
 
     char *resp = NULL;
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,

@@ -22,7 +22,7 @@ static int test_find_by_orderby_time_correct(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"prof\","
         "\"splits\":8,\"max_key\":12,\"fields\":[\"by:varchar:16\",\"time:long\"],"
@@ -73,7 +73,7 @@ static int test_count_find_parity(void) {
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"par\","
         "\"splits\":8,\"max_key\":12,\"fields\":[\"tag:varchar:8\",\"active:bool\"],"

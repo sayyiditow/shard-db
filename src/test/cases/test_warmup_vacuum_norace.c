@@ -177,7 +177,7 @@ static int test_warmup_vacuum_norace_run(void) {
     }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,

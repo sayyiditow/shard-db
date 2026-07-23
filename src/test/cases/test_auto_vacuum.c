@@ -165,7 +165,7 @@ static int test_auto_vacuum_run(void) {
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Object 1: needs vacuum (50 inserts, delete 30 → 60% tombstones, 30 ≥ 10). */
     tc_request(tc,

@@ -55,7 +55,7 @@ static int test_secure_random_keys_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     /* Create an auto_key=uuid object. */

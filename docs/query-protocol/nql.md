@@ -24,8 +24,21 @@ count     ::= "count"     dir obj [filter]
 aggregate ::= "aggregate" dir obj [filter] agg-list [agg-flags]
 ```
 
-`dir` and `obj` are bare words (no spaces). `filter` is a single shell-quoted (or double-quoted)
-string. When `filter` is absent, all records match — same as empty criteria `[]` in JSON.
+`dir` and `obj` are bare words (no spaces). Quoting differs slightly by caller:
+
+- **CLI:** pass the whole filter as one ordinary shell argument. The CLI performs the
+  NQL wire-level wrapping and delimiter doubling automatically; do not pre-double its
+  wrapper quotes yourself. For example:
+  `./shard-db find default users "name eq 'O''Brien'"`.
+- **Raw TCP:** include one NQL top-level wrapper around the filter, using either
+  `'...'` or `"..."`. A literal instance of that wrapper's own delimiter inside the
+  filter text is doubled: `''` inside a `'...'` wrapper, or `""` inside a `"..."`
+  wrapper. Prefer the `"..."` top-level wrapper when filter values use single quotes:
+  `find default users "name eq 'O''Brien'"`.
+
+The doubled `''` in both examples belongs to the filter value itself and decodes to the
+apostrophe in `O'Brien`; it is independent of shell/top-level wrapping. When `filter`
+is absent, all records match — same as empty criteria `[]` in JSON.
 
 For `aggregate`, the parser tells `filter` from `agg-list` by checking whether the token contains
 `(`. If it does, it is `agg-list`; if not, it is `filter` and the next positional is `agg-list`.
@@ -137,6 +150,10 @@ number        = "-"? [0-9]+ ("." [0-9]+)?
 boolean       = "true" | "false"
 bare-word     = [a-zA-Z0-9_.-]+   # no spaces; use single-quoted for spaces
 ```
+
+A literal `'` inside a single-quoted value is written doubled: `''` decodes to one
+literal `'` (SQL-style). Example: to filter on the value `O'Brien`,
+write `name eq 'O''Brien'`.
 
 Values with spaces must be single-quoted: `name starts 'john doe'`.
 

@@ -20,7 +20,7 @@ static int test_error_paths_run(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    char *r = req(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}"); free(r);
+    char *r = req(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}"); free(r);
     r = req(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"testobj\",\"splits\":8,\"max_key\":64,\"fields\":[\"name:varchar:50\"],\"indexes\":[]}"); free(r);
 
     r = req(tc, "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"nonexistent\",\"criteria\":[]}");

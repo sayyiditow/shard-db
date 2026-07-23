@@ -57,7 +57,7 @@ static int test_stats_prom_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"stats-prom\"}", &resp);
     ASSERT_NOT_NULL(resp, "stats-prom returned output");

@@ -31,7 +31,7 @@ static int test_criteria_in_then_invalid_leak_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"leak_t\","
         "\"fields\":[\"tag:varchar:16\"],\"indexes\":[\"tag\"],\"splits\":8}",

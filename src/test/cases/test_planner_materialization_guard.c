@@ -22,7 +22,7 @@ static int test_planner_materialization_guard(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"m\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"m\"}", &resp); free(resp); resp=NULL;
     /* score:int with btree so the cursor find (correctness) can order by it. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"m\",\"object\":\"ob\","

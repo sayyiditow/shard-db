@@ -42,7 +42,7 @@ static int test_cursor_sparse_prefetch(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"sp\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"sp\"}", &resp); free(resp); resp=NULL;
 
     /* type: bitmap; score: single btree (drivable order_by). NO type+score
      * composite — OP_EQUAL on type must fall through to the D2/D3 fork. */

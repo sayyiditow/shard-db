@@ -171,7 +171,7 @@ static int test_tls_run(void) {
     free(resp); resp = NULL;
 
     /* put-file / get-file via JSON path. */
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"tlsfiles\","
         "\"fields\":[\"body:varchar:64\"]}", &resp); free(resp); resp = NULL;

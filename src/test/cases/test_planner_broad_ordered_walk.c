@@ -41,7 +41,7 @@ static int test_planner_broad_ordered_walk(void) {
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"p\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"p\"}", &resp); free(resp); resp=NULL;
 
     /* type: bitmap; score: single btree (drivable order_by). NO type+score or
      * other composite — OP_EQUAL on type must NOT have a covering composite,

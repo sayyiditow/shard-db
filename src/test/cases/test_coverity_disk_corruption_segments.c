@@ -53,7 +53,7 @@ static int test_coverity_seg_klen_corruption_run(void) {
     if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"segrec\","
@@ -133,7 +133,7 @@ static int test_coverity_reindex_trigram_overflow_run(void) {
     if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"tgobj\","
@@ -216,7 +216,7 @@ static int test_coverity_estimate_index_overflow_run(void) {
     if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"d\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"d\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"d\",\"object\":\"tgobj2\","

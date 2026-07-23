@@ -52,7 +52,7 @@ static int test_objlock_run(void) {
     if (!tc) { test_env_kill(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"leads\","
         "\"splits\":16,\"max_key\":32,"

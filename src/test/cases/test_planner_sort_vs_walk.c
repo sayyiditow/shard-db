@@ -25,7 +25,7 @@ static int test_planner_sort_vs_walk(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg); ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"sw\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"sw\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"sw\",\"object\":\"swobj\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"cat:varchar:8\",\"t:long\"],"
@@ -71,7 +71,7 @@ static int test_cursor_fetch_sort(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg); ASSERT_NOT_NULL(tc, "connect");
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"cf\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"cf\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"cf\",\"object\":\"cfobj\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"kind:varchar:8\",\"score:long\"],"

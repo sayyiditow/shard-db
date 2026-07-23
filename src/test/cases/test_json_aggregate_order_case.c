@@ -26,7 +26,7 @@ static int test_json_aggregate_order_case_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ord_case_t\","
         "\"fields\":[\"grp:varchar:8\",\"amount:int\"],\"indexes\":[\"grp\"],\"splits\":8}",

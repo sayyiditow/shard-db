@@ -14,7 +14,7 @@ static int test_range_fold_window(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"c\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"c\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"c\",\"object\":\"cm\","
         "\"splits\":8,\"max_key\":16,"
@@ -77,7 +77,7 @@ static int test_range_fold_no_bound(void) {
     TestClientCfg cfg = { .port = env.port };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"c2\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"c2\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"c2\",\"object\":\"cm\","
         "\"splits\":8,\"max_key\":16,"

@@ -49,7 +49,7 @@ static int test_planner_trigram_over_bitmaps(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* title trigram + two bool bitmaps — mirrors hn/stories' shape
      * (title:trigram, dead:bitmap, deleted:bitmap) that triggered the 20s count. */

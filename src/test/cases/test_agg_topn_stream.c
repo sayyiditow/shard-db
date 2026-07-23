@@ -125,7 +125,7 @@ static int test_topn_eligible_truth_table(void) {
 
     /* Register the "default" tenant dir at runtime. */
     char *resp = NULL;
-    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     shard_db_free_result(resp);
     resp = NULL;
 
@@ -233,7 +233,7 @@ static int test_topn_stream_count_no_criteria(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     /* 100 unique names × variable counts; author N has count = N+1. Total = 5050. */
@@ -308,7 +308,7 @@ static int test_topn_stream_with_criteria_bitmap(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -391,7 +391,7 @@ static int test_topn_stream_sum_min_max(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     /* 100 unique int values, 10 copies each = 1000 records.
@@ -484,7 +484,7 @@ static int test_topn_stream_with_composite(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     /* fields a:varchar:16, b:int; indexes a, b, and composite a+b. */
@@ -589,7 +589,7 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -678,7 +678,7 @@ static int test_topn_stream_multi_criteria_all_leaves(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -790,7 +790,7 @@ static int test_topn_stream_btree_btree_intersect(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"topn_bb\","

@@ -21,7 +21,7 @@ static TestClient *cm_setup(TestEnv *env, const char *obj, const char *fields,
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(env); return NULL; }
     char *resp=NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp=NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp=NULL;
     char co[1024];
     snprintf(co,sizeof(co),
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"%s\","
@@ -40,7 +40,7 @@ static ShardDb *cm_pdb_setup(TestEnv *env, const char *obj, const char *fields,
     if (!db) return NULL;
     snprintf(env->db_root, sizeof(env->db_root), "%s", test_get_process_db_root());
     char *resp=NULL;
-    tu_pdb_request(db, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tu_pdb_request(db, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     shard_db_free_result(resp); resp=NULL;
     char co[1024];
     snprintf(co,sizeof(co),
@@ -867,7 +867,7 @@ static int test_planD3_single_leaf_indexed_order(void) {
 
     char *resp = NULL;
     /* add-dir */
-    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp);
+    tu_pdb_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     shard_db_free_result(resp); resp = NULL;
 
     /* create object: score + time indexed, note NOT indexed */

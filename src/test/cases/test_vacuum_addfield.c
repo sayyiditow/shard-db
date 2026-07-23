@@ -25,7 +25,7 @@ static int test_vacuum_addfield_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Plain vacuum: 5 inserts, delete 2, vacuum cleans=2. */
     tc_request(tc,

@@ -54,7 +54,7 @@ static int test_find_timestamp_criteria_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *resp = NULL;
-    tc_request(tc, "{\"mode\":\"add-dir\",\"name\":\"default\"}", &resp); free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     /* Object: `time` is FT_TIMESTAMP and indexed; `story_root` is an
        indexed int so we can exercise the int + timestamp AND-intersect
