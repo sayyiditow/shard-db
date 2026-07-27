@@ -26,6 +26,10 @@ void  tls_close(SSL *ssl, int fd);
 extern _Atomic int active_threads;
 extern _Atomic int in_flight_writes;
 
+/* Set to 1 by cmd_server when the startup marker recovery sweep runs
+   (unclean shutdown detected); see shard_db_internal.h. */
+int g_marker_recovery_ran = 0;
+
 /* Commands that mutate data (insert/delete/update/bulk/put-file/sequence).
    Take per-object rdlock during dispatch so rebuild (wrlock) blocks them briefly. */
 static int mode_is_write(const char *m) {
@@ -1041,6 +1045,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
         uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
         uint64_t uptime   = now_ms() - g_server_start_ms;
+        /* Durability commit-window instrumentation (lock-hold budget). */
+        uint64_t commit_n         = __atomic_load_n(&g_commit_count, __ATOMIC_RELAXED);
+        uint64_t commit_hold_us   = __atomic_load_n(&g_commit_lock_hold_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_sync_us   = __atomic_load_n(&g_commit_sync_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_hold_avg  = commit_n ? commit_hold_us / commit_n : 0;
+        uint64_t commit_sync_avg  = commit_n ? commit_sync_us / commit_n : 0;
         /* Subtract 1 for this stats request itself (occupies one worker thread). */
         int at = active_threads > 0 ? active_threads - 1 : 0;
 
@@ -1048,6 +1058,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             double u_hit_pct = (u_hits + u_miss) ? 100.0 * u_hits / (u_hits + u_miss) : 0.0;
             double b_hit_pct = (b_hits + b_miss) ? 100.0 * b_hits / (b_hits + b_miss) : 0.0;
             OUT("uptime          %.1fs\n", uptime / 1000.0);
+            OUT("marker_recovery_ran %d\n", g_marker_recovery_ran);
             OUT("active_threads  %d\n", at);
             OUT("in_flight_wr    %d\n", in_flight_writes);
             OUT("ucache          used=%d/%d bytes=%zu hit=%.1f%% (%lu/%lu)\n",
@@ -1065,14 +1076,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 printed++;
             }
             pthread_mutex_unlock(&g_slow_query_lock);
+            OUT("commit          count=%lu lock_hold_avg_us=%lu sync_avg_us=%lu lock_hold_total_us=%lu sync_total_us=%lu\n",
+                commit_n, commit_hold_avg, commit_sync_avg, commit_hold_us, commit_sync_us);
         } else {
-            OUT("{\"uptime_ms\":%lu,\"active_threads\":%d,\"in_flight_writes\":%d,"
+            OUT("{\"uptime_ms\":%lu,\"marker_recovery_ran\":%d,\"active_threads\":%d,\"in_flight_writes\":%d,"
                 "\"ucache\":{\"used\":%d,\"total\":%d,\"bytes\":%zu,\"hits\":%lu,\"misses\":%lu},"
                 "\"bt_cache\":{\"used\":%d,\"total\":%d,\"bytes\":%zu,\"hits\":%lu,\"misses\":%lu},"
+                "\"commit\":{\"count\":%lu,\"lock_hold_us_total\":%lu,\"lock_hold_us_avg\":%lu,"
+                "\"sync_us_total\":%lu,\"sync_us_avg\":%lu},"
                 "\"slow_query\":{\"threshold_ms\":%d,\"count\":%lu,\"recent\":[",
-                uptime, at, in_flight_writes,
+                uptime, g_marker_recovery_ran, at, in_flight_writes,
                 uc_used, uc_total, uc_bytes, u_hits, u_miss,
                 bc_used, bc_total, bc_bytes, b_hits, b_miss,
+                commit_n, commit_hold_us, commit_hold_avg, commit_sync_us, commit_sync_avg,
                 g_slow_query_ms, slow_n);
             pthread_mutex_lock(&g_slow_query_lock);
             int printed = 0;
@@ -1165,6 +1181,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         OUT("# HELP shard_db_slow_query_total Cumulative requests slower than the threshold.\n");
         OUT("# TYPE shard_db_slow_query_total counter\n");
         OUT("shard_db_slow_query_total %lu\n", slow_n);
+
+        uint64_t commit_n       = __atomic_load_n(&g_commit_count, __ATOMIC_RELAXED);
+        uint64_t commit_hold_us = __atomic_load_n(&g_commit_lock_hold_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_sync_us = __atomic_load_n(&g_commit_sync_us_total, __ATOMIC_RELAXED);
+        OUT("# HELP shard_db_commit_total Cumulative durability commit windows (single-record + bulk).\n");
+        OUT("# TYPE shard_db_commit_total counter\n");
+        OUT("shard_db_commit_total %lu\n", commit_n);
+        OUT("# HELP shard_db_commit_lock_hold_microseconds_total Cumulative time spent inside commit calls (lock-hold proxy).\n");
+        OUT("# TYPE shard_db_commit_lock_hold_microseconds_total counter\n");
+        OUT("shard_db_commit_lock_hold_microseconds_total %lu\n", commit_hold_us);
+        OUT("# HELP shard_db_commit_sync_microseconds_total Cumulative time inside marker fsync / kf-slot-sync primitives (subset of lock hold).\n");
+        OUT("# TYPE shard_db_commit_sync_microseconds_total counter\n");
+        OUT("shard_db_commit_sync_microseconds_total %lu\n", commit_sync_us);
 
         free(mode);
         return;
@@ -3538,6 +3567,44 @@ static int validate_metadata(const char *db_root) {
     return errors;
 }
 
+/* Walks schema.conf the same way the startup marker-recovery sweep does,
+   checking each object's data/kf/ for a retained marker file. Used only at
+   graceful shutdown to decide whether writing .shard-db.clean is safe —
+   unlike the startup sweep, this never replays anything, it only observes.
+   Returns 1 if any object has a pending marker, 0 if none do, -1 on an
+   I/O error reading schema.conf itself (treated as "not safe" by the
+   caller, since we can't prove no markers remain). */
+static int any_markers_pending(const char *db_root) {
+    char scpath[PATH_MAX];
+    snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
+    FILE *sf = fopen(scpath, "r");
+    if (!sf) return -1;
+
+    int pending = 0;
+    char line[1024];
+    while (!pending && fgets(line, sizeof(line), sf)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        char *c1 = strchr(line, ':');
+        if (!c1) continue;
+        *c1 = '\0';
+        const char *dir = line;
+        char *rest = c1 + 1;
+        char *c2 = strchr(rest, ':');
+        if (!c2) continue;
+        *c2 = '\0';
+        const char *obj = rest;
+
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, dir, obj);
+
+        int rc = object_has_pending_markers(data_dir);
+        if (rc != 0) pending = 1;   /* both "found" (1) and "I/O error" (-1) are treated as pending */
+    }
+    fclose(sf);
+    return pending;
+}
+
 int cmd_server(const char *db_root, int daemonize) {
     /* Recovery mutates object directories, so DB-root ownership must be
        established before any instance initialization or recovery work. */
@@ -3607,6 +3674,67 @@ int cmd_server(const char *db_root, int daemonize) {
                 "shard-db: refusing to start: rebuild recovery requires manual intervention\n");
         db_root_lock_release(&lock_fd);
         return 1;
+    }
+
+    /* Marker recovery sweep: on unclean exit (no .shard-db.clean flag),
+       enumerate every object listed in schema.conf and replay any marker
+       files left in its data/kf/ directory before accepting connections. */
+    int was_clean = clean_flag_exists(db_root);
+    if (clean_flag_remove(db_root) != 0) {
+        fprintf(stderr,
+                "shard-db: refusing to start: failed to consume %s/.shard-db.clean (%s); "
+                "a stale clean flag could cause a future crash to skip recovery\n",
+                db_root, strerror(errno));
+        db_root_lock_release(&lock_fd);
+        return 1;
+    }
+    if (!was_clean) {
+        LOG_WARN(LOG_SUB_DURABILITY, "Unclean shutdown detected — running marker recovery sweep");
+        char scpath[PATH_MAX];
+        snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
+        FILE *sf = fopen(scpath, "r");
+        int sweep_failures = 0;
+        int markers_replayed = 0;
+        if (sf) {
+            char line[1024];
+            while (fgets(line, sizeof(line), sf)) {
+                line[strcspn(line, "\n")] = '\0';
+                if (!line[0] || line[0] == '#') continue;
+                char *c1 = strchr(line, ':');
+                if (!c1) continue;
+                *c1 = '\0';
+                const char *dir = line;
+                char *rest = c1 + 1;
+                char *c2 = strchr(rest, ':');
+                if (!c2) continue;
+                *c2 = '\0';
+                const char *obj = rest;
+
+                char eff_root[PATH_MAX];
+                snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
+                char data_dir[PATH_MAX];
+                snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, obj);
+
+                objlock_wrlock(eff_root, obj);
+                int rc = marker_recovery_sweep_object(eff_root, data_dir, obj, &markers_replayed);
+                objlock_wrunlock(eff_root, obj);
+                if (rc != 0) {
+                    sweep_failures++;
+                    LOG_ERROR(LOG_SUB_DURABILITY,
+                              "marker recovery failed for %s/%s: corrupt or unreplayable marker left on disk",
+                              dir, obj);
+                }
+            }
+            fclose(sf);
+        }
+        g_marker_recovery_ran = (markers_replayed > 0) ? 1 : 0;
+        if (sweep_failures > 0) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: %d object(s) have unreplayable durability markers; "
+                    "manual investigation required (see error log)\n", sweep_failures);
+            db_root_lock_release(&lock_fd);
+            return 1;
+        }
     }
 
     /* Pre-fork validation: dirs.conf + schema.conf consistency must be
@@ -3900,6 +4028,27 @@ int cmd_server(const char *db_root, int daemonize) {
        may be inside pool work or hold object/cache locks, so joining later
        would race cache rwlock destruction and mapped-entry teardown. */
     bg_threads_stop(g_shard_db_instance);
+
+    /* Mark shutdown as clean, but only if no object still has a retained
+       durability marker (all in-flight commits fully drained/replayed).
+       This flag is checked at startup: if present, recovery sweep is
+       skipped; if absent, it runs. Writing it while a marker is still
+       pending would make a future crash silently skip recovery. */
+    {
+        int pending = any_markers_pending(db_root);
+        if (pending != 0) {
+            LOG_WARN(LOG_SUB_DURABILITY,
+                     "shutdown: %s — leaving .shard-db.clean absent so the next "
+                     "startup runs a recovery sweep",
+                     pending < 0 ? "failed to check for retained markers"
+                                 : "retained durability marker(s) found");
+        } else if (clean_flag_write(db_root) != 0) {
+            LOG_ERROR(LOG_SUB_DURABILITY,
+                      "shutdown: failed to write %s/.shard-db.clean (%s); next startup "
+                      "will run a recovery sweep unnecessarily but safely",
+                      db_root, strerror(errno));
+        }
+    }
 
     remove_pid_file(db_root);
     parallel_io_pool_shutdown();

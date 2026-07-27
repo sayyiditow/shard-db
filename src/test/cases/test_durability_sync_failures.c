@@ -233,5 +233,75 @@ static int test_durability_msync_injection_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+static void assert_second_sync_failure(int rc, const char *what) {
+    int succeeded = -1;
+    int failed = -1;
+    ASSERT_EQ_INT(rc, -1, what);
+    durability_test_msync_counts(&succeeded, &failed);
+    ASSERT_EQ_INT(succeeded, 1, "segment sync succeeds before keyfile sync fails");
+    ASSERT_EQ_INT(failed, 1, "targeted keyfile sync failure reaches the API");
+    durability_test_msync_reset();
+}
+
+static int test_unindexed_kf_sync_failure_propagates(void) {
+    char root[] = "/tmp/shard-db-unindexed-kf-sync-XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(root), "create unindexed sync-failure fixture");
+    if (!root[0]) return 1;
+
+    char object_dir[PATH_MAX];
+    snprintf(object_dir, sizeof(object_dir), "%s/object", root);
+    slotcask_shutdown();
+    slotcask_init(64, 64);
+    SlotcaskDb db;
+    ASSERT_EQ_INT(slotcask_open(&db, object_dir, 8, 1, 256), 0,
+                  "open unindexed sync-failure fixture");
+
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&db, 0, "fast-update", 11,
+                                              "old", 3, NULL, NULL), 0,
+                  "seed fast-path update");
+    SlotcaskUpsertOpts slow_opts = { .check_needs_old = 1 };
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&db, 0, "slow-update", 11,
+                                              "old", 3, &slow_opts, NULL), 0,
+                  "seed slow-path update");
+
+    durability_test_msync_reset();
+    durability_test_msync_fail_on_call(2, EIO);
+    assert_second_sync_failure(
+        slotcask_upsert_with_hooks(&db, 0, "fast-insert", 11, "value", 5,
+                                   NULL, NULL),
+        "fast new-key upsert propagates keyfile sync failure");
+
+    durability_test_msync_fail_on_call(2, EIO);
+    assert_second_sync_failure(
+        slotcask_upsert_with_hooks(&db, 0, "fast-update", 11, "new", 3,
+                                   NULL, NULL),
+        "fast existing-key upsert propagates keyfile sync failure");
+
+    durability_test_msync_fail_on_call(2, EIO);
+    assert_second_sync_failure(
+        slotcask_upsert_with_hooks(&db, 0, "slow-insert", 11, "value", 5,
+                                   &slow_opts, NULL),
+        "slow new-key upsert propagates keyfile sync failure");
+
+    durability_test_msync_fail_on_call(2, EIO);
+    assert_second_sync_failure(
+        slotcask_upsert_with_hooks(&db, 0, "slow-update", 11, "new", 3,
+                                   &slow_opts, NULL),
+        "slow existing-key upsert propagates keyfile sync failure");
+
+    durability_test_msync_fail_on_call(2, EIO);
+    assert_second_sync_failure(
+        slotcask_insert_with_hooks(&db, 0, "insert-only", 11, "value", 5,
+                                   NULL, NULL),
+        "insert-only path propagates keyfile sync failure");
+
+    slotcask_close(&db);
+    slotcask_shutdown();
+    rmrf(root);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-durability-sync-failures",
               test_durability_msync_injection_run)
+TEST_REGISTER("test-unindexed-kf-sync-failure",
+              test_unindexed_kf_sync_failure_propagates)

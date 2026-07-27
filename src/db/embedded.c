@@ -58,6 +58,8 @@ static void db_defaults_set(ShardDb *db) {
     db->index_page_size           = 4096;
     db->rebuild_test_pause_phase[0] = '\0';
     db->rebuild_test_pause_ms       = 0;
+    db->durability_test_pause_phase[0] = '\0';
+    db->durability_test_pause_ms       = 0;
     memcpy(db->warmup_mode, "async", 6);
 }
 

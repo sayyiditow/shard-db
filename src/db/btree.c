@@ -924,36 +924,38 @@ static uint32_t bt_alloc_page(BtFile *bt) {
 
     if (needed > bt->map_size) {
         /* Grow in chunks: double or add 1MB, whichever is larger */
-        size_t new_size = bt->map_size * 2;
-        if (new_size < bt->map_size + 1024 * 1024)
-            new_size = bt->map_size + 1024 * 1024;
+        size_t old_size = bt->map_size;
+        size_t new_size = old_size * 2;
+        if (new_size < old_size + 1024 * 1024)
+            new_size = old_size + 1024 * 1024;
         if (new_size < needed) new_size = needed;
+        /* Extend and fsync the file BEFORE remapping — the previous order
+           remapped to new_size first, leaving a window where the mapping
+           extended beyond the actual file size (SIGBUS on access to those
+           pages if ftruncate failed or hadn't landed yet). */
+        if (ftruncate(bt->fd, (off_t)new_size) < 0 || fsync(bt->fd) < 0) {
+            fprintf(stderr, "btree: allocation grow %zu→%zu failed: %s\n",
+                    old_size, new_size, strerror(errno));
+            abort();
+        }
         /* Use mremap on Linux for O(1) page-table remap (vs munmap+mmap
            which is O(virtual address range) — matters at 500MB+ file sizes).
            Fall back to munmap+mmap on non-Linux (macOS, *BSD). */
 #ifdef __linux__
-        bt->map = mremap(bt->map, bt->map_size, new_size, MREMAP_MAYMOVE);
-        if (bt->map == MAP_FAILED) {
-            fprintf(stderr, "btree: mremap(grow %zu→%zu) failed: %s\n",
-                    bt->map_size, new_size, strerror(errno));
-            bt->map = NULL;
-        }
+        void *new_map = mremap(bt->map, old_size, new_size, MREMAP_MAYMOVE);
+        bt->map = new_map == MAP_FAILED ? NULL : new_map;
 #else
-        munmap(bt->map, bt->map_size);
-        bt->map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
-        if (bt->map == MAP_FAILED) bt->map = NULL;
+        munmap(bt->map, old_size);
+        void *new_map = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, bt->fd, 0);
+        bt->map = new_map == MAP_FAILED ? NULL : new_map;
 #endif
         /* No caller of bt_alloc_page (11 sites) checks an error sentinel —
            there isn't one, it always returns a uint32_t page id. Silently
            continuing with a NULL or stale map here would corrupt the
            B+tree on the next access. Fail loudly instead (CID 1696467). */
         if (!bt->map) {
-            fprintf(stderr, "btree: page allocation failed, aborting\n");
+            fprintf(stderr, "btree: page allocation remap failed: %s\n", strerror(errno));
             abort();
-        }
-        if (ftruncate(bt->fd, (off_t)new_size) < 0) {
-            fprintf(stderr, "btree: ftruncate(grow %zu→%zu) failed: %s\n",
-                    bt->map_size, new_size, strerror(errno));
         }
         bt->map_size = new_size;
         fh = (BtFileHeader *)bt->map;
@@ -1563,13 +1565,13 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
             if (leaf_iter_seek(&dit, pos) &&
                 val_cmp(dit.key_buf, dit.key_len, value, vlen) == 0 &&
                 memcmp(dit.hash, hash, BT_HASH_SIZE) == 0) {
-                return -1; /* duplicate, skip */
+                return BT_INSERT_DUPLICATE; /* duplicate, skip */
             }
         }
 
         /* Try to insert */
         if (page_insert_at_leaf(page, pos, value, vlen, hash) == 0) {
-            return -1; /* success, no split */
+            return BT_INSERT_NO_SPLIT; /* success, no split */
         }
 
         /* Page full — split */
@@ -1590,7 +1592,7 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
             page_insert_at_leaf(page, pos, value, vlen, hash);
         }
 
-        return 0; /* split happened */
+        return BT_INSERT_SPLIT; /* split happened */
     } else {
         /* Internal page — find child via (value, hash) descent so a
            split that promoted v == sep doesn't misroute on the next
@@ -1612,7 +1614,7 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
         int result = bt_insert_rec(bt, child_id, value, vlen, hash,
                                    sub_promote, &sub_promote_len,
                                    sub_promote_hash, &sub_new_child);
-        if (result == -1) return -1; /* no split below */
+        if (result != BT_INSERT_SPLIT) return result; /* no split or duplicate below */
 
         /* Child split — insert promoted (value, hash, child) into this page */
         page = bt_page(bt, page_id); /* re-fetch after potential remap */
@@ -1621,8 +1623,8 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
                                              sub_promote_hash);
 
         if (page_insert_at_internal(page, ipos, sub_promote, sub_promote_len,
-                                    sub_promote_hash, sub_new_child) == 0) {
-            return -1; /* inserted into this page, no further split */
+                                     sub_promote_hash, sub_new_child) == 0) {
+            return BT_INSERT_NO_SPLIT; /* inserted into this page, no further split */
         }
 
         /* This internal page is full — split it too */
@@ -1670,7 +1672,7 @@ int btree_insert(const char *path, const char *value, size_t vlen,
                                promote_val, &promote_vlen, promote_hash,
                                &new_child);
 
-    if (result == 0) {
+    if (result == BT_INSERT_SPLIT) {
         /* Root was split — create new root */
         fh = (BtFileHeader *)bt.map; /* re-fetch */
         uint32_t new_root = bt_alloc_page(&bt);
@@ -1693,9 +1695,11 @@ int btree_insert(const char *path, const char *value, size_t vlen,
         fh->height++;
     }
 
-    fh = (BtFileHeader *)bt.map;
-    fh->entry_count++;
-    fh->insert_count++;
+    if (result != BT_INSERT_DUPLICATE) {
+        fh = (BtFileHeader *)bt.map;
+        fh->entry_count++;
+        fh->insert_count++;
+    }
     bt_release(&bt);
     return 0;
 }
@@ -1720,7 +1724,7 @@ int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
         int result = bt_insert_rec(&bt, fh->root_page, entries[i].value, entries[i].vlen,
                                    entries[i].hash, promote_val, &promote_vlen,
                                    promote_hash, &new_child);
-        if (result == 0) {
+        if (result == BT_INSERT_SPLIT) {
             fh = (BtFileHeader *)bt.map;
             uint32_t new_root = bt_alloc_page(&bt);
             fh = (BtFileHeader *)bt.map;
@@ -1735,9 +1739,11 @@ int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
             fh->root_page = new_root;
             fh->height++;
         }
-        fh = (BtFileHeader *)bt.map;
-        fh->entry_count++;
-        fh->insert_count++;
+        if (result != BT_INSERT_DUPLICATE) {
+            fh = (BtFileHeader *)bt.map;
+            fh->entry_count++;
+            fh->insert_count++;
+        }
     }
 
     bt_release(&bt);
@@ -1784,6 +1790,14 @@ int btree_delete(const char *path, const char *value, size_t vlen,
 
     bt_release(&bt);
     return 0;
+}
+
+int btree_sync_path(const char *path) {
+    BtFile bt;
+    if (bt_acquire(&bt, path, 1) != 0) return -1;
+    int rc = fdatasync(bt.fd);
+    bt_release(&bt);
+    return rc;
 }
 
 void btree_search(const char *path, const char *value, size_t vlen,

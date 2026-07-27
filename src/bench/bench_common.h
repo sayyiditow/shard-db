@@ -27,4 +27,11 @@ long long bench_du_bytes(const char *path);
    automatically. Writes a NUL-terminated string into `out`. */
 void bench_fmt_bytes(long long bytes, char *out, size_t outlen);
 
+typedef struct TestClient TestClient;
+
+void bench_format_object_stats(char *out, size_t outlen, const char *label,
+                               const char *live_count, const char *disk_bytes);
+void bench_print_object_stats(TestClient *tc, const char *dir,
+                              const char *object, const char *label);
+
 #endif

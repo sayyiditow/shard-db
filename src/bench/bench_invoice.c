@@ -273,10 +273,7 @@ static int bench_invoice_run(void)
         free(resp); resp = NULL;
     }
 
-    /* size check (informational) */
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"bench\"}", &resp);
-    printf("SIZE after no-idx insert: %s\n\n", resp ? resp : "(err)");
-    free(resp); resp = NULL;
+    bench_print_object_stats(tc, "default", "bench", "AFTER NO-INDEX INSERT");
 
     /* ---- 4. GET x1000 pipelined --------------------------------------- */
     long get_total_us = 0; uint64_t get_p50 = 0;
@@ -381,9 +378,7 @@ static int bench_invoice_run(void)
         free(resp); resp = NULL;
     }
 
-    tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"bench\"}", &resp);
-    printf("SIZE after 14-idx insert: %s\n\n", resp ? resp : "(err)");
-    free(resp); resp = NULL;
+    bench_print_object_stats(tc, "default", "bench", "AFTER 14-INDEX INSERT");
 
     /* ---- BULK INSERT throughput — table view --------------------------- */
     {

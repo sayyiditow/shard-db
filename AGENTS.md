@@ -1,12 +1,12 @@
 # AGENTS.md
 
-Guidance for Claude Code when working in this repository. User-facing docs live under `docs/`; this file is a fast index for me, not for users.
+User-facing docs live under `docs/`.
 
 @CORE-PROCESS.md
 
 ## Standing exceptions for this repo
 
-- **Execution mode:** leave work **uncommitted** after plan execution — Sonnet reviews the raw `git diff` first; nothing is committed until that review pass is done.
+- **Execution mode:** leave work **uncommitted** after plan execution — the reviewing agent + human MUST review the raw `git diff` first; nothing is committed until that review pass is done.
 - **Build/test commands for plans:** build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`.
 - **Dynamic-safety tooling for this repo (CORE-PROCESS.md's "Definition of done" gate):** ASan+UBSan and TSan, via `BUILD_MODE`. Any diff touching locks, shared/cached state (kfcache, segcache, bitmap cache, btree cache), object lifetimes, or background threads must be run locally under both before being called done — not deferred to CI:
   - `BUILD_MODE=asan SKIP_TESTS=1 ./build.sh` then `ASAN_OPTIONS="halt_on_error=0:detect_leaks=1:abort_on_error=0:print_stacktrace=1" ./build/bin/shard-db-test run-all --jobs 2` (or `run <name>` for the affected case(s) at minimum).
@@ -14,11 +14,6 @@ Guidance for Claude Code when working in this repository. User-facing docs live 
   - New findings get root-caused and either fixed now (if simple — see CORE-PROCESS.md's "never paper over issues") or written up as a `docs/plans/<date>-<slug>.md` and, only if deliberately deferred, added to `.tsan.supp` with a named-function suppression and a full rationale paragraph — never a blanket suppression, never "not a real bug" without justification.
   - CI (`.github/workflows/sanitizers.yml`, `.github/workflows/tsan.yml`) runs both against the full suite as a backstop, not a substitute for the local run above.
 
-## Deployment (Netcup) — ship artifacts, never git
-
-Deploy by shipping **built artifacts only**, then restart the app. **Never** `git pull` or build on the server.
-- **shard-db:** build locally, copy `build/bin/` contents (`shard-db` + `shard-db-cli` + `migrate`) to the server's install dir, then restart the daemon (`./shard-db stop && ./shard-db start`). Run `./migrate` only when a release requires it.
-- **shard-db-hn-explorer:** build locally (`bun run build`), copy the `build/` folder to the server, restart the app.
 
 ## Overview
 

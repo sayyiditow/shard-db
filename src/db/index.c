@@ -371,7 +371,8 @@ static int bitmap_update(const char *db_root, const char *object,
                          const char *field, int kf_shard, int splits,
                          uint32_t kf_slot, uint32_t max_values,
                          const uint8_t *new_val, size_t new_len,
-                         const uint8_t *old_val, size_t old_len) {
+                         const uint8_t *old_val, size_t old_len,
+                         int sync_after) {
     char path[1024];
     bitmap_shard_path(path, sizeof(path), db_root, object, field, kf_shard);
 
@@ -400,16 +401,20 @@ static int bitmap_update(const char *db_root, const char *object,
            the bottleneck. */
         uint32_t grown = 1;
         while (grown < want && grown < 0x80000000u) grown <<= 1;
-        bm_grow(bm, grown);
+        if (bm_grow(bm, grown) != 0) {
+            bm_close(bm);
+            return -1;
+        }
     }
 
     int rc = 0;
-    if (old_val) bm_clear(bm, old_val, old_len, kf_slot);
+    if (old_val && bm_clear(bm, old_val, old_len, kf_slot) != 0) rc = -1;
     if (new_val) {
         if (bm_set(bm, new_val, new_len, kf_slot) != 0) {
             rc = -1;
         }
     }
+    if (sync_after && bm_sync(bm) != 0) rc = -1;
     /* Release the per-entry rwlock. The cache keeps fd + mmap alive
        so a same-path follow-up call pays just the rwlock acquire. */
     bm_close(bm);
@@ -442,6 +447,15 @@ void *update_idx_fn(void *arg) {
                                   a->new_key, a->new_len, a->hash) != 0) {
                 a->out_error = -2;
                 a->out_errno = errno;
+            }
+            if (!a->out_error && a->sync_after) {
+                int shard = idx_shard_for_hash(a->hash, a->splits);
+                char idx_path[PATH_MAX];
+                build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object, a->field, shard);
+                if (btree_sync_path(idx_path) != 0) {
+                    a->out_error = -2;
+                    a->out_errno = errno;
+                }
             }
             break;
 
@@ -496,6 +510,15 @@ void *update_idx_fn(void *arg) {
                     }
                 }
             }
+            if (!a->out_error && a->sync_after) {
+                int shard = idx_shard_for_hash(a->hash, a->splits);
+                char tg_path[PATH_MAX];
+                tg_build_path(tg_path, sizeof(tg_path), a->db_root, a->object, a->field, shard);
+                if (btree_sync_path(tg_path) != 0) {
+                    a->out_error = -2;
+                    a->out_errno = errno;
+                }
+            }
             break;
         }
 
@@ -513,10 +536,276 @@ void *update_idx_fn(void *arg) {
                                          a->kf_shard, a->splits,
                                          a->kf_slot, a->bm_max_values,
                                          a->new_key, a->new_len,
-                                         a->old_key, a->old_len);
+                                         a->old_key, a->old_len,
+                                         a->sync_after);
             break;
     }
     return NULL;
+}
+
+/* ── Bitmap prepare/apply split (see types.h for the contract) ────────── */
+
+int bitmap_prepare_set_init(BitmapPrepareSet *set, size_t max_entries) {
+    set->entries = calloc(max_entries, sizeof(BitmapPrepareEntry));
+    if (!set->entries) return -1;
+    set->n = 0;
+    set->cap = max_entries;
+    return 0;
+}
+
+static BitmapShard *bitmap_prepare_open(const UpdateIdxArg *arg) {
+    char path[1024];
+    bitmap_shard_path(path, sizeof(path), arg->db_root, arg->object, arg->field, arg->kf_shard);
+    int bool_fastpath = 0;
+    if (arg->new_key && arg->new_len == 1) bool_fastpath = 1;
+    else if (arg->old_key && arg->old_len == 1) bool_fastpath = 1;
+    int slots = (int)slotcask_default_slots_for_splits(arg->splits);
+    /* Growing the shard (if kf_slot doesn't fit yet) is deferred to apply
+       time — bm_grow() can fsync+publish a rewritten file, a durable
+       mutation that must not happen during prepare, before any commit-
+       intent marker exists for a record that might still be rejected. */
+    return bm_open(path, slots, 1, bool_fastpath, arg->bm_max_values, 1 /* writer */);
+}
+
+/* Grow bm (if needed) so kf_slot fits, right before the apply-phase set/
+   clear that targets it. Called only after the window/set's marker is
+   already durable — a failure here is a genuine I/O error, not a policy
+   rejection, and is propagated like any other apply failure. */
+static int bitmap_apply_grow_for_slot(BitmapShard *bm, uint32_t kf_slot) {
+    if (kf_slot < bm_slots(bm)) return 0;
+    uint32_t want = kf_slot + 1;
+    uint32_t grown = 1;
+    while (grown < want && grown < 0x80000000u) grown <<= 1;
+    return bm_grow(bm, grown);
+}
+
+int bitmap_prepare_set_add(BitmapPrepareSet *set, const UpdateIdxArg *arg,
+                           char *err_field, size_t err_field_len) {
+    if (set->n >= set->cap) return -2;
+    BitmapShard *bm = bitmap_prepare_open(arg);
+    if (!bm) return -2;
+
+    if (arg->new_key) {
+        int would = bm_dict_would_exceed_cap(bm, arg->new_key, arg->new_len);
+        if (would < 0) { bm_close(bm); return -2; }
+        if (would) {
+            bm_close(bm);
+            if (err_field) snprintf(err_field, err_field_len, "%s", arg->field);
+            return -1;
+        }
+    }
+
+    BitmapPrepareEntry *e = &set->entries[set->n++];
+    snprintf(e->field, sizeof(e->field), "%s", arg->field);
+    e->kf_shard = arg->kf_shard;
+    e->bm = bm;
+    e->new_val = arg->new_key;
+    e->new_len = arg->new_len;
+    e->old_val = arg->old_key;
+    e->old_len = arg->old_len;
+    e->kf_slot = arg->kf_slot;
+    e->sync_after = arg->sync_after;
+    return 0;
+}
+
+int bitmap_prepare_set_apply(BitmapPrepareSet *set) {
+    int rc = 0;
+    for (size_t i = 0; i < set->n; i++) {
+        BitmapPrepareEntry *e = &set->entries[i];
+        BitmapShard *bm = (BitmapShard *)e->bm;
+        if (!bm) continue;
+        if (bitmap_apply_grow_for_slot(bm, e->kf_slot) != 0) {
+            rc = -1;
+        } else {
+            if (e->old_val) {
+                if (bm_clear(bm, e->old_val, e->old_len, e->kf_slot) != 0) rc = -1;
+            }
+            if (e->new_val) {
+                if (bm_set(bm, e->new_val, e->new_len, e->kf_slot) != 0) rc = -1;
+            }
+            if (e->sync_after) {
+                if (bm_sync(bm) != 0) rc = -1;
+            }
+        }
+        bm_close(bm);
+        e->bm = NULL;
+    }
+    set->n = 0;
+    return rc;
+}
+
+void bitmap_prepare_set_abort(BitmapPrepareSet *set) {
+    for (size_t i = 0; i < set->n; i++) {
+        if (set->entries[i].bm) {
+            bm_close((BitmapShard *)set->entries[i].bm);
+            set->entries[i].bm = NULL;
+        }
+    }
+    set->n = 0;
+}
+
+void bitmap_prepare_set_free(BitmapPrepareSet *set) {
+    if (!set) return;
+    bitmap_prepare_set_abort(set);
+    free(set->entries);
+    set->entries = NULL;
+    set->cap = 0;
+}
+
+/* ── Window-scoped variant for bulk ─────────────────────────────────── */
+
+int bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields, size_t max_records) {
+    memset(win, 0, sizeof(*win));
+    win->entries = calloc(max_fields, sizeof(BitmapWindowEntry));
+    win->ops = calloc(max_records, sizeof(BitmapWindowOp));
+    if (!win->entries || !win->ops) {
+        free(win->entries); free(win->ops);
+        win->entries = NULL; win->ops = NULL;
+        return -1;
+    }
+    win->cap_entries = max_fields;
+    win->cap_ops = max_records;
+    return 0;
+}
+
+static BitmapWindowEntry *bitmap_window_find_or_open(BitmapPrepareWindow *win, const UpdateIdxArg *arg) {
+    for (size_t i = 0; i < win->n_entries; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->kf_shard == arg->kf_shard && strcmp(e->field, arg->field) == 0) return e;
+    }
+    if (win->n_entries >= win->cap_entries) return NULL;
+    BitmapShard *bm = bitmap_prepare_open(arg);
+    if (!bm) return NULL;
+    BitmapWindowEntry *e = &win->entries[win->n_entries++];
+    snprintf(e->field, sizeof(e->field), "%s", arg->field);
+    e->kf_shard = arg->kf_shard;
+    e->bm = bm;
+    e->pending = NULL;
+    e->npending = 0;
+    e->pending_cap = 0;
+    return e;
+}
+
+int bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg,
+                              char *err_field, size_t err_field_len) {
+    BitmapWindowEntry *e = bitmap_window_find_or_open(win, arg);
+    if (!e) return -2;
+    BitmapShard *bm = (BitmapShard *)e->bm;
+
+    if (arg->new_key) {
+        int already = bm_dict_contains(bm, arg->new_key, arg->new_len);
+        int in_pending = 0;
+        if (!already) {
+            for (size_t i = 0; i < e->npending; i++) {
+                if (e->pending[i].vlen == arg->new_len &&
+                    memcmp(e->pending[i].value, arg->new_key, arg->new_len) == 0) {
+                    in_pending = 1;
+                    break;
+                }
+            }
+        }
+        if (!already && !in_pending) {
+            uint32_t on_disk = bm_n_values(bm);
+            uint32_t max_v = bm_max_values(bm);
+            if ((uint64_t)on_disk + (uint64_t)e->npending + 1 > (uint64_t)max_v) {
+                if (err_field) snprintf(err_field, err_field_len, "%s", arg->field);
+                return 1; /* this record rejected; entry/handle stay open for other records */
+            }
+            if (e->npending >= e->pending_cap) {
+                size_t ncap = e->pending_cap ? e->pending_cap * 2 : 8;
+                BitmapPendingValue *np = realloc(e->pending, ncap * sizeof(BitmapPendingValue));
+                if (!np) return -2;
+                e->pending = np;
+                e->pending_cap = ncap;
+            }
+            e->pending[e->npending].value = arg->new_key;
+            e->pending[e->npending].vlen = arg->new_len;
+            e->npending++;
+        }
+    }
+
+    if (win->n_ops >= win->cap_ops) return -2;
+    BitmapWindowOp *op = &win->ops[win->n_ops++];
+    op->entry_idx = (size_t)(e - win->entries);
+    op->new_val = arg->new_key;
+    op->new_len = arg->new_len;
+    op->old_val = arg->old_key;
+    op->old_len = arg->old_len;
+    op->kf_slot = arg->kf_slot;
+    op->sync_after = arg->sync_after;
+    return 0;
+}
+
+int bitmap_prepare_window_apply(BitmapPrepareWindow *win) {
+    int rc = 0;
+    for (size_t i = 0; i < win->n_ops; i++) {
+        BitmapWindowOp *op = &win->ops[i];
+        BitmapShard *bm = (BitmapShard *)win->entries[op->entry_idx].bm;
+        if (!bm) continue;
+        if (bitmap_apply_grow_for_slot(bm, op->kf_slot) != 0) {
+            rc = -1;
+            continue;
+        }
+        if (op->old_val) {
+            if (bm_clear(bm, op->old_val, op->old_len, op->kf_slot) != 0) rc = -1;
+        }
+        if (op->new_val) {
+            if (bm_set(bm, op->new_val, op->new_len, op->kf_slot) != 0) rc = -1;
+        }
+        if (op->sync_after) {
+            if (bm_sync(bm) != 0) rc = -1;
+        }
+    }
+    for (size_t i = 0; i < win->n_entries; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->bm) { bm_close((BitmapShard *)e->bm); e->bm = NULL; }
+        free(e->pending);
+        e->pending = NULL;
+    }
+    win->n_entries = 0;
+    win->n_ops = 0;
+    return rc;
+}
+
+void bitmap_prepare_window_abort(BitmapPrepareWindow *win) {
+    for (size_t i = 0; i < win->n_entries; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->bm) { bm_close((BitmapShard *)e->bm); e->bm = NULL; }
+        free(e->pending);
+        e->pending = NULL;
+    }
+    win->n_entries = 0;
+    win->n_ops = 0;
+}
+
+void bitmap_prepare_window_free(BitmapPrepareWindow *win) {
+    if (!win) return;
+    bitmap_prepare_window_abort(win);
+    free(win->entries);
+    free(win->ops);
+    win->entries = NULL;
+    win->ops = NULL;
+    win->cap_entries = 0;
+    win->cap_ops = 0;
+}
+
+void bitmap_prepare_window_checkpoint(const BitmapPrepareWindow *win,
+                                      BitmapWindowCheckpoint *cp) {
+    cp->n_ops = win->n_ops;
+    cp->n_entries = win->n_entries;
+    for (size_t i = 0; i < win->n_entries && i < MAX_FIELDS; i++)
+        cp->npending[i] = win->entries[i].npending;
+}
+
+void bitmap_prepare_window_rollback(BitmapPrepareWindow *win,
+                                    const BitmapWindowCheckpoint *cp) {
+    win->n_ops = cp->n_ops;
+    for (size_t i = 0; i < cp->n_entries && i < win->n_entries && i < MAX_FIELDS; i++)
+        win->entries[i].npending = cp->npending[i];
+    /* Entries opened for the first time by this record (didn't exist at
+       checkpoint time) had no pending values before it either. */
+    for (size_t i = cp->n_entries; i < win->n_entries; i++)
+        win->entries[i].npending = 0;
 }
 
 /* Delete from index — uses B+ tree */
@@ -538,6 +827,7 @@ typedef struct {
     uint8_t *val;               /* heap-owned bytes (index-key encoding); freed by caller */
     size_t vlen;
     const uint8_t *hash16;
+    int sync_after;
     int out_error;
     int out_errno;
 } IndexThreadArg;
@@ -547,6 +837,15 @@ void *index_thread_fn(void *arg) {
     a->out_error = write_index_entry(a->db_root, a->object, a->field,
                                      a->splits, a->val, a->vlen, a->hash16);
     a->out_errno = a->out_error ? errno : 0;
+    if (!a->out_error && a->sync_after) {
+        int shard = idx_shard_for_hash(a->hash16, a->splits);
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object, a->field, shard);
+        if (btree_sync_path(idx_path) != 0) {
+            a->out_error = -2;
+            a->out_errno = errno;
+        }
+    }
     return NULL;
 }
 
@@ -614,7 +913,7 @@ char *build_composite_value(const char *field_name, const char *json_value) {
 int index_parallel(const char *db_root, const char *object, int splits,
                    const char *value, const uint8_t hash16[16],
                    char fields[][256], int nfields,
-                   const enum IndexType *types) {
+                   const enum IndexType *types, int sync_after) {
     if (nfields <= 0) return 0;
 
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -768,6 +1067,7 @@ int index_parallel(const char *db_root, const char *object, int splits,
         args[tcount].val = key_buf;
         args[tcount].vlen = key_len;
         args[tcount].hash16 = hash16;
+        args[tcount].sync_after = sync_after;
         args[tcount].out_error = 0;
         args[tcount].out_errno = 0;
         tcount++;

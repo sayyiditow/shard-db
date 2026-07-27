@@ -103,6 +103,11 @@ typedef struct __attribute__((packed)) {
 
 #define BT_PAGE_DATA_START (sizeof(BtPageHeader))
 
+/* Insert results for marker-replay idempotence */
+#define BT_INSERT_NO_SPLIT   (-1)
+#define BT_INSERT_SPLIT       0
+#define BT_INSERT_DUPLICATE   1
+
 /* Callback for search/range results: return 0 to continue, -1 to stop early */
 typedef int (*bt_result_cb)(const char *value, size_t vlen,
                             const uint8_t *hash16, void *ctx);
@@ -116,6 +121,12 @@ int btree_insert(const char *path, const char *value, size_t vlen,
 /* Delete entry matching value + hash. */
 int btree_delete(const char *path, const char *value, size_t vlen,
                  const uint8_t hash[BT_HASH_SIZE]);
+
+/* Synchronously fdatasync the btree file at `path`. Acquires the writer
+   lock for that path, calls fdatasync on its fd, releases. Used by the
+   marker-governed CRUD path to make index mutations durable before the
+   marker clear. Not used by index builds/reindex. */
+int btree_sync_path(const char *path);
 
 /* Search for all entries matching value exactly. Calls cb for each. */
 void btree_search(const char *path, const char *value, size_t vlen,

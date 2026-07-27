@@ -272,11 +272,7 @@ static int bench_kv_run(void)
         free(resp); resp = NULL;
     }
 
-    tc_request(tc,
-        "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
-        &resp);
-    printf("SIZE after JSON insert: %s\n", resp ? resp : "(err)");
-    free(resp); resp = NULL;
+    bench_print_object_stats(tc, "default", "kvbench", "AFTER JSON INSERT");
 
     /* ---- 4. Truncate + BULK INSERT CSV — captured into table --------- */
     tc_request(tc,
@@ -295,11 +291,7 @@ static int bench_kv_run(void)
     }
     free(csv_buf); csv_buf = NULL;
 
-    tc_request(tc,
-        "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
-        &resp);
-    printf("SIZE after CSV insert:  %s\n\n", resp ? resp : "(err)");
-    free(resp); resp = NULL;
+    bench_print_object_stats(tc, "default", "kvbench", "AFTER CSV INSERT");
 
     /* ---- BULK INSERT throughput table -------------------------------- */
     {
@@ -448,11 +440,7 @@ static int bench_kv_run(void)
         delete_p50 = bench_hist_p50_ns(&h);
         free(samples);
 
-        tc_request(tc,
-            "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"kvbench\"}",
-            &resp);
-        printf("SIZE after DELETE x10000: %s\n\n", resp ? resp : "(err)");
-        free(resp); resp = NULL;
+        bench_print_object_stats(tc, "default", "kvbench", "AFTER DELETE x10000");
     }
 
     /* ---- Single-conn latency table ----------------------------------- */

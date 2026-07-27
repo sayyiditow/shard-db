@@ -492,6 +492,8 @@ typedef struct {
 } SlowQueryEntry;
 uint64_t now_ms(void);
 uint64_t now_ms_coarse(void);
+uint64_t now_us(void);
+void commit_lock_hold_record(uint64_t t0_us, const char *dir, const char *object);
 
 static inline void durability_mark_dirty(_Atomic int *dirty,
                                          _Atomic uint64_t *dirty_since_ms) {
@@ -575,16 +577,19 @@ typedef enum {
 } BgRuntimeMode;
 
 int durability_msync(void *addr, size_t len);
+int durability_msync_range(void *base, size_t offset, size_t len);
 int durability_flush_dirty(_Atomic int *dirty,
                            _Atomic uint64_t *dirty_since_ms,
                            void *addr, size_t len);
 void *durability_sync_thread(void *arg);
+void durability_test_pause(const char *data_dir, const char *phase);
 int bg_threads_start(struct ShardDb *db, BgRuntimeMode mode);
 void bg_threads_stop(struct ShardDb *db);
 
 #ifdef TEST_BUILD
 void durability_test_msync_reset(void);
 void durability_test_msync_fail_next(int count, int err);
+void durability_test_msync_fail_on_call(int call_number, int err);
 void durability_test_msync_counts(int *succeeded, int *failed);
 void durability_test_sync_one_pass(struct ShardDb *db, int interval_ms,
                                    DurabilitySyncStats *stats);
@@ -957,7 +962,7 @@ int delete_index_entry(const char *db_root, const char *object, const char *fiel
 int index_parallel(const char *db_root, const char *object, int splits,
                    const char *value, const uint8_t hash16[16],
                    char fields[][256], int nfields,
-                   const enum IndexType *types);
+                   const enum IndexType *types, int sync_after);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
 
@@ -1414,8 +1419,118 @@ typedef struct {
                                      -1 = bitmap dict cap exceeded; pre_commit walks
                                      args[] after parallel_for and aborts the write. */
     int            out_errno;     /* errno captured on cache/I/O failure */
+    int            sync_after;    /* set by CRUD pre_commit: sync btree/bitmap file
+                                     after mutation via fdatasync. Index builds/
+                                     reindex leave this 0. */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
+
+/* ── Bitmap prepare/apply split ──────────────────────────────────────────
+   Closes the cap-check-then-apply race without transferring rwlock-owned
+   handles across threads: every BitmapShard writer handle opened by
+   add() is held (rwlock stays locked) until the same call stack's
+   apply()/abort() closes it — i.e. everything here must run on one
+   thread, never split across a parallel_for boundary. That continuous
+   hold is what makes the cap check race-free; see index.c. */
+typedef struct {
+    char           field[128];
+    int            kf_shard;
+    void          *bm;          /* opaque BitmapShard *, writer handle */
+    const uint8_t *new_val;
+    size_t         new_len;
+    const uint8_t *old_val;
+    size_t         old_len;
+    uint32_t       kf_slot;
+    int            sync_after;
+} BitmapPrepareEntry;
+
+typedef struct {
+    BitmapPrepareEntry *entries;
+    size_t              n;
+    size_t              cap;
+} BitmapPrepareSet;
+
+int  bitmap_prepare_set_init(BitmapPrepareSet *set, size_t max_entries);
+/* Returns 0 (staged), -1 (cap exceeded — err_field filled with the
+   offending field name), -2 (I/O/OOM error). Never mutates on-disk state. */
+int  bitmap_prepare_set_add(BitmapPrepareSet *set, const UpdateIdxArg *arg,
+                            char *err_field, size_t err_field_len);
+/* Applies every staged entry (clear/set/sync) and closes all handles,
+   even on partial failure. Returns 0 on full success, -1 if any entry's
+   bm_set failed (genuine I/O error post-cap-check — not expected in
+   normal operation since the cap was already validated under the same
+   continuously-held writer lock). */
+int  bitmap_prepare_set_apply(BitmapPrepareSet *set);
+/* Closes every staged handle without mutating. */
+void bitmap_prepare_set_abort(BitmapPrepareSet *set);
+void bitmap_prepare_set_free(BitmapPrepareSet *set);
+
+/* Window-scoped variant for bulk: opens each (field, kf_shard) bitmap at
+   most once, and tracks pending (not-yet-on-disk) distinct values per
+   entry so multiple records in the same bulk window can share one cap
+   budget without any of them touching disk until apply. */
+typedef struct {
+    const uint8_t *value;
+    size_t         vlen;
+} BitmapPendingValue;
+
+typedef struct {
+    char                field[128];
+    int                 kf_shard;
+    void               *bm;         /* opaque BitmapShard *, writer handle */
+    BitmapPendingValue *pending;
+    size_t              npending;
+    size_t              pending_cap;
+} BitmapWindowEntry;
+
+typedef struct {
+    size_t         entry_idx;
+    const uint8_t *new_val;
+    size_t         new_len;
+    const uint8_t *old_val;
+    size_t         old_len;
+    uint32_t       kf_slot;
+    int            sync_after;
+} BitmapWindowOp;
+
+typedef struct {
+    BitmapWindowEntry *entries;
+    size_t              n_entries, cap_entries;
+    BitmapWindowOp     *ops;
+    size_t              n_ops, cap_ops;
+} BitmapPrepareWindow;
+
+int  bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields,
+                                size_t max_records);
+/* Stages one record's bitmap mutation for `arg->field` at `arg->kf_shard`.
+   Returns 0 (staged), 1 (this record would exceed the field's cap — the
+   caller marks only this record rejected and does NOT call add() again
+   for it), -2 (I/O/OOM error). Never mutates on-disk state. */
+int  bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg,
+                               char *err_field, size_t err_field_len);
+/* Applies every staged op in the order added, then closes all handles. */
+int  bitmap_prepare_window_apply(BitmapPrepareWindow *win);
+void bitmap_prepare_window_abort(BitmapPrepareWindow *win);
+void bitmap_prepare_window_free(BitmapPrepareWindow *win);
+
+/* Per-record undo point within a window: a record can stage ops for some
+   of its bitmap fields and then get rejected by a later field's cap
+   check. checkpoint()/rollback() let the caller unwind exactly that
+   record's ops (win->n_ops truncated) and pending-value counts (restored
+   per entry) so a rejected record leaves zero staged bitmap side effects
+   — matching the already-established tg_ops truncation pattern for
+   trigram fields. Take the checkpoint before processing a record's first
+   bitmap field. cap_entries is bounded by MAX_FIELDS (one window entry
+   per indexed field). */
+typedef struct {
+    size_t n_ops;
+    size_t n_entries;
+    size_t npending[MAX_FIELDS];
+} BitmapWindowCheckpoint;
+void bitmap_prepare_window_checkpoint(const BitmapPrepareWindow *win,
+                                      BitmapWindowCheckpoint *cp);
+void bitmap_prepare_window_rollback(BitmapPrepareWindow *win,
+                                    const BitmapWindowCheckpoint *cp);
 /* Release this thread's cached bitmap shard handle, if any. Called at
    batch boundaries (end of bulk worker, end of pre_commit's parallel_for)
    to drop fds and ensure subsequent reindex/wipe operations don't leave

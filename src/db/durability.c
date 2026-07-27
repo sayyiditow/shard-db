@@ -1,6 +1,7 @@
 #include "types.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -9,6 +10,8 @@
 #ifdef TEST_BUILD
 static pthread_mutex_t g_durability_msync_test_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_durability_msync_fail_remaining;
+static int g_durability_msync_fail_on_call;
+static int g_durability_msync_call_count;
 static int g_durability_msync_fail_errno;
 static int g_durability_msync_succeeded;
 static int g_durability_msync_failed;
@@ -16,6 +19,8 @@ static int g_durability_msync_failed;
 void durability_test_msync_reset(void) {
     pthread_mutex_lock(&g_durability_msync_test_lock);
     g_durability_msync_fail_remaining = 0;
+    g_durability_msync_fail_on_call = 0;
+    g_durability_msync_call_count = 0;
     g_durability_msync_fail_errno = 0;
     g_durability_msync_succeeded = 0;
     g_durability_msync_failed = 0;
@@ -25,6 +30,15 @@ void durability_test_msync_reset(void) {
 void durability_test_msync_fail_next(int count, int err) {
     pthread_mutex_lock(&g_durability_msync_test_lock);
     g_durability_msync_fail_remaining = count > 0 ? count : 0;
+    g_durability_msync_fail_on_call = 0;
+    g_durability_msync_fail_errno = err > 0 ? err : EIO;
+    pthread_mutex_unlock(&g_durability_msync_test_lock);
+}
+
+void durability_test_msync_fail_on_call(int call_number, int err) {
+    pthread_mutex_lock(&g_durability_msync_test_lock);
+    g_durability_msync_fail_remaining = 0;
+    g_durability_msync_fail_on_call = call_number > 0 ? call_number : 0;
     g_durability_msync_fail_errno = err > 0 ? err : EIO;
     pthread_mutex_unlock(&g_durability_msync_test_lock);
 }
@@ -40,8 +54,13 @@ void durability_test_msync_counts(int *succeeded, int *failed) {
 int durability_msync(void *addr, size_t len) {
 #ifdef TEST_BUILD
     pthread_mutex_lock(&g_durability_msync_test_lock);
-    if (g_durability_msync_fail_remaining > 0) {
-        g_durability_msync_fail_remaining--;
+    g_durability_msync_call_count++;
+    if (g_durability_msync_fail_remaining > 0 ||
+        (g_durability_msync_fail_on_call > 0 &&
+         g_durability_msync_call_count == g_durability_msync_fail_on_call)) {
+        if (g_durability_msync_fail_remaining > 0)
+            g_durability_msync_fail_remaining--;
+        g_durability_msync_fail_on_call = 0;
         g_durability_msync_failed++;
         int injected_errno = g_durability_msync_fail_errno;
         pthread_mutex_unlock(&g_durability_msync_test_lock);
@@ -63,6 +82,41 @@ int durability_msync(void *addr, size_t len) {
 #endif
 
     return rc;
+}
+
+int durability_msync_range(void *base, size_t offset, size_t len) {
+    static long page_size = 0;
+    if (!base || len == 0) { errno = EINVAL; return -1; }
+    if (page_size == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) return -1;
+        page_size = ps;
+    }
+    uintptr_t addr = (uintptr_t)base + offset;
+    uintptr_t aligned = addr & ~((uintptr_t)page_size - 1);
+    size_t front_pad = (size_t)(addr - aligned);
+    size_t sync_len = len + front_pad;
+    sync_len = (sync_len + (size_t)page_size - 1) & ~((size_t)page_size - 1);
+    return durability_msync((void *)aligned, sync_len);
+}
+
+void durability_test_pause(const char *data_dir, const char *phase) {
+    if (!g_db || g_durability_test_pause_ms <= 0 ||
+        strcmp(g_durability_test_pause_phase, phase) != 0) return;
+    char marker[PATH_MAX];
+    int n = snprintf(marker, sizeof(marker), "%s/.durability-test-%s.active",
+                     data_dir, phase);
+    if (n < 0 || n >= (int)sizeof(marker)) return;
+    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+    int remaining = g_durability_test_pause_ms;
+    while (remaining > 0) {
+        int slice = remaining > 100 ? 100 : remaining;
+        struct timespec ts = { slice / 1000, (long)(slice % 1000) * 1000000L };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        remaining -= slice;
+    }
+    unlink(marker);
 }
 
 static void durability_restore_earliest(_Atomic uint64_t *dirty_since_ms,

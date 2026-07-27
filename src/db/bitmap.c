@@ -609,6 +609,11 @@ uint32_t bm_max_values(const BitmapShard *bm) {
     return bm ? bm->hdr.max_values : 0;
 }
 
+int bm_sync(BitmapShard *bm) {
+    if (!bm || !bm->writer || bm->fd < 0) { errno = EINVAL; return -1; }
+    return fdatasync(bm->fd);
+}
+
 void bm_close(BitmapShard *bm) {
     if (!bm) return;
     if (bm->slot >= 0 && g_bm_cache) {
@@ -628,6 +633,18 @@ void bm_close(BitmapShard *bm) {
 }
 
 /* ─────────────────────── set / clear / test ─────────────────────── */
+
+int bm_dict_would_exceed_cap(BitmapShard *bm, const uint8_t *value, size_t vlen) {
+    if (!bm) { errno = EINVAL; return -1; }
+    if (vlen > 0xffff) return -1;
+    if (bm_dict_lookup(bm, value, vlen) >= 0) return 0; /* already present */
+    return (bm->hdr.n_values >= bm->hdr.max_values) ? 1 : 0;
+}
+
+int bm_dict_contains(BitmapShard *bm, const uint8_t *value, size_t vlen) {
+    if (!bm) return 0;
+    return bm_dict_lookup(bm, value, vlen) >= 0;
+}
 
 /* Add a new value to the dictionary by rewriting the file. Returns the
    new value index, or -1 on failure (including the BM_MAX_VALUES cap).
