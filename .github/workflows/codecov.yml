@@ -46,7 +46,7 @@ jobs:
         # run-all now defaults to parallel (--jobs unset = nproc) since
         # the parallel test runner landed, so --jobs 1 must be passed
         # explicitly here to keep this step actually sequential.
-        run: ./build/bin/shard-db-test run-all --jobs 2
+        run: ./build/bin/shard-db-test run-all --jobs 1
 
       - name: Collect coverage
         run: |

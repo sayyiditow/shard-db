@@ -50,7 +50,7 @@ jobs:
         # --jobs pinned low: ASan/UBSan instrumentation is CPU/memory
         # heavy per test case, and this runner is shared/weak — full-nproc
         # default parallelism caused contention-driven request timeouts.
-        run: ./build/bin/shard-db-test run-all --jobs 2
+        run: ./build/bin/shard-db-test run-all --jobs 1
 
       # If ASan/UBSan finds anything, it prints to stderr; each test case's
       # daemon-startup capture catches it. Grep the daemon logs once

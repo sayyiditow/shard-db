@@ -69,7 +69,7 @@ jobs:
         # thread pools, and produced a contention-driven SIGSEGV in an
         # unrelated pre-existing test (trigram executor) that would not
         # reproduce locally even pinned to 2 vCPUs.
-        run: ./build/bin/shard-db-test run-all --jobs 2
+        run: ./build/bin/shard-db-test run-all --jobs 1
 
       - name: Package binary
         # Tag artifact uploads by os+arch so binaries from different
