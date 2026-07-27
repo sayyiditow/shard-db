@@ -46,7 +46,7 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite under TSan
-        run: ./build/bin/shard-db-test run-all --jobs 1
+        run: ./build/bin/shard-db-test run-all --jobs 2
 
       - name: Fail if any TSan findings escaped
         run: |

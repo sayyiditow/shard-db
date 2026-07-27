@@ -2430,7 +2430,7 @@ static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
         ids[nids++] = (uint32_t)batch_id;
     }
     closedir(d);
-    qsort(ids, nids, sizeof(*ids), batch_marker_id_cmp);
+    if (nids) qsort(ids, nids, sizeof(*ids), batch_marker_id_cmp);
 
     int rc = 0;
     for (size_t i = 0; i < nids && rc == 0; i++) {

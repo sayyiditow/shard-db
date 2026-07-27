@@ -1,9 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
-#include "bitmap.h"
 #include "query_internal.h"
 #include <dirent.h>
-#include <math.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>

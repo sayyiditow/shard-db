@@ -13,7 +13,6 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
-#include "types.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,10 +34,13 @@ static const char *order_of(TestEnv *env, const char *obj,
     return order;
 }
 
+#define SPARSE_PREFETCH_N 20000
+#define SPARSE_PREFETCH_BUF_SIZE (SPARSE_PREFETCH_N * 80 + 4096)
+
 static int test_cursor_sparse_prefetch(void) {
     TestEnv env; TestClient *tc; char *resp = NULL;
     if (test_env_start(&env) != 0) { ASSERT_TRUE(0, "spawn"); return 1; }
-    TestClientCfg cfg = { .port = env.port };
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 60000 };
     tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
 
@@ -57,17 +59,34 @@ static int test_cursor_sparse_prefetch(void) {
        the order-by index (test hook uses limit=0 → want=1). The quadratic:
          K² = 490000  >  want*N = 1*20000 = 20000  → walk
        But the sparsity formula:
-         K³ = 343000000  <  want*N² = 1*400000000 = 400000000  → sort */
-    int N = 20000;
+         K³ = 343000000  <  want*N² = 1*400000000 = 400000000  → sort
+
+       Fixture load uses a single bulk-insert (not N sequential single-record
+       inserts): each single insert now pays a synchronous marker+fsync
+       durability barrier on this indexed object, and 20000 of those blew
+       past the 180s per-test watchdog under ASan. bulk-insert batches the
+       durability barrier once for the whole window, so it stays fast while
+       exercising the same fixture shape. */
+    int N = SPARSE_PREFETCH_N;
     int rare_K = 700;
+    char *bulk = malloc(SPARSE_PREFETCH_BUF_SIZE);
+    ASSERT_NOT_NULL(bulk, "malloc bulk-insert buffer");
+    int off = 0;
+    off += snprintf(bulk + off, SPARSE_PREFETCH_BUF_SIZE - off,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"sp\",\"object\":\"spobj\",\"records\":[");
     for (int i = 0; i < N; i++) {
-        char req[256];
         const char *type = (i < rare_K) ? "rare" : "common";
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"insert\",\"dir\":\"sp\",\"object\":\"spobj\",\"key\":\"k%05d\","
-            "\"value\":{\"type\":\"%s\",\"score\":%d}}", i, type, i);
-        tc_request(tc, req, &resp); free(resp); resp=NULL;
+        int rem = SPARSE_PREFETCH_BUF_SIZE - off;
+        if (rem > 0) off += snprintf(bulk + off, (size_t)rem,
+            "%s{\"key\":\"k%05d\",\"value\":{\"type\":\"%s\",\"score\":%d}}",
+            i ? "," : "", i, type, i);
     }
+    { int rem = SPARSE_PREFETCH_BUF_SIZE - off;
+      if (rem > 0) off += snprintf(bulk + off, (size_t)rem, "]}"); }
+    tc_request(tc, bulk, &resp);
+    ASSERT_CONTAINS(resp, "\"inserted\":20000", "bulk-insert: 20000 inserted");
+    free(resp); resp=NULL;
+    free(bulk);
 
     /* SPARSE BITMAP: type=rare (K=700) with order_by score.
      * Quadratic formula says walk, but K³ < want*N² overrides to sort. */
