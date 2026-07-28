@@ -82,6 +82,8 @@ extern void compute_hash_raw(const char *key, size_t key_len,
     }                                                              \
 } while (0)
 
+#define BULK_COMMIT_MAX_RECORDS 256
+
 static int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
 static uint32_t path_hash(const char *s) {
@@ -646,6 +648,203 @@ void kfcache_release(SlotcaskKfHandle *h) {
     h->map = NULL;
     h->map_size = 0;
     h->capacity = 0;
+}
+
+/* ── Marker file helpers (durability write-ordering intent) ── */
+
+/* Set once by storage.c (via __attribute__((constructor))) before any
+   recovery sweep can run. See declaration/rationale in
+   shard_db_internal.h. */
+RecoveryIndexDiffFn g_recovery_index_diff_fn = NULL;
+
+static void kf_marker_path(char *buf, size_t cap, const char *data_dir,
+                           int kf_shard) {
+    snprintf(buf, cap, "%s/data/kf/%03x_marker.dat",
+             data_dir, (unsigned)kf_shard);
+}
+
+static void kf_marker_dir_path(char *buf, size_t cap, const char *data_dir) {
+    snprintf(buf, cap, "%s/data/kf", data_dir);
+}
+
+static int fsync_dir(const char *dir_path) {
+    int dfd = open(dir_path, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return -1;
+    int rc = fsync(dfd);
+    close(dfd);
+    return rc;
+}
+
+/* Accumulate time spent in marker and targeted kf durability barriers. */
+static void commit_sync_us_record(uint64_t t0) {
+    if (g_db) __atomic_add_fetch(&g_commit_sync_us_total, now_us() - t0, __ATOMIC_RELAXED);
+}
+
+static int kf_marker_write_impl(const char *data_dir, int kf_shard,
+                    const KfMarkerSlot *slot) {
+    char path[PATH_MAX], dpath[PATH_MAX];
+    KfMarkerSlot durable = *slot;
+    durable.checksum = XXH32(&durable, offsetof(KfMarkerSlot, checksum), 0);
+    kf_marker_path(path, sizeof(path), data_dir, kf_shard);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    ssize_t n = pwrite(fd, &durable, sizeof(durable), 0);
+    if (n != (ssize_t)sizeof(durable)) { close(fd); return -1; }
+    if (fsync(fd) != 0) { close(fd); return -1; }
+    close(fd);
+    kf_marker_dir_path(dpath, sizeof(dpath), data_dir);
+    return fsync_dir(dpath);
+}
+
+int kf_marker_write(const char *data_dir, int kf_shard,
+                    const KfMarkerSlot *slot) {
+    uint64_t t0 = now_us();
+    int rc = kf_marker_write_impl(data_dir, kf_shard, slot);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+static int kf_marker_clear_impl(const char *data_dir, int kf_shard) {
+    char path[PATH_MAX], dpath[PATH_MAX];
+    kf_marker_path(path, sizeof(path), data_dir, kf_shard);
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    kf_marker_dir_path(dpath, sizeof(dpath), data_dir);
+    return fsync_dir(dpath);
+}
+
+int kf_marker_clear(const char *data_dir, int kf_shard) {
+    uint64_t t0 = now_us();
+    int rc = kf_marker_clear_impl(data_dir, kf_shard);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+/* Return 0=valid, 1=absent, 2=zero-byte, -1=corrupt/I/O. */
+int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out) {
+    char path[PATH_MAX];
+    struct stat st;
+    kf_marker_path(path, sizeof(path), data_dir, kf_shard);
+    if (stat(path, &st) != 0) return errno == ENOENT ? 1 : -1;
+    if (st.st_size == 0) return 2;
+    if (st.st_size != (off_t)sizeof(*out)) { errno = EILSEQ; return -1; }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = pread(fd, out, sizeof(*out), 0);
+    int saved = errno;
+    close(fd);
+    if (n != (ssize_t)sizeof(*out)) { errno = n < 0 ? saved : EILSEQ; return -1; }
+    if (out->magic != KF_MARKER_MAGIC ||
+        out->checksum != XXH32(out, offsetof(KfMarkerSlot, checksum), 0)) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+/* Sync only the pages containing the given kf slots, while h's writer
+   lock remains held. header_changed: sync the 24-byte shard header too.
+   h must be a writer-acquired handle with non-NULL hdr and map. */
+static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
+                              const size_t *slots, size_t nslots,
+                              int header_changed) {
+    if (!h || !h->writer || !h->hdr || (!slots && nslots)) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < nslots; i++) {
+        if (slots[i] >= h->capacity) { errno = EINVAL; return -1; }
+        size_t off = SLOTCASK_KF_HDR_SIZE + slots[i] * sizeof(*h->map);
+        if (durability_msync_range(h->hdr, off, sizeof(*h->map)) < 0)
+            return -1;
+    }
+    return !header_changed ||
+           durability_msync_range(h->hdr, 0, SLOTCASK_KF_HDR_SIZE) == 0
+               ? 0 : -1;
+}
+
+int kfcache_sync_slots_locked(SlotcaskKfHandle *h,
+                              const size_t *slots, size_t nslots,
+                              int header_changed) {
+    uint64_t t0 = now_us();
+    int rc = kfcache_sync_slots_locked_impl(h, slots, nslots, header_changed);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+/* data_dir is always eff_root/object (tenant dir + object name — see
+   AGENTS.md storage model), so both can be recovered by splitting on the
+   final path separator rather than threading extra fields through
+   SlotcaskDb. Object names are validated via valid_filename() and never
+   contain '/', so this split is unambiguous. */
+static void split_data_dir(const char *data_dir, char *eff_root, size_t eff_root_len,
+                            char *object, size_t object_len) {
+    const char *slash = strrchr(data_dir, '/');
+    if (!slash) {
+        if (eff_root_len) eff_root[0] = '\0';
+        snprintf(object, object_len, "%s", data_dir);
+        return;
+    }
+    size_t root_len = (size_t)(slash - data_dir);
+    if (root_len >= eff_root_len) root_len = eff_root_len - 1;
+    memcpy(eff_root, data_dir, root_len);
+    eff_root[root_len] = '\0';
+    snprintf(object, object_len, "%s", slash + 1);
+}
+
+/* Retained-marker gate: check for existing marker before allowing a new write.
+   Must be called while kf writer lock is held, before any marker is created.
+   Returns 0 to proceed with new write, -1 to fail and abort.
+   On success, caller may proceed; if replay was needed, marker is now cleared. */
+static int kf_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
+                           const char *data_dir) {
+    KfMarkerSlot marker;
+    int rc = kf_marker_read(data_dir, kf_shard, &marker);
+    if (rc == 1) {
+        /* No marker present (common case) — proceed. */
+        return 0;
+    }
+    if (rc == 2) {
+        /* Zero-byte torn create (crash before fsync) — safe to unlink. */
+        return kf_marker_clear(data_dir, kf_shard);
+    }
+    if (rc == 0) {
+        /* Valid marker present — replay it to completion. */
+        char eff_root[PATH_MAX], object[256];
+        split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
+        int replay_rc = kf_marker_replay_locked(eff_root, object, data_dir, kf_shard, kh, &marker);
+        if (replay_rc != 0) return -1;
+        /* Replay succeeded and cleared marker. */
+        return 0;
+    }
+    /* rc == -1: corrupt marker (bad size/magic/checksum) or I/O error.
+       Leave it untouched and fail closed — this signals an operator-visible
+       issue that must be investigated. */
+    return -1;
+}
+
+/* A marker is the durable commit-intent point: once its fsync has returned,
+   the operation it describes is never rolled back. If a kf or index step
+   fails afterward, the only correct recovery is the same synchronous replay
+   startup recovery uses, run here while the kf writer lock is still held.
+   If replay still cannot converge, the daemon must not silently discard the
+   marker or hand the caller an ordinary failure for an operation whose
+   commit-intent is already durable — it fails closed so the next start's
+   mandatory recovery sweep finishes the job. */
+static int kf_marker_replay_current(const char *data_dir, int kf_shard,
+                                     SlotcaskKfHandle *kh,
+                                     const KfMarkerSlot *marker) {
+    char eff_root[PATH_MAX], object[256];
+    split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
+    return kf_marker_replay_locked(eff_root, object, data_dir, kf_shard, kh, marker);
+}
+
+static void kf_marker_fail_closed(const char *data_dir, int kf_shard, const char *why) {
+    LOG_ERROR(LOG_SUB_SLOTCASK,
+              "commit-intent marker for kf shard %03x under %s could not be "
+              "replayed post-fsync (%s); terminating so the next start's "
+              "recovery sweep completes it rather than serving unknown state",
+              kf_shard, data_dir, why);
+    abort();
 }
 
 /* Fast-path kfcache acquire for read-only callers that hold a SlotRef.
@@ -1570,65 +1769,52 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
     return NULL;
 }
 
-/* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
-   reuse, repurposes that slot. Before probing, checks the per-shard
-   header.total — when it crosses 75 % of capacity, the shard doubles via
-   kfcache_resplit_locked. Header reads/writes are plain mmap loads/stores
-   under the kf wrlock — no atomics, no syscalls. */
-static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
-                      uint8_t stream_id, uint16_t file_id, uint32_t offset,
-                      const void *key, size_t klen, const char *data_dir,
-                      size_t *used_delta, size_t *out_slot) {
+/* Non-mutating probe result for a not-yet-committed new-key insert. Produced
+   by kf_plan_insert_slot / kf_plan_window_insert_slot, consumed by
+   kf_commit_planned_slot. Carries the (hash, key, klen) that produced it so
+   window-local duplicate detection can compare in-memory instead of doing
+   I/O via verify_stored_key. */
+typedef struct {
+    size_t      target_slot;
+    int         reused_tomb;   /* 1 = target was a tombstone (deleted--), 0 = fresh (total++) */
+    uint8_t     hash[16];
+    const void *key;           /* borrowed; valid for the caller's window/call lifetime */
+    size_t      klen;
+} KfInsertPlan;
+
+/* Non-mutating probe for a brand-new kf entry. Finds the slot a subsequent
+   kf_commit_planned_slot call should write to, without touching the table.
+   Returns 0 (planned into *out_plan), 1 (key already live — duplicate), or
+   -1 (shard full / error). Triggers the same load-based resplit as the old
+   kf_put_new — resplit only grows capacity/reshapes existing entries, it
+   never touches this key's own (not-yet-existing) entry, so doing it during
+   planning is safe. */
+static int kf_plan_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
+                                const void *key, size_t klen, const char *data_dir,
+                                KfInsertPlan *out_plan) {
     (void)db;  /* db param retained for ABI; per-shard load lives in the header */
-    /* Load-triggered resplit. The header tracks `total` (= live + tombstoned),
-       which matches the linear-probe pressure that drives chain length —
-       tombstones still force probing past them on lookup. 75 % trigger keeps
-       average probe chains around 4 (textbook). No upper cap: streaming
-       resplit has flat memory cost and shard-stats surfaces operator-visible
-       skew if a single shard ever becomes unwieldy. */
     if (kh->hdr) {
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
         if (cap > 0 && total * 4 >= cap * 3) {
             (void)kfcache_resplit_locked(kh, kh->capacity * 2);
-            /* Resplit failure isn't fatal — fall through and try the put on
-               the old capacity. If THAT fails too (truly full), caller
-               bubbles the error up. */
         }
     }
 
     size_t cap = kh->capacity;
-    /* Defensive: kfcache_resplit_locked never sets capacity to 0 on
-       failure (success path is the only writer), but Coverity can't
-       trace that across the call (CID 1693834: divide-by-zero in
-       kf_slot_for below). Bail explicitly so a future regression in
-       resplit can't silently turn into UB. */
     if (cap == 0) return -1;
     SlotcaskKfEntry *kf = kh->map;
-    SlotcaskKfHeader *hdr = kh->hdr;
     size_t start = kf_slot_for(hash, cap);
     size_t first_tomb = (size_t)-1;
     for (size_t i = 0; i < cap; i++) {
         size_t slot = (start + i) % cap;
         SlotcaskKfEntry *e = &kf[slot];
         if (e->flag == 0) {
-            /* End of probe chain. Insert at first-tombstone if we saw one
-               (decrements deleted; total stays — slot was already counted),
-               otherwise at this empty slot (increments total). */
-            size_t target_idx = (first_tomb != (size_t)-1) ? first_tomb : slot;
-            SlotcaskKfEntry *t = &kf[target_idx];
-            int reused_tomb = (first_tomb != (size_t)-1);
-            memcpy(t->hash, hash, 16);
-            t->stream_id = stream_id;
-            t->file_id = file_id;
-            t->offset = offset;
-            __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
-            if (hdr) {
-                if (reused_tomb) hdr->deleted--;   /* tombstone reclaimed */
-                else             hdr->total++;    /* fresh slot occupied */
-            }
-            (*used_delta)++;
-            if (out_slot) *out_slot = target_idx;
+            out_plan->target_slot = (first_tomb != (size_t)-1) ? first_tomb : slot;
+            out_plan->reused_tomb = (first_tomb != (size_t)-1);
+            memcpy(out_plan->hash, hash, 16);
+            out_plan->key = key;
+            out_plan->klen = klen;
             return 0;
         }
         if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
@@ -1639,34 +1825,150 @@ static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[1
         }
         if (e->flag == 2 && memcmp(e->hash, hash, 16) == 0) {
             /* Same-key resurrection — reuse this exact slot, skip probe. */
-            e->stream_id = stream_id;
-            e->file_id = file_id;
-            e->offset = offset;
-            __atomic_store_n(&e->flag, 1, __ATOMIC_RELEASE);
-            if (hdr) hdr->deleted--;  /* tombstone reclaimed; total unchanged */
-            (*used_delta)++;
-            if (out_slot) *out_slot = slot;
+            out_plan->target_slot = slot;
+            out_plan->reused_tomb = 1;
+            memcpy(out_plan->hash, hash, 16);
+            out_plan->key = key;
+            out_plan->klen = klen;
             return 0;
         }
         if (e->flag == 2 && first_tomb == (size_t)-1) {
             first_tomb = slot;
         }
     }
-    /* Probed full chain without finding flag=0. If we saw a tombstone,
-       reuse it. Otherwise the table is genuinely full. */
     if (first_tomb != (size_t)-1) {
-        SlotcaskKfEntry *t = &kf[first_tomb];
-        memcpy(t->hash, hash, 16);
-        t->stream_id = stream_id;
-        t->file_id = file_id;
-        t->offset = offset;
-        __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
-        if (hdr) hdr->deleted--;  /* tombstone reclaimed */
-        (*used_delta)++;
-        if (out_slot) *out_slot = first_tomb;
+        out_plan->target_slot = first_tomb;
+        out_plan->reused_tomb = 1;
+        memcpy(out_plan->hash, hash, 16);
+        out_plan->key = key;
+        out_plan->klen = klen;
         return 0;
     }
     return -1;
+}
+
+/* Window-scoped variant of kf_plan_insert_slot: `reserved`/`nreserved` are
+   plans already produced earlier in the same not-yet-committed bulk window.
+   A slot claimed by an earlier plan is treated as occupied (matches the
+   post-commit table state those earlier plans will produce), and a
+   duplicate key within the window is detected in-memory (no I/O — the
+   duplicate's probe necessarily reaches the earlier plan's target_slot
+   first, since identical keys share the same hash and probe start). */
+static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
+                                       const uint8_t hash[16],
+                                       const void *key, size_t klen,
+                                       const char *data_dir,
+                                       const KfInsertPlan *reserved, size_t nreserved,
+                                       KfInsertPlan *out_plan) {
+    (void)db;
+    if (kh->hdr) {
+        uint64_t total = kh->hdr->total;
+        uint64_t cap = (uint64_t)kh->capacity;
+        if (cap > 0 && total * 4 >= cap * 3) {
+            (void)kfcache_resplit_locked(kh, kh->capacity * 2);
+        }
+    }
+
+    size_t cap = kh->capacity;
+    if (cap == 0) return -1;
+    SlotcaskKfEntry *kf = kh->map;
+    size_t start = kf_slot_for(hash, cap);
+    size_t first_tomb = (size_t)-1;
+    for (size_t i = 0; i < cap; i++) {
+        size_t slot = (start + i) % cap;
+
+        int reserved_here = 0;
+        for (size_t r = 0; r < nreserved; r++) {
+            if (reserved[r].target_slot != slot) continue;
+            reserved_here = 1;
+            if (memcmp(reserved[r].hash, hash, 16) == 0 &&
+                reserved[r].klen == klen &&
+                memcmp(reserved[r].key, key, klen) == 0) {
+                return 1; /* duplicate key within this window */
+            }
+            break;
+        }
+        if (reserved_here) continue; /* treat as occupied, keep probing */
+
+        SlotcaskKfEntry *e = &kf[slot];
+        if (e->flag == 0) {
+            out_plan->target_slot = (first_tomb != (size_t)-1) ? first_tomb : slot;
+            out_plan->reused_tomb = (first_tomb != (size_t)-1);
+            memcpy(out_plan->hash, hash, 16);
+            out_plan->key = key;
+            out_plan->klen = klen;
+            return 0;
+        }
+        if (e->flag == 1 && memcmp(e->hash, hash, 16) == 0) {
+            int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                       e->offset, key, klen);
+            if (km < 0) return -1;
+            if (km == 1) return 1;
+        }
+        if (e->flag == 2 && memcmp(e->hash, hash, 16) == 0) {
+            out_plan->target_slot = slot;
+            out_plan->reused_tomb = 1;
+            memcpy(out_plan->hash, hash, 16);
+            out_plan->key = key;
+            out_plan->klen = klen;
+            return 0;
+        }
+        if (e->flag == 2 && first_tomb == (size_t)-1) {
+            first_tomb = slot;
+        }
+    }
+    if (first_tomb != (size_t)-1) {
+        out_plan->target_slot = first_tomb;
+        out_plan->reused_tomb = 1;
+        memcpy(out_plan->hash, hash, 16);
+        out_plan->key = key;
+        out_plan->klen = klen;
+        return 0;
+    }
+    return -1;
+}
+
+/* Mutating write at a slot found by a prior kf_plan_insert_slot /
+   kf_plan_window_insert_slot call. Identical bookkeeping to the old
+   kf_put_new's write branches (tombstone reclaim vs fresh-slot occupy). */
+static void kf_commit_planned_slot(SlotcaskKfHandle *kh, const KfInsertPlan *plan,
+                                    uint8_t stream_id, uint16_t file_id, uint32_t offset,
+                                    size_t *used_delta, size_t *out_slot) {
+    SlotcaskKfEntry *kf = kh->map;
+    SlotcaskKfHeader *hdr = kh->hdr;
+    SlotcaskKfEntry *t = &kf[plan->target_slot];
+    memcpy(t->hash, plan->hash, 16);
+    t->stream_id = stream_id;
+    t->file_id = file_id;
+    t->offset = offset;
+    __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
+    if (hdr) {
+        if (plan->reused_tomb) hdr->deleted--;
+        else                   hdr->total++;
+    }
+    (*used_delta)++;
+    if (out_slot) *out_slot = plan->target_slot;
+}
+
+/* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
+   reuse, repurposes that slot. Before probing, checks the per-shard
+   header.total — when it crosses 75 % of capacity, the shard doubles via
+   kfcache_resplit_locked. Header reads/writes are plain mmap loads/stores
+   under the kf wrlock — no atomics, no syscalls.
+
+   Implemented as kf_plan_insert_slot (probe) + kf_commit_planned_slot
+   (write) so callers that need the two phases split around an index
+   prepare/apply boundary can call them separately; this composition keeps
+   every other existing caller byte-for-byte unaffected. */
+static int kf_put_new(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8_t hash[16],
+                      uint8_t stream_id, uint16_t file_id, uint32_t offset,
+                      const void *key, size_t klen, const char *data_dir,
+                      size_t *used_delta, size_t *out_slot) {
+    KfInsertPlan plan;
+    int rc = kf_plan_insert_slot(db, kh, hash, key, klen, data_dir, &plan);
+    if (rc != 0) return rc;
+    kf_commit_planned_slot(kh, &plan, stream_id, file_id, offset, used_delta, out_slot);
+    return 0;
 }
 
 /* Probe-chain iterator. Encapsulates the open-addressed walk so callers
@@ -1807,6 +2109,489 @@ static inline void kf_repoint_at_slot(SlotcaskKfHandle *kh, size_t slot,
     combo.parts.offset = new_offset;
     __atomic_store_n((uint64_t *)((uint8_t *)e + 16), combo.u64,
                      __ATOMIC_RELEASE);
+}
+
+/* Reconcile one marker entry while the shard writer lock is held.  Clearing
+   is deliberately owned by the caller: a batch marker contains many entries
+   and must never remove the unrelated single-marker filename. */
+static int kf_marker_replay_entry_locked(const char *eff_root, const char *object,
+                                         const char *data_dir, int kf_shard,
+                                         void *kh_opaque, const KfMarkerSlot *marker) {
+    SlotcaskKfHandle *kh = (SlotcaskKfHandle *)kh_opaque;
+
+    if (!kh || !kh->writer || !marker || !data_dir) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Step 1: read new record from segment. */
+    char seg_path[PATH_MAX];
+    seg_path_for(seg_path, data_dir, marker->new_stream_id, marker->new_file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, seg_path, 0, 0, 0) != 0) return -1;
+
+    const uint8_t *new_rec = h.map + marker->new_offset;
+    uint16_t new_klen = seg_rec_klen(new_rec);
+    uint32_t new_vlen = seg_rec_vlen(new_rec);
+    const uint8_t *new_key = new_rec + 24;
+    const uint8_t *new_value = new_key + new_klen;
+    uint8_t hash[16];
+    memcpy(hash, new_rec, 16);
+    (void)new_key; (void)new_klen;
+
+    /* Verify live flag */
+    if (__atomic_load_n(&new_rec[18], __ATOMIC_ACQUIRE) != 1) {
+        segcache_release(&h);
+        return -1;
+    }
+
+    /* Step 2: if update, read old record. Keep the segcache handle open —
+       old_value must stay valid through the index-diff call in steps 4-5
+       below, which reads raw bytes directly out of the mmap'd segment. */
+    SlotcaskSegHandle oh;
+    int oh_open = 0;
+    const uint8_t *old_value = NULL;
+    uint32_t old_vlen = 0;
+    if (marker->has_old) {
+        char old_seg_path[PATH_MAX];
+        seg_path_for(old_seg_path, data_dir, marker->old_stream_id, marker->old_file_id);
+        if (segcache_acquire(&oh, old_seg_path, 0, 0, 0) != 0) {
+            segcache_release(&h);
+            return -1;
+        }
+        oh_open = 1;
+        const uint8_t *old_rec = oh.map + marker->old_offset;
+        old_vlen = seg_rec_vlen(old_rec);
+        old_value = old_rec + 24 + seg_rec_klen(old_rec);
+    }
+
+    /* Step 3: establish/sync kf mapping. resolved_kf_slot is the physical
+       slot the record now lives at — for updates this is marker->kf_slot
+       unchanged; for inserts it's only known after kf_put_new (or after
+       the idempotent-replay lookup below finds it already present). Index
+       reconciliation (steps 4-5) addresses records by physical slot, same
+       as the live-write pre_commit path, so this must be the real slot. */
+    int step3_rc = 0;
+    size_t resolved_kf_slot = (size_t)marker->kf_slot;
+    if (marker->has_old) {
+        /* Update: repoint to new record. */
+        size_t slot = (size_t)marker->kf_slot;
+        kf_repoint_at_slot(kh, slot, marker->new_stream_id,
+                          marker->new_file_id, marker->new_offset);
+        size_t slots[] = { slot };
+        if (kfcache_sync_slots_locked(kh, slots, 1, 0) != 0) step3_rc = -1;
+    } else {
+        /* Insert: place the new record into kf if it isn't already there
+           (idempotent — a prior partial replay may have already inserted
+           it before crashing again). Re-derive hash/key from the segment
+           record itself rather than trusting a stale kf_slot hint, since
+           a resplit between the original write and this replay can move
+           slots. */
+        char seg_path2[PATH_MAX];
+        seg_path_for(seg_path2, data_dir, marker->new_stream_id, marker->new_file_id);
+        SlotcaskSegHandle h2;
+        if (segcache_acquire(&h2, seg_path2, 0, 0, 0) != 0) {
+            step3_rc = -1;
+        } else {
+            const uint8_t *rec2 = h2.map + marker->new_offset;
+            uint16_t klen2 = seg_rec_klen(rec2);
+            const uint8_t *key2 = rec2 + 24;
+
+            uint8_t flag_out; uint8_t stream_out; uint16_t file_out;
+            uint32_t off_out; size_t existing_slot;
+            int found = (kf_lookup_with_slot(kh, hash, key2, klen2, data_dir,
+                                             &flag_out, &stream_out, &file_out,
+                                             &off_out, &existing_slot) == 0);
+
+            if (!found) {
+                size_t used_delta = 0, out_slot = 0;
+                if (marker->kf_slot != UINT32_MAX) {
+                    /* Bulk markers persist the exact slot selected before
+                       index apply.  Do not re-probe here: a recovery-time
+                       resplit could otherwise move the kf record while its
+                       already-durable bitmap bit still names the old slot. */
+                    if (marker->kf_slot >= kh->capacity ||
+                        kh->map[marker->kf_slot].flag == 1) {
+                        step3_rc = -1;
+                    } else {
+                        KfInsertPlan replay_plan = {
+                            .target_slot = marker->kf_slot,
+                            .reused_tomb = kh->map[marker->kf_slot].flag == 2,
+                            .key = key2,
+                            .klen = klen2,
+                        };
+                        memcpy(replay_plan.hash, hash, sizeof(replay_plan.hash));
+                        kf_commit_planned_slot(kh, &replay_plan,
+                                               marker->new_stream_id,
+                                               marker->new_file_id,
+                                               marker->new_offset,
+                                               &used_delta, &out_slot);
+                        size_t slots[] = { out_slot };
+                        if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0)
+                            step3_rc = -1;
+                        resolved_kf_slot = out_slot;
+                    }
+                } else {
+                    char keybuf[1024];
+                    if (klen2 > sizeof(keybuf)) {
+                        step3_rc = -1;
+                    } else {
+                        memcpy(keybuf, key2, klen2);
+                        if (kf_put_new(NULL, kh, hash, marker->new_stream_id,
+                                       marker->new_file_id, marker->new_offset,
+                                       keybuf, klen2, data_dir, &used_delta, &out_slot) != 0) {
+                            step3_rc = -1;
+                        } else {
+                            size_t slots[] = { out_slot };
+                            if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0) step3_rc = -1;
+                            resolved_kf_slot = out_slot;
+                        }
+                    }
+                }
+            } else {
+                resolved_kf_slot = existing_slot;
+            }
+            segcache_release(&h2);
+        }
+    }
+
+    if (step3_rc != 0) {
+        if (oh_open) segcache_release(&oh);
+        segcache_release(&h);
+        return -1;
+    }
+
+    /* Steps 4-5: reconcile index state via the registered recovery
+       callback. slotcask.c stays decoupled from schema/index logic (owned
+       by storage.c) — see g_recovery_index_diff_fn in shard_db_internal.h.
+       NULL registration is a no-op, for kf-layer-only test builds. */
+    int diff_rc = 0;
+    if (g_recovery_index_diff_fn) {
+        char err_buf[256] = {0};
+        diff_rc = g_recovery_index_diff_fn(eff_root, object, kf_shard,
+                                           (uint32_t)resolved_kf_slot, hash,
+                                           old_value, old_vlen, new_value, new_vlen,
+                                           err_buf, sizeof(err_buf));
+    }
+
+    if (oh_open) segcache_release(&oh);
+    segcache_release(&h);
+
+    if (diff_rc != 0) return -1;
+
+    return 0;
+}
+
+/* Single-marker compatibility wrapper.  Batch callers use the entry helper
+   and clear only their own batch file after every entry has replayed. */
+int kf_marker_replay_locked(const char *eff_root, const char *object,
+                            const char *data_dir, int kf_shard,
+                            void *kh_opaque, const KfMarkerSlot *marker) {
+    if (kf_marker_replay_entry_locked(eff_root, object, data_dir, kf_shard,
+                                      kh_opaque, marker) != 0)
+        return -1;
+    return kf_marker_clear(data_dir, kf_shard);
+}
+
+/* Clean shutdown flag — written at graceful stop, unlinked at startup.
+   Presence means previous shutdown was clean; absence means unclean (needs recovery). */
+int clean_flag_write(const char *data_dir) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.shard-db.clean", data_dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    if (fsync(fd) != 0) { close(fd); return -1; }
+    close(fd);
+    /* Fsync containing directory too. */
+    fd = open(data_dir, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+}
+
+int clean_flag_exists(const char *data_dir) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.shard-db.clean", data_dir);
+    return (access(path, F_OK) == 0) ? 1 : 0;
+}
+
+int clean_flag_remove(const char *data_dir) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.shard-db.clean", data_dir);
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    /* Fsync dir after unlink. */
+    int fd = open(data_dir, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+}
+
+/* Bulk marker I/O: one file contains one KfMarkerSlot per record. */
+
+static void kf_batch_marker_path(char *buf, size_t cap, const char *data_dir,
+                                  int kf_shard, uint32_t batch_id) {
+    snprintf(buf, cap, "%s/data/kf/%03x_batch_%u_marker.dat",
+             data_dir, (unsigned)kf_shard, batch_id);
+}
+
+/* Write array of markers for a bulk operation (one per record in batch).
+   Returns 0 on success, -1 on failure. */
+static int kf_batch_marker_write_impl(const char *data_dir, int kf_shard, uint32_t batch_id,
+                          const KfMarkerSlot *markers, size_t count) {
+    if (!markers || count == 0) { errno = EINVAL; return -1; }
+
+    char path[PATH_MAX];
+    kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+
+    /* Write all markers with checksum */
+    for (size_t i = 0; i < count; i++) {
+        KfMarkerSlot durable = markers[i];
+        durable.checksum = XXH32(&durable, offsetof(KfMarkerSlot, checksum), 0);
+        ssize_t n = pwrite(fd, &durable, sizeof(durable), (off_t)(i * sizeof(durable)));
+        if (n != (ssize_t)sizeof(durable)) { close(fd); return -1; }
+    }
+
+    if (fsync(fd) != 0) { close(fd); return -1; }
+    close(fd);
+
+    /* Fsync directory. */
+    int dfd = open(data_dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+
+    return 0;
+}
+
+int kf_batch_marker_write(const char *data_dir, int kf_shard, uint32_t batch_id,
+                          const KfMarkerSlot *markers, size_t count) {
+    uint64_t t0 = now_us();
+    int rc = kf_batch_marker_write_impl(data_dir, kf_shard, batch_id, markers, count);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+/* Clear batch marker file after recovery/completion. */
+static int kf_batch_marker_clear_impl(const char *data_dir, int kf_shard, uint32_t batch_id) {
+    char path[PATH_MAX], dpath[PATH_MAX];
+    kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    /* The marker lives in data/kf, so the parent directory that must be
+       synced is data/kf itself.  Treat a failed directory sync as a failed
+       clear: otherwise the caller could reuse this batch id before the
+       unlink is durable. */
+    kf_marker_dir_path(dpath, sizeof(dpath), data_dir);
+    return fsync_dir(dpath);
+}
+
+int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id) {
+    uint64_t t0 = now_us();
+    int rc = kf_batch_marker_clear_impl(data_dir, kf_shard, batch_id);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+/* Bulk counterpart to kf_marker_gate().  A retained batch marker belongs to
+   this kf shard, so replay it while the shard writer lock is held before a
+   new bulk window can reuse its batch-id/path.  Without this gate a later
+   call starts again at batch 0 and O_TRUNC can discard the recovery intent
+   left by a failed apply or kf sync. */
+static int batch_marker_id_cmp(const void *a, const void *b) {
+    const uint32_t aa = *(const uint32_t *)a;
+    const uint32_t bb = *(const uint32_t *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
+                                const char *data_dir) {
+    char kf_dir[PATH_MAX];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+    DIR *d = opendir(kf_dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+
+    char eff_root[PATH_MAX], object[256];
+    split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
+    uint32_t *ids = NULL;
+    size_t nids = 0, cap_ids = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int marker_shard = -1, consumed = 0;
+        unsigned batch_id = 0;
+        if (sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &marker_shard,
+                   &batch_id, &consumed) != 2 || consumed != (int)strlen(e->d_name) ||
+            marker_shard != kf_shard)
+            continue;
+        if (nids == cap_ids) {
+            size_t next = cap_ids ? cap_ids * 2 : 4;
+            uint32_t *grown = realloc(ids, next * sizeof(*ids));
+            if (!grown) { free(ids); closedir(d); return -1; }
+            ids = grown;
+            cap_ids = next;
+        }
+        ids[nids++] = (uint32_t)batch_id;
+    }
+    closedir(d);
+    if (nids) qsort(ids, nids, sizeof(*ids), batch_marker_id_cmp);
+
+    int rc = 0;
+    for (size_t i = 0; i < nids && rc == 0; i++) {
+        char path[PATH_MAX];
+        kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, ids[i]);
+        FILE *bf = fopen(path, "rb");
+        if (!bf) { rc = -1; break; }
+        KfMarkerSlot marker;
+        while (fread(&marker, sizeof(marker), 1, bf) == 1) {
+            uint32_t stored = marker.checksum;
+            uint32_t calc = XXH32(&marker, offsetof(KfMarkerSlot, checksum), 0);
+            if (stored != calc ||
+                kf_marker_replay_entry_locked(eff_root, object, data_dir, kf_shard, kh, &marker) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+        if (ferror(bf)) rc = -1;
+        fclose(bf);
+        if (rc == 0 && kf_batch_marker_clear(data_dir, kf_shard, ids[i]) != 0) rc = -1;
+    }
+    free(ids);
+    return rc;
+}
+
+/* Every indexed writer must recover both marker formats before it plans a
+   slot or opens a bitmap writer handle.  Treating the formats as independent
+   let a batch replay clear an unrelated single marker, and let INSERT plan
+   against a keyfile that replay was about to change. */
+static int kf_shard_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
+                                const char *data_dir) {
+    if (kf_marker_gate(kf_shard, kh, data_dir) != 0) return -1;
+    return kf_batch_marker_gate(kf_shard, kh, data_dir);
+}
+
+/* Marker recovery sweep: scan one object's data/kf/ for leftover marker
+   files (single-record or batch) and replay each to completion.
+   Called at startup when unclean shutdown was detected, before the
+   server accepts connections. Caller must already hold the object's
+   write lock (objlock_wrlock) for the duration.
+   Returns 0 if every marker found was replayed/cleared, -1 if any marker
+   is corrupt or fails to replay (fail-closed — operator must investigate;
+   the marker is left on disk so nothing is silently lost).
+   If out_replayed is non-NULL, it is incremented once per marker file this
+   call actually found (regardless of replay outcome) — callers use this to
+   report whether recovery replayed anything, as opposed to merely running. */
+int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, const char *object_name,
+                                  int *out_replayed) {
+    char kf_dir[PATH_MAX];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+
+    DIR *d = opendir(kf_dir);
+    if (!d) return (errno == ENOENT) ? 0 : -1;
+
+    int rc = 0;
+    int *batch_shards = NULL;
+    size_t n_batch_shards = 0, cap_batch_shards = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int kf_shard = -1;
+        unsigned batch_id = 0;
+        int is_batch = 0;
+        int name_len = (int)strlen(e->d_name);
+        int consumed = 0;
+
+        if (sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &kf_shard, &batch_id, &consumed) == 2 &&
+            consumed == name_len) {
+            is_batch = 1;
+        } else if ((consumed = 0, sscanf(e->d_name, "%x_marker.dat%n", &kf_shard, &consumed) == 1) &&
+                   consumed == name_len) {
+            /* single-record marker match */
+        } else {
+            continue;
+        }
+        if (kf_shard < 0) continue;
+        if (out_replayed) (*out_replayed)++;
+
+        if (is_batch) {
+            size_t i;
+            for (i = 0; i < n_batch_shards; i++)
+                if (batch_shards[i] == kf_shard) break;
+            if (i == n_batch_shards) {
+                if (n_batch_shards == cap_batch_shards) {
+                    size_t next = cap_batch_shards ? cap_batch_shards * 2 : 4;
+                    int *grown = realloc(batch_shards, next * sizeof(*batch_shards));
+                    if (!grown) { rc = -1; break; }
+                    batch_shards = grown;
+                    cap_batch_shards = next;
+                }
+                batch_shards[n_batch_shards++] = kf_shard;
+            }
+            continue;
+        }
+
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, data_dir, kf_shard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, 0, 1) != 0) { rc = -1; continue; }
+
+        KfMarkerSlot marker;
+        int rrc = kf_marker_read(data_dir, kf_shard, &marker);
+        if (rrc == 1) {
+            /* Marker vanished (replayed by a concurrent gate already). */
+        } else if (rrc == 2) {
+            if (kf_marker_clear(data_dir, kf_shard) != 0) rc = -1;
+        } else if (rrc == 0) {
+            if (kf_marker_replay_locked(eff_root, object_name, data_dir, kf_shard, &kh, &marker) != 0)
+                rc = -1;
+        } else {
+            rc = -1; /* corrupt — fail closed, leave marker in place */
+        }
+
+        kfcache_release(&kh);
+    }
+    closedir(d);
+    for (size_t i = 0; i < n_batch_shards; i++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, data_dir, batch_shards[i]);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, 0, 1) != 0) {
+            rc = -1;
+            continue;
+        }
+        if (kf_batch_marker_gate(batch_shards[i], &kh, data_dir) != 0)
+            rc = -1;
+        kfcache_release(&kh);
+    }
+    free(batch_shards);
+    return rc;
+}
+
+/* Non-replaying marker check for graceful shutdown. Deliberately does not read/verify marker
+   contents — a corrupt marker still means "not safe to skip recovery next
+   time," so mere presence of a matching filename is enough to answer 1. */
+int object_has_pending_markers(const char *data_dir) {
+    char kf_dir[PATH_MAX];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+
+    DIR *d = opendir(kf_dir);
+    if (!d) return (errno == ENOENT) ? 0 : -1;
+
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int kf_shard = -1;
+        unsigned batch_id = 0;
+        int name_len = (int)strlen(e->d_name);
+        int consumed = 0;
+        int is_batch_match = sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &kf_shard, &batch_id, &consumed) == 2 &&
+                              consumed == name_len;
+        consumed = 0;
+        int is_single_match = !is_batch_match &&
+                               sscanf(e->d_name, "%x_marker.dat%n", &kf_shard, &consumed) == 1 &&
+                               consumed == name_len;
+        if (is_batch_match || is_single_match) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
 }
 
 /* Direct tombstone at a known slot — see kf_repoint_at_slot rationale.
@@ -2053,7 +2838,8 @@ static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
                              uint16_t file_id, uint32_t offset,
                              const uint8_t hash[16],
                              const void *key, size_t klen,
-                             const void *value, size_t vlen) {
+                             const void *value, size_t vlen,
+                             int sync_now) {
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
@@ -2069,8 +2855,11 @@ static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
         SegCacheEntry *e = &g_segcache[h.slot];
         durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
     }
+    int rc = 0;
+    if (sync_now && durability_msync_range(h.map, offset, (size_t)db->slot_size) != 0)
+        rc = -1;
     segcache_release(&h);
-    return 0;
+    return rc;
 }
 
 /* Variable-length variant: writes a record without padding to slot_size.
@@ -2080,7 +2869,7 @@ static int seg_write_record_varlen(const SlotcaskDb *db, uint8_t stream_id,
                                     const uint8_t hash[16],
                                     const void *key, size_t klen,
                                     const void *value, size_t vlen,
-                                    size_t rec_size) {
+                                    size_t rec_size, int sync_now) {
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
@@ -2090,8 +2879,11 @@ static int seg_write_record_varlen(const SlotcaskDb *db, uint8_t stream_id,
         SegCacheEntry *e = &g_segcache[h.slot];
         durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
     }
+    int rc = 0;
+    if (sync_now && durability_msync_range(h.map, offset, rec_size) != 0)
+        rc = -1;
     segcache_release(&h);
-    return 0;
+    return rc;
 }
 
 /* Forward decl — seg_write_flag is defined below this function but
@@ -2211,14 +3003,14 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
                                      hash, key, klen, value, vlen,
-                                     slot_capacity) != 0) {
+                                     slot_capacity, 1) != 0) {
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
             return -1;
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen) != 0) {
+                              hash, key, klen, value, vlen, 1) != 0) {
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             return -1;
         }
@@ -2336,7 +3128,7 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
                                      hash, key, klen, value, vlen,
-                                     slot_capacity) != 0) {
+                                     slot_capacity, 1) != 0) {
             kfcache_release(&kh);
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
@@ -2344,7 +3136,7 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen) != 0) {
+                              hash, key, klen, value, vlen, 1) != 0) {
             kfcache_release(&kh);
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             return -1;
@@ -2552,14 +3344,14 @@ int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n) {
                                                infos[i].hash,
                                                recs[i].key, recs[i].klen,
                                                recs[i].value, recs[i].vlen,
-                                               (uint32_t)rec_size);
+                                               (uint32_t)rec_size, 0);
         } else {
             write_rc = seg_write_record(db, infos[i].target_sid,
                                         infos[i].target.file_id,
                                         infos[i].target.offset,
                                         infos[i].hash,
                                         recs[i].key, recs[i].klen,
-                                        recs[i].value, recs[i].vlen);
+                                        recs[i].value, recs[i].vlen, 0);
         }
         if (write_rc != 0) { free(infos); return -1; }
         int sid_kf = shard_for_hash(infos[i].hash, db->num_shards);
@@ -3284,13 +4076,34 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     SlotcaskUpsertOpts blank = {0};
     if (!opts) opts = &blank;
 
+    /* Fail loud on a missed two-phase migration: an indexed, fresh-insert
+       capable object with a legacy pre_commit alongside only one half of
+       the prepare/apply pair (or with prepare/apply set but the other
+       missing) would silently run the fresh-insert path with an
+       incomplete hook set. require_existing=1 callers are update-only
+       (e.g. v2_update_pre_commit) and do not create fresh keyfile slots. */
+    if (opts->has_indexed_fields && !opts->require_existing &&
+        ((!!opts->prepare_commit != !!opts->apply_commit) ||
+         (opts->pre_commit && (!opts->prepare_commit || !opts->apply_commit)))) {
+        errno = EINVAL;
+        return -1;
+    }
+
     uint8_t hash[16];
     compute_hash(key, klen, hash);
     int sid_kf = shard_for_hash(hash, db->num_shards);
 
     /* Slow path is required when the caller's check fn needs OLD (CAS) or
-       when require_existing is set (must know existence to reject missing). */
-    if (opts->require_existing || opts->check_needs_old) {
+       when require_existing is set (must know existence to reject missing).
+       It is also required for any object with indexed fields: the fast
+       path's single-probe kf_put_new decides new-vs-existing by mutating kf
+       as part of the probe itself, which makes it structurally impossible to
+       have a correctly-shaped marker (has_old depends on that verdict)
+       durable before kf commits. upsert_slow_path knows new-vs-existing from
+       its own lookup before touching kf, so it can honor the required
+       marker-before-kf ordering; the fast path cannot, so it is restricted
+       to has_indexed_fields=0 objects, where that ordering doesn't matter. */
+    if (opts->require_existing || opts->check_needs_old || opts->has_indexed_fields) {
         return upsert_slow_path(db, stream_id_hint, key, klen, value, vlen,
                                 opts, result, hash, sid_kf);
     }
@@ -3350,14 +4163,14 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
                                      hash, key, klen, value, vlen,
-                                     slot_capacity) != 0) {
+                                     slot_capacity, 1) != 0) {
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
             return -1;
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen) != 0) {
+                              hash, key, klen, value, vlen, 1) != 0) {
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             return -1;
         }
@@ -3377,10 +4190,7 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
                             key, klen, db->data_dir, &used_delta, &put_slot);
 
     if (put_rc == 0) {
-        /* NEW key path. Run check (with NULL old) and pre_commit. */
-        /* Publish (shard, slot) to opts out-params for index-update hooks
-           that key by physical location (bitmap). Done BEFORE check + pre_commit
-           so user code sees the location of the just-written kf entry. */
+        /* NEW key path. Run check (with NULL old) and commit. */
         if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
         if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
         if (opts->check && opts->check(NULL, opts->check_ctx) == 0) {
@@ -3401,25 +4211,29 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             if (result) result->condition_not_met = 1;
             return -2;
         }
+
+        /* has_indexed_fields=1 objects are routed to upsert_slow_path before
+           kf_put_new above ever runs (see the dispatch in
+           slotcask_upsert_with_hooks): this fast path's single-probe
+           kf_put_new decides new-vs-existing by mutating kf as part of the
+           probe, which makes a correctly-shaped marker (has_old depends on
+           that verdict) impossible to make durable before kf commits. So
+           this branch only ever runs for zero-index objects, where
+           seg-write-then-kf-publish is already crash-safe without a marker. */
         if (opts->pre_commit) {
             int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
             if (rc != 0) {
-                /* pre_commit failed AFTER kf commit. Best effort: tombstone
-                   our kf entry + seg. Indexes may be partially populated;
-                   matches the existing-path's pre_commit-failure behavior
-                   (just on the opposite side of kf). */
-                uint8_t  tmp_flag = 0, tmp_sid = 0;
-                uint16_t tmp_fid = 0;
-                uint32_t tmp_off = 0;
-                size_t   tmp_slot = 0;
-                if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
-                                         &tmp_flag, &tmp_sid, &tmp_fid, &tmp_off,
-                                         &tmp_slot) == 0) {
-                    kf_tombstone_at_slot(&kh, tmp_slot);
-                }
+                kf_tombstone_at_slot(&kh, put_slot);
                 kfcache_release(&kh);
                 seg_write_flag(db, target_stream, target_fid, target_off, 2);
                 pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                return -1;
+            }
+        }
+        {
+            size_t cs[] = { put_slot };
+            if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
+                kfcache_release(&kh);
                 return -1;
             }
         }
@@ -3478,7 +4292,7 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         uint8_t *old_buf = NULL;
         size_t   old_vlen = 0;
         if (read_record_value(db, ex_sid, ex_fid, ex_off, key, klen,
-                              &old_buf, &old_vlen) != 0) {
+                               &old_buf, &old_vlen) != 0) {
             kfcache_release(&kh);
             seg_write_flag(db, target_stream, target_fid, target_off, 2);
             pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
@@ -3508,6 +4322,15 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
            changing its index. */
         if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
         if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)ex_slot;
+
+        /* has_indexed_fields=1 objects are routed to upsert_slow_path above
+           (see the dispatch in slotcask_upsert_with_hooks), so this branch —
+           reached only via the fast path's single-probe kf_put_new — only
+           ever runs for zero-index objects: seg-write-then-kf-repoint is
+           already crash-safe there, no marker needed. pre_commit (if set)
+           fires BEFORE the kf repoint: on abort, kf stays untouched (pointing
+           at the old record) and the speculative new segment slot is
+           tombstoned. */
         if (opts->pre_commit) {
             int rc = opts->pre_commit(&old_rec, value, vlen, 1, opts->pre_commit_ctx);
             if (rc != 0) {
@@ -3518,11 +4341,16 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
                 return -1;
             }
         }
-        /* Atomic 8B repoint of the existing kf entry to our new seg. */
         kf_repoint_at_slot(&kh, ex_slot, target_stream, target_fid, target_off);
+        {
+            size_t cs[] = { ex_slot };
+            if (kfcache_sync_slots_locked(&kh, cs, 1, 0) != 0) {
+                kfcache_release(&kh);
+                free(old_buf);
+                return -1;
+            }
+        }
         kfcache_release(&kh);
-        /* Tombstone the OLD seg (after dropping kf wrlock so segcache wrlock
-           doesn't compete with concurrent reads on the kf shard). */
         if (slotcask_tombstone_and_push_back(db, ex_sid, ex_fid, ex_off) != 0) {
             if (result) result->was_update = 1;
             free(old_buf);
@@ -3655,7 +4483,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
                                      hash, key, klen, value, vlen,
-                                     slot_capacity) != 0) {
+                                     slot_capacity, 1) != 0) {
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
             kfcache_release(&kh);
@@ -3664,7 +4492,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen) != 0) {
+                              hash, key, klen, value, vlen, 1) != 0) {
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             kfcache_release(&kh);
             free(old_buf);
@@ -3684,36 +4512,65 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
     }
 
-    /* Pre-commit hook (Option B index ordering). Caller updates indexes
-       here; if it errors out we tombstone the new slot and bail. */
-    if (opts->pre_commit) {
-        int rc = opts->pre_commit(old_ptr, value, vlen, found,
-                                  opts->pre_commit_ctx);
-        if (rc != 0) {
-            seg_write_flag(db, target_stream, target_fid, target_off, 2);
-            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
-            kfcache_release(&kh);
+    if (!opts->has_indexed_fields) {
+        /* No marker path — seg-write-then-kf-repoint is already crash-safe.
+           pre_commit (if set) still fires unconditionally, BEFORE the kf
+           commit: on abort, kf stays untouched and the speculative new
+           segment slot is tombstoned. */
+        if (opts->pre_commit) {
+            int rc = opts->pre_commit(old_ptr, value, vlen, found, opts->pre_commit_ctx);
+            if (rc != 0) {
+                kfcache_release(&kh);
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                free(old_buf);
+                return -1;
+            }
+        }
+        if (found) {
+            kf_repoint_at_slot(&kh, kf_slot, target_stream, target_fid, target_off);
+            {
+                size_t cs[] = { kf_slot };
+                if (kfcache_sync_slots_locked(&kh, cs, 1, 0) != 0) {
+                    kfcache_release(&kh);
+                    free(old_buf);
+                    return -1;
+                }
+            }
+        } else {
+            size_t used_delta = 0;
+            size_t insert_slot = 0;
+            int kr = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
+                                key, klen, db->data_dir, &used_delta, &insert_slot);
+            if (kr == 1) kr = -1;
+            if (kr != 0) {
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                kfcache_release(&kh);
+                free(old_buf);
+                return -1;
+            }
+            {
+                size_t cs[] = { insert_slot };
+                if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
+                    kfcache_release(&kh);
+                    free(old_buf);
+                    return -1;
+                }
+            }
+        }
+        kfcache_release(&kh);
+        if (found && slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off) != 0) {
             free(old_buf);
             return -1;
         }
+        if (result) { result->was_update = found ? 1 : 0; result->condition_not_met = 0; }
+        free(old_buf);
+        return 0;
     }
 
-    /* Commit point: direct atomic store at the captured slot for updates
-       (no probe/verify), kf_put_new for fresh inserts. */
-    int kf_rc;
-    if (found) {
-        kf_repoint_at_slot(&kh, kf_slot, target_stream, target_fid, target_off);
-        kf_rc = 0;
-    } else {
-        size_t used_delta = 0;
-        kf_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
-                           key, klen, db->data_dir, &used_delta, NULL);
-        /* Under wrlock; a "1 = already exists" return here would mean a race
-           we haven't seen evidence of, but treat it as a hard error. */
-        if (kf_rc == 1) kf_rc = -1;
-    }
-
-    if (kf_rc != 0) {
+    /* Retained-marker gate before creating any new marker. */
+    if (kf_shard_marker_gate(sid_kf, &kh, db->data_dir) != 0) {
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
         pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
         kfcache_release(&kh);
@@ -3721,16 +4578,146 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         return -1;
     }
 
-    /* kf is now committed to the new slot. Drop wrlock before tombstoning
-       the old slot — that's a separate segment write. */
-    kfcache_release(&kh);
-
+    /* Marker-guarded commit (has_indexed_fields=1). Every branch below
+       writes and fsyncs the marker *before* the kf mutation it protects —
+       for `found` the old/new locations are already known from the lookup
+       above; for insert, an insert-type marker's kf_slot is intentionally
+       UINT32_MAX (recovery re-derives it via key lookup), so its content
+       doesn't depend on kf_put_new's result either. Once the marker fsync
+       returns, the operation is never rolled back: a later kf/index failure
+       is retried via the same replay helper startup recovery uses, while
+       this lock is still held, and fails closed (aborts, so the next start
+       runs the mandatory recovery sweep) if replay still can't converge. */
     if (found) {
-        if (slotcask_tombstone_and_push_back(db, old_sid, old_fid,
-                                             old_off) != 0) {
+        KfMarkerSlot marker = {
+            .magic = KF_MARKER_MAGIC, .kf_slot = (uint32_t)kf_slot, .has_old = 1,
+            .old_stream_id = old_sid, .old_file_id = old_fid, .old_offset = old_off,
+            .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
+        };
+        if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            kfcache_release(&kh);
             free(old_buf);
             return -1;
         }
+        durability_test_pause(db->data_dir, "marker-after-write");
+
+        if (opts->pre_commit) {
+            int rc = opts->pre_commit(old_ptr, value, vlen, 1, opts->pre_commit_ctx);
+            if (rc != 0) {
+                /* kf has not been repointed yet -- no commit-intent has been
+                   acted on, safe to clear the marker and roll back. */
+                kf_marker_clear(db->data_dir, sid_kf);
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                kfcache_release(&kh);
+                free(old_buf);
+                return -1;
+            }
+        }
+
+        kf_repoint_at_slot(&kh, kf_slot, target_stream, target_fid, target_off);
+        { size_t cs[] = { kf_slot };
+          if (kfcache_sync_slots_locked(&kh, cs, 1, 0) != 0) {
+              if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
+                  kf_marker_fail_closed(db->data_dir, sid_kf, "kf-slot sync after repoint");
+              kfcache_release(&kh);
+              free(old_buf);
+              if (result) { result->was_update = 1; result->condition_not_met = 0; }
+              return 0;
+          }
+        }
+        kf_marker_clear(db->data_dir, sid_kf);
+        kfcache_release(&kh);
+        if (slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off) != 0) {
+            free(old_buf);
+            return -1;
+        }
+    } else {
+        /* Fresh insert: plan the physical (shard, slot) up front — without
+           mutating kf — so prepare_commit can see it and any legitimate
+           rejection (e.g. bitmap cap) is reported as an ordinary error
+           instead of routing through the post-fsync replay/fail-closed
+           path. Ordering: plan slot -> prepare_commit -> marker
+           write+fsync -> apply_commit -> kf_commit_planned_slot+sync ->
+           marker clear. */
+        KfInsertPlan plan;
+        int prc = kf_plan_insert_slot(db, &kh, hash, key, klen, db->data_dir, &plan);
+        if (prc == 1) prc = -1; /* unreachable in practice: !found already ruled this out under the same held wrlock */
+        if (prc != 0) {
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)plan.target_slot;
+
+        if (opts->prepare_commit) {
+            int rc = opts->prepare_commit(value, vlen, (uint32_t)plan.target_slot, opts->pre_commit_ctx);
+            if (rc != 0) {
+                /* No durable mutation happened yet (kf untouched, no
+                   marker) — safe to bail cleanly, same as any other
+                   pre-commit rejection. */
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                kfcache_release(&kh);
+                free(old_buf);
+                return -1;
+            }
+        }
+
+        KfMarkerSlot marker = {
+            .magic = KF_MARKER_MAGIC, .kf_slot = UINT32_MAX, .has_old = 0,
+            .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
+        };
+        if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
+            if (opts->prepare_commit && opts->abort_commit)
+                opts->abort_commit(opts->pre_commit_ctx);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+        durability_test_pause(db->data_dir, "marker-after-write");
+
+        if (opts->apply_commit) {
+            int rc = opts->apply_commit(value, vlen, (uint32_t)plan.target_slot, opts->pre_commit_ctx);
+            if (rc != 0) {
+                /* Marker is durable. apply_commit failures are only legal
+                   for genuine I/O/OOM (prepare_commit already rejected
+                   every legitimate policy failure) — treat it like any
+                   other post-marker durability failure: replay
+                   (idempotent) rather than a silent second rollback path. */
+                if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf, "index apply after insert");
+                kfcache_release(&kh);
+                free(old_buf);
+                if (result) { result->was_update = 0; result->condition_not_met = 0; }
+                return 0;
+            }
+        }
+
+        size_t used_delta = 0;
+        kf_commit_planned_slot(&kh, &plan, target_stream, target_fid, target_off, &used_delta, NULL);
+
+        { size_t cs[] = { plan.target_slot };
+          if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
+              if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
+                  kf_marker_fail_closed(db->data_dir, sid_kf, "kf-slot sync after insert");
+              kfcache_release(&kh);
+              free(old_buf);
+              if (result) { result->was_update = 0; result->condition_not_met = 0; }
+              return 0;
+          }
+        }
+
+        kf_marker_clear(db->data_dir, sid_kf);
+        kfcache_release(&kh);
     }
 
     if (result) {
@@ -3769,6 +4756,15 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     /* require_existing is incompatible with INSERT-only semantics; the caller
        should route through slotcask_upsert_with_hooks for that. */
     if (opts->require_existing) return -1;
+
+    /* See the identical guard in slotcask_upsert_with_hooks — same missed-
+       migration hazard for INSERT-only callers. */
+    if (opts->has_indexed_fields &&
+        ((!!opts->prepare_commit != !!opts->apply_commit) ||
+         (opts->pre_commit && (!opts->prepare_commit || !opts->apply_commit)))) {
+        errno = EINVAL;
+        return -1;
+    }
 
     uint8_t hash[16];
     compute_hash(key, klen, hash);
@@ -3829,14 +4825,14 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
                                      hash, key, klen, value, vlen,
-                                     slot_capacity) != 0) {
+                                     slot_capacity, 1) != 0) {
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
             return -1;
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen) != 0) {
+                              hash, key, klen, value, vlen, 1) != 0) {
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             return -1;
         }
@@ -3852,18 +4848,126 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         return -1;
     }
 
+    if (opts->has_indexed_fields &&
+        kf_shard_marker_gate(sid_kf, &kh, db->data_dir) != 0) {
+        kfcache_release(&kh);
+        seg_write_flag(db, target_stream, target_fid, target_off, 2);
+        pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+        return -1;
+    }
+
+    if (opts->has_indexed_fields) {
+        /* Fresh insert with index maintenance: plan the slot before any
+           durable mutation exists, so prepare_commit can legitimately
+           reject (e.g. bitmap cap) before the marker or kf entry exist.
+           Ordering: plan slot -> prepare_commit -> marker write+fsync ->
+           apply_commit -> kf_commit_planned_slot+sync -> marker clear. */
+        KfInsertPlan plan;
+        int prc = kf_plan_insert_slot(db, &kh, hash, key, klen, db->data_dir, &plan);
+        if (prc == 1) {
+            /* Duplicate — read the existing record so the caller can
+               report it via result->current_value (matches the upsert
+               path's behavior for condition_not_met). */
+            uint8_t  ex_flag = 0, ex_sid = 0;
+            uint16_t ex_fid = 0;
+            uint32_t ex_off = 0;
+            size_t   ex_slot = 0;
+            uint8_t *old_buf = NULL;
+            size_t   old_vlen = 0;
+            if (kf_lookup_with_slot(&kh, hash, key, klen, db->data_dir,
+                                     &ex_flag, &ex_sid, &ex_fid, &ex_off,
+                                     &ex_slot) == 0) {
+                (void)read_record_value(db, ex_sid, ex_fid, ex_off, key, klen,
+                                         &old_buf, &old_vlen);
+            }
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            if (result) {
+                result->was_update = 1;
+                result->condition_not_met = 1;
+                result->current_value = old_buf;     /* transfer ownership */
+                result->current_vlen = old_vlen;
+            } else {
+                free(old_buf);
+            }
+            return -2;
+        }
+        if (prc != 0) {
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            return -1;
+        }
+
+        if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
+        if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)plan.target_slot;
+
+        if (opts->prepare_commit) {
+            int rc = opts->prepare_commit(value, vlen, (uint32_t)plan.target_slot, opts->pre_commit_ctx);
+            if (rc != 0) {
+                kfcache_release(&kh);
+                seg_write_flag(db, target_stream, target_fid, target_off, 2);
+                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                return -1;
+            }
+        }
+
+        KfMarkerSlot marker = {
+            .magic = KF_MARKER_MAGIC, .kf_slot = UINT32_MAX, .has_old = 0,
+            .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
+        };
+        if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
+            if (opts->prepare_commit && opts->abort_commit)
+                opts->abort_commit(opts->pre_commit_ctx);
+            kfcache_release(&kh);
+            seg_write_flag(db, target_stream, target_fid, target_off, 2);
+            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+            return -1;
+        }
+        durability_test_pause(db->data_dir, "marker-after-write");
+
+        if (opts->apply_commit) {
+            int rc = opts->apply_commit(value, vlen, (uint32_t)plan.target_slot, opts->pre_commit_ctx);
+            if (rc != 0) {
+                /* Marker is durable; apply_commit failures are only legal
+                   for genuine I/O/OOM (prepare_commit already rejected
+                   every legitimate policy failure) — replay/fail-closed,
+                   unchanged from the pre-existing post-marker contract. */
+                if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf, "index apply after insert");
+                kfcache_release(&kh);
+                if (result) { result->was_update = 0; result->condition_not_met = 0; }
+                return 0;
+            }
+        }
+
+        size_t used_delta = 0;
+        kf_commit_planned_slot(&kh, &plan, target_stream, target_fid, target_off, &used_delta, NULL);
+
+        { size_t cs[] = { plan.target_slot };
+          if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
+              if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
+                  kf_marker_fail_closed(db->data_dir, sid_kf, "kf-slot sync after insert");
+              kfcache_release(&kh);
+              if (result) { result->was_update = 0; result->condition_not_met = 0; }
+              return 0;
+          }
+        }
+        kf_marker_clear(db->data_dir, sid_kf);
+        kfcache_release(&kh);
+        return 0;
+    }
+
+    /* !has_indexed_fields: unaffected by the two-phase split (no marker,
+       no cap-bearing index to reject on) — unchanged legacy single-phase
+       path via the composed kf_put_new. */
     size_t used_delta = 0;
     size_t put_slot = 0;
     int put_rc = kf_put_new(db, &kh, hash, target_stream, target_fid, target_off,
                             key, klen, db->data_dir, &used_delta, &put_slot);
     if (put_rc != 0) {
         if (put_rc == 1) {
-            /* Duplicate — read the existing record so the caller can
-               report it via result->current_value (matches the upsert
-               path's behavior for condition_not_met). The lookup pays
-               one extra probe + segment read here, but this branch
-               only fires on actual duplicates (rare); the common-case
-               new-key path stays single-probe. */
             uint8_t  ex_flag = 0, ex_sid = 0;
             uint16_t ex_fid = 0;
             uint32_t ex_off = 0;
@@ -3895,24 +4999,26 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         return -1;
     }
 
-    /* kf committed. Run pre_commit for index updates. If it fails AFTER kf
-       is committed, the kf entry is already live — best we can do is
-       tombstone the seg (so reads see the stale kf entry as a miss) and
-       return error. The orphan kf entry will be cleaned up by vacuum's
-       compact_kf pass. Same trade-off the existing upsert path makes for
-       pre_commit failure (just on the opposite side of kf commit). */
     if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
     if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)put_slot;
+
     if (opts->pre_commit) {
         int rc = opts->pre_commit(NULL, value, vlen, 0, opts->pre_commit_ctx);
         if (rc != 0) {
+            kf_tombstone_at_slot(&kh, put_slot);
             kfcache_release(&kh);
             seg_write_flag(db, target_stream, target_fid, target_off, 2);
             pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
             return -1;
         }
     }
-
+    {
+        size_t cs[] = { put_slot };
+        if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
+            kfcache_release(&kh);
+            return -1;
+        }
+    }
     kfcache_release(&kh);
     return 0;
 }
@@ -3953,6 +5059,13 @@ typedef struct {
     uint16_t target_fid;
     uint32_t target_off;
     uint8_t  got_pool;      /* 1 = slot came from free pool (rollback path differs) */
+    size_t   plan_slot;         /* kf_plan_window_insert_slot() result for a
+                                    fresh-insert (not old_found) record —
+                                    populated before the window's marker is
+                                    written, consumed by kf_commit_planned_slot
+                                    after apply_window runs */
+    int      plan_reused_tomb;
+    uint8_t  has_plan;
 } SlotcaskBulkState;
 
 /* ----- Phase helpers shared by the slow and fast bulk-upsert paths.
@@ -4290,12 +5403,32 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     SlotcaskBulkOpts blank = {0};
     if (!opts) opts = &blank;
 
+    /* Bulk equivalent of the single-record guard: fail loud rather than
+       silently run an indexed window with half of the prepare_window/
+       apply_window pair missing, or a legacy pre_commit alongside only
+       one of them. require_existing=1 callers are the bulk-update-only
+       sites and do not create fresh keyfile slots. */
+    if (opts->has_indexed_fields && !opts->require_existing &&
+        ((!!opts->prepare_window != !!opts->apply_window) ||
+         (opts->pre_commit && (!opts->prepare_window || !opts->apply_window)))) {
+        errno = EINVAL;
+        return -1;
+    }
+
     /* Slow path required when caller needs OLD bytes before commit:
        - require_existing: bulk-update gate, must reject missing keys
        - pre_commit_needs_old: indexed update needs old value for diff
-       - value_compute: bulk-update derives NEW from OLD */
+       - value_compute: bulk-update derives NEW from OLD
+       - prepare_window/apply_window: the two-phase windowed hooks are only
+         wired into the slow path (see below) — a caller that sets a valid
+         pair but happens not to also set one of the flags above must still
+         be routed here, or its hooks would be silently skipped entirely by
+         the fast path (which knows nothing about prepare_window/
+         apply_window), running the batch with none of the durability
+         protection the hook pair is there to provide. */
     if (opts->require_existing || opts->pre_commit_needs_old ||
-        opts->value_compute != NULL) {
+        opts->value_compute != NULL ||
+        (opts->prepare_window && opts->apply_window)) {
         return bulk_upsert_slow_in_kfshard(db, kf_shard_id, recs, n, opts);
     }
     return bulk_upsert_fast_in_kfshard(db, kf_shard_id, recs, n, opts);
@@ -4308,6 +5441,10 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     kf_path_for(kf_path, db->data_dir, kf_shard_id);
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    if (kf_shard_marker_gate(kf_shard_id, &kh, db->data_dir) != 0) {
+        kfcache_release(&kh);
+        return -1;
+    }
 
     SlotcaskBulkState *st = calloc(n, sizeof(SlotcaskBulkState));
     if (!st) { kfcache_release(&kh); return -1; }
@@ -4449,30 +5586,552 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     /* ===== Phase 3 — per-stream batched reserve + seg write. */
     bulk_phase3_seg_writes(db, recs, st, stream_counts, stream_idx);
 
-    /* ===== Phase 4 — per-record kf commit + pre_commit (under held kf wrlock).
-       For UPDATES the slot index is known from Phase 1a (kf_lookup) — we
-       publish (shard, slot) and run pre_commit before kf_repoint. For
-       INSERTS the slot only exists after kf_put_new, so we commit the
-       kf entry first, publish (shard, slot), then run pre_commit; if it
-       returns non-zero we kf_tombstone the entry we just wrote. This
-       gives bitmap index hooks a stable (shard, slot) handle regardless
-       of insert vs update path. */
-    for (size_t i = 0; i < n; i++) {
-        if (recs[i].status != 0) continue;
-        if (!st[i].needs_write) continue;
-        SlotcaskBulkRec *r = &recs[i];
+    /* ===== Phase 4 — per-record kf commit + pre_commit (under held kf wrlock). */
 
-        size_t pub_slot = 0;
-        int kf_committed = 0;
-        if (st[i].old_found) {
-            pub_slot = st[i].old_kf_slot;
-        } else {
-            size_t used_delta = 0;
-            int kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
-                                   st[i].target_fid, st[i].target_off,
-                                   r->key, r->klen, db->data_dir,
-                                   &used_delta, &pub_slot);
-            if (kf_rc == 1) kf_rc = -1;
+    if (opts->has_indexed_fields &&
+        (opts->pre_commit != NULL || opts->prepare_window != NULL)) {
+        /* Indexed path: windowed batch-marker protocol. */
+        size_t wi = 0;
+        while (wi < n) {
+            size_t w_start = wi;
+            size_t w_valid = 0;
+            size_t w_end = wi;
+            while (w_end < n && w_valid < (size_t)BULK_COMMIT_MAX_RECORDS) {
+                if (recs[w_end].status == 0 && st[w_end].needs_write)
+                    w_valid++;
+                w_end++;
+            }
+
+            int fd = -1;
+            char bpath[PATH_MAX];
+            char dpath[PATH_MAX];
+            snprintf(dpath, sizeof(dpath), "%s/data/kf", db->data_dir);
+            KfMarkerSlot *mslots = NULL;
+            /* w_start is strictly increasing across windows within this call,
+               so it doubles as a unique batch_id — this keeps each window's
+               marker file distinct (a retained/degraded window's marker must
+               never be O_TRUNC'd by the next window reusing the same path)
+               and matches kf_batch_marker_path's "<shard>_batch_<id>_marker.dat"
+               naming, which is what the startup recovery sweep's sscanf
+               pattern actually recognizes. */
+            uint32_t batch_id = (uint32_t)w_start;
+            int keep_marker = 0;
+
+            if (opts->prepare_window && opts->apply_window) {
+                /* ---- Two-phase window protocol. Stages+validates every
+                   active record (fresh inserts AND old_found updates
+                   alike — a cap rejection must be caught for both) before
+                   any durable marker exists, applies the real index
+                   mutation once the marker is durable, then commits kf. */
+                KfInsertPlan new_plans[BULK_COMMIT_MAX_RECORDS];
+                size_t active[BULK_COMMIT_MAX_RECORDS];
+                size_t survive[BULK_COMMIT_MAX_RECORDS];
+                size_t nactive = 0, nsurvive = 0;
+
+                /* A prepare-window cap rejection invalidates the original
+                   reservation overlay: a later fresh key may have probed
+                   past the rejected key's planned slot.  Abort the staged
+                   hooks, then plan + prepare the surviving set again under
+                   a fresh overlay before publishing anything.  Otherwise a
+                   committed survivor can sit after an empty probe-chain hole
+                   and become unreachable. */
+                for (;;) {
+                    size_t nnew_plans = 0;
+                    nactive = 0;
+                    for (size_t j = w_start; j < w_end; j++) {
+                        if (recs[j].status != 0 || !st[j].needs_write) continue;
+                        SlotcaskBulkRec *r = &recs[j];
+                        if (st[j].old_found) {
+                            r->kf_shard = kf_shard_id;
+                            r->kf_slot  = (uint32_t)st[j].old_kf_slot;
+                            r->was_update = 1;
+                            if (!r->old_value) {
+                                r->old_value = st[j].old_buf;
+                                r->old_vlen  = st[j].old_vlen;
+                            }
+                        } else {
+                            KfInsertPlan plan;
+                            int prc = kf_plan_window_insert_slot(db, &kh, st[j].hash,
+                                                                  r->key, r->klen,
+                                                                  db->data_dir,
+                                                                  new_plans, nnew_plans, &plan);
+                            if (prc == 1) prc = -1;
+                            if (prc != 0) {
+                                seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                               st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                               st[j].target_fid, st[j].target_off, db->slot_size);
+                                r->status = -1;
+                                st[j].needs_write = 0;
+                                continue;
+                            }
+                            new_plans[nnew_plans++] = plan;
+                            st[j].plan_slot = plan.target_slot;
+                            st[j].plan_reused_tomb = plan.reused_tomb;
+                            st[j].has_plan = 1;
+                            r->kf_shard = kf_shard_id;
+                            r->kf_slot  = (uint32_t)plan.target_slot;
+                            r->was_update = 0;
+                        }
+                        active[nactive++] = j;
+                    }
+
+                    if (nactive > 0 &&
+                        opts->prepare_window(recs, active, nactive, opts->bulk_hook_ctx) != 0) {
+                        for (size_t a = 0; a < nactive; a++) {
+                            size_t j = active[a];
+                            if (recs[j].status == 0) recs[j].status = -1;
+                        }
+                    }
+
+                    nsurvive = 0;
+                    for (size_t a = 0; a < nactive; a++) {
+                        size_t j = active[a];
+                        if (recs[j].status != 0) {
+                            seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                           st[j].target_off, 2);
+                            pool_push_free(&db->streams[st[j].target_stream],
+                                           st[j].target_fid, st[j].target_off, db->slot_size);
+                            st[j].needs_write = 0;
+                            st[j].has_plan = 0;
+                            continue;
+                        }
+                        survive[nsurvive++] = j;
+                    }
+                    if (nsurvive == nactive || nsurvive == 0) break;
+                    /* Re-preparing a subset is safe only if the caller can
+                       tear down the first pass's staged resources.  Current
+                       indexed callers provide this hook; refuse to publish a
+                       partially prepared generic window rather than reuse
+                       stale state if a future caller forgets it. */
+                    if (!opts->abort_window) {
+                        for (size_t a = 0; a < nsurvive; a++) {
+                            size_t j = survive[a];
+                            seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                           st[j].target_off, 2);
+                            pool_push_free(&db->streams[st[j].target_stream],
+                                           st[j].target_fid, st[j].target_off, db->slot_size);
+                            recs[j].status = -1;
+                            st[j].needs_write = 0;
+                            st[j].has_plan = 0;
+                        }
+                        nsurvive = 0;
+                        break;
+                    }
+                    opts->abort_window(opts->bulk_hook_ctx);
+                }
+
+                if (nsurvive > 0)
+                    durability_test_pause(db->data_dir, "bulk-window-prepared");
+
+                if (nsurvive > 0) {
+                    kf_batch_marker_path(bpath, sizeof(bpath), db->data_dir,
+                                          kf_shard_id, batch_id);
+                    mslots = calloc(nsurvive, sizeof(KfMarkerSlot));
+                    if (mslots) {
+                        fd = open(bpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                        if (fd >= 0) {
+                            if (fsync_dir(dpath) != 0) { close(fd); fd = -1; unlink(bpath); }
+                        }
+                        if (fd < 0) { free(mslots); mslots = NULL; }
+                    }
+
+                    size_t vi = 0;
+                    for (size_t a = 0; a < nsurvive; a++) {
+                        size_t j = survive[a];
+                        SlotcaskBulkRec *r = &recs[j];
+                        if (fd >= 0 && mslots) {
+                            KfMarkerSlot *ms = &mslots[vi];
+                            memset(ms, 0, sizeof(*ms));
+                            ms->magic = KF_MARKER_MAGIC;
+                            ms->new_stream_id = st[j].target_stream;
+                            ms->new_file_id = st[j].target_fid;
+                            ms->new_offset = st[j].target_off;
+                            if (st[j].old_found) {
+                                ms->kf_slot = (uint32_t)st[j].old_kf_slot;
+                                ms->has_old = 1;
+                                ms->old_stream_id = st[j].old_sid;
+                                ms->old_file_id = st[j].old_fid;
+                                ms->old_offset = st[j].old_off;
+                            } else {
+                                /* Persist the exact reservation used by
+                                   apply_window's bitmap operation. Recovery
+                                   must commit this same slot rather than
+                                   re-probing after a possible resplit. */
+                                ms->kf_slot = (uint32_t)st[j].plan_slot;
+                                ms->has_old = 0;
+                            }
+                            ms->checksum = XXH32(ms, offsetof(KfMarkerSlot, checksum), 0);
+                            off_t off = (off_t)(vi * sizeof(KfMarkerSlot));
+                            if (pwrite(fd, ms, sizeof(*ms), off) != (ssize_t)sizeof(*ms) ||
+                                fsync(fd) != 0) {
+                                close(fd); fd = -1;
+                                /* This marker file already has a durably fsynced
+                                   prefix of valid slots (0..vi-1) from earlier loop
+                                   iterations. unlink() alone only removes the
+                                   directory entry from the page cache — without a
+                                   matching fsync_dir(), a crash before that entry
+                                   reaches disk can leave bpath fully intact on
+                                   restart, and recovery streams whatever complete,
+                                   checksum-valid slots it finds as a legitimate
+                                   batch (by design, for the genuine-crash-mid-write
+                                   case). That would resurrect this rejected
+                                   window's already-written prefix even though the
+                                   caller was told the whole batch failed. Fold the
+                                   removal into the same synchronous fsync_dir()
+                                   barrier the rest of this file uses for durable
+                                   unlinks so no such prefix can survive us. */
+                                if (unlink(bpath) != 0 || fsync_dir(dpath) != 0)
+                                    kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                                          "could not durably discard partial bulk marker");
+                                seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                                st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                r->status = -1;
+                                vi++;
+                                continue;
+                            }
+                        }
+                        vi++;
+                    }
+
+                    if (fd >= 0 && mslots)
+                        durability_test_pause(db->data_dir, "bulk-marker-after-write");
+
+                    /* fd<0 always implies mslots==NULL by this point (either
+                       alloc/open/fsync_dir failed upfront, which nulls mslots
+                       immediately above, or a mid-loop pwrite/fsync failure
+                       set fd=-1 after already unlinking bpath) — so the marker
+                       is definitively not durable either way. Checking fd<0
+                       alone (not "&& mslots") is what actually rejects the
+                       survivors that never got a marker slot written. */
+                    if (fd < 0) {
+                        for (size_t a = 0; a < nsurvive; a++) {
+                            size_t j = survive[a];
+                            if (recs[j].status == 0) {
+                                seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                                st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                recs[j].status = -1;
+                            }
+                        }
+                    }
+                }
+
+                size_t apply_active[BULK_COMMIT_MAX_RECORDS];
+                size_t napply_active = 0;
+                for (size_t a = 0; a < nsurvive; a++) {
+                    size_t j = survive[a];
+                    if (recs[j].status == 0) apply_active[napply_active++] = j;
+                }
+
+                /* ---- apply_window: fires once the window's batch marker
+                   is durable, before kf is committed for the surviving
+                   records. A nonzero return is always a genuine I/O/OOM
+                   failure — routed through the same degraded/replay path
+                   as a kfcache_sync_slots_locked failure below, never a
+                   policy rejection (those are handled by prepare_window,
+                   above, before the marker existed). */
+                if (napply_active > 0) {
+                    if (opts->apply_window(recs, apply_active, napply_active, opts->bulk_hook_ctx) != 0) {
+                        keep_marker = 1;
+                        if (opts->out_durability_degraded)
+                            *opts->out_durability_degraded = 1;
+                    }
+                } else if (nactive > 0 && opts->abort_window) {
+                    /* prepare_window staged resources (open bitmap writer
+                       handles, tracked buffers, queued ops) for this window
+                       but every record was rejected before or during marker
+                       write — apply_window will never run, so release them
+                       here instead of leaking them. */
+                    opts->abort_window(opts->bulk_hook_ctx);
+                }
+
+                durability_test_pause(db->data_dir, "bulk-window-applied");
+
+                size_t vslots[BULK_COMMIT_MAX_RECORDS];
+                size_t nvslots = 0;
+                for (size_t a = 0; a < napply_active; a++) {
+                    size_t j = apply_active[a];
+                    SlotcaskBulkRec *r = &recs[j];
+                    size_t pub_slot;
+                    if (st[j].old_found) {
+                        pub_slot = st[j].old_kf_slot;
+                        kf_repoint_at_slot(&kh, st[j].old_kf_slot,
+                                            st[j].target_stream,
+                                            st[j].target_fid, st[j].target_off);
+                    } else {
+                        KfInsertPlan plan;
+                        memcpy(plan.hash, st[j].hash, sizeof(plan.hash));
+                        plan.target_slot = st[j].plan_slot;
+                        plan.reused_tomb = st[j].plan_reused_tomb;
+                        plan.key = r->key;
+                        plan.klen = r->klen;
+                        size_t used_delta = 0;
+                        pub_slot = 0;
+                        kf_commit_planned_slot(&kh, &plan, st[j].target_stream,
+                                                st[j].target_fid, st[j].target_off,
+                                                &used_delta, &pub_slot);
+                    }
+                    r->kf_shard = kf_shard_id;
+                    r->kf_slot  = (uint32_t)pub_slot;
+                    vslots[nvslots++] = pub_slot;
+                }
+
+                if (nvslots > 0 &&
+                    kfcache_sync_slots_locked(&kh, vslots, nvslots, 0) != 0) {
+                    keep_marker = 1;
+                    if (opts->out_durability_degraded)
+                        *opts->out_durability_degraded = 1;
+                }
+            } else {
+                /* ---- Legacy single-phase path: pre_commit fires per
+                   record after kf is already committed and the marker is
+                   durable. Preserved unchanged for non-migrated callers
+                   (bulk-update sites; require_existing = 1). */
+                if (w_valid > 0) {
+                    kf_batch_marker_path(bpath, sizeof(bpath), db->data_dir,
+                                          kf_shard_id, batch_id);
+                    mslots = calloc(w_valid, sizeof(KfMarkerSlot));
+                    if (mslots) {
+                        fd = open(bpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                        if (fd >= 0) {
+                            if (fsync_dir(dpath) != 0) { close(fd); fd = -1; unlink(bpath); }
+                        }
+                        if (fd < 0) { free(mslots); mslots = NULL; }
+                    }
+
+                    size_t vi = 0;
+                    for (size_t j = w_start; j < w_end; j++) {
+                        if (recs[j].status != 0 || !st[j].needs_write) continue;
+                        SlotcaskBulkRec *r = &recs[j];
+
+                        if (fd >= 0 && mslots) {
+                            KfMarkerSlot *ms = &mslots[vi];
+                            memset(ms, 0, sizeof(*ms));
+                            ms->magic = KF_MARKER_MAGIC;
+                            ms->new_stream_id = st[j].target_stream;
+                            ms->new_file_id = st[j].target_fid;
+                            ms->new_offset = st[j].target_off;
+                            if (st[j].old_found) {
+                                ms->kf_slot = (uint32_t)st[j].old_kf_slot;
+                                ms->has_old = 1;
+                                ms->old_stream_id = st[j].old_sid;
+                                ms->old_file_id = st[j].old_fid;
+                                ms->old_offset = st[j].old_off;
+                            } else {
+                                ms->kf_slot = UINT32_MAX;
+                                ms->has_old = 0;
+                            }
+                            ms->checksum = XXH32(ms, offsetof(KfMarkerSlot, checksum), 0);
+                            off_t off = (off_t)(vi * sizeof(KfMarkerSlot));
+                            if (pwrite(fd, ms, sizeof(*ms), off) != (ssize_t)sizeof(*ms) ||
+                                fsync(fd) != 0) {
+                                close(fd); fd = -1;
+                                /* This marker file already has a durably fsynced
+                                   prefix of valid slots (0..vi-1) from earlier loop
+                                   iterations. unlink() alone only removes the
+                                   directory entry from the page cache — without a
+                                   matching fsync_dir(), a crash before that entry
+                                   reaches disk can leave bpath fully intact on
+                                   restart, and recovery streams whatever complete,
+                                   checksum-valid slots it finds as a legitimate
+                                   batch (by design, for the genuine-crash-mid-write
+                                   case). That would resurrect this rejected
+                                   window's already-written prefix even though the
+                                   caller was told the whole batch failed. Fold the
+                                   removal into the same synchronous fsync_dir()
+                                   barrier the rest of this file uses for durable
+                                   unlinks so no such prefix can survive us. */
+                                if (unlink(bpath) != 0 || fsync_dir(dpath) != 0)
+                                    kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                                          "could not durably discard partial bulk marker");
+                                seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                                st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                r->status = -1;
+                                vi++;
+                                continue;
+                            }
+                        }
+                        vi++;
+                    }
+
+                    if (fd >= 0 && mslots)
+                        durability_test_pause(db->data_dir, "bulk-marker-after-write");
+
+                    if (fd < 0 && mslots) {
+                        for (size_t j = w_start; j < w_end; j++) {
+                            if (recs[j].status == 0 && st[j].needs_write) {
+                                seg_write_flag(db, st[j].target_stream, st[j].target_fid,
+                                                st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                recs[j].status = -1;
+                            }
+                        }
+                        w_valid = 0;
+                    }
+                }
+
+                size_t vslots[BULK_COMMIT_MAX_RECORDS];
+                size_t nvslots = 0;
+
+                for (size_t j = w_start; j < w_end; j++) {
+                    if (recs[j].status != 0 || !st[j].needs_write) continue;
+                    SlotcaskBulkRec *r = &recs[j];
+
+                    size_t pub_slot = st[j].old_found ? st[j].old_kf_slot : 0;
+
+                    if (!st[j].old_found) {
+                        size_t used_delta = 0;
+                        int kf_rc = kf_put_new(db, &kh, st[j].hash,
+                                                st[j].target_stream,
+                                                st[j].target_fid, st[j].target_off,
+                                                r->key, r->klen, db->data_dir,
+                                                &used_delta, &pub_slot);
+                        if (kf_rc == 1) kf_rc = -1;
+                        if (kf_rc != 0) {
+                            keep_marker = 1;
+                            r->status = -1;
+                            continue;
+                        }
+                    }
+
+                    r->kf_shard = kf_shard_id;
+                    r->kf_slot  = (uint32_t)pub_slot;
+
+                    if (st[j].old_found) {
+                        kf_repoint_at_slot(&kh, st[j].old_kf_slot,
+                                            st[j].target_stream,
+                                            st[j].target_fid, st[j].target_off);
+                    }
+
+                    vslots[nvslots++] = pub_slot;
+                }
+
+                if (nvslots > 0 &&
+                    kfcache_sync_slots_locked(&kh, vslots, nvslots, 0) != 0) {
+                    keep_marker = 1;
+                    if (opts->out_durability_degraded)
+                        *opts->out_durability_degraded = 1;
+                }
+
+                if (!keep_marker) {
+                    for (size_t j = w_start; j < w_end; j++) {
+                        if (recs[j].status != 0 || !st[j].needs_write) continue;
+                        SlotcaskBulkRec *r = &recs[j];
+
+                        if (opts->pre_commit) {
+                            const void *old_v = r->old_value ? r->old_value : st[j].old_buf;
+                            size_t      old_l = r->old_value ? r->old_vlen  : st[j].old_vlen;
+                            SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
+                            int rc = opts->pre_commit(st[j].old_found ? &old_rec : NULL,
+                                                       r, st[j].old_found);
+                            if (rc != 0) {
+                                keep_marker = 1;
+                                if (opts->out_durability_degraded)
+                                    *opts->out_durability_degraded = 1;
+                                r->status = -1;
+                                continue;
+                            }
+                        }
+                        r->was_update = st[j].old_found ? 1 : 0;
+                    }
+                }
+            }
+
+            if (fd >= 0) {
+                close(fd);
+                if (!keep_marker) {
+                    char dpath[PATH_MAX];
+                    snprintf(dpath, sizeof(dpath), "%s/data/kf", db->data_dir);
+                    if (unlink(bpath) != 0 || fsync_dir(dpath) != 0) {
+                        if (opts->out_durability_degraded)
+                            *opts->out_durability_degraded = 1;
+                    } else {
+                        durability_test_pause(db->data_dir, "bulk-window-cleared");
+                    }
+                } else {
+                    if (opts->out_durability_degraded)
+                        *opts->out_durability_degraded = 1;
+                }
+                free(mslots);
+            } else if (mslots) {
+                free(mslots);
+            }
+
+            if (keep_marker) {
+                for (size_t j = w_start; j < w_end; j++) {
+                    if (recs[j].status == 0 && st[j].needs_write && st[j].old_found)
+                        st[j].old_found = 0;
+                }
+            }
+
+            wi = w_end;
+        }
+    } else {
+        /* Non-indexed path: original single-loop Phase 4. */
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status != 0) continue;
+            if (!st[i].needs_write) continue;
+            SlotcaskBulkRec *r = &recs[i];
+
+            size_t pub_slot = 0;
+            int kf_committed = 0;
+            if (st[i].old_found) {
+                pub_slot = st[i].old_kf_slot;
+            } else {
+                size_t used_delta = 0;
+                int kf_rc = kf_put_new(db, &kh, st[i].hash, st[i].target_stream,
+                                       st[i].target_fid, st[i].target_off,
+                                       r->key, r->klen, db->data_dir,
+                                       &used_delta, &pub_slot);
+                if (kf_rc == 1) kf_rc = -1;
+                if (kf_rc != 0) {
+                    seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                    st[i].target_off, 2);
+                    pool_push_free(&db->streams[st[i].target_stream],
+                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    r->status = -1;
+                    continue;
+                }
+                kf_committed = 1;
+            }
+
+            r->kf_shard = kf_shard_id;
+            r->kf_slot  = (uint32_t)pub_slot;
+
+            if (opts->pre_commit) {
+                const void *old_v = r->old_value ? r->old_value : st[i].old_buf;
+                size_t      old_l = r->old_value ? r->old_vlen  : st[i].old_vlen;
+                SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
+                int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
+                                           r, st[i].old_found);
+                if (rc != 0) {
+                    if (kf_committed) {
+                        kf_tombstone_at_slot(&kh, pub_slot);
+                    }
+                    seg_write_flag(db, st[i].target_stream, st[i].target_fid,
+                                    st[i].target_off, 2);
+                    pool_push_free(&db->streams[st[i].target_stream],
+                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    r->status = -1;
+                    continue;
+                }
+            }
+
+            int kf_rc;
+            if (st[i].old_found) {
+                kf_repoint_at_slot(&kh, st[i].old_kf_slot, st[i].target_stream,
+                                    st[i].target_fid, st[i].target_off);
+                kf_rc = 0;
+            } else {
+                kf_rc = 0;
+            }
             if (kf_rc != 0) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
@@ -4481,54 +6140,8 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 r->status = -1;
                 continue;
             }
-            kf_committed = 1;
+            r->was_update = st[i].old_found ? 1 : 0;
         }
-
-        r->kf_shard = kf_shard_id;
-        r->kf_slot  = (uint32_t)pub_slot;
-
-        if (opts->pre_commit) {
-            const void *old_v = r->old_value ? r->old_value : st[i].old_buf;
-            size_t      old_l = r->old_value ? r->old_vlen  : st[i].old_vlen;
-            SlotcaskOldRecord old_rec = { (const uint8_t *)old_v, old_l };
-            int rc = opts->pre_commit(st[i].old_found ? &old_rec : NULL,
-                                       r, st[i].old_found);
-            if (rc != 0) {
-                /* Roll back: tombstone the kf entry we just wrote (if any)
-                   and the seg, push the free slot back. */
-                if (kf_committed) {
-                    kf_tombstone_at_slot(&kh, pub_slot);
-                }
-                seg_write_flag(db, st[i].target_stream, st[i].target_fid,
-                                st[i].target_off, 2);
-                pool_push_free(&db->streams[st[i].target_stream],
-                                st[i].target_fid, st[i].target_off, db->slot_size);
-                r->status = -1;
-                continue;
-            }
-        }
-
-        int kf_rc;
-        if (st[i].old_found) {
-            /* Skip kf_repoint's probe + verify_stored_key — the slot index
-               from Phase 1a is still valid because the kf wrlock has been
-               held continuously. Direct atomic 8B store. */
-            kf_repoint_at_slot(&kh, st[i].old_kf_slot, st[i].target_stream,
-                                st[i].target_fid, st[i].target_off);
-            kf_rc = 0;
-        } else {
-            /* Already committed in the pre_commit publish phase above. */
-            kf_rc = 0;
-        }
-        if (kf_rc != 0) {
-            seg_write_flag(db, st[i].target_stream, st[i].target_fid,
-                            st[i].target_off, 2);
-            pool_push_free(&db->streams[st[i].target_stream],
-                            st[i].target_fid, st[i].target_off, db->slot_size);
-            r->status = -1;
-            continue;
-        }
-        r->was_update = st[i].old_found ? 1 : 0;
     }
 
     kfcache_release(&kh);
@@ -6250,6 +7863,12 @@ static int compact_od_cb(const uint8_t *rec, size_t vlen,
     seg_record_emit(c->rmap + target_off, c->db->slot_size,
                     hash16, key, (size_t)klen, value, (size_t)vlen);
 
+    if (durability_msync_range(c->rmap, target_off, (size_t)c->db->slot_size) != 0) {
+        c->rc = -1;
+        return 1;
+    }
+    durability_test_pause(c->db->data_dir, "compact-after-recipient-sync");
+
     /* Step 2: repoint kf entry under the kf shard wrlock. */
     int kfshard = shard_for_hash(hash16, c->db->num_shards);
     char kfp[PATH_MAX];
@@ -6357,6 +7976,12 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
     const uint8_t *value = rec + 24 + (size_t)klen;
     seg_record_emit(c->rmap + target_off, (int)donor_rec_size,
                     hash16, key, (size_t)klen, value, vlen);
+
+    if (durability_msync_range(c->rmap, target_off, donor_rec_size) != 0) {
+        c->rc = -1;
+        return 1;
+    }
+    durability_test_pause(c->db->data_dir, "compact-after-recipient-sync");
 
     /* Repoint kf entry. */
     int kfshard = shard_for_hash(hash16, c->db->num_shards);

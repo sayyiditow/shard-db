@@ -155,6 +155,16 @@ struct ShardDb {
     uint64_t bt_cache_misses;
     uint64_t server_start_ms;
     uint64_t slow_query_count;
+    /* Durability commit-window instrumentation. commit_count
+       and commit_lock_hold_us_total cover single-record upsert/insert
+       commits and each bulk commit window; commit_sync_us_total covers
+       time spent specifically inside the marker fsync / kf-slot-sync
+       primitives (kf_marker_write/clear, kf_batch_marker_write/clear,
+       kfcache_sync_slots_locked) — a subset of the lock-hold total, kept
+       separate so the marker-fsync cost can be reported on its own. */
+    uint64_t commit_count;
+    uint64_t commit_lock_hold_us_total;
+    uint64_t commit_sync_us_total;
 
     /* config / tuning */
     int slow_query_ms;
@@ -174,6 +184,8 @@ struct ShardDb {
     int schema_wrlock_test_delay_ms; /* test-only; 0 = off in production */
     char rebuild_test_pause_phase[32]; /* test-only; empty = disabled */
     int rebuild_test_pause_ms;         /* test-only; 0 = disabled */
+    char durability_test_pause_phase[32]; /* test-only; empty = disabled */
+    int durability_test_pause_ms;         /* test-only; 0 = disabled */
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
@@ -329,6 +341,9 @@ extern ShardDb *g_shard_db_instance;
 #define g_server_start_ms           (g_db->server_start_ms)
 #define g_slow_query_count          (g_db->slow_query_count)
 #define g_slow_query_ms             (g_db->slow_query_ms)
+#define g_commit_count              (g_db->commit_count)
+#define g_commit_lock_hold_us_total (g_db->commit_lock_hold_us_total)
+#define g_commit_sync_us_total      (g_db->commit_sync_us_total)
 #define g_random_seq_ratio          (g_db->random_seq_ratio)
 #define g_vacuum_recommend_pct      (g_db->vacuum_recommend_pct)
 #define g_vacuum_recommend_min_deleted (g_db->vacuum_recommend_min_deleted)
@@ -344,6 +359,8 @@ extern ShardDb *g_shard_db_instance;
 #define g_schema_wrlock_test_delay_ms (g_db->schema_wrlock_test_delay_ms)
 #define g_rebuild_test_pause_phase  (g_db->rebuild_test_pause_phase)
 #define g_rebuild_test_pause_ms     (g_db->rebuild_test_pause_ms)
+#define g_durability_test_pause_phase (g_db->durability_test_pause_phase)
+#define g_durability_test_pause_ms    (g_db->durability_test_pause_ms)
 #define g_warmup_mode               (g_db->warmup_mode)
 #define g_log_level                 (g_db->log_level)
 #define g_log_retain_days           (g_db->log_retain_days)
@@ -425,5 +442,90 @@ void shard_db_destroy_after_storage(ShardDb *db);
 /* Server-wide instance set by cmd_server before any threads spawn.
    Pool workers and the log thread bind their thread-local g_db to this. */
 extern ShardDb *g_shard_db_instance;
+
+/* ── Marker file (durability write-ordering) ── */
+
+#define KF_MARKER_MAGIC 0x4B464D31u /* "KFM1" */
+
+typedef struct {
+    uint32_t magic;        /* KF_MARKER_MAGIC */
+    uint32_t kf_slot;     /* update: existing slot; insert: UINT32_MAX */
+    uint32_t old_offset;
+    uint32_t new_offset;
+    uint16_t old_file_id;
+    uint16_t new_file_id;
+    uint8_t  old_stream_id;
+    uint8_t  new_stream_id;
+    uint8_t  has_old;      /* 0=insert, 1=update */
+    uint8_t  reserved[5];
+    uint32_t checksum;     /* XXH32 over [0, offsetof(checksum)) */
+} KfMarkerSlot;
+
+_Static_assert(sizeof(KfMarkerSlot) == 32,
+               "KfMarkerSlot must stay 32 bytes");
+
+/* Marker I/O — non-static for test access (TEST_BUILD). */
+int kf_marker_write(const char *data_dir, int kf_shard,
+                    const KfMarkerSlot *slot);
+int kf_marker_clear(const char *data_dir, int kf_shard);
+int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out);
+
+/* Marker recovery — replays a marker's intent when kf writer lock is held.
+   eff_root/object identify the object for index-diff reconciliation
+   (steps 4-5); eff_root is the tenant dir ($DB_ROOT/<dir>), matching the
+   db_root convention used throughout config.c/storage.c.
+   Returns 0 on success (marker cleared), -1 on failure (marker retained).
+   Opaque kh pointer from slotcask.h (avoid cross-header typedef). */
+int kf_marker_replay_locked(const char *eff_root, const char *object,
+                            const char *data_dir, int kf_shard,
+                            void *kh, const KfMarkerSlot *marker);
+
+/* Recovery-time index reconciliation callback.
+   slotcask.c is deliberately decoupled from schema/index logic (that lives
+   in storage.c), so kf_marker_replay_locked reaches it through this
+   process-wide callback rather than a direct call. Registered once by
+   storage.c via an __attribute__((constructor)) initializer, so it is set
+   before any recovery sweep can run. NULL (unregistered) is a silent
+   no-op, matching pre_commit's "not set = no-op" convention — only
+   relevant to tests that exercise the kf layer in isolation.
+   old_value is NULL for a pure insert (marker->has_old == 0). */
+typedef int (*RecoveryIndexDiffFn)(const char *eff_root, const char *object,
+                                   int kf_shard, uint32_t kf_slot,
+                                   const uint8_t *hash,
+                                   const uint8_t *old_value, size_t old_vlen,
+                                   const uint8_t *new_value, size_t new_vlen,
+                                   char *err_buf, size_t err_buf_len);
+extern RecoveryIndexDiffFn g_recovery_index_diff_fn;
+
+/* Clean shutdown flag management. */
+int clean_flag_write(const char *data_dir);
+int clean_flag_exists(const char *data_dir);
+int clean_flag_remove(const char *data_dir);
+
+/* Bulk marker I/O. */
+int kf_batch_marker_write(const char *data_dir, int kf_shard, uint32_t batch_id,
+                          const KfMarkerSlot *markers, size_t count);
+int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id);
+
+/* Startup recovery sweep. Caller must hold objlock_wrlock(data_dir's
+   eff_root, object_name) for the duration. Returns 0 if all markers found
+   were replayed/cleared, -1 if any marker is corrupt or fails to replay.
+   If out_replayed is non-NULL, it is incremented once per marker file found
+   (regardless of replay outcome), letting the caller distinguish "the sweep
+   ran" from "the sweep actually replayed something". */
+int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, const char *object_name,
+                                  int *out_replayed);
+
+/* Returns 1 if this object's data/kf/ still has a single-record or batch
+   marker file, 0 if none, -1 on a directory I/O error. Non-replaying (no
+   lock required) — used by graceful shutdown to decide whether writing
+   .shard-db.clean is safe, without walking every marker's contents. */
+int object_has_pending_markers(const char *data_dir);
+
+/* Test-visible counter: set to 1 by cmd_server when the startup marker
+   recovery sweep actually ran (unclean shutdown detected), left at 0 on a
+   clean-shutdown startup. Declared here so TEST_BUILD cases can assert on
+   it without racing the .shard-db.clean file's deletion. */
+extern int g_marker_recovery_ran;
 
 #endif /* SHARD_DB_INTERNAL_H */

@@ -16,9 +16,12 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "bitmap.h"
+#include "slotcask.h"
+#include "types.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* Convenience: the framework only provides ASSERT_TRUE / EQ_* / CONTAINS /
    NOT_NULL. Spelling NOT_CONTAINS as a wrapper keeps the test prose
@@ -218,6 +221,90 @@ static int run_unit_assertions(void) {
     }
     unlink(path);
     return 0;
+}
+
+typedef struct {
+    TestClientCfg cfg;
+    int idx;
+    int rc; /* 0 = accepted, 1 = rejected (cap error), -1 = connect/IO failure */
+} ConcCapWorkerCtx;
+
+/* One thread = one connection = one single-record insert of a distinct
+   value into the same (single-shard, bitmap-capped) object, fired
+   concurrently with every other worker so the cap check/commit races for
+   real instead of being serialized by the test driver. */
+static void *conc_cap_worker(void *arg) {
+    ConcCapWorkerCtx *w = (ConcCapWorkerCtx *)arg;
+    TestClient *tc = tc_connect(&w->cfg);
+    if (!tc) { w->rc = -1; return NULL; }
+    char req[256], *resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"conccap\","
+        "\"key\":\"cc%d\",\"value\":{\"v\":\"ccv%d\"}}", w->idx, w->idx);
+    if (tc_request(tc, req, &resp) != 0) { w->rc = -1; tc_close(tc); return NULL; }
+    w->rc = (resp && SAFE_STRSTR(resp, "\"error\"")) ? 1 : 0;
+    free(resp);
+    tc_close(tc);
+    return NULL;
+}
+
+/* Fills keys[0..n) with distinct "cc<N>" keys that all hash to
+   target_shard under `splits` — mirrors the bitmap dict cap's actual
+   scoping (per field, per kf-shard), so the cap-boundary race below is
+   deterministic instead of relying on natural pigeonhole collisions. */
+static int cc_pick_same_shard_keys(int splits, int target_shard, int n, int *out_idx) {
+    int found = 0;
+    for (int cand = 0; cand < 100000 && found < n; cand++) {
+        char key[32];
+        snprintf(key, sizeof(key), "cc%d", cand);
+        uint8_t hash16[16];
+        compute_hash_raw(key, strlen(key), hash16);
+        if (compute_record_shard(hash16, splits) == target_shard)
+            out_idx[found++] = cand;
+    }
+    return found == n ? 0 : -1;
+}
+
+typedef struct {
+    uint64_t bucket;             /* (kf shard, initial probe slot) */
+    int candidate;
+} ProbeCollisionCandidate;
+
+static int probe_collision_cmp(const void *a, const void *b) {
+    const ProbeCollisionCandidate *pa = a, *pb = b;
+    return (pa->bucket > pb->bucket) - (pa->bucket < pb->bucket);
+}
+
+/* Find four keys with exactly the same initial kf probe position.  A
+   same-shard-only fixture would not expose the reservation-hole bug: the
+   rejected middle record must occupy the same probe chain as a surviving
+   later record.  Sorting a modest candidate sample finds a quadruple by the
+   birthday effect without a slow brute-force search for one fixed slot. */
+static int pick_four_same_probe_keys(int splits, char out_keys[][32]) {
+    enum { NCANDIDATES = 500000 };
+    ProbeCollisionCandidate *candidates = malloc(sizeof(*candidates) * NCANDIDATES);
+    if (!candidates) return -1;
+    size_t slots = slotcask_default_slots_for_splits(splits);
+    for (int cand = 0; cand < NCANDIDATES; cand++) {
+        char key[32];
+        uint8_t hash16[16];
+        snprintf(key, sizeof(key), "sc%06d", cand);
+        compute_hash_raw(key, strlen(key), hash16);
+        candidates[cand].bucket = ((uint64_t)(unsigned)compute_record_shard(hash16, splits) << 32) |
+                                  (uint64_t)kf_slot_for(hash16, slots);
+        candidates[cand].candidate = cand;
+    }
+    qsort(candidates, NCANDIDATES, sizeof(*candidates), probe_collision_cmp);
+    int rc = -1;
+    for (int i = 0; i + 3 < NCANDIDATES; i++) {
+        if (candidates[i].bucket != candidates[i + 3].bucket) continue;
+        for (int k = 0; k < 4; k++)
+            snprintf(out_keys[k], 32, "sc%06d", candidates[i + k].candidate);
+        rc = 0;
+        break;
+    }
+    free(candidates);
+    return rc;
 }
 
 static int test_bitmap_index_run(void) {
@@ -986,6 +1073,7 @@ static int test_bitmap_index_run(void) {
        distinct values; some MUST collide and trip the cap. */
     int saw_cap_error = 0;
     int actionable_msg = 0;
+    int rejected_k = -1;
     for (int k = 0; k < 24; k++) {
         char req[256];
         snprintf(req, sizeof(req),
@@ -994,6 +1082,7 @@ static int test_bitmap_index_run(void) {
         tc_request(tc, req, &resp);
         if (resp && SAFE_STRSTR(resp, "\"error\"")) {
             saw_cap_error = 1;
+            rejected_k = k;
             if (SAFE_STRSTR(resp, "bitmap index on field 'v' exceeded") &&
                 SAFE_STRSTR(resp, "or switch to btree")) {
                 actionable_msg = 1;
@@ -1007,6 +1096,265 @@ static int test_bitmap_index_run(void) {
                 "bitmap(2) cap eventually trips across 24 distinct values");
     ASSERT_TRUE(actionable_msg,
                 "cap-exceeded error names the field + suggests btree");
+
+    /* === Daemon survives repeated cap rejections (the original bug: this
+           used to abort() the whole daemon once kf became durable before
+           pre_commit ran). Re-hit the *same* over-cap shard a few more
+           times with the exact key/value that already tripped it — new
+           distinct values would just as likely land on a different,
+           not-yet-full shard (bitmap dict cap is scoped per (field,
+           kf-shard), not per object), so retrying the identical pair is
+           the only way to deterministically keep hitting a full shard.
+           Prove: the daemon keeps answering, the rejected key never
+           landed, and an update to an already-accepted key/value in that
+           same shard's dict still works afterward (dict/lock state for
+           the capped shard isn't corrupted). */
+    if (saw_cap_error && rejected_k >= 0) {
+        char rereq[256];
+        snprintf(rereq, sizeof(rereq),
+            "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"capovf\","
+            "\"key\":\"k%d\",\"value\":{\"v\":\"v%d\"}}", rejected_k, rejected_k);
+        int repeat_cap_errors = 0;
+        for (int i = 0; i < 5; i++) {
+            tc_request(tc, rereq, &resp);
+            if (resp && SAFE_STRSTR(resp, "\"error\"")) repeat_cap_errors++;
+            free(resp); resp = NULL;
+        }
+        ASSERT_EQ_INT(repeat_cap_errors, 5,
+                    "daemon still alive and consistently rejecting the same "
+                    "over-cap insert on retry");
+
+        char existsreq[256];
+        snprintf(existsreq, sizeof(existsreq),
+            "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"capovf\",\"key\":\"k%d\"}",
+            rejected_k);
+        tc_request(tc, existsreq, &resp);
+        ASSERT_CONTAINS(resp, "false", "rejected key never landed (exists:false)");
+        free(resp); resp = NULL;
+
+        /* Key k0's own shard already has v0 in its dict (k0 was among the
+           first successful inserts in the loop above); updating k0 back
+           to v0 doesn't add a new distinct value, so it must still
+           succeed even though that same key's kf-shard may or may not be
+           the one that tripped the cap — proves the dict/lock state for
+           an already-accepted entry keeps working after a cap rejection
+           elsewhere. */
+        tc_request(tc,
+            "{\"mode\":\"update\",\"dir\":\"t\",\"object\":\"capovf\","
+            "\"key\":\"k0\",\"value\":{\"v\":\"v0\"}}", &resp);
+        ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
+                    "update of an already-accepted key/value still succeeds "
+                    "after a cap rejection");
+        free(resp); resp = NULL;
+    }
+
+    /* === Bulk-window partial rejection: one bulk-insert call carrying
+           enough distinct values that a bitmap(2) shard cap trips partway
+           through the window. Exercises v2_bulk_ins_prepare_window /
+           v2_bulk_ins_apply_window (the two-phase bulk fix) — asserts the
+           rejected record(s) alone get dropped, every other record in the
+           same window still commits (both before and after the rejection
+           point), and the daemon/dict/lock state survive intact. === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bulkcapovf\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"v:varchar:32\"],\"indexes\":[\"v:bitmap(2)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bulkcapovf bitmap(2)");
+    free(resp); resp = NULL;
+
+    {
+        /* 20 distinct values across 8 shards, cap=2/shard: pigeonhole
+           guarantees at least one shard exceeds its cap within the window
+           (avg 2.5 distinct values/shard > cap 2). */
+        char req[2048];
+        int off = snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"bulkcapovf\",\"records\":[");
+        for (int k = 0; k < 20; k++) {
+            off += snprintf(req + off, sizeof(req) - (size_t)off,
+                "%s{\"key\":\"bc%d\",\"value\":{\"v\":\"bcv%d\"}}", k ? "," : "", k, k);
+        }
+        snprintf(req + off, sizeof(req) - (size_t)off, "]}");
+        tc_request(tc, req, &resp);
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"errors\":") &&
+                    !SAFE_STRSTR(resp, "\"inserted\":20"),
+                    "bulk window: at least one record rejected by the bitmap cap");
+        free(resp); resp = NULL;
+    }
+
+    int bulkcap_existing = 0;
+    int bulkcap_exists[20];
+    int first_rejected = -1;
+    int survivor_after_rejection = -1;
+    for (int k = 0; k < 20; k++) {
+        char req[128];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"bulkcapovf\",\"key\":\"bc%d\"}", k);
+        tc_request(tc, req, &resp);
+        bulkcap_exists[k] = (resp && SAFE_STRSTR(resp, "true")) ? 1 : 0;
+        if (bulkcap_exists[k]) bulkcap_existing++;
+        else if (first_rejected < 0) first_rejected = k;
+        free(resp); resp = NULL;
+    }
+    ASSERT_TRUE(bulkcap_existing > 0 && bulkcap_existing < 20,
+                "bulk window: surviving records (before AND after the rejected "
+                "one) committed, only the capped record(s) dropped");
+    ASSERT_TRUE(first_rejected >= 0,
+                "bulk window: at least one specific record identified as rejected "
+                "(exists:false)");
+    if (first_rejected >= 0) {
+        for (int k = first_rejected + 1; k < 20; k++) {
+            if (bulkcap_exists[k]) { survivor_after_rejection = k; break; }
+        }
+        ASSERT_TRUE(survivor_after_rejection >= 0,
+                    "bulk window: a record positioned AFTER the first rejected "
+                    "record still committed — a rejection mid-window does not "
+                    "abort or drop the rest of the window");
+    }
+
+    /* A stronger form of the partial-rejection case: all four records
+       begin at the same kf probe slot. Two distinct values fill bitmap(2),
+       the third is rejected, and the final record shares an accepted value
+       and must still commit.  Before reservation re-planning, that final
+       entry could be published after the rejected record's reserved slot,
+       making it unreachable to normal open-address lookup. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bulkcapprobe\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"v:varchar:32\"],\"indexes\":[\"v:bitmap(2)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"",
+                    "create probe-collision bitmap(2) fixture");
+    free(resp); resp = NULL;
+
+    {
+        char keys[4][32];
+        ASSERT_EQ_INT(pick_four_same_probe_keys(8, keys), 0,
+                      "find four keys with one identical initial kf probe slot");
+        char req[768];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"bulkcapprobe\","
+            "\"records\":[{\"key\":\"%s\",\"value\":{\"v\":\"kept\"}},"
+            "{\"key\":\"%s\",\"value\":{\"v\":\"also-kept\"}},"
+            "{\"key\":\"%s\",\"value\":{\"v\":\"rejected\"}},"
+            "{\"key\":\"%s\",\"value\":{\"v\":\"kept\"}}]}",
+            keys[0], keys[1], keys[2], keys[3]);
+        tc_request(tc, req, &resp);
+        ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"errors\":"),
+                    "colliding bulk window rejects only the cap-exceeding record");
+        free(resp); resp = NULL;
+
+        for (int k = 0; k < 4; k++) {
+            char exists_req[192];
+            snprintf(exists_req, sizeof(exists_req),
+                "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"bulkcapprobe\",\"key\":\"%s\"}",
+                keys[k]);
+            tc_request(tc, exists_req, &resp);
+            ASSERT_TRUE(resp && (k == 2 ? SAFE_STRSTR(resp, "true") == NULL
+                                         : SAFE_STRSTR(resp, "true") != NULL),
+                        k == 2 ? "rejected colliding key is absent"
+                               : "surviving colliding key is reachable through its kf probe chain");
+            free(resp); resp = NULL;
+        }
+    }
+
+    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"t\",\"object\":\"bulkcapovf\","
+        "\"key\":\"bcpost\",\"value\":{\"v\":\"bcv0\"}}", &resp);
+    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
+                "daemon alive: post-bulk-window-rejection insert still succeeds");
+    free(resp); resp = NULL;
+
+    {
+        char saved_root[256];
+        int  saved_port = env.port;
+        snprintf(saved_root, sizeof(saved_root), "%s", env.db_root);
+        tc_close(tc);
+        tc = NULL;
+        test_env_stop_keep(&env);
+
+        ASSERT_EQ_INT(test_env_start_at(&env, saved_root, saved_port), 0,
+                      "restart after bulk-window partial rejection");
+        tc = tc_connect(&cfg);
+        ASSERT_NOT_NULL(tc, "reconnect after bulk-window restart");
+        if (tc) {
+            int post_existing = 0;
+            for (int k = 0; k < 20; k++) {
+                char req[128];
+                snprintf(req, sizeof(req),
+                    "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"bulkcapovf\",\"key\":\"bc%d\"}", k);
+                tc_request(tc, req, &resp);
+                if (resp && SAFE_STRSTR(resp, "true")) post_existing++;
+                free(resp); resp = NULL;
+            }
+            ASSERT_EQ_INT(post_existing, bulkcap_existing,
+                          "bulk-window survivors unchanged across restart "
+                          "(no orphaned marker left to replay)");
+        }
+    }
+
+    /* === Concurrent cap-boundary: many connections race to insert distinct
+           values into the same single-shard bitmap(CAP) object at once, all
+           firing before any of them completes. Exercises the cap
+           check-then-commit path under real cross-connection concurrency —
+           the per-(field, kf-shard) dict cap must land on exactly CAP
+           accepted values, never more (a race letting two threads both pass
+           the cap check before either commits) and never fewer (a race
+           incorrectly rejecting a value that had room). === */
+    {
+        const int conc_splits = 8;
+        const int conc_cap = 8;
+        const int conc_n = 20;
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"conccap\","
+            "\"splits\":%d,\"max_key\":16,"
+            "\"fields\":[\"v:varchar:32\"],\"indexes\":[\"v:bitmap(%d)\"]}",
+            conc_splits, conc_cap);
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"created\"",
+                        "create conccap: bitmap(8) for concurrent race");
+        free(resp); resp = NULL;
+
+        int key_idx[20];
+        ASSERT_EQ_INT(cc_pick_same_shard_keys(conc_splits, 0, conc_n, key_idx), 0,
+                      "found 20 keys all hashing to the same kf shard");
+
+        pthread_t threads[20];
+        ConcCapWorkerCtx ctxs[20];
+        for (int i = 0; i < conc_n; i++) {
+            ctxs[i].cfg = cfg;
+            ctxs[i].idx = key_idx[i];
+            ctxs[i].rc = -2;
+            ASSERT_EQ_INT(pthread_create(&threads[i], NULL, conc_cap_worker, &ctxs[i]), 0,
+                          "spawn concurrent cap-boundary insert thread");
+        }
+        for (int i = 0; i < conc_n; i++) pthread_join(threads[i], NULL);
+
+        int accepted = 0, rejected = 0, errored = 0;
+        for (int i = 0; i < conc_n; i++) {
+            if (ctxs[i].rc == 0) accepted++;
+            else if (ctxs[i].rc == 1) rejected++;
+            else errored++;
+        }
+        ASSERT_EQ_INT(errored, 0,
+                      "all concurrent cap-boundary requests completed (no connect/IO errors)");
+        ASSERT_EQ_INT(accepted, conc_cap,
+                      "concurrent race: exactly the shard's cap worth of distinct "
+                      "values accepted, no more and no fewer");
+        ASSERT_EQ_INT(rejected, conc_n - conc_cap,
+                      "concurrent race: every value beyond the cap rejected");
+
+        int exists_count = 0;
+        for (int i = 0; i < conc_n; i++) {
+            char ereq[128];
+            snprintf(ereq, sizeof(ereq),
+                "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"conccap\",\"key\":\"cc%d\"}",
+                key_idx[i]);
+            tc_request(tc, ereq, &resp);
+            if (resp && SAFE_STRSTR(resp, "true")) exists_count++;
+            free(resp); resp = NULL;
+        }
+        ASSERT_EQ_INT(exists_count, conc_cap,
+                      "on-disk state matches: exactly CAP keys durable after the race");
+    }
 
     /* === Restart: schema + index.conf survive across daemon stop/start.
            No `test_env_restart` helper — compose it from stop_keep + start_at,

@@ -12,6 +12,14 @@ uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+/* Microsecond-resolution monotonic clock, for timing sub-millisecond
+   durability commit/sync windows (lock-hold budget instrumentation). */
+uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
 /* Coarse clock: ~1-4ms granularity, essentially free (vDSO, no syscall)
    on Linux via CLOCK_MONOTONIC_COARSE. macOS has no equivalent — it
    falls back to plain CLOCK_MONOTONIC which is still cheap (~50 ns).
@@ -334,6 +342,24 @@ void log_slow_query(const char *mode, const char *dir,
     pthread_mutex_unlock(&g_log_lock);
 }
 
+/* Records one commit's lock-hold duration into the aggregate durability
+   stats (see docs/plans/2026-07-24-durability-write-ordering.md, lock-hold
+   budget section) and, if it exceeds SLOW_QUERY_MS, emits a WARN log line
+   distinct from the whole-request slow-query log. t0_us must come from
+   now_us(). */
+void commit_lock_hold_record(uint64_t t0_us, const char *dir, const char *object) {
+    uint64_t dt_us = now_us() - t0_us;
+    if (!g_db) return;
+    __atomic_add_fetch(&g_commit_count, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_commit_lock_hold_us_total, dt_us, __ATOMIC_RELAXED);
+    if (g_slow_query_ms > 0 && dt_us > (uint64_t)g_slow_query_ms * 1000) {
+        LOG_WARN(LOG_SUB_DURABILITY,
+                 "slow commit lock-hold: %llums dir=%s object=%s",
+                 (unsigned long long)(dt_us / 1000),
+                 dir ? dir : "", object ? object : "");
+    }
+}
+
 int load_db_root(char *out, size_t outlen) {
     FILE *f = fopen("db.env", "r");
     if (!f) { fprintf(stderr, "Error: db.env not found\n"); return -1; }
@@ -540,6 +566,27 @@ int load_db_root(char *out, size_t outlen) {
                 if (g_db) g_rebuild_test_pause_ms = 0;
             } else if (g_db) {
                 g_rebuild_test_pause_ms = (int)n;
+            }
+        } else if (strncmp(p, "DURABILITY_TEST_PAUSE_PHASE=", 28) == 0) {
+            /* Test-only knob (fires durability_test_pause at the named
+               commit-window phase — e.g. "update-after-kf-sync",
+               "compact-after-recipient-sync"). Not a documented production
+               setting — do not add to configuration.md. */
+            char *v = p + 28;
+            v[strcspn(v, "\r\n")] = '\0';
+            if (g_db) snprintf(g_durability_test_pause_phase,
+                               sizeof(g_durability_test_pause_phase), "%s", v);
+        } else if (strncmp(p, "DURABILITY_TEST_PAUSE_MS=", 25) == 0) {
+            char *end = NULL;
+            long n = strtol(p + 25, &end, 10);
+            while (end && (*end == ' ' || *end == '\r' || *end == '\n')) end++;
+            if (!end || end == p + 25 || *end != '\0' || n < 0 ||
+                n > INT_MAX) {
+                fprintf(stderr,
+                        "config: invalid DURABILITY_TEST_PAUSE_MS; hook disabled\n");
+                if (g_db) g_durability_test_pause_ms = 0;
+            } else if (g_db) {
+                g_durability_test_pause_ms = (int)n;
             }
         } else if (strncmp(p, "WARMUP=", 7) == 0) {
             if (g_db) {

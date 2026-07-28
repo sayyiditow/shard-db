@@ -16,10 +16,12 @@ Global server snapshot.
 ```json
 {
   "uptime_ms": 3612450,
+  "marker_recovery_ran": 0,
   "connections": {"active": 4, "total": 18231},
   "in_flight_writes": 0,
   "ucache":    {"used": 0, "total": 0, "bytes": 0, "hits": 0, "misses": 0},
   "bt_cache":  {"used": 48,  "total": 1024, "bytes": 2097152,    "hits": 923104,  "misses": 847},
+  "commit": {"count": 483102, "lock_hold_us_total": 19324080, "lock_hold_us_avg": 40, "sync_us_total": 8213904, "sync_us_avg": 17},
   "slow_queries": [
     {"mode":"find","object":"orders","duration_ms":1347,"at":"20260418153012"}
   ]
@@ -27,6 +29,10 @@ Global server snapshot.
 ```
 
 `bt_cache.total` is **derived** as `FCACHE_MAX / 4` since 2026.05.1 — it is no longer configurable. Setting `BT_CACHE_MAX` in db.env emits a stderr warning and is ignored.
+
+`marker_recovery_ran` is `1` if the durability marker recovery sweep replayed at least one in-flight commit during this process's startup (i.e. the previous process was killed mid-commit), `0` otherwise. Check this after any unclean shutdown/restart.
+
+`commit` covers the durability commit-window instrumentation (single-record insert/update and each bulk commit window, up to `BULK_COMMIT_MAX_RECORDS` records per window): `count` is the number of commit windows executed since server start; `lock_hold_us_total`/`lock_hold_us_avg` is wall-clock time spent inside the commit call (a proxy for time under the per-shard kf writer lock — the caller-side timing spans the whole call, which for bulk workers sums every window in that call); `sync_us_total`/`sync_us_avg` is the subset of that time spent specifically inside the marker fsync / targeted kf-slot-sync primitives. A commit whose lock-hold exceeds `SLOW_QUERY_MS` also logs a `durability`-subsystem WARN line, separate from the whole-request slow-query log.
 
 ### Response (table)
 
@@ -38,6 +44,8 @@ Human-readable block with the same numbers. Use `format:"table"` from the CLI; J
 - **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived). The universal read-cache metric.
 - **`in_flight_writes`** — should drain quickly. Sustained high = bottleneck (disk, lock contention).
 - **`slow_queries` ring** — the last 64 queries exceeding `SLOW_QUERY_MS`. See also `slow-*.log` for history.
+- **`commit.lock_hold_us_avg` / `sync_us_avg`** — rising average = growing contention or a slower disk under the kf writer lock. `sync_us_avg` isolates the marker-fsync/targeted-sync cost specifically; if it dominates `lock_hold_us_avg`, the bottleneck is fsync latency, not lock contention.
+- **`marker_recovery_ran`** — `1` after a crash-recovered startup; correlate with logs around that restart to confirm what was replayed.
 
 CLI:
 
@@ -79,6 +87,9 @@ shard_db_bt_cache_hits_total 923104
 shard_db_bt_cache_misses_total 847
 shard_db_slow_query_threshold_milliseconds 500
 shard_db_slow_query_total 17
+shard_db_commit_total 483102
+shard_db_commit_lock_hold_microseconds_total 19324080
+shard_db_commit_sync_microseconds_total 8213904
 ```
 
 CLI:

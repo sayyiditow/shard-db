@@ -124,6 +124,23 @@ uint32_t bm_max_values(const BitmapShard *bm);
 /* Close + unmap. Safe on NULL. */
 void bm_close(BitmapShard *bm);
 
+/* Synchronously fdatasync the bitmap file. `bm` must be opened with
+   writer=1. Used by the marker-governed CRUD path. */
+int bm_sync(BitmapShard *bm);
+
+/* Non-mutating cap preflight: would inserting `value` (if it isn't already
+   in the dict) push n_values past max_values? `bm` must be a writer handle
+   (same-thread ownership requirement mirrors bm_set/bm_clear). Returns 1 if
+   it would exceed the cap, 0 if it's already present or there's room, -1 on
+   error (e.g. value too long for the dict's uint16 length prefix). Reading
+   the header + walking the dict does no I/O beyond the existing mmap. */
+int  bm_dict_would_exceed_cap(BitmapShard *bm, const uint8_t *value, size_t vlen);
+
+/* Non-mutating membership check: is `value` already in the dict? Used by
+   window-scoped cap accounting, which must distinguish "already on disk"
+   from "new distinct value" separately from the cap arithmetic. */
+int  bm_dict_contains(BitmapShard *bm, const uint8_t *value, size_t vlen);
+
 /* Set / clear / test a single bit for a (value, slot) pair. On first
    set of a new value, the dictionary grows and the file is rewritten —
    so set is more expensive on the very first write of a given value.

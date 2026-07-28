@@ -126,6 +126,9 @@ void kfcache_shutdown(void);
 int  kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                      size_t slots_capacity, int writer);
 void kfcache_release(SlotcaskKfHandle *h);
+int  kfcache_sync_slots_locked(SlotcaskKfHandle *h,
+                               const size_t *slots, size_t nslots,
+                               int header_changed);
 
 /* Fast-path acquire for read-only callers that hold a SlotRef.
    On gen match: takes rdlock and returns 0 without touching the table mutex.
@@ -419,6 +422,39 @@ typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
                                        const uint8_t *new_value, size_t new_vlen,
                                        int is_update, void *ctx);
 
+/* Two-phase hooks for indexed new-key inserts only (single-record and bulk
+ * windowed paths).
+ *
+ * prepare_commit — fires AFTER the segment write, BEFORE the commit-intent
+ *   marker exists. Must perform every check that can legitimately reject
+ *   the write (e.g. bitmap distinct-value cap) and MUST NOT durably mutate
+ *   index state. planned_kf_slot is the physical slot this record will
+ *   commit to (see kf_plan_insert_slot). Returning non-zero rejects: no
+ *   marker is ever written, the speculative segment slot is tombstoned,
+ *   caller gets an ordinary error — never routed through fail-closed.
+ *
+ * apply_commit — fires AFTER the marker is durable, BEFORE kf is committed.
+ *   Performs the actual index mutation. Returning non-zero here is always a
+ *   genuine failure (I/O/OOM), never a policy rejection — per the
+ *   commit-intent rule this is never rolled back; replayed (idempotent) or
+ *   fails closed exactly like every other post-marker-fsync failure today.
+ *
+ * Return 0 to proceed, non-zero to reject/fail. These hooks are required
+ * for an indexed fresh insert that also supplies pre_commit; slotcask must
+ * reject a partial/missing pair with EINVAL rather than silently falling
+ * back to the unsafe single-phase ordering. */
+typedef int (*slotcask_prepare_commit_fn)(const uint8_t *new_value, size_t new_vlen,
+                                           uint32_t planned_kf_slot, void *ctx);
+typedef int (*slotcask_apply_commit_fn)(const uint8_t *new_value, size_t new_vlen,
+                                         uint32_t planned_kf_slot, void *ctx);
+/* Releases whatever prepare_commit staged (e.g. retained bitmap writer
+ * handles), without applying it. Only reachable if prepare_commit
+ * succeeded but something else (currently: the marker write itself)
+ * failed before apply_commit could run — a narrow, rare I/O-failure
+ * window. Optional: NULL is fine when prepare_commit stages nothing
+ * that needs releasing. */
+typedef void (*slotcask_abort_commit_fn)(void *ctx);
+
 typedef struct {
     int                       if_not_exists;     /* fail if key exists (insert path) */
     int                       require_existing;  /* fail if key missing (update path) */
@@ -433,6 +469,15 @@ typedef struct {
     void                     *check_ctx;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
+    /* Two-phase hooks — required together for a fresh indexed insert that
+       also needs pre_commit-style index application (has_indexed_fields=1
+       and pre_commit != NULL); slotcask rejects a partial/missing pair with
+       EINVAL rather than silently falling back to the unsafe single-phase
+       ordering. See slotcask_prepare_commit_fn / slotcask_apply_commit_fn
+       above. Both share pre_commit_ctx. */
+    slotcask_prepare_commit_fn prepare_commit;
+    slotcask_apply_commit_fn   apply_commit;
+    slotcask_abort_commit_fn   abort_commit;
     /* Optional out-params: when non-NULL, slotcask writes the target kf
        shard index + kf slot index here BEFORE invoking pre_commit. The
        pre_commit ctx can read them via its own pointer to the same
@@ -441,6 +486,17 @@ typedef struct {
        fields are ignored — no behaviour change. */
     int                      *out_kf_shard;
     uint32_t                 *out_kf_slot;
+    /* Set to 1 when the object has at least one indexed field. Gates the
+       marker-write / index-sync / marker-clear sequence. Zero-index objects
+       skip the entire marker path — segment-write + kf-repoint is already
+       crash-safe without a third structure to reconcile. */
+    int                       has_indexed_fields;
+    /* When non-NULL, set to 1 after the kf + index mutation if the
+       marker could not be deleted (kf and indexes have converged; the
+       object is safe to read but a retry or restart must clean up the
+       orphaned marker). The caller must propagate this to the wire
+       response as "durability_degraded". */
+    int                      *out_durability_degraded;
 } SlotcaskUpsertOpts;
 
 /* ============================================================ Bulk upsert
@@ -501,6 +557,42 @@ typedef int (*slotcask_bulk_pre_commit_fn)(const SlotcaskOldRecord *old,
 typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
                                        SlotcaskBulkRec *rec);
 
+/* Two-phase, window-scoped hooks for indexed bulk-insert windows
+ * (BULK_COMMIT_MAX_RECORDS records per commit window).
+ *
+ * prepare_window — fires once per window, on the bulk worker thread,
+ *   BEFORE the window's batch marker exists. active[] lists indices into
+ *   recs[] that still have a valid segment write and planned kf target.
+ *   May reject an individual record for a legitimate policy condition
+ *   (e.g. bitmap cap) by setting recs[active[i]].status = -1; must not
+ *   durably mutate index state for any record, accepted or rejected.
+ *   Returns 0 (window may proceed with whatever active[] holds after
+ *   rejections) or non-zero for a hard staging failure (aborts the whole
+ *   window, no marker written).
+ *
+ * apply_window — fires once per window, AFTER the batch marker is durable,
+ *   BEFORE kf is committed for the window's surviving records. Performs
+ *   the actual index mutations for every record in active[]. A non-zero
+ *   return is always a genuine failure (I/O/OOM), never a policy
+ *   rejection — routed through the existing degraded/replay path,
+ *   unchanged.
+ *
+ * abort_window — fires instead of apply_window when the window's batch
+ *   marker never became durable (marker alloc/open/fsync failed, or every
+ *   staged record was individually rejected before or during marker
+ *   write). Releases whatever prepare_window staged (open bitmap writer
+ *   handles, tracked buffers, queued index ops) without performing any
+ *   index mutation — apply_window will never be called for this window.
+ *   Optional; NULL is fine for hooks that stage nothing durable-adjacent
+ *   in prepare_window. */
+typedef int (*slotcask_bulk_prepare_window_fn)(SlotcaskBulkRec *recs,
+                                                const size_t *active,
+                                                size_t nactive, void *ctx);
+typedef int (*slotcask_bulk_apply_window_fn)(SlotcaskBulkRec *recs,
+                                              const size_t *active,
+                                              size_t nactive, void *ctx);
+typedef void (*slotcask_bulk_abort_window_fn)(void *ctx);
+
 typedef struct {
     int                          if_not_exists;     /* skip if key exists */
     int                          require_existing;  /* skip if key missing (bulk-update use) */
@@ -513,6 +605,21 @@ typedef struct {
     int                          pre_commit_needs_old;
     /* Optional NEW-from-OLD compute hook — see slotcask_bulk_value_fn. */
     slotcask_bulk_value_fn       value_compute;
+    /* Two-phase window hooks — required together for a fresh indexed bulk
+       insert window (has_indexed_fields=1 and pre_commit != NULL); see
+       slotcask_bulk_prepare_window_fn / slotcask_bulk_apply_window_fn
+       above. Both share bulk_hook_ctx (not pre_commit's per-record ctx —
+       the window hooks operate on the whole window at once). */
+    slotcask_bulk_prepare_window_fn prepare_window;
+    slotcask_bulk_apply_window_fn   apply_window;
+    slotcask_bulk_abort_window_fn   abort_window;
+    void                            *bulk_hook_ctx;
+    /* Gate: when 0, skip marker path entirely. Set from load_index_fields()
+       same as the single-record path. */
+    int                          has_indexed_fields;
+    /* When non-NULL, set to 1 if kf+index converged but marker clear failed
+       (safe degraded state). Caller propagates to wire response. */
+    int                         *out_durability_degraded;
 } SlotcaskBulkOpts;
 
 /* Returns 0 if the batch ran (per-record results in recs[].status), -1 on

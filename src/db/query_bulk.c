@@ -1,9 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
-#include "bitmap.h"
 #include "query_internal.h"
 #include <dirent.h>
-#include <math.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -247,6 +245,18 @@ typedef struct {
     int       if_not_exists;
 } BulkInsRecord;
 
+/* A B-tree old-entry deletion staged in prepare_window for real dispatch
+   in apply_window, once the window's marker is durable. `key` may point
+   into the worker's per-record arena (stable for the worker's lifetime)
+   or into a buffer tracked via bw_track_buf — either way it outlives the
+   window's apply call. */
+typedef struct {
+    int            fi;
+    const uint8_t *key;
+    size_t         klen;
+    uint8_t        hash[16];
+} BtDeleteOp;
+
 /* Per-shard bucket + worker arguments. Each bucket targets exactly one
    shard so the worker can take the kf-shard wrlock **once**, write every
    record in the bucket, and release **once** — avoiding per-record
@@ -269,15 +279,37 @@ typedef struct {
     const int      *idx_field_counts;
     const int      *idx_is_composite;
     const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM */
-    /* Per-field bitmap accumulators — mirror btree's idx_pairs[] but
-       carry (slot, value) instead of (value, hash). Filled by
-       v2_bulk_ins_pre_commit_bulk under the kf wrlock; flushed AFTER
-       each per-shard slotcask_bulk_upsert call returns, holding the
-       bm wrlock once per (shard, field) instead of once per record.
-       Counts reset between shard iterations. */
-    struct BmPair **bm_pairs;        /* [nidx] */
-    size_t         *bm_pair_counts;  /* [nidx] */
-    size_t         *bm_pair_caps;    /* [nidx] */
+    /* Two-phase window state for indexed bulk inserts. Populated by
+       v2_bulk_ins_prepare_window (before the window's kf marker exists)
+       and consumed/torn down by v2_bulk_ins_apply_window (after the
+       marker is durable, before kf is committed for surviving records).
+       Bitmap cap rejection happens inside bitmap_prepare_window_add,
+       synchronously, so it can reject an individual record before any
+       marker exists — closing both the daemon-abort bug (rejection after
+       fsync) and the silent-cap-bypass bug (old post-return bm_pairs
+       flush that ignored bm_set's return value). */
+    BitmapPrepareWindow bw_window;
+    void               **bw_bufs;       /* malloc'd key buffers kept alive
+                                            until apply/abort closes bw_window */
+    size_t               bw_nbufs, bw_bufs_cap;
+    /* Trigram mutations deferred from prepare_window to apply_window — a
+       real on-disk write must not happen before the window's marker is
+       durable (a sibling bitmap field's cap rejection must not leave a
+       half-written record). */
+    UpdateIdxArg        *tg_ops;
+    size_t                tg_nops, tg_cap;
+    /* B-tree old-entry deletions deferred from prepare_window to
+       apply_window — same rationale as tg_ops: a durable btree delete
+       must not happen before the window's marker is durable. New-entry
+       inserts still accumulate in idx_pairs[]/idx_pair_counts[] below,
+       but apply_window now flushes (merges to disk) and resets them once
+       per window instead of the caller deferring the merge until after
+       every kf-shard worker in the whole bulk op has finished — that gap
+       let a crash between this window's marker-clear and the old
+       post-join Phase 4 merge lose btree entries for records already
+       durable in kf. */
+    BtDeleteOp          *bt_del_ops;
+    size_t                bt_del_nops, bt_del_cap;
     /* Results (written by worker) */
     int             inserted;   /* new keys — updates do NOT increment */
     int             errors;
@@ -377,8 +409,7 @@ typedef struct {
        on an upsert — restore the original bytes from the old record.
      - key is a genuine fresh insert (old == NULL): re-stamp now()
        unconditionally, even though phase 1 may already have stamped it,
-       to overwrite any client-supplied override (mirrors cmd_insert_v2's
-       Task 3 fix in storage.c — same contract, same reasoning). */
+       to overwrite any client-supplied override, matching cmd_insert_v2. */
 static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
                                          SlotcaskBulkRec *rec) {
     V2BulkInsCtx *ctx = (V2BulkInsCtx *)rec->user_ctx;
@@ -404,215 +435,481 @@ static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
     return 0;
 }
 
-/* (slot, value) pair queued for batched bitmap flush. Inline value
-   buffer covers bool (1 B) + typical varchar enum values (≤32 B);
-   longer encodings fall back to the per-record bm_open path. */
-#define BM_PAIR_INLINE  64
-typedef struct BmPair {
-    uint32_t slot;
-    uint16_t vlen;
-    uint8_t  value[BM_PAIR_INLINE];
-} BmPair;
+/* Track a malloc'd key buffer so it survives from prepare_window (where
+   it's queued into sw->bw_window or sw->tg_ops) through apply_window
+   (which actually dereferences it), then gets freed exactly once. */
+static int bw_track_buf(BulkInsShardWork *sw, void *buf) {
+    if (!buf) return 0;
+    if (sw->bw_nbufs >= sw->bw_bufs_cap) {
+        size_t ncap = sw->bw_bufs_cap ? sw->bw_bufs_cap * 2 : 32;
+        void **t = realloc(sw->bw_bufs, ncap * sizeof(void *));
+        if (!t) return -1;
+        sw->bw_bufs = t;
+        sw->bw_bufs_cap = ncap;
+    }
+    sw->bw_bufs[sw->bw_nbufs++] = buf;
+    return 0;
+}
 
-/* Per-record pre_commit hook fired under the kf-shard wrlock by
-   slotcask_bulk_upsert_in_kfshard. Reads the V2BulkInsCtx via
-   rec->user_ctx and accumulates idx entries into sw->idx_pairs[fi]. */
-static int v2_bulk_ins_pre_commit_bulk(const SlotcaskOldRecord *old,
-                                        SlotcaskBulkRec *rec,
-                                        int is_update) {
-    V2BulkInsCtx *ctx = (V2BulkInsCtx *)rec->user_ctx;
-    BulkInsShardWork *sw = ctx->sw;
-    BulkInsRecord    *r  = ctx->rec;
-    if (sw->nidx == 0) return 0;
+static void bw_free_bufs(BulkInsShardWork *sw) {
+    for (size_t i = 0; i < sw->bw_nbufs; i++) free(sw->bw_bufs[i]);
+    free(sw->bw_bufs);
+    sw->bw_bufs = NULL;
+    sw->bw_nbufs = 0;
+    sw->bw_bufs_cap = 0;
+}
 
-    /* Old idx values (only on update + when caller has an old record).
-       Bufs point either into the worker's shared arena (no per-field
-       malloc) or to malloc'd memory when the arena overflowed for a
-       particular field. old_idx_owned[fi] tracks ownership so cleanup
-       only frees malloc'd entries. */
-    uint8_t *old_idx_bufs[MAX_FIELDS];
-    size_t   old_idx_lens[MAX_FIELDS];
-    int      old_idx_have[MAX_FIELDS];
-    int      old_idx_owned[MAX_FIELDS];
-    /* Zero-init bufs + lens too — Coverity CIDs 1693836/1693840 flagged
-       reads of old_idx_bufs[fi]/old_idx_lens[fi] inside an
-       old_idx_have[fi]-guarded condition. The short-circuit means the
-       read is functionally safe, but the analyzer can't track the
-       array-element relationship. Cheap defense (~2 KB stack). */
-    memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-    memset(old_idx_lens, 0, sizeof(old_idx_lens));
-    memset(old_idx_have, 0, sizeof(old_idx_have));
-    memset(old_idx_owned, 0, sizeof(old_idx_owned));
-    if (is_update && old) {
-        for (int fi = 0; fi < sw->nidx; fi++) {
-            if (ctx->old_arena) {
-                uint8_t *slot = ctx->old_arena + (size_t)fi * ctx->old_arena_slot;
-                int rc = build_index_key_from_record_into(
-                    sw->ts, old->value, sw->idx_fields[fi],
-                    slot, ctx->old_arena_slot, &old_idx_lens[fi]);
-                if (rc == 1) {
-                    old_idx_bufs[fi] = slot;
-                    old_idx_have[fi] = 1;
-                } else if (rc == -1) {
-                    /* Oversized index key — fall back to malloc. */
+/* Returns a buffer holding the old index key that's safe to reference from
+   a deferred apply_window op. `buf` may point into the per-worker OLD-key
+   arena (owned == 0), which is reused by the next record's prepare call
+   before apply_window ever runs — those bytes must be copied out. When the
+   buffer is already independently heap-allocated for this record
+   (owned == 1), ownership just transfers into bw_track_buf() instead.
+   Sets *err = -1 on allocation/tracking failure (caller must abort the
+   window); leaves *err untouched on success. */
+static uint8_t *bw_stage_old_key(BulkInsShardWork *sw, uint8_t *buf, size_t len,
+                                  int owned, int *err) {
+    if (owned) {
+        if (bw_track_buf(sw, buf) != 0) { free(buf); *err = -1; return NULL; }
+        return buf;
+    }
+    uint8_t *copy = malloc(len);
+    if (!copy) { *err = -1; return NULL; }
+    memcpy(copy, buf, len);
+    if (bw_track_buf(sw, copy) != 0) { free(copy); *err = -1; return NULL; }
+    return copy;
+}
+
+/* Queue a trigram mutation for apply_window. Real dispatch (update_idx_fn)
+   must not happen until the window's marker is durable. */
+static int tg_track_op(BulkInsShardWork *sw, const UpdateIdxArg *a) {
+    if (sw->tg_nops >= sw->tg_cap) {
+        size_t ncap = sw->tg_cap ? sw->tg_cap * 2 : 32;
+        UpdateIdxArg *t = realloc(sw->tg_ops, ncap * sizeof(UpdateIdxArg));
+        if (!t) return -1;
+        sw->tg_ops = t;
+        sw->tg_cap = ncap;
+    }
+    sw->tg_ops[sw->tg_nops++] = *a;
+    return 0;
+}
+
+/* Queue a B-tree old-entry deletion for apply_window. Real dispatch
+   (delete_index_entry) must not happen until the window's marker is
+   durable. */
+static int bt_track_del_op(BulkInsShardWork *sw, const BtDeleteOp *op) {
+    if (sw->bt_del_nops >= sw->bt_del_cap) {
+        size_t ncap = sw->bt_del_cap ? sw->bt_del_cap * 2 : 32;
+        BtDeleteOp *t = realloc(sw->bt_del_ops, ncap * sizeof(BtDeleteOp));
+        if (!t) return -1;
+        sw->bt_del_ops = t;
+        sw->bt_del_cap = ncap;
+    }
+    sw->bt_del_ops[sw->bt_del_nops++] = *op;
+    return 0;
+}
+
+/* Releases every resource a window's prepare_window may have staged:
+ * open bitmap writer handles, tracked key buffers, queued trigram ops,
+ * queued B-tree deletions, and any B-tree inserts already accumulated
+ * for this window's idx_pairs. Used both when a window is torn down
+ * without ever reaching apply (hard staging failure, or every active
+ * record individually rejected) and, for idx_pairs, is mirrored by
+ * apply_window's own post-flush reset. */
+static void v2_bulk_ins_window_release(BulkInsShardWork *sw) {
+    bitmap_prepare_window_free(&sw->bw_window);
+    bw_free_bufs(sw);
+    free(sw->tg_ops); sw->tg_ops = NULL; sw->tg_nops = sw->tg_cap = 0;
+    free(sw->bt_del_ops); sw->bt_del_ops = NULL; sw->bt_del_nops = sw->bt_del_cap = 0;
+    for (int fi = 0; fi < sw->nidx; fi++) {
+        for (size_t k = 0; k < sw->idx_pair_counts[fi]; k++)
+            free((void *)sw->idx_pairs[fi][k].value);
+        sw->idx_pair_counts[fi] = 0;
+    }
+}
+
+/* Two-phase replacement for the old single-phase bulk index hook.
+ *
+ * prepare_window fires once per commit window, on the bulk worker thread,
+ * BEFORE the window's kf marker exists. For every active record it builds
+ * the new/old index keys (same logic the old single-phase hook used) and:
+ *   - IT_BTREE: old-entry deletes are queued into sw->bt_del_ops and
+ *     new-entry inserts accumulate into sw->idx_pairs[fi] — both are
+ *     dispatched for real only by apply_window, once this window's
+ *     marker is durable (deleting/merging during prepare would be a
+ *     durable mutation for a record that might still be rejected).
+ *   - IT_TRIGRAM: queue into sw->tg_ops for apply_window instead of
+ *     dispatching immediately — a sibling bitmap field's cap rejection
+ *     must not leave a real trigram mutation for a rejected record.
+ *   - IT_BITMAP: bitmap_prepare_window_add both validates the cap AND
+ *     queues the real set/clear for apply_window. A per-record cap
+ *     rejection here happens before any marker exists, so it can never
+ *     reach the post-fsync fail-closed/abort() path.
+ *
+ * A record can have index diffs queued for one field and then hit a
+ * rejection on a later field; since fields for one record are processed
+ * back-to-back, any partially-queued state for that record is unwound
+ * before moving to the next record: tg_ops and bt_del_ops are truncated
+ * back to this record's start, idx_pairs[fi] counts are truncated back
+ * per field (freeing the now-orphaned key buffers), and the bitmap
+ * window's ops/pending-value bookkeeping is rolled back to a checkpoint
+ * taken before this record's first field — so a rejected record leaves
+ * zero staged index side effects across every field type. */
+static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *active,
+                                       size_t nactive, void *ctx) {
+    BulkInsShardWork *sw = (BulkInsShardWork *)ctx;
+    if (sw->nidx == 0 || nactive == 0) return 0;
+
+    if (bitmap_prepare_window_init(&sw->bw_window, (size_t)sw->nidx,
+                                    nactive * (size_t)sw->nidx) != 0)
+        return -1;
+    sw->bw_bufs = NULL; sw->bw_nbufs = 0; sw->bw_bufs_cap = 0;
+    sw->tg_ops = NULL; sw->tg_nops = 0; sw->tg_cap = 0;
+    sw->bt_del_ops = NULL; sw->bt_del_nops = 0; sw->bt_del_cap = 0;
+
+    size_t nsurvive = 0;
+
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *rec = &recs[j];
+        V2BulkInsCtx *rctx = (V2BulkInsCtx *)rec->user_ctx;
+        BulkInsRecord *r = rctx->rec;
+        int is_update = rec->was_update;
+        SlotcaskOldRecord old_rec;
+        const SlotcaskOldRecord *old = NULL;
+        if (is_update && rec->old_value) {
+            old_rec.value = (const uint8_t *)rec->old_value;
+            old_rec.vlen  = (uint32_t)rec->old_vlen;
+            old = &old_rec;
+        }
+
+        uint8_t *old_idx_bufs[MAX_FIELDS];
+        size_t   old_idx_lens[MAX_FIELDS];
+        int      old_idx_have[MAX_FIELDS];
+        int      old_idx_owned[MAX_FIELDS];
+        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
+        memset(old_idx_lens, 0, sizeof(old_idx_lens));
+        memset(old_idx_have, 0, sizeof(old_idx_have));
+        memset(old_idx_owned, 0, sizeof(old_idx_owned));
+        if (is_update && old) {
+            for (int fi = 0; fi < sw->nidx; fi++) {
+                if (rctx->old_arena) {
+                    uint8_t *slot = rctx->old_arena + (size_t)fi * rctx->old_arena_slot;
+                    int rc = build_index_key_from_record_into(
+                        sw->ts, old->value, sw->idx_fields[fi],
+                        slot, rctx->old_arena_slot, &old_idx_lens[fi]);
+                    if (rc == 1) {
+                        old_idx_bufs[fi] = slot;
+                        old_idx_have[fi] = 1;
+                    } else if (rc == -1) {
+                        old_idx_have[fi] = build_index_key_from_record(
+                            sw->ts, old->value, sw->idx_fields[fi],
+                            &old_idx_bufs[fi], &old_idx_lens[fi]);
+                        old_idx_owned[fi] = old_idx_have[fi];
+                    }
+                } else {
                     old_idx_have[fi] = build_index_key_from_record(
                         sw->ts, old->value, sw->idx_fields[fi],
                         &old_idx_bufs[fi], &old_idx_lens[fi]);
                     old_idx_owned[fi] = old_idx_have[fi];
                 }
-            } else {
-                old_idx_have[fi] = build_index_key_from_record(
-                    sw->ts, old->value, sw->idx_fields[fi],
-                    &old_idx_bufs[fi], &old_idx_lens[fi]);
-                old_idx_owned[fi] = old_idx_have[fi];
             }
         }
+
+        const uint8_t *new_value = (const uint8_t *)rec->value;
+        int record_rejected = 0;
+        size_t tg_start = sw->tg_nops;
+        size_t bt_del_start = sw->bt_del_nops;
+        size_t idx_pair_start[MAX_FIELDS];
+        for (int fi = 0; fi < sw->nidx; fi++) idx_pair_start[fi] = sw->idx_pair_counts[fi];
+        BitmapWindowCheckpoint bm_cp;
+        bitmap_prepare_window_checkpoint(&sw->bw_window, &bm_cp);
+
+        for (int fi = 0; fi < sw->nidx; fi++) {
+            enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
+            uint8_t *key_buf = NULL;
+            size_t   key_len = 0;
+
+            if (sw->idx_is_composite[fi]) {
+                char cat[4096]; int cp = 0; int ok = 1;
+                for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
+                    int tidx = sw->idx_field_indices[fi][si];
+                    if (tidx < 0) { ok = 0; break; }
+                    size_t blen = 0;
+                    typed_field_to_index_key(sw->ts, new_value, tidx,
+                                              (uint8_t *)cat + cp, &blen);
+                    if (blen == 0) { ok = 0; break; }
+                    if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
+                    else { ok = 0; break; }
+                }
+                if (ok && cp > 0) {
+                    key_buf = malloc((size_t)cp);
+                    memcpy(key_buf, cat, (size_t)cp);
+                    key_len = (size_t)cp;
+                }
+            } else {
+                int tidx = sw->idx_field_indices[fi][0];
+                if (tidx >= 0) {
+                    const TypedField *f = &sw->ts->fields[tidx];
+                    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
+                    key_buf = malloc(cap);
+                    typed_field_to_index_key(sw->ts, new_value, tidx,
+                                              key_buf, &key_len);
+                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
+                }
+            }
+
+            int have_new  = (key_buf != NULL && key_len > 0);
+            int unchanged = old_idx_have[fi] && have_new &&
+                            key_len == old_idx_lens[fi] &&
+                            memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
+
+            int tg_bm_change = !unchanged && (have_new || old_idx_have[fi]);
+
+            if (itype == IT_TRIGRAM) {
+                if (tg_bm_change) {
+                    int err = 0;
+                    uint8_t *staged_old = old_idx_have[fi]
+                        ? bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                                          old_idx_owned[fi], &err)
+                        : NULL;
+                    if (err) {
+                        free(key_buf);
+                        v2_bulk_ins_window_release(sw);
+                        return -1;
+                    }
+                    UpdateIdxArg ta = {0};
+                    ta.db_root = sw->db_root; ta.object = sw->object;
+                    ta.field = sw->idx_fields[fi]; ta.splits = sw->sch->splits;
+                    ta.new_key = have_new ? key_buf : NULL;
+                    ta.new_len = have_new ? key_len : 0;
+                    ta.old_key = staged_old;
+                    ta.old_len = staged_old ? old_idx_lens[fi] : 0;
+                    ta.hash = r->hash; ta.type = IT_TRIGRAM;
+                    ta.sync_after = 1;
+                    int tracked = !have_new || (bw_track_buf(sw, key_buf) == 0);
+                    if (!tracked || tg_track_op(sw, &ta) != 0) {
+                        if (!tracked) free(key_buf);
+                        v2_bulk_ins_window_release(sw);
+                        return -1;
+                    }
+                } else {
+                    free(key_buf);
+                    if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+                }
+                continue;
+            }
+
+            if (itype == IT_BITMAP) {
+                if (tg_bm_change) {
+                    int err = 0;
+                    uint8_t *staged_old = old_idx_have[fi]
+                        ? bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                                          old_idx_owned[fi], &err)
+                        : NULL;
+                    if (err) {
+                        free(key_buf);
+                        v2_bulk_ins_window_release(sw);
+                        return -1;
+                    }
+                    UpdateIdxArg ba = {0};
+                    ba.db_root = sw->db_root; ba.object = sw->object;
+                    ba.field = sw->idx_fields[fi]; ba.splits = sw->sch->splits;
+                    ba.new_key = have_new ? key_buf : NULL;
+                    ba.new_len = have_new ? key_len : 0;
+                    ba.old_key = staged_old;
+                    ba.old_len = staged_old ? old_idx_lens[fi] : 0;
+                    ba.hash = r->hash; ba.type = IT_BITMAP;
+                    ba.kf_shard = rec->kf_shard; ba.kf_slot = rec->kf_slot;
+                    char errf[128];
+                    int rc = bitmap_prepare_window_add(&sw->bw_window, &ba,
+                                                        errf, sizeof(errf));
+                    if (rc == 0) {
+                        if (have_new && bw_track_buf(sw, key_buf) != 0) {
+                            free(key_buf);
+                            v2_bulk_ins_window_release(sw);
+                            return -1;
+                        }
+                    } else if (rc == 1) {
+                        free(key_buf);
+                        record_rejected = 1;
+                    } else {
+                        free(key_buf);
+                        v2_bulk_ins_window_release(sw);
+                        return -1;
+                    }
+                } else {
+                    free(key_buf);
+                    if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+                }
+                if (record_rejected) break;
+                continue;
+            }
+
+            /* IT_BTREE: old-entry delete and new-entry insert are both
+               deferred to apply_window (queued here, dispatched only once
+               the window's marker is durable). */
+            if (old_idx_have[fi] && !unchanged) {
+                int err = 0;
+                uint8_t *staged_old = bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                                                       old_idx_owned[fi], &err);
+                if (err) {
+                    free(key_buf);
+                    v2_bulk_ins_window_release(sw);
+                    return -1;
+                }
+                BtDeleteOp bdop;
+                bdop.fi = fi;
+                bdop.key = staged_old;
+                bdop.klen = old_idx_lens[fi];
+                memcpy(bdop.hash, r->hash, 16);
+                if (bt_track_del_op(sw, &bdop) != 0) {
+                    free(key_buf);
+                    v2_bulk_ins_window_release(sw);
+                    return -1;
+                }
+            } else if (old_idx_have[fi] && old_idx_owned[fi]) {
+                free(old_idx_bufs[fi]);
+            }
+
+            if (unchanged) { free(key_buf); continue; }
+
+            if (have_new) {
+                if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
+                    size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
+                    /* Keep the existing entries live on OOM so the common
+                       window-release path can free every already allocated
+                       key.  xrealloc_or_free() releases only the outer
+                       array, leaking those per-entry values. */
+                    BtEntry *t = realloc(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
+                    if (!t) {
+                        /* Abort the whole pre-marker window rather than
+                           silently committing records with a missing B-tree
+                           entry for this field. */
+                        LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (aborting bulk window)",
+                                sw->shard_id, sw->idx_fields[fi]);
+                        free(key_buf);
+                        v2_bulk_ins_window_release(sw);
+                        return -1;
+                    }
+                    sw->idx_pairs[fi] = t;
+                    sw->idx_pair_caps[fi] = new_cap;
+                }
+                BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
+                bp->value = (const char *)key_buf;
+                bp->vlen  = key_len;
+                memcpy(bp->hash, r->hash, 16);
+            } else {
+                free(key_buf);
+            }
+        }
+
+        if (record_rejected) {
+            /* Undo every index diff this record staged so far, across all
+               field types, so a rejected record leaves zero side effects. */
+            sw->tg_nops = tg_start;
+            sw->bt_del_nops = bt_del_start;
+            for (int fi = 0; fi < sw->nidx; fi++) {
+                for (size_t k = idx_pair_start[fi]; k < sw->idx_pair_counts[fi]; k++)
+                    free((void *)sw->idx_pairs[fi][k].value);
+                sw->idx_pair_counts[fi] = idx_pair_start[fi];
+            }
+            bitmap_prepare_window_rollback(&sw->bw_window, &bm_cp);
+            recs[j].status = -1;
+            continue;
+        }
+        nsurvive++;
     }
 
-    const uint8_t *new_value = (const uint8_t *)rec->value;
-
-    for (int fi = 0; fi < sw->nidx; fi++) {
-        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
-        uint8_t *key_buf = NULL;
-        size_t   key_len = 0;
-
-        if (sw->idx_is_composite[fi]) {
-            char cat[4096]; int cp = 0; int ok = 1;
-            for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
-                int tidx = sw->idx_field_indices[fi][si];
-                if (tidx < 0) { ok = 0; break; }
-                size_t blen = 0;
-                typed_field_to_index_key(sw->ts, new_value, tidx,
-                                          (uint8_t *)cat + cp, &blen);
-                if (blen == 0) { ok = 0; break; }
-                if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
-                else { ok = 0; break; }
-            }
-            if (ok && cp > 0) {
-                key_buf = malloc((size_t)cp);
-                memcpy(key_buf, cat, (size_t)cp);
-                key_len = (size_t)cp;
-            }
-        } else {
-            int tidx = sw->idx_field_indices[fi][0];
-            if (tidx >= 0) {
-                const TypedField *f = &sw->ts->fields[tidx];
-                size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-                key_buf = malloc(cap);
-                typed_field_to_index_key(sw->ts, new_value, tidx,
-                                          key_buf, &key_len);
-                if (key_len == 0) { free(key_buf); key_buf = NULL; }
-            }
-        }
-
-        int have_new  = (key_buf != NULL && key_len > 0);
-        int unchanged = old_idx_have[fi] && have_new &&
-                        key_len == old_idx_lens[fi] &&
-                        memcmp(key_buf, old_idx_bufs[fi], key_len) == 0;
-
-        /* Trigram fields: dispatch via update_idx_fn so the IT_TRIGRAM
-           branch in index.c extracts distinct trigrams and writes one
-           .tg leaf entry per (trigram, hash). No accumulator like
-           bitmap — each trigram is already its own btree_insert at the
-           index.c layer, and per-shard bt_acquire amortises the file
-           lock automatically. */
-        if (itype == IT_TRIGRAM) {
-            if (!unchanged && have_new) {
-                UpdateIdxArg a = {0};
-                a.db_root = sw->db_root; a.object = sw->object;
-                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
-                a.new_key = key_buf; a.new_len = key_len;
-                a.old_key = old_idx_have[fi] ? old_idx_bufs[fi] : NULL;
-                a.old_len = old_idx_have[fi] ? old_idx_lens[fi] : 0;
-                a.hash = r->hash; a.type = IT_TRIGRAM;
-                update_idx_fn(&a);
-            }
-            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
-            free(key_buf);
-            continue;
-        }
-
-        /* Bitmap fields: enqueue (slot, value) into the per-field
-           accumulator. The post-shard flush (bulk_insert_shard_worker_v2)
-           opens the .bm shard with writer=1 once, applies all bm_set's,
-           then releases — same lock-amortisation pattern btree uses
-           via idx_pairs[] + btree_bulk_merge. */
-        if (itype == IT_BITMAP) {
-            if (!unchanged && have_new && key_len <= BM_PAIR_INLINE && sw->bm_pairs) {
-                if (sw->bm_pair_counts[fi] >= sw->bm_pair_caps[fi]) {
-                    size_t new_cap = sw->bm_pair_caps[fi]
-                                     ? sw->bm_pair_caps[fi] * 2 : 256;
-                    BmPair *t = xrealloc_or_free(sw->bm_pairs[fi],
-                                                  new_cap * sizeof(BmPair));
-                    if (!t) {
-                        LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (dropped bitmap pair)",
-                                sw->shard_id, sw->idx_fields[fi]);
-                        sw->bm_pairs[fi] = NULL;
-                        sw->bm_pair_counts[fi] = 0;
-                        sw->bm_pair_caps[fi] = 0;
-                    } else {
-                        sw->bm_pairs[fi] = t;
-                        sw->bm_pair_caps[fi] = new_cap;
-                    }
-                }
-                if (sw->bm_pairs[fi]) {
-                    BmPair *p = &sw->bm_pairs[fi][sw->bm_pair_counts[fi]++];
-                    p->slot = rec->kf_slot;
-                    p->vlen = (uint16_t)key_len;
-                    memcpy(p->value, key_buf, key_len);
-                }
-            } else if (!unchanged && have_new) {
-                /* Oversized value or no accumulator — fall back to the
-                   per-record path. Same correctness, slower. */
-                UpdateIdxArg a = {0};
-                a.db_root = sw->db_root; a.object = sw->object;
-                a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
-                a.new_key = key_buf; a.new_len = key_len;
-                a.hash = r->hash; a.type = IT_BITMAP;
-                a.kf_shard = rec->kf_shard; a.kf_slot = rec->kf_slot;
-                update_idx_fn(&a);
-            }
-            if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
-            free(key_buf);
-            continue;
-        }
-
-        if (old_idx_have[fi] && !unchanged) {
-            delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                               sw->sch->splits,
-                               old_idx_bufs[fi], old_idx_lens[fi], r->hash);
-        }
-        /* Arena-backed bufs are owned by the worker (freed after the
-           full batch); only malloc'd fallback bufs are freed here. */
-        if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
-
-        if (unchanged) { free(key_buf); continue; }
-
-        if (have_new) {
-            if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
-                size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
-                BtEntry *t = xrealloc_or_free(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
-                if (!t) {
-                    LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (dropped index pair on realloc; rerun reindex)",
-                            sw->shard_id, sw->idx_fields[fi]);
-                    sw->idx_pairs[fi] = NULL;
-                    sw->idx_pair_counts[fi] = 0;
-                    sw->idx_pair_caps[fi] = 0;
-                    free(key_buf);
-                    continue;
-                }
-                sw->idx_pairs[fi] = t;
-                sw->idx_pair_caps[fi] = new_cap;
-            }
-            BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
-            bp->value = (const char *)key_buf;
-            bp->vlen  = key_len;
-            memcpy(bp->hash, r->hash, 16);
-        } else {
-            free(key_buf);
-        }
+    if (nsurvive == 0) {
+        /* Every active record in this window was individually rejected;
+           apply_window will never be invoked for an empty active set, so
+           release the window's staged resources here instead. */
+        v2_bulk_ins_window_release(sw);
     }
     return 0;
+}
+
+/* apply_window fires once the window's kf marker is durable, before kf is
+ * committed for the surviving records. Performs the real trigram, B-tree,
+ * and bitmap mutations staged by prepare_window, in that order, always
+ * running every staged op even if an earlier one fails (mirrors
+ * bitmap_prepare_window_apply's own "keep going, report at the end"
+ * pattern) so a partial apply doesn't leave some of this window's
+ * surviving records indexed and others not. A non-zero return is always
+ * a genuine I/O/OOM failure and is routed by the caller through the
+ * existing degraded/replay path — the marker is retained, never a
+ * policy rejection (those are handled entirely in prepare_window). */
+static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
+                                     size_t nactive, void *ctx) {
+    BulkInsShardWork *sw = (BulkInsShardWork *)ctx;
+    (void)recs; (void)active;
+    if (sw->nidx == 0 || nactive == 0) return 0;
+
+    int rc = 0;
+    int bt_field_touched[MAX_FIELDS] = {0};
+
+    for (size_t i = 0; i < sw->tg_nops; i++) {
+        update_idx_fn(&sw->tg_ops[i]);
+        if (sw->tg_ops[i].out_error) rc = -1;
+    }
+    free(sw->tg_ops);
+    sw->tg_ops = NULL; sw->tg_nops = sw->tg_cap = 0;
+
+    for (size_t i = 0; i < sw->bt_del_nops; i++) {
+        BtDeleteOp *op = &sw->bt_del_ops[i];
+        if (delete_index_entry(sw->db_root, sw->object, sw->idx_fields[op->fi],
+                               sw->sch->splits, op->key, op->klen, op->hash) != 0)
+            rc = -1;
+        bt_field_touched[op->fi] = 1;
+    }
+    free(sw->bt_del_ops);
+    sw->bt_del_ops = NULL; sw->bt_del_nops = sw->bt_del_cap = 0;
+
+    for (int fi = 0; fi < sw->nidx; fi++) {
+        size_t count = sw->idx_pair_counts[fi];
+        if (count == 0) continue;
+        IdxFieldArg fa = {0};
+        fa.db_root = sw->db_root; fa.object = sw->object;
+        fa.field = sw->idx_fields[fi]; fa.splits = sw->sch->splits;
+        fa.new_entries = sw->idx_pairs[fi]; fa.new_count = count;
+        idx_build_field_worker(&fa);
+        if (fa.out_error) rc = -1;
+        for (size_t k = 0; k < count; k++) free((void *)sw->idx_pairs[fi][k].value);
+        sw->idx_pair_counts[fi] = 0;
+        bt_field_touched[fi] = 1;
+    }
+
+    /* btree_bulk_merge/delete_index_entry only dirty mmap'd pages — they do
+       not fsync. Force every touched field's shards durable now, before the
+       window's marker gets cleared and Kf is published, so a crash right
+       after "apply succeeded" can't leave on-disk B-tree state lagging
+       behind the now-durable Kf state. */
+    for (int fi = 0; fi < sw->nidx; fi++) {
+        if (!bt_field_touched[fi]) continue;
+        int idx_n = index_splits_for(sw->sch->splits);
+        for (int s = 0; s < idx_n; s++) {
+            char idx_path[PATH_MAX];
+            build_idx_path(idx_path, sizeof(idx_path), sw->db_root, sw->object,
+                           sw->idx_fields[fi], s);
+            if (btree_sync_path(idx_path) != 0) rc = -1;
+        }
+    }
+
+    if (bitmap_prepare_window_apply(&sw->bw_window) != 0) rc = -1;
+    bitmap_prepare_window_free(&sw->bw_window);
+    bw_free_bufs(sw);
+    return rc;
+}
+
+/* Releases every resource prepare_window staged for a window that will
+ * never reach apply — the window's marker failed to become durable, so
+ * none of its staged index mutations may run (that would index records
+ * whose kf entry was never committed). Mirrors v2_bulk_ins_window_release
+ * exactly; kept as a separate name for the SlotcaskBulkOpts.abort_window
+ * wiring so the call site reads as "abort", not "release". */
+static void v2_bulk_ins_abort_window(void *ctx) {
+    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
 }
 
 static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
@@ -666,22 +963,6 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         ? malloc((size_t)sw->nidx * INDEX_KEY_MAX)
         : NULL;
 
-    /* Bitmap accumulators — per-field BmPair arrays. Reset between shard
-       iterations (each shard flushes its own pending bm_set's, then
-       counts go back to 0). Only allocated when there's at least one
-       bitmap-typed field. */
-    int has_bm_field = 0;
-    if (sw->idx_types) {
-        for (int fi = 0; fi < sw->nidx; fi++) {
-            if (sw->idx_types[fi] == IT_BITMAP) { has_bm_field = 1; break; }
-        }
-    }
-    if (has_bm_field) {
-        sw->bm_pairs       = calloc((size_t)sw->nidx, sizeof(BmPair *));
-        sw->bm_pair_counts = calloc((size_t)sw->nidx, sizeof(size_t));
-        sw->bm_pair_caps   = calloc((size_t)sw->nidx, sizeof(size_t));
-    }
-
     /* Pack records into [batch] grouped by kf shard, with [ctxs] mirrored. */
     for (size_t i = 0; i < sw->count; i++) {
         int s = kf_shards[i];
@@ -716,18 +997,29 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
 
     SlotcaskBulkOpts opts = {
         .if_not_exists        = sw->if_not_exists,
-        .pre_commit           = v2_bulk_ins_pre_commit_bulk,
+        /* Fresh-insert-capable bulk-insert window: routed through the
+           two-phase hooks so a bitmap-cap rejection happens before the
+           window's kf marker exists. No pre_commit here — every active
+           record (fresh insert or update-resolved) goes through
+           prepare_window/apply_window uniformly for this call site. */
+        .prepare_window       = sw->nidx > 0 ? v2_bulk_ins_prepare_window : NULL,
+        .apply_window         = sw->nidx > 0 ? v2_bulk_ins_apply_window  : NULL,
+        .abort_window         = sw->nidx > 0 ? v2_bulk_ins_abort_window  : NULL,
+        .bulk_hook_ctx         = sw,
         /* OLD value only needed when there are indexes to update; otherwise
            the hook returns immediately. Tells the primitive to skip the
            per-record read_record_value on UPDATE. */
         .pre_commit_needs_old = sw->nidx > 0,
+        .has_indexed_fields   = sw->nidx > 0,
         .value_compute        = has_ac ? v2_bulk_ins_ac_value_compute : NULL,
     };
     for (int s = 0; s < splits; s++) {
         if (counts[s] == 0) continue;
+        uint64_t _commit_t0 = now_us();
         int rc = slotcask_bulk_upsert_in_kfshard(sdb, s,
                                                   batch + offsets[s],
                                                   (size_t)counts[s], &opts);
+        commit_lock_hold_record(_commit_t0, sw->db_root, sw->object);
         if (rc != 0) {
             for (int k = 0; k < counts[s]; k++) {
                 if (batch[offsets[s] + k].status == 0)
@@ -739,46 +1031,10 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
            per (shard, field) — wrlock acquired once, all bm_set's
            applied, wrlock released. Same amortisation pattern btree
            uses with btree_insert_batch in the merge phase. */
-        if (has_bm_field && sw->bm_pairs) {
-            int slots_per_shard =
-                (int)slotcask_default_slots_for_splits(sw->sch->splits);
-            for (int fi = 0; fi < sw->nidx; fi++) {
-                if (sw->idx_types[fi] != IT_BITMAP) continue;
-                if (sw->bm_pair_counts[fi] == 0) continue;
-                if (!sw->bm_pairs[fi]) {
-                    sw->bm_pair_counts[fi] = 0;
-                    continue;
-                }
-                char bp[PATH_MAX];
-                bm_build_path(bp, sizeof(bp), sw->db_root, sw->object,
-                              sw->idx_fields[fi], s);
-                /* bool_fastpath autodetect: first queued pair is 1 byte? */
-                int bool_fast = (sw->bm_pair_counts[fi] > 0 &&
-                                 sw->bm_pairs[fi][0].vlen == 1);
-                BitmapShard *bm = bm_open(bp, slots_per_shard, 1,
-                                          bool_fast, 0, 1 /* writer */);
-                if (bm) {
-                    /* Auto-grow if any pair exceeds current stride. The
-                       largest slot in this batch bounds the requirement. */
-                    uint32_t max_slot = 0;
-                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
-                        if (sw->bm_pairs[fi][k].slot > max_slot)
-                            max_slot = sw->bm_pairs[fi][k].slot;
-                    }
-                    if (max_slot >= bm_slots(bm)) {
-                        uint32_t want = max_slot + 1, grown = 1;
-                        while (grown < want && grown < 0x80000000u) grown <<= 1;
-                        bm_grow(bm, grown);
-                    }
-                    for (size_t k = 0; k < sw->bm_pair_counts[fi]; k++) {
-                        BmPair *p = &sw->bm_pairs[fi][k];
-                        bm_set(bm, p->value, p->vlen, p->slot);
-                    }
-                    bm_close(bm);
-                }
-                sw->bm_pair_counts[fi] = 0;
-            }
-        }
+        /* Bitmap (and trigram) mutations for this shard's records already
+           happened inside slotcask_bulk_upsert_in_kfshard, via
+           v2_bulk_ins_apply_window, before kf was committed for the
+           surviving records — no post-return flush needed here anymore. */
     }
 
     for (size_t i = 0; i < sw->count; i++) {
@@ -793,14 +1049,6 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     free(batch); free(ctxs); free(kf_shards);
     free(counts); free(offsets); free(cursors);
     free(old_arena);
-    /* Free per-field bitmap accumulators (all already flushed above). */
-    if (sw->bm_pairs) {
-        for (int fi = 0; fi < sw->nidx; fi++) free(sw->bm_pairs[fi]);
-        free(sw->bm_pairs); free(sw->bm_pair_counts); free(sw->bm_pair_caps);
-        sw->bm_pairs = NULL;
-        sw->bm_pair_counts = NULL;
-        sw->bm_pair_caps = NULL;
-    }
     bm_flush_thread_bitmap_cache();  /* no-op shim, kept for symmetry */
     sw->wall_ms = now_ms_coarse() - t_worker_start;
     return NULL;
@@ -2935,10 +3183,13 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         .require_existing     = 1,
         .pre_commit           = v2_bulk_upd_pre_commit_bulk,
         .pre_commit_needs_old = w->nidx > 0,
+        .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_value_compute,
     };
+    uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
+    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
 
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;
@@ -3358,10 +3609,13 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
         .require_existing     = 1,
         .pre_commit           = v2_bulk_upd_delim_pre_commit_bulk,
         .pre_commit_needs_old = w->nidx > 0,
+        .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_delim_value_compute,
     };
+    uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
+    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
 
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;
@@ -3819,10 +4073,13 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
         .require_existing     = 1,
         .pre_commit           = v2_bulk_upd_json_pre_commit_bulk,
         .pre_commit_needs_old = w->nidx > 0,
+        .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_json_value_compute,
     };
+    uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
+    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
 
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;

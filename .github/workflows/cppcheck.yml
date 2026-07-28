@@ -19,6 +19,13 @@ name: cppcheck
 #     default ("normal") level still catches every real finding the
 #     exhaustive run found on this codebase. Re-add for periodic deep
 #     audits if needed.
+#   - `--cppcheck-build-dir` persists per-file analysis data across runs
+#     (actions/cache below, keyed on a hash of src/db + src/cli). On a
+#     cache hit, cppcheck skips re-analyzing files that haven't changed
+#     since the cached run — a real win now that query.c/query_aggregate.c
+#     (8K/6K LOC) are the next-biggest TUs after slotcask.c. Falls back to
+#     the most recent cache via restore-keys on a full miss (e.g. first run
+#     on a new branch), so PRs still benefit from main's cache.
 
 on:
   push:
@@ -46,6 +53,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends cppcheck
           cppcheck --version
 
+      - name: Cache cppcheck analysis data
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cppcheck-build-dir
+          key: cppcheck-${{ hashFiles('src/db/**/*.c', 'src/db/**/*.h', 'src/cli/**/*.c', 'src/cli/**/*.h') }}
+          restore-keys: |
+            cppcheck-
+
       - name: Run cppcheck on src/
         continue-on-error: true
         # NOTE: dropped --error-exitcode=1 for now. The first run on this
@@ -63,6 +78,7 @@ jobs:
         # already covers slotcask.c with deeper analysis; cppcheck stays
         # focused on the smaller TUs where the round-trip is fast.
         run: |
+          mkdir -p .cppcheck-build-dir
           cppcheck \
             --enable=warning,performance,portability \
             --suppress=missingIncludeSystem \
@@ -71,6 +87,7 @@ jobs:
             --suppress=*:src/db/slotcask.c \
             --inline-suppr \
             --quiet \
+            --cppcheck-build-dir=.cppcheck-build-dir \
             -j "$(nproc)" \
             -Isrc/db -Isrc/cli \
             src/db/ src/cli/

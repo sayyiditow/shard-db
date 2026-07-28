@@ -44,6 +44,7 @@
 #include "test_runner.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "bench_stats.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,7 +80,7 @@ static uint64_t run_n_median(TestClient *tc, const char *json, int n) {
         free(resp);
     }
     qsort(samples, (size_t)n, sizeof(samples[0]), cmp_u64);
-    return samples[n / 2];
+    return bench_median_sorted_ns(samples, (size_t)n);
 }
 
 typedef struct {

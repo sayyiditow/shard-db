@@ -18,10 +18,19 @@ static int cmp_u64(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+uint64_t bench_median_sorted_ns(const uint64_t *samples_ns, size_t count) {
+    if (!samples_ns || count == 0) return 0;
+    size_t upper = count / 2;
+    if (count % 2 != 0) return samples_ns[upper];
+    uint64_t lower_value = samples_ns[upper - 1];
+    uint64_t upper_value = samples_ns[upper];
+    return lower_value + (upper_value - lower_value) / 2;
+}
+
 uint64_t bench_hist_p50_ns(BenchHist *h) {
     if (!h || h->count == 0) return 0;
     qsort(h->samples_ns, h->count, sizeof(uint64_t), cmp_u64);
-    return h->samples_ns[h->count / 2];
+    return bench_median_sorted_ns(h->samples_ns, h->count);
 }
 
 void bench_hist_report(BenchHist *h, const char *label, uint64_t total_wall_ns) {
@@ -33,7 +42,7 @@ void bench_hist_report(BenchHist *h, const char *label, uint64_t total_wall_ns) 
     uint64_t sum = 0;
     for (size_t i = 0; i < h->count; i++) sum += h->samples_ns[i];
     double mean_us = (double)sum / (double)h->count / 1000.0;
-    double p50_us = (double)h->samples_ns[h->count / 2] / 1000.0;
+    double p50_us = (double)bench_median_sorted_ns(h->samples_ns, h->count) / 1000.0;
     size_t p99_i = (size_t)((double)h->count * 0.99);
     if (p99_i >= h->count) p99_i = h->count - 1;
     double p99_us = (double)h->samples_ns[p99_i] / 1000.0;

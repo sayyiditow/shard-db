@@ -229,6 +229,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_warmup_vacuum_race.c \
     src/test/cases/test_warmup_vacuum_norace.c \
     src/test/cases/test_durability_sync.c \
+    src/test/cases/test_bench_stats.c \
+    src/test/cases/test_durability_ordering.c \
     src/test/cases/test_durability_sync_failures.c \
     src/test/cases/test_durability_sync_cache_paths.c \
     src/test/cases/test_embedded_bg_threads.c \
@@ -339,6 +341,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_runner_parallel.c \
     src/db/util.c \
     src/db/durability.c \
+    src/bench/bench_stats.c \
+    src/bench/bench_common.c \
     src/db/slotcask.c \
     src/db/parallel.c \
     src/db/storage.c \
@@ -364,7 +368,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/db/type_desc.c \
     src/db/embedded.c \
     src/db/nql.c \
-    -Isrc/db -Isrc/test \
+    -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test
 

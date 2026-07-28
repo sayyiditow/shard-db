@@ -75,6 +75,7 @@ typedef struct {
 } BenchHist;
 
 uint64_t bench_now_ns(void);  /* CLOCK_MONOTONIC */
+uint64_t bench_median_sorted_ns(const uint64_t *samples_ns, size_t count);
 
 static inline void bench_hist_init(BenchHist *h, uint64_t *buf, size_t cap) {
     h->samples_ns = buf; h->cap = cap; h->count = 0;

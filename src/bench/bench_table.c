@@ -82,16 +82,16 @@ static void flush_section(void) {
     /* Sort copies for percentile + min/max. Simple insertion sort, n <= 256.
        Zero-init silences gcc's maybe-uninitialized warning — it can't prove
        past the early-return for g_n==0 above. */
-    long arr[MAX_ROWS] = {0};
-    for (int i = 0; i < g_n; i++) arr[i] = g_rows[i].us;
+    uint64_t arr[MAX_ROWS] = {0};
+    for (int i = 0; i < g_n; i++) arr[i] = (uint64_t)g_rows[i].us;
     for (int i = 1; i < g_n; i++) {
-        long v = arr[i]; int j = i - 1;
+        uint64_t v = arr[i]; int j = i - 1;
         while (j >= 0 && arr[j] > v) { arr[j+1] = arr[j]; j--; }
         arr[j+1] = v;
     }
-    long mi = arr[0], ma = arr[g_n - 1];
-    long p50 = arr[g_n / 2];
-    long total = 0;
+    uint64_t mi = arr[0], ma = arr[g_n - 1];
+    uint64_t p50 = bench_median_sorted_ns(arr, (size_t)g_n);
+    uint64_t total = 0;
     for (int i = 0; i < g_n; i++) total += arr[i];
 
     printf("%.*s\n", 116, dashes);

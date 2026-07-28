@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "bench_common.h"
+#include "test_client.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,4 +64,31 @@ void bench_fmt_bytes(long long b, char *out, size_t outlen) {
     else if (b < 1024 * 1024) snprintf(out, outlen, "%.1f KB", b / 1024.0);
     else if (b < 1LL << 30)   snprintf(out, outlen, "%.1f MB", b / (1024.0 * 1024));
     else                      snprintf(out, outlen, "%.2f GB", b / (1024.0 * 1024 * 1024));
+}
+
+void bench_format_object_stats(char *out, size_t outlen, const char *label,
+                               const char *live_count, const char *disk_bytes) {
+    snprintf(out, outlen, "%s\n  live records: %s\n  disk bytes:   %s\n",
+             label, live_count ? live_count : "(error)",
+             disk_bytes ? disk_bytes : "(error)");
+}
+
+void bench_print_object_stats(TestClient *tc, const char *dir,
+                              const char *object, const char *label) {
+    char count_req[256], size_req[256], output[384];
+    char *count_resp = NULL, *size_resp = NULL;
+
+    snprintf(count_req, sizeof(count_req),
+             "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\"}",
+             dir, object);
+    snprintf(size_req, sizeof(size_req),
+             "{\"mode\":\"size\",\"dir\":\"%s\",\"object\":\"%s\"}",
+             dir, object);
+    if (tc_request(tc, count_req, &count_resp) != 0) count_resp = NULL;
+    if (tc_request(tc, size_req, &size_resp) != 0) size_resp = NULL;
+
+    bench_format_object_stats(output, sizeof(output), label, count_resp, size_resp);
+    printf("%s\n", output);
+    free(count_resp);
+    free(size_resp);
 }
