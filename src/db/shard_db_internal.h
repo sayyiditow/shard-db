@@ -122,6 +122,12 @@ struct IdxCache {
 /* server.c */
 #define IP_SET_BUCKETS 128
 
+typedef struct BtMutationLockEntry {
+    struct BtMutationLockEntry *next;
+    char                       *path;
+    pthread_mutex_t             mutex;
+} BtMutationLockEntry;
+
 /* ── ShardDb: one instance per open data directory ── */
 
 struct ShardDb {
@@ -251,7 +257,10 @@ struct ShardDb {
     int                  bt_cache_count;
     pthread_mutex_t      bt_cache_lock;
     volatile uint64_t    bt_cache_clock;
-    pthread_mutex_t      bt_merge_table_lock;
+    BtMutationLockEntry **bt_mutation_lock_buckets;
+    size_t                bt_mutation_lock_bucket_count;
+    size_t                bt_mutation_lock_count;
+    pthread_mutex_t       bt_mutation_lock_table_lock;
 
     /* bitmap cache */
     BmCacheEntry        *bm_cache;
@@ -391,7 +400,10 @@ extern ShardDb *g_shard_db_instance;
 #define bt_cache_count              (g_db->bt_cache_count)
 #define bt_cache_lock               (g_db->bt_cache_lock)
 #define bt_cache_clock              (g_db->bt_cache_clock)
-#define g_bt_merge_table_lock       (g_db->bt_merge_table_lock)
+#define g_bt_mutation_lock_buckets      (g_db->bt_mutation_lock_buckets)
+#define g_bt_mutation_lock_bucket_count (g_db->bt_mutation_lock_bucket_count)
+#define g_bt_mutation_lock_count        (g_db->bt_mutation_lock_count)
+#define g_bt_mutation_lock_table_lock   (g_db->bt_mutation_lock_table_lock)
 
 /* bitmap.c */
 #define g_bm_cache                  (g_db->bm_cache)

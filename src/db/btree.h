@@ -166,6 +166,18 @@ int btree_insert_batch(const char *path, BtEntry *entries, size_t count);
    Use for bulk insert operations instead of btree_insert_batch. */
 int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count);
 
+typedef void (*btree_test_after_extract_fn)(void *ctx);
+
+/* Test-only deterministic interleaving seam.  Pass NULL to disable. */
+void btree_test_set_after_extract_hook(btree_test_after_extract_fn fn,
+                                       void *ctx);
+
+#ifdef TEST_BUILD
+/* Test-only: reproduce the pre-fix delete path without changing production
+   synchronization.  The race regression uses this to prove its bad ordering. */
+void btree_test_set_delete_gate_bypass(int enabled);
+#endif
+
 /* Streaming bulk build — same output as btree_bulk_build but accepts entries
    one-at-a-time so the caller never materialises the full sorted input array
    in memory. Used by the streaming external-merge-sort index pipeline: k-way
@@ -218,5 +230,6 @@ int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx);
 void bt_cache_init(int cap);
 void bt_cache_shutdown(void);
 void btree_cache_invalidate(const char *path);
+void btree_mutation_locks_shutdown(void);
 
 #endif /* BTREE_H */
