@@ -372,12 +372,12 @@ static pid_t trigger_bulk_insert(TestEnv *env, const char *object,
     int off = snprintf(req, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\",\"records\":[",
         object);
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count && (size_t)off < cap; i++) {
         off += snprintf(req + off, cap - (size_t)off,
             "%s{\"key\":\"%s\",\"value\":{\"score\":%d,\"title\":\"t%d\"}}",
             i == 0 ? "" : ",", keys[i], i, i);
     }
-    snprintf(req + off, cap - (size_t)off, "]}");
+    if ((size_t)off < cap) snprintf(req + off, cap - (size_t)off, "]}");
 
     char *resp = NULL;
     int rc = tc_request(tc, req, &resp);
@@ -1017,13 +1017,13 @@ static int test_durability_bulk_window_boundary_mixed_indexes(void) {
         int off = snprintf(breq, cap,
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\",\"records\":[",
             object);
-        for (int i = 0; i < nrecords; i++) {
+        for (int i = 0; i < nrecords && (size_t)off < cap; i++) {
             off += snprintf(breq + off, cap - (size_t)off,
                 "%s{\"key\":\"mix%04d\",\"value\":{\"score\":%d,"
                 "\"title\":\"needle%04d haystack\",\"cat\":\"c%d\"}}",
                 i == 0 ? "" : ",", i, i, i, i % cat_mod);
         }
-        snprintf(breq + off, cap - (size_t)off, "]}");
+        if ((size_t)off < cap) snprintf(breq + off, cap - (size_t)off, "]}");
         tc_request(tc, breq, &resp);
         ASSERT_CONTAINS(resp, "\"inserted\":257",
                         "all 257 mixed-index records committed across the window boundary");

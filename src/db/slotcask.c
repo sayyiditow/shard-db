@@ -724,11 +724,11 @@ int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out) {
     char path[PATH_MAX];
     struct stat st;
     kf_marker_path(path, sizeof(path), data_dir, kf_shard);
-    if (stat(path, &st) != 0) return errno == ENOENT ? 1 : -1;
-    if (st.st_size == 0) return 2;
-    if (st.st_size != (off_t)sizeof(*out)) { errno = EILSEQ; return -1; }
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    if (st.st_size == 0) { close(fd); return 2; }
+    if (st.st_size != (off_t)sizeof(*out)) { close(fd); errno = EILSEQ; return -1; }
     ssize_t n = pread(fd, out, sizeof(*out), 0);
     int saved = errno;
     close(fd);

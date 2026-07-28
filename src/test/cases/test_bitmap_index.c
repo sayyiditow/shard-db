@@ -1169,11 +1169,11 @@ static int test_bitmap_index_run(void) {
         char req[2048];
         int off = snprintf(req, sizeof(req),
             "{\"mode\":\"bulk-insert\",\"dir\":\"t\",\"object\":\"bulkcapovf\",\"records\":[");
-        for (int k = 0; k < 20; k++) {
+        for (int k = 0; k < 20 && (size_t)off < sizeof(req); k++) {
             off += snprintf(req + off, sizeof(req) - (size_t)off,
                 "%s{\"key\":\"bc%d\",\"value\":{\"v\":\"bcv%d\"}}", k ? "," : "", k, k);
         }
-        snprintf(req + off, sizeof(req) - (size_t)off, "]}");
+        if ((size_t)off < sizeof(req)) snprintf(req + off, sizeof(req) - (size_t)off, "]}");
         tc_request(tc, req, &resp);
         ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"errors\":") &&
                     !SAFE_STRSTR(resp, "\"inserted\":20"),
