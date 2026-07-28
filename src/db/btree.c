@@ -1652,13 +1652,97 @@ static int bt_insert_rec(BtFile *bt, uint32_t page_id,
 
 /* ========== Public API ========== */
 
-int btree_insert(const char *path, const char *value, size_t vlen,
-                 const uint8_t hash[BT_HASH_SIZE]) {
-    if (vlen > BT_MAX_VAL_LEN) {
-        errno = EINVAL;
-        return -1;
-    }
+#define BT_MUTATION_LOCK_INITIAL_BUCKETS 64u
 
+static int bt_mutation_locks_grow_locked(size_t new_count) {
+    BtMutationLockEntry **buckets = calloc(new_count, sizeof(*buckets));
+    if (!buckets) return -1;
+    for (size_t i = 0; i < g_bt_mutation_lock_bucket_count; i++) {
+        BtMutationLockEntry *entry = g_bt_mutation_lock_buckets[i];
+        while (entry) {
+            BtMutationLockEntry *next = entry->next;
+            size_t slot = bt_path_hash(entry->path) % new_count;
+            entry->next = buckets[slot];
+            buckets[slot] = entry;
+            entry = next;
+        }
+    }
+    free(g_bt_mutation_lock_buckets);
+    g_bt_mutation_lock_buckets = buckets;
+    g_bt_mutation_lock_bucket_count = new_count;
+    return 0;
+}
+
+static int bt_mutation_lock_for(const char *path, pthread_mutex_t **out) {
+    *out = NULL;
+    pthread_mutex_lock(&g_bt_mutation_lock_table_lock);
+    if (g_bt_mutation_lock_bucket_count == 0 &&
+        bt_mutation_locks_grow_locked(BT_MUTATION_LOCK_INITIAL_BUCKETS) != 0)
+        goto oom;
+    size_t slot = bt_path_hash(path) % g_bt_mutation_lock_bucket_count;
+    for (BtMutationLockEntry *entry = g_bt_mutation_lock_buckets[slot];
+         entry; entry = entry->next) {
+        if (strcmp(entry->path, path) == 0) {
+            *out = &entry->mutex;
+            pthread_mutex_unlock(&g_bt_mutation_lock_table_lock);
+            return 0;
+        }
+    }
+    if (g_bt_mutation_lock_count >=
+        g_bt_mutation_lock_bucket_count * 3u / 4u &&
+        bt_mutation_locks_grow_locked(g_bt_mutation_lock_bucket_count * 2u) != 0)
+        goto oom;
+    slot = bt_path_hash(path) % g_bt_mutation_lock_bucket_count;
+    BtMutationLockEntry *entry = calloc(1, sizeof(*entry));
+    if (!entry) goto oom;
+    entry->path = strdup(path);
+    if (!entry->path) { free(entry); goto oom; }
+    if (pthread_mutex_init(&entry->mutex, NULL) != 0) {
+        free(entry->path); free(entry); errno = EAGAIN; goto oom;
+    }
+    entry->next = g_bt_mutation_lock_buckets[slot];
+    g_bt_mutation_lock_buckets[slot] = entry;
+    g_bt_mutation_lock_count++;
+    *out = &entry->mutex;
+    pthread_mutex_unlock(&g_bt_mutation_lock_table_lock);
+    return 0;
+oom:
+    pthread_mutex_unlock(&g_bt_mutation_lock_table_lock);
+    errno = ENOMEM;
+    return -1;
+}
+
+void btree_mutation_locks_shutdown(void) {
+    pthread_mutex_lock(&g_bt_mutation_lock_table_lock);
+    BtMutationLockEntry **buckets = g_bt_mutation_lock_buckets;
+    size_t bucket_count = g_bt_mutation_lock_bucket_count;
+    g_bt_mutation_lock_buckets = NULL;
+    g_bt_mutation_lock_bucket_count = 0;
+    g_bt_mutation_lock_count = 0;
+    pthread_mutex_unlock(&g_bt_mutation_lock_table_lock);
+    for (size_t i = 0; i < bucket_count; i++) {
+        BtMutationLockEntry *entry = buckets[i];
+        while (entry) {
+            BtMutationLockEntry *next = entry->next;
+            pthread_mutex_destroy(&entry->mutex);
+            free(entry->path);
+            free(entry);
+            entry = next;
+        }
+    }
+    free(buckets);
+}
+
+static inline void bt_mutation_lock(pthread_mutex_t *lock) {
+    pthread_mutex_lock(lock);
+}
+
+static inline void bt_mutation_unlock(pthread_mutex_t *lock) {
+    pthread_mutex_unlock(lock);
+}
+
+static int btree_insert_locked(const char *path, const char *value, size_t vlen,
+                               const uint8_t hash[BT_HASH_SIZE]) {
     BtFile bt;
     if (bt_acquire(&bt, path, 1) != 0) return -1;
 
@@ -1704,9 +1788,25 @@ int btree_insert(const char *path, const char *value, size_t vlen,
     return 0;
 }
 
+int btree_insert(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]) {
+    if (vlen > BT_MAX_VAL_LEN) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_t *lock = NULL;
+    if (bt_mutation_lock_for(path, &lock) != 0) return -1;
+    bt_mutation_lock(lock);
+    int rc = btree_insert_locked(path, value, vlen, hash);
+    int saved_errno = errno;
+    bt_mutation_unlock(lock);
+    errno = saved_errno;
+    return rc;
+}
+
 /* Batch insert — opens file once, inserts all entries, closes once.
    Much faster and safer than calling btree_insert N times. */
-int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
+static int btree_insert_batch_locked(const char *path, BtEntry *entries, size_t count) {
     if (count == 0) return 0;
 
     BtFile bt;
@@ -1750,8 +1850,19 @@ int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
     return 0;
 }
 
-int btree_delete(const char *path, const char *value, size_t vlen,
-                 const uint8_t hash[BT_HASH_SIZE]) {
+int btree_insert_batch(const char *path, BtEntry *entries, size_t count) {
+    pthread_mutex_t *lock = NULL;
+    if (bt_mutation_lock_for(path, &lock) != 0) return -1;
+    bt_mutation_lock(lock);
+    int rc = btree_insert_batch_locked(path, entries, count);
+    int saved_errno = errno;
+    bt_mutation_unlock(lock);
+    errno = saved_errno;
+    return rc;
+}
+
+static int btree_delete_locked(const char *path, const char *value, size_t vlen,
+                               const uint8_t hash[BT_HASH_SIZE]) {
     BtFile bt;
     if (bt_acquire(&bt, path, 1) != 0) return -1; /* write mode — needs to modify pages */
 
@@ -1790,6 +1901,40 @@ int btree_delete(const char *path, const char *value, size_t vlen,
 
     bt_release(&bt);
     return 0;
+}
+
+#ifdef TEST_BUILD
+static pthread_mutex_t g_btree_test_delete_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_btree_test_delete_gate_bypass;
+
+void btree_test_set_delete_gate_bypass(int enabled) {
+    pthread_mutex_lock(&g_btree_test_delete_gate_lock);
+    g_btree_test_delete_gate_bypass = enabled != 0;
+    pthread_mutex_unlock(&g_btree_test_delete_gate_lock);
+}
+
+static int btree_test_delete_gate_is_bypassed(void) {
+    pthread_mutex_lock(&g_btree_test_delete_gate_lock);
+    int bypass = g_btree_test_delete_gate_bypass;
+    pthread_mutex_unlock(&g_btree_test_delete_gate_lock);
+    return bypass;
+}
+#endif
+
+int btree_delete(const char *path, const char *value, size_t vlen,
+                 const uint8_t hash[BT_HASH_SIZE]) {
+#ifdef TEST_BUILD
+    if (btree_test_delete_gate_is_bypassed())
+        return btree_delete_locked(path, value, vlen, hash);
+#endif
+    pthread_mutex_t *lock = NULL;
+    if (bt_mutation_lock_for(path, &lock) != 0) return -1;
+    bt_mutation_lock(lock);
+    int rc = btree_delete_locked(path, value, vlen, hash);
+    int saved_errno = errno;
+    bt_mutation_unlock(lock);
+    errno = saved_errno;
+    return rc;
 }
 
 int btree_sync_path(const char *path) {
@@ -2421,7 +2566,7 @@ done:
     return rc;
 }
 
-int btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
+static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t count) {
     /* Drop the cached fd/mapping before unlink — otherwise the cache holds
        the orphaned inode alive and the next acquire opens the new file via
        a fresh fd while old writers still see the deleted one. */
@@ -2593,6 +2738,17 @@ leaf_oom:
     return -1;
 }
 
+int btree_bulk_build(const char *path, BtEntry *entries, size_t count) {
+    pthread_mutex_t *lock = NULL;
+    if (bt_mutation_lock_for(path, &lock) != 0) return -1;
+    bt_mutation_lock(lock);
+    int rc = btree_bulk_build_locked(path, entries, count);
+    int saved_errno = errno;
+    bt_mutation_unlock(lock);
+    errno = saved_errno;
+    return rc;
+}
+
 /* ========== Streaming bulk build =========================================
  * Same on-disk format as btree_bulk_build but written incrementally so the
  * caller can drive arbitrary-size inputs without holding a single sorted
@@ -2614,27 +2770,50 @@ struct BtStreamBuilder {
     size_t    last_key_len;
     size_t    total_entries;
     int       fatal;         /* set on alloc failure — finish becomes a no-op release */
+    pthread_mutex_t *mutation_lock;  /* held from open until finish */
+    int              bt_held;        /* bt_acquire succeeded; dispose must release */
 };
 
-BtStreamBuilder *bt_stream_build_open(const char *path) {
-    btree_cache_invalidate(path);
-    unlink(path);
+static int bt_stream_build_dispose(BtStreamBuilder *b, int rc) {
+    if (!b) return rc;
+    if (b->bt_held) {
+        bt_release(&b->bt);
+        b->bt_held = 0;
+    }
+    if (b->mutation_lock) {
+        bt_mutation_unlock(b->mutation_lock);
+        b->mutation_lock = NULL;
+    }
+    free(b->leaf_ids);
+    free(b);
+    return rc;
+}
 
+BtStreamBuilder *bt_stream_build_open(const char *path) {
     BtStreamBuilder *b = calloc(1, sizeof(*b));
     if (!b) {
         LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_open %s: calloc(BtStreamBuilder) failed", path);
         return NULL;
     }
-    if (bt_acquire(&b->bt, path, 1) != 0) { free(b); return NULL; }
-
+    if (bt_mutation_lock_for(path, &b->mutation_lock) != 0) {
+        free(b);
+        return NULL;
+    }
+    bt_mutation_lock(b->mutation_lock);
+    btree_cache_invalidate(path);
+    unlink(path);
+    if (bt_acquire(&b->bt, path, 1) != 0) {
+        bt_stream_build_dispose(b, -1);
+        return NULL;
+    }
+    b->bt_held = 1;
     b->leaf_cap = 256;
     b->leaf_ids = malloc(b->leaf_cap * sizeof(uint32_t));
     if (!b->leaf_ids) {
         LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_open %s: malloc(leaf_ids, cap=%zu) failed", path, b->leaf_cap);
-        bt_release(&b->bt); free(b); return NULL;
+        bt_stream_build_dispose(b, -1);
+        return NULL;
     }
-
-    /* First leaf is page 1 (pre-allocated by bt_acquire). */
     b->cur_leaf = 1;
     b->leaf_ids[b->leaf_count++] = b->cur_leaf;
     return b;
@@ -2694,7 +2873,7 @@ int bt_stream_build_add(BtStreamBuilder *b,
 
 int bt_stream_build_finish(BtStreamBuilder *b) {
     if (!b) return -1;
-    if (b->fatal) { bt_release(&b->bt); free(b->leaf_ids); free(b); return -1; }
+    if (b->fatal) return bt_stream_build_dispose(b, -1);
 
     /* No entries → leave the file as an empty (header-only) btree.
        Header has page_type=1, count=0 on page 1 from bt_acquire. */
@@ -2704,10 +2883,7 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
         fh0->entry_count = 0;
         fh0->last_leaf_page = 1;
         fh0->height = 1;
-        bt_release(&b->bt);
-        free(b->leaf_ids);
-        free(b);
-        return 0;
+        return bt_stream_build_dispose(b, 0);
     }
 
     /* === Build internal nodes bottom-up — identical to bulk_build. === */
@@ -2720,10 +2896,7 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
         if (!parent_ids) {
             LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_finish: malloc(parent_ids, cap=%zu) failed", parent_cap);
             if (child_ids != b->leaf_ids) free(child_ids);
-            bt_release(&b->bt);
-            free(b->leaf_ids);
-            free(b);
-            return -1;
+            return bt_stream_build_dispose(b, -1);
         }
         size_t parent_count = 0;
 
@@ -2795,10 +2968,7 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
     }
 
     if (child_ids != b->leaf_ids) free(child_ids);
-    free(b->leaf_ids);
-    bt_release(&b->bt);
-    free(b);
-    return 0;
+    return bt_stream_build_dispose(b, 0);
 }
 
 /* ========== Merge-rebuild: extract existing + merge + bulk_build ========== */
@@ -2876,6 +3046,26 @@ extract_done:
     return entries;
 }
 
+static pthread_mutex_t g_btree_test_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static btree_test_after_extract_fn g_btree_test_after_extract_hook;
+static void *g_btree_test_after_extract_ctx;
+
+void btree_test_set_after_extract_hook(btree_test_after_extract_fn fn,
+                                       void *ctx) {
+    pthread_mutex_lock(&g_btree_test_hook_lock);
+    g_btree_test_after_extract_hook = fn;
+    g_btree_test_after_extract_ctx = ctx;
+    pthread_mutex_unlock(&g_btree_test_hook_lock);
+}
+
+static void btree_test_after_extract(void) {
+    pthread_mutex_lock(&g_btree_test_hook_lock);
+    btree_test_after_extract_fn fn = g_btree_test_after_extract_hook;
+    void *ctx = g_btree_test_after_extract_ctx;
+    pthread_mutex_unlock(&g_btree_test_hook_lock);
+    if (fn) fn(ctx);
+}
+
 static int bt_cmp_entry(const void *a, const void *b) {
     const BtEntry *ea = a, *eb = b;
     int r = val_cmp(ea->value, ea->vlen, eb->value, eb->vlen);
@@ -2890,42 +3080,20 @@ static int bt_cmp_entry(const void *a, const void *b) {
 
    Concurrency: parallel bulk-inserts to an indexed object call this on the
    same .idx file. The read-merge-write sequence is inherently non-atomic, so
-   serialize via a per-path mutex. Different .idx files still parallelize. */
-
-typedef struct { char path[PATH_MAX]; pthread_mutex_t mutex; int used; } BtMergeLock;
-#define BT_MERGE_LOCK_BUCKETS 256
-static BtMergeLock g_bt_merge_locks[BT_MERGE_LOCK_BUCKETS];
-/* g_bt_merge_table_lock moved to ShardDb struct */
-
-static pthread_mutex_t *bt_merge_lock_for(const char *path) {
-    uint32_t idx = bt_path_hash(path) % BT_MERGE_LOCK_BUCKETS;
-    pthread_mutex_lock(&g_bt_merge_table_lock);
-    for (int i = 0; i < BT_MERGE_LOCK_BUCKETS; i++) {
-        int slot = (idx + i) % BT_MERGE_LOCK_BUCKETS;
-        if (g_bt_merge_locks[slot].used &&
-            strcmp(g_bt_merge_locks[slot].path, path) == 0) {
-            pthread_mutex_unlock(&g_bt_merge_table_lock);
-            return &g_bt_merge_locks[slot].mutex;
-        }
-        if (!g_bt_merge_locks[slot].used) {
-            strncpy(g_bt_merge_locks[slot].path, path, PATH_MAX - 1);
-            g_bt_merge_locks[slot].path[PATH_MAX - 1] = '\0';
-            pthread_mutex_init(&g_bt_merge_locks[slot].mutex, NULL);
-            g_bt_merge_locks[slot].used = 1;
-            pthread_mutex_unlock(&g_bt_merge_table_lock);
-            return &g_bt_merge_locks[slot].mutex;
-        }
-    }
-    pthread_mutex_unlock(&g_bt_merge_table_lock);
-    LOG_WARN(LOG_SUB_BTREE, "bt_merge_lock_for %s: all %d merge-lock buckets in use — proceeding WITHOUT per-path serialization", path, BT_MERGE_LOCK_BUCKETS);
-    return NULL;
-}
+   serialize via a per-path mutation gate acquired through bt_mutation_lock_for.
+   Different .idx files still parallelize. */
 
 int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
     if (new_count == 0) return 0;
 
-    pthread_mutex_t *m = bt_merge_lock_for(path);
-    if (m) pthread_mutex_lock(m);
+    pthread_mutex_t *lock = NULL;
+    if (bt_mutation_lock_for(path, &lock) != 0) return -1;
+    bt_mutation_lock(lock);
+
+    int rc = 0;
+    BtEntry *existing = NULL;
+    BtEntry *combined = NULL;
+    size_t exist_count = 0;
 
     /* Adaptive strategy: if the existing tree is much larger than the batch,
        point-insert into it is cheaper (O(M log N)) than extract+merge+rebuild
@@ -2959,59 +3127,59 @@ int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
 
     if (ratio > 0 && existing_count > 1000 &&
         existing_count > new_count * (size_t)ratio) {
-        /* Small batch into a large tree — splice via btree_insert_batch.
-           Single bt_acquire(write) for the whole batch, no per-entry
-           wrlock cycle. The per-path mutex above serialises bulk_merge
-           callers; btree_insert_batch's own bt_acquire serialises against
-           any concurrent btree_insert / btree_delete on the same path. */
-        int rc = btree_insert_batch(path, new_entries, new_count);
-        if (m) pthread_mutex_unlock(m);
-        return rc;
+        /* Small batch into a large tree — splice via btree_insert_batch_locked.
+           The outer mutation gate serialises every logical writer of this path;
+           btree_insert_batch_locked then takes the existing BtFile writer lock. */
+        rc = btree_insert_batch_locked(path, new_entries, new_count);
+        goto done;
     }
 
     /* Large batch (or empty tree) — use the rebuild path. */
     qsort(new_entries, new_count, sizeof(BtEntry), bt_cmp_entry);
 
-    size_t exist_count = 0;
-    BtEntry *existing = bt_extract_all(path, &exist_count);
+    existing = bt_extract_all(path, &exist_count);
+
+    btree_test_after_extract();
 
     if (exist_count == 0) {
-        if (existing) free(existing);
-        int rc = btree_bulk_build(path, new_entries, new_count);
-        if (m) pthread_mutex_unlock(m);
-        return rc;
+        rc = btree_bulk_build_locked(path, new_entries, new_count);
+        goto done;
     }
 
     /* Merge two sorted arrays */
-    size_t total = exist_count + new_count;
-    BtEntry *combined = malloc(total * sizeof(BtEntry));
-    if (!combined) {
-        for (size_t xi = 0; xi < exist_count; xi++) free((char *)existing[xi].value);
-        free(existing);
-        if (m) pthread_mutex_unlock(m);
-        errno = ENOMEM;
-        return -1;
+    {
+        size_t total = exist_count + new_count;
+        combined = malloc(total * sizeof(BtEntry));
+        if (!combined) {
+            errno = ENOMEM;
+            rc = -1;
+            goto done;
+        }
+
+        size_t ei = 0, ni = 0, ci = 0;
+        while (ei < exist_count && ni < new_count) {
+            if (val_hash_cmp(existing[ei].value, existing[ei].vlen, existing[ei].hash,
+                              new_entries[ni].value, new_entries[ni].vlen, new_entries[ni].hash) <= 0)
+                combined[ci++] = existing[ei++];
+            else
+                combined[ci++] = new_entries[ni++];
+        }
+        while (ei < exist_count) combined[ci++] = existing[ei++];
+        while (ni < new_count)   combined[ci++] = new_entries[ni++];
+
+        rc = btree_bulk_build_locked(path, combined, ci);
     }
 
-    size_t ei = 0, ni = 0, ci = 0;
-    while (ei < exist_count && ni < new_count) {
-        if (val_hash_cmp(existing[ei].value, existing[ei].vlen, existing[ei].hash,
-                          new_entries[ni].value, new_entries[ni].vlen, new_entries[ni].hash) <= 0)
-            combined[ci++] = existing[ei++];
-        else
-            combined[ci++] = new_entries[ni++];
+done:
+    {
+        int saved_errno = errno;
+        if (combined) free(combined);
+        if (existing) {
+            for (size_t xi = 0; xi < exist_count; xi++) free((char *)existing[xi].value);
+            free(existing);
+        }
+        bt_mutation_unlock(lock);
+        errno = saved_errno;
     }
-    while (ei < exist_count) combined[ci++] = existing[ei++];
-    while (ni < new_count)   combined[ci++] = new_entries[ni++];
-
-    int build_rc = btree_bulk_build(path, combined, ci);
-    int build_errno = errno;
-
-    free(combined);
-    for (size_t xi = 0; xi < exist_count; xi++) free((char *)existing[xi].value);
-    free(existing);
-
-    if (m) pthread_mutex_unlock(m);
-    if (build_rc != 0) errno = build_errno;
-    return build_rc;
+    return rc;
 }

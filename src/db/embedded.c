@@ -22,7 +22,7 @@ static void db_mutexes_init(void) {
     pthread_mutex_init(&g_idx_lock,              NULL);
     pthread_mutex_init(&g_counts_lock,           NULL);
     pthread_mutex_init(&bt_cache_lock,         NULL);
-    pthread_mutex_init(&g_bt_merge_table_lock,   NULL);
+    pthread_mutex_init(&g_bt_mutation_lock_table_lock, NULL);
     pthread_mutex_init(&g_bm_cache_lock,         NULL);
     pthread_mutex_init(&g_kfcache_lock,          NULL);
     pthread_mutex_init(&g_segcache_lock,         NULL);
@@ -417,7 +417,8 @@ static void db_mutexes_destroy(void) {
     pthread_mutex_destroy(&g_idx_lock);
     pthread_mutex_destroy(&g_counts_lock);
     pthread_mutex_destroy(&bt_cache_lock);
-    pthread_mutex_destroy(&g_bt_merge_table_lock);
+    btree_mutation_locks_shutdown();
+    pthread_mutex_destroy(&g_bt_mutation_lock_table_lock);
     pthread_mutex_destroy(&g_bm_cache_lock);
     pthread_mutex_destroy(&g_kfcache_lock);
     pthread_mutex_destroy(&g_segcache_lock);
