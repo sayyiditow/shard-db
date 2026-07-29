@@ -78,18 +78,13 @@ static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
         if (!u) {
             strncpy(g_objlocks[slot].name, key, sizeof(g_objlocks[slot].name) - 1);
             g_objlocks[slot].name[sizeof(g_objlocks[slot].name) - 1] = '\0';
-#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
-            {
-                pthread_rwlockattr_t attr;
-                pthread_rwlockattr_init(&attr);
-                pthread_rwlockattr_setkind_np(&attr,
-                    PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-                pthread_rwlock_init(&g_objlocks[slot].rwlock, &attr);
-                pthread_rwlockattr_destroy(&attr);
-            }
-#else
+            /* Default-attribute (reader-preferring) rwlock: objlock's API
+               permits recursive read locks, which
+               PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP does not support
+               safely (see docs/plans/2026-07-29-cache-rwlock-writer-preference.md),
+               so this stays unchanged even where the four file caches switch
+               to writer-preferring. */
             pthread_rwlock_init(&g_objlocks[slot].rwlock, NULL);
-#endif
             /* Release ordering: name + rwlock_init complete before
                any concurrent fast-path acquire-load sees used==1. */
             atomic_store_explicit(&g_objlocks[slot].used, 1, memory_order_release);
