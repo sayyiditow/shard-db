@@ -31,6 +31,165 @@ typedef struct {
     int rc;
 } Worker;
 
+typedef struct {
+    uint8_t hash[BT_HASH_SIZE];
+    int key_id;
+} ExpectedHash;
+
+typedef struct {
+    uint8_t *hashes;
+    size_t count;
+    size_t cap;
+} PhysicalHashes;
+
+static const char *INDEX_SPECS[] = {
+    "status", "region", "status+region", "region+tier",
+    "status+region+tier"
+};
+
+static int hash16_cmp(const void *a, const void *b) {
+    return memcmp(a, b, BT_HASH_SIZE);
+}
+
+static int expected_hash_cmp(const void *a, const void *b) {
+    const ExpectedHash *ea = a, *eb = b;
+    return memcmp(ea->hash, eb->hash, BT_HASH_SIZE);
+}
+
+static int hash_to_expected_cmp(const void *a, const void *b) {
+    const uint8_t *hash = a;
+    const ExpectedHash *expected = b;
+    return memcmp(hash, expected->hash, BT_HASH_SIZE);
+}
+
+static int physical_hashes_append(PhysicalHashes *out,
+                                  const uint8_t hash[BT_HASH_SIZE]) {
+    if (out->count == out->cap) {
+        size_t new_cap = out->cap ? out->cap * 2 : 1024;
+        uint8_t *new_hashes = realloc(out->hashes, new_cap * BT_HASH_SIZE);
+        if (!new_hashes) return -1;
+        out->hashes = new_hashes;
+        out->cap = new_cap;
+    }
+    memcpy(out->hashes + out->count * BT_HASH_SIZE, hash, BT_HASH_SIZE);
+    out->count++;
+    return 0;
+}
+
+/* Read each physical index shard directly. This is deliberately below the
+   index/query wrapper layer: when an E2E indexed count is short, the test can
+   distinguish an absent on-disk entry from a reader/planner omission. */
+static int collect_physical_index_hashes(const TestEnv *env, const char *spec,
+                                         PhysicalHashes *out) {
+    char min[1] = {0};
+    static const char max[] = "\xff\xff\xff\xff";
+    int nshards = index_splits_for(64);
+    char tenant_root[PATH_MAX];
+    snprintf(tenant_root, sizeof(tenant_root), "%s/default", env->db_root);
+    for (int shard = 0; shard < nshards; shard++) {
+        char path[PATH_MAX];
+        build_idx_path(path, sizeof(path), tenant_root, "idxtest", spec, shard);
+        BtRangeIter *it = btree_range_iter_open(path, min, 0, 0,
+                                                 max, 4, 0, 0);
+        if (!it) return -1;
+        const char *value;
+        const uint8_t *hash;
+        size_t vlen;
+        while (btree_range_iter_next(it, &value, &vlen, &hash)) {
+            (void)value;
+            (void)vlen;
+            if (physical_hashes_append(out, hash) != 0) {
+                btree_range_iter_close(it);
+                return -1;
+            }
+        }
+        btree_range_iter_close(it);
+    }
+    qsort(out->hashes, out->count, BT_HASH_SIZE, hash16_cmp);
+    return 0;
+}
+
+static void report_first_physical_mismatch(const char *spec,
+                                           const ExpectedHash *expected,
+                                           size_t expected_count,
+                                           const PhysicalHashes *actual) {
+    size_t ei = 0, ai = 0;
+    int reported_missing = 0;
+    int reported_duplicate = 0;
+    while (ei < expected_count && ai < actual->count) {
+        int cmp = memcmp(expected[ei].hash,
+                         actual->hashes + ai * BT_HASH_SIZE, BT_HASH_SIZE);
+        if (cmp == 0) { ei++; ai++; continue; }
+        if (cmp < 0) {
+            if (!reported_missing) {
+                TAP_DIAG("# diagnostic: physical index %s is missing key k%d in shard %d\n",
+                         spec, expected[ei].key_id,
+                         idx_shard_for_hash(expected[ei].hash, 64));
+                reported_missing = 1;
+            }
+            ei++;
+            continue;
+        }
+        const ExpectedHash *found = bsearch(actual->hashes + ai * BT_HASH_SIZE,
+                                            expected, expected_count,
+                                            sizeof(*expected), hash_to_expected_cmp);
+        if (!reported_duplicate) {
+            if (found) {
+                TAP_DIAG("# diagnostic: physical index %s duplicates key k%d in shard %d\n",
+                         spec, found->key_id,
+                         idx_shard_for_hash(found->hash, 64));
+            } else {
+                TAP_DIAG("# diagnostic: physical index %s has a hash absent from primary data\n",
+                         spec);
+            }
+            reported_duplicate = 1;
+        }
+        ai++;
+    }
+    if (ei < expected_count && !reported_missing) {
+        TAP_DIAG("# diagnostic: physical index %s is missing key k%d in shard %d\n",
+                 spec, expected[ei].key_id,
+                 idx_shard_for_hash(expected[ei].hash, 64));
+    }
+    if (ai < actual->count && !reported_duplicate) {
+        const ExpectedHash *found = bsearch(actual->hashes + ai * BT_HASH_SIZE,
+                                            expected, expected_count,
+                                            sizeof(*expected), hash_to_expected_cmp);
+        if (found) {
+            TAP_DIAG("# diagnostic: physical index %s duplicates key k%d in shard %d\n",
+                     spec, found->key_id, idx_shard_for_hash(found->hash, 64));
+        } else {
+            TAP_DIAG("# diagnostic: physical index %s has a hash absent from primary data\n",
+                     spec);
+        }
+    }
+}
+
+static int physical_index_matches_expected(const TestEnv *env, const char *spec,
+                                           const ExpectedHash *expected,
+                                           size_t expected_count) {
+    PhysicalHashes actual = {0};
+    int read_rc = collect_physical_index_hashes(env, spec, &actual);
+    int matches = read_rc == 0 && actual.count == expected_count;
+    if (matches) {
+        for (size_t i = 0; i < expected_count; i++) {
+            if (memcmp(expected[i].hash,
+                       actual.hashes + i * BT_HASH_SIZE, BT_HASH_SIZE) != 0) {
+                matches = 0;
+                break;
+            }
+        }
+    }
+    if (!matches) {
+        TAP_DIAG("# diagnostic: physical index %s has %zu entries; expected %zu\n",
+                 spec, actual.count, expected_count);
+        if (read_rc == 0)
+            report_first_physical_mismatch(spec, expected, expected_count, &actual);
+    }
+    free(actual.hashes);
+    return matches;
+}
+
 /* Build a JSON bulk-insert payload for chunk c covering keys
    k(c*PER_CHUNK) .. k(c*PER_CHUNK + PER_CHUNK - 1). */
 static char *build_payload(int chunk) {
@@ -93,7 +252,13 @@ static int find_count_keys(TestClient *tc, const char *crit) {
 
 static int test_parallel_index_integrity_run(void) {
     TestEnv env = {0};
-    if (test_env_start(&env) != 0) return 1;
+    const char *old_ratio = getenv("SHARDKV_BULK_RATIO");
+    char *saved_ratio = old_ratio ? strdup(old_ratio) : NULL;
+    setenv("SHARDKV_BULK_RATIO", "1", 1);
+    int start_rc = test_env_start(&env);
+    if (saved_ratio) { setenv("SHARDKV_BULK_RATIO", saved_ratio, 1); free(saved_ratio); }
+    else unsetenv("SHARDKV_BULK_RATIO");
+    if (start_rc != 0) return 1;
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 120000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
@@ -127,6 +292,29 @@ static int test_parallel_index_integrity_run(void) {
         if (workers[i].rc != 0) worker_failures++;
     }
     ASSERT_EQ_INT(worker_failures, 0, "all bulk-insert workers succeeded");
+
+    /* The query assertions below diagnose user-visible correctness. These
+       direct tree walks establish whether a failed query already lacks its
+       physical entry, without relying on the same wrapper/planner path. */
+    ExpectedHash *expected = malloc((size_t)TOTAL * sizeof(*expected));
+    ASSERT_NOT_NULL(expected, "allocate physical index oracle");
+    if (expected) {
+        for (int i = 0; i < TOTAL; i++) {
+            char key[32];
+            snprintf(key, sizeof(key), "k%d", i);
+            compute_hash_raw(key, strlen(key), expected[i].hash);
+            expected[i].key_id = i;
+        }
+        qsort(expected, TOTAL, sizeof(expected[0]), expected_hash_cmp);
+        for (size_t i = 0; i < sizeof(INDEX_SPECS) / sizeof(INDEX_SPECS[0]); i++) {
+            char desc[96];
+            snprintf(desc, sizeof(desc), "physical %s index has every inserted key",
+                     INDEX_SPECS[i]);
+            ASSERT_TRUE(physical_index_matches_expected(&env, INDEX_SPECS[i], expected,
+                                                         TOTAL), desc);
+        }
+        free(expected);
+    }
 
     /* Total record count. */
     tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"idxtest\"}", &resp);

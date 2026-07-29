@@ -29,6 +29,13 @@ static int count_cb(const char *v, size_t vl, const uint8_t *h, void *ctx) {
    hashes happen to be larger than the just-inserted neighbor, the leaf
    ended up unsorted by hash and the delete landed at the wrong slot. */
 static int test_dup_value_delete(const char *path) {
+    /* All six subtests below share one path with a single trailing
+       bt_cache_shutdown(). bt_cache keys entries by path string with no
+       inode check (see server.c's mode_is_write comment), so a bare
+       unlink() here would leave the previous subtest's still-mmap'd
+       entry live in cache; the next write would land on that stale
+       mapping instead of a fresh file. Must invalidate before unlink. */
+    btree_cache_invalidate(path);
     unlink(path);
     uint8_t h[3][16] = {{0}};
     /* Deliberately non-monotonic to expose ordering bugs: hash[1] is the
@@ -68,6 +75,7 @@ static int test_dup_value_delete(const char *path) {
    values + delete one entry from a duplicate-value cluster + insert into a
    different cluster. Pre-BTRH the delete left a ghost. */
 static int test_mixed_value_upsert(const char *path) {
+    btree_cache_invalidate(path);
     unlink(path);
     uint8_t h[10][16] = {{0}};
     for (int i = 0; i < 10; i++) h[i][0] = (uint8_t)(i * 17 + 3);
@@ -104,6 +112,7 @@ static int test_mixed_value_upsert(const char *path) {
    (cmp_btentry_fn in index.c + bt_cmp_entry in btree.c), so feeding it
    value-only-grouped input is the right way to exercise the fix. */
 static int test_bulk_build_sort(const char *path) {
+    btree_cache_invalidate(path);
     unlink(path);
     enum { N = 64 };
     BtEntry *entries = malloc(N * sizeof(BtEntry));
@@ -147,11 +156,44 @@ static int test_bulk_build_sort(const char *path) {
     return 0;
 }
 
+/* Diagnosis: exercise the bulk merge adaptive branch's in-place insertion
+   primitive with the same dense duplicate-value distribution as secondary
+   indexes. This has no daemon, cache publication, or request concurrency. */
+static int test_dense_duplicate_batch_insert(const char *path) {
+    enum { N = 20000, BATCH = 64 };
+    btree_cache_invalidate(path);
+    unlink(path);
+    BtEntry *entries = calloc(BATCH, sizeof(*entries));
+    ASSERT_NOT_NULL(entries, "allocate dense insert batch");
+    if (!entries) return 1;
+    for (int base = 0; base < N; base += BATCH) {
+        int n = N - base < BATCH ? N - base : BATCH;
+        for (int i = 0; i < n; i++) {
+            int id = base + i;
+            entries[i].value = (id % 4 == 0) ? "paid" : (id % 4 == 1) ? "pending" :
+                               (id % 4 == 2) ? "refunded" : "cancelled";
+            entries[i].vlen = strlen(entries[i].value);
+            memset(entries[i].hash, 0, BT_HASH_SIZE);
+            uint32_t mixed = (uint32_t)id * 2654435761u;
+            memcpy(entries[i].hash, &mixed, sizeof(mixed));
+        }
+        ASSERT_EQ_INT(btree_insert_batch(path, entries, (size_t)n), 0,
+                      "dense duplicate batch insert succeeds");
+    }
+    g_count = 0;
+    btree_range(path, "", 0, "\xff\xff\xff\xff", 4, count_cb, NULL);
+    ASSERT_EQ_INT(g_count, N, "dense duplicate point inserts retain exactly N entries");
+    free(entries);
+    unlink(path);
+    return 0;
+}
+
 /* Many duplicate-value entries to force a leaf split + internal-page
    (value, hash) separators. Then random-order deletes — every one must
    land. Pre-BTRH: split promoted only a value, so descent for
    (paid, H_X) routed to the wrong side of the tree about half the time. */
 static int test_split_propagates_hash(const char *path) {
+    btree_cache_invalidate(path);
     unlink(path);
     enum { N = 800 }; /* enough to force a multi-leaf tree */
     uint8_t hashes[N][16];
@@ -197,6 +239,7 @@ static int test_split_propagates_hash(const char *path) {
    instead of hash order, breaking (value, hash) sort and silently
    failing later deletes. */
 static int test_bulk_merge_value_hash(const char *path) {
+    btree_cache_invalidate(path);
     unlink(path);
     BtEntry batch1[3];
     for (int i = 0; i < 3; i++) {
@@ -244,6 +287,7 @@ static int test_btree_value_hash_sort_run(void) {
     test_dup_value_delete(path);
     test_mixed_value_upsert(path);
     test_bulk_build_sort(path);
+    test_dense_duplicate_batch_insert(path);
     test_split_propagates_hash(path);
     test_bulk_merge_value_hash(path);
     bt_cache_shutdown();

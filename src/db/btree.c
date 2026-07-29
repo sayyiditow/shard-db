@@ -413,19 +413,31 @@ static uint32_t bt_path_hash(const char *s) {
     return h;
 }
 
+enum {
+    BT_CACHE_EMPTY = 0,
+    BT_CACHE_LIVE = 1,
+    BT_CACHE_TOMBSTONE = 2,
+};
+
 /* Linear probe. Returns slot index of match (out_found=1) or first empty slot
-   for insertion (out_found=0). Returns -1 only if the table is completely
-   full and no path match was found. No tombstones — deletions clear `used`
-   to 0 outright, so reaching an empty slot means "path is not in the table". */
+   or tombstone for insertion (out_found=0). A removed entry must leave a
+   tombstone: clearing a linear-probed slot to empty stops a later lookup
+   before it can find a colliding live entry, creating a second cache mapping
+   for that path. That becomes unsafe when a bulk rebuild unlinks the file. */
 static int bt_cache_probe(const char *path, int *out_found) {
     uint32_t h = bt_path_hash(path);
     int mask = bt_cache_slots - 1;
     int idx = h & mask;
+    int first_tombstone = -1;
     for (int i = 0; i < bt_cache_slots; i++) {
         int s = (idx + i) & mask;
-        if (!bt_cache[s].used) {
+        if (bt_cache[s].used == BT_CACHE_EMPTY) {
             *out_found = 0;
-            return s;
+            return first_tombstone >= 0 ? first_tombstone : s;
+        }
+        if (bt_cache[s].used == BT_CACHE_TOMBSTONE) {
+            if (first_tombstone < 0) first_tombstone = s;
+            continue;
         }
         if (strcmp(bt_cache[s].path, path) == 0) {
             *out_found = 1;
@@ -433,18 +445,11 @@ static int bt_cache_probe(const char *path, int *out_found) {
         }
     }
     *out_found = 0;
+    if (first_tombstone >= 0) return first_tombstone;
     LOG_WARN(LOG_SUB_BTREE, "bt_cache_probe %s: table full after probing all %d slots, falling back to uncached mapping", path, bt_cache_slots);
     return -1;
 }
 
-/* Tear down a cache slot. Caller holds bt_cache_lock and ensures no holder
-   of the rwlock. Mirrors storage.c's LRU eviction — does not check the
-   rwlock and does not compact the probe chain. The dropped slot leaves a
-   probe-chain gap; a subsequent probe for a path that hashed past this
-   slot may install a duplicate at the gap. Both copies are MAP_SHARED of
-   the same file (coherent via the kernel page cache); the orphaned copy
-   gets LRU-evicted eventually. Bounded by working-set sizing
-   (BT_CACHE_MAX = FCACHE_MAX/4). */
 /* Detach a slot's resources under bt_cache_lock without doing any syscalls.
    The caller disposes the returned fd/map AFTER releasing bt_cache_lock via
    bt_dispose_mapping(). Non-blocking: tries the slot's own rwlock with
@@ -460,7 +465,7 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
                                size_t *out_sz) {
     BtCacheEntry *e = &bt_cache[slot];
     *out_fd = -1; *out_map = NULL; *out_sz = 0;
-    if (!e->used) return 1;
+    if (e->used != BT_CACHE_LIVE) return 1;
     char expected_path[PATH_MAX];
     snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     pthread_mutex_unlock(&bt_cache_lock);
@@ -468,7 +473,7 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
                        : pthread_rwlock_trywrlock(&e->rwlock);
     pthread_mutex_lock(&bt_cache_lock);
     if (lock_rc != 0) return 0;
-    if (!e->used) {
+    if (e->used != BT_CACHE_LIVE) {
         pthread_rwlock_unlock(&e->rwlock);
         return 1;
     }
@@ -490,7 +495,7 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
     e->map_size = 0;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
-    e->used = 0;
+    e->used = BT_CACHE_TOMBSTONE;
     e->path[0] = '\0';
     bt_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
@@ -672,7 +677,7 @@ retry_bt_acquire:
         else        pthread_rwlock_rdlock(lock);
 
         BtCacheEntry *e = &bt_cache[slot];
-        if (e->used && strcmp(e->path, path) == 0) {
+        if (e->used == BT_CACHE_LIVE && strcmp(e->path, path) == 0) {
             /* Confirmed cache hit. Two things going on:
                1. The per-entry rwlock stays held across this return by
                   design — bt_release() is the matched unlock (see btree.c:559).
@@ -758,7 +763,7 @@ retry_bt_acquire:
             int lru = -1;
             uint64_t oldest = UINT64_MAX;
             for (int i = 0; i < bt_cache_slots; i++) {
-                if (bt_cache[i].used && bt_cache[i].last_access >= floor_ts &&
+                if (bt_cache[i].used == BT_CACHE_LIVE && bt_cache[i].last_access >= floor_ts &&
                     bt_cache[i].last_access < oldest) {
                     oldest = bt_cache[i].last_access;
                     lru = i;
@@ -815,7 +820,7 @@ retry_bt_acquire:
     e->map_size = sz;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
-    e->used = 1;
+    e->used = BT_CACHE_LIVE;
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
     pthread_rwlock_t *lock = &e->rwlock;
@@ -832,7 +837,7 @@ retry_bt_acquire:
        steal this slot before we lock it. */
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
-    if (!e->used || strcmp(e->path, path) != 0) {
+    if (e->used != BT_CACHE_LIVE || strcmp(e->path, path) != 0) {
         /* Stolen by a concurrent evictor; they now own disposing our fd/map
            (captured as their own victim to dispose). Retry from scratch. */
         pthread_rwlock_unlock(lock);
