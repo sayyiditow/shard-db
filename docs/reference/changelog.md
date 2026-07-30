@@ -51,6 +51,18 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
   (likely 0) integer rather than surfacing the open failure. Now returns
   `{"error":"object not open"}`, matching `cmd_rebuild_kf`'s existing
   behavior for the same failure.
+- **`bt_cache`/`kfcache`/`segcache`/bitmap-cache per-file rwlocks now
+  initialize writer-preferring on glibc/Linux**
+  (`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`) — a writer blocked on one
+  of these per-file locks could previously be starved indefinitely by
+  continuous concurrent reader traffic on the same file, since
+  default-attribute rwlocks on glibc/NPTL always grant new readers ahead of
+  a waiting writer. `objlock.c` (schema mutations, vacuum, rebuild-kf) is
+  unchanged and keeps its current (platform-default, recursion-safe)
+  behavior, since its API permits recursive read locks that a nonrecursive
+  writer-preferring policy can't support safely. No portable equivalent
+  exists on non-glibc platforms (macOS, other Linux libcs); those keep the
+  prior platform-default behavior for all four caches, unchanged.
 
 ### Removed
 

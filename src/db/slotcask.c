@@ -160,7 +160,7 @@ void kfcache_init(int cap) {
     g_kfcache = calloc(g_kfcache_slots, sizeof(KfCacheEntry));
     g_kfcache_count = 0;
     for (int i = 0; i < g_kfcache_slots; i++) {
-        pthread_rwlock_init(&g_kfcache[i].rwlock, NULL);
+        rwlock_init_writer_preferring(&g_kfcache[i].rwlock);
         g_kfcache[i].fd = -1;
     }
 }
@@ -940,7 +940,7 @@ void segcache_init(int cap) {
     g_segcache = calloc(g_segcache_slots, sizeof(SegCacheEntry));
     g_segcache_count = 0;
     for (int i = 0; i < g_segcache_slots; i++) {
-        pthread_rwlock_init(&g_segcache[i].rwlock, NULL);
+        rwlock_init_writer_preferring(&g_segcache[i].rwlock);
         g_segcache[i].fd = -1;
     }
 }

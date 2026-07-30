@@ -74,7 +74,7 @@ void bm_cache_init(int cap) {
     g_bm_cache = calloc((size_t)g_bm_cache_slots, sizeof(BmCacheEntry));
     g_bm_cache_count = 0;
     for (int i = 0; i < g_bm_cache_slots; i++) {
-        pthread_rwlock_init(&g_bm_cache[i].rwlock, NULL);
+        rwlock_init_writer_preferring(&g_bm_cache[i].rwlock);
         g_bm_cache[i].fd = -1;
     }
 }
