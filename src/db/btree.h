@@ -176,6 +176,39 @@ void btree_test_set_after_extract_hook(btree_test_after_extract_fn fn,
 /* Test-only: reproduce the pre-fix delete path without changing production
    synchronization.  The race regression uses this to prove its bad ordering. */
 void btree_test_set_delete_gate_bypass(int enabled);
+
+#include <stdatomic.h>
+
+/* Test-only: number of threads currently blocked in bt_acquire()'s
+   pthread_rwlock_wrlock() across all cached .idx files. Lets a test prove a
+   writer is genuinely queued before applying reader pressure, instead of
+   assuming it via timing. */
+int btree_test_writer_pending_count(void);
+
+/* Test-only: number of threads currently blocked in bt_acquire()'s
+   pthread_rwlock_rdlock() across all cached .idx files. Lets a test prove a
+   reader has actually entered the blocking call (not merely been scheduled
+   to attempt it) before starting a bounded observation window — closes the
+   race where thread-launch scheduling delay could be mistaken for a proven
+   block. */
+int btree_test_reader_pending_count(void);
+
+struct ShardDb;
+
+/* Test-only: pthread start routine. Binds the calling thread's `g_db`, then
+   takes a real rdlock on `path` via the normal bt_acquire() path. It reports
+   just-before-acquire via *attempted and successful acquisition via
+   *acquired, then parks until *release is set before releasing via
+   bt_release(). Lets a test distinguish a late reader queued at rdlock from
+   one that actually slipped ahead of a queued writer. */
+typedef struct {
+    const char *path;
+    struct ShardDb *db;
+    atomic_int *attempted;
+    atomic_int *acquired;
+    atomic_int *release;
+} BtTestHoldRdlockArgs;
+void *btree_test_hold_rdlock(void *arg);
 #endif
 
 /* Streaming bulk build — same output as btree_bulk_build but accepts entries

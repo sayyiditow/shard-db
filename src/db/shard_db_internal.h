@@ -81,6 +81,66 @@ typedef struct {
     _Atomic int used;
 } ObjLockEntry;
 
+/* Shared by every fixed-size file-cache table above (BtCacheEntry,
+   BmCacheEntry, KfCacheEntry, SegCacheEntry). Default-attribute
+   pthread_rwlock_t on glibc/NPTL prefers readers, so a writer blocked in
+   pthread_rwlock_wrlock() on one of these per-file locks can be starved under continuous
+   read pressure (docs/plans/2026-07-29-cache-rwlock-writer-preference.md).
+   PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP is a glibc/NPTL enum value,
+   not a preprocessor macro, so it cannot be probed with #ifdef; gate on
+   __GLIBC__ instead. Other Linux libcs and macOS have no equivalent portable
+   attribute — the #else branch keeps today's behavior there unchanged.
+
+   NONRECURSIVE requires that no thread ever holds a read lock on one of
+   these and then takes a second read lock on the *same* path/slot from the
+   same thread — a recursive reader can self-deadlock behind a queued writer
+   under this policy (this is why objlock.c, whose API deliberately permits
+   recursive readers, is not switched to this helper). Checked against every
+   acquire/release call site in btree.c, slotcask.c (kfcache + segcache), and
+   bitmap.c: no such recursive acquisition exists today. In particular,
+   btree_idx_walk_ordered's k-way cursor merge opens one BtRangeIter per
+   shard, always on a distinct path, never the same file twice in one
+   thread; every eviction path uses non-blocking trywrlock against LRU
+   candidates so a thread can't be blocked trying to evict a slot it already
+   holds open. This is a live invariant, not a one-time fact — any future
+   code path that acquires the same cached file twice on one thread without
+   releasing in between would reintroduce the self-deadlock risk this
+   comment rules out today. */
+static inline void rwlock_init_writer_preferring_fallback(pthread_rwlock_t *lock) {
+    int rc = pthread_rwlock_init(lock, NULL);
+    if (rc != 0)
+        LOG_ERROR(LOG_SUB_SERVER, "rwlock_init (default fallback) failed: %s", strerror(rc));
+}
+
+static inline void rwlock_init_writer_preferring(pthread_rwlock_t *lock) {
+#ifdef __GLIBC__
+    pthread_rwlockattr_t attr;
+    int rc;
+    if ((rc = pthread_rwlockattr_init(&attr)) != 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "rwlockattr_init failed: %s", strerror(rc));
+        rwlock_init_writer_preferring_fallback(lock);
+        return;
+    }
+    if ((rc = pthread_rwlockattr_setkind_np(&attr,
+            PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)) != 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "rwlockattr_setkind_np failed: %s", strerror(rc));
+        pthread_rwlockattr_destroy(&attr);
+        rwlock_init_writer_preferring_fallback(lock);
+        return;
+    }
+    if ((rc = pthread_rwlock_init(lock, &attr)) != 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "rwlock_init (writer-preferring) failed: %s", strerror(rc));
+        pthread_rwlockattr_destroy(&attr);
+        rwlock_init_writer_preferring_fallback(lock);
+        return;
+    }
+    if ((rc = pthread_rwlockattr_destroy(&attr)) != 0)
+        LOG_ERROR(LOG_SUB_SERVER, "rwlockattr_destroy failed: %s", strerror(rc));
+#else
+    rwlock_init_writer_preferring_fallback(lock);
+#endif
+}
+
 /* storage.c */
 #define COUNTS_CACHE_BUCKETS 1024
 typedef struct {

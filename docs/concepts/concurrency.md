@@ -61,6 +61,31 @@ Each indexed field is sharded into `index_splits_for(splits)` btree files (`<obj
 
 This was the central reason for the per-shard layout. Pre-2026.05.1, a single `<field>.idx` file meant `bulk_build` (which truncates and rewrites the whole file) raced against in-flight readers holding an mmap of intermediate state. Per-file rwlocks give writers and readers proper isolation, and the parallel fan-out turns indexed lookups into N-way concurrent btree probes for free.
 
+## Writer preference on file-cache rwlocks (2026.07.x+)
+
+`bt_cache`, `kfcache`, `segcache`, and the bitmap cache initialize their
+per-file rwlocks writer-preferring on glibc/Linux
+(`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`, via
+`rwlock_init_writer_preferring()` in `shard_db_internal.h`). Default-attribute
+`pthread_rwlock_t` on glibc/NPTL prefers readers indefinitely: a writer
+blocked in `pthread_rwlock_wrlock()` on one of these per-file locks could be
+starved by continuous concurrent reader traffic on that same file, since new
+readers were always granted ahead of a waiting writer. The writer-preferring
+attribute instead queues new readers behind an already-waiting writer, so a
+writer is guaranteed to make progress once it starts waiting, at some cost
+to peak reader throughput on a hot file under sustained write pressure.
+
+On non-glibc platforms (macOS, other Linux libcs), `pthread_rwlockattr_setkind_np`
+and the `_NONRECURSIVE_NP` attribute don't exist — there's no portable
+equivalent to fall back to. These four caches keep the platform default
+there (no writer-preference guarantee), same as before this change.
+
+`objlock` (below) is unchanged everywhere, on every platform: it
+deliberately keeps default-attribute (platform-default) rwlocks, because its
+API permits a thread to hold a recursive read lock, which a nonrecursive
+writer-preferring policy doesn't support safely — a recursive reader could
+self-deadlock behind a queued writer.
+
 ## Per-stream mutex + free pool
 
 Each of the (up-to-16) write streams has:

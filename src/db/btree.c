@@ -381,7 +381,7 @@ void bt_cache_init(int cap) {
     bt_cache = calloc(bt_cache_slots, sizeof(BtCacheEntry));
     bt_cache_count = 0;
     for (int i = 0; i < bt_cache_slots; i++) {
-        pthread_rwlock_init(&bt_cache[i].rwlock, NULL);
+        rwlock_init_writer_preferring(&bt_cache[i].rwlock);
         bt_cache[i].fd = -1;
     }
 }
@@ -629,6 +629,52 @@ static int bt_open_file(const char *path, int writer,
     return 0;
 }
 
+#ifdef TEST_BUILD
+static pthread_mutex_t g_bt_test_writer_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_bt_test_writer_pending_count;
+
+static void bt_test_writer_pending_begin(void) {
+    pthread_mutex_lock(&g_bt_test_writer_pending_lock);
+    g_bt_test_writer_pending_count++;
+    pthread_mutex_unlock(&g_bt_test_writer_pending_lock);
+}
+
+static void bt_test_writer_pending_end(void) {
+    pthread_mutex_lock(&g_bt_test_writer_pending_lock);
+    g_bt_test_writer_pending_count--;
+    pthread_mutex_unlock(&g_bt_test_writer_pending_lock);
+}
+
+int btree_test_writer_pending_count(void) {
+    pthread_mutex_lock(&g_bt_test_writer_pending_lock);
+    int n = g_bt_test_writer_pending_count;
+    pthread_mutex_unlock(&g_bt_test_writer_pending_lock);
+    return n;
+}
+
+static pthread_mutex_t g_bt_test_reader_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_bt_test_reader_pending_count;
+
+static void bt_test_reader_pending_begin(void) {
+    pthread_mutex_lock(&g_bt_test_reader_pending_lock);
+    g_bt_test_reader_pending_count++;
+    pthread_mutex_unlock(&g_bt_test_reader_pending_lock);
+}
+
+static void bt_test_reader_pending_end(void) {
+    pthread_mutex_lock(&g_bt_test_reader_pending_lock);
+    g_bt_test_reader_pending_count--;
+    pthread_mutex_unlock(&g_bt_test_reader_pending_lock);
+}
+
+int btree_test_reader_pending_count(void) {
+    pthread_mutex_lock(&g_bt_test_reader_pending_lock);
+    int n = g_bt_test_reader_pending_count;
+    pthread_mutex_unlock(&g_bt_test_reader_pending_lock);
+    return n;
+}
+#endif
+
 /* Acquire a btree handle. writer=0 takes rdlock, writer=1 takes wrlock and
    creates the file (with a fresh header) if missing. On cache pressure we
    evict the least-recently-used slot; if the cache isn't initialised or
@@ -673,8 +719,20 @@ retry_bt_acquire:
         pthread_rwlock_t *lock = &bt_cache[slot].rwlock;
         pthread_mutex_unlock(&bt_cache_lock);
 
+#ifdef TEST_BUILD
+        if (writer) {
+            bt_test_writer_pending_begin();
+            pthread_rwlock_wrlock(lock);
+            bt_test_writer_pending_end();
+        } else {
+            bt_test_reader_pending_begin();
+            pthread_rwlock_rdlock(lock);
+            bt_test_reader_pending_end();
+        }
+#else
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
+#endif
 
         BtCacheEntry *e = &bt_cache[slot];
         if (e->used == BT_CACHE_LIVE && strcmp(e->path, path) == 0) {
@@ -835,8 +893,20 @@ retry_bt_acquire:
        lock-order inversion against that. Verify-and-retry exactly like the
        hit path handles the resulting window where a concurrent evictor can
        steal this slot before we lock it. */
+#ifdef TEST_BUILD
+    if (writer) {
+        bt_test_writer_pending_begin();
+        pthread_rwlock_wrlock(lock);
+        bt_test_writer_pending_end();
+    } else {
+        bt_test_reader_pending_begin();
+        pthread_rwlock_rdlock(lock);
+        bt_test_reader_pending_end();
+    }
+#else
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
+#endif
     if (e->used != BT_CACHE_LIVE || strcmp(e->path, path) != 0) {
         /* Stolen by a concurrent evictor; they now own disposing our fd/map
            (captured as their own victim to dispose). Retry from scratch. */
@@ -874,6 +944,20 @@ static void bt_release(BtFile *bt) {
     bt->fd = -1;
     bt->slot = -1;
 }
+
+#ifdef TEST_BUILD
+void *btree_test_hold_rdlock(void *arg) {
+    BtTestHoldRdlockArgs *a = arg;
+    g_db = a->db;
+    BtFile bt;
+    atomic_store(a->attempted, 1);
+    if (bt_acquire(&bt, a->path, 0) != 0) return NULL;
+    atomic_store(a->acquired, 1);
+    while (!atomic_load(a->release)) usleep(1000);
+    bt_release(&bt);
+    return NULL;
+}
+#endif
 
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes) {
     int used = 0;
