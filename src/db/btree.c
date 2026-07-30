@@ -3247,11 +3247,23 @@ int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
 
         size_t ei = 0, ni = 0, ci = 0;
         while (ei < exist_count && ni < new_count) {
-            if (val_hash_cmp(existing[ei].value, existing[ei].vlen, existing[ei].hash,
-                              new_entries[ni].value, new_entries[ni].vlen, new_entries[ni].hash) <= 0)
-                combined[ci++] = existing[ei++];
-            else
+            int cmp = val_hash_cmp(existing[ei].value, existing[ei].vlen, existing[ei].hash,
+                                    new_entries[ni].value, new_entries[ni].vlen, new_entries[ni].hash);
+            if (cmp == 0) {
+                /* Exact (value,hash) match between the on-disk snapshot
+                   and the incoming batch. BtEntry carries no payload
+                   beyond (value,hash), so the two copies are
+                   interchangeable — keep one and advance both cursors.
+                   Advancing only `ei` here previously left new_entries[ni]
+                   unconsumed, so the trailing drain loop re-appended it,
+                   writing a physical duplicate leaf entry. */
                 combined[ci++] = new_entries[ni++];
+                ei++;
+            } else if (cmp < 0) {
+                combined[ci++] = existing[ei++];
+            } else {
+                combined[ci++] = new_entries[ni++];
+            }
         }
         while (ei < exist_count) combined[ci++] = existing[ei++];
         while (ni < new_count)   combined[ci++] = new_entries[ni++];
