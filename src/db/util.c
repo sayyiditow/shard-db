@@ -98,32 +98,6 @@ int parent_dir_copy(const char *path, char *out, size_t out_size) {
     return 0;
 }
 
-/* fsync a regular file by path (open O_RDONLY, durability_fsync, close).
-   Preserves the first errno across the close(). */
-int fsync_file_path(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    int rc = durability_fsync(fd);
-    int saved_errno = errno;
-    close(fd);
-    errno = saved_errno;
-    return rc;
-}
-
-/* fsync the parent directory of `path` (durability requirement for a rename
-   to be crash-safe). Preserves the first errno across the close(). */
-int fsync_parent_dir(const char *path) {
-    char parent[PATH_MAX];
-    if (parent_dir_copy(path, parent, sizeof(parent)) != 0) return -1;
-    int fd = open(parent, O_DIRECTORY | O_RDONLY);
-    if (fd < 0) return -1;
-    int rc = durability_fsync(fd);
-    int saved_errno = errno;
-    close(fd);
-    errno = saved_errno;
-    return rc;
-}
-
 char *dirname_of(const char *path) {
     static char buf[PATH_MAX];
     snprintf(buf, sizeof(buf), "%s", path);

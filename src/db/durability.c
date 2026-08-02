@@ -139,6 +139,32 @@ int durability_fsync(int fd) {
     return fsync(fd);
 }
 
+/* fsync a regular file by path (open O_RDONLY, durability_fsync, close).
+   Preserves the first errno across the close(). */
+int fsync_file_path(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = durability_fsync(fd);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return rc;
+}
+
+/* fsync the parent directory of `path` (durability requirement for a rename
+   to be crash-safe). Preserves the first errno across the close(). */
+int fsync_parent_dir(const char *path) {
+    char parent[PATH_MAX];
+    if (parent_dir_copy(path, parent, sizeof(parent)) != 0) return -1;
+    int fd = open(parent, O_DIRECTORY | O_RDONLY);
+    if (fd < 0) return -1;
+    int rc = durability_fsync(fd);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return rc;
+}
+
 int durability_publish_replace(const char *target, const char *tmp_path,
                                durability_after_rename_fn after_rename,
                                void *after_rename_ctx) {
