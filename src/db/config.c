@@ -2635,7 +2635,7 @@ static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
     } while (0)
 
     size_t pos = 0;
-    APPEND("unknown enum value \"%.*s\" for field [%s]; legal: [",
+    APPEND("unknown enum value '%.*s' for field [%s]; legal: [",
            (int)bad_len, bad_val, f->name);
 
     for (int i = 0; i < f->n_enum_values; i++) {
