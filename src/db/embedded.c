@@ -101,6 +101,14 @@ ShardDb *shard_db_open_internal(const char *db_root) {
 
     slot_init();
 
+    if (index_rebuild_temp_sweep(db_root) != 0) {
+        fprintf(stderr, "shard-db: index temporary cleanup failed for DB_ROOT=%s: %s\n",
+                db_root, strerror(errno));
+        free(db);
+        g_db = NULL;
+        return NULL;
+    }
+
     /* Auto-tune query_buffer_max_bytes (mirrors cmd_server logic). */
     if (db->query_buffer_max_bytes == 256ULL * 1024 * 1024) {
         long pages = sysconf(_SC_PHYS_PAGES);

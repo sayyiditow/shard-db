@@ -51,6 +51,12 @@ extern "C" {
    caller (slotcask) owns. */
 typedef struct BitmapShard BitmapShard;
 
+typedef enum {
+    BM_PUBLISH_OK = 0,
+    BM_PUBLISH_PRE_RENAME_FAILED,
+    BM_PUBLISH_POST_RENAME_FSYNC_FAILED,
+} bm_publish_result;
+
 /* Flags */
 #define BM_FLAG_BOOL_FASTPATH  0x0001u
 
@@ -97,7 +103,11 @@ void bm_cache_shutdown(void);
 
 /* Drop the cache entry for `path` (e.g. after a reindex unlinks it).
    Caller must ensure no thread holds the entry's rwlock. */
+int bm_cache_invalidate_checked(const char *path);
 void bm_cache_invalidate(const char *path);
+
+/* Publish a complete, closed temporary bitmap at target. */
+bm_publish_result bm_publish_replace(const char *target, const char *tmp_path);
 
 /* Open the bitmap shard file. If it doesn't exist:
      - If `create == 0`, returns NULL.
@@ -121,8 +131,16 @@ BitmapShard *bm_open(const char *path, int slots, int create,
    value (never 0 — defaults to BM_DEFAULT_MAX_VALUES). */
 uint32_t bm_max_values(const BitmapShard *bm);
 
-/* Close + unmap. Safe on NULL. */
+/* Close + unmap. Checked form returns the first release failure; the
+   compatibility wrapper intentionally discards it. Both are safe on NULL. */
+int bm_close_checked(BitmapShard *bm);
 void bm_close(BitmapShard *bm);
+
+#ifdef TEST_BUILD
+void bm_test_fail_close_next(int count);
+void bm_test_fail_invalidate_next(int count);
+void bm_test_fail_reset(void);
+#endif
 
 /* Synchronously fdatasync the bitmap file. `bm` must be opened with
    writer=1. Used by the marker-governed CRUD path. */

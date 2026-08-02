@@ -100,8 +100,65 @@ int durability_msync_range(void *base, size_t offset, size_t len) {
     return durability_msync((void *)aligned, sync_len);
 }
 
+#ifdef TEST_BUILD
+static pthread_mutex_t g_durability_fsync_test_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_durability_fsync_call_count;
+static int g_durability_fsync_fail_on_call;
+static int g_durability_fsync_fail_errno;
+
+void durability_test_fsync_reset(void) {
+    pthread_mutex_lock(&g_durability_fsync_test_lock);
+    g_durability_fsync_call_count = 0;
+    g_durability_fsync_fail_on_call = 0;
+    g_durability_fsync_fail_errno = 0;
+    pthread_mutex_unlock(&g_durability_fsync_test_lock);
+}
+
+void durability_test_fsync_fail_on_call(int call_number, int err) {
+    pthread_mutex_lock(&g_durability_fsync_test_lock);
+    g_durability_fsync_fail_on_call = call_number > 0 ? call_number : 0;
+    g_durability_fsync_fail_errno = err > 0 ? err : EIO;
+    pthread_mutex_unlock(&g_durability_fsync_test_lock);
+}
+#endif
+
+int durability_fsync(int fd) {
+#ifdef TEST_BUILD
+    pthread_mutex_lock(&g_durability_fsync_test_lock);
+    g_durability_fsync_call_count++;
+    if (g_durability_fsync_fail_on_call > 0 &&
+        g_durability_fsync_call_count == g_durability_fsync_fail_on_call) {
+        int injected_errno = g_durability_fsync_fail_errno;
+        g_durability_fsync_fail_on_call = 0;
+        pthread_mutex_unlock(&g_durability_fsync_test_lock);
+        errno = injected_errno;
+        return -1;
+    }
+    pthread_mutex_unlock(&g_durability_fsync_test_lock);
+#endif
+    return fsync(fd);
+}
+
+int durability_publish_replace(const char *target, const char *tmp_path,
+                               durability_after_rename_fn after_rename,
+                               void *after_rename_ctx) {
+    if (fsync_file_path(tmp_path) != 0) return -1;
+    if (rename(tmp_path, target) != 0) return -1;
+    if (after_rename) after_rename(target, after_rename_ctx);
+    if (fsync_parent_dir(target) != 0) return 1;
+    return 0;
+}
+
+int durability_same_open_inode(int fd, const char *path) {
+    struct stat opened;
+    struct stat current;
+    if (fstat(fd, &opened) != 0) return 0;
+    if (stat(path, &current) != 0) return 0;
+    return opened.st_dev == current.st_dev && opened.st_ino == current.st_ino;
+}
+
 void durability_test_pause(const char *data_dir, const char *phase) {
-    if (!g_db || g_durability_test_pause_ms <= 0 ||
+    if (!data_dir || !g_db || g_durability_test_pause_ms <= 0 ||
         strcmp(g_durability_test_pause_phase, phase) != 0) return;
     char marker[PATH_MAX];
     int n = snprintf(marker, sizeof(marker), "%s/.durability-test-%s.active",

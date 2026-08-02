@@ -2,6 +2,8 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include "btree.h"
+#include "types.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,8 +16,50 @@ static int bt_count_cb(const char *v, size_t vl, const uint8_t *h, void *ctx) {
     return 0;
 }
 
+static void test_btree_publication(const char *path, const uint8_t hash[16]) {
+    BtEntry old_entry = { .value = "old", .vlen = 3 };
+    memcpy(old_entry.hash, hash, sizeof(old_entry.hash));
+    BtEntry new_entry = { .value = "new", .vlen = 3 };
+    memcpy(new_entry.hash, hash, sizeof(new_entry.hash));
+
+    unlink(path);
+    ASSERT_EQ_INT(btree_bulk_build(path, &old_entry, 1), 0, "seed publication target");
+
+    durability_test_fsync_reset();
+    durability_test_fsync_fail_on_call(1, EIO);
+    ASSERT_EQ_INT(btree_bulk_merge(path, &new_entry, 1), -1, "pre-rename sync failure");
+    ASSERT_EQ_INT(btree_bulk_merge_publish_result(),
+                  BT_PUBLISH_PRE_RENAME_FAILED,
+                  "pre-rename merge reports failed publication state");
+    g_bt_count = 0;
+    btree_search(path, "old", 3, bt_count_cb, NULL);
+    ASSERT_EQ_INT(g_bt_count, 1, "pre-rename failure retains target");
+
+    durability_test_fsync_reset();
+    durability_test_fsync_fail_on_call(2, EIO);
+    ASSERT_EQ_INT(btree_bulk_merge(path, &new_entry, 1), -1, "post-rename sync failure");
+    ASSERT_EQ_INT(btree_bulk_merge_publish_result(),
+                  BT_PUBLISH_POST_RENAME_FSYNC_FAILED,
+                  "post-rename merge reports durability-warning state");
+    g_bt_count = 0;
+    btree_search(path, "new", 3, bt_count_cb, NULL);
+    ASSERT_EQ_INT(g_bt_count, 1, "post-rename failure publishes readable target");
+
+    durability_test_fsync_reset();
+    ASSERT_EQ_INT(btree_bulk_build(path, NULL, 0), 0, "empty replacement publishes");
+    g_bt_count = 0;
+    btree_search(path, "new", 3, bt_count_cb, NULL);
+    ASSERT_EQ_INT(g_bt_count, 0, "empty replacement removes old entries");
+    unlink(path);
+}
+
 static int test_btree_run(void) {
-    const char *path = "/tmp/shard-db-btree-test.idx";
+    char root[] = "/tmp/shard-db-btree-XXXXXX";
+    if (!mkdtemp(root)) { ASSERT_TRUE(0, "mkdtemp btree test root"); return 1; }
+    char path[PATH_MAX];
+    char publication_path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/tree.idx", root);
+    snprintf(publication_path, sizeof(publication_path), "%s/publication.idx", root);
     unlink(path);
 
     uint8_t h1[16], h2[16], h3[16], h4[16], h5[16];
@@ -24,6 +68,8 @@ static int test_btree_run(void) {
     memset(h3, 0, 16); h3[0] = 3;
     memset(h4, 0, 16); h4[0] = 4;
     memset(h5, 0, 16); h5[0] = 5;
+
+    test_btree_publication(publication_path, h1);
 
     btree_insert(path, "Charlie", 7, h3);
     btree_insert(path, "Alice", 5, h1);
@@ -154,6 +200,8 @@ static int test_btree_run(void) {
     free(entries);
     unlink(path);
     bt_cache_shutdown();
+    unlink(path);
+    ASSERT_EQ_INT(rmdir(root), 0, "btree test temporary root cleaned");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

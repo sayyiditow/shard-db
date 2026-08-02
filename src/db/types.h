@@ -581,7 +581,19 @@ int durability_msync_range(void *base, size_t offset, size_t len);
 int durability_flush_dirty(_Atomic int *dirty,
                            _Atomic uint64_t *dirty_since_ms,
                            void *addr, size_t len);
+int durability_same_open_inode(int fd, const char *path);
 void *durability_sync_thread(void *arg);
+int durability_fsync(int fd);
+/* Runs immediately after the rename (before the parent-directory sync) so
+   cache layers can advance their publication generation while a target
+   cache entry may still be in use. Must not block on any acquire path. */
+typedef void (*durability_after_rename_fn)(const char *target, void *ctx);
+
+/* Returns 0 after a durable replacement, 1 if rename succeeded but the
+   parent-directory sync failed, and -1 before rename. */
+int durability_publish_replace(const char *target, const char *tmp_path,
+                               durability_after_rename_fn after_rename,
+                               void *after_rename_ctx);
 void durability_test_pause(const char *data_dir, const char *phase);
 int bg_threads_start(struct ShardDb *db, BgRuntimeMode mode);
 void bg_threads_stop(struct ShardDb *db);
@@ -593,6 +605,10 @@ void durability_test_msync_fail_on_call(int call_number, int err);
 void durability_test_msync_counts(int *succeeded, int *failed);
 void durability_test_sync_one_pass(struct ShardDb *db, int interval_ms,
                                    DurabilitySyncStats *stats);
+void durability_test_fsync_reset(void);
+void durability_test_fsync_fail_on_call(int call_number, int err);
+void index_test_spill_open_fail_errno(int err);
+void index_test_conf_publish_fail_stage(int stage);
 #endif
 
 /* ========== Function declarations ========== */
@@ -600,6 +616,11 @@ void durability_test_sync_one_pass(struct ShardDb *db, int interval_ms,
 /* util.c */
 void mkdirp(const char *path);
 char *dirname_of(const char *path);
+int parent_dir_copy(const char *path, char *out, size_t out_size);
+/* Remove crash-abandoned index publication siblings without following links. */
+int index_rebuild_temp_sweep(const char *db_root);
+int fsync_file_path(const char *path);
+int fsync_parent_dir(const char *path);
 char *read_file(const char *path, size_t *out_len);
 int is_number(const char *s);
 ExcludedKeys parse_excluded_keys(const char *csv);
