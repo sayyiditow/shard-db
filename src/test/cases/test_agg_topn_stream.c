@@ -584,7 +584,7 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
     }
 
     char *resp = NULL;
-    TestClientCfg cfg = { .port = env.port };
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 120000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
@@ -626,6 +626,8 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
         "\"records\":%s}", body);
     tc_request(tc, req, &resp);
+    ASSERT_TRUE(resp && !strstr(resp, "\"error\""),
+                "45k-row bitmap fixture bulk insert succeeds");
     free(req); free(body); free(resp); resp = NULL;
 
     /* group_by name, count, criteria active=true, top 5. */

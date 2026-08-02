@@ -4292,10 +4292,11 @@ static void reindex_cleanup_obsolete(const char *eff_root, const char *object,
 
         char legacy[PATH_MAX];
         snprintf(legacy, sizeof(legacy), "%s/%s.idx", idx_root, fname);
-        struct stat lst;
-        if (lstat(legacy, &lst) == 0 && S_ISREG(lst.st_mode)) {
-            btree_cache_invalidate(legacy);
-            unlink(legacy);
+        btree_cache_invalidate(legacy);
+        if (unlink(legacy) != 0 && errno != ENOENT) {
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "reindex cleanup: unlink %s failed: %s",
+                     legacy, strerror(errno));
         }
 
         char fdir[PATH_MAX];

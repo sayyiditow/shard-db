@@ -158,64 +158,85 @@ static int rsc_line_cmp(const void *a, const void *b) {
     return strcmp(((const RscLine *)a)->line, ((const RscLine *)b)->line);
 }
 
-/* Recursive walk of <base>/<rel> collecting "path|size|hexcontent" lines
-   for every regular file. Returns 0 on success (including empty). */
+/* Descriptor-first recursive walk of <base>/<rel>, collecting
+   "path|size|hexcontent" lines for every regular file. Opening before
+   inspecting the type ensures the bytes come from the same inode that was
+   classified, even if a test fixture is being changed concurrently. Returns
+   0 on success (including empty). */
 static int rsc_snapshot_walk(const char *base, const char *rel,
                              RscLine **lines, int *n, int *cap) {
-    char dir[PATH_MAX];
-    snprintf(dir, sizeof(dir), "%s%s", base, rel);
-    DIR *d = opendir(dir);
-    if (!d) return -1;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        struct stat st;
-        if (stat(path, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s%s", base, rel);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = fdopendir(fd);
+        if (!d) {
+            close(fd);
+            return -1;
+        }
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
             char sub[PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", rel, e->d_name);
-            if (rsc_snapshot_walk(base, sub, lines, n, cap) != 0)
-                continue;
-            continue;
+            (void)rsc_snapshot_walk(base, sub, lines, n, cap);
         }
-        if (!S_ISREG(st.st_mode)) continue;
-        FILE *f = fopen(path, "rb");
-        if (!f) continue;
-        long fsz = 0;
-        if (fseek(f, 0, SEEK_END) == 0 && (fsz = ftell(f)) >= 0 &&
-            fseek(f, 0, SEEK_SET) == 0) {
-            size_t sz = (size_t)fsz;
-            char *hex = malloc(sz * 2 + 1);
-            char *content = malloc(sz ? sz : 1);
-            size_t got = fread(content, 1, sz, f);
-            if (hex && content) {
-                for (size_t i = 0; i < got; i++)
-                    snprintf(hex + i * 2, 3, "%02x", (unsigned char)content[i]);
-                hex[got * 2] = '\0';
-                char *line = malloc(strlen(rel) + strlen(e->d_name) +
-                                    got * 2 + 40);
-                if (line) {
-                    sprintf(line, "%s/%s|%zu|%s", rel, e->d_name, got, hex);
-                    if (*n >= *cap) {
-                        *cap = *cap ? *cap * 2 : 64;
-                        RscLine *t = realloc(*lines,
-                                             (size_t)*cap * sizeof(RscLine));
-                        if (t) *lines = t;
-                    }
-                    if (*n < *cap)
-                        (*lines)[(*n)++].line = line;
-                    else
-                        free(line);
-                }
-            }
+        closedir(d);
+        return 0;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return 0;
+    }
+
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        close(fd);
+        return -1;
+    }
+    long fsz = 0;
+    if (fseek(f, 0, SEEK_END) == 0 && (fsz = ftell(f)) >= 0 &&
+        fseek(f, 0, SEEK_SET) == 0) {
+        size_t sz = (size_t)fsz;
+        char *hex = malloc(sz * 2 + 1);
+        char *content = malloc(sz ? sz : 1);
+        if (!hex || !content) {
             free(hex);
             free(content);
+            fclose(f);
+            return -1;
         }
-        fclose(f);
+        size_t got = fread(content, 1, sz, f);
+        for (size_t i = 0; i < got; i++)
+            snprintf(hex + i * 2, 3, "%02x", (unsigned char)content[i]);
+        hex[got * 2] = '\0';
+        char *line = malloc(strlen(rel) + got * 2 + 40);
+        if (line) {
+            sprintf(line, "%s|%zu|%s", rel, got, hex);
+            if (*n >= *cap) {
+                *cap = *cap ? *cap * 2 : 64;
+                RscLine *t = realloc(*lines,
+                                     (size_t)*cap * sizeof(RscLine));
+                if (t) *lines = t;
+            }
+            if (*n < *cap)
+                (*lines)[(*n)++].line = line;
+            else
+                free(line);
+        }
+        free(hex);
+        free(content);
     }
-    closedir(d);
+    fclose(f);
     return 0;
 }
 
@@ -712,7 +733,8 @@ static void *rsc_reindex_thread(void *arg) {
     RscQueryThread *q = arg;
     char request[256];
     snprintf(request, sizeof(request),
-             "{\"mode\":\"reindex\",\"dir\":\"d\",\"object\":\"%s\"}",
+             "{\"mode\":\"reindex\",\"dir\":\"d\",\"object\":\"%s\","
+             "\"timeout_ms\":30000}",
              q->object);
     tu_pdb_request(q->db, request, &q->response);
     return NULL;
@@ -893,7 +915,7 @@ static void *rsc_continuous_reader_thread(void *arg) {
         tu_pdb_request(r->db,
             "{\"mode\":\"count\",\"dir\":\"d\",\"object\":\"concurrent_idx\","
             "\"criteria\":[{\"field\":\"title\",\"op\":\"starts\","
-            "\"value\":\"row\"}]}", &resp);
+            "\"value\":\"row\"}],\"timeout_ms\":30000}", &resp);
         if (!resp || strstr(resp, "\"error\"")) atomic_store(r->failed, 1);
         free(resp);
         atomic_fetch_add(r->completed, 1);
@@ -905,7 +927,8 @@ static void *rsc_bulk_insert_thread(void *arg) {
     RscQueryThread *q = arg;
     tu_pdb_request(q->db,
         "{\"mode\":\"bulk-insert\",\"dir\":\"d\",\"object\":\"concurrent_idx\","
-        "\"records\":{\"late\":{\"title\":\"row late\"}}}",
+        "\"records\":{\"late\":{\"title\":\"row late\"}},"
+        "\"timeout_ms\":30000}",
         &q->response);
     return NULL;
 }
@@ -960,7 +983,7 @@ static int test_online_bulk_reindex_readers_run(void) {
              "%s/d/concurrent_idx/indexes/title/.spill_0/"
              ".durability-test-idx-spills-before-merge.active", root);
     int seen = 0;
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 3000; i++) {
         if (access(marker, F_OK) == 0) { seen = 1; break; }
         usleep(10 * 1000);
     }

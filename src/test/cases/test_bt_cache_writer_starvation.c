@@ -46,6 +46,26 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static int noop_count_cb(const char *v, size_t vl, const uint8_t *h, void *ctx) {
+    (void)v; (void)vl; (void)h;
+    int *n = ctx;
+    (*n)++;
+    return 0;
+}
+
+/* Bound waits in forked deadlock regressions on every supported platform. */
+static int wait_child_bounded(pid_t pid, int *status, int secs) {
+    for (int tick = 0; tick < secs * 10; tick++) {
+        pid_t r = waitpid(pid, status, WNOHANG);
+        if (r == pid) return 1;
+        if (r < 0) return -1;
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, status, 0);
+    return 0;
+}
+
 #if defined(__linux__) && defined(__GLIBC__)
 
 #define BASE_COUNT 5000
@@ -63,13 +83,6 @@ static void make_hash(long id, uint8_t out[BT_HASH_SIZE]) {
     memcpy(out, &mixed, sizeof(mixed));
     memcpy(out + 4, &mixed, sizeof(mixed));
     memcpy(out + 8, &id, sizeof(id) < 8 ? sizeof(id) : 8);
-}
-
-static int noop_count_cb(const char *v, size_t vl, const uint8_t *h, void *ctx) {
-    (void)v; (void)vl; (void)h;
-    int *n = ctx;
-    (*n)++;
-    return 0;
 }
 
 static int range_count(const char *path) {
@@ -215,21 +228,6 @@ static int run_child(const char *base) {
     if (got != expected || atomic_load(&chunks_done) != WRITER_CHUNKS) _exit(9);
 
     _exit(0);
-}
-
-/* Bound the wait so an unexpected lock-ordering deadlock cannot hang the
-   parent test process. `secs * 10` polls at 100ms is a true `secs`-second
-   deadline. */
-static int wait_child_bounded(pid_t pid, int *status, int secs) {
-    for (int tick = 0; tick < secs * 10; tick++) {
-        pid_t r = waitpid(pid, status, WNOHANG);
-        if (r == pid) return 1;
-        if (r < 0) return -1;
-        usleep(100000);
-    }
-    kill(pid, SIGKILL);
-    waitpid(pid, status, 0);
-    return 0;
 }
 
 static int test_bt_cache_writer_starvation_glibc_run(void) {
