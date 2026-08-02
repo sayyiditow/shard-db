@@ -149,6 +149,23 @@ void test_init_process_db(void) {
     char tmpdir[] = "/tmp/shard-db-unit-XXXXXX";
     if (!mkdtemp(tmpdir)) return;
     shard_db_open_internal(tmpdir);  /* sets g_db as a side effect */
+#ifdef TEST_BUILD
+    /* Tests exercise concurrency the auto slot cap can't hold: db.env
+       declares MAX_CONCURRENT_QUERIES=0 (auto = max(4, min(nproc,32))),
+       which is only 4 on the 4-vCPU CI runners. In-process tests fire up
+       to 6 concurrent embedded requests (e.g. test-online-bulk-reindex-
+       readers: 4 readers + reindex + bulk) and the overflow gets
+       {"error":"server at capacity"} — a CI-only failure invisible on
+       beefier local boxes. Pin 32 like the daemon-test fixture
+       (fixtures.c). TEST_BUILD-only: production/embedded users keep
+       slot_init()'s resolved count untouched. */
+    if (g_db->slots_inited) {
+        sem_destroy(&g_db->query_slots);
+        g_db->slots_inited = 0;
+    }
+    g_db->max_concurrent_queries = 32;
+    slot_init();
+#endif
     /* Expose the instance so threads spawned by test code can bind their
        own g_db via the g_shard_db_instance fallback in storage functions.
        Guarded: under parallel run-all, multiple worker threads call this

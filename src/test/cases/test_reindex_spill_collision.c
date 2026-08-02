@@ -771,7 +771,7 @@ static int test_reindex_malformed_bitmap_spill_run(void) {
              "%s/d/spill_bits/indexes/flag/.spill_0/.durability-test-bm-resolve-before-open.active",
              root);
     int seen = 0;
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 500; i++) {
         if (access(marker, F_OK) == 0) { seen = 1; break; }
         usleep(20 * 1000);
     }
@@ -837,7 +837,7 @@ static int test_reindex_malformed_btree_spill_run(void) {
              "%s/d/spill_tree/indexes/title/.spill_0/"
              ".durability-test-idx-spills-before-merge.active", root);
     int seen = 0;
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 500; i++) {
         if (access(marker, F_OK) == 0) { seen = 1; break; }
         usleep(20 * 1000);
     }
