@@ -1,11 +1,12 @@
 # Corrective plan — atomic index publication review fixes
 
-**Status: DRAFT — do not execute until explicitly approved.**
+**Status: COMPLETE — landed in main as part of commit 846e78d (PR #277,
+2026-08-02); every fix below is included in that squash commit.**
 
-**Execution base:** the existing uncommitted worktree on
+**Execution base (historical):** the then-uncommitted worktree on
 `fix/index-atomic-publication`, after the implementation of
-`2026-07-31-index-atomic-publication.md`. Do not reset, discard, or commit the
-current diff before this corrective plan is approved and executed.
+`2026-07-31-index-atomic-publication.md`. That diff was committed as part of
+846e78d; the imperative below no longer applies.
 
 ## Goal
 

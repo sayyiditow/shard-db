@@ -1,6 +1,8 @@
 # Plan A — atomic index publication
 
-**Status: DRAFT — do not execute until explicitly approved.**
+**Status: COMPLETE — landed in main via commit 846e78d (PR #277,
+2026-08-02), including the corrective round in
+2026-08-01-index-atomic-publication-review-fixes.md.**
 
 **Revised 2026-07-31:** result propagation now includes both the singular and
 plural add-index paths; force/reindex cleanup is explicitly deferred until
