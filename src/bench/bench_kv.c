@@ -3,7 +3,7 @@
  * 16-byte hex key, varchar(100) value, SPLITS=128, COUNT=1M default
  * (override via SHARD_BENCH_COUNT env var). Mirrors db_bench / LMDB
  * shape so numbers compare directly. Single-connection throughout
- * except for the two parallel sections.
+ * except for the parallel GET section.
  *
  * Key shape  : sha256(decimal-i)[:16] hex — same as Python bench loader.
  * Value shape: "val_<i>" left-padded to 100 chars with 'x'.
@@ -60,7 +60,7 @@ static void make_val(int i, char out[VAL_LEN + 1])
 
 /* --------------------------------------------------------- parallel workers */
 
-typedef enum { PAR_GET, PAR_UPDATE } ParMode;
+typedef enum { PAR_GET } ParMode;
 
 typedef struct {
     int         port;
@@ -82,17 +82,10 @@ static void *par_worker(void *vp)
     uint64_t s = bench_now_ns();
     for (int i = 0; i < w->n; i++) {
         const char *k = w->keys[(unsigned)rand() % (unsigned)w->total_keys];
-        if (w->mode == PAR_GET) {
-            snprintf(req, sizeof(req),
-                     "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\"}",
-                     k);
-        } else {
-            snprintf(req, sizeof(req),
-                     "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\",\"value\":{\"v\":\"par_%s\"}}",
-                     k, k);
-        }
+        snprintf(req, sizeof(req),
+                 "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"kvbench\","
+                 "\"key\":\"%s\"}",
+                 k);
         char *resp = NULL;
         tc_request(tc, req, &resp);
         free(resp);
@@ -311,7 +304,6 @@ static int bench_kv_run(void)
     long get_total_us = 0; uint64_t get_p50 = 0;
     long exists_hit_total_us = 0; uint64_t exists_hit_p50 = 0;
     long exists_miss_total_us = 0; uint64_t exists_miss_p50 = 0;
-    long update_total_us = 0; uint64_t update_p50 = 0;
     long delete_total_us = 0; uint64_t delete_p50 = 0;
 
     /* GET single (warm) */
@@ -395,29 +387,10 @@ static int bench_kv_run(void)
         free(samples);
     }
 
-    /* UPDATE x10000 */
-    {
-        const int N = 10000;
-        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
-        BenchHist h;
-        bench_hist_init(&h, samples, (size_t)N);
-        uint64_t wall_start = bench_now_ns();
-        for (int i = 0; i < N; i++) {
-            int ri = (int)((unsigned)rand() % (unsigned)COUNT);
-            char req[256];
-            snprintf(req, sizeof(req),
-                     "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\",\"value\":{\"v\":\"updated_%s\"}}",
-                     keys[ri], keys[ri]);
-            uint64_t t0 = bench_now_ns();
-            tc_request(tc, req, &resp);
-            bench_hist_add(&h, bench_now_ns() - t0);
-            free(resp); resp = NULL;
-        }
-        update_total_us = (long)((bench_now_ns() - wall_start) / 1000);
-        update_p50 = bench_hist_p50_ns(&h);
-        free(samples);
-    }
+    /* UPDATE x10000 removed — single-request updates are sync-bound
+       (each waits on full-ACID commit), so a 10k batch measures fsync
+       latency, not DB throughput. Parallel writes below cover the
+       write path at realistic concurrency. */
 
     /* DELETE x10000 (deterministic coverage of first N keys) */
     {
@@ -445,7 +418,7 @@ static int bench_kv_run(void)
 
     /* ---- Single-conn latency table ----------------------------------- */
     {
-        char e_get[48], e_exh[48], e_exm[48], e_upd[48], e_del[48];
+        char e_get[48], e_exh[48], e_exm[48], e_del[48];
         snprintf(e_get, sizeof(e_get), "p50=%.0fµs  %.0f k op/s",
                  (double)get_p50 / 1000.0,
                  10.0 / ((double)get_total_us / 1e6));
@@ -455,9 +428,6 @@ static int bench_kv_run(void)
         snprintf(e_exm, sizeof(e_exm), "p50=%.0fµs  %.0f k op/s",
                  (double)exists_miss_p50 / 1000.0,
                  10.0 / ((double)exists_miss_total_us / 1e6));
-        snprintf(e_upd, sizeof(e_upd), "p50=%.0fµs  %.0f k op/s",
-                 (double)update_p50 / 1000.0,
-                 10.0 / ((double)update_total_us / 1e6));
         snprintf(e_del, sizeof(e_del), "p50=%.0fµs  %.0f k op/s",
                  (double)delete_p50 / 1000.0,
                  10.0 / ((double)delete_total_us / 1e6));
@@ -466,7 +436,6 @@ static int bench_kv_run(void)
         bench_table_record("GET    x10000 pipelined", get_total_us, 1, e_get);
         bench_table_record("EXISTS x10000 (hits)",   exists_hit_total_us, 1, e_exh);
         bench_table_record("EXISTS x10000 (all-miss)", exists_miss_total_us, 1, e_exm);
-        bench_table_record("UPDATE x10000",          update_total_us, 1, e_upd);
         bench_table_record("DELETE x10000",          delete_total_us, 1, e_del);
         bench_table_section_end();
     }
@@ -597,8 +566,8 @@ static int bench_kv_run(void)
     /* JSON blob no longer needed. */
     free(json_buf); json_buf = NULL;
 
-    /* ---- 14-15. PARALLEL GET / UPDATE — table view ------------------- */
-    long par_get_us = 0, par_upd_us = 0;
+    /* ---- 14. PARALLEL GET — table view ------------------------------- */
+    long par_get_us = 0;
     {
         pthread_t    threads[N_PAR];
         ParWorkerArg args[N_PAR];
@@ -613,33 +582,19 @@ static int bench_kv_run(void)
         for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
         par_get_us = (long)((bench_now_ns() - wall_start) / 1000);
     }
-    {
-        pthread_t    threads[N_PAR];
-        ParWorkerArg args[N_PAR];
-        uint64_t wall_start = bench_now_ns();
-        for (int t = 0; t < N_PAR; t++) {
-            args[t] = (ParWorkerArg){
-                .port = env.port, .mode = PAR_UPDATE, .n = N_PAR_OPS,
-                .keys = keys, .total_keys = COUNT, .total_ns = 0,
-            };
-            pthread_create(&threads[t], NULL, par_worker, &args[t]);
-        }
-        for (int t = 0; t < N_PAR; t++) pthread_join(threads[t], NULL);
-        par_upd_us = (long)((bench_now_ns() - wall_start) / 1000);
-    }
+    /* PARALLEL UPDATE removed — like the single-conn batch, every
+       per-request write is sync-bound (full-ACID commit), so a parallel
+       write section measures fsync throughput under N conns, not DB
+       write throughput. The bulk-write rows above cover the write path. */
     {
         int total_ops = N_PAR * N_PAR_OPS;
-        char e_get[48], e_upd[48], lbl[64];
+        char e_get[48], lbl[64];
         snprintf(e_get, sizeof(e_get), "%.0f k op/s",
                  (double)total_ops / ((double)par_get_us / 1e3));
-        snprintf(e_upd, sizeof(e_upd), "%.0f k op/s",
-                 (double)total_ops / ((double)par_upd_us / 1e3));
-        bench_table_section_begin("Parallel latency batches "
+        bench_table_section_begin("Parallel GET "
                                   "(5 conns × 10k = 50k ops)");
-        snprintf(lbl, sizeof(lbl), "PARALLEL GET    %d conns × %d", N_PAR, N_PAR_OPS);
+        snprintf(lbl, sizeof(lbl), "PARALLEL GET %d conns × %d", N_PAR, N_PAR_OPS);
         bench_table_record(lbl, par_get_us, 1, e_get);
-        snprintf(lbl, sizeof(lbl), "PARALLEL UPDATE %d conns × %d", N_PAR, N_PAR_OPS);
-        bench_table_record(lbl, par_upd_us, 1, e_upd);
         bench_table_section_end();
     }
 
