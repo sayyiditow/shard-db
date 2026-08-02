@@ -173,6 +173,10 @@ void btree_test_set_after_extract_hook(btree_test_after_extract_fn fn,
                                        void *ctx);
 
 #ifdef TEST_BUILD
+/* Fail the next replacement publication at 1=pre-rename or
+   2=post-rename parent-durability reporting. Zero disables the seam. */
+void btree_test_publish_fail_stage(int stage);
+
 /* Test-only: reproduce the pre-fix delete path without changing production
    synchronization.  The race regression uses this to prove its bad ordering. */
 void btree_test_set_delete_gate_bypass(int enabled);
@@ -220,11 +224,24 @@ void *btree_test_hold_rdlock(void *arg);
 
    Caller must call entries in ASCENDING sorted order (by value, then hash).
    Out-of-order adds corrupt the on-disk tree silently. */
+typedef enum {
+    BT_PUBLISH_NOT_ATTEMPTED = -1,
+    BT_PUBLISH_OK = 0,
+    BT_PUBLISH_PRE_RENAME_FAILED,
+    BT_PUBLISH_POST_RENAME_FSYNC_FAILED,
+} bt_publish_result;
+
+/* Result of the most recent btree_bulk_merge in this thread. */
+bt_publish_result btree_bulk_merge_publish_result(void);
+
 typedef struct BtStreamBuilder BtStreamBuilder;
 BtStreamBuilder *bt_stream_build_open(const char *path);
-int  bt_stream_build_add(BtStreamBuilder *b, const char *value, size_t vlen,
-                         const uint8_t hash[BT_HASH_SIZE]);
-int  bt_stream_build_finish(BtStreamBuilder *b);
+int bt_stream_build_add(BtStreamBuilder *b, const char *value, size_t vlen,
+                        const uint8_t hash[BT_HASH_SIZE]);
+/* Mark a builder fatal. Finish disposes the temporary output instead of
+   publishing a partial tree. */
+void bt_stream_build_abort(BtStreamBuilder *b);
+bt_publish_result bt_stream_build_finish(BtStreamBuilder *b);
 
 /* Streaming range iterator. Pulls one entry at a time so callers can drive a
    k-way merge across multiple btree files without buffering everything per

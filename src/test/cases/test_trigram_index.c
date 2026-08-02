@@ -648,10 +648,12 @@ static int run_singular_add_index_assertions(TestEnv *env) {
     ASSERT_CONTAINS(resp, "\"status\":\"removed\"", "remove bitmap: response");
     free(resp); resp = NULL;
     {
-        char bm0[512];
+        char bm0[512], bm7[512];
         snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/category/000.bm", env->db_root);
+        snprintf(bm7, sizeof(bm7), "%s/s/items/indexes/category/007.bm", env->db_root);
         struct stat st;
         ASSERT_TRUE(stat(bm0, &st) != 0, "remove bitmap: 000.bm unlinked");
+        ASSERT_TRUE(stat(bm7, &st) != 0, "remove bitmap: final shard unlinked");
     }
 
     tc_request(tc,
@@ -692,12 +694,14 @@ static int run_singular_add_index_assertions(TestEnv *env) {
     ASSERT_CONTAINS(resp, "\"count\":2", "plural remove: removed both");
     free(resp); resp = NULL;
     {
-        char tg0[512], bm0[512];
+        char tg0[512], bm0[512], bm7[512];
         snprintf(tg0, sizeof(tg0), "%s/s/items/indexes/body/000.tg",     env->db_root);
         snprintf(bm0, sizeof(bm0), "%s/s/items/indexes/category/000.bm", env->db_root);
+        snprintf(bm7, sizeof(bm7), "%s/s/items/indexes/category/007.bm", env->db_root);
         struct stat st;
         ASSERT_TRUE(stat(tg0, &st) != 0, "plural remove: trigram 000.tg unlinked");
         ASSERT_TRUE(stat(bm0, &st) != 0, "plural remove: bitmap 000.bm unlinked");
+        ASSERT_TRUE(stat(bm7, &st) != 0, "plural remove: bitmap final shard unlinked");
     }
 
     tc_close(tc);

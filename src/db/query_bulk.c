@@ -95,6 +95,16 @@ static void *idx_build_field_worker(void *arg) {
         if (btree_bulk_merge(path, parted + offsets[s], counts[s]) != 0) {
             fa->out_error = -1;
             fa->out_errno = errno;
+            bt_publish_result publish = btree_bulk_merge_publish_result();
+            const char *state = publish == BT_PUBLISH_PRE_RENAME_FAILED
+                              ? "pre-rename-failed"
+                              : publish == BT_PUBLISH_POST_RENAME_FSYNC_FAILED
+                              ? "post-rename-durability-unconfirmed"
+                              : "bulk-merge-failed";
+            LOG_ERROR(LOG_SUB_QUERY,
+                      "idx_build_field_worker: field=%s shard=%d target=%s state=%s errno=%d (%s)",
+                      fa->field, s, path, state, fa->out_errno,
+                      strerror(fa->out_errno));
             break;
         }
     }

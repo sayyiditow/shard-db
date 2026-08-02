@@ -23,6 +23,8 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include "btree.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,5 +282,159 @@ static int test_coverity_btree_leafcount_overflow_run(void) {
     return 0;
 }
 
+static int cov_btree_seed(const char *path, int count) {
+    BtEntry *entries = calloc((size_t)count, sizeof(*entries));
+    if (!entries) return -1;
+    for (int i = 0; i < count; i++) {
+        char *value = malloc(32);
+        if (!value) {
+            for (int j = 0; j < i; j++) free((char *)entries[j].value);
+            free(entries);
+            return -1;
+        }
+        int n = snprintf(value, 32, "key_%04d", i);
+        entries[i].value = value;
+        entries[i].vlen = (size_t)n;
+        memset(entries[i].hash, 0, sizeof(entries[i].hash));
+        memcpy(entries[i].hash, &i, sizeof(i));
+    }
+    int rc = btree_bulk_build(path, entries, (size_t)count);
+    for (int i = 0; i < count; i++) free((char *)entries[i].value);
+    free(entries);
+    return rc;
+}
+
+static int cov_btree_range_count_cb(const char *value, size_t vlen,
+                                    const uint8_t *hash, void *ctx) {
+    (void)value;
+    (void)vlen;
+    (void)hash;
+    int *count = ctx;
+    (*count)++;
+    return 0;
+}
+
+static int cov_btree_corrupt_root(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    BtFileHeader header;
+    int rc = -1;
+    if (pread(fd, &header, sizeof(header), 0) == (ssize_t)sizeof(header)) {
+        header.root_page = header.page_count + 1;
+        rc = pwrite(fd, &header.root_page, sizeof(header.root_page),
+                    offsetof(BtFileHeader, root_page)) ==
+             (ssize_t)sizeof(header.root_page) ? 0 : -1;
+    }
+    close(fd);
+    return rc;
+}
+
+static int cov_btree_corrupt_leaf_chain(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    BtFileHeader header;
+    int rc = -1;
+    if (pread(fd, &header, sizeof(header), 0) == (ssize_t)sizeof(header) &&
+        header.root_page > 0 && header.root_page < header.page_count) {
+        uint32_t page_id = header.root_page;
+        BtPageHeader page;
+        for (uint32_t hops = 0; hops < header.page_count; hops++) {
+            off_t offset = (off_t)page_id * BT_PAGE_SIZE;
+            if (pread(fd, &page, sizeof(page), offset) != (ssize_t)sizeof(page))
+                break;
+            if (page.page_type == 1) {
+                uint32_t bad_next = header.page_count + 1;
+                rc = pwrite(fd, &bad_next, sizeof(bad_next),
+                            offset + offsetof(BtPageHeader, next_leaf)) ==
+                     (ssize_t)sizeof(bad_next) ? 0 : -1;
+                break;
+            }
+            page_id = page.next_leaf;
+            if (page_id == 0 || page_id >= header.page_count) break;
+        }
+    }
+    close(fd);
+    return rc;
+}
+
+static int test_coverity_btree_bulk_merge_rejects_bad_root_run(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/shard-db-cov-bt-root-%d.idx", (int)getpid());
+    unlink(path);
+    ASSERT_EQ_INT(cov_btree_seed(path, 500), 0, "seed root corruption tree");
+
+    int expected = 0;
+    btree_range(path, "key_0000", 8, "key_0499", 8,
+                cov_btree_range_count_cb, &expected);
+    ASSERT_EQ_INT(expected, 500, "complete range before root corruption");
+
+    struct stat before, after;
+    ASSERT_EQ_INT(stat(path, &before), 0, "stat before root corruption");
+    ASSERT_EQ_INT(cov_btree_corrupt_root(path), 0, "corrupt root bounds");
+    char *corrupted = tu_read_file(path);
+    ASSERT_NOT_NULL(corrupted, "snapshot corrupted root tree before merge");
+
+    BtEntry added = { .value = "key_new_root", .vlen = 12 };
+    memset(added.hash, 0xA1, sizeof(added.hash));
+    ASSERT_TRUE(btree_bulk_merge(path, &added, 1) != 0,
+                "reject root corruption");
+    ASSERT_EQ_INT(stat(path, &after), 0, "stat after root corruption");
+    ASSERT_EQ_INT((int)after.st_ino, (int)before.st_ino,
+                  "root corruption retains inode");
+    char *after_bytes = tu_read_file(path);
+    ASSERT_TRUE(corrupted && after_bytes && before.st_size == after.st_size &&
+                memcmp(corrupted, after_bytes, (size_t)before.st_size) == 0,
+                "root corruption merge leaves every corrupted byte unchanged");
+    ASSERT_TRUE(!after_bytes || memmem(after_bytes, (size_t)after.st_size,
+                                       "key_new_root", 12) == NULL,
+                "root corruption merge does not add the proposed raw key");
+    free(after_bytes);
+    free(corrupted);
+    unlink(path);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_coverity_btree_bulk_merge_rejects_bad_leaf_chain_run(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/shard-db-cov-bt-chain-%d.idx", (int)getpid());
+    unlink(path);
+    ASSERT_EQ_INT(cov_btree_seed(path, 500), 0, "seed leaf-chain corruption tree");
+
+    int expected = 0;
+    btree_range(path, "key_0000", 8, "key_0499", 8,
+                cov_btree_range_count_cb, &expected);
+    ASSERT_EQ_INT(expected, 500, "complete range before chain corruption");
+
+    struct stat before, after;
+    ASSERT_EQ_INT(stat(path, &before), 0, "stat before chain corruption");
+    ASSERT_EQ_INT(cov_btree_corrupt_leaf_chain(path), 0,
+                  "corrupt forward leaf chain");
+    char *corrupted = tu_read_file(path);
+    ASSERT_NOT_NULL(corrupted, "snapshot corrupted leaf-chain tree before merge");
+
+    BtEntry added = { .value = "key_new_chain", .vlen = 13 };
+    memset(added.hash, 0xB2, sizeof(added.hash));
+    ASSERT_TRUE(btree_bulk_merge(path, &added, 1),
+                "reject leaf-chain corruption");
+    ASSERT_EQ_INT(stat(path, &after), 0, "stat after chain corruption");
+    ASSERT_EQ_INT((int)after.st_ino, (int)before.st_ino,
+                  "leaf-chain corruption retains inode");
+    char *after_bytes = tu_read_file(path);
+    ASSERT_TRUE(corrupted && after_bytes && before.st_size == after.st_size &&
+                memcmp(corrupted, after_bytes, (size_t)before.st_size) == 0,
+                "leaf-chain merge leaves every corrupted byte unchanged");
+    ASSERT_TRUE(!after_bytes || memmem(after_bytes, (size_t)after.st_size,
+                                       "key_new_chain", 13) == NULL,
+                "leaf-chain merge does not add the proposed raw key");
+    free(after_bytes);
+    free(corrupted);
+    unlink(path);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+TEST_REGISTER("test-coverity-btree-bulk-merge-bad-root",
+              test_coverity_btree_bulk_merge_rejects_bad_root_run);
+TEST_REGISTER("test-coverity-btree-bulk-merge-bad-leaf-chain",
+              test_coverity_btree_bulk_merge_rejects_bad_leaf_chain_run);
 TEST_REGISTER("test-coverity-btree-nextleaf-cycle", test_coverity_btree_nextleaf_cycle_run);
 TEST_REGISTER("test-coverity-btree-leafcount-overflow", test_coverity_btree_leafcount_overflow_run);

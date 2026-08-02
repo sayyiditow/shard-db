@@ -1,5 +1,27 @@
 # Indexes
 
+## Index build and maintenance
+
+Rebuilds publish each B-tree, trigram, and bitmap shard atomically. A builder
+first materialises and syncs a sibling temporary file, then replaces the live
+path. A concurrent reader may complete on the old complete file, while a reader
+that begins after publication completes sees the replacement. Cache visibility
+uses publication generations plus file-identity validation rather than a global
+publication gate. A failed scan, spill read, or temporary write leaves the
+previous live shard intact; an empty rebuild publishes a valid empty shard
+rather than removing the index.
+
+If the post-rename parent-directory sync fails, the replacement is already
+live but its crash durability is unconfirmed. The command returns a durability
+warning and operators should repeat the maintenance operation after resolving
+the underlying filesystem error. Atomicity is per shard: a later shard failure
+can leave an index with a mix of old and new shards, so retry the operation.
+Target-shard publication and `index.conf` metadata publication have separate
+failure and durability-warning states. Reindex removes obsolete
+legacy/high-shard files only after all requested replacement shards were
+published. Crash-abandoned generated temporary siblings are removed during
+startup before index work begins.
+
 shard-db ships three index types:
 
 - **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).

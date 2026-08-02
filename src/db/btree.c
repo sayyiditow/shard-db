@@ -26,7 +26,6 @@ int bt_page_size = 4096;
 /* Defined in util.c — forward-declared here to avoid pulling all of types.h
    (types.h carries heavy server/storage deps that btree.c doesn't need). */
 extern void  mkdirp(const char *path);
-extern char *dirname_of(const char *path);
 
 /* ========== Page helpers ========== */
 
@@ -374,6 +373,33 @@ typedef struct {
 
 static int bt_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
+/* Publication generation (see btree_publish_contract comments). Advanced by
+   one on every successful publish rename; cache entries record the
+   generation at which their open inode was validated. */
+static _Atomic uint64_t g_bt_publish_generation = 1;
+static _Thread_local bt_publish_result g_bt_last_bulk_merge_publish =
+    BT_PUBLISH_NOT_ATTEMPTED;
+
+#ifdef TEST_BUILD
+static _Atomic int g_bt_test_publish_fail_stage;
+
+void btree_test_publish_fail_stage(int stage) {
+    atomic_store_explicit(&g_bt_test_publish_fail_stage, stage,
+                          memory_order_release);
+}
+
+static int bt_test_take_publish_failure(int stage) {
+    int expected = stage;
+    return atomic_compare_exchange_strong_explicit(
+        &g_bt_test_publish_fail_stage, &expected, 0,
+        memory_order_acq_rel, memory_order_acquire);
+}
+#endif
+
+bt_publish_result btree_bulk_merge_publish_result(void) {
+    return g_bt_last_bulk_merge_publish;
+}
+
 void bt_cache_init(int cap) {
     if (bt_cache) return;
     if (cap < 16) cap = 16;
@@ -495,6 +521,8 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
     e->map_size = 0;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->validated_publish_generation, 0,
+                          memory_order_relaxed);
     e->used = BT_CACHE_TOMBSTONE;
     e->path[0] = '\0';
     bt_cache_count--;
@@ -555,8 +583,9 @@ static int bt_open_file(const char *path, int writer,
                         int *out_fd, uint8_t **out_map, size_t *out_size) {
     int fd;
     if (writer) {
-        /* dirname_of returns a static-buffer pointer — do not free. */
-        mkdirp(dirname_of(path));
+        char parent[PATH_MAX];
+        if (parent_dir_copy(path, parent, sizeof(parent)) != 0) return -1;
+        mkdirp(parent);
         fd = open(path, O_RDWR | O_CREAT, 0644);
     } else {
         fd = open(path, O_RDWR);
@@ -675,12 +704,48 @@ int btree_test_reader_pending_count(void) {
 }
 #endif
 
+/* Publication contract (replaces the removed global publication gate):
+   publication never holds a global lock and never blocks on a live target
+   cache entry. A successful rename advances g_bt_publish_generation before
+   publication returns. Cache entries record the generation at which their
+   open inode was validated; the first acquire after a generation change
+   compares the cached fd's (st_dev, st_ino) with the current path. A
+   mismatched entry is retired non-blockingly when possible; otherwise that
+   acquire opens the current path uncached. An acquire overlapping
+   publication may finish on the old inode, but an acquire beginning after
+   publication completes cannot. The only remaining lock order is
+   bt_cache_lock -> per-entry rwlock (never the reverse). */
+
+/* Non-blocking cache invalidation for `path`: detaches the entry only if
+   nobody holds it. Returns 1 when detached, 0 when absent/busy, and -1 on a
+   real cleanup error. Never waits on a cache-entry rwlock. */
+static int btree_cache_invalidate_nowait(const char *path) {
+    int rc = 0;
+    pthread_mutex_lock(&bt_cache_lock);
+    if (bt_cache) {
+        int found = 0;
+        int slot = bt_cache_probe(path, &found);
+        if (found && slot >= 0) {
+            int fd = -1;
+            uint8_t *map = NULL;
+            size_t map_size = 0;
+            rc = bt_cache_evict_slot(slot, CACHE_DROP_DISCARD, 0,
+                                     &fd, &map, &map_size);
+            pthread_mutex_unlock(&bt_cache_lock);
+            if (rc > 0) bt_dispose_mapping(fd, map, map_size);
+            return rc;
+        }
+    }
+    pthread_mutex_unlock(&bt_cache_lock);
+    return rc;
+}
+
 /* Acquire a btree handle. writer=0 takes rdlock, writer=1 takes wrlock and
    creates the file (with a fresh header) if missing. On cache pressure we
    evict the least-recently-used slot; if the cache isn't initialised or
    eviction can't free a slot, we fall back to an uncached mapping (slot=-1,
    no rwlock) — MAP_SHARED keeps duplicate mappings byte-coherent, but concurrent uncached writers do not get the cache's rwlock serialization; that accepted cache-pressure hazard is unchanged here. */
-static int bt_acquire(BtFile *bt, const char *path, int writer) {
+static int bt_acquire_impl(BtFile *bt, const char *path, int writer) {
     bt->slot = -1;
     bt->writer = writer;
     bt->fd = -1;
@@ -751,6 +816,27 @@ retry_bt_acquire:
                   just bumped to current clock at line 466, so we won't be
                   selected as victim).
                   coverity[atomicity] slot stability guaranteed by rwlock + verify */
+            uint64_t current_generation = atomic_load_explicit(
+                &g_bt_publish_generation, memory_order_acquire);
+            uint64_t validated_generation = atomic_load_explicit(
+                &e->validated_publish_generation, memory_order_acquire);
+            if (validated_generation != current_generation) {
+                /* A publication completed since this entry was validated. If
+                   the cached inode is still the current path's inode, the
+                   entry is valid for the new generation; otherwise it is
+                   stale — retire it non-blockingly, or serve this acquire
+                   from a fresh open of the current path. */
+                if (!durability_same_open_inode(e->fd, path)) {
+                    pthread_rwlock_unlock(lock);
+                    if (btree_cache_invalidate_nowait(path) > 0)
+                        goto retry_bt_acquire;
+                    bt->slot = -1;
+                    return bt_open_file(path, writer, &bt->fd, &bt->map,
+                                        &bt->map_size);
+                }
+                atomic_store_explicit(&e->validated_publish_generation,
+                                      current_generation, memory_order_release);
+            }
             __atomic_add_fetch(&g_bt_cache_hits, 1, __ATOMIC_RELAXED);
             bt->slot = slot;
             bt->fd = e->fd;
@@ -776,6 +862,12 @@ retry_bt_acquire:
     int fd;
     uint8_t *map;
     size_t sz;
+    /* Capture the publication generation immediately before opening the
+       pathname — not at cache-install time. A reader can open the old
+       inode, lose the race to rename, and install only afterwards;
+       loading the generation at install would falsely bless that old
+       inode as current. */
+    uint64_t opened_generation = 0;
     if (!writer) {
         /* Readers: open+mmap OUTSIDE the table lock so parallel cold-cache
            index fan-out doesn't serialize on syscalls. Safe for readers
@@ -783,6 +875,8 @@ retry_bt_acquire:
            lock: fresh-file creation (O_CREAT + ftruncate + bt_init_file)
            relies on the table lock for serialization. */
         pthread_mutex_unlock(&bt_cache_lock);
+        opened_generation = atomic_load_explicit(&g_bt_publish_generation,
+                                                 memory_order_acquire);
         if (bt_open_file(path, 0, &fd, &map, &sz) < 0) return -1;
         pthread_mutex_lock(&bt_cache_lock);
         int refound = 0;
@@ -801,6 +895,8 @@ retry_bt_acquire:
             return 0;
         }
     } else {
+        opened_generation = atomic_load_explicit(&g_bt_publish_generation,
+                                                 memory_order_acquire);
         if (bt_open_file(path, 1, &fd, &map, &sz) < 0) {
             pthread_mutex_unlock(&bt_cache_lock);
             return -1;
@@ -878,6 +974,8 @@ retry_bt_acquire:
     e->map_size = sz;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->validated_publish_generation,
+                          opened_generation, memory_order_release);
     e->used = BT_CACHE_LIVE;
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
@@ -922,6 +1020,14 @@ retry_bt_acquire:
        rwlock stays held; bt_release() is the matched unlock.
        coverity[missing_unlock] rwlock handoff to caller is intentional */
     return 0;
+}
+
+/* Public/private acquire name — direct call into the implementation. The
+   removed global publication gate used to wrap this; cache visibility is
+   now enforced by the publication generation + inode validation described
+   above bt_acquire_impl. */
+static int bt_acquire(BtFile *bt, const char *path, int writer) {
+    return bt_acquire_impl(bt, path, writer);
 }
 
 static void bt_release(BtFile *bt) {
@@ -2655,16 +2761,81 @@ done:
     return rc;
 }
 
+/* Advance the publication generation and retire a stale target cache entry
+   without ever blocking on it. Runs immediately after the rename (via
+   durability_publish_replace), before the parent-directory fsync. */
+static void bt_after_rename(const char *target, void *ctx) {
+    (void)ctx;
+    atomic_fetch_add_explicit(&g_bt_publish_generation, 1,
+                              memory_order_acq_rel);
+    (void)btree_cache_invalidate_nowait(target);
+}
+
+static bt_publish_result bt_publish_replace(const char *target,
+                                            const char *tmp_path) {
+    char parent[PATH_MAX];
+    if (parent_dir_copy(target, parent, sizeof(parent)) != 0)
+        return BT_PUBLISH_PRE_RENAME_FAILED;
+    /* The generated temporary is never retained by a caller, so blocking
+       invalidation of only the temp path is safe; the live target is
+       retired non-blockingly in bt_after_rename. */
+    btree_cache_invalidate(tmp_path);
+#ifdef TEST_BUILD
+    if (bt_test_take_publish_failure(1)) {
+        errno = EIO;
+        return BT_PUBLISH_PRE_RENAME_FAILED;
+    }
+#endif
+    durability_test_pause(parent, "bt-publish-before-rename");
+    int rc = durability_publish_replace(target, tmp_path,
+                                        bt_after_rename, NULL);
+    if (rc < 0) return BT_PUBLISH_PRE_RENAME_FAILED;
+    if (rc > 0) return BT_PUBLISH_POST_RENAME_FSYNC_FAILED;
+#ifdef TEST_BUILD
+    if (bt_test_take_publish_failure(2)) {
+        errno = EIO;
+        return BT_PUBLISH_POST_RENAME_FSYNC_FAILED;
+    }
+#endif
+    return BT_PUBLISH_OK;
+}
+
+static int bt_rebuild_temp_path(const char *target, char out[PATH_MAX]) {
+    char parent[PATH_MAX];
+    if (parent_dir_copy(target, parent, sizeof(parent)) != 0) return -1;
+    int n = snprintf(out, PATH_MAX, "%s/.rebuild-XXXXXX", parent);
+    if (n < 0 || n >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+    int fd = mkstemp(out);
+    if (fd < 0) return -1;
+    if (close(fd) != 0) { int e = errno; unlink(out); errno = e; return -1; }
+    return 0;
+}
+
 static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t count) {
-    /* Drop the cached fd/mapping before unlink — otherwise the cache holds
-       the orphaned inode alive and the next acquire opens the new file via
-       a fresh fd while old writers still see the deleted one. */
-    btree_cache_invalidate(path);
-    unlink(path);
-    if (count == 0) return 0;
+    char parent[PATH_MAX];
+    if (parent_dir_copy(path, parent, sizeof(parent)) != 0) return -1;
+    mkdirp(parent);
+    char tmp_path[PATH_MAX];
+    if (bt_rebuild_temp_path(path, tmp_path) != 0) return -1;
 
     BtFile bt;
-    if (bt_acquire(&bt, path, 1) != 0) return -1;
+    if (bt_acquire(&bt, tmp_path, 1) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (count == 0) {
+        BtFileHeader *fh = (BtFileHeader *)bt.map;
+        fh->root_page = 1;
+        fh->entry_count = 0;
+        fh->last_leaf_page = 1;
+        fh->height = 1;
+        bt_release(&bt);
+        bt_publish_result pr = bt_publish_replace(path, tmp_path);
+        g_bt_last_bulk_merge_publish = pr;
+        if (pr == BT_PUBLISH_PRE_RENAME_FAILED) unlink(tmp_path);
+        return pr == BT_PUBLISH_OK ? 0 : -1;
+    }
 
     /* Fill leaf pages left to right */
     uint32_t *leaf_ids = NULL;
@@ -2672,6 +2843,7 @@ static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t co
     leaf_ids = malloc(leaf_cap * sizeof(uint32_t));
     if (!leaf_ids) {
         bt_release(&bt);
+        unlink(tmp_path);
         errno = ENOMEM;
         return -1;
     }
@@ -2816,13 +2988,28 @@ static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t co
     if (child_ids != leaf_ids) free(child_ids);
     free(leaf_ids);
     bt_release(&bt);
+
+    bt_publish_result pr = bt_publish_replace(path, tmp_path);
+    g_bt_last_bulk_merge_publish = pr;
+    if (pr == BT_PUBLISH_PRE_RENAME_FAILED) {
+        unlink(tmp_path);
+        return -1;
+    }
+    if (pr == BT_PUBLISH_POST_RENAME_FSYNC_FAILED) {
+        LOG_WARN(LOG_SUB_BTREE,
+                 "btree_bulk_build_locked %s: published via %s but "
+                 "post-rename parent-directory fsync failed: %s",
+                 path, tmp_path, strerror(errno));
+        return -1;
+    }
     return 0;
 
 leaf_oom:
     /* Out of memory while growing leaf_ids — release the file lock and
-       bail out. The on-disk tree is partial but consistent up to the
-       last successfully written leaf; readers won't crash. */
+       bail out. The on-disk temp file is partial but was never published;
+       the live target is untouched. */
     bt_release(&bt);
+    unlink(tmp_path);
     errno = ENOMEM;
     return -1;
 }
@@ -2861,14 +3048,18 @@ struct BtStreamBuilder {
     int       fatal;         /* set on alloc failure — finish becomes a no-op release */
     pthread_mutex_t *mutation_lock;  /* held from open until finish */
     int              bt_held;        /* bt_acquire succeeded; dispose must release */
+    char      target_path[PATH_MAX];
+    char      tmp_path[PATH_MAX];
+    int       tmp_created;   /* bt_rebuild_temp_path succeeded; dispose may unlink it */
 };
 
-static int bt_stream_build_dispose(BtStreamBuilder *b, int rc) {
+static bt_publish_result bt_stream_build_dispose(BtStreamBuilder *b, bt_publish_result rc) {
     if (!b) return rc;
     if (b->bt_held) {
         bt_release(&b->bt);
         b->bt_held = 0;
     }
+    if (rc == BT_PUBLISH_PRE_RENAME_FAILED && b->tmp_created) unlink(b->tmp_path);
     if (b->mutation_lock) {
         bt_mutation_unlock(b->mutation_lock);
         b->mutation_lock = NULL;
@@ -2889,10 +3080,20 @@ BtStreamBuilder *bt_stream_build_open(const char *path) {
         return NULL;
     }
     bt_mutation_lock(b->mutation_lock);
-    btree_cache_invalidate(path);
-    unlink(path);
-    if (bt_acquire(&b->bt, path, 1) != 0) {
-        bt_stream_build_dispose(b, -1);
+    snprintf(b->target_path, sizeof(b->target_path), "%s", path);
+    char parent[PATH_MAX];
+    if (parent_dir_copy(path, parent, sizeof(parent)) != 0) {
+        bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
+        return NULL;
+    }
+    mkdirp(parent);
+    if (bt_rebuild_temp_path(path, b->tmp_path) != 0) {
+        bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
+        return NULL;
+    }
+    b->tmp_created = 1;
+    if (bt_acquire(&b->bt, b->tmp_path, 1) != 0) {
+        bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
         return NULL;
     }
     b->bt_held = 1;
@@ -2900,7 +3101,7 @@ BtStreamBuilder *bt_stream_build_open(const char *path) {
     b->leaf_ids = malloc(b->leaf_cap * sizeof(uint32_t));
     if (!b->leaf_ids) {
         LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_open %s: malloc(leaf_ids, cap=%zu) failed", path, b->leaf_cap);
-        bt_stream_build_dispose(b, -1);
+        bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
         return NULL;
     }
     b->cur_leaf = 1;
@@ -2960,9 +3161,15 @@ int bt_stream_build_add(BtStreamBuilder *b,
     return 0;
 }
 
-int bt_stream_build_finish(BtStreamBuilder *b) {
-    if (!b) return -1;
-    if (b->fatal) return bt_stream_build_dispose(b, -1);
+/* Mark a builder fatal so finish disposes its temporary output rather than
+   publishing a partial tree. */
+void bt_stream_build_abort(BtStreamBuilder *b) {
+    if (b) b->fatal = 1;
+}
+
+bt_publish_result bt_stream_build_finish(BtStreamBuilder *b) {
+    if (!b) return BT_PUBLISH_PRE_RENAME_FAILED;
+    if (b->fatal) return bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
 
     /* No entries → leave the file as an empty (header-only) btree.
        Header has page_type=1, count=0 on page 1 from bt_acquire. */
@@ -2972,7 +3179,10 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
         fh0->entry_count = 0;
         fh0->last_leaf_page = 1;
         fh0->height = 1;
-        return bt_stream_build_dispose(b, 0);
+        bt_release(&b->bt);
+        b->bt_held = 0;
+        bt_publish_result pr0 = bt_publish_replace(b->target_path, b->tmp_path);
+        return bt_stream_build_dispose(b, pr0);
     }
 
     /* === Build internal nodes bottom-up — identical to bulk_build. === */
@@ -2985,7 +3195,7 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
         if (!parent_ids) {
             LOG_ERROR(LOG_SUB_BTREE, "bt_stream_build_finish: malloc(parent_ids, cap=%zu) failed", parent_cap);
             if (child_ids != b->leaf_ids) free(child_ids);
-            return bt_stream_build_dispose(b, -1);
+            return bt_stream_build_dispose(b, BT_PUBLISH_PRE_RENAME_FAILED);
         }
         size_t parent_count = 0;
 
@@ -3057,68 +3267,165 @@ int bt_stream_build_finish(BtStreamBuilder *b) {
     }
 
     if (child_ids != b->leaf_ids) free(child_ids);
-    return bt_stream_build_dispose(b, 0);
+
+    bt_release(&b->bt);
+    b->bt_held = 0;
+    bt_publish_result pr = bt_publish_replace(b->target_path, b->tmp_path);
+    return bt_stream_build_dispose(b, pr);
 }
 
 /* ========== Merge-rebuild: extract existing + merge + bulk_build ========== */
 
-/* Extract all entries from an existing B+ tree via sequential leaf scan.
-   Returns malloc'd array of BtEntry (each .value is malloc'd). Sets *out_count.
-   Returns NULL if file doesn't exist or is empty. */
-static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
+/* NULL with out_failed == 0 means a valid empty or absent (ENOENT) target.
+ * out_failed == 1 prevents replacement after open, format, traversal,
+ * allocation, or entry-count failure. */
+static BtEntry *bt_extract_all(const char *path, size_t *out_count,
+                               int *out_failed) {
     *out_count = 0;
+    *out_failed = 0;
 
-    /* Use the unified btree open path — same rdlock that every other
-       reader takes, so a concurrent btree_insert blocks briefly on the
-       per-file wrlock rather than racing this MAP_PRIVATE view. The
-       caller (btree_bulk_merge) holds the per-path bulk-merge mutex and
-       runs under objlock, but going through bt_acquire keeps the access
-       pattern uniform with the rest of the read path. */
     BtFile bt;
-    if (bt_acquire(&bt, path, 0) != 0) return NULL;
-    if (bt.map_size < (size_t)bt_page_size * 2) { bt_release(&bt); return NULL; }
+    if (bt_acquire(&bt, path, 0) != 0) {
+        int saved_errno = errno;
+        if (saved_errno != ENOENT) {
+            *out_failed = 1;
+            if (saved_errno == 0) errno = EIO;
+        }
+        return NULL;
+    }
+
+    BtEntry *entries = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+    int saved_errno = 0;
+    size_t mapped_pages = bt.map_size / (size_t)bt_page_size;
+
+#define BT_EXTRACT_FAIL(err) do { \
+        saved_errno = (err); \
+        if (saved_errno == 0) saved_errno = EIO; \
+        goto extract_failed; \
+    } while (0)
+
+    if (bt.map_size < (size_t)bt_page_size * 2 ||
+        bt.map_size % (size_t)bt_page_size != 0 ||
+        mapped_pages < 2)
+        BT_EXTRACT_FAIL(EINVAL);
 
     BtFileHeader *fh = (BtFileHeader *)bt.map;
-    if (fh->magic != BT_MAGIC || fh->entry_count == 0) {
-        bt_release(&bt); return NULL;
-    }
+    if (fh->magic != BT_MAGIC || fh->page_count < 2 ||
+        (uint64_t)fh->page_count > mapped_pages ||
+        fh->root_page == 0 || fh->root_page >= fh->page_count)
+        BT_EXTRACT_FAIL(EINVAL);
 
-    size_t cap = (size_t)fh->entry_count + 64;
-    /* CID 1693855 - header value from trusted index file, triage */
-    BtEntry *entries = malloc(cap * sizeof(BtEntry));
+    if (fh->entry_count > SIZE_MAX - 64)
+        BT_EXTRACT_FAIL(EOVERFLOW);
+    cap = (size_t)fh->entry_count + 64;
+    if (cap > SIZE_MAX / sizeof(*entries))
+        BT_EXTRACT_FAIL(EOVERFLOW);
+
+    entries = malloc(cap * sizeof(*entries));
     if (!entries) {
-        LOG_ERROR(LOG_SUB_BTREE, "bt_extract_all %s: malloc(entries, cap=%zu) failed", path, cap);
-        bt_release(&bt); return NULL;
+        LOG_ERROR(LOG_SUB_BTREE,
+                  "bt_extract_all %s: malloc(entries, cap=%zu) failed",
+                  path, cap);
+        BT_EXTRACT_FAIL(ENOMEM);
     }
-    size_t count = 0;
 
-    /* Walk down to leftmost leaf via next_leaf (= leftmost child for internal) */
+    /* Walk down to the leftmost leaf through the internal-page child chain.
+       The hop bound is mandatory: a corrupt child pointer must not spin the
+       merge worker forever. */
     uint32_t page_id = fh->root_page;
-    while (1) {
-        if ((size_t)page_id * bt_page_size + bt_page_size > bt.map_size) break;
+    int found_leaf = 0;
+    for (uint32_t hops = 0; hops < fh->page_count; hops++) {
+        if (page_id == 0 || page_id >= fh->page_count ||
+            (size_t)page_id >= mapped_pages)
+            BT_EXTRACT_FAIL(EINVAL);
+
         uint8_t *pg = bt.map + (size_t)page_id * bt_page_size;
         BtPageHeader *ph = (BtPageHeader *)pg;
-        if (ph->page_type == 1) break;
+        size_t slots_end = sizeof(*ph) +
+                           (size_t)ph->count * sizeof(uint16_t);
+        if ((ph->page_type != 0 && ph->page_type != 1) ||
+            ph->count > (size_t)(bt_page_size - sizeof(*ph)) / sizeof(uint16_t) ||
+            slots_end > (size_t)bt_page_size || ph->data_end < slots_end ||
+            ph->data_end > (size_t)bt_page_size)
+            BT_EXTRACT_FAIL(EINVAL);
+
+        if (ph->page_type == 1) {
+            found_leaf = 1;
+            break;
+        }
+        if (ph->count == 0 || ph->next_leaf == 0 ||
+            ph->next_leaf >= fh->page_count)
+            BT_EXTRACT_FAIL(EINVAL);
+
+        for (uint32_t i = 0; i < ph->count; i++) {
+            uint16_t offset = page_slots(pg)[i];
+            if (offset < slots_end || offset < ph->data_end ||
+                (size_t)offset + sizeof(uint16_t) > (size_t)bt_page_size)
+                BT_EXTRACT_FAIL(EINVAL);
+            uint8_t *entry = pg + offset;
+            size_t data_len = entry_data_len(entry);
+            if (data_len < BT_HASH_SIZE + 4 ||
+                data_len > (size_t)bt_page_size - (size_t)offset - sizeof(uint16_t))
+                BT_EXTRACT_FAIL(EINVAL);
+            uint32_t child = entry_child(entry);
+            if (child == 0 || child >= fh->page_count)
+                BT_EXTRACT_FAIL(EINVAL);
+        }
         page_id = ph->next_leaf;
     }
+    if (!found_leaf)
+        BT_EXTRACT_FAIL(EINVAL);
 
-    /* Scan leaf chain — sequential decode via LeafIter */
-    while (page_id != 0 && (size_t)page_id * bt_page_size + bt_page_size <= bt.map_size) {
+    /* Scan the leaf chain, validating every slot before LeafIter decodes it.
+       LeafIter assumes trusted offsets and lengths, so those checks must
+       happen before it is called. */
+    size_t leaf_hops = 0;
+    while (page_id != 0) {
+        if (page_id >= fh->page_count || (size_t)page_id >= mapped_pages ||
+            leaf_hops++ >= fh->page_count)
+            BT_EXTRACT_FAIL(EINVAL);
+
         uint8_t *pg = bt.map + (size_t)page_id * bt_page_size;
         BtPageHeader *ph = (BtPageHeader *)pg;
-        if (ph->page_type != 1) break;
+        size_t slots_end = sizeof(*ph) +
+                           (size_t)ph->count * sizeof(uint16_t);
+        if (ph->page_type != 1 ||
+            ph->count > (size_t)(bt_page_size - sizeof(*ph)) / sizeof(uint16_t) ||
+            slots_end > (size_t)bt_page_size || ph->data_end < slots_end ||
+            ph->data_end > (size_t)bt_page_size)
+            BT_EXTRACT_FAIL(EINVAL);
+
+        size_t previous_key_len = 0;
+        for (uint32_t i = 0; i < ph->count; i++) {
+            uint16_t offset = page_slots(pg)[i];
+            if (offset < slots_end || offset < ph->data_end ||
+                (size_t)offset + sizeof(uint16_t) > (size_t)bt_page_size)
+                BT_EXTRACT_FAIL(EINVAL);
+            uint8_t *entry = pg + offset;
+            size_t data_len = entry_data_len(entry);
+            if (data_len < 1 + BT_HASH_SIZE ||
+                data_len > (size_t)bt_page_size - (size_t)offset - sizeof(uint16_t))
+                BT_EXTRACT_FAIL(EINVAL);
+            size_t prefix_len = leaf_entry_prefix_len(entry);
+            size_t suffix_len = data_len - 1 - BT_HASH_SIZE;
+            if (((i & (BT_LEAF_RESTART_K - 1)) == 0 && prefix_len != 0) ||
+                ((i & (BT_LEAF_RESTART_K - 1)) != 0 &&
+                    prefix_len > previous_key_len) ||
+                prefix_len + suffix_len > BT_MAX_VAL_LEN)
+                BT_EXTRACT_FAIL(EINVAL);
+            previous_key_len = prefix_len + suffix_len;
+        }
 
         LeafIter it;
         leaf_iter_init(&it, pg);
         while (leaf_iter_next(&it)) {
-            if (count >= cap) {
-                cap *= 2;
-                BtEntry *tmp = realloc(entries, cap * sizeof(BtEntry));
-                if (!tmp) goto extract_done;
-                entries = tmp;
-            }
+            if (count >= cap)
+                BT_EXTRACT_FAIL(EOVERFLOW);
             char *vcopy = malloc(it.key_len + 1);
-            if (!vcopy) goto extract_done;
+            if (!vcopy)
+                BT_EXTRACT_FAIL(ENOMEM);
             memcpy(vcopy, it.key_buf, it.key_len);
             vcopy[it.key_len] = '\0';
             entries[count].value = vcopy;
@@ -3126,13 +3433,34 @@ static BtEntry *bt_extract_all(const char *path, size_t *out_count) {
             memcpy(entries[count].hash, it.hash, BT_HASH_SIZE);
             count++;
         }
-        page_id = ph->next_leaf;
+
+        uint32_t next = ph->next_leaf;
+        if (next == page_id)
+            BT_EXTRACT_FAIL(EINVAL);
+        page_id = next;
     }
 
-extract_done:
+    if (count != (size_t)fh->entry_count)
+        BT_EXTRACT_FAIL(EINVAL);
+
     bt_release(&bt);
     *out_count = count;
+    if (count == 0) {
+        free(entries);
+        return NULL;
+    }
+#undef BT_EXTRACT_FAIL
     return entries;
+
+extract_failed:
+    for (size_t i = 0; i < count; i++)
+        free((char *)entries[i].value);
+    free(entries);
+    bt_release(&bt);
+    *out_failed = 1;
+    errno = saved_errno;
+#undef BT_EXTRACT_FAIL
+    return NULL;
 }
 
 static pthread_mutex_t g_btree_test_hook_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -3173,6 +3501,7 @@ static int bt_cmp_entry(const void *a, const void *b) {
    Different .idx files still parallelize. */
 
 int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
+    g_bt_last_bulk_merge_publish = BT_PUBLISH_NOT_ATTEMPTED;
     if (new_count == 0) return 0;
 
     pthread_mutex_t *lock = NULL;
@@ -3226,7 +3555,12 @@ int btree_bulk_merge(const char *path, BtEntry *new_entries, size_t new_count) {
     /* Large batch (or empty tree) — use the rebuild path. */
     qsort(new_entries, new_count, sizeof(BtEntry), bt_cmp_entry);
 
-    existing = bt_extract_all(path, &exist_count);
+    int extract_failed = 0;
+    existing = bt_extract_all(path, &exist_count, &extract_failed);
+    if (extract_failed) {
+        rc = -1;
+        goto done;
+    }
 
     btree_test_after_extract();
 

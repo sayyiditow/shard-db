@@ -18,6 +18,7 @@
 #include "bitmap.h"
 #include "slotcask.h"
 #include "types.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -1387,4 +1388,207 @@ static int test_bitmap_index_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* ── Post-review regression (2026-08-01 corrective plan, Task 1) ──
+ *
+ * Bitmap counterpart of the btree bounded-deadlock regression: retain a
+ * reader handle on A, publish a replacement of A, acquire/use B while A
+ * remains retained, then prove a post-publication A acquire sees the new
+ * bitmap only. Pre-fix: bm_publish_replace holds the global publication
+ * gate and blocks on A's cache-entry rwlock while bm_open(B) blocks on
+ * the gate — the child hangs and the parent kills it at the bound.
+ */
+#define PUB_BM_SLOTS 256
+
+typedef struct {
+    const char *target;
+    const char *tmp;
+    ShardDb    *db;
+    int         rc;
+    atomic_int *done;
+} PubBmArgs;
+
+static void *pub_bm_publish_thread_main(void *arg) {
+    PubBmArgs *a = arg;
+    g_db = a->db;
+    BitmapShard *bm = bm_open(a->tmp, PUB_BM_SLOTS, 1, 0, 0, 1);
+    if (!bm) { a->rc = -1; atomic_store(a->done, 1); return NULL; }
+    for (uint32_t s = 0; s < 5; s++)
+        bm_set(bm, (const uint8_t *)"new", 3, s);
+    a->rc = bm_sync(bm) != 0 ? -1 : 0;
+    bm_close(bm);
+    if (a->rc == 0) a->rc = bm_publish_replace(a->target, a->tmp);
+    atomic_store(a->done, 1);
+    return NULL;
+}
+
+static int run_bm_publish_deadlock_child(const char *base) {
+    bm_cache_shutdown();
+    bm_cache_init(16);
+
+    char path_a[PATH_MAX], path_b[PATH_MAX], path_tmp[PATH_MAX];
+    snprintf(path_a, sizeof(path_a), "%s/pub_a.bm", base);
+    snprintf(path_b, sizeof(path_b), "%s/pub_b.bm", base);
+    snprintf(path_tmp, sizeof(path_tmp), "%s/pub_tmp.bm", base);
+
+    BitmapShard *bm = bm_open(path_a, PUB_BM_SLOTS, 1, 0, 0, 1);
+    if (!bm) _exit(2);
+    for (uint32_t s = 0; s < 5; s++)
+        bm_set(bm, (const uint8_t *)"old", 3, s);
+    if (bm_sync(bm) != 0) _exit(2);
+    bm_close(bm);
+
+    bm = bm_open(path_b, PUB_BM_SLOTS, 1, 0, 0, 1);
+    if (!bm) _exit(2);
+    for (uint32_t s = 0; s < 3; s++)
+        bm_set(bm, (const uint8_t *)"bval", 4, s);
+    if (bm_sync(bm) != 0) _exit(2);
+    bm_close(bm);
+
+    ShardDb *db = g_db;
+    snprintf(db->durability_test_pause_phase,
+             sizeof(db->durability_test_pause_phase), "%s",
+             "bm-publish-before-rename");
+    db->durability_test_pause_ms = 2000;
+
+    /* Retain a real rdlock on A's cache entry. */
+    BitmapShard *retained = bm_open(path_a, 0, 0, 0, 0, 0);
+    if (!retained) _exit(3);
+
+    atomic_int pub_done = 0;
+    PubBmArgs margs = { .target = path_a, .tmp = path_tmp, .db = db,
+                        .rc = -999, .done = &pub_done };
+    pthread_t pub_tid;
+    pthread_create(&pub_tid, NULL, pub_bm_publish_thread_main, &margs);
+
+    int marker_seen = 0;
+    {
+        char marker[PATH_MAX];
+        snprintf(marker, sizeof(marker), "%s/.durability-test-%s.active",
+                 base, "bm-publish-before-rename");
+        for (int tick = 0; tick < 50; tick++) {
+            struct stat st;
+            if (stat(marker, &st) == 0) { marker_seen = 1; break; }
+            usleep(100 * 1000);
+        }
+    }
+
+    /* Must complete before releasing A. Pre-fix this blocks forever on the
+       global publication gate. */
+    BitmapShard *b2 = bm_open(path_b, 0, 0, 0, 0, 0);
+    if (!b2) _exit(4);
+    if (bm_count(b2, (const uint8_t *)"bval", 4) != 3) _exit(5);
+    bm_close(b2);
+
+    /* Release A's retained rdlock, then let publication finish. */
+    bm_close(retained);
+
+    if (marker_seen) {
+        char marker[PATH_MAX];
+        snprintf(marker, sizeof(marker), "%s/.durability-test-%s.active",
+                 base, "bm-publish-before-rename");
+        for (int tick = 0; tick < 50; tick++) {
+            struct stat st;
+            if (stat(marker, &st) != 0) break;
+            usleep(100 * 1000);
+            if (tick == 49) _exit(6);
+        }
+    }
+
+    for (int waited = 0; !atomic_load(&pub_done); waited++) {
+        if (waited >= 100) _exit(7);
+        usleep(100 * 1000);
+    }
+    pthread_join(pub_tid, NULL);
+    if (margs.rc != BM_PUBLISH_OK) _exit(8);
+
+    /* Post-publication A acquire sees the new bitmap only. */
+    BitmapShard *a2 = bm_open(path_a, 0, 0, 0, 0, 0);
+    if (!a2) _exit(9);
+    if (bm_n_values(a2) != 1) _exit(10);
+    if (bm_test(a2, (const uint8_t *)"new", 3, 0) != 1) _exit(11);
+    if (bm_test(a2, (const uint8_t *)"old", 3, 0) != 0) _exit(12);
+    bm_close(a2);
+
+    db->durability_test_pause_ms = 0;
+    db->durability_test_pause_phase[0] = '\0';
+    _exit(0);
+}
+
+static int test_bm_publish_generation_run(void) {
+    char base[] = "/tmp/shard-db-bm-publish-XXXXXX";
+    if (!mkdtemp(base)) { ASSERT_TRUE(0, "mkdtemp"); return 1; }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        ASSERT_TRUE(0, "fork");
+        char cmd[700]; snprintf(cmd, sizeof(cmd), "rm -rf %s", base); system(cmd);
+        return 1;
+    }
+    if (pid == 0) run_bm_publish_deadlock_child(base); /* never returns */
+
+    int status = 0;
+    int wait_rc = 0;
+    for (int tick = 0; tick < 300; tick++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) { wait_rc = 1; break; }
+        if (r < 0) break;
+        usleep(100000);
+    }
+    if (wait_rc != 1) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+
+    ASSERT_EQ_INT(wait_rc, 1,
+                  "bitmap bounded-deadlock child exits before the 30-second bound");
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        TAP_DIAG("# bitmap deadlock child exited %d (2=seed failed, 3=retain "
+                  "open failed, 4=B never acquired, 5=B contents wrong, "
+                  "6=marker never cleared, 7=publisher did not finish, "
+                  "8=publisher failed, 9=post-publication A open failed, "
+                  "10-12=post-publication A contents wrong)\n",
+                  WEXITSTATUS(status));
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+        "bitmap acquire of B completes while A is retained mid-publication");
+
+    char cmd[700]; snprintf(cmd, sizeof(cmd), "rm -rf %s", base); system(cmd);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bm_checked_discard_flush_failure_run(void) {
+    char root[] = "/tmp/shard-db-bm-discard-XXXXXX";
+    if (!mkdtemp(root)) {
+        ASSERT_TRUE(0, "mkdtemp bitmap discard root");
+        return 1;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/dirty.bm", root);
+    bm_cache_shutdown();
+    bm_cache_init(16);
+    BitmapShard *bm = bm_open(path, 256, 1, 0, 0, 1);
+    ASSERT_NOT_NULL(bm, "open bitmap for checked discard");
+    if (bm) {
+        ASSERT_EQ_INT(bm_set(bm, (const uint8_t *)"dirty", 5, 7), 0,
+                      "mark cached bitmap dirty");
+        bm_close(bm);
+    }
+    durability_test_msync_reset();
+    durability_test_msync_fail_next(1, EIO);
+    errno = 0;
+    ASSERT_EQ_INT(bm_cache_invalidate_checked(path), -1,
+                  "checked discard propagates dirty flush failure");
+    ASSERT_EQ_INT(errno, EIO,
+                  "checked discard preserves dirty flush errno");
+    durability_test_msync_reset();
+    ASSERT_EQ_INT(bm_cache_invalidate_checked(path), 0,
+                  "checked discard succeeds after injection reset");
+    bm_cache_shutdown();
+    unlink(path);
+    rmdir(root);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-bitmap-index", test_bitmap_index_run)
+TEST_REGISTER("test-bm-publish-generation", test_bm_publish_generation_run)
+TEST_REGISTER("test-bm-checked-discard-flush-failure",
+              test_bm_checked_discard_flush_failure_run)

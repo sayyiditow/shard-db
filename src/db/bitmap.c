@@ -67,6 +67,41 @@ struct __attribute__((packed)) BmHeader {
 
 static int bm_next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
+/* Publication generation (see the contract beside durability_same_open_inode).
+   Advanced by one on every successful publish rename; cache entries record
+   the generation at which their open inode was validated. */
+static _Atomic uint64_t g_bm_publish_generation = 1;
+
+#ifdef TEST_BUILD
+static _Atomic int g_bm_test_fail_close_count;
+static _Atomic int g_bm_test_fail_invalidate_count;
+void bm_test_fail_close_next(int count) {
+    atomic_store_explicit(&g_bm_test_fail_close_count, count,
+                          memory_order_release);
+}
+void bm_test_fail_invalidate_next(int count) {
+    atomic_store_explicit(&g_bm_test_fail_invalidate_count, count,
+                          memory_order_release);
+}
+void bm_test_fail_reset(void) {
+    bm_test_fail_close_next(0);
+    bm_test_fail_invalidate_next(0);
+}
+
+/* Consume one positive failure, or preserve a negative persistent failure. */
+static int bm_test_consume_failure(_Atomic int *counter) {
+    int current = atomic_load_explicit(counter, memory_order_acquire);
+    while (current != 0) {
+        if (current < 0) return 1;
+        if (atomic_compare_exchange_weak_explicit(
+                counter, &current, current - 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return 1;
+    }
+    return 0;
+}
+#endif
+
 void bm_cache_init(int cap) {
     if (g_bm_cache) return;
     if (cap < 16) cap = 16;
@@ -119,7 +154,7 @@ static int bm_cache_probe(const char *path, int *out_found) {
 
 /* Caller holds g_bm_cache_lock. The entry lock is acquired without holding
    the table mutex, then identity is rechecked after the mutex is restored. */
-static int bm_cache_drop_slot(int slot, CacheDropReason reason, int wait) {
+static int bm_cache_drop_slot(int slot, int wait) {
     BmCacheEntry *e = &g_bm_cache[slot];
     if (!e->used) return 1;
     char expected_path[PATH_MAX];
@@ -137,37 +172,93 @@ static int bm_cache_drop_slot(int slot, CacheDropReason reason, int wait) {
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
-    if (reason == CACHE_DROP_EVICT && e->map && e->map_size > 0 &&
+    if (e->map && e->map_size > 0 &&
         durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
                                e->map, e->map_size) < 0) {
         pthread_rwlock_unlock(&e->rwlock);
         return -1;
     }
-    if (e->map) munmap(e->map, e->map_size);
-    if (e->fd >= 0) close(e->fd);
+    /* A failed munmap leaves a live mapping owned by this entry. Preserve the
+       complete entry so a later invalidation can safely retry teardown. */
+    if (e->map && munmap(e->map, e->map_size) != 0) {
+        int saved_errno = errno;
+        pthread_rwlock_unlock(&e->rwlock);
+        errno = saved_errno;
+        return -1;
+    }
     e->map = NULL;
-    e->fd = -1;
     e->map_size = 0;
+    int saved_errno = 0;
+    if (e->fd >= 0 && close(e->fd) != 0) saved_errno = errno;
+    e->fd = -1;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->validated_publish_generation, 0,
+                          memory_order_relaxed);
     e->used = 0;
     e->path[0] = '\0';
     g_bm_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
+    if (saved_errno) {
+        errno = saved_errno;
+        return -1;
+    }
     return 1;
 }
 
-void bm_cache_invalidate(const char *path) {
-    if (!g_bm_cache) return;
+int bm_cache_invalidate_checked(const char *path) {
+    if (!g_bm_cache) return 0;
+    int rc = 0;
     pthread_mutex_lock(&g_bm_cache_lock);
     int found = 0;
     int slot = bm_cache_probe(path, &found);
     if (found && slot >= 0) {
         /* Structural discard after the path has been unlinked/recreated;
            identity is rechecked after taking the entry wrlock. */
-        bm_cache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
+        rc = bm_cache_drop_slot(slot, 1);
     }
     pthread_mutex_unlock(&g_bm_cache_lock);
+    if (rc < 0) return -1;
+#ifdef TEST_BUILD
+    if (bm_test_consume_failure(&g_bm_test_fail_invalidate_count)) {
+        errno = EIO;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+void bm_cache_invalidate(const char *path) {
+    (void)bm_cache_invalidate_checked(path);
+}
+
+/* Publication contract (replaces the removed global publication gate):
+   publication never holds a global lock and never blocks on a live target
+   cache entry. A successful rename advances g_bm_publish_generation before
+   publication returns. Cache entries record the generation at which their
+   open inode was validated; the first acquire after a generation change
+   compares the cached fd's (st_dev, st_ino) with the current path. A
+   mismatched entry is retired non-blockingly when possible; otherwise that
+   acquire opens the current path uncached. An acquire overlapping
+   publication may finish on the old inode, but an acquire beginning after
+   publication completes cannot. The only remaining lock order is
+   g_bm_cache_lock -> per-entry rwlock (never the reverse). */
+
+/* Non-blocking cache invalidation for `path`: detaches the entry only if
+   nobody holds it. Returns 1 when detached, 0 when absent/busy, and -1 on a
+   real cleanup error. Never waits on a cache-entry rwlock. */
+static int bm_cache_invalidate_nowait(const char *path) {
+    if (!g_bm_cache) return 0;
+    pthread_mutex_lock(&g_bm_cache_lock);
+    int found = 0;
+    int slot = bm_cache_probe(path, &found);
+    if (found && slot >= 0) {
+        int rc = bm_cache_drop_slot(slot, 0);
+        pthread_mutex_unlock(&g_bm_cache_lock);
+        return rc;
+    }
+    pthread_mutex_unlock(&g_bm_cache_lock);
+    return 0;
 }
 
 /* ─────────────────── BitmapShard handle ─────────────────── */
@@ -237,6 +328,34 @@ static int bm_publish(BitmapShard *bm, const char *tmp_path) {
     bm->fd = open(bm->path, O_RDWR);
     if (bm->fd < 0) return -1;
     return bm_remap(bm);
+}
+
+/* Advance the publication generation and retire a stale target cache entry
+   without ever blocking on it. Runs immediately after the rename (via
+   durability_publish_replace), before the parent-directory fsync. */
+static void bm_after_rename(const char *target, void *ctx) {
+    (void)ctx;
+    atomic_fetch_add_explicit(&g_bm_publish_generation, 1,
+                              memory_order_acq_rel);
+    (void)bm_cache_invalidate_nowait(target);
+}
+
+bm_publish_result bm_publish_replace(const char *target, const char *tmp_path) {
+    int publish_rc;
+    char parent[PATH_MAX];
+    if (parent_dir_copy(target, parent, sizeof(parent)) != 0)
+        return BM_PUBLISH_PRE_RENAME_FAILED;
+    /* The generated temporary is never retained by a caller, so blocking
+       invalidation of only the temp path is safe; the live target is
+       retired non-blockingly in bm_after_rename. */
+    if (bm_cache_invalidate_checked(tmp_path) != 0)
+        return BM_PUBLISH_PRE_RENAME_FAILED;
+    durability_test_pause(parent, "bm-publish-before-rename");
+    publish_rc = durability_publish_replace(target, tmp_path,
+                                            bm_after_rename, NULL);
+    if (publish_rc < 0) return BM_PUBLISH_PRE_RENAME_FAILED;
+    if (publish_rc > 0) return BM_PUBLISH_POST_RENAME_FSYNC_FAILED;
+    return BM_PUBLISH_OK;
 }
 
 static int bm_mkdir_p(const char *path) {
@@ -395,8 +514,9 @@ static int bm_file_open_mmap(const char *path,
     return 0;
 }
 
-BitmapShard *bm_open(const char *path, int slots, int create,
-                     int bool_fastpath, uint32_t max_values, int writer) {
+static BitmapShard *bm_open_impl(const char *path, int slots, int create,
+                                 int bool_fastpath, uint32_t max_values,
+                                 int writer) {
     if (writer && !g_bm_cache) {
         errno = ENODEV;
         return NULL;
@@ -456,7 +576,43 @@ retry_bm_acquire:;
 
         BmCacheEntry *e = &g_bm_cache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
-            /* Confirmed hit. Hand the rwlock + cached map to caller. */
+            /* Confirmed hit. A publication may have completed since this
+               entry's inode was validated; serve the entry only if its
+               inode still matches the current path. */
+            uint64_t current_generation = atomic_load_explicit(
+                &g_bm_publish_generation, memory_order_acquire);
+            uint64_t validated_generation = atomic_load_explicit(
+                &e->validated_publish_generation, memory_order_acquire);
+            if (validated_generation != current_generation) {
+                if (!durability_same_open_inode(e->fd, path)) {
+                    /* Stale target: retire it non-blockingly, never waiting
+                       on its entry lock. If it is busy, serve the current
+                       path from a fresh uncached mapping. */
+                    pthread_rwlock_unlock(lock);
+                    if (bm_cache_invalidate_nowait(path) > 0)
+                        goto retry_bm_acquire;
+                    int nfd; uint8_t *nmap; size_t nsz; struct BmHeader nhdr;
+                    if (bm_file_open_mmap(path, &nfd, &nmap, &nsz, &nhdr) != 0)
+                        return NULL;
+                    BitmapShard *nbm = calloc(1, sizeof(*nbm));
+                    if (!nbm) { munmap(nmap, nsz); close(nfd); return NULL; }
+                    nbm->slot = -1;
+                    nbm->writer = writer;
+                    nbm->fd = nfd;
+                    nbm->mmap_ptr = nmap;
+                    nbm->mmap_size = nsz;
+                    nbm->hdr = nhdr;
+                    snprintf(nbm->path, sizeof(nbm->path), "%s", path);
+                    if (nbm->hdr.max_values == 0 && writer) {
+                        nbm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
+                        memcpy(nbm->mmap_ptr, &nbm->hdr, sizeof(struct BmHeader));
+                    }
+                    return nbm;
+                }
+                atomic_store_explicit(&e->validated_publish_generation,
+                                      current_generation, memory_order_release);
+            }
+            /* Hand the rwlock + cached map to caller. */
             BitmapShard *bm = calloc(1, sizeof(*bm));
             if (!bm) { pthread_rwlock_unlock(lock); return NULL; }
             bm->slot = slot;
@@ -483,8 +639,14 @@ retry_bm_acquire:;
         pthread_mutex_lock(&g_bm_cache_lock);
     }
 
-    /* Cache-miss path: load from disk + install into the slot. */
+    /* Cache-miss path: load from disk + install into the slot. Capture the
+       publication generation immediately before opening the pathname — not
+       at cache-install time: a reader can open the old inode, lose the race
+       to rename, and install only afterwards. Loading the generation at
+       install would falsely bless that old inode as current. */
     int fd; uint8_t *map; size_t sz; struct BmHeader hdr;
+    uint64_t opened_generation = atomic_load_explicit(
+        &g_bm_publish_generation, memory_order_acquire);
     if (bm_file_open_mmap(path, &fd, &map, &sz, &hdr) != 0) {
         pthread_mutex_unlock(&g_bm_cache_lock);
         return NULL;
@@ -507,7 +669,7 @@ retry_bm_acquire:;
                 }
             }
             if (lru < 0) break;
-            int drop_rc = bm_cache_drop_slot(lru, CACHE_DROP_EVICT, 0);
+            int drop_rc = bm_cache_drop_slot(lru, 0);
             if (drop_rc > 0) {
                 slot = lru;
                 break;
@@ -517,8 +679,7 @@ retry_bm_acquire:;
             floor_ts = oldest + 1;
         }
         if (slot < 0 && writer && wait_candidate >= 0) {
-            int drop_rc = bm_cache_drop_slot(wait_candidate,
-                                             CACHE_DROP_EVICT, 1);
+            int drop_rc = bm_cache_drop_slot(wait_candidate, 1);
             if (drop_rc > 0) slot = wait_candidate;
             else if (drop_rc < 0 && first_error == 0) first_error = errno;
             else if (drop_rc == 0) first_error = 0;
@@ -567,6 +728,8 @@ retry_bm_acquire:;
     e->map_size = sz;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->validated_publish_generation,
+                          opened_generation, memory_order_release);
     e->used = 1;
     e->last_access = __atomic_add_fetch(&g_bm_cache_clock, 1, __ATOMIC_RELAXED);
     g_bm_cache_count++;
@@ -605,6 +768,15 @@ retry_bm_acquire:;
     return bm;
 }
 
+BitmapShard *bm_open(const char *path, int slots, int create,
+                     int bool_fastpath, uint32_t max_values, int writer) {
+    /* Public/private acquire name — direct call into the implementation.
+       The removed global publication gate used to wrap this; cache
+       visibility is now enforced by the publication generation + inode
+       validation described above bm_open_impl. */
+    return bm_open_impl(path, slots, create, bool_fastpath, max_values, writer);
+}
+
 uint32_t bm_max_values(const BitmapShard *bm) {
     return bm ? bm->hdr.max_values : 0;
 }
@@ -614,8 +786,9 @@ int bm_sync(BitmapShard *bm) {
     return fdatasync(bm->fd);
 }
 
-void bm_close(BitmapShard *bm) {
-    if (!bm) return;
+int bm_close_checked(BitmapShard *bm) {
+    if (!bm) return 0;
+    int saved_errno = 0;
     if (bm->slot >= 0 && g_bm_cache) {
         /* Cached: release the rwlock — the cache keeps the mmap + fd
            alive across releases (LRU evicts later under memory pressure). */
@@ -623,13 +796,32 @@ void bm_close(BitmapShard *bm) {
             BmCacheEntry *e = &g_bm_cache[bm->slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
-        pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
+        int rc = pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
+        if (rc != 0) saved_errno = rc;
     } else {
         /* Uncached fallback: tear the mapping down per call. */
-        if (bm->mmap_ptr && bm->mmap_size > 0) munmap(bm->mmap_ptr, bm->mmap_size);
-        if (bm->fd >= 0) close(bm->fd);
+        if (bm->mmap_ptr && bm->mmap_size > 0 &&
+            munmap(bm->mmap_ptr, bm->mmap_size) != 0)
+            saved_errno = errno;
+        if (bm->fd >= 0 && close(bm->fd) != 0 && !saved_errno)
+            saved_errno = errno;
     }
     free(bm);
+    if (saved_errno) {
+        errno = saved_errno;
+        return -1;
+    }
+#ifdef TEST_BUILD
+    if (bm_test_consume_failure(&g_bm_test_fail_close_count)) {
+        errno = EIO;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+void bm_close(BitmapShard *bm) {
+    (void)bm_close_checked(bm);
 }
 
 /* ─────────────────────── set / clear / test ─────────────────────── */

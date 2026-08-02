@@ -15,6 +15,7 @@ typedef struct {
     _Atomic int used;
     _Atomic int dirty;
     _Atomic uint64_t dirty_since_ms;
+    _Atomic uint64_t validated_publish_generation;
     uint64_t last_access;
 } BtCacheEntry;
 
@@ -28,6 +29,7 @@ typedef struct {
     _Atomic int used;
     _Atomic int dirty;
     _Atomic uint64_t dirty_since_ms;
+    _Atomic uint64_t validated_publish_generation;
     uint64_t last_access;
 } BmCacheEntry;
 

@@ -1393,33 +1393,400 @@ void rmrf(const char *path) {
    resolve_bitmaps). A force add-index over N fields of mixed type does
    exactly one sequential pass over storage, not one pass per type. */
 
-/* Unlink every .tg shard for a trigram field — shared by build_trigram_pass,
-   cmd_add_indexes inline force, and unlink_index_by_line. */
-static void tg_idx_unlink_all(const char *db_root, const char *object,
-                               const char *field, int splits) {
-    int idx_n = index_splits_for(splits);
-    for (int s = 0; s < idx_n; s++) {
-        char tp[PATH_MAX];
-        tg_build_path(tp, sizeof(tp), db_root, object, field, s);
-        btree_cache_invalidate(tp);
-        unlink(tp);
+typedef enum {
+    INDEX_BUILD_OK = 0,
+    INDEX_BUILD_DURABILITY_UNCONFIRMED,
+    INDEX_BUILD_FAILED,
+} index_build_status;
+
+typedef struct {
+    index_build_status status;
+    int all_requested_shards_published;
+    int error_errno;
+} index_build_result;
+
+static index_build_result index_build_ok(void) {
+    return (index_build_result){
+        .status = INDEX_BUILD_OK,
+        .all_requested_shards_published = 1,
+        .error_errno = 0,
+    };
+}
+
+static index_build_result index_build_failed(int error_errno) {
+    return (index_build_result){
+        .status = INDEX_BUILD_FAILED,
+        .all_requested_shards_published = 0,
+        .error_errno = error_errno ? error_errno : EIO,
+    };
+}
+
+static index_build_result
+index_build_durability_unconfirmed(int error_errno) {
+    return (index_build_result){
+        .status = INDEX_BUILD_DURABILITY_UNCONFIRMED,
+        .all_requested_shards_published = 1,
+        .error_errno = error_errno ? error_errno : EIO,
+    };
+}
+
+static index_build_result index_build_result_combine(index_build_result left,
+                                                      index_build_result right) {
+    index_build_result result = left;
+    if (right.status > result.status) {
+        result.status = right.status;
+        result.error_errno = right.error_errno;
+    } else if (!result.error_errno && right.error_errno) {
+        result.error_errno = right.error_errno;
     }
+    result.all_requested_shards_published =
+        left.all_requested_shards_published &&
+        right.all_requested_shards_published;
+    return result;
+}
+
+enum { INDEX_CONF_MAX_BYTES = 1024 * 1024 };
+
+static int index_write_all(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) { errno = EIO; return -1; }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* Read the complete prior metadata so both add-index entry points publish one
+   replacement rather than mutating index.conf in place. ENOENT is an empty
+   metadata file; every other error is a command failure. */
+static int index_conf_read(const char *path, char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+        st.st_size > INDEX_CONF_MAX_BYTES) {
+        int saved_errno = errno ? errno : EFBIG;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    size_t len = (size_t)st.st_size;
+    char *contents = calloc(len + 1, 1);
+    if (!contents) { close(fd); return -1; }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = read(fd, contents + off, len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            int saved_errno = n == 0 ? EIO : errno;
+            free(contents); close(fd); errno = saved_errno;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    if (close(fd) != 0) { int saved_errno = errno; free(contents); errno = saved_errno; return -1; }
+    *out = contents;
+    *out_len = len;
+    return 0;
+}
+
+static int index_conf_has_line(const char *contents, size_t contents_len,
+                               const char *line) {
+    size_t line_len = strlen(line);
+    const char *p = contents;
+    const char *end = contents + contents_len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = nl ? nl : end;
+        if ((size_t)(line_end - p) == line_len &&
+            memcmp(p, line, line_len) == 0)
+            return 1;
+        p = nl ? nl + 1 : end;
+    }
+    return 0;
+}
+
+/* A bare bool/enum index line is legacy spelling for the bitmap index that
+   current add-index commands materialise.  Replacing it, rather than merely
+   appending the typed spelling, keeps retry idempotent and gives reindex one
+   unambiguous descriptor to consume. */
+static int index_conf_replaces_legacy_bare(const char *canonical,
+                                           const char *line, size_t line_len) {
+    const char *colon = strchr(canonical, ':');
+    if (!colon || strncmp(colon, ":bitmap", 7) != 0) return 0;
+    return (size_t)(colon - canonical) == line_len &&
+           memcmp(canonical, line, line_len) == 0;
+}
+
+#ifdef TEST_BUILD
+static _Atomic int g_index_spill_open_fail_errno;
+static _Atomic int g_index_conf_publish_fail_stage;
+
+void index_test_spill_open_fail_errno(int err) {
+    atomic_store_explicit(&g_index_spill_open_fail_errno, err,
+                          memory_order_release);
+}
+
+void index_test_conf_publish_fail_stage(int stage) {
+    atomic_store_explicit(&g_index_conf_publish_fail_stage, stage,
+                          memory_order_release);
+}
+
+static int index_test_take_conf_publish_failure(int stage) {
+    int expected = stage;
+    return atomic_compare_exchange_strong_explicit(
+        &g_index_conf_publish_fail_stage, &expected, 0,
+        memory_order_acq_rel, memory_order_acquire);
+}
+#endif
+
+static index_build_result publish_index_conf(const char *conf_path,
+                                             const char *contents,
+                                             size_t contents_len) {
+    char parent[PATH_MAX];
+    char tmp_path[PATH_MAX];
+    if (parent_dir_copy(conf_path, parent, sizeof(parent)) != 0)
+        return index_build_failed(errno);
+    mkdirp(parent);
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s/.index-conf-XXXXXX", parent);
+    if (n < 0 || n >= (int)sizeof(tmp_path))
+        return index_build_failed(ENAMETOOLONG);
+#ifdef TEST_BUILD
+    if (index_test_take_conf_publish_failure(1)) {
+        return index_build_failed(EIO);
+    }
+#endif
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) return index_build_failed(errno);
+    int saved_errno = 0;
+#ifdef TEST_BUILD
+    if (index_test_take_conf_publish_failure(2))
+        saved_errno = EIO;
+#endif
+    if (!saved_errno && index_write_all(fd, contents, contents_len) != 0)
+        saved_errno = errno;
+#ifdef TEST_BUILD
+    if (!saved_errno && index_test_take_conf_publish_failure(3))
+        saved_errno = EIO;
+#endif
+    if (!saved_errno && durability_fsync(fd) != 0) saved_errno = errno;
+    int close_rc = close(fd);
+    if (!saved_errno && close_rc != 0) saved_errno = errno;
+#ifdef TEST_BUILD
+    if (!saved_errno && index_test_take_conf_publish_failure(4))
+        saved_errno = EIO;
+#endif
+    if (saved_errno) {
+        (void)unlink(tmp_path);
+        return index_build_failed(saved_errno);
+    }
+#ifdef TEST_BUILD
+    if (index_test_take_conf_publish_failure(5)) {
+        (void)unlink(tmp_path);
+        return index_build_failed(EIO);
+    }
+#endif
+    if (rename(tmp_path, conf_path) != 0) {
+        saved_errno = errno;
+        (void)unlink(tmp_path);
+        return index_build_failed(saved_errno);
+    }
+#ifdef TEST_BUILD
+    if (index_test_take_conf_publish_failure(6)) {
+        return index_build_durability_unconfirmed(EIO);
+    }
+#endif
+    if (fsync_parent_dir(conf_path) != 0)
+        return index_build_durability_unconfirmed(errno);
+    return index_build_ok();
+}
+
+static index_build_result index_conf_append_unique(const char *conf_path,
+                                                   const char *const *lines,
+                                                   int n_lines) {
+    char *old = NULL;
+    size_t old_len = 0;
+    if (index_conf_read(conf_path, &old, &old_len) != 0)
+        return index_build_failed(errno);
+    size_t required = old_len + (old_len && old[old_len - 1] != '\n' ? 1 : 0);
+    for (int i = 0; i < n_lines; i++)
+        if (!index_conf_has_line(old ? old : "", old_len, lines[i]))
+            required += strlen(lines[i]) + 1;
+    if (required > INDEX_CONF_MAX_BYTES) { free(old); return index_build_failed(EFBIG); }
+    char *next = calloc(required + 1, 1);
+    if (!next) { free(old); return index_build_failed(errno); }
+    size_t used = 0;
+    const char *p = old ? old : "";
+    const char *end = p + old_len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = nl ? nl : end;
+        int replaced = 0;
+        for (int i = 0; i < n_lines; i++) {
+            if (index_conf_replaces_legacy_bare(lines[i], p,
+                                                (size_t)(line_end - p))) {
+                replaced = 1;
+                break;
+            }
+        }
+        if (!replaced) {
+            size_t kept = (size_t)(line_end - p);
+            memcpy(next + used, p, kept);
+            used += kept;
+            if (nl) next[used++] = '\n';
+        }
+        p = nl ? nl + 1 : end;
+    }
+    if (used && next[used - 1] != '\n') next[used++] = '\n';
+    for (int i = 0; i < n_lines; i++) {
+        if (index_conf_has_line(old ? old : "", old_len, lines[i])) continue;
+        size_t line_len = strlen(lines[i]);
+        memcpy(next + used, lines[i], line_len);
+        used += line_len;
+        next[used++] = '\n';
+    }
+    index_build_result result = publish_index_conf(conf_path, next, used);
+    free(next);
+    free(old);
+    return result;
+}
+
+static int index_sweep_generated_files(int dirfd, const char *prefix,
+                                       int descend_fields) {
+    /* dup() shares the directory stream offset with dirfd. The caller runs
+       two passes over indexes/ (metadata siblings, then field directories),
+       so open an independent description to keep the second pass at offset 0. */
+    int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (scanfd < 0) return -1;
+    DIR *dir = fdopendir(scanfd);
+    if (!dir) { int saved_errno = errno; close(scanfd); errno = saved_errno; return -1; }
+    int result = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0 && !result) result = errno;
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        struct stat st;
+        if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT && !result) result = errno;
+            continue;
+        }
+        if (descend_fields) {
+            if (!S_ISDIR(st.st_mode)) continue;
+            int fieldfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+            if (fieldfd < 0) { if (errno != ENOENT && !result) result = errno; continue; }
+            if (index_sweep_generated_files(fieldfd, ".rebuild-", 0) != 0 && !result)
+                result = errno;
+            if (close(fieldfd) != 0 && !result) result = errno;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode) || strncmp(entry->d_name, prefix, strlen(prefix)) != 0)
+            continue;
+        if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT && !result)
+            result = errno;
+    }
+    if (closedir(dir) != 0 && !result) result = errno;
+    if (result) { errno = result; return -1; }
+    return 0;
+}
+
+/* Sweep only paths described by schema.conf. All directory operations are
+   anchored beneath db_root, and fstatat(..., AT_SYMLINK_NOFOLLOW) ensures a
+   crash leftover can never turn startup cleanup into link traversal. */
+int index_rebuild_temp_sweep(const char *db_root) {
+    int rootfd = open(db_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (rootfd < 0) return -1;
+    int schemafd = openat(rootfd, "schema.conf", O_RDONLY | O_NOFOLLOW);
+    if (schemafd < 0) {
+        int saved_errno = errno;
+        if (close(rootfd) != 0 && saved_errno == ENOENT) saved_errno = errno;
+        if (saved_errno == ENOENT) return 0;
+        errno = saved_errno;
+        return -1;
+    }
+    FILE *schema = fdopen(schemafd, "r");
+    if (!schema) { int saved_errno = errno; close(schemafd); close(rootfd); errno = saved_errno; return -1; }
+    int result = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), schema)) {
+        char *first = strchr(line, ':');
+        if (!first) continue;
+        *first++ = '\0';
+        char *second = strchr(first, ':');
+        if (!second || !line[0] || !first[0]) continue;
+        *second = '\0';
+        /* schema.conf is parsed before the normal startup validator runs.
+           Reject non-components here so fd-relative traversal cannot escape
+           DB_ROOT through an absolute or parent path. */
+        if (!valid_filename(line) || !valid_filename(first)) continue;
+        int tenantfd = openat(rootfd, line, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (tenantfd < 0) { if (errno != ENOENT && !result) result = errno; continue; }
+        int objectfd = openat(tenantfd, first, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        int open_errno = errno;
+        if (close(tenantfd) != 0 && objectfd >= 0) {
+            if (!result) result = errno;
+        }
+        if (objectfd < 0) errno = open_errno;
+        if (objectfd < 0) { if (errno != ENOENT && !result) result = errno; continue; }
+        int indexesfd = openat(objectfd, "indexes", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        open_errno = errno;
+        if (close(objectfd) != 0 && indexesfd >= 0) {
+            if (!result) result = errno;
+        }
+        if (indexesfd < 0) errno = open_errno;
+        if (indexesfd < 0) { if (errno != ENOENT && !result) result = errno; continue; }
+        if (index_sweep_generated_files(indexesfd, ".index-conf-", 0) != 0 && !result)
+            result = errno;
+        if (index_sweep_generated_files(indexesfd, NULL, 1) != 0 && !result)
+            result = errno;
+        if (close(indexesfd) != 0 && !result) result = errno;
+    }
+    if (ferror(schema) && !result) result = errno ? errno : EIO;
+    if (fclose(schema) != 0 && !result) result = errno;
+    if (close(rootfd) != 0 && !result) result = errno;
+    if (result) { errno = result; return -1; }
+    return 0;
 }
 
 /* Forward decls — full definitions live near the multi-index builder. */
-int build_bitmap_pass(const char *db_root, const char *object,
+index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
                       const char *field, uint32_t max_values, int force);
-int build_trigram_pass(const char *db_root, const char *object,
+index_build_result build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force);
 
 /* Btree build entry point — routes to the shared segment-sequential
    engine (seg_seq_build_spills). cmd_add_index calls this from its
-   IT_BTREE branch. Returns 0 on success, -1 on setup failure. */
-int build_btree_streaming(const char *db_root, const char *object,
+   IT_BTREE branch. */
+index_build_result build_btree_streaming(const char *db_root, const char *object,
                           const Schema *sch, TypedSchema *ts,
                           const char *field, int force);
+
+static void index_canonical_line(char *out, size_t out_size,
+                                 const char *name, enum IndexType type,
+                                 uint32_t max_values) {
+    if (type == IT_BITMAP) {
+        if (max_values > 0 && max_values != BM_DEFAULT_MAX_VALUES)
+            snprintf(out, out_size, "%s:bitmap(%u)", name, max_values);
+        else
+            snprintf(out, out_size, "%s:bitmap", name);
+    } else if (type == IT_TRIGRAM) {
+        snprintf(out, out_size, "%s:trigram", name);
+    } else {
+        snprintf(out, out_size, "%s", name);
+    }
+}
 
 int cmd_add_index(const char *db_root, const char *object,
                          const char *field, int force) {
@@ -1453,85 +1820,77 @@ int cmd_add_index(const char *db_root, const char *object,
 
     /* Compose the canonical index.conf line for dedupe + write. */
     char canon[300];
-    if (type == IT_BITMAP) {
-        if (max_values > 0)
-            snprintf(canon, sizeof(canon), "%s:bitmap(%u)", eff, max_values);
-        else
-            snprintf(canon, sizeof(canon), "%s:bitmap", eff);
-    } else if (type == IT_TRIGRAM) {
-        snprintf(canon, sizeof(canon), "%s:trigram", eff);
-    } else {
-        snprintf(canon, sizeof(canon), "%s", eff);
-    }
+    index_canonical_line(canon, sizeof(canon), eff, type, max_values);
 
     Schema sch = load_schema(db_root, object);
     char conf_path[PATH_MAX];
     snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
 
-    /* Skip-if-exists: bitmap/trigram probe shard-0 of their respective
-       on-disk file (matches cmd_add_indexes); btree walks index.conf. */
+    /* Metadata is the activation record. A physical shard without its
+       canonical line may be the residue of a partial first publication, so
+       retry must rebuild the complete shard set before repairing metadata. */
     if (!force) {
-        if (type == IT_BITMAP || type == IT_TRIGRAM) {
-            char probe[PATH_MAX];
-            struct stat st;
-            if (type == IT_BITMAP)
-                bm_build_path(probe, sizeof(probe), db_root, object, eff, 0);
-            else
-                tg_build_path(probe, sizeof(probe), db_root, object, eff, 0);
-            if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-                OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
-                return 0;
-            }
-        } else {
-            FILE *cf = fopen(conf_path, "r");
-            if (cf) {
-                char line[256];
-                while (fgets(line, sizeof(line), cf)) {
-                    line[strcspn(line, "\n")] = '\0';
-                    if (strcmp(line, canon) == 0) {
-                        OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
-                        fclose(cf); return 0;
-                    }
-                }
-                fclose(cf);
-            }
+        char *existing_conf = NULL;
+        size_t existing_conf_len = 0;
+        if (index_conf_read(conf_path, &existing_conf, &existing_conf_len) != 0) {
+            OUT("{\"error\":\"cannot read index metadata: %s\"}\n",
+                strerror(errno));
+            return -1;
+        }
+        int already_active = index_conf_has_line(existing_conf ? existing_conf : "",
+                                                 existing_conf_len, canon);
+        free(existing_conf);
+        if (already_active) {
+            OUT("{\"status\":\"exists\",\"field\":\"%s\"}\n", field);
+            return 0;
         }
     }
 
     TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        OUT("{\"error\":\"cannot load object schema for index build\"}\n");
+        return -1;
+    }
 
+    index_build_result build_result;
     if (type == IT_BITMAP) {
-        build_bitmap_pass(db_root, object, &sch, ts, eff, max_values, force);
+        build_result = build_bitmap_pass(db_root, object, &sch, ts, eff,
+                                         max_values, force);
     } else if (type == IT_TRIGRAM) {
-        build_trigram_pass(db_root, object, &sch, ts, eff, force);
+        build_result = build_trigram_pass(db_root, object, &sch, ts, eff, force);
     } else {
         /* === btree build via streaming pipeline (bounded per-worker
            memory; safe at any dataset size). Same machinery as
            build_trigram_pass but for STREAM_BTREE. */
-        build_btree_streaming(db_root, object, &sch, ts, eff, force);
+        build_result = build_btree_streaming(db_root, object, &sch, ts, eff, force);
     }
 
-    /* Add canonical line to index.conf (idempotent). */
-    mkdirp(dirname_of(conf_path));
-    int already = 0;
-    FILE *cf = fopen(conf_path, "r");
-    if (cf) {
-        char line[256];
-        while (fgets(line, sizeof(line), cf)) {
-            line[strcspn(line, "\n")] = '\0';
-            if (strcmp(line, canon) == 0) { already = 1; break; }
-        }
-        fclose(cf);
+    if (build_result.status == INDEX_BUILD_FAILED) {
+        OUT("{\"error\":\"index build failed for %s: %s; index metadata was not "
+            "changed; one or more shards may already have been published\"}\n",
+            field, strerror(build_result.error_errno ? build_result.error_errno : EIO));
+        return -1;
     }
-    if (!already) {
-        FILE *af = fopen(conf_path, "a");
-        if (af) { fprintf(af, "%s\n", canon); fclose(af); }
+
+    const char *metadata_lines[] = { canon };
+    index_build_result metadata_result = index_conf_append_unique(conf_path,
+                                                                   metadata_lines, 1);
+    if (metadata_result.status == INDEX_BUILD_FAILED) {
+        OUT("{\"error\":\"index shards published but index metadata update failed; "
+            "retry add-index\"}\n");
+        return -1;
     }
 
     invalidate_idx_cache(db_root, object);
     uint64_t duration_ms = now_ms() - t_start;
     int records = get_live_count(db_root, object);
     if (records < 0) records = 0;
+    if (build_result.status == INDEX_BUILD_DURABILITY_UNCONFIRMED ||
+        metadata_result.status == INDEX_BUILD_DURABILITY_UNCONFIRMED) {
+        OUT("{\"warning\":\"index and metadata published but directory durability "
+            "is unconfirmed\"}\n");
+        return 1;
+    }
     OUT("{\"status\":\"indexed\",\"field\":\"%s\",\"records\":%d,\"duration_ms\":%llu}\n",
         field, records, (unsigned long long)duration_ms);
     return 0;
@@ -1546,6 +1905,8 @@ typedef struct {
     BitmapShard *bm;
     int          field_index;     /* typed schema field index */
     TypedSchema *ts;
+    int          failed;
+    int          saved_errno;
 } BmRebuildCtx;
 
 static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
@@ -1575,7 +1936,11 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
         memcpy(key_buf, vbase, sz);
         key_len = sz;
     }
-    bm_set(c->bm, key_buf, key_len, slot);
+    if (bm_set(c->bm, key_buf, key_len, slot) != 0) {
+        if (!c->failed) c->saved_errno = errno;
+        c->failed = 1;
+        return -1;
+    }
     return 0;
 }
 
@@ -1815,12 +2180,20 @@ static int spill_run_reader_init(SpillRunReader *r, int fd, off_t body_start,
 
 /* Entry compare via (value, hash) lexicographic. Mirrors cmp_btentry_fn
    on BtEntry — keeps the on-disk order matching what btree expects. */
-static int spill_entry_cmp(const SpillRunReader *a, const SpillRunReader *b) {
-    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
-    int c = memcmp(a->value, b->value, m);
+static int spill_entry_parts_cmp(const uint8_t *a_value, size_t a_vlen,
+                                 const uint8_t a_hash[BT_HASH_SIZE],
+                                 const uint8_t *b_value, size_t b_vlen,
+                                 const uint8_t b_hash[BT_HASH_SIZE]) {
+    size_t m = a_vlen < b_vlen ? a_vlen : b_vlen;
+    int c = memcmp(a_value, b_value, m);
     if (c != 0) return c;
-    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
-    return memcmp(a->hash, b->hash, BT_HASH_SIZE);
+    if (a_vlen != b_vlen) return a_vlen < b_vlen ? -1 : 1;
+    return memcmp(a_hash, b_hash, BT_HASH_SIZE);
+}
+
+static int spill_entry_cmp(const SpillRunReader *a, const SpillRunReader *b) {
+    return spill_entry_parts_cmp(a->value, a->vlen, a->hash,
+                                 b->value, b->vlen, b->hash);
 }
 
 /* === Min-heap over SpillRunReader indices for k-way merge ================== */
@@ -1858,34 +2231,179 @@ static void mh_push(MinHeap *h, int reader_idx) {
     h->idx[h->size++] = reader_idx;
     mh_sift_up(h, h->size - 1);
 }
-/* Advance the top reader to its next entry; either re-sift or pop. */
-static void mh_advance_top(MinHeap *h) {
+/* Advance the top reader to its next entry; either re-sift or pop.
+   A spill read/decode error returns -1 and prevents publication. */
+static int mh_advance_top(MinHeap *h) {
     SpillRunReader *r = &h->readers[h->idx[0]];
-    spill_run_advance(r);
+    uint8_t previous_value[sizeof(r->value)];
+    uint8_t previous_hash[BT_HASH_SIZE];
+    size_t previous_vlen = r->vlen;
+    memcpy(previous_value, r->value, previous_vlen);
+    memcpy(previous_hash, r->hash, sizeof(previous_hash));
+    if (spill_run_advance(r) != 0) return -1;
+    if (r->has_entry &&
+        spill_entry_parts_cmp(previous_value, previous_vlen, previous_hash,
+                              r->value, r->vlen, r->hash) > 0) {
+        errno = EINVAL;
+        return -1;
+    }
     if (!r->has_entry) {
-        if (--h->size == 0) return;
+        if (--h->size == 0) return 0;
         h->idx[0] = h->idx[h->size];
     }
     if (h->size > 0) mh_sift_down(h, 0);
+    return 0;
+}
+
+static index_build_result index_result_from_bt_publish(bt_publish_result r) {
+    switch (r) {
+        case BT_PUBLISH_OK:
+            return index_build_ok();
+        case BT_PUBLISH_POST_RENAME_FSYNC_FAILED:
+            return index_build_durability_unconfirmed(0);
+        default:
+            return index_build_failed(0);
+    }
+}
+
+/* Phase-2 spill-file open wrapper. Phase 1 opens every (worker, shard)
+   spill file with O_CREAT up front, so after a clean scan every file
+   exists — a missing one is anomalous (an aborted worker) rather than
+   normal. Any non-ENOENT open failure is fail-closed: skipping it would
+   silently drop that worker's entries from the rebuilt index. */
+static int index_spill_open(const char *path) {
+#ifdef TEST_BUILD
+    /* Errcode injection for the fail-closed regression. Stays armed until
+       explicitly reset rather than firing once: the per-shard merge fan-out
+       would otherwise publish sibling shards before the injected shard
+       fails, making the "no target changed" assertion racy. Test cleanup
+       resets it so sequential run-all --jobs 1 stays isolated. */
+    int injected_errno = atomic_load_explicit(&g_index_spill_open_fail_errno,
+                                              memory_order_acquire);
+    if (injected_errno != 0) {
+        errno = injected_errno;
+        return -1;
+    }
+#endif
+    return open(path, O_RDONLY);
+}
+
+/* Validate one complete spill file without publishing any output. This
+   preflight runs across every requested btree/trigram field before phase 2
+   starts, so a malformed later shard cannot race with publication of an
+   earlier sibling. */
+static int validate_index_spill_file(const char *path) {
+    int fd = index_spill_open(path);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    off_t end = st.st_size;
+    off_t pos = 0;
+    while (pos < end) {
+        if (end - pos < 8) {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+        uint32_t count = 0, body = 0;
+        if (pread(fd, &count, sizeof(count), pos) != sizeof(count) ||
+            pread(fd, &body, sizeof(body), pos + 4) != sizeof(body)) {
+            int saved_errno = errno ? errno : EIO;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+        off_t body_start = pos + 8;
+        if ((uint64_t)body > (uint64_t)(end - body_start)) {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+        off_t body_end = body_start + (off_t)body;
+        if (count == 0) {
+            if (body != 0) {
+                close(fd);
+                errno = EINVAL;
+                return -1;
+            }
+        } else {
+            SpillRunReader reader;
+            if (spill_run_reader_init(&reader, fd, body_start, body_end,
+                                      count) != 0 || !reader.has_entry) {
+                close(fd);
+                errno = EINVAL;
+                return -1;
+            }
+            while (reader.entries_remaining > 0) {
+                uint8_t previous_value[sizeof(reader.value)];
+                uint8_t previous_hash[BT_HASH_SIZE];
+                size_t previous_vlen = reader.vlen;
+                memcpy(previous_value, reader.value, previous_vlen);
+                memcpy(previous_hash, reader.hash, sizeof(previous_hash));
+                if (spill_run_advance(&reader) != 0 || !reader.has_entry) {
+                    close(fd);
+                    errno = EINVAL;
+                    return -1;
+                }
+                if (spill_entry_parts_cmp(
+                        previous_value, previous_vlen, previous_hash,
+                        reader.value, reader.vlen, reader.hash) > 0) {
+                    close(fd);
+                    errno = EINVAL;
+                    return -1;
+                }
+            }
+            off_t consumed = reader.pos -
+                             (off_t)(reader.buf_used - reader.buf_off);
+            if (consumed != body_end) {
+                close(fd);
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        pos = body_end;
+    }
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+static int validate_index_spills(const char *spill_dir,
+                                 int workers, int shards) {
+    for (int w = 0; w < workers; w++) {
+        for (int s = 0; s < shards; s++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/w%d_s%d.bin", spill_dir, w, s);
+            if (validate_index_spill_file(path) != 0) return -1;
+        }
+    }
+    return 0;
 }
 
 /* Phase 2 — merge all per-worker spill files for one output shard into
    the final .tg/.idx via k-way merge. Output sorted insertions →
-   leaves fill at 100%. Deletes spill files as it goes. */
-static int merge_spills_into_index(int type,
+   leaves fill at 100%. Deletes spill files as it goes. Always builds and
+   publishes a valid tree (even an empty one) unless a fatal error occurs;
+   a fatal error aborts the temporary build and leaves the existing target
+   untouched. */
+static index_build_result merge_spills_into_index(int type,
                                    const char *db_root, const char *object,
                                    const char *field,
                                    int idx_n, int n_kf, int shard,
                                    const char *spill_dir) {
     (void)idx_n;
-    int rc = 0;
+    index_build_result result = index_build_ok();
 
     /* Open every worker's spill file for this output shard. Files may
        not exist if a worker had no entries for this shard — skip those. */
     int *fds = calloc((size_t)n_kf, sizeof(int));
     if (!fds) {
         LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: calloc failed for %d fd slots (%s/%s/%s shard %d)", n_kf, db_root, object, field, shard);
-        return -1;
+        return index_build_failed(0);
     }
     for (int w = 0; w < n_kf; w++) fds[w] = -1;
 
@@ -1894,45 +2412,79 @@ static int merge_spills_into_index(int type,
     SpillRunReader *readers = malloc(reader_cap * sizeof(SpillRunReader));
     if (!readers) {
         LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: malloc failed for %zu spill run readers (%s/%s/%s shard %d)", reader_cap, db_root, object, field, shard);
-        free(fds); return -1;
+        free(fds);
+        return index_build_failed(0);
     }
 
     for (int w = 0; w < n_kf; w++) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/w%d_s%d.bin", spill_dir, w, shard);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
+        int fd = index_spill_open(path);
+        if (fd < 0) {
+            int saved_errno = errno;
+            if (saved_errno == ENOENT) continue;
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "merge_spills_into_index: open(%s) failed: %s",
+                      path, strerror(saved_errno));
+            result = (index_build_result){
+                .status = INDEX_BUILD_FAILED,
+                .all_requested_shards_published = 0,
+                .error_errno = saved_errno,
+            };
+            goto cleanup;
+        }
         fds[w] = fd;
 
         struct stat st;
-        if (fstat(fd, &st) != 0) continue;
+        if (fstat(fd, &st) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: fstat(%s) failed: %s", path, strerror(errno));
+            result = index_build_failed(0);
+            goto cleanup;
+        }
         off_t end = st.st_size, pos = 0;
         while (pos + 8 <= end) {
             uint32_t count = 0, body = 0;
-            if (pread(fd, &count, sizeof(count), pos)     != sizeof(count)) break;
-            if (pread(fd, &body,  sizeof(body),  pos + 4) != sizeof(body))  break;
+            if (pread(fd, &count, sizeof(count), pos)     != sizeof(count) ||
+                pread(fd, &body,  sizeof(body),  pos + 4) != sizeof(body)) {
+                LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: malformed run header at offset %lld in %s", (long long)pos, path);
+                result = index_build_failed(0);
+                goto cleanup;
+            }
             off_t body_start = pos + 8;
             off_t body_end   = body_start + body;
-            if (body_end > end) break;
+            if (body_end > end) {
+                LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: run body at offset %lld in %s extends beyond EOF", (long long)pos, path);
+                result = index_build_failed(0);
+                goto cleanup;
+            }
 
             if (count > 0) {
                 if (reader_count >= reader_cap) {
                     reader_cap *= 2;
                     SpillRunReader *t = realloc(readers, reader_cap * sizeof(SpillRunReader));
-                    if (!t) { rc = -1; goto cleanup; }
+                    if (!t) {
+                        result = index_build_failed(0);
+                        goto cleanup;
+                    }
                     readers = t;
                 }
                 if (spill_run_reader_init(&readers[reader_count], fd, body_start,
-                                          body_end, count) == 0 &&
-                    readers[reader_count].has_entry) {
-                    reader_count++;
+                                          body_end, count) != 0 ||
+                    !readers[reader_count].has_entry) {
+                    LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: malformed run body at offset %lld in %s", (long long)pos, path);
+                    result = index_build_failed(0);
+                    goto cleanup;
                 }
+                reader_count++;
             }
             pos = body_end;
         }
+        if (pos != end) {
+            LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: %s has %lld trailing bytes too short for a run header", path, (long long)(end - pos));
+            result = index_build_failed(0);
+            goto cleanup;
+        }
     }
-
-    if (reader_count == 0) goto cleanup;  /* no data — nothing to merge */
 
     /* Build target file path. */
     char target[PATH_MAX];
@@ -1941,11 +2493,19 @@ static int merge_spills_into_index(int type,
     else
         build_idx_path(target, sizeof(target), db_root, object, field, shard);
 
-    /* Build heap. */
+    /* Build heap. reader_count may legitimately be 0 (no entries for this
+       shard anywhere) — the stream builder below still opens, finishes,
+       and publishes a valid empty tree in that case. */
     MinHeap heap = { .readers = readers, .cap = (int)reader_count, .size = 0 };
-    heap.idx = malloc((size_t)reader_count * sizeof(int));
-    if (!heap.idx) { rc = -1; goto cleanup; }
-    for (size_t i = 0; i < reader_count; i++) mh_push(&heap, (int)i);
+    heap.idx = NULL;
+    if (reader_count > 0) {
+        heap.idx = malloc(reader_count * sizeof(int));
+        if (!heap.idx) {
+            result = index_build_failed(0);
+            goto cleanup;
+        }
+        for (size_t i = 0; i < reader_count; i++) mh_push(&heap, (int)i);
+    }
 
     /* Stream the merged sorted output directly into a btree_stream
        builder — no in-memory materialisation of the per-shard data.
@@ -1954,15 +2514,33 @@ static int merge_spills_into_index(int type,
        any scale; phase 2 concurrency cap below is now effectively
        just bounded by pool_size. */
     BtStreamBuilder *builder = bt_stream_build_open(target);
-    if (!builder) { rc = -1; free(heap.idx); goto cleanup; }
+    if (!builder) {
+        free(heap.idx);
+        result = index_build_failed(0);
+        goto cleanup;
+    }
 
     while (heap.size > 0) {
         SpillRunReader *r = &readers[heap.idx[0]];
-        bt_stream_build_add(builder, (const char *)r->value, r->vlen, r->hash);
-        mh_advance_top(&heap);
+        if (bt_stream_build_add(builder, (const char *)r->value, r->vlen,
+                                r->hash) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "merge_spills_into_index: btree build failed for %s/%s/%s shard %d",
+                      db_root, object, field, shard);
+            bt_stream_build_abort(builder);
+            result = index_build_failed(0);
+            break;
+        }
+        if (mh_advance_top(&heap) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX, "merge_spills_into_index: spill read error mid-merge for %s/%s/%s shard %d — aborting build", db_root, object, field, shard);
+            bt_stream_build_abort(builder);
+            break;
+        }
     }
 
-    if (bt_stream_build_finish(builder) != 0) rc = -1;
+    bt_publish_result publish = bt_stream_build_finish(builder);
+    if (result.status != INDEX_BUILD_FAILED)
+        result = index_result_from_bt_publish(publish);
     free(heap.idx);
 
 cleanup:
@@ -1974,7 +2552,7 @@ cleanup:
         unlink(path);
     }
     free(fds);
-    return rc;
+    return result;
 }
 
 /* Merge wrapper for parallel_for over output shards. */
@@ -1987,7 +2565,7 @@ typedef struct {
     int         n_kf;
     int         shard;
     const char *spill_dir;
-    int         rc;
+    index_build_result rc;
 } MergeShardArg;
 static void *merge_shard_worker_fn(void *arg) {
     MergeShardArg *m = (MergeShardArg *)arg;
@@ -2013,7 +2591,7 @@ typedef struct {
 /* Segment-sequential btree/trigram builder — defined further down; both
    add-index (single field) and reindex (multi field) funnel through it so
    there is exactly one scan code path. */
-static int seg_seq_build_spills(const char *db_root, const char *object,
+static index_build_result seg_seq_build_spills(const char *db_root, const char *object,
                                 const Schema *sch, TypedSchema *ts,
                                 SlotcaskDb *sdb,
                                 const MFFieldDesc *descs, int n_fields);
@@ -2022,24 +2600,23 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
    seg_seq_build_spills/resolve_bitmaps. cmd_add_indexes calls this to
    build every requested field (btree+bitmap+trigram) in one scan, same
    engine reindex_object uses. */
-static int build_indexes_streaming_multi(const char *db_root, const char *object,
+static index_build_result build_indexes_streaming_multi(const char *db_root, const char *object,
                                           const Schema *sch, TypedSchema *ts,
                                           const MFFieldDesc *descs, int n_fields);
 
-int build_trigram_pass(const char *db_root, const char *object,
+index_build_result build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force);
-int build_trigram_pass(const char *db_root, const char *object,
+index_build_result build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force) {
-    if (!ts) return -1;
+    if (!ts) return index_build_failed(0);
     int fi = typed_field_index(ts, field);
-    if (fi < 0) return -1;
+    if (fi < 0) return index_build_failed(0);
 
-    /* Force: unlink existing .tg shards before rebuild (matches btree's
-       force semantics). bt_cache is path-keyed, so cached handles on the
-       orphaned inode die on next bt_acquire via inode-mismatch reopen. */
-    if (force) tg_idx_unlink_all(db_root, object, field, sch->splits);
+    /* Force builds complete replacement shards and publishes them atomically
+       over the existing generation. Non-force skip was handled above. */
+    (void)force;
 
     SlotcaskSchemaInfo info = {
         .splits = sch->splits, .slot_size = sch->slot_size,
@@ -2048,7 +2625,7 @@ int build_trigram_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_TRIGRAM, "build_trigram_pass: slotcask_registry_get failed for %s/%s", db_root, object);
-        return -1;
+        return index_build_failed(0);
     }
 
     LOG_WARN(LOG_SUB_TRIGRAM, "BUILD-TRIGRAM %s/%s/%s: segment-sequential scan",
@@ -2067,13 +2644,13 @@ int build_trigram_pass(const char *db_root, const char *object,
    dataset size. Mirror of build_trigram_pass but with STREAM_BTREE
    and composite-field handling. Called from cmd_add_index's IT_BTREE
    branch (and could be lifted into cmd_add_indexes / reindex later). */
-int build_btree_streaming(const char *db_root, const char *object,
+index_build_result build_btree_streaming(const char *db_root, const char *object,
                           const Schema *sch, TypedSchema *ts,
                           const char *field, int force) {
-    if (!ts) return -1;
+    if (!ts) return index_build_failed(0);
     int idx_n = index_splits_for(sch->splits);
 
-    if (force) btree_idx_unlink_all(db_root, object, field, sch->splits);
+    (void)force;
     (void)idx_n;
 
     SlotcaskSchemaInfo info = {
@@ -2083,7 +2660,7 @@ int build_btree_streaming(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BTREE, "build_btree_streaming: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
-        return -1;
+        return index_build_failed(0);
     }
 
     MFFieldDesc d;
@@ -2103,7 +2680,8 @@ int build_btree_streaming(const char *db_root, const char *object,
         d.field_indices[0] = typed_field_index(ts, field);
         d.field_index_count = 1;
     }
-    if (d.field_index_count == 0 || d.field_indices[0] < 0) return -1;
+    if (d.field_index_count == 0 || d.field_indices[0] < 0)
+        return index_build_failed(0);
 
     LOG_WARN(LOG_SUB_BTREE, "BUILD-BTREE %s/%s/%s: segment-sequential scan",
             db_root, object, field);
@@ -2115,16 +2693,41 @@ int build_btree_streaming(const char *db_root, const char *object,
    .bm writer and walk the already-locked kf shard. Distinct workers use
    distinct files; the cache-entry locks protect mapping lifetime. */
 typedef struct {
-    char         path[PATH_MAX];
+    char         target_path[PATH_MAX];
+    char         tmp_path[PATH_MAX];
     int          kf_shard;
     int          slots_per_shard;
     int          fi;
+    int          bool_fastpath;
+    uint32_t     max_values;
     TypedSchema *ts;
     SlotcaskDb  *sdb;
+    index_build_result result;
+    int          saved_errno;
+    BmRebuildCtx rebuild;
 } BmShardWalkArg;
+
+static int bm_rebuild_temp_path(const char *target, char out[PATH_MAX]) {
+    char parent[PATH_MAX];
+    if (parent_dir_copy(target, parent, sizeof(parent)) != 0) return -1;
+    int n = snprintf(out, PATH_MAX, "%s/.rebuild-XXXXXX", parent);
+    if (n < 0 || n >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+    int fd = mkstemp(out);
+    if (fd < 0) return -1;
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        unlink(out);
+        errno = saved_errno;
+        return -1;
+    }
+    if (unlink(out) != 0) return -1;
+    return 0;
+}
 
 static void *bm_shard_walk_worker(void *arg) {
     BmShardWalkArg *a = (BmShardWalkArg *)arg;
+    a->result = index_build_failed(0);
+    a->rebuild = (BmRebuildCtx){ 0 };
 
     char kf_path[PATH_MAX];
     slotcask_kf_path(kf_path, sizeof(kf_path),
@@ -2132,34 +2735,66 @@ static void *bm_shard_walk_worker(void *arg) {
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path,
                         a->sdb->slots_per_shard, 0) != 0) {
+        a->saved_errno = errno;
         LOG_ERROR(LOG_SUB_BITMAP,
                   "bm_shard_walk_worker: kfcache_acquire failed for %s",
                   kf_path);
         return NULL;
     }
 
-    BitmapShard *bm = bm_open(a->path, a->slots_per_shard, 0, 0, 0,
-                              1 /* writer: reindex bm_set's */);
-    if (!bm) {
-        LOG_ERROR(LOG_SUB_BITMAP, "bm_shard_walk_worker: bm_open failed for %s (kf_shard=%d); bitmap left stale for this shard", a->path, a->kf_shard);
+    if (bm_rebuild_temp_path(a->target_path, a->tmp_path) != 0) {
+        a->saved_errno = errno;
+        LOG_ERROR(LOG_SUB_BITMAP,
+                  "bm_shard_walk_worker: temp path failed for %s: %s",
+                  a->target_path, strerror(errno));
         kfcache_release(&kh);
         return NULL;
     }
-    BmRebuildCtx c = { bm, a->fi, a->ts };
-    slotcask_walk_one_shard_slots_locked(
-        a->sdb, a->kf_shard, &kh, bm_rebuild_cb, &c);
-    bm_close(bm);
+
+    BitmapShard *bm = bm_open(a->tmp_path, a->slots_per_shard, 1,
+                              a->bool_fastpath, a->max_values,
+                              1 /* writer: reindex bm_set's */);
+    if (!bm) {
+        a->saved_errno = errno;
+        LOG_ERROR(LOG_SUB_BITMAP,
+                  "bm_shard_walk_worker: bm_open failed for temporary %s (kf_shard=%d): %s",
+                  a->tmp_path, a->kf_shard, strerror(errno));
+        unlink(a->tmp_path);
+        kfcache_release(&kh);
+        return NULL;
+    }
+
+    a->rebuild.bm = bm;
+    a->rebuild.field_index = a->fi;
+    a->rebuild.ts = a->ts;
+    int walk_rc = slotcask_walk_one_shard_slots_locked(
+        a->sdb, a->kf_shard, &kh, bm_rebuild_cb, &a->rebuild);
+    int sync_rc = (!walk_rc && !a->rebuild.failed) ? bm_sync(bm) : -1;
+    int saved_errno = a->rebuild.saved_errno;
+    if (sync_rc != 0 && !saved_errno) saved_errno = errno;
+    if (bm_close_checked(bm) != 0 && !saved_errno) saved_errno = errno;
     kfcache_release(&kh);
+
+    if (walk_rc != 0 || a->rebuild.failed || sync_rc != 0 || saved_errno) {
+        a->saved_errno = saved_errno;
+        if (saved_errno) errno = saved_errno;
+        LOG_ERROR(LOG_SUB_BITMAP,
+                  "bm_shard_walk_worker: materialisation failed for %s shard %d: %s",
+                  a->target_path, a->kf_shard, strerror(errno));
+        unlink(a->tmp_path);
+        return NULL;
+    }
+    a->result = index_build_ok();
     return NULL;
 }
 
-int build_bitmap_pass(const char *db_root, const char *object,
+index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
                       const char *field, uint32_t max_values, int force) {
     (void)force;
-    if (!ts) return -1;
+    if (!ts) return index_build_failed(0);
     int fi = typed_field_index(ts, field);
-    if (fi < 0) return -1;
+    if (fi < 0) return index_build_failed(0);
     const TypedField *f = &ts->fields[fi];
     int bool_fastpath = (f->type == FT_BOOL);
 
@@ -2173,19 +2808,16 @@ int build_bitmap_pass(const char *db_root, const char *object,
         "BUILD-BITMAP %s/%s/%s: %d shards, max_values=%u, bool_fastpath=%d",
         db_root, object, field, sch->splits, max_values, bool_fastpath);
 
-    /* Wipe + re-create every shard's .bm file with the correct cap.
-       Invalidate the global bm_cache entry for each path BEFORE the
-       unlink + recreate so a stale mmap on the old inode doesn't
-       linger and serve later acquires. */
     int slots_per_shard = (int)slotcask_default_slots_for_splits(sch->splits);
-    for (int s = 0; s < sch->splits; s++) {
-        char bp[PATH_MAX];
-        bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-        bm_cache_invalidate(bp);
-        unlink(bp);
-        BitmapShard *bm = bm_open(bp, slots_per_shard, 1, bool_fastpath, max_values, 1);
-        if (bm) bm_close(bm);
-    }
+
+    /* Sibling temporaries require the field directory to exist. A first-time
+       bitmap build has no live shard whose creation would have made it yet. */
+    char first_target[PATH_MAX];
+    char field_dir[PATH_MAX];
+    bm_build_path(first_target, sizeof(first_target), db_root, object, field, 0);
+    if (parent_dir_copy(first_target, field_dir, sizeof(field_dir)) != 0)
+        return index_build_failed(errno);
+    mkdirp(field_dir);
 
     /* Open the slotcask db for this object and walk every kf shard. */
     SlotcaskSchemaInfo info = {
@@ -2195,7 +2827,7 @@ int build_bitmap_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
-        return -1;
+        return index_build_failed(0);
     }
 
     /* Parallel kf-shard walks: each worker opens its own .bm (paths are
@@ -2203,22 +2835,48 @@ int build_bitmap_pass(const char *db_root, const char *object,
        directly into the mmap'd file. Zero file contention; no memory
        accumulation (mmap is the persistent store). Matches the
        phase-1-parallel shape used by btree/trigram. */
-    BmShardWalkArg *args = malloc((size_t)sch->splits * sizeof(BmShardWalkArg));
+    BmShardWalkArg *args = calloc((size_t)sch->splits, sizeof(BmShardWalkArg));
     if (!args) {
         LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", sch->splits, db_root, object, field);
-        return -1;
+        return index_build_failed(0);
     }
     for (int s = 0; s < sch->splits; s++) {
-        bm_build_path(args[s].path, sizeof(args[s].path), db_root, object, field, s);
+        bm_build_path(args[s].target_path, sizeof(args[s].target_path),
+                      db_root, object, field, s);
         args[s].kf_shard       = s;
         args[s].slots_per_shard= slots_per_shard;
         args[s].fi             = fi;
+        args[s].bool_fastpath  = bool_fastpath;
+        args[s].max_values     = max_values;
         args[s].ts             = ts;
         args[s].sdb            = sdb;
     }
     parallel_for(bm_shard_walk_worker, args, sch->splits, sizeof(BmShardWalkArg));
+
+    index_build_result result = index_build_ok();
+    for (int s = 0; s < sch->splits; s++) {
+        if (args[s].result.status == INDEX_BUILD_FAILED) {
+            int saved_errno = args[s].saved_errno ? args[s].saved_errno : EIO;
+            for (int i = 0; i < sch->splits; i++)
+                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+            free(args);
+            return index_build_failed(saved_errno);
+        }
+    }
+    for (int s = 0; s < sch->splits; s++) {
+        bm_publish_result publish = bm_publish_replace(args[s].target_path,
+                                                      args[s].tmp_path);
+        if (publish == BM_PUBLISH_PRE_RENAME_FAILED) {
+            for (int i = s; i < sch->splits; i++)
+                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+            result = index_build_failed(0);
+            break;
+        }
+        if (publish == BM_PUBLISH_POST_RENAME_FSYNC_FAILED)
+            result.status = INDEX_BUILD_DURABILITY_UNCONFIRMED;
+    }
     free(args);
-    return 0;
+    return result;
 }
 
 int cmd_add_indexes(const char *db_root, const char *object,
@@ -2250,6 +2908,10 @@ int cmd_add_indexes(const char *db_root, const char *object,
 
     Schema sch = load_schema(db_root, object);
     TypedSchema *ts_for_idx = load_typed_schema(db_root, object);
+    if (sch.splits <= 0 || sch.streams <= 0 || !ts_for_idx) {
+        OUT("{\"error\":\"cannot load object schema for index build\"}\n");
+        return -1;
+    }
 
     /* Parse + auto-promote each spec via the canonical helpers
        (config.c::parse_index_spec + idx_should_auto_bitmap). Same logic
@@ -2257,7 +2919,6 @@ int cmd_add_indexes(const char *db_root, const char *object,
     char       names[MAX_FIELDS][256];
     enum IndexType types[MAX_FIELDS];
     uint32_t   maxes[MAX_FIELDS];
-    int        promoted = 0;
     for (int i = 0; i < nfields; i++) {
         ParsedIndexSpec ps;
         if (parse_index_spec(fields[i], &ps) != 0) {
@@ -2287,14 +2948,13 @@ int cmd_add_indexes(const char *db_root, const char *object,
                     maxes[i] == 0) {
                     maxes[i] = 65535;
                 }
-                promoted++;
             }
         }
     }
 
-    /* Bitmap- and trigram-typed fields follow the same skip-if-exists
-       semantic as btree: with force, wipe + rebuild; without force,
-       no-op when any shard file already exists for the field. All three
+    /* Bitmap- and trigram-typed fields follow the same metadata-authoritative
+       skip semantic as btree: with force, publish replacement shards; without
+       force, no-op only when the canonical index.conf entry is active. All three
        types are accumulated into ONE combined MFFieldDesc array below and
        built via ONE call to build_indexes_streaming_multi — the same
        single-scan engine reindex_object uses — instead of the old
@@ -2307,53 +2967,87 @@ int cmd_add_indexes(const char *db_root, const char *object,
     MFFieldDesc *descs = total_fields > 0
                        ? calloc((size_t)total_fields, sizeof(MFFieldDesc))
                        : NULL;
+    if (total_fields > 0 && !descs) {
+        OUT("{\"error\":\"cannot allocate index build descriptors\"}\n");
+        return -1;
+    }
     int n_desc = 0;
 
+    /* Resolve every requested field before any build or metadata write.
+       A missing simple field, or a composite with an unresolved component,
+       is a command error — silently skipping it would later write
+       index.conf entries for a field that can never be built, or no-op a
+       command the caller believed succeeded. Composites are btree-only
+       (mirrors create-object's validator). */
     for (int i = 0; i < nfields; i++) {
-        if (types[i] == IT_BITMAP) {
-            if (!force) {
-                /* Probe shard 0's .bm — if it exists, treat the field
-                   as already-indexed and skip. */
-                char probe[PATH_MAX];
-                bm_build_path(probe, sizeof(probe), db_root, object, names[i], 0);
-                struct stat st;
-                if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
+        if (types[i] != IT_BTREE && strchr(names[i], '+')) {
+            OUT("{\"error\":\"composite indexes are btree-only (got \\\"%s\\\")\"}\n",
+                names[i]);
+            free(descs);
+            return -1;
+        }
+        if (strchr(names[i], '+')) {
+            char fbuf[256];
+            strncpy(fbuf, names[i], 255); fbuf[255] = '\0';
+            char *save = NULL;
+            int total = 0, resolved = 0;
+            for (char *t = strtok_r(fbuf, "+", &save); t;
+                 t = strtok_r(NULL, "+", &save)) {
+                total++;
+                if (typed_field_index(ts_for_idx, t) >= 0) resolved++;
             }
-            if (descs && ts_for_idx) {
+            if (resolved != total) {
+                OUT("{\"error\":\"unknown field \\\"%s\\\" in add-indexes request\"}\n",
+                    names[i]);
+                free(descs);
+                return -1;
+            }
+        } else if (typed_field_index(ts_for_idx, names[i]) < 0) {
+            OUT("{\"error\":\"unknown field \\\"%s\\\" in add-indexes request\"}\n",
+                names[i]);
+            free(descs);
+            return -1;
+        }
+    }
+
+    char conf_path[PATH_MAX];
+    snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
+    char *existing_conf = NULL;
+    size_t existing_conf_len = 0;
+    if (!force && index_conf_read(conf_path, &existing_conf, &existing_conf_len) != 0) {
+        OUT("{\"error\":\"cannot read index metadata: %s\"}\n",
+            strerror(errno));
+        free(descs);
+        return -1;
+    }
+
+    for (int i = 0; i < nfields; i++) {
+        char canonical[300];
+        index_canonical_line(canonical, sizeof(canonical),
+                             names[i], types[i], maxes[i]);
+        if (types[i] == IT_BITMAP) {
+            if (!force && index_conf_has_line(existing_conf ? existing_conf : "",
+                                              existing_conf_len, canonical))
+                continue;
+            if (descs) {
                 int fi_t = typed_field_index(ts_for_idx, names[i]);
-                if (fi_t >= 0) {
-                    MFFieldDesc *d = &descs[n_desc++];
-                    memset(d, 0, sizeof(*d));
-                    d->type = MF_BITMAP;
-                    strncpy(d->name, names[i], sizeof(d->name) - 1);
-                    d->field_indices[0] = fi_t;
-                    d->field_index_count = 1;
-                    d->bm_max_values = maxes[i];
-                    d->bm_bool_fastpath = (ts_for_idx->fields[fi_t].type == FT_BOOL) ? 1 : 0;
-                }
+                MFFieldDesc *d = &descs[n_desc++];
+                memset(d, 0, sizeof(*d));
+                d->type = MF_BITMAP;
+                strncpy(d->name, names[i], sizeof(d->name) - 1);
+                d->field_indices[0] = fi_t;
+                d->field_index_count = 1;
+                d->bm_max_values = maxes[i];
+                d->bm_bool_fastpath = (ts_for_idx->fields[fi_t].type == FT_BOOL) ? 1 : 0;
             }
             continue;
         }
         if (types[i] == IT_TRIGRAM) {
-            /* Validate field exists in typed schema before touching any
-               on-disk state — matches build_trigram_pass's early return
-               on fi < 0. A typo'd field name must not wipe existing shards. */
-            int fi_t = ts_for_idx ? typed_field_index(ts_for_idx, names[i]) : -1;
-            if (fi_t < 0) continue;
-            if (!force) {
-                /* Probe shard 0's .tg — same skip-if-exists rule the
-                   btree and bitmap branches use. */
-                char probe[PATH_MAX];
-                tg_build_path(probe, sizeof(probe), db_root, object, names[i], 0);
-                struct stat st;
-                if (stat(probe, &st) == 0 && S_ISREG(st.st_mode)) continue;
-            } else {
-                /* Force: unlink existing .tg shards before rebuild —
-                   mirrors build_trigram_pass's own force branch, since
-                   we no longer call build_trigram_pass from here. */
-                tg_idx_unlink_all(db_root, object, names[i], sch.splits);
-            }
+            if (!force && index_conf_has_line(existing_conf ? existing_conf : "",
+                                              existing_conf_len, canonical))
+                continue;
             if (descs) {
+                int fi_t = typed_field_index(ts_for_idx, names[i]);
                 MFFieldDesc *d = &descs[n_desc++];
                 memset(d, 0, sizeof(*d));
                 d->type = STREAM_TRIGRAM;
@@ -2369,10 +3063,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
     memcpy(fields, btree_fields, (size_t)btree_count * sizeof(btree_fields[0]));
     nfields = btree_count;
 
-    char conf_path[PATH_MAX];
-    snprintf(conf_path, sizeof(conf_path), "%s/%s/indexes/index.conf", db_root, object);
-
-    /* === Btree fields: same skip-if-exists / force-unlink semantics as
+    /* === Btree fields: same skip-if-exists / force-replacement semantics as
        before — just add one MFFieldDesc per field to the SAME combined
        array built above instead of running a separate batched pass. */
     char actual_fields[MAX_FIELDS][256];
@@ -2380,19 +3071,17 @@ int cmd_add_indexes(const char *db_root, const char *object,
     if (nfields > 0) {
         /* Filter out already-existing btree indexes (unless force). */
         for (int i = 0; i < nfields; i++) {
-            if (force) {
-                btree_idx_unlink_all(db_root, object, fields[i], sch.splits);
-            } else if (btree_idx_exists(db_root, object, fields[i], sch.splits)) {
+            if (!force && index_conf_has_line(existing_conf ? existing_conf : "",
+                                              existing_conf_len, fields[i])) {
                 continue; /* skip existing */
             }
             memcpy(actual_fields[actual_count], fields[i], 256);
             actual_count++;
         }
 
-        if (actual_count > 0 && descs && ts_for_idx) {
+        if (actual_count > 0 && descs) {
             for (int i = 0; i < actual_count; i++) {
                 int fi_t = typed_field_index(ts_for_idx, actual_fields[i]);
-                if (fi_t < 0 && !strchr(actual_fields[i], '+')) continue;
                 MFFieldDesc *d = &descs[n_desc++];
                 memset(d, 0, sizeof(*d));
                 d->type = STREAM_BTREE;
@@ -2409,7 +3098,6 @@ int cmd_add_indexes(const char *db_root, const char *object,
                         if (ci >= 0)
                             d->field_indices[d->field_index_count++] = ci;
                     }
-                    if (d->field_index_count == 0) { n_desc--; continue; }
                 } else {
                     d->field_indices[0] = fi_t;
                     d->field_index_count = 1;
@@ -2417,87 +3105,53 @@ int cmd_add_indexes(const char *db_root, const char *object,
             }
         }
     }
+    free(existing_conf);
 
     /* Single scan: build every requested bitmap/trigram/btree field in
        ONE call to the same engine reindex uses. This is the fix for the
        "N separate full-object scans per add-index call" incident. */
+    index_build_result build_result = index_build_ok();
     if (n_desc > 0) {
         LOG_AUDIT(LOG_SUB_INDEX, "ADD-INDEXES %s: %d field(s), single scan",
                  object, n_desc);
-        build_indexes_streaming_multi(db_root, object, &sch, ts_for_idx, descs, n_desc);
+        build_result = build_indexes_streaming_multi(db_root, object, &sch, ts_for_idx, descs, n_desc);
     }
     free(descs);
 
-    /* === Write canonical index.conf for ALL original fields (typed +
-       btree). Pre-fix this only ran for btree fields, so a plural
-       add-index with only :bitmap / :trigram entries left index.conf
-       unchanged — reindex saw no record of the field, and remove-index
-       couldn't match it. Iterates `total_fields` (saved before the
-       btree-only reduction) using the canonical names/types/maxes
-       arrays populated at parse time. */
-    mkdirp(dirname_of(conf_path));
-    if (promoted) {
-        /* Full rewrite from (names, types, maxes). Mirrors the writer
-           in cmd_create_object's index.conf-emission block. */
-        FILE *wf = fopen(conf_path, "w");
-        if (wf) {
-            for (int i = 0; i < total_fields; i++) {
-                switch (types[i]) {
-                    case IT_BTREE:
-                        fprintf(wf, "%s\n", names[i]);
-                        break;
-                    case IT_BITMAP:
-                        if (maxes[i] && maxes[i] != BM_DEFAULT_MAX_VALUES)
-                            fprintf(wf, "%s:bitmap(%u)\n", names[i], maxes[i]);
-                        else
-                            fprintf(wf, "%s:bitmap\n", names[i]);
-                        break;
-                    case IT_TRIGRAM:
-                        fprintf(wf, "%s:trigram\n", names[i]);
-                        break;
-                }
-            }
-            fclose(wf);
-        }
-    } else {
-        /* Append-with-dedupe for every original field (typed lines too). */
-        for (int i = 0; i < total_fields; i++) {
-            char canon[300];
-            switch (types[i]) {
-                case IT_BITMAP:
-                    if (maxes[i] && maxes[i] != BM_DEFAULT_MAX_VALUES)
-                        snprintf(canon, sizeof(canon), "%s:bitmap(%u)", names[i], maxes[i]);
-                    else
-                        snprintf(canon, sizeof(canon), "%s:bitmap", names[i]);
-                    break;
-                case IT_TRIGRAM:
-                    snprintf(canon, sizeof(canon), "%s:trigram", names[i]);
-                    break;
-                default:
-                    snprintf(canon, sizeof(canon), "%s", names[i]);
-                    break;
-            }
-            int already = 0;
-            FILE *cf = fopen(conf_path, "r");
-            if (cf) {
-                char line[256];
-                while (fgets(line, sizeof(line), cf)) {
-                    line[strcspn(line, "\n")] = '\0';
-                    if (strcmp(line, canon) == 0) { already = 1; break; }
-                }
-                fclose(cf);
-            }
-            if (!already) {
-                FILE *af = fopen(conf_path, "a");
-                if (af) { fprintf(af, "%s\n", canon); fclose(af); }
-            }
-        }
+    if (build_result.status == INDEX_BUILD_FAILED) {
+        OUT("{\"error\":\"index build failed; index metadata was not changed; "
+            "one or more shards may already have been published\"}\n");
+        return -1;
+    }
+
+    /* Build complete canonical additions in memory and atomically publish the
+       resulting metadata file only after every requested descriptor built. */
+    char canonical_lines[MAX_FIELDS][300];
+    const char *metadata_lines[MAX_FIELDS];
+    for (int i = 0; i < total_fields; i++) {
+        index_canonical_line(canonical_lines[i], sizeof(canonical_lines[i]),
+                             names[i], types[i], maxes[i]);
+        metadata_lines[i] = canonical_lines[i];
+    }
+    index_build_result metadata_result = index_conf_append_unique(conf_path,
+                                                                   metadata_lines,
+                                                                   total_fields);
+    if (metadata_result.status == INDEX_BUILD_FAILED) {
+        OUT("{\"error\":\"index shards published but index metadata update failed; "
+            "retry add-index\"}\n");
+        return -1;
     }
 
     invalidate_idx_cache(db_root, object);
     uint64_t duration_ms = now_ms() - t_start;
     int records = get_live_count(db_root, object);
     if (records < 0) records = 0;
+    if (build_result.status == INDEX_BUILD_DURABILITY_UNCONFIRMED ||
+        metadata_result.status == INDEX_BUILD_DURABILITY_UNCONFIRMED) {
+        OUT("{\"warning\":\"index and metadata published but directory durability "
+            "is unconfirmed\"}\n");
+        return 1;
+    }
     /* Response semantics:
          all-typed-only            → {"status":"ok","records":..,"duration_ms":..}
          btree present, all exist  → {"status":"all_exist"}
@@ -2547,7 +3201,7 @@ static void unlink_index_by_line(const char *db_root, const char *object,
                  db_root, object, ps.name);
         rmdir(dir_path);
     } else if (ps.type == IT_BITMAP) {
-        for (int s = 0; s < idx_n; s++) {
+        for (int s = 0; s < splits; s++) {
             char bp[PATH_MAX];
             bm_build_path(bp, sizeof(bp), db_root, object, ps.name, s);
             bm_cache_invalidate(bp);
@@ -3056,21 +3710,29 @@ static void *seg_scan_worker(void *arg) {
     return NULL;
 }
 
-/* Enumerate every segment .dat file under data/streams/<sid>/. Returns a
-   malloc'd array (caller frees) sorted by (sid, fid); *out_n set. */
-static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_n) {
+/* Enumerate every segment .dat file under data/streams/<sid>/. A successful
+   empty result is distinct from a setup failure. */
+static int enumerate_segments(const char *data_dir, int n_streams,
+                              SegRef **out_segs, int *out_n) {
     size_t cap = 256, n = 0;
+    *out_segs = NULL;
+    *out_n = 0;
     SegRef *segs = malloc(cap * sizeof(SegRef));
     if (!segs) {
         LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: malloc failed for %zu SegRef entries (%s)", cap, data_dir);
-        *out_n = 0; return NULL;
+        return -1;
     }
     for (int sid = 0; sid < n_streams; sid++) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof(dir), "%s/data/streams/%03d", data_dir, sid);
         DIR *d = opendir(dir);
-        if (!d) continue;
+        if (!d) {
+            LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: opendir(%s) failed: %s", dir, strerror(errno));
+            free(segs);
+            return -1;
+        }
         struct dirent *e;
+        errno = 0;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
             size_t L = strlen(e->d_name);
@@ -3083,7 +3745,9 @@ static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_
                 SegRef *t = realloc(segs, cap * sizeof(SegRef));
                 if (!t) {
                     LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: realloc failed growing to %zu SegRef entries (%s)", cap, data_dir);
-                    closedir(d); free(segs); *out_n = 0; return NULL;
+                    closedir(d);
+                    free(segs);
+                    return -1;
                 }
                 segs = t;
             }
@@ -3091,10 +3755,17 @@ static SegRef *enumerate_segments(const char *data_dir, int n_streams, int *out_
             segs[n].fid = (uint32_t)fid;
             n++;
         }
+        if (errno != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX, "enumerate_segments: readdir(%s) failed: %s", dir, strerror(errno));
+            closedir(d);
+            free(segs);
+            return -1;
+        }
         closedir(d);
     }
     *out_n = (int)n;
-    return segs;
+    *out_segs = segs;
+    return 0;
 }
 
 /* Single segment-sequential build for a set of btree/trigram fields. */
@@ -3124,7 +3795,7 @@ static long kf_probe_slot(const KfMap *k, const uint8_t hash[16]) {
    files. Reads every keyfile shard once (sequential, ~1.6GB total) to map
    hash→slot, then sets bits. Single-threaded: per field opens all `splits`
    bm writers + holds `splits` kf mmaps, so fd use is ~2×splits. */
-static int resolve_bitmaps(const char *db_root, const char *object,
+static index_build_result resolve_bitmaps(const char *db_root, const char *object,
                            const Schema *sch, TypedSchema *ts,
                            SlotcaskDb *sdb,
                            const MFFieldDesc *descs, int n_fields, int P) {
@@ -3132,33 +3803,49 @@ static int resolve_bitmaps(const char *db_root, const char *object,
     int splits = sch->splits;
     int n_bm = 0;
     for (int fi = 0; fi < n_fields; fi++) if (descs[fi].type == MF_BITMAP) n_bm++;
-    if (n_bm == 0) return 0;
+    if (n_bm == 0) return index_build_ok();
 
     int slots = (int)slotcask_default_slots_for_splits(splits);
-    int rc = 0;
+    index_build_result result = index_build_ok();
 
     /* mmap every kf shard once, read-only, shared across all bitmap fields. */
     KfMap *kf = calloc((size_t)splits, sizeof(KfMap));
     if (!kf) {
         LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: calloc failed for %d KfMap entries (%s/%s)", splits, db_root, object);
-        return -1;
+        return index_build_failed(0);
     }
     for (int s = 0; s < splits; s++) {
         char kp[PATH_MAX];
         slotcask_kf_path(kp, sizeof(kp), sdb->data_dir, s);
         int fd = open(kp, O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st;
-        if (fstat(fd, &st) == 0 && (size_t)st.st_size > 24) {
-            void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (m != MAP_FAILED) {
-                kf[s].map = m;
-                kf[s].map_size = (size_t)st.st_size;
-                kf[s].ent = (const SlotcaskKfEntry *)((uint8_t *)m + 24);
-                kf[s].cap = ((size_t)st.st_size - 24) / sizeof(SlotcaskKfEntry);
-            }
+        if (fd < 0) {
+            LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: open(%s) failed: %s",
+                      kp, strerror(errno));
+            result = index_build_failed(0);
+            goto cleanup_kf;
         }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size <= 24 ||
+            ((size_t)st.st_size - 24) % sizeof(SlotcaskKfEntry) != 0 ||
+            ((size_t)st.st_size - 24) / sizeof(SlotcaskKfEntry) == 0) {
+            LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: malformed kf shard %s",
+                      kp);
+            close(fd);
+            result = index_build_failed(0);
+            goto cleanup_kf;
+        }
+        void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
+        if (m == MAP_FAILED) {
+            LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: mmap(%s) failed: %s",
+                      kp, strerror(errno));
+            result = index_build_failed(0);
+            goto cleanup_kf;
+        }
+        kf[s].map = m;
+        kf[s].map_size = (size_t)st.st_size;
+        kf[s].ent = (const SlotcaskKfEntry *)((uint8_t *)m + 24);
+        kf[s].cap = ((size_t)st.st_size - 24) / sizeof(SlotcaskKfEntry);
     }
 
     LOG_WARN(LOG_SUB_BITMAP, "BUILD-BITMAP %s/%s: resolving %d bitmap field(s) via kf join",
@@ -3167,76 +3854,147 @@ static int resolve_bitmaps(const char *db_root, const char *object,
     for (int fi = 0; fi < n_fields; fi++) {
         if (descs[fi].type != MF_BITMAP) continue;
 
-        /* Wipe + create every .bm shard, kept open as writer. */
-        BitmapShard **bm = calloc((size_t)splits, sizeof(BitmapShard *));
-        if (!bm) { rc = -1; continue; }
-        for (int s = 0; s < splits; s++) {
-            char bp[PATH_MAX];
-            bm_build_path(bp, sizeof(bp), db_root, object, descs[fi].name, s);
-            bm_cache_invalidate(bp);
-            unlink(bp);
-            bm[s] = bm_open(bp, slots, 1 /* create */,
-                            descs[fi].bm_bool_fastpath, descs[fi].bm_max_values,
-                            1 /* writer */);
-        }
-
         char spill_dir[PATH_MAX];
         snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
                  db_root, object, descs[fi].name, fi);
+
+        /* Materialise every shard at an unreferenced sibling path first.
+           A scan, spill, or bitmap-write error must leave all live paths
+           for this field untouched. */
+        BitmapShard **bm = calloc((size_t)splits, sizeof(BitmapShard *));
+        char (*targets)[PATH_MAX] = calloc((size_t)splits, sizeof(*targets));
+        char (*temps)[PATH_MAX] = calloc((size_t)splits, sizeof(*temps));
+        int field_failed = !bm || !targets || !temps;
+        if (field_failed) {
+            LOG_ERROR(LOG_SUB_BITMAP, "resolve_bitmaps: allocation failed for %s/%s/%s",
+                      db_root, object, descs[fi].name);
+            goto field_cleanup;
+        }
+        durability_test_pause(spill_dir, "bm-resolve-before-open");
+        for (int s = 0; s < splits; s++) {
+            bm_build_path(targets[s], sizeof(targets[s]), db_root, object,
+                          descs[fi].name, s);
+            if (bm_rebuild_temp_path(targets[s], temps[s]) != 0) {
+                field_failed = 1;
+                break;
+            }
+            bm[s] = bm_open(temps[s], slots, 1 /* create */,
+                            descs[fi].bm_bool_fastpath, descs[fi].bm_max_values,
+                            1 /* writer */);
+            if (!bm[s]) {
+                field_failed = 1;
+                break;
+            }
+        }
 
         for (int w = 0; w < P; w++) {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/bmw%d.bin", spill_dir, w);
             int fd = open(path, O_RDONLY);
-            if (fd < 0) continue;
+            if (fd < 0) {
+                if (errno == ENOENT) continue;
+                field_failed = 1;
+                break;
+            }
             struct stat st;
-            if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            if (fstat(fd, &st) != 0 || st.st_size < 0) {
+                close(fd);
+                field_failed = 1;
+                break;
+            }
+            if (st.st_size > 0) {
                 uint8_t *m = mmap(NULL, (size_t)st.st_size, PROT_READ,
                                   MAP_PRIVATE, fd, 0);
-                if (m != MAP_FAILED) {
-#ifdef __linux__
-                    madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
-#endif
-                    size_t pos = 0, sz = (size_t)st.st_size;
-                    while (pos + 4 <= sz) {
-                        uint16_t kfs = (uint16_t)m[pos] | ((uint16_t)m[pos+1] << 8);
-                        uint16_t vl  = (uint16_t)m[pos+2] | ((uint16_t)m[pos+3] << 8);
-                        pos += 4;
-                        if (pos + (size_t)vl + 16 > sz) break;
-                        const uint8_t *val  = m + pos;
-                        const uint8_t *hash = m + pos + vl;
-                        pos += (size_t)vl + 16;
-                        if (kfs >= splits || !bm[kfs]) continue;
-                        long slot = kf_probe_slot(&kf[kfs], hash);
-                        if (slot >= 0)
-                            bm_set(bm[kfs], val, vl, (uint32_t)slot);
-                    }
-#ifdef __linux__
-                    madvise(m, (size_t)st.st_size, MADV_DONTNEED);
-#endif
-                    munmap(m, (size_t)st.st_size);
+                if (m == MAP_FAILED) {
+                    close(fd);
+                    field_failed = 1;
+                    break;
                 }
+#ifdef __linux__
+                madvise(m, (size_t)st.st_size, MADV_SEQUENTIAL);
+#endif
+                size_t pos = 0, sz = (size_t)st.st_size;
+                while (pos + 4 <= sz) {
+                    uint16_t kfs = (uint16_t)m[pos] | ((uint16_t)m[pos+1] << 8);
+                    uint16_t vl  = (uint16_t)m[pos+2] | ((uint16_t)m[pos+3] << 8);
+                    pos += 4;
+                    if (pos + (size_t)vl + 16 > sz || kfs >= splits || !bm[kfs]) {
+                        field_failed = 1;
+                        break;
+                    }
+                    const uint8_t *val  = m + pos;
+                    const uint8_t *hash = m + pos + vl;
+                    pos += (size_t)vl + 16;
+                    long slot = kf_probe_slot(&kf[kfs], hash);
+                    if (slot < 0 || bm_set(bm[kfs], val, vl, (uint32_t)slot) != 0) {
+                        field_failed = 1;
+                        break;
+                    }
+                }
+                if (pos != sz) field_failed = 1;
+#ifdef __linux__
+                madvise(m, (size_t)st.st_size, MADV_DONTNEED);
+#endif
+                munmap(m, (size_t)st.st_size);
             }
             close(fd);
             unlink(path);
+            if (field_failed) break;
         }
 
-        for (int s = 0; s < splits; s++) if (bm[s]) bm_close(bm[s]);
+        for (int s = 0; s < splits; s++) {
+            if (bm[s] && !field_failed && bm_sync(bm[s]) != 0) field_failed = 1;
+            if (bm[s] && bm_close_checked(bm[s]) != 0) field_failed = 1;
+            bm[s] = NULL;
+        }
+        if (!field_failed) {
+            for (int s = 0; s < splits; s++) {
+                if (bm_cache_invalidate_checked(temps[s]) != 0) {
+                    field_failed = 1;
+                    break;
+                }
+            }
+        }
+        if (!field_failed) {
+            for (int s = 0; s < splits; s++) {
+                bm_publish_result publish = bm_publish_replace(targets[s], temps[s]);
+                if (publish == BM_PUBLISH_PRE_RENAME_FAILED) {
+                    field_failed = 1;
+                    break;
+                }
+                if (publish == BM_PUBLISH_POST_RENAME_FSYNC_FAILED &&
+                    result.status == INDEX_BUILD_OK)
+                    result.status = INDEX_BUILD_DURABILITY_UNCONFIRMED;
+            }
+        }
+
+field_cleanup:
+        if (field_failed) {
+            result = index_build_failed(0);
+            for (int s = 0; s < splits; s++) {
+                if (bm && bm[s]) bm_close(bm[s]);
+                if (temps && temps[s][0]) unlink(temps[s]);
+            }
+        }
         free(bm);
+        free(targets);
+        free(temps);
         rmdir(spill_dir);
+        if (field_failed) break;
     }
 
+cleanup_kf:
     for (int s = 0; s < splits; s++)
         if (kf[s].map) munmap(kf[s].map, kf[s].map_size);
     free(kf);
-    return rc;
+    return result;
 }
 
-static int seg_seq_build_spills(const char *db_root, const char *object,
+static index_build_result seg_seq_build_spills(const char *db_root, const char *object,
                                 const Schema *sch, TypedSchema *ts,
                                 SlotcaskDb *sdb,
                                 const MFFieldDesc *descs, int n_fields) {
-    if (n_fields <= 0) return 0;
+    if (n_fields <= 0) return index_build_ok();
     int idx_n = index_splits_for(sch->splits);
 
     for (int fi = 0; fi < n_fields; fi++) {
@@ -3247,13 +4005,21 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
     }
 
     int n_segs = 0;
-    SegRef *segs = enumerate_segments(sdb->data_dir, sch->streams, &n_segs);
-    if (n_segs == 0) { free(segs); return 0; }  /* empty object → empty indexes */
+    SegRef *segs = NULL;
+    if (enumerate_segments(sdb->data_dir, sch->streams, &segs, &n_segs) != 0) {
+        for (int fi = 0; fi < n_fields; fi++) {
+            char spill_dir[PATH_MAX];
+            snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                     db_root, object, descs[fi].name, fi);
+            rmdir(spill_dir);
+        }
+        return index_build_failed(0);
+    }
 
     int pool_size = parallel_pool_size();
     if (pool_size < 1) pool_size = 1;
     int P = pool_size;
-    if (P > n_segs) P = n_segs;
+    if (n_segs > 0 && P > n_segs) P = n_segs;
 
     size_t budget = g_index_build_budget_bytes;
     if (budget < 64ULL * 1024 * 1024) budget = 64ULL * 1024 * 1024;
@@ -3270,7 +4036,8 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
     SegScanWorker *workers = calloc((size_t)P, sizeof(SegScanWorker));
     if (!workers) {
         LOG_ERROR(LOG_SUB_REINDEX, "seg_seq_build_spills: calloc failed for %d SegScanWorker entries (%s/%s)", P, db_root, object);
-        free(segs); return -1;
+        free(segs);
+        return index_build_failed(0);
     }
 
     /* Contiguous segment ranges per worker so each reads its files in order. */
@@ -3320,7 +4087,7 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
             free(workers[w].bm_writers);
         }
         free(workers); free(segs);
-        return -1;
+        return index_build_failed(0);
     }
 
     /* Phase 1: parallel sequential scan (parallel_for_io = independent
@@ -3347,17 +4114,75 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
     free(workers);
     free(segs);
 
+    if (any_error) {
+        for (int fi = 0; fi < n_fields; fi++) {
+            char spill_dir[PATH_MAX];
+            snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                     db_root, object, descs[fi].name, fi);
+            for (int w = 0; w < P; w++) {
+                for (int s = 0; s < idx_n; s++) {
+                    char path[PATH_MAX];
+                    snprintf(path, sizeof(path), "%s/w%d_s%d.bin", spill_dir, w, s);
+                    unlink(path);
+                }
+                char bm_path[PATH_MAX];
+                snprintf(bm_path, sizeof(bm_path), "%s/bmw%d.bin", spill_dir, w);
+                unlink(bm_path);
+            }
+            rmdir(spill_dir);
+        }
+        return index_build_failed(0);
+    }
+
+    /* Fail the whole invocation before the first rename if any tree spill is
+       malformed or unreadable. Per-shard validation inside the parallel
+       merge remains defense in depth, but cannot provide this publication
+       ordering guarantee by itself. */
+    for (int fi = 0; fi < n_fields; fi++) {
+        if (descs[fi].type == MF_BITMAP) continue;
+        char spill_dir[PATH_MAX];
+        snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
+                 db_root, object, descs[fi].name, fi);
+        durability_test_pause(spill_dir, "idx-spills-before-merge");
+        if (validate_index_spills(spill_dir, P, idx_n) != 0) {
+            for (int cleanup_fi = 0; cleanup_fi < n_fields; cleanup_fi++) {
+                char cleanup_dir[PATH_MAX];
+                snprintf(cleanup_dir, sizeof(cleanup_dir),
+                         "%s/%s/indexes/%s/.spill_%d", db_root, object,
+                         descs[cleanup_fi].name, cleanup_fi);
+                for (int w = 0; w < P; w++) {
+                    for (int s = 0; s < idx_n; s++) {
+                        char path[PATH_MAX];
+                        snprintf(path, sizeof(path), "%s/w%d_s%d.bin",
+                                 cleanup_dir, w, s);
+                        unlink(path);
+                    }
+                    char bm_path[PATH_MAX];
+                    snprintf(bm_path, sizeof(bm_path), "%s/bmw%d.bin",
+                             cleanup_dir, w);
+                    unlink(bm_path);
+                }
+                rmdir(cleanup_dir);
+            }
+            return index_build_failed(errno);
+        }
+    }
+
     /* Phase 2a: merge btree/trigram spills per field. Spill files are
        w{0..P-1}_s{shard}.bin, so the merge's "n_kf" arg is P. Bitmap fields
        are resolved separately in Phase 2b (resolve_bitmaps). */
-    int merge_rc = 0;
+    index_build_result merge_result = index_build_ok();
     for (int fi = 0; fi < n_fields; fi++) {
         if (descs[fi].type == MF_BITMAP) continue;
         char spill_dir[PATH_MAX];
         snprintf(spill_dir, sizeof(spill_dir), "%s/%s/indexes/%s/.spill_%d",
                  db_root, object, descs[fi].name, fi);
         MergeShardArg *margs = calloc((size_t)idx_n, sizeof(MergeShardArg));
-        if (!margs) { merge_rc = -1; continue; }
+        if (!margs) {
+            merge_result.status = INDEX_BUILD_FAILED;
+            merge_result.all_requested_shards_published = 0;
+            continue;
+        }
         for (int s = 0; s < idx_n; s++) {
             margs[s].type      = descs[fi].type;
             margs[s].db_root   = db_root;
@@ -3372,15 +4197,19 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
             int cnt = (b + pool_size <= idx_n) ? pool_size : (idx_n - b);
             parallel_for_io(merge_shard_worker_fn, margs + b, cnt, sizeof(MergeShardArg));
         }
-        for (int s = 0; s < idx_n; s++) if (margs[s].rc != 0) merge_rc = -1;
+        index_build_result field_result = index_build_ok();
+        for (int s = 0; s < idx_n; s++)
+            field_result = index_build_result_combine(field_result,
+                                                      margs[s].rc);
+        merge_result = index_build_result_combine(merge_result, field_result);
         free(margs);
         rmdir(spill_dir);
     }
 
     /* Phase 2b: resolve bitmap fields (kf hash→slot join). */
-    int bm_rc = resolve_bitmaps(db_root, object, sch, ts, sdb, descs, n_fields, P);
+    index_build_result bm_result = resolve_bitmaps(db_root, object, sch, ts, sdb, descs, n_fields, P);
 
-    return (any_error || merge_rc != 0 || bm_rc != 0) ? -1 : 0;
+    return index_build_result_combine(merge_result, bm_result);
 }
 
 /*
@@ -3389,9 +4218,9 @@ static int seg_seq_build_spills(const char *db_root, const char *object,
  * during the single segment scan (seg_seq_build_spills); bitmap slots are
  * resolved from the keyfile afterwards (resolve_bitmaps).
  *
- * Caller holds the object's wrlock.
+ * The object write lock protects the scan from concurrent mutations.
  */
-static int build_indexes_streaming_multi(const char *db_root, const char *object,
+static index_build_result build_indexes_streaming_multi(const char *db_root, const char *object,
                                           const Schema *sch, TypedSchema *ts,
                                           const MFFieldDesc *descs, int n_fields) {
     SlotcaskSchemaInfo info = {
@@ -3400,7 +4229,7 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
     SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_REINDEX, "build_indexes_streaming_multi: slotcask_registry_get failed for %s/%s", db_root, object);
-        return -1;
+        return index_build_failed(0);
     }
 
     return seg_seq_build_spills(db_root, object, sch, ts, sdb, descs, n_fields);
@@ -3421,62 +4250,99 @@ static int build_indexes_streaming_multi(const char *db_root, const char *object
    gets the indexes/ directory into the new <field>/<NNN>.idx shape with
    no orphans on disk. */
 
-/* Wipe every per-field idx directory + legacy <field>.idx file under
-   indexes/, preserving index.conf. Used by reindex_object before a force=1
-   rebuild so the new layout starts from a clean slate (vacuum --splits=N
-   in particular needs this — the old layout's idx_splits = old_splits/4
-   doesn't match the new splits, and btree_idx_unlink_all only walks the
-   new shard count, leaving high-index orphans behind). */
-static void reindex_wipe_idx_dirs(const char *eff_root, const char *object) {
-    char idx_dir[PATH_MAX];
-    snprintf(idx_dir, sizeof(idx_dir), "%s/%s/indexes", eff_root, object);
-    DIR *d = opendir(idx_dir);
-    if (!d) return;
-    int dfd = dirfd(d);
+/* Post-build cleanup for reindex: with the upfront wipe removed, indexes
+   are published in place via bt_publish_replace/bm_publish_replace,
+   so a partially-failed run always leaves the previous live shard intact.
+   Once every requested shard has published, this sweeps
+   only what the new layout can never reference again: a legacy pre-2026.05.1
+   single-file <field>.idx, and numeric shard files left behind by a higher
+   split count than the object's current index_splits_for(splits). It must
+   not run before publication completes — see reindex_object_checked. */
+static void reindex_cleanup_obsolete(const char *eff_root, const char *object,
+                                     char (*field_specs)[512],
+                                     const MFFieldDesc *descs, int nf,
+                                     int bitmap_splits, int tree_splits) {
+    char idx_root[PATH_MAX];
+    snprintf(idx_root, sizeof(idx_root), "%s/%s/indexes", eff_root, object);
 
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        if (strcmp(e->d_name, "index.conf") == 0) continue;
-
-        struct stat st;
-        /* fstatat against the open dirfd ties the metadata check to the
-           same inode that unlinkat/rmrf will operate on: TOCTOU-safe. */
-        if (fstatat(dfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
-
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", idx_dir, e->d_name);
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Per-shard layout: indexes/<field>/<NNN>.{idx,bm,tg}.
-               Drop every cached btree mapping under this directory
-               before rmrf so bt_cache doesn't keep stale fds alive.
-               Bitmap (.bm) and trigram (.tg) files don't use bt_cache
-               but the rmrf cleans them too — they get rebuilt below
-               in the type-aware cmd_add_indexes path. */
-            DIR *sub = opendir(path);
-            if (sub) {
-                struct dirent *se;
-                while ((se = readdir(sub))) {
-                    if (se->d_name[0] == '.') continue;
-                    char sp[PATH_MAX];
-                    snprintf(sp, sizeof(sp), "%s/%s", path, se->d_name);
-                    btree_cache_invalidate(sp);
-                }
-                closedir(sub);
-            }
-            rmrf(path);
-        } else if (S_ISREG(st.st_mode)) {
-            /* Legacy single-file <field>.idx artefact. */
-            btree_cache_invalidate(path);
-            unlinkat(dfd, e->d_name, 0);
+    for (int i = 0; i < nf; i++) {
+        const char *extension;
+        int live_shards;
+        switch (descs[i].type) {
+            case MF_BITMAP:
+                extension = ".bm";
+                live_shards = bitmap_splits;
+                break;
+            case STREAM_TRIGRAM:
+                extension = ".tg";
+                live_shards = tree_splits;
+                break;
+            case STREAM_BTREE:
+                extension = ".idx";
+                live_shards = tree_splits;
+                break;
+            default:
+                continue;
         }
+        char fname[512];
+        strncpy(fname, field_specs[i], 511);
+        fname[511] = '\0';
+        char *colon = strchr(fname, ':');
+        if (colon) *colon = '\0';
+
+        char legacy[PATH_MAX];
+        snprintf(legacy, sizeof(legacy), "%s/%s.idx", idx_root, fname);
+        struct stat lst;
+        if (lstat(legacy, &lst) == 0 && S_ISREG(lst.st_mode)) {
+            btree_cache_invalidate(legacy);
+            unlink(legacy);
+        }
+
+        char fdir[PATH_MAX];
+        snprintf(fdir, sizeof(fdir), "%s/%s", idx_root, fname);
+        DIR *d = opendir(fdir);
+        if (!d) continue;
+        int dfd = dirfd(d);
+        struct dirent *e;
+        for (;;) {
+            errno = 0;
+            e = readdir(d);
+            if (!e) {
+                if (errno != 0)
+                    LOG_WARN(LOG_SUB_REINDEX,
+                             "reindex cleanup: readdir(%s) failed: %s",
+                             fdir, strerror(errno));
+                break;
+            }
+            size_t name_len = strlen(e->d_name);
+            size_t extension_len = strlen(extension);
+            if (name_len != 3 + extension_len) continue;
+            if (strcmp(e->d_name + 3, extension) != 0) continue;
+
+            char shard_text[4] = {
+                e->d_name[0], e->d_name[1], e->d_name[2], '\0'
+            };
+            char *end = NULL;
+            unsigned long shard = strtoul(shard_text, &end, 16);
+            if (end != shard_text + 3 || shard > INT_MAX) continue;
+            if ((int)shard < live_shards) continue;
+
+            char sp[PATH_MAX];
+            snprintf(sp, sizeof(sp), "%s/%s", fdir, e->d_name);
+            if (descs[i].type == MF_BITMAP) bm_cache_invalidate(sp);
+            else btree_cache_invalidate(sp);
+            if (unlinkat(dfd, e->d_name, 0) != 0 && errno != ENOENT) {
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "reindex cleanup: unlink %s failed: %s",
+                         sp, strerror(errno));
+            }
+        }
+        closedir(d);
     }
-    closedir(d);
 }
 
 /* Rebuild every index for one object: read index.conf for the field list,
-   wipe stale on-disk idx files, then rebuild all indexes in a single
+   publish replacement shards, then remove type-specific obsolete files in a single
    kf-scan via build_indexes_streaming_multi (one pass, all fields).
    Caller must hold objlock_wrlock(eff_root, object) — cmd_reindex takes it
    per-object; rebuild_object_v2 (vacuum) inherits it from the server dispatch.
@@ -3509,32 +4375,6 @@ int reindex_object_checked(const char *eff_root, const char *object,
 
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: starting (%d indexes%s)...",
              eff_root, object, nf, composites_only ? ", composites-only" : "");
-
-    if (!composites_only) {
-        reindex_wipe_idx_dirs(eff_root, object);
-    } else {
-        /* Wipe only the composite field dirs to leave non-composite indexes intact. */
-        char idx_root[PATH_MAX];
-        snprintf(idx_root, sizeof(idx_root), "%s/%s/indexes", eff_root, object);
-        for (int i = 0; i < nf; i++) {
-            char fname[512]; strncpy(fname, field_specs[i], 511); fname[511] = '\0';
-            char *colon = strchr(fname, ':'); if (colon) *colon = '\0';
-            char fdir[PATH_MAX];
-            snprintf(fdir, sizeof(fdir), "%s/%s", idx_root, fname);
-            DIR *dd = opendir(fdir);
-            if (dd) {
-                struct dirent *de;
-                while ((de = readdir(dd))) {
-                    if (de->d_name[0] == '.') continue;
-                    char sp[PATH_MAX];
-                    snprintf(sp, sizeof(sp), "%s/%s", fdir, de->d_name);
-                    btree_cache_invalidate(sp);
-                }
-                closedir(dd);
-            }
-            rmrf(fdir);
-        }
-    }
 
     /* Build MFFieldDesc array: parse each index.conf line, resolve type
        (with the same auto-promotion logic as cmd_add_index), fill indices. */
@@ -3612,18 +4452,23 @@ int reindex_object_checked(const char *eff_root, const char *object,
         n_desc++;
     }
 
-    int build_rc = 0;
+    index_build_result build_result = index_build_ok();
     if (n_desc > 0)
-        build_rc = build_indexes_streaming_multi(eff_root, object, &sch, ts,
-                                                  descs, n_desc);
+        build_result = build_indexes_streaming_multi(eff_root, object, &sch, ts,
+                                                       descs, n_desc);
 
-    free(descs);
-    free(field_specs);
-    if (build_rc != 0) {
+    if (build_result.status == INDEX_BUILD_FAILED) {
+        free(descs);
+        free(field_specs);
         LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: index build failed",
                   eff_root, object);
         return -1;
     }
+    if (build_result.all_requested_shards_published)
+        reindex_cleanup_obsolete(eff_root, object, field_specs, descs, nf,
+                                 sch.splits, index_splits_for(sch.splits));
+    free(descs);
+    free(field_specs);
     *out_count = nf;
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
     return 0;
@@ -3636,9 +4481,9 @@ int reindex_object(const char *eff_root, const char *object,
                ? count : 0;
 }
 
-/* Legacy single-file sweep — kept for cmd_reindex's per-object loop where
-   reindex_wipe_idx_dirs would already handle it, but documented separately
-   so the upgrade path stays clear. */
+/* Legacy single-file sweep — kept for cmd_reindex's per-object loop, now
+   superseded by reindex_cleanup_obsolete's post-publication sweep, but
+   documented separately so the upgrade path stays clear. */
 static void reindex_clean_legacy(const char *eff_root, const char *object) __attribute__((unused));
 static void reindex_clean_legacy(const char *eff_root, const char *object) {
     char idx_dir[PATH_MAX];
@@ -3681,6 +4526,7 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
     uint64_t t0 = now_ms_coarse();
     int objects_rebuilt = 0;
     int objects_skipped = 0;
+    int objects_failed = 0;
     int indexes_rebuilt = 0;
 
     char line[1024];
@@ -3705,16 +4551,21 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
         char eff_root[PATH_MAX];
         snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
 
-        /* Exclusive lock for the full wipe+rebuild cycle: inserts that
-           arrive after the wipe would write to fresh idx files that
-           build_btree_streaming(force=1) then discards. The lock queues
-           them until reindex completes. rebuild_object_v2 (vacuum) holds
+        /* Exclusive lock for the full per-shard replacement cycle: inserts
+           arriving while replacement shards are being materialised could
+           otherwise update the live generation and be absent from a later
+           published shard. The lock queues them until reindex completes.
+           rebuild_object_v2 (vacuum) holds
            this lock already via the server dispatch; reindex must take it
            explicitly here since it bypasses that dispatch path. */
         objlock_wrlock(eff_root, obj);
-        int n = reindex_object(eff_root, obj, composites_only);
+        int n = 0;
+        int rebuild_rc = reindex_object_checked(eff_root, obj,
+                                                composites_only, &n);
         objlock_wrunlock(eff_root, obj);
-        if (n > 0) {
+        if (rebuild_rc != 0) {
+            objects_failed++;
+        } else if (n > 0) {
             objects_rebuilt++;
             indexes_rebuilt += n;
         } else {
@@ -3724,6 +4575,13 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
     fclose(sf);
 
     uint64_t t1 = now_ms_coarse();
+    if (objects_failed > 0) {
+        OUT("{\"error\":\"reindex failed\",\"objects\":%d,\"failed\":%d,"
+            "\"skipped\":%d,\"indexes\":%d,\"duration_ms\":%llu}\n",
+            objects_rebuilt, objects_failed, objects_skipped, indexes_rebuilt,
+            (unsigned long long)(t1 - t0));
+        return -1;
+    }
     OUT("{\"status\":\"reindexed\",\"objects\":%d,\"skipped\":%d,\"indexes\":%d,\"duration_ms\":%llu}\n",
         objects_rebuilt, objects_skipped, indexes_rebuilt,
         (unsigned long long)(t1 - t0));
