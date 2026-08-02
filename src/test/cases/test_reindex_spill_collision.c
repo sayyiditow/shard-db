@@ -764,7 +764,7 @@ static int test_reindex_malformed_bitmap_spill_run(void) {
     db->durability_test_pause_ms = 2000;
     RscQueryThread q = { .db = db, .object = "spill_bits", .response = NULL };
     pthread_t tid;
-    ASSERT_EQ_INT(pthread_create(&tid, NULL, rsc_reindex_thread, &q), 0,
+    ASSERT_EQ_INT(db_thread_create(&tid, rsc_reindex_thread, &q), 0,
                   "start paused bitmap reindex");
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
@@ -830,7 +830,7 @@ static int test_reindex_malformed_btree_spill_run(void) {
     db->durability_test_pause_ms = 2000;
     RscQueryThread q = { .db = db, .object = "spill_tree", .response = NULL };
     pthread_t tid;
-    ASSERT_EQ_INT(pthread_create(&tid, NULL, rsc_reindex_thread, &q), 0,
+    ASSERT_EQ_INT(db_thread_create(&tid, rsc_reindex_thread, &q), 0,
                   "start paused btree reindex");
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
@@ -959,7 +959,7 @@ static int test_online_bulk_reindex_readers_run(void) {
     };
     pthread_t readers[4];
     for (int i = 0; i < 4; i++)
-        ASSERT_EQ_INT(pthread_create(&readers[i], NULL,
+        ASSERT_EQ_INT(db_thread_create(&readers[i],
                                     rsc_continuous_reader_thread,
                                     &reader_args), 0,
                       "start continuous public index reader");
@@ -975,7 +975,7 @@ static int test_online_bulk_reindex_readers_run(void) {
         .db = db, .object = "concurrent_idx", .response = NULL,
     };
     pthread_t reindex_tid;
-    ASSERT_EQ_INT(pthread_create(&reindex_tid, NULL, rsc_reindex_thread,
+    ASSERT_EQ_INT(db_thread_create(&reindex_tid, rsc_reindex_thread,
                                  &reindex), 0,
                   "start public reindex with continuous readers");
     char marker[PATH_MAX];
@@ -991,7 +991,7 @@ static int test_online_bulk_reindex_readers_run(void) {
 
     RscQueryThread bulk = { .db = db, .object = NULL, .response = NULL };
     pthread_t bulk_tid;
-    ASSERT_EQ_INT(pthread_create(&bulk_tid, NULL, rsc_bulk_insert_thread,
+    ASSERT_EQ_INT(db_thread_create(&bulk_tid, rsc_bulk_insert_thread,
                                  &bulk), 0,
                   "start online bulk insert while reindex is publishing");
     pthread_join(reindex_tid, NULL);
