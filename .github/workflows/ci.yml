@@ -56,6 +56,26 @@ jobs:
         # TEST_REGISTER static-init; one invocation runs the whole suite.
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
+      # ── TEMPORARY DIAGNOSTIC (debug/macos-sigbus): reproduce the
+      #    macOS-only SIGBUS in test-reindex-malformed-bitmap-spill in
+      #    isolation, then dump macOS crash reports (.ips) for a
+      #    backtrace. Removed before merge. ────────────────────────────
+      - name: Reproduce macOS SIGBUS (single test)
+        if: matrix.os == 'macos'
+        run: |
+          ./build/bin/shard-db-test run test-reindex-malformed-bitmap-spill
+
+      - name: Dump macOS crash reports
+        if: matrix.os == 'macos' && always()
+        run: |
+          sleep 10
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null \
+            || echo "no crash reports dir"
+          for f in ~/Library/Logs/DiagnosticReports/*.ips; do
+            [ -e "$f" ] && echo "=== $f ===" && cat "$f"
+          done
+      # ── end temporary diagnostic ────────────────────────────────────
+
       - name: Run full C test suite
         # 40+ cases / 1000+ assertions. Each case spawns its own daemon on
         # a free port at a unique tmpdir, so cases are CWD-independent and
