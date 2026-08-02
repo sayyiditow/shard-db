@@ -1,5 +1,6 @@
 /* src/test/test_runner.c */
 #include "test_runner.h"
+#include "fixtures.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -350,6 +351,7 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
 }
 
 int test_run_all(const char *filter, int jobs) {
+    test_fixture_set_jobs(jobs);
     TestCaseEntry **cases = NULL;
     int n = collect_matching(filter, &cases);
 

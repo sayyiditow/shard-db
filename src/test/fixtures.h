@@ -25,6 +25,11 @@ int test_env_start(TestEnv *env);
    (daemon default). */
 int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override);
 
+/* Tell daemon-backed fixtures how many cases run concurrently. Standalone
+   `run` leaves this unset, so daemon worker pools retain their auto defaults.
+   Returns the previous value so a specialized case can restore it. */
+int test_fixture_set_jobs(int jobs);
+
 /* Stop the daemon (SIGTERM, then SIGKILL if it doesn't exit in 5s) and
    rm -rf the db_root. */
 void test_env_stop(TestEnv *env);

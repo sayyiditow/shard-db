@@ -110,6 +110,18 @@ static int sleep_ms(int ms) {
    prints why. Filled by the last failed step. */
 static __thread int g_wait_last_step = 0;   /* 1=connect 2=request */
 static __thread int g_wait_last_errno = 0;
+static int g_test_jobs = 0;
+
+int test_fixture_set_jobs(int jobs) {
+    int previous = g_test_jobs;
+    g_test_jobs = jobs;
+    return previous;
+}
+
+static int fixture_pool_size(void) {
+    if (g_test_jobs <= 0) return 0;
+    return g_test_jobs <= 4 ? 4 : 2;
+}
 
 static int wait_daemon_ready(int port, int timeout_ms) {
     int waited = 0;
@@ -202,6 +214,7 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     if (!f) return -1;
     env->port = test_pick_port();
     if (env->port < 0) { fclose(f); return -1; }
+    int pool_size = fixture_pool_size();
     fprintf(f,
         "export DB_ROOT=\"%s\"\n"
         "export PORT=%d\n"
@@ -218,27 +231,14 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
            Pin it explicitly so the CPU-pool shrink doesn't reject
            legitimate concurrent test traffic with "server at capacity". */
         "export MAX_CONCURRENT_QUERIES=32\n"
-        /* WORKERS (TCP accept/dispatch pool) and IO_THREADS (page-fault
-           I/O pool) both default to nproc-scaled values (nproc and
-           nproc*4 respectively) when unset — sized for a single
-           production daemon. Under run-all's parallel mode, up to
-           nproc test daemons now run concurrently in separate
-           processes; left at their defaults that multiplies out to
-           nproc daemons × nproc*4 IO threads each (e.g. 16 × 64 = 1024
-           threads just for I/O), which starves every daemon of CPU and
-           causes real request timeouts/connection resets under load —
-           not a logic bug, but visible as sporadic NULL responses in
-           tests run under high --jobs counts. Pin both to small fixed
-           values, independent of host core count or --jobs, so total
-           thread footprint stays bounded regardless of how many
-           daemons run side by side. 16 preserves
-           test-registry-single-flight's 16-concurrent-connection
-           requirement without queuing. */
-        "export WORKERS=16\n"
-        "export IO_THREADS=8\n"
+        /* A standalone test keeps both pools in auto mode (0). During
+           run-all, give lightly parallel runs four threads per daemon and
+           reduce wider runs to two so their total thread count stays bounded. */
+        "export WORKERS=%d\n"
+        "export IO_THREADS=%d\n"
         "export FCACHE_MAX=4096\n"
         "export TLS_ENABLE=0\n",
-        env->db_root, env->port, base);
+        env->db_root, env->port, base, pool_size, pool_size);
     /* Optional per-test override: a test that needs to exercise the
        per-query memory cap (e.g. forcing a bitmap KeySet past budget)
        passes qbuf_mb_override via test_env_start_ex. NULL → daemon

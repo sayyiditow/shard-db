@@ -154,8 +154,15 @@ static int test_stress_no_hang_run(void) {
             return 0;
     }
 
+    /* This saturation test needs the production-sized auto pools it is
+       designed to probe; the small run-all fixture pools intentionally trade
+       that capacity for a bounded aggregate thread count. Restore the runner
+       setting immediately so later sequential cases keep the normal mapping. */
+    int fixture_jobs = test_fixture_set_jobs(0);
     TestEnv env = {0};
-    if (test_env_start(&env) != 0) return 1;
+    int start_rc = test_env_start(&env);
+    test_fixture_set_jobs(fixture_jobs);
+    if (start_rc != 0) return 1;
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
