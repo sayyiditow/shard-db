@@ -117,11 +117,11 @@ static int test_find_filter_first_orderby_run(void) {
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"age\"]}",
         &resp);
     ASSERT_NOT_NULL(resp, "case2: response received");
-    ASSERT_CONTAINS(resp, "\"age\":\"99\"", "case2: includes age=99 (highest odd)");
-    ASSERT_CONTAINS(resp, "\"age\":\"81\"", "case2: includes age=81 (10th-highest odd)");
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"79\"") == NULL,
+    ASSERT_CONTAINS(resp, "\"age\":99", "case2: includes age=99 (highest odd)");
+    ASSERT_CONTAINS(resp, "\"age\":81", "case2: includes age=81 (10th-highest odd)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":79") == NULL,
         "case2: excludes age=79 (would be 11th, past limit)");
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":\"100\"") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"age\":100") == NULL,
         "case2: excludes age=100 (even row, bio='scientist')");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 10,
         "case2: exactly 10 rows");
@@ -148,7 +148,7 @@ static int test_find_filter_first_orderby_run(void) {
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"age\",\"tag\"]}",
         &resp);
     ASSERT_NOT_NULL(resp, "case4: response received");
-    ASSERT_CONTAINS(resp, "\"age\":\"42\"", "case4: returns the single matching row");
+    ASSERT_CONTAINS(resp, "\"age\":42", "case4: returns the single matching row");
     ASSERT_CONTAINS(resp, "\"tag\":\"rare_tag\"", "case4: tag column present");
     ASSERT_TRUE(count_substr(resp, "\"key\":\"k") == 1,
         "case4: exactly 1 row");

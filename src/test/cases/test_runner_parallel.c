@@ -77,6 +77,41 @@ static int sum_case_totals(const char *out) {
     return sum;
 }
 
+/* Prints every "not ok" TAP line, every case summary that reports
+   failures, and every worker-level diagnostic (crashed child, missing
+   result, failed spawn, watchdog) from a captured sub-run buffer, so a
+   totals mismatch is immediately actionable — the sub-run output is
+   otherwise captured and never surfaced in CI logs. */
+static void dump_failures(const char *tag, const char *out) {
+    const char *p = out;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (strncmp(p, "not ok ", 7) == 0) {
+            fprintf(stderr, "[%s] %.*s\n", tag, (int)len, p);
+        } else if (strncmp(p, "# ", 2) == 0 && strncmp(p, "# total:", 8) != 0) {
+            char buf[1024];
+            if (len < sizeof(buf)) {
+                memcpy(buf, p, len);
+                buf[len] = '\0';
+                int x, y;
+                int is_summary =
+                    sscanf(buf, "# %*[^:]: %d passed, %d failed", &x, &y) == 2;
+                int is_worker_diag =
+                    strstr(buf, "crashed with signal") ||
+                    strstr(buf, "exited without a test result") ||
+                    strstr(buf, "runner failed to start worker") ||
+                    strstr(buf, "without reporting a failure") ||
+                    strstr(buf, "WATCHDOG");
+                if ((is_summary && y > 0) || is_worker_diag)
+                    fprintf(stderr, "[%s] %s\n", tag, buf);
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
 static int test_runner_parallel_matches_sequential(void) {
     int exit_seq = -1, exit_par = -1;
     char *out_seq = run_subcommand(1, &exit_seq);
@@ -107,6 +142,11 @@ static int test_runner_parallel_matches_sequential(void) {
                   "sequential TAP line count reconciles with per-case totals");
     ASSERT_EQ_INT(count_tap_lines(out_par), sum_case_totals(out_par),
                   "parallel TAP line count reconciles with per-case totals (no interleaving)");
+
+    /* Surface captured sub-run failures on stderr: prints nothing on a
+       clean run, and names the failing cases whenever the totals mismatch. */
+    dump_failures("seq", out_seq);
+    dump_failures("par", out_par);
 
     free(out_seq);
     free(out_par);

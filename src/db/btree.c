@@ -476,6 +476,13 @@ static int bt_cache_probe(const char *path, int *out_found) {
     return -1;
 }
 
+/* bt_cache_evict_slot return codes. */
+enum {
+    BT_EVICT_BUSY    = 0,  /* slot held by rwlock holder; try a different one */
+    BT_EVICT_DETACHED = 1, /* slot detached; out_fd/out_map/out_sz filled */
+    BT_EVICT_ABSENT  = 2,  /* no live entry to detach (already evicted/reused) */
+};
+
 /* Detach a slot's resources under bt_cache_lock without doing any syscalls.
    The caller disposes the returned fd/map AFTER releasing bt_cache_lock via
    bt_dispose_mapping(). Non-blocking: tries the slot's own rwlock with
@@ -491,21 +498,21 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
                                size_t *out_sz) {
     BtCacheEntry *e = &bt_cache[slot];
     *out_fd = -1; *out_map = NULL; *out_sz = 0;
-    if (e->used != BT_CACHE_LIVE) return 1;
+    if (e->used != BT_CACHE_LIVE) return BT_EVICT_ABSENT;
     char expected_path[PATH_MAX];
     snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     pthread_mutex_unlock(&bt_cache_lock);
     int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
                        : pthread_rwlock_trywrlock(&e->rwlock);
     pthread_mutex_lock(&bt_cache_lock);
-    if (lock_rc != 0) return 0;
+    if (lock_rc != 0) return BT_EVICT_BUSY;
     if (e->used != BT_CACHE_LIVE) {
         pthread_rwlock_unlock(&e->rwlock);
-        return 1;
+        return BT_EVICT_ABSENT;
     }
     if (strcmp(e->path, expected_path) != 0) {
         pthread_rwlock_unlock(&e->rwlock);
-        return 0;
+        return BT_EVICT_BUSY;
     }
     if (reason == CACHE_DROP_EVICT && e->map && e->map_size > 0 &&
         durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
@@ -527,7 +534,7 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
     e->path[0] = '\0';
     bt_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
-    return 1;
+    return BT_EVICT_DETACHED;
 }
 
 /* Flush + unmap + close a detached mapping. Never call with bt_cache_lock
@@ -543,7 +550,7 @@ static void bt_dispose_mapping(int fd, uint8_t *map, size_t map_size) {
 static void bt_cache_drop_slot(int slot, CacheDropReason reason) {
     int fd; uint8_t *map; size_t sz;
     int rc = bt_cache_evict_slot(slot, reason, 1, &fd, &map, &sz);
-    if (rc > 0) {
+    if (rc == BT_EVICT_DETACHED) {
         bt_dispose_mapping(fd, map, sz);
     } else if (rc < 0) {
         LOG_ERROR(LOG_SUB_BTREE,
@@ -732,8 +739,9 @@ static int btree_cache_invalidate_nowait(const char *path) {
             rc = bt_cache_evict_slot(slot, CACHE_DROP_DISCARD, 0,
                                      &fd, &map, &map_size);
             pthread_mutex_unlock(&bt_cache_lock);
-            if (rc > 0) bt_dispose_mapping(fd, map, map_size);
-            return rc;
+            if (rc == BT_EVICT_DETACHED) bt_dispose_mapping(fd, map, map_size);
+            /* Map internal codes to the documented 1/0/-1 contract. */
+            return rc == BT_EVICT_DETACHED ? 1 : 0;
         }
     }
     pthread_mutex_unlock(&bt_cache_lock);
@@ -926,21 +934,22 @@ retry_bt_acquire:
             if (lru < 0) break; /* no more candidates at all */
             int drop_rc = bt_cache_evict_slot(lru, CACHE_DROP_EVICT, 0,
                                               &vic_fd, &vic_map, &vic_sz);
-            if (drop_rc > 0) {
+            if (drop_rc == BT_EVICT_DETACHED) {
                 slot = lru;
                 break;
             }
             if (drop_rc < 0 && first_error == 0) first_error = errno;
-            if (drop_rc == 0 && wait_candidate < 0) wait_candidate = lru;
+            if (drop_rc == BT_EVICT_BUSY && wait_candidate < 0) wait_candidate = lru;
+            /* BT_EVICT_ABSENT: already evicted; scan bumped floor_ts above. */
             floor_ts = oldest + 1;
         }
         if (slot < 0 && writer && wait_candidate >= 0) {
             int drop_rc = bt_cache_evict_slot(wait_candidate,
                                               CACHE_DROP_EVICT, 1,
                                               &vic_fd, &vic_map, &vic_sz);
-            if (drop_rc > 0) slot = wait_candidate;
+            if (drop_rc == BT_EVICT_DETACHED) slot = wait_candidate;
             else if (drop_rc < 0 && first_error == 0) first_error = errno;
-            else if (drop_rc == 0) first_error = 0;
+            else if (drop_rc == BT_EVICT_BUSY) first_error = 0;
         }
         if (slot < 0 && writer && first_error != 0) {
             pthread_mutex_unlock(&bt_cache_lock);
@@ -1005,9 +1014,12 @@ retry_bt_acquire:
     if (writer) pthread_rwlock_wrlock(lock);
     else        pthread_rwlock_rdlock(lock);
 #endif
-    if (e->used != BT_CACHE_LIVE || strcmp(e->path, path) != 0) {
-        /* Stolen by a concurrent evictor; they now own disposing our fd/map
-           (captured as their own victim to dispose). Retry from scratch. */
+    if (e->used != BT_CACHE_LIVE || strcmp(e->path, path) != 0 ||
+        e->fd != fd || e->map != map || e->map_size != sz) {
+        /* Stolen by a concurrent evictor, including an eviction followed by
+           a reopen of the same pathname. Path equality alone is not an
+           ownership check: the evictor owns disposing the original fd/map,
+           while this handoff must retry with the slot's current identity. */
         pthread_rwlock_unlock(lock);
         goto retry_bt_acquire;
     }
@@ -1033,9 +1045,9 @@ static int bt_acquire(BtFile *bt, const char *path, int writer) {
 static void bt_release(BtFile *bt) {
     if (bt->slot >= 0) {
         if (bt->writer) {
+            BtCacheEntry *e = &bt_cache[bt->slot];
             /* Propagate any grow-time remap back into the cache entry so the
                next reader picks up the new mapping. Safe: we hold wrlock. */
-            BtCacheEntry *e = &bt_cache[bt->slot];
             e->map = bt->map;
             e->map_size = bt->map_size;
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);

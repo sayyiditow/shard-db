@@ -80,7 +80,7 @@ static int test_float_field_type_run(void) {
         "\"criteria\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"3.14\"}],"
         "\"fields\":[\"id\",\"amount\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"id\":\"three\"", "find eq 3.14 has three");
-    ASSERT_CONTAINS(resp, "\"amount\":\"3.14\"", "find eq 3.14 has amount 3.14");
+    ASSERT_CONTAINS(resp, "\"amount\":3.14", "find eq 3.14 has amount 3.14");
     free(resp); resp = NULL;
 
     tc_close(tc);

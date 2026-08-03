@@ -144,7 +144,7 @@ static int test_small_prefilter_orderby_run(void) {
         "\"fields\":[\"username\",\"age\"]}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"username\":\"user_10\"") != NULL,
                 "projection includes username");
-    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"age\":\"28\"") != NULL,
+    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"age\":28") != NULL,
                 "projection includes age=28");
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"bio\":") == NULL,
                 "projection excludes bio");

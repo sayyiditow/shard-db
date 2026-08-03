@@ -1,11 +1,24 @@
 /* src/test/shard-db-test.c */
 #include "test_runner.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    /* Case children fork without exec, so these inherit down to every
+       daemon-backed test and the daemons' grandchildren:
+       - SIGPIPE ignored: a write to a daemon connection the peer closed
+         must fail with EPIPE (a clean, visible tc_request failure), not
+         kill the child with signal 13. Signal deaths are counted by the
+         runner as phantom failures with no TAP line — the reported
+         "crashed with signal 13" empty-output cases in parallel runs.
+       - Unbuffered stdout: case stdout is a dup2'd file, which stdio
+         fully buffers; a child that dies mid-case loses every buffered
+         "ok" line. Flush-per-line so crash post-mortems see real output. */
+    signal(SIGPIPE, SIG_IGN);
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr,
             "usage: shard-db-test list | run <name> | run-all [--filter <substr>] [--jobs N]\n");
