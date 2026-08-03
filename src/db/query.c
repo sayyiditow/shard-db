@@ -1461,10 +1461,10 @@ static int stream_find_record_cb(const uint8_t hash16[16],
                 OUT("{");
                 int first = 1;
                 for (int j = 0; j < sc->proj_count; j++) {
-                    char *pv = json_escape_field(decode_field((const char *)raw, (uint32_t)vlen,
-                                             sc->proj_fields[j], sc->fs));
+                    char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
+                                             sc->proj_fields[j], sc->fs);
                     if (!pv) continue;
-                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                    OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
                     first = 0;
                     free(pv);
                 }
@@ -1478,10 +1478,10 @@ static int stream_find_record_cb(const uint8_t hash16[16],
             OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
             int first = 1;
             for (int j = 0; j < sc->proj_count; j++) {
-                char *pv = json_escape_field(decode_field((const char *)raw, (uint32_t)vlen,
-                                         sc->proj_fields[j], sc->fs));
+                char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
+                                         sc->proj_fields[j], sc->fs);
                 if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[j], pv);
+                OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
                 first = 0;
                 free(pv);
             }
@@ -1681,10 +1681,10 @@ static int composite_prefix_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs));
+                char *pv = json_projected_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
                 if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
                 free(pv);
             }
@@ -1698,10 +1698,10 @@ static int composite_prefix_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs));
+            char *pv = json_projected_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
             free(pv);
         }
@@ -1753,10 +1753,10 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_escape_field(decode_field((const char *)value, (uint32_t)vlen,
-                                        c->proj_fields[i], c->fs));
+                char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
+                                        c->proj_fields[i], c->fs);
                 if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
                 free(pv);
             }
@@ -1770,10 +1770,10 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_escape_field(decode_field((const char *)value, (uint32_t)vlen,
-                                    c->proj_fields[i], c->fs));
+            char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
+                                    c->proj_fields[i], c->fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
             free(pv);
         }
@@ -2320,10 +2320,10 @@ static int order_index_walk_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs));
+                char *pv = json_projected_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
                 if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
                 free(pv);
             }
@@ -2337,10 +2337,10 @@ static int order_index_walk_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs));
+            char *pv = json_projected_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
             free(pv);
         }
@@ -4507,16 +4507,18 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             OUT("%s[\"%s\"", printed ? "," : "", keybuf);
                             if (proj_count > 0) {
                                 for (int j = 0; j < proj_count; j++) {
-                                    char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs));
-                                    OUT(",\"%s\"", pv ? pv : "");
+                                    char *pv = json_projected_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs);
+                                    OUT(",%s", pv ? pv : "\"\"");
                                     free(pv);
                                 }
                             } else if (fs && fs->ts) {
                                 for (int j = 0; j < fs->ts->nfields; j++) {
                                     if (fs->ts->fields[j].removed) continue;
-                                    char *pv = json_escape_field(typed_get_field_str(fs->ts, raw, (int)value_len, j));
-                                    OUT(",\"%s\"", pv ? pv : "");
+                                    char *pv = json_projected_value(
+                                        typed_get_field_str(fs->ts, raw, (int)value_len, j),
+                                        &fs->ts->fields[j]);
+                                    OUT(",%s", pv ? pv : "\"\"");
                                     free(pv);
                                 }
                             }
@@ -4527,10 +4529,10 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                 OUT("{");
                                 int first = 1;
                                 for (int j = 0; j < proj_count; j++) {
-                                    char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs));
+                                    char *pv = json_projected_field((const char *)raw, value_len,
+                                                            proj_fields[j], fs);
                                     if (!pv) continue;
-                                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                                    OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                                     first = 0;
                                     free(pv);
                                 }
@@ -4544,10 +4546,10 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
                             int first = 1;
                             for (int j = 0; j < proj_count; j++) {
-                                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                                        proj_fields[j], fs));
+                                char *pv = json_projected_field((const char *)raw, value_len,
+                                                        proj_fields[j], fs);
                                 if (!pv) continue;
-                                OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                                OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                                 first = 0;
                                 free(pv);
                             }
@@ -5725,16 +5727,18 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
         if (c->proj_count > 0) {
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs));
-                OUT(",\"%s\"", pv ? pv : "");
+                char *pv = json_projected_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
+                OUT(",%s", pv ? pv : "\"\"");
                 free(pv);
             }
         } else if (c->fs && c->fs->ts) {
             for (int i = 0; i < c->fs->ts->nfields; i++) {
                 if (c->fs->ts->fields[i].removed) continue;
-                char *pv = json_escape_field(typed_get_field_str(c->fs->ts, raw, (int)value_len, i));
-                OUT(",\"%s\"", pv ? pv : "");
+                char *pv = json_projected_value(
+                    typed_get_field_str(c->fs->ts, raw, (int)value_len, i),
+                    &c->fs->ts->fields[i]);
+                OUT(",%s", pv ? pv : "\"\"");
                 free(pv);
             }
         }
@@ -5745,10 +5749,10 @@ static int cursor_find_cb(const char *val, size_t vlen,
             OUT("{");
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs));
+                char *pv = json_projected_field((const char *)raw, value_len,
+                                        c->proj_fields[i], c->fs);
                 if (!pv) continue;
-                OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
                 free(pv);
             }
@@ -5762,10 +5766,10 @@ static int cursor_find_cb(const char *val, size_t vlen,
         OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_escape_field(decode_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs));
+            char *pv = json_projected_field((const char *)raw, value_len,
+                                    c->proj_fields[i], c->fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", c->proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
             free(pv);
         }
@@ -7924,15 +7928,17 @@ static int cmd_find_do(const char *db_root, const char *object,
                 OUT("%s[\"%s\"", printed ? "," : "", r->key);
                 if (proj_count > 0) {
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
-                        OUT(",\"%s\"", pv ? pv : "");
+                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        OUT(",%s", pv ? pv : "\"\"");
                         free(pv);
                     }
                 } else if (driver_fs.ts) {
                     for (int j = 0; j < driver_fs.ts->nfields; j++) {
                         if (driver_fs.ts->fields[j].removed) continue;
-                        char *pv = json_escape_field(typed_get_field_str(driver_fs.ts, val, (int)r->value_len, j));
-                        OUT(",\"%s\"", pv ? pv : "");
+                        char *pv = json_projected_value(
+                            typed_get_field_str(driver_fs.ts, val, (int)r->value_len, j),
+                            &driver_fs.ts->fields[j]);
+                        OUT(",%s", pv ? pv : "\"\"");
                         free(pv);
                     }
                 }
@@ -7943,9 +7949,9 @@ static int cmd_find_do(const char *db_root, const char *object,
                     OUT("{");
                     int first = 1;
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
+                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
                         if (!pv) continue;
-                        OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                        OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                         first = 0;
                         free(pv);
                     }
@@ -7959,9 +7965,9 @@ static int cmd_find_do(const char *db_root, const char *object,
                 OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", r->key);
                 int first = 1;
                 for (int j = 0; j < proj_count; j++) {
-                    char *pv = json_escape_field(decode_field((const char *)val, r->value_len, proj_fields[j], &driver_fs));
+                    char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
                     if (!pv) continue;
-                    OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[j], pv);
+                    OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                     first = 0;
                     free(pv);
                 }

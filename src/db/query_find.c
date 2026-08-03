@@ -464,6 +464,54 @@ char *json_escape_field(char *v) {
     return esc;
 }
 
+static int projected_field_is_numeric(const TypedField *field) {
+    if (!field) return 0;
+    switch (field->type) {
+    case FT_LONG:
+    case FT_TIMESTAMP:
+    case FT_INT:
+    case FT_SHORT:
+    case FT_DOUBLE:
+    case FT_FLOAT:
+    case FT_BYTE:
+    case FT_NUMERIC:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+char *json_projected_value(char *v, const TypedField *field) {
+    if (!v) return NULL;
+    if (projected_field_is_numeric(field)) return v;
+
+    char *escaped = json_escape_field(v);
+    if (!escaped) return NULL;
+    size_t len = strlen(escaped);
+    char *out = malloc(len + 3);
+    if (!out) {
+        free(escaped);
+        return NULL;
+    }
+    out[0] = '"';
+    memcpy(out + 1, escaped, len);
+    out[len + 1] = '"';
+    out[len + 2] = '\0';
+    free(escaped);
+    return out;
+}
+
+char *json_projected_field(const char *raw, size_t raw_len, const char *field,
+                           FieldSchema *fs) {
+    char *v = decode_field(raw, raw_len, field, fs);
+    const TypedField *tf = NULL;
+    if (fs && fs->ts && field && !strchr(field, '+')) {
+        int idx = typed_field_index(fs->ts, field);
+        if (idx >= 0) tf = &fs->ts->fields[idx];
+    }
+    return json_projected_value(v, tf);
+}
+
 char *json_escape_const(const char *v) {
     if (!v) return NULL;
     size_t len = strlen(v);
@@ -1389,9 +1437,9 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[i], pv);
             first = 0; free(pv);
         }
         OUT("}}");
@@ -1417,9 +1465,9 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
             if (!pv) continue;
-            OUT("%s\"%s\":\"%s\"", first ? "" : ",", proj_fields[i], pv);
+            OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[i], pv);
             first = 0;
             free(pv);
         }
@@ -1444,15 +1492,17 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
     OUT("%s[\"%s\"", *printed ? "," : "", key);
     if (proj_count > 0) {
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_escape_field(decode_field(raw, hdr->value_len, proj_fields[i], fs));
-            OUT(",\"%s\"", pv ? pv : "");
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
+            OUT(",%s", pv ? pv : "\"\"");
             free(pv);
         }
     } else if (fs && fs->ts) {
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
-            char *pv = json_escape_field(typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i));
-            OUT(",\"%s\"", pv ? pv : "");
+            char *pv = json_projected_value(
+                typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i),
+                &fs->ts->fields[i]);
+            OUT(",%s", pv ? pv : "\"\"");
             free(pv);
         }
     }

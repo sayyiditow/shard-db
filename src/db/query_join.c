@@ -655,15 +655,17 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     OUT("%s[\"%s\"", sc->printed ? "," : "", key);
                     if (sc->proj_count > 0) {
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
-                            OUT(",\"%s\"", pv ? pv : "");
+                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            OUT(",%s", pv ? pv : "\"\"");
                             free(pv);
                         }
                     } else if (sc->fs && sc->fs->ts) {
                         for (int i = 0; i < sc->fs->ts->nfields; i++) {
                             if (sc->fs->ts->fields[i].removed) continue;
-                            char *pv = json_escape_field(typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i));
-                            OUT(",\"%s\"", pv ? pv : "");
+                            char *pv = json_projected_value(
+                                typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i),
+                                &sc->fs->ts->fields[i]);
+                            OUT(",%s", pv ? pv : "\"\"");
                             free(pv);
                         }
                     }
@@ -674,9 +676,9 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                         OUT("{");
                         int first = 1;
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
+                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
                             if (!pv) continue;
-                            OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[i], pv);
+                            OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
                             first = 0;
                             free(pv);
                         }
@@ -690,9 +692,9 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", key);
                     int first = 1;
                     for (int i = 0; i < sc->proj_count; i++) {
-                        char *pv = json_escape_field(decode_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs));
+                        char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
                         if (!pv) continue;
-                        OUT("%s\"%s\":\"%s\"", first ? "" : ",", sc->proj_fields[i], pv);
+                        OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
                         first = 0;
                         free(pv);
                     }
@@ -716,4 +718,3 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     free(key);
     return 0;
 }
-

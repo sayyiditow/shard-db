@@ -82,7 +82,65 @@ static int test_get_fields_run(void) {
         "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"gf\",\"key\":\"k1\","
         "\"fields\":[\"name\",\"age\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"Alice\"", "multi-field: name present");
-    ASSERT_CONTAINS(resp, "\"age\":\"30\"", "multi-field: age present");
+    ASSERT_CONTAINS(resp, "\"age\":30", "multi-field: age is a JSON number");
+    free(resp); resp = NULL;
+
+    /* Every typed projection value must be emitted according to its JSON
+       type.  This exercises the shared typed_get_field_str → projection
+       emitter seam, including the numeric default-branch types and enum. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"long_v:long\",\"timestamp_v:timestamp\",\"int_v:int\","
+        "\"short_v:short\",\"double_v:double\",\"float_v:float\",\"byte_v:byte\","
+        "\"numeric_v:numeric:2\",\"enum_v:enum(red,green)\"]}", &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gf_types\",\"key\":\"k1\","
+        "\"value\":{\"long_v\":\"1234567890123\",\"timestamp_v\":\"1700000000000\","
+        "\"int_v\":\"-42\",\"short_v\":\"-7\",\"double_v\":\"3.25\","
+        "\"float_v\":\"2.5\",\"byte_v\":\"255\",\"numeric_v\":\"12.34\","
+        "\"enum_v\":\"red\"}}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "typed projection fixture inserted");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "\"criteria\":[],\"fields\":\"long_v,timestamp_v,int_v,short_v,double_v,float_v,byte_v,numeric_v,enum_v\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"long_v\":1234567890123", "find projection: long is a JSON number");
+    ASSERT_CONTAINS(resp, "\"timestamp_v\":1700000000000", "find projection: timestamp is a JSON number");
+    ASSERT_CONTAINS(resp, "\"int_v\":-42", "find projection: int is a JSON number");
+    ASSERT_CONTAINS(resp, "\"short_v\":-7", "find projection: short is a JSON number");
+    ASSERT_CONTAINS(resp, "\"double_v\":3.25", "find projection: double is a JSON number");
+    ASSERT_CONTAINS(resp, "\"float_v\":2.5", "find projection: float is a JSON number");
+    ASSERT_CONTAINS(resp, "\"byte_v\":255", "find projection: byte is a JSON number");
+    ASSERT_CONTAINS(resp, "\"numeric_v\":12.34", "find projection: numeric is a JSON number");
+    ASSERT_CONTAINS(resp, "\"enum_v\":\"red\"", "find projection: enum is an uncorrupted JSON string");
+    ASSERT_TRUE(!SAFE_STRSTR(resp, "\"int_v\":\"-42\""), "find projection: int is not a JSON string");
+    ASSERT_TRUE(!SAFE_STRSTR(resp, "\"enum_v\":\"\\\"red\\\"\""), "find projection: enum has no embedded quotes");
+    free(resp); resp = NULL;
+
+    /* Dict and fetch projections use the same typed field extraction contract. */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "\"criteria\":[],\"format\":\"dict\",\"fields\":\"int_v,enum_v\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"int_v\":-42", "dict projection: int is a JSON number");
+    ASSERT_CONTAINS(resp, "\"enum_v\":\"red\"", "dict projection: enum is a JSON string");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "\"criteria\":[],\"format\":\"rows\",\"fields\":[\"int_v\",\"enum_v\"]}", &resp);
+    ASSERT_CONTAINS(resp, "[\"k1\",-42,\"red\"]", "rows projection: numeric is a number and enum is a string");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"fetch\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "\"limit\":1,\"fields\":[\"numeric_v\",\"enum_v\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"numeric_v\":12.34", "fetch projection: numeric is a JSON number");
+    ASSERT_CONTAINS(resp, "\"enum_v\":\"red\"", "fetch projection: enum is a JSON string");
     free(resp); resp = NULL;
 
     /* Missing key with fields — must still report Not found, not crash. */

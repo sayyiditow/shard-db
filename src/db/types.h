@@ -1089,6 +1089,12 @@ void init_field_schema(FieldSchema *fs, const char *db_root, const char *object)
 char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs);
 char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs);
 char *json_escape_field(char *v);
+/* Return a complete JSON value for a projected typed field. Numeric typed
+   fields are returned as bare JSON numbers; all other projected values are
+   escaped and quoted. Ownership of `v` is consumed. */
+char *json_projected_value(char *v, const TypedField *field);
+char *json_projected_field(const char *raw, size_t raw_len, const char *field,
+                           FieldSchema *fs);
 char *json_escape_const(const char *v);
 
 /* Typed-binary fast path: compile criteria against a TypedSchema once, then

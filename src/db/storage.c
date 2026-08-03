@@ -436,10 +436,10 @@ int cmd_get_fields(const char *db_root, const char *object,
     OUT("{");
     int first = 1;
     for (int fi = 0; fi < nf; fi++) {
-        char *pv = json_escape_field(decode_field((const char *)val, vlen, flds[fi],
-            (pfs.ts || pfs.nfields > 0) ? &pfs : NULL));
+        char *pv = json_projected_field((const char *)val, vlen, flds[fi],
+            (pfs.ts || pfs.nfields > 0) ? &pfs : NULL);
         if (!pv) continue;
-        OUT("%s\"%s\":\"%s\"", first ? "" : ",", flds[fi], pv);
+        OUT("%s\"%s\":%s", first ? "" : ",", flds[fi], pv);
         first = 0; free(pv);
     }
     OUT("}\n");

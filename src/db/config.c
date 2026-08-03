@@ -3230,6 +3230,35 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         }
         return out;
     }
+    case FT_ENUM: {
+        /* typed_get_field_str is a raw display-string API.  Do not use the
+           JSON-fragment returned by decode_field_to_buf here: projection
+           emitters escape this result and add the one required JSON layer
+           themselves. */
+        if (!f->enum_values || f->n_enum_values <= 0) return NULL;
+        int idx = (f->enum_width == 2)
+                    ? (int)(((uint16_t)src[f->offset] << 8) |
+                            (uint16_t)src[f->offset + 1])
+                    : (int)src[f->offset];
+        if (idx < 0 || idx >= f->n_enum_values)
+            return strdup("");
+        return strdup(f->enum_values[idx] ? f->enum_values[idx] : "");
+    }
+    case FT_LONG:
+    case FT_TIMESTAMP:
+    case FT_INT:
+    case FT_SHORT:
+    case FT_DOUBLE:
+    case FT_FLOAT:
+    case FT_BYTE:
+    case FT_NUMERIC:
+        /* decode_field_to_buf already renders these as bare numeric text.
+           Make that text the raw value returned by this API, rather than
+           allowing projection callers to receive a JSON fragment or quote
+           the number as a string. */
+        len = decode_field_to_buf(f, src + f->offset, buf, sizeof(buf));
+        if (len <= 0) return NULL;
+        return strdup(buf);
     default:
         len = decode_field_to_buf(f, src + f->offset, buf, sizeof(buf));
         if (len <= 0) return NULL;
