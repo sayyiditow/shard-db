@@ -1,6 +1,9 @@
 #include "types.h"
 #include "slotcask.h"
 #include "nql.h"
+#ifdef TEST_BUILD
+#include "test_control.h"
+#endif
 
 /* ========== MAIN ========== */
 
@@ -109,7 +112,40 @@ int main(int argc, char *argv[]) {
         char db_root[PATH_MAX];
         if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
         if (strcmp(cmd, "start") == 0) return cmd_server(db_root, 1);
-        if (strcmp(cmd, "server") == 0) return cmd_server(db_root, 0);
+        if (strcmp(cmd, "server") == 0) {
+#ifdef TEST_BUILD
+            /* TEST_BUILD-only deterministic test control: `server
+               --test-control-fd <fd>` hands the daemon one end of an
+               inherited anonymous Unix socketpair owned by the test
+               runner's fixture. Malformed or extra arguments are rejected.
+               The production binary never parses this pair and every
+               non-TEST_BUILD build keeps its current argument behavior. */
+            int ctl_fd = -1;
+            if (argc > 2) {
+                if (argc == 4 && strcmp(argv[2], "--test-control-fd") == 0) {
+                    char *end = NULL;
+                    long v = strtol(argv[3], &end, 10);
+                    if (!end || *end != '\0' || v < 0) {
+                        fprintf(stderr,
+                            "shard-db server: invalid --test-control-fd value '%s'\n",
+                            argv[3]);
+                        return 1;
+                    }
+                    ctl_fd = (int)v;
+                } else {
+                    fprintf(stderr, "shard-db server: unexpected argument '%s'\n",
+                            argv[2]);
+                    return 1;
+                }
+            }
+            if (shard_db_test_control_start(ctl_fd) != 0) return 1;
+            int rc = cmd_server(db_root, 0);
+            shard_db_test_control_stop();
+            return rc;
+#else
+            return cmd_server(db_root, 0);
+#endif
+        }
         if (strcmp(cmd, "stop") == 0) return cmd_stop(db_root);
         if (strcmp(cmd, "status") == 0) return cmd_status(db_root);
     }

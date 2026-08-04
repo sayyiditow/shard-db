@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +172,9 @@ static int run_cmd(const char *fmt, ...) {
 
 int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     if (!env) return -1;
+    /* First state init so `TestEnv env = {0}` callers never cause cleanup
+       to close descriptor 0 on an early return. */
+    env->test_control_fd = -1;
 
     /* Unique DB_ROOT under <dir>/shard-db-test-<pid>-<idx>/db. Default
        <dir> is /tmp (fast, RAM-backed on Linux), but tmpfs is typically
@@ -252,12 +256,32 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     mkdir(logs_dir, 0755);
 
     /* Find shard-db: prefer ./build/bin/, fall back to ./shard-db. The path
-       is recorded with realpath() so child can chdir(base) safely. */
+       is recorded with realpath() so child can chdir(base) safely. The
+       TEST_BUILD daemon (shard-db-test-server) is preferred when present so
+       TCP cases reach the deterministic test-control seam; the production
+       path stays as a fallback for builds that lack the test target. */
     const char *binary_rel = "./build/bin/shard-db";
     if (access(binary_rel, X_OK) != 0) binary_rel = "./shard-db";
+    if (access("./build/bin/shard-db-test-server", X_OK) == 0)
+        binary_rel = "./build/bin/shard-db-test-server";
     char binary_abs[PATH_MAX];
     if (!realpath(binary_rel, binary_abs)) {
         return -1;
+    }
+
+    /* Inherited anonymous Unix socketpair control channel for the TEST_BUILD
+       daemon: the child keeps its endpoint across exec and invokes the test
+       server as `server --test-control-fd <fd>`; the parent side lives in
+       env->test_control_fd and is closed by test_env_stop / stop_keep /
+       kill and on every start-failure path. The production-binary fallback
+       passes no test-control argument and leaves test_control_fd == -1. */
+    int is_test_server = (strstr(binary_abs, "/shard-db-test-server") != NULL);
+    int child_ctl_fd = -1;
+    if (is_test_server) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+        env->test_control_fd = sv[0];
+        child_ctl_fd = sv[1];
     }
 
     /* Capture daemon stdout+stderr to a log file so spawn failures can be
@@ -268,7 +292,14 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     snprintf(dlog, sizeof(dlog), "%s/daemon.log", base);
 
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        if (child_ctl_fd >= 0) close(child_ctl_fd);
+        return -1;
+    }
     if (pid == 0) {
         /* Child: cd to base/ so daemon picks up the db.env we wrote there,
            then exec daemon in foreground mode. Redirect stdout+stderr to
@@ -281,9 +312,18 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
             dup2(lfd, 2);
             close(lfd);
         }
-        execl(binary_abs, binary_abs, "server", (char *)NULL);
+        if (env->test_control_fd > 0) close(env->test_control_fd);
+        if (child_ctl_fd >= 0) {
+            char fdarg[16];
+            snprintf(fdarg, sizeof(fdarg), "%d", child_ctl_fd);
+            execl(binary_abs, binary_abs, "server", "--test-control-fd",
+                  fdarg, (char *)NULL);
+        } else {
+            execl(binary_abs, binary_abs, "server", (char *)NULL);
+        }
         _exit(127);
     }
+    if (child_ctl_fd >= 0) close(child_ctl_fd);
     env->daemon_pid = pid;
 
     if (wait_daemon_ready(env->port, 5000) != 0) {
@@ -305,6 +345,10 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
         dump_daemon_log(dlog);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
         return -1;
     }
     return 0;
@@ -316,6 +360,8 @@ int test_env_start(TestEnv *env) {
 
 int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     if (!env || !db_root || port <= 0) return -1;
+    /* First state init — see test_env_start_ex. */
+    env->test_control_fd = -1;
 
     /* Derive base = parent(db_root). Caller must have created it + db_root. */
     const char *slash = strrchr(db_root, '/');
@@ -394,21 +440,54 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
 
     const char *binary_rel = "./build/bin/shard-db";
     if (access(binary_rel, X_OK) != 0) binary_rel = "./shard-db";
+    if (access("./build/bin/shard-db-test-server", X_OK) == 0)
+        binary_rel = "./build/bin/shard-db-test-server";
     char binary_abs[PATH_MAX];
     if (!realpath(binary_rel, binary_abs)) return -1;
 
+    /* Inherited anonymous socketpair control channel — same rules as
+       test_env_start_ex. */
+    int is_test_server = (strstr(binary_abs, "/shard-db-test-server") != NULL);
+    int child_ctl_fd = -1;
+    if (is_test_server) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+        env->test_control_fd = sv[0];
+        child_ctl_fd = sv[1];
+    }
+
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        if (child_ctl_fd >= 0) close(child_ctl_fd);
+        return -1;
+    }
     if (pid == 0) {
         chdir(base);
-        execl(binary_abs, binary_abs, "server", (char *)NULL);
+        if (env->test_control_fd > 0) close(env->test_control_fd);
+        if (child_ctl_fd >= 0) {
+            char fdarg[16];
+            snprintf(fdarg, sizeof(fdarg), "%d", child_ctl_fd);
+            execl(binary_abs, binary_abs, "server", "--test-control-fd",
+                  fdarg, (char *)NULL);
+        } else {
+            execl(binary_abs, binary_abs, "server", (char *)NULL);
+        }
         _exit(127);
     }
+    if (child_ctl_fd >= 0) close(child_ctl_fd);
     env->daemon_pid = pid;
 
     if (wait_daemon_ready(env->port, 5000) != 0) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
         return -1;
     }
     return 0;
@@ -419,6 +498,10 @@ void test_env_kill(TestEnv *env) {
     kill(env->daemon_pid, SIGKILL);
     waitpid(env->daemon_pid, NULL, 0);
     env->daemon_pid = -1;
+    if (env->test_control_fd > 0) {
+        close(env->test_control_fd);
+        env->test_control_fd = -1;
+    }
     /* No db_root cleanup — caller controls persistent state. */
 }
 
@@ -441,6 +524,10 @@ void test_env_stop_keep(TestEnv *env) {
         waitpid(env->daemon_pid, NULL, 0);
     }
     env->daemon_pid = -1;
+    if (env->test_control_fd > 0) {
+        close(env->test_control_fd);
+        env->test_control_fd = -1;
+    }
     /* No db_root cleanup. */
 }
 
@@ -461,6 +548,10 @@ void test_env_stop(TestEnv *env) {
         waitpid(env->daemon_pid, NULL, 0);
     }
     env->daemon_pid = -1;
+    if (env->test_control_fd > 0) {
+        close(env->test_control_fd);
+        env->test_control_fd = -1;
+    }
 
     /* Best-effort cleanup of the tmp tree. db_root is "<base>/db";
        strrchr finds the last '/' so we can rm -rf the parent. */
@@ -565,4 +656,101 @@ int tu_pdb_drop_object(ShardDb *db, const char *dir, const char *object) {
     int failed = (rc != 0) || !resp || strstr(resp, "\"error\"") != NULL;
     shard_db_free_result(resp);
     return failed ? 1 : 0;
+}
+
+/* ---- Deterministic TEST_BUILD daemon seam ---- */
+
+/* Private runner-side transport adapter for the TEST_BUILD daemon's
+   test-control channel. Messages are fixed-size and private to this
+   fixture + src/db/test_control.c (duplicated constants, no shared header).
+   Helpers never retry, poll, sleep, use a fixed pathname, or mutate
+   process-wide environment state. */
+typedef struct {
+    uint32_t kind;   /* INSTALL=1, RELEASE=2, CLEAR=3, ACK=4, REACHED=5 */
+    int32_t  phase;  /* REACHED: 0=stale snapshot, 1=under kf wrlock; else 0 */
+} TestHookMessage;
+
+enum {
+    TEST_HOOK_INSTALL = 1,
+    TEST_HOOK_RELEASE = 2,
+    TEST_HOOK_CLEAR   = 3,
+    TEST_HOOK_ACK     = 4,
+    TEST_HOOK_REACHED = 5,
+};
+
+static int test_hook_write_full(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w > 0) {
+            p += w;
+            n -= (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_hook_read_full(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    while (n > 0) {
+        ssize_t r = read(fd, p, n);
+        if (r > 0) {
+            p += r;
+            n -= (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        return -1; /* EOF or I/O error */
+    }
+    return 0;
+}
+
+int test_env_test_hook_install(TestEnv *env) {
+    if (!env || env->test_control_fd < 0) return -1;
+    TestHookMessage msg = { .kind = TEST_HOOK_INSTALL, .phase = 0 };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return 0;
+}
+
+int test_env_test_hook_wait(TestEnv *env, int *out_under_kf_wrlock) {
+    if (!env || env->test_control_fd < 0 || !out_under_kf_wrlock) return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_REACHED) return -1;
+    if (rep.phase != 0 && rep.phase != 1) return -1;
+    *out_under_kf_wrlock = rep.phase;
+    return 0;
+}
+
+int test_env_test_hook_release(TestEnv *env) {
+    if (!env || env->test_control_fd < 0) return -1;
+    TestHookMessage msg = { .kind = TEST_HOOK_RELEASE, .phase = 0 };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return 0;
+}
+
+int test_env_test_hook_clear(TestEnv *env) {
+    if (!env || env->test_control_fd < 0) return -1;
+    TestHookMessage msg = { .kind = TEST_HOOK_CLEAR, .phase = 0 };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return 0;
 }

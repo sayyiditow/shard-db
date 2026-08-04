@@ -12,6 +12,7 @@ typedef struct {
     char db_root[256];      /* /tmp/shard-db-test-<pid>-<n>/db */
     int  port;              /* picked from the OS-allocated range */
     pid_t daemon_pid;
+    int  test_control_fd;   /* parent side; -1 when the selected daemon is production */
 } TestEnv;
 
 /* Allocate db_root + free port, write a minimal db.env, fork the daemon,
@@ -44,6 +45,14 @@ int test_pick_port(void);
    wiping db_root afterwards. Populates env->db_root / env->port /
    env->daemon_pid. Returns 0 on success. */
 int test_env_start_at(TestEnv *env, const char *db_root, int port);
+
+/* Deterministic TEST_BUILD daemon seam. Each operation returns 0 on a
+   complete protocol exchange and -1 on EOF, malformed framing, or I/O error.
+   `wait` blocks until the daemon-side hook reports the requested phase. */
+int test_env_test_hook_install(TestEnv *env);
+int test_env_test_hook_wait(TestEnv *env, int *out_under_kf_wrlock);
+int test_env_test_hook_release(TestEnv *env);
+int test_env_test_hook_clear(TestEnv *env);
 
 /* SIGKILL the daemon immediately and reap. Does NOT clean up db_root.
    Mirrors a crash — no graceful drain, no in-flight write completion.

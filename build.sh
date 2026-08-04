@@ -145,6 +145,16 @@ esac
 gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c src/cli/conn.c -Isrc/cli $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS $NCURSES_LDFLAGS -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-cli
 
+# shard-db-test-server — TEST_BUILD-only daemon for deterministic
+# cross-process test control. Same source list as the production shard-db
+# target plus src/db/test_control.c, compiled with -DTEST_BUILD (which also
+# enables the slotcask pause-hook seam). Test fixtures prefer this binary so
+# TCP cases reach the deterministic seam; the production shard-db binary and
+# its flags are never built from TEST_BUILD.
+gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test-server \
+    src/db/util.c src/db/durability.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/type_desc.c src/db/nql.c src/db/embedded.c src/db/test_control.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+[ "$DO_STRIP" = 1 ] && strip shard-db-test-server
+
 # shard-db-test — TAP-style C test runner. Links daemon's JSON helpers
 # (src/db/util.c) for response parsing; otherwise self-contained (TCP/TLS
 # client + assertion macros + per-test daemon fixtures). Future test cases
@@ -342,6 +352,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_nql_order_by_direction.c \
     src/test/cases/test_json_aggregate_order_case.c \
     src/test/cases/test_runner_parallel.c \
+    src/test/cases/test_update_partial_concurrent.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \
@@ -447,7 +458,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli shard-db-test shard-db-bench migrate build/bin/
+cp shard-db shard-cli shard-db-test shard-db-test-server shard-db-bench migrate build/bin/
 cp src/db/shard_db.h build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids

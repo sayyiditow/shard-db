@@ -179,6 +179,19 @@ void segcache_release(SlotcaskSegHandle *h);
 int  segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
                               const char *path);
 
+/* Deterministic TEST_BUILD-only pause hook for the single-partial-update
+   regression seam. Installed by the daemon's test-control thread on an
+   INSTALL message; fires at most once per install (the invocation takes and
+   clears the stored pair atomically). `under_kf_wrlock` distinguishes the
+   pre-fix stale-snapshot site (0) from the fixed under-lock callback site
+   (1) so the test never relies on timing. Never present in production
+   builds; no production code calls it. */
+#ifdef TEST_BUILD
+typedef void (*slotcask_test_after_old_fn)(int under_kf_wrlock, void *ctx);
+void slotcask_test_set_after_old_hook(slotcask_test_after_old_fn fn, void *ctx);
+void slotcask_test_after_old(int under_kf_wrlock);
+#endif
+
 #ifdef TEST_BUILD
 void segcache_test_force_identity_mismatches(int count);
 int  segcache_test_identity_mismatches_remaining(void);
@@ -417,6 +430,26 @@ typedef struct {
 /* Return 1 to proceed; 0 to abort with condition_not_met. NULL = always proceed. */
 typedef int (*slotcask_check_fn)(const SlotcaskOldRecord *old, void *ctx);
 
+/* Opt-in NEW-from-OLD constructor for the upsert path. When
+   SlotcaskUpsertOpts.new_from_old is non-NULL, the slow upsert path builds
+   the replacement record from the OLD bytes it reads while holding the
+   kf-shard write lock, instead of trusting the caller's earlier snapshot.
+   The callback runs after the built-in if_not_exists / require_existing /
+   check gates have accepted the current OLD, and before segment
+   reservation, segment writing, or pre_commit. The caller's earlier
+   'value'/'vlen' are ignored in this mode. Output contract: '*out_vlen'
+   must be 0 unless the callback sets it, and '*out_vlen <= out_capacity'
+   is mandatory (the upsert path re-checks the final record-header/key/
+   value size before reservation). Return 0 to commit the produced bytes;
+   any non-zero return aborts the update without reserving a segment or
+   tombstoning anything. The callback must not perform network I/O or
+   re-enter the database. */
+typedef int (*slotcask_new_from_old_fn)(const SlotcaskOldRecord *old,
+                                         uint8_t *out_value,
+                                         size_t out_capacity,
+                                         size_t *out_vlen,
+                                         void *ctx);
+
 /* Return 0 to commit; non-zero to abort. NULL = always commit. */
 typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
                                        const uint8_t *new_value, size_t new_vlen,
@@ -467,6 +500,12 @@ typedef struct {
     int                       check_needs_old;
     slotcask_check_fn         check;
     void                     *check_ctx;
+    /* Opt-in NEW-from-OLD constructor (see slotcask_new_from_old_fn). When
+       set, the slow upsert path is forced and the supplied 'value'/'vlen'
+       are ignored — the callback produces the replacement from the OLD the
+       upsert reads under the kf-shard wrlock. NULL = existing behavior. */
+    slotcask_new_from_old_fn  new_from_old;
+    void                     *new_from_old_ctx;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
     /* Two-phase hooks — required together for a fresh indexed insert that

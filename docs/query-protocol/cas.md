@@ -85,7 +85,7 @@ Combine `auto_update` with a `version:long:default=seq(version_counter)` field t
 }
 ```
 
-On success the server bumps `version` via the sequence, and `updated` via `auto_update`. On conflict, the client reads the current record, reconciles, and retries with the new version.
+On success `updated` is bumped via `auto_update`, but `version` is **not** — `default=seq(...)` only evaluates on **insert**, so an update never implicitly re-runs it. Update CAS revisions must be explicitly supplied or incremented by the caller, as shown above (`{"value":{"version":18}}`), or by a separately implemented update policy (e.g. an `auto_update` counter field). On conflict, the client reads the current record, reconciles, and retries with the new version.
 
 ## Pattern: claim-once
 

@@ -105,7 +105,7 @@ A single field can carry at most one of: `default=...`, `auto_create`, `auto_upd
 ]
 ```
 
-Combined with `{"mode":"update", "if":{"version":42}}` gives you optimistic concurrency control without app-side locking.
+Combined with `{"mode":"update", "if":{"version":42}}` gives you optimistic concurrency control without app-side locking. The `default=seq(version_counter)` runs on **insert only** — an update never re-runs the insert default, so the CAS revision must be supplied or incremented explicitly by the caller (e.g. by `{"value":{"version":43}}`), or by a separately implemented update policy.
 
 ## On-disk encoding
 

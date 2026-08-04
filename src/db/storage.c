@@ -1087,12 +1087,14 @@ int cmd_insert(const char *db_root, const char *object,
 
 /* ========== PARTIAL UPDATE — v2 (slotcask) helper ==========
  *
- * Two-phase: slotcask_get → apply partial → upsert(require_existing=1) with a
- * pre_commit hook that diffs old vs new typed records for index updates.
- * The two reads of OLD (one outside the wrlock to compute new, one inside
- * the wrlock that the upsert handles) introduce a tiny last-writer-wins race
- * window vs v1's full-shard wrlock. Acceptable for partial-update workloads;
- * documented behavior change.
+ * Single-lock construction: upsert(require_existing=1) with a
+ * new_from_old callback that rebuilds NEW from the OLD record already read
+ * under the kf-shard wrlock, an inline check_fn that enforces the `if`
+ * criteria, and a pre_commit hook that diffs old vs new typed records for
+ * index updates. No outside-lock OLD snapshot exists, so a concurrent
+ * partial update cannot resurrect stale fields (atomic single updates).
+ * dry_run is the only path that still reads OLD up-front — race-tolerant
+ * since it writes nothing.
  */
 typedef struct {
     const char       *db_root;
@@ -1103,6 +1105,9 @@ typedef struct {
     int               nidx;
     enum IndexType   *idx_types;        /* parallel to idx_fields[] */
     TypedSchema      *idx_ts;
+    /* Raw partial-update field JSON, parsed inside the lock-protected
+       new_from_old callback (v2_update_new_from_old). */
+    const char       *partial_json;
     /* CAS criteria — verified inside check_fn under the kf-shard wrlock
        so the check + commit are atomic against concurrent writers. NULL
        when the caller didn't pass `if`. */
@@ -1112,9 +1117,120 @@ typedef struct {
        by physical slot, not by hash). */
     int               kf_shard;
     uint32_t          kf_slot;
-    /* Populated by pre_commit on bitmap-index cap overflow. */
+    /* Populated by pre_commit on bitmap-index cap overflow, and by
+       v2_update_new_from_old for malformed-escape / varchar-overflow
+       rejections. */
     char              err_buf[256];
 } V2UpdateCtx;
+
+/* NEW-from-OLD constructor for single partial updates. Runs inside
+   upsert_slow_path while the kf-shard write lock is held, after
+   if_not_exists / require_existing / check have accepted the current OLD —
+   so the replacement is built from the same OLD that the commit will
+   overwrite, never from a stale caller-side snapshot. Copies every
+   untouched field, applies only fields present in the request, preserves
+   removed fields, and stamps auto_update fields exactly once. */
+static int v2_update_new_from_old(const SlotcaskOldRecord *old,
+                                  uint8_t *out_value,
+                                  size_t out_capacity,
+                                  size_t *out_vlen,
+                                  void *ctx_ptr) {
+    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
+    if (!old || !out_value || !out_vlen || old->vlen > out_capacity) return -1;
+#ifdef TEST_BUILD
+    /* Fixed-path seam: deterministic pause at the top of the under-lock
+       callback, after OLD has been received. Reports under_kf_wrlock == 1. */
+    slotcask_test_after_old(1);
+#endif
+    memcpy(out_value, old->value, old->vlen);
+    *out_vlen = old->vlen;
+
+    /* Build new typed buffer = copy of old, with partial fields applied. */
+    const char *field_names[MAX_FIELDS];
+    char *field_vals[MAX_FIELDS] = {0};
+    enum FieldType field_types[MAX_FIELDS];
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        field_names[i] = c->idx_ts->fields[i].name;
+        field_types[i] = c->idx_ts->fields[i].type;
+    }
+    if (json_get_fields_unescaped(c->partial_json, field_names,
+                                  c->idx_ts->nfields, field_types,
+                                  field_vals) != 0) {
+        /* At least one field the client explicitly named had a malformed
+           JSON escape. Reject the whole update rather than silently
+           applying every other field and dropping this one — a partial
+           write here would look like success to the caller. */
+        for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
+        snprintf(c->err_buf, sizeof(c->err_buf),
+                 "malformed JSON escape in one or more field values");
+        return -1;
+    }
+
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        if (field_vals[i]) {
+            if (!c->idx_ts->fields[i].removed) {
+                if (c->idx_ts->fields[i].type == FT_VARCHAR) {
+                    int content_max = c->idx_ts->fields[i].size - 2;
+                    size_t vlen = strlen(field_vals[i]);
+                    if ((int)vlen > content_max) {
+                        snprintf(c->err_buf, sizeof(c->err_buf),
+                            "value for field '%s' is %zu bytes; exceeds max %d for varchar",
+                            c->idx_ts->fields[i].name, vlen, content_max);
+                        free(field_vals[i]);
+                        for (int j = i + 1; j < c->idx_ts->nfields; j++)
+                            free(field_vals[j]);
+                        return -1;
+                    }
+                }
+                encode_field(&c->idx_ts->fields[i], field_vals[i],
+                             out_value + c->idx_ts->fields[i].offset);
+            }
+            free(field_vals[i]);
+        }
+    }
+
+    /* auto_update fields: stamp current value on every update.
+       Each typed type gets its appropriate now-form:
+         FT_DATE      — yyyyMMdd (8-char int32 packed)
+         FT_TIMESTAMP — Unix epoch ms (int64 BE; 2026.05.6+)
+         everything else — yyyyMMddHHmmss (FT_DATETIME / fallback) */
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        if (c->idx_ts->fields[i].removed) continue;
+        if (c->idx_ts->fields[i].default_kind != DK_AUTO_UPDATE) continue;
+
+        char tbuf[24];
+        if (c->idx_ts->fields[i].type == FT_TIMESTAMP) {
+            struct timespec tsn;
+            clock_gettime(CLOCK_REALTIME, &tsn);
+            long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
+            snprintf(tbuf, sizeof(tbuf), "%lld", ms);
+        } else if (c->idx_ts->fields[i].type == FT_DATETIMEMS) {
+            struct timespec tsn;
+            clock_gettime(CLOCK_REALTIME, &tsn);
+            time_t nowsec = tsn.tv_sec;
+            struct tm tmv;
+            localtime_r(&nowsec, &tmv);
+            int msec = (int)(tsn.tv_nsec / 1000000L);
+            snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
+                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msec);
+        } else {
+            time_t now = time(NULL);
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            if (c->idx_ts->fields[i].type == FT_DATE)
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
+                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+            else
+                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
+                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        }
+        encode_field(&c->idx_ts->fields[i], tbuf,
+                     out_value + c->idx_ts->fields[i].offset);
+    }
+    return 0;
+}
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
@@ -1309,14 +1425,23 @@ static int cmd_update_v2(const char *db_root, const char *object,
         sdb->trim_ctx = (void *)ts;
     }
 
-    void *old_val = NULL; size_t old_vlen = 0;
-    if (slotcask_get(sdb, key, klen, &old_val, &old_vlen) != 0) {
-        OUT("{\"error\":\"Not found\"}\n");
-        return 1;
-    }
-
-    /* dry_run validates criteria but doesn't write — race-tolerant. */
+    /* dry_run validates criteria but doesn't write — race-tolerant. It is
+       the only remaining user of the up-front slotcask_get snapshot: a
+       normal update builds NEW from the lock-protected OLD inside
+       v2_update_new_from_old instead, so no stale outside-lock snapshot
+       exists for the race to be lost against. */
     if (dry_run) {
+        void *old_val = NULL; size_t old_vlen = 0;
+        if (slotcask_get(sdb, key, klen, &old_val, &old_vlen) != 0) {
+            OUT("{\"error\":\"Not found\"}\n");
+            return 1;
+        }
+#ifdef TEST_BUILD
+        /* TEST_BUILD seam retained for dry_run only: fires on dry-run
+           updates in the fixed code (normal updates pause at the top of
+           v2_update_new_from_old, under_kf_wrlock == 1). */
+        slotcask_test_after_old(0);
+#endif
         if (if_json) {
             SearchCriterion *crit = NULL; int ncrit = 0;
             if (parse_criteria_json(if_json, &crit, &ncrit) != 0) {
@@ -1341,96 +1466,17 @@ static int cmd_update_v2(const char *db_root, const char *object,
         return 0;
     }
 
-    /* Build new typed buffer = copy of old, with partial fields applied. */
-    uint8_t *new_buf = malloc(old_vlen);
-    if (!new_buf) {
-        free(old_val);
-        OUT("{\"error\":\"oom\"}\n"); return 1;
-    }
-    memcpy(new_buf, old_val, old_vlen);
-    free(old_val);
-
-    const char *field_names[MAX_FIELDS];
-    char *field_vals[MAX_FIELDS] = {0};
-    enum FieldType field_types[MAX_FIELDS];
-    for (int i = 0; i < ts->nfields; i++) {
-        field_names[i] = ts->fields[i].name;
-        field_types[i] = ts->fields[i].type;
-    }
-    if (json_get_fields_unescaped(partial_json, field_names, ts->nfields, field_types, field_vals) != 0) {
-        /* At least one field the client explicitly named had a malformed
-           JSON escape. Reject the whole update rather than silently
-           applying every other field and dropping this one — a partial
-           write here would look like success to the caller. */
-        for (int i = 0; i < ts->nfields; i++) free(field_vals[i]);
-        free(new_buf);
-        OUT("{\"error\":\"malformed JSON escape in one or more field values\"}\n");
+    /* Parse `if` once before the lock-protected callback; check_fn runs
+       cas_check under the kf-shard wrlock so the verify + commit are atomic
+       against concurrent writers. Note the intentional precedence shift:
+       when both the partial field JSON and the `if` criteria are invalid,
+       this now reports "invalid if condition" first — the field parsing
+       happens inside the callback under the lock. */
+    SearchCriterion *crit = NULL;
+    int ncrit = 0;
+    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+        OUT("{\"error\":\"invalid if condition\"}\n");
         return 1;
-    }
-
-    for (int i = 0; i < ts->nfields; i++) {
-        if (field_vals[i]) {
-            if (!ts->fields[i].removed) {
-                if (ts->fields[i].type == FT_VARCHAR) {
-                    int content_max = ts->fields[i].size - 2;
-                    size_t vlen = strlen(field_vals[i]);
-                    if ((int)vlen > content_max) {
-                        char err[256];
-                        snprintf(err, sizeof(err),
-                            "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                            ts->fields[i].name, vlen, content_max);
-                        free(field_vals[i]);
-                        for (int j = i + 1; j < ts->nfields; j++) free(field_vals[j]);
-                        free(new_buf);
-                        OUT("{\"error\":\"%s\"}\n", err);
-                        return 1;
-                    }
-                }
-                encode_field(&ts->fields[i], field_vals[i],
-                             new_buf + ts->fields[i].offset);
-            }
-            free(field_vals[i]);
-        }
-    }
-
-    /* auto_update fields: stamp current value on every update.
-       Each typed type gets its appropriate now-form:
-         FT_DATE      — yyyyMMdd (8-char int32 packed)
-         FT_TIMESTAMP — Unix epoch ms (int64 BE; 2026.05.6+)
-         everything else — yyyyMMddHHmmss (FT_DATETIME / fallback) */
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed) continue;
-        if (ts->fields[i].default_kind != DK_AUTO_UPDATE) continue;
-
-        char tbuf[24];
-        if (ts->fields[i].type == FT_TIMESTAMP) {
-            struct timespec tsn;
-            clock_gettime(CLOCK_REALTIME, &tsn);
-            long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
-            snprintf(tbuf, sizeof(tbuf), "%lld", ms);
-        } else if (ts->fields[i].type == FT_DATETIMEMS) {
-            struct timespec tsn;
-            clock_gettime(CLOCK_REALTIME, &tsn);
-            time_t nowsec = tsn.tv_sec;
-            struct tm tmv;
-            localtime_r(&nowsec, &tmv);
-            int msec = (int)(tsn.tv_nsec / 1000000L);
-            snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d%03d",
-                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msec);
-        } else {
-            time_t now = time(NULL);
-            struct tm tmv;
-            localtime_r(&now, &tmv);
-            if (ts->fields[i].type == FT_DATE)
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
-                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
-            else
-                snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d%02d%02d%02d",
-                         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-        }
-        encode_field(&ts->fields[i], tbuf, new_buf + ts->fields[i].offset);
     }
 
     char idx_fields[MAX_FIELDS][256];
@@ -1440,21 +1486,12 @@ static int cmd_update_v2(const char *db_root, const char *object,
     enum IndexType idx_types[MAX_FIELDS];
     load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
-    /* Parse `if` once; check_fn runs cas_check under the kf-shard wrlock
-       so the verify + commit are atomic against concurrent writers. */
-    SearchCriterion *crit = NULL;
-    int ncrit = 0;
-    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
-        free(new_buf);
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        return 1;
-    }
-
     V2UpdateCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
         .idx_fields = idx_fields, .nidx = nidx,
         .idx_types = idx_types,
         .idx_ts = ts,
+        .partial_json = partial_json,
         .crit = crit, .ncrit = ncrit,
     };
     compute_hash_raw(key, klen, ctx.hash);
@@ -1463,6 +1500,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .require_existing = 1,
         .check            = v2_update_check_fn,
         .check_ctx        = &ctx,
+        .new_from_old     = v2_update_new_from_old,
+        .new_from_old_ctx = &ctx,
         .pre_commit       = v2_update_pre_commit,
         .pre_commit_ctx   = &ctx,
         .out_kf_shard     = &ctx.kf_shard,
@@ -1472,9 +1511,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
     SlotcaskUpsertResult result = {0};
     uint64_t _commit_t0 = now_us();
     int rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
-                                        new_buf, old_vlen, &opts, &result);
+                                        NULL, 0, &opts, &result);
     commit_lock_hold_record(_commit_t0, db_root, object);
-    free(new_buf);
 
     if (rc == -2) {
         /* Either require_existing fired (record vanished) or check_fn
