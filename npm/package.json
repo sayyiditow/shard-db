@@ -28,7 +28,8 @@
     "prebuildify": "^6.0.1"
   },
   "dependencies": {
-    "node-gyp-build": "^4.8.4"
+    "node-gyp-build": "^4.8.4",
+    "undici": "^8.10.0"
   },
   "engines": {
     "node": ">=18.0.0",
