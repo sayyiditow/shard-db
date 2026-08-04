@@ -613,8 +613,10 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
  *   BEFORE kf is committed for the window's surviving records. Performs
  *   the actual index mutations for every record in active[]. A non-zero
  *   return is always a genuine failure (I/O/OOM), never a policy
- *   rejection — routed through the existing degraded/replay path,
- *   unchanged.
+ *   rejection. The primitive durably writes an abort sidecar, applies the
+ *   inverse index diff, tombstones speculative NEW segments, rejects the
+ *   window, and returns the original error; it never publishes Kf for that
+ *   failed window or reports durability_degraded.
  *
  * abort_window — fires instead of apply_window when the window's batch
  *   marker never became durable (marker alloc/open/fsync failed, or every
@@ -672,25 +674,51 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
 /* ============================================================ Bulk delete
  *
  * Same shape as bulk_upsert_in_kfshard but for deletes — no NEW value, no
- * seg writes, just kf_tombstone per record + batched seg flag-flips.
+ * seg writes, just indexed forward-diff + kf tombstones + batched seg
+ * flag-flips.
  * 4 phases under one held kf wrlock:
  *   1a. kf_lookup per record. Records not found get status=-2.
  *   1b. Batched OLD reads (sorted by old_sid/old_fid) iff
  *       pre_commit_needs_old=1; otherwise skipped entirely.
- *   2.  Per-record pre_commit hook + kf_tombstone (under wrlock).
+ *   2.  Indexed windows: marker -> forward index diff -> kf tombstone;
+ *       non-indexed callers: per-record pre_commit hook + kf_tombstone.
  *   3.  Post-kf-release: batched seg flag-flips, sorted by (old_sid,
  *       old_fid) — one segcache rdlock per unique seg file.
  *
- * Crash safety: kf_tombstone is the commit point. A crash between
- * kf_tombstone and the seg flag-flip leaves the OLD slot live-looking on
- * disk but unreachable via kf — recovery treats it as orphan free space.
+ * Crash safety: indexed windows write a delete marker before the forward
+ * index diff. An apply failure writes a durable abort sidecar and applies
+ * the inverse, so OLD remains visible. A crash after the Kf tombstone but
+ * before segment cleanup is recovered from the marker; non-indexed deletes
+ * retain the simpler kf-tombstone commit point.
  */
 typedef int (*slotcask_bulk_del_pre_commit_fn)(const SlotcaskOldRecord *old,
                                                 SlotcaskBulkRec *rec);
 
+/* Two-phase, window-scoped hooks for indexed bulk deletes, mirroring the
+ * bulk-upsert window contract exactly. prepare_window — fires once per
+ * window BEFORE the batch delete marker is durable; performs the forward
+ * index diffs (old=OLD, new=NULL) for every active record but must NOT
+ * tombstone kf slots (the primitive does that synchronously after a
+ * successful apply). On apply_window failure the primitive writes the
+ * batch abort sidecar, performs every inverse (old=NULL, new=OLD) while
+ * the kf wrlock is held, rejects the records, and returns the original
+ * apply error only after the sidecar was fsynced. abort_window frees
+ * staging without writing. */
+typedef int (*slotcask_bulk_del_prepare_window_fn)(
+    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx);
+typedef int (*slotcask_bulk_del_apply_window_fn)(
+    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx);
+typedef void (*slotcask_bulk_del_abort_window_fn)(void *ctx);
+
 typedef struct {
-    slotcask_bulk_del_pre_commit_fn pre_commit;
-    int                              pre_commit_needs_old;
+    slotcask_bulk_del_pre_commit_fn       pre_commit;
+    int                                    pre_commit_needs_old;
+    slotcask_bulk_del_prepare_window_fn   prepare_window;
+    slotcask_bulk_del_apply_window_fn     apply_window;
+    slotcask_bulk_del_abort_window_fn     abort_window;
+    void                                  *bulk_hook_ctx;
+    int                                    has_indexed_fields;
+    int                                   *out_durability_degraded;
 } SlotcaskBulkDeleteOpts;
 
 int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
@@ -755,6 +783,22 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
                                 const SlotcaskUpsertOpts *opts,
                                 SlotcaskUpsertResult *result);
 
+/* Two-phase, single-record hooks for indexed deletes, mirroring the upsert
+   window contract. prepare_commit fires after the delete marker is durable,
+   before the kf tombstone, and performs the forward index diff
+   (old=OLD, new=NULL); it must not tombstone the kf slot — the primitive
+   does that synchronously after a successful apply. On apply failure the
+   primitive writes the abort sidecar, performs the inverse (old=NULL,
+   new=OLD) while the kf wrlock is held, rejects the record, and returns the
+   original apply error only after the sidecar was fsynced. abort_commit
+   frees staged resources without writing (optional). Both share
+   pre_commit_ctx. */
+typedef int (*slotcask_delete_prepare_fn)(const SlotcaskOldRecord *old,
+                                          uint32_t kf_slot, void *ctx);
+typedef int (*slotcask_delete_apply_fn)(const SlotcaskOldRecord *old,
+                                        uint32_t kf_slot, void *ctx);
+typedef void (*slotcask_delete_abort_fn)(void *ctx);
+
 typedef struct {
     slotcask_check_fn   check;
     void               *check_ctx;
@@ -775,6 +819,23 @@ typedef struct {
        slot). Existing callers leave these NULL — no behaviour change. */
     int                *out_kf_shard;
     uint32_t           *out_kf_slot;
+    /* Two-phase hooks for indexed deletes, mirroring the upsert window
+       contract. prepare_commit — fires after OLD lookup but BEFORE the
+       delete marker is durable, and may reject/stage policy checks without
+       mutating indexes. apply_commit fires after the marker is durable and
+       performs the forward index diff (old=OLD, new=NULL). It must not
+       tombstone the kf slot; the primitive does that synchronously after a
+       successful apply. On apply failure the primitive writes the abort
+       sidecar, performs the inverse (old=NULL, new=OLD) while holding the
+       kf wrlock, rejects the record, and only then returns the original
+       apply error. abort_commit mirrors slotcask_abort_commit_fn (optional).
+       When has_indexed_fields is set, apply_commit is mandatory and there is
+       no legacy single-phase path. */
+    slotcask_delete_prepare_fn prepare_commit;
+    slotcask_delete_apply_fn   apply_commit;
+    slotcask_delete_abort_fn   abort_commit;
+    int                        has_indexed_fields;
+    int                       *out_durability_degraded;
 } SlotcaskDeleteOpts;
 
 typedef struct {

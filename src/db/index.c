@@ -1,4 +1,27 @@
 #include "types.h"
+
+#ifdef TEST_BUILD
+static _Atomic int g_indexed_abort_fail_after;
+
+void index_test_abort_fail_after(int n) {
+    atomic_store_explicit(&g_indexed_abort_fail_after, n > 0 ? n : 0,
+                          memory_order_release);
+}
+
+static int index_test_should_fail_after_success(void) {
+    int remaining = atomic_load_explicit(&g_indexed_abort_fail_after,
+                                         memory_order_acquire);
+    while (remaining > 0) {
+        if (atomic_compare_exchange_weak_explicit(
+                &g_indexed_abort_fail_after, &remaining, remaining - 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return remaining == 1;
+    }
+    return 0;
+}
+#else
+static int index_test_should_fail_after_success(void) { return 0; }
+#endif
 #include "bitmap.h"
 #include "trigram.h"
 #include "slotcask.h"
@@ -457,6 +480,10 @@ void *update_idx_fn(void *arg) {
                     a->out_errno = errno;
                 }
             }
+            if (!a->out_error && index_test_should_fail_after_success()) {
+                a->out_error = -2;
+                a->out_errno = EIO;
+            }
             break;
 
         case IT_TRIGRAM: {
@@ -519,6 +546,10 @@ void *update_idx_fn(void *arg) {
                     a->out_errno = errno;
                 }
             }
+            if (!a->out_error && index_test_should_fail_after_success()) {
+                a->out_error = -2;
+                a->out_errno = EIO;
+            }
             break;
         }
 
@@ -538,6 +569,10 @@ void *update_idx_fn(void *arg) {
                                          a->new_key, a->new_len,
                                          a->old_key, a->old_len,
                                          a->sync_after);
+            if (!a->out_error && index_test_should_fail_after_success()) {
+                a->out_error = -2;
+                a->out_errno = EIO;
+            }
             break;
     }
     return NULL;
@@ -845,6 +880,10 @@ void *index_thread_fn(void *arg) {
             a->out_error = -2;
             a->out_errno = errno;
         }
+    }
+    if (!a->out_error && index_test_should_fail_after_success()) {
+        a->out_error = -2;
+        a->out_errno = EIO;
     }
     return NULL;
 }

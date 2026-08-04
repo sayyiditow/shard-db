@@ -380,6 +380,10 @@ int load_db_root(char *out, size_t outlen) {
             if (g_db) g_timeout = (uint32_t)atoi(p + 8);
         } else if (strncmp(p, "PORT=", 5) == 0) {
             if (g_db) g_port = atoi(p + 5);
+#ifdef TEST_BUILD
+        } else if (strncmp(p, "INDEXED_ABORT_FAIL_AFTER=", 25) == 0) {
+            index_test_abort_fail_after(atoi(p + 25));
+#endif
         } else if (strncmp(p, "LOG_DIR=", 8) == 0) {
             p += 8;
             if (*p == '"' || *p == '\'') p++;

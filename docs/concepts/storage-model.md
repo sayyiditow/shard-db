@@ -143,6 +143,16 @@ The slotcask engine is "commit on atomic 8B store" — every other byte may be i
 
 On startup, the daemon's `validate_metadata` pass sweeps `.shard-db.lock` (refuses two daemons on one root), validates that every object in `schema.conf` has a `fields.conf` + `data/` tree, and unlinks stale `.new`/`.old` rebuild artifacts.
 
+Indexed writes add a durable commit-intent marker in `data/kf/` before applying
+secondary-index changes. If the process dies before Kf publication, startup
+forward-replays the marker and clears it. If an index apply fails after the
+marker is durable, the writer first persists a matching `*_abort.dat` sidecar;
+recovery then applies the inverse index diff, tombstones speculative NEW segment
+data for upserts, and leaves the OLD record live. Cleanup is ordered marker
+unlink + directory sync, then sidecar unlink + directory sync. A valid orphan
+sidecar is therefore only cleared after its marker is already gone; corrupt or
+mismatched evidence remains in place and fails closed.
+
 ## Caches
 
 Two LRU caches sit between the engine and disk:

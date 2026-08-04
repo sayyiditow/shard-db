@@ -434,6 +434,114 @@ static int append_durability_pause_config(const char *db_root, const char *phase
     return fclose(f);
 }
 
+static int append_index_abort_config(const char *db_root, int fail_after,
+                                     const char *pause_phase) {
+    char base[PATH_MAX], env_path[PATH_MAX];
+    snprintf(base, sizeof(base), "%s", db_root);
+    char *slash = strrchr(base, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(env_path, sizeof(env_path), "%s/db.env", base);
+    FILE *f = fopen(env_path, "a");
+    if (!f) return -1;
+    fprintf(f, "export INDEXED_ABORT_FAIL_AFTER=%d\n"
+               "export DURABILITY_TEST_PAUSE_PHASE=%s\n"
+               "export DURABILITY_TEST_PAUSE_MS=30000\n",
+            fail_after, pause_phase ? pause_phase : "disabled");
+    return fclose(f);
+}
+
+static int create_abort_matrix_object(TestEnv *env, const char *object,
+                                      const char *index_spec,
+                                      const char *initial_value) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char *resp = NULL;
+    if (tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}",
+                   &resp) != 0) {
+        free(resp); tc_close(tc); return -1;
+    }
+    free(resp); resp = NULL;
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"create-object\",\"dir\":\"default\","
+        "\"object\":\"%s\",\"splits\":8,\"streams\":1,\"max_key\":16,"
+        "\"fields\":[\"score:int\",\"title:varchar:64\",\"cat:varchar:8\"],"
+        "\"indexes\":[\"%s\"]}", object, index_spec);
+    if (tc_request(tc, req, &resp) != 0 ||
+        !SAFE_STRSTR(resp, "\"status\":\"created\"")) {
+        free(resp); tc_close(tc); return -1;
+    }
+    free(resp); resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"%s\","
+        "\"key\":\"failure-key\",\"value\":{\"score\":1,"
+        "\"title\":\"%s\",\"cat\":\"%s\"}}",
+        object, initial_value, initial_value);
+    int rc = tc_request(tc, req, &resp) == 0 &&
+             SAFE_STRSTR(resp, "\"status\":\"inserted\"") ? 0 : -1;
+    free(resp); tc_close(tc);
+    return rc;
+}
+
+static pid_t trigger_indexed_update(TestEnv *env, const char *object,
+                                    const char *field, const char *value) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) _exit(2);
+    char req[768], *resp = NULL;
+    if (strcmp(field, "score") == 0) {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"update\",\"dir\":\"default\","
+            "\"object\":\"%s\",\"key\":\"failure-key\","
+            "\"value\":{\"score\":%s}}", object, value);
+    } else {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"update\",\"dir\":\"default\","
+            "\"object\":\"%s\",\"key\":\"failure-key\","
+            "\"value\":{\"%s\":\"%s\"}}", object, field, value);
+    }
+    int rc = tc_request(tc, req, &resp);
+    free(resp); tc_close(tc);
+    _exit(rc == 0 ? 0 : 3);
+}
+
+static pid_t trigger_indexed_delete(TestEnv *env, const char *object) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) _exit(2);
+    char req[768], *resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"delete\",\"dir\":\"default\","
+        "\"object\":\"%s\",\"key\":\"failure-key\"}", object);
+    int rc = tc_request(tc, req, &resp);
+    free(resp); tc_close(tc);
+    _exit(rc == 0 ? 0 : 3);
+}
+
+static int request_indexed_count(TestEnv *env, const char *object,
+                                 const char *field, const char *op,
+                                 const char *value) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[768], *resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
+        "\"criteria\":[{\"field\":\"%s\",\"op\":\"%s\","
+        "\"value\":\"%s\"}]}", object, field, op, value);
+    int result = -1;
+    if (tc_request(tc, req, &resp) == 0) result = tu_parse_count(resp);
+    free(resp); tc_close(tc);
+    return result;
+}
+
 static int wait_for_path(const char *path, int timeout_ms) {
     for (int elapsed = 0; elapsed < timeout_ms; elapsed += 20) {
         if (access(path, F_OK) == 0) return 0;
@@ -895,6 +1003,256 @@ static int test_durability_bulk_window_applied_recovers(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* Apply failure after one durable index mutation must take the abort path,
+   not the old forward-replay path. Keep the three index implementations as
+   separate rows: a shared fixture can otherwise hide a missing dispatch or
+   an incomplete inverse in one of them. */
+static int test_durability_index_apply_abort_matrix(void) {
+    struct {
+        const char *object;
+        const char *index_spec;
+        const char *field;
+        const char *old_value;
+        const char *new_value;
+        const char *op;
+    } rows[] = {
+        { "abortbtree", "score", "score", "1", "2", "eq" },
+        { "aborttrigram", "title:trigram", "title", "old", "newneedle", "contains" },
+        { "abortbitmap", "cat:bitmap(64)", "cat", "old", "newcat", "eq" },
+    };
+
+    for (size_t ri = 0; ri < sizeof(rows) / sizeof(rows[0]); ri++) {
+        TestEnv env = {0};
+        ASSERT_EQ_INT(test_env_start(&env), 0, "start abort-matrix daemon");
+        if (env.daemon_pid <= 0) continue;
+
+        ASSERT_EQ_INT(create_abort_matrix_object(&env, rows[ri].object,
+                                                 rows[ri].index_spec, "old"), 0,
+                      "create single-index abort fixture");
+        int saved_port = env.port;
+        char saved_db_root[PATH_MAX];
+        snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
+        test_env_stop_keep(&env);
+
+        ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 1,
+                                                "abort-sidecar-after-fsync"), 0,
+                      "enable deterministic post-index failure");
+        ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                      "restart with deterministic index failure enabled");
+        if (env.daemon_pid <= 0) continue;
+
+        uint8_t hash[16];
+        compute_hash_raw("failure-key", strlen("failure-key"), hash);
+        int kf_shard = compute_record_shard(hash, 8);
+        char pause_path[PATH_MAX], marker_path[PATH_MAX], sidecar_path[PATH_MAX];
+        snprintf(pause_path, sizeof(pause_path),
+                 "%s/default/%s/.durability-test-abort-sidecar-after-fsync.active",
+                 saved_db_root, rows[ri].object);
+        snprintf(marker_path, sizeof(marker_path),
+                 "%s/default/%s/data/kf/%03x_marker.dat", saved_db_root,
+                 rows[ri].object, (unsigned)kf_shard);
+        snprintf(sidecar_path, sizeof(sidecar_path),
+                 "%s/default/%s/data/kf/%03x_marker_abort.dat", saved_db_root,
+                 rows[ri].object, (unsigned)kf_shard);
+
+        pid_t update_pid = trigger_indexed_update(&env, rows[ri].object,
+                                                   rows[ri].field,
+                                                   rows[ri].new_value);
+        ASSERT_TRUE(update_pid > 0, "spawn update that will fail after index apply");
+        int pause_rc = wait_for_path(pause_path, 5000);
+        ASSERT_EQ_INT(pause_rc, 0,
+                      "update reaches durable abort-sidecar pause");
+        if (pause_rc == 0) {
+            ASSERT_EQ_INT(access(marker_path, F_OK), 0,
+                           "forward marker remains paired with abort sidecar");
+            ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
+                           "abort sidecar is durable before the error returns");
+            test_env_kill(&env);
+            unlink(pause_path);
+        }
+        if (update_pid > 0) waitpid(update_pid, NULL, 0);
+
+        ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
+                      "disable failure injection before recovery");
+        ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                      "restart and recover the pinned abort");
+        if (env.daemon_pid <= 0) continue;
+
+        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
+                                            rows[ri].field, rows[ri].op,
+                                            rows[ri].old_value), 1,
+                      "old index entry remains visible after abort recovery");
+        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
+                                            rows[ri].field, rows[ri].op,
+                                            rows[ri].new_value), 0,
+                      "new index entry is absent after abort recovery");
+
+        TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+        TestClient *tc = tc_connect(&cfg);
+        ASSERT_NOT_NULL(tc, "connect after abort recovery");
+        if (tc) {
+            char req[768], *resp = NULL;
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"get\",\"dir\":\"default\","
+                "\"object\":\"%s\",\"key\":\"failure-key\"}",
+                rows[ri].object);
+            ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
+                          "direct get succeeds after abort recovery");
+            if (strcmp(rows[ri].field, "score") == 0)
+                ASSERT_CONTAINS(resp, "\"score\":1", "direct get retained old score");
+            else if (strcmp(rows[ri].field, "title") == 0)
+                ASSERT_CONTAINS(resp, "\"title\":\"old\"", "direct get retained old title");
+            else
+                ASSERT_CONTAINS(resp, "\"cat\":\"old\"", "direct get retained old category");
+            free(resp);
+            tc_close(tc);
+        }
+
+        pid_t retry_pid = trigger_indexed_update(&env, rows[ri].object,
+                                                  rows[ri].field,
+                                                  rows[ri].new_value);
+        ASSERT_TRUE(retry_pid > 0, "retry after orphan-sidecar recovery starts");
+        if (retry_pid > 0) {
+            int retry_status = 0;
+            waitpid(retry_pid, &retry_status, 0);
+            ASSERT_TRUE(WIFEXITED(retry_status) && WEXITSTATUS(retry_status) == 0,
+                        "retry after recovery commits normally");
+        }
+        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
+                                            rows[ri].field, rows[ri].op,
+                                            rows[ri].new_value), 1,
+                      "retry publishes the new index entry exactly once");
+        test_env_stop(&env);
+    }
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* A single indexed delete uses the same durable abort decision as an
+   upsert, but its inverse must re-insert the OLD index entry and leave the
+   OLD segment live. Exercise that path across a crash while the sidecar is
+   paired with the forward marker. */
+static int test_durability_index_delete_abort(void) {
+    TestEnv env = {0};
+    ASSERT_EQ_INT(test_env_start(&env), 0, "start indexed-delete abort daemon");
+    if (env.daemon_pid <= 0) return 1;
+
+    ASSERT_EQ_INT(create_abort_matrix_object(&env, "abortdelete", "score", "old"), 0,
+                  "create indexed-delete abort fixture");
+    int saved_port = env.port;
+    char saved_db_root[PATH_MAX];
+    snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
+    test_env_stop_keep(&env);
+
+    ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 1,
+                                            "abort-sidecar-after-fsync"), 0,
+                  "enable deterministic delete index failure");
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart indexed-delete fixture with failure enabled");
+    if (env.daemon_pid <= 0) return 1;
+
+    uint8_t hash[16];
+    compute_hash_raw("failure-key", strlen("failure-key"), hash);
+    int kf_shard = compute_record_shard(hash, 8);
+    char pause_path[PATH_MAX], marker_path[PATH_MAX], sidecar_path[PATH_MAX];
+    snprintf(pause_path, sizeof(pause_path),
+             "%s/default/abortdelete/.durability-test-abort-sidecar-after-fsync.active",
+             saved_db_root);
+    snprintf(marker_path, sizeof(marker_path),
+             "%s/default/abortdelete/data/kf/%03x_marker.dat", saved_db_root,
+             (unsigned)kf_shard);
+    snprintf(sidecar_path, sizeof(sidecar_path),
+             "%s/default/abortdelete/data/kf/%03x_marker_abort.dat", saved_db_root,
+             (unsigned)kf_shard);
+
+    pid_t delete_pid = trigger_indexed_delete(&env, "abortdelete");
+    ASSERT_TRUE(delete_pid > 0, "spawn delete that will fail after index apply");
+    int pause_rc = wait_for_path(pause_path, 5000);
+    ASSERT_EQ_INT(pause_rc, 0, "delete reaches durable abort-sidecar pause");
+    if (pause_rc == 0) {
+        ASSERT_EQ_INT(access(marker_path, F_OK), 0,
+                       "delete marker remains paired with abort sidecar");
+        ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
+                       "delete abort sidecar is durable before the error returns");
+        test_env_kill(&env);
+        unlink(pause_path);
+    }
+    if (delete_pid > 0) waitpid(delete_pid, NULL, 0);
+
+    ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
+                  "disable delete failure injection before recovery");
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart and recover indexed delete abort");
+    if (env.daemon_pid <= 0) return 1;
+
+    ASSERT_EQ_INT(request_indexed_count(&env, "abortdelete", "score", "eq", "1"), 1,
+                  "delete abort recovery restores the OLD index entry");
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect after indexed-delete abort recovery");
+    if (tc) {
+        char *resp = NULL;
+        ASSERT_EQ_INT(tc_request(tc,
+            "{\"mode\":\"get\",\"dir\":\"default\","
+            "\"object\":\"abortdelete\",\"key\":\"failure-key\"}",
+            &resp), 0, "direct get succeeds after indexed-delete abort recovery");
+        ASSERT_CONTAINS(resp, "\"score\":1", "delete abort leaves OLD record live");
+        free(resp);
+        tc_close(tc);
+    }
+
+    pid_t retry_pid = trigger_indexed_delete(&env, "abortdelete");
+    ASSERT_TRUE(retry_pid > 0, "retry indexed delete after recovery starts");
+    if (retry_pid > 0) {
+        int retry_status = 0;
+        waitpid(retry_pid, &retry_status, 0);
+        ASSERT_TRUE(WIFEXITED(retry_status) && WEXITSTATUS(retry_status) == 0,
+                    "retry indexed delete commits normally");
+    }
+    ASSERT_EQ_INT(request_indexed_count(&env, "abortdelete", "score", "eq", "1"), 0,
+                  "retry removes the OLD index entry exactly once");
+    test_env_stop(&env);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* An abort sidecar can outlive its marker after the binding cleanup step 2.
+   The next indexed bulk operation must discover and validate that orphan
+   before reusing batch id 0, rather than truncating it as a new marker. */
+static int test_durability_orphan_batch_sidecar_gate(void) {
+    TestEnv env = {0};
+    ASSERT_EQ_INT(test_env_start(&env), 0, "start orphan-sidecar gate daemon");
+    if (env.daemon_pid <= 0) return 1;
+    ASSERT_EQ_INT(create_abort_matrix_object(&env, "orphanbatch", "score", "old"), 0,
+                  "create orphan-sidecar gate fixture");
+
+    char keys[1][32];
+    int next_candidate = 0;
+    ASSERT_EQ_INT(pick_same_shard_keys(8, 0, &next_candidate, keys, 1), 0,
+                  "pick key for batch shard zero");
+    char object_root[PATH_MAX], sidecar_path[PATH_MAX];
+    snprintf(object_root, sizeof(object_root), "%s/default/orphanbatch", env.db_root);
+    snprintf(sidecar_path, sizeof(sidecar_path),
+             "%s/data/kf/000_batch_0_abort.dat", object_root);
+    ASSERT_EQ_INT(kf_abort_write_sidecar(object_root, KF_ABORT_BATCH, 0, 0, 1), 0,
+                  "create valid orphan batch sidecar");
+    ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
+                  "orphan sidecar exists before batch-id reuse");
+
+    pid_t bulk_pid = trigger_bulk_insert(&env, "orphanbatch", keys, 1);
+    ASSERT_TRUE(bulk_pid > 0, "spawn indexed bulk write that reuses batch id zero");
+    if (bulk_pid > 0) {
+        int status = 0;
+        waitpid(bulk_pid, &status, 0);
+        ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                    "bulk write succeeds after clearing validated orphan sidecar");
+    }
+    ASSERT_TRUE(access(sidecar_path, F_OK) != 0,
+                "validated orphan sidecar is cleared before batch-id reuse");
+    ASSERT_EQ_INT(request_count(&env, "orphanbatch"), 2,
+                  "bulk write remains visible after orphan-sidecar gate");
+    test_env_stop(&env);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 /* 5) Window-boundary: route 257 indexed records (single shard, so they span
    two commit windows since BULK_COMMIT_MAX_RECORDS=256) through one
    bulk-insert call, pausing right after the first window's marker is
@@ -1085,5 +1443,8 @@ TEST_REGISTER("test-durability-corrupt-marker-policy", test_durability_corrupt_m
 TEST_REGISTER("test-durability-bulk-marker-recovers", test_durability_bulk_marker_recovers)
 TEST_REGISTER("test-durability-bulk-window-prepared-recovers", test_durability_bulk_window_prepared_recovers)
 TEST_REGISTER("test-durability-bulk-window-applied-recovers", test_durability_bulk_window_applied_recovers)
+TEST_REGISTER("test-durability-index-apply-abort-matrix", test_durability_index_apply_abort_matrix)
+TEST_REGISTER("test-durability-index-delete-abort", test_durability_index_delete_abort)
+TEST_REGISTER("test-durability-orphan-batch-sidecar-gate", test_durability_orphan_batch_sidecar_gate)
 TEST_REGISTER("test-durability-bulk-window-boundary", test_durability_bulk_window_boundary)
 TEST_REGISTER("test-durability-bulk-window-boundary-mixed-indexes", test_durability_bulk_window_boundary_mixed_indexes)

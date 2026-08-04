@@ -1121,6 +1121,10 @@ typedef struct {
        v2_update_new_from_old for malformed-escape / varchar-overflow
        rejections. */
     char              err_buf[256];
+    /* Stashed during v2_update_new_from_old so apply_commit can
+       compute the forward index diff (old→new) without re-reading. */
+    const uint8_t    *saved_old_value;
+    size_t            saved_old_vlen;
 } V2UpdateCtx;
 
 /* NEW-from-OLD constructor for single partial updates. Runs inside
@@ -1137,6 +1141,10 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
                                   void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old || !out_value || !out_vlen || old->vlen > out_capacity) return -1;
+    /* Stash OLD so apply_commit can compute the index diff without
+       re-reading (the two-phase hook signature doesn't carry OLD). */
+    c->saved_old_value = old->value;
+    c->saved_old_vlen  = old->vlen;
 #ifdef TEST_BUILD
     /* Fixed-path seam: deterministic pause at the top of the under-lock
        callback, after OLD has been received. Reports under_kf_wrlock == 1. */
@@ -1278,9 +1286,11 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                                                    a->idx_fields[i],
                                                    old_slot, INDEX_KEY_MAX, &old_len)
                 : 0;
-            int rn = build_index_key_from_record_into(a->idx_ts, a->new_value,
-                                                       a->idx_fields[i],
-                                                       new_slot, INDEX_KEY_MAX, &new_len);
+            int rn = a->new_value
+                ? build_index_key_from_record_into(a->idx_ts, a->new_value,
+                                                   a->idx_fields[i],
+                                                   new_slot, INDEX_KEY_MAX, &new_len)
+                : 0;
             have_old = (ro == 1);
             have_new = (rn == 1);
             old_buf = have_old ? old_slot : NULL;
@@ -1293,16 +1303,22 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                 if (have_old) fb_bufs[n_fb++] = old_buf;
             }
             if (rn == -1) {
-                have_new = build_index_key_from_record(a->idx_ts, a->new_value,
-                                                       a->idx_fields[i], &new_buf, &new_len);
+                have_new = a->new_value
+                    ? build_index_key_from_record(a->idx_ts, a->new_value,
+                                                  a->idx_fields[i], &new_buf,
+                                                  &new_len)
+                    : 0;
                 if (have_new) fb_bufs[n_fb++] = new_buf;
             }
         } else {
             if (a->old_value)
                 have_old = build_index_key_from_record(a->idx_ts, a->old_value,
                                                        a->idx_fields[i], &old_buf, &old_len);
-            have_new = build_index_key_from_record(a->idx_ts, a->new_value,
-                                                   a->idx_fields[i], &new_buf, &new_len);
+            if (a->new_value)
+                have_new = build_index_key_from_record(a->idx_ts,
+                                                       a->new_value,
+                                                       a->idx_fields[i],
+                                                       &new_buf, &new_len);
             if (have_old) fb_bufs[n_fb++] = old_buf;
             if (have_new) fb_bufs[n_fb++] = new_buf;
         }
@@ -1405,6 +1421,36 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
     return apply_index_diff(&args);
 }
 
+/* Two-phase update hooks: prepare_commit is a no-op (no bitmap staging
+   needed for updates), apply_commit fires the index diff after the
+   commit-intent marker is durable, abort_commit is a no-op. */
+static int v2_update_prepare_commit(const uint8_t *new_value, size_t new_vlen,
+                                    uint32_t kf_slot, void *ctx_ptr) {
+    (void)new_value; (void)new_vlen; (void)kf_slot; (void)ctx_ptr;
+    return 0;
+}
+
+static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
+                                  uint32_t kf_slot, void *ctx_ptr) {
+    (void)new_vlen; (void)kf_slot;
+    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
+    if (c->nidx == 0 || !c->saved_old_value) return 0;
+    IndexDiffApplyArgs args = {
+        .db_root = c->db_root, .object = c->object,
+        .nidx = c->nidx, .idx_fields = c->idx_fields,
+        .idx_types = c->idx_types, .splits = c->splits,
+        .hash = c->hash, .kf_shard = c->kf_shard,
+        .kf_slot = c->kf_slot, .idx_ts = c->idx_ts,
+        .old_value = c->saved_old_value, .new_value = new_value,
+        .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
+    };
+    return apply_index_diff(&args);
+}
+
+static void v2_update_abort_commit(void *ctx_ptr) {
+    (void)ctx_ptr;
+}
+
 static int cmd_update_v2(const char *db_root, const char *object,
                          const char *key, size_t klen,
                          const char *partial_json,
@@ -1504,6 +1550,9 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .new_from_old_ctx = &ctx,
         .pre_commit       = v2_update_pre_commit,
         .pre_commit_ctx   = &ctx,
+        .prepare_commit   = v2_update_prepare_commit,
+        .apply_commit     = v2_update_apply_commit,
+        .abort_commit     = v2_update_abort_commit,
         .out_kf_shard     = &ctx.kf_shard,
         .out_kf_slot      = &ctx.kf_slot,
         .has_indexed_fields = nidx > 0,
@@ -1590,13 +1639,15 @@ static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     return 1;
 }
 
-static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
+/* Forward index diff for an indexed delete — (old=OLD, new=NULL). Runs
+   after the delete marker is durable, before the kf tombstone. Same
+   parallel-fanout + arena allocation pattern as v2_update_pre_commit;
+   update_idx_fn with new_key=NULL is a pure delete. */
+static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
+                                  uint32_t kf_slot, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
     if (!old || c->nidx == 0) return 0;
 
-    /* Same parallel-fanout + arena allocation pattern as
-       v2_update_pre_commit. update_idx_fn with new_key=NULL is a
-       pure delete. */
     enum { INDEX_KEY_MAX = 4096 };
     size_t arena_bytes = (size_t)c->nidx * (size_t)INDEX_KEY_MAX;
     uint8_t *arena = malloc(arena_bytes);
@@ -1638,7 +1689,7 @@ static int v2_delete_pre_commit(const SlotcaskOldRecord *old, void *ctx_ptr) {
         args[n_args].hash    = c->hash;
         args[n_args].type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
         args[n_args].kf_shard = c->kf_shard;
-        args[n_args].kf_slot  = c->kf_slot;
+        args[n_args].kf_slot  = kf_slot;
         args[n_args].bm_max_values = 0;
         n_args++;
     }
@@ -1734,6 +1785,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         .crit = crit, .ncrit = ncrit,
     };
     compute_hash_raw(key, klen, ctx.hash);
+    int durability_degraded = 0;
 
     /* Only set the check hook when there's actual CAS criteria — otherwise
        v2_delete_check_fn would just return 1 unconditionally but the
@@ -1742,17 +1794,20 @@ static int cmd_delete_v2(const char *db_root, const char *object,
        read_record_value entirely. */
     int has_cas = (crit && ncrit > 0);
     SlotcaskDeleteOpts opts = {
-        .check          = has_cas ? v2_delete_check_fn : NULL,
-        .check_ctx      = &ctx,
-        .pre_commit     = v2_delete_pre_commit,
-        .pre_commit_ctx = &ctx,
-        .out_kf_shard   = &ctx.kf_shard,
-        .out_kf_slot    = &ctx.kf_slot,
-        /* pre_commit only dereferences old when there are index entries
-           to drop. On non-indexed + non-CAS delete, opt out of
-           read_record_value — saves a segcache_acquire + 100B memcpy +
-           malloc/free per call. v2_delete_pre_commit handles old=NULL. */
-        .skip_old_read  = (nidx == 0),
+        .check              = has_cas ? v2_delete_check_fn : NULL,
+        .check_ctx          = &ctx,
+        .apply_commit       = (nidx > 0) ? v2_delete_apply_commit : NULL,
+        .pre_commit_ctx     = &ctx,
+        .out_kf_shard       = &ctx.kf_shard,
+        .out_kf_slot        = &ctx.kf_slot,
+        .has_indexed_fields = (nidx > 0),
+        .out_durability_degraded = &durability_degraded,
+        /* apply_commit only dereferences old when there are index entries
+           to drop; check only when there is CAS criteria. On non-indexed +
+           non-CAS delete, opt out of read_record_value — saves a
+           segcache_acquire + 100B memcpy + malloc/free per call.
+           v2_delete_apply_commit handles old=NULL. */
+        .skip_old_read      = (nidx == 0),
     };
     SlotcaskDeleteResult result = {0};
     int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);
@@ -1786,7 +1841,11 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     LOG_INFO(LOG_SUB_SLOTCASK, "DELETE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
     free_criteria(crit, ncrit);
-    OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
+    if (durability_degraded)
+        OUT("{\"status\":\"deleted\",\"key\":\"%s\",\"durability_degraded\":true}\n",
+            wire_key);
+    else
+        OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
 

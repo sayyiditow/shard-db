@@ -609,6 +609,10 @@ void durability_test_fsync_reset(void);
 void durability_test_fsync_fail_on_call(int call_number, int err);
 void index_test_spill_open_fail_errno(int err);
 void index_test_conf_publish_fail_stage(int stage);
+/* After N successful durable index mutations, make the next completed
+   mutation report EIO. The mutation is intentionally performed first so
+   callers can exercise partial index apply and its abort/recovery path. */
+void index_test_abort_fail_after(int n);
 #endif
 
 /* ========== Function declarations ========== */
