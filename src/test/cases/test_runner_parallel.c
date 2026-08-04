@@ -113,9 +113,23 @@ static void dump_failures(const char *tag, const char *out) {
 }
 
 static int test_runner_parallel_matches_sequential(void) {
+    /* Nested parallel width defaults to 4, but CI runners are 1-2 vCPU
+       and --jobs 4 over-subscribes them badly enough to cause spurious
+       contention-driven assertion failures (see
+       docs/plans/2026-07-21-test-harness-port-toctou-flake.md and the
+       sibling test-runner-parallel flake history). CI workflows export
+       SHARD_TEST_RUNNER_PARALLEL_JOBS=2 to narrow this; local/dev runs
+       keep the stronger --jobs 4 coverage by default. */
+    int par_jobs = 4;
+    const char *ov = getenv("SHARD_TEST_RUNNER_PARALLEL_JOBS");
+    if (ov && *ov) {
+        int v = atoi(ov);
+        if (v >= 2) par_jobs = v;
+    }
+
     int exit_seq = -1, exit_par = -1;
     char *out_seq = run_subcommand(1, &exit_seq);
-    char *out_par = run_subcommand(4, &exit_par);
+    char *out_par = run_subcommand(par_jobs, &exit_par);
 
     ASSERT_TRUE(out_seq && out_par, "both subcommand runs captured output");
     if (!out_seq || !out_par) { free(out_seq); free(out_par); return 1; }

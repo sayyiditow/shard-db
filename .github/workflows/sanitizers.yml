@@ -40,6 +40,10 @@ jobs:
       # for the wrong reason).
       ASAN_OPTIONS: "halt_on_error=0:detect_leaks=1:abort_on_error=0:print_stacktrace=1:log_exe_name=1"
       UBSAN_OPTIONS: "halt_on_error=0:print_stacktrace=1"
+      # test-runner-parallel's own nested run-all spawns a --jobs 4
+      # sub-run internally, unrelated to the --jobs 1 outer setting below.
+      # This runner is too weak for that nested width; narrow it to 2.
+      SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

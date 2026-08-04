@@ -18,6 +18,11 @@ jobs:
     name: Build & test (${{ matrix.os }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 25
+    env:
+      # test-runner-parallel's own nested run-all spawns a --jobs 4
+      # sub-run internally, unrelated to the --jobs 1 outer setting below.
+      # These runners are too weak for that nested width; narrow it to 2.
+      SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
     strategy:
       # Don't cancel the other arch when one fails — we want full signal.
       fail-fast: false
